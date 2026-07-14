@@ -1,0 +1,128 @@
+task_id: TASK-043
+rev: 15
+messages:
+- id: MSG-001
+  role: agent
+  kind: question
+  body: What is your favorite color?
+  status: answered
+  parent_id: null
+  variants: []
+  author: agent
+  answer: Green
+  created_at: '2026-06-15T18:56:05.349263'
+  updated_at: '2026-06-15T19:07:58.879151'
+  answered_by_role: human
+  resolved_at: '2026-06-15T19:07:58.879151'
+- id: MSG-002
+  role: agent
+  kind: question
+  body: Why do you like green?
+  status: answered
+  parent_id: null
+  variants: []
+  author: agent
+  answer: It's calming and reminds me of nature
+  created_at: '2026-06-15T19:22:52.034389'
+  updated_at: '2026-06-15T19:23:52.820997'
+  answered_by_role: human
+  resolved_at: '2026-06-15T19:23:52.820997'
+- id: MSG-003
+  role: agent
+  kind: question
+  body: What is your favorite season, and does it relate to the color green?
+  status: answered
+  parent_id: null
+  variants: []
+  author: agent
+  answer: Summer, yeah because it greeny
+  created_at: '2026-06-15T19:31:41.415284'
+  updated_at: '2026-06-15T20:21:41.527489'
+  answered_by_role: human
+  resolved_at: '2026-06-15T20:21:41.527489'
+- id: MSG-004
+  role: agent
+  kind: question
+  body: If you could spend a day in one green place this summer, would you rather
+    visit a forest, a botanical garden, or a lakeside meadow?
+  status: answered
+  parent_id: null
+  variants:
+  - Forest
+  - Botanical garden
+  - Lakeside meadow
+  author: agent
+  answer: forest of course
+  created_at: '2026-06-15T20:22:46.449007'
+  updated_at: '2026-06-15T20:24:47.725810'
+  answered_by_role: human
+  resolved_at: '2026-06-15T20:24:47.725810'
+- id: MSG-005
+  role: agent
+  kind: question
+  body: "What activity would you most enjoy in the forest this summer \u2014 hiking,\
+    \ picnicking, reading, or just relaxing?"
+  status: answered
+  parent_id: null
+  variants:
+  - Hiking
+  - Picnicking
+  - Reading
+  - Just relaxing
+  author: agent
+  answer: Reading
+  created_at: '2026-06-15T20:26:34.001551'
+  updated_at: '2026-06-15T20:26:52.790609'
+  answered_by_role: human
+  resolved_at: '2026-06-15T20:26:52.790609'
+- id: MSG-006
+  role: agent
+  kind: question
+  body: What genre of book would you bring to read in the forest this summer?
+  status: answered
+  parent_id: null
+  variants:
+  - Fantasy
+  - Mystery
+  - Nature/Science
+  - Poetry
+  author: agent
+  answer: Nature/Science
+  created_at: '2026-06-15T20:27:40.174410'
+  updated_at: '2026-06-15T20:29:23.682677'
+  answered_by_role: human
+  resolved_at: '2026-06-15T20:29:23.682677'
+- id: MSG-007
+  role: agent
+  kind: question
+  body: When you're reading that nature/science book in the forest this summer, would
+    you prefer a physical paperback, an e-reader, or an audiobook?
+  status: answered
+  parent_id: null
+  variants:
+  - Physical paperback
+  - E-reader
+  - Audiobook
+  author: agent
+  answer: E-reader
+  created_at: '2026-06-15T20:30:10.081627'
+  updated_at: '2026-06-15T20:30:21.108999'
+  answered_by_role: human
+  resolved_at: '2026-06-15T20:30:21.108999'
+- id: MSG-008
+  role: agent
+  kind: question
+  body: "What is your favorite feature of reading on an e-reader in a forest setting\
+    \ \u2014 the adjustable backlight, the lightweight device, the long battery life,\
+    \ or the ability to carry many books?"
+  status: open
+  parent_id: null
+  variants:
+  - Adjustable backlight
+  - Lightweight device
+  - Long battery life
+  - Ability to carry many books
+  author: agent
+  answer: null
+  created_at: '2026-06-15T20:30:46.685385'
+  updated_at: '2026-06-15T20:30:46.685394'

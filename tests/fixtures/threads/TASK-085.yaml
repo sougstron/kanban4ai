@@ -1,0 +1,163 @@
+task_id: TASK-085
+rev: 10
+messages:
+- id: MSG-001
+  role: system
+  kind: system
+  body: 'Task created: Sonnet 5 update
+
+    Status: todo
+
+    Created at: 2026-07-01T10:13:22.036493'
+  status: open
+  parent_id: null
+  variants: []
+  author: kanban
+  answer: null
+  created_at: '2026-07-01T10:13:22.036493'
+  updated_at: '2026-07-01T10:13:22.036493'
+- id: MSG-002
+  role: human
+  kind: task
+  body: Is model in opencode sonnet takes last available model? For now is it will
+    take sonnet 5?
+  status: open
+  parent_id: null
+  variants: []
+  author: user
+  answer: null
+  created_at: '2026-07-01T10:13:22.036493'
+  updated_at: '2026-07-01T10:13:22.036493'
+- id: MSG-003
+  role: agent
+  kind: context
+  body: "Investigated model resolution. Findings: kanban-cli never resolves model\
+    \ aliases itself \u2014 operations._build_agent_command (operations.py:923,939-940)\
+    \ passes task.ai_model (or backend default 'model') verbatim to the backend CLI\
+    \ as '--model <string>'. In this project's .kanban/config.yaml the sonnet/opus/haiku\
+    \ aliases exist ONLY under the 'claude' backend (lines 73-77); the 'opencode'\
+    \ backend uses full provider/model IDs (openai/gpt-5.5 etc, lines 56-63) and has\
+    \ NO bare 'sonnet' alias. So: (1) 'sonnet' is a Claude Code alias, not an opencode\
+    \ one; opencode needs an explicit anthropic/claude-sonnet-* ID. (2) 'sonnet' resolves\
+    \ to whatever the INSTALLED Claude Code version maps it to \u2014 the latest Sonnet\
+    \ that CLI knows, not automatically the newest model on the API. It moves when\
+    \ you update Claude Code, not the instant a new model ships. (3) No 'Sonnet 5'\
+    \ exists as of now (latest is Sonnet 4.x), so 'sonnet' would not pick a Sonnet\
+    \ 5 until such a model exists and the CLI's alias table is updated."
+  status: open
+  parent_id: null
+  variants: []
+  author: agent
+  answer: null
+  created_at: '2026-07-01T10:14:25.545374'
+  updated_at: '2026-07-01T10:14:25.545382'
+- id: MSG-004
+  role: agent
+  kind: question
+  body: "Answer: 'sonnet' does NOT auto-pick the newest model. kanban-cli passes the\
+    \ string '--model sonnet' straight to the backend (operations.py:939). The sonnet/opus/haiku\
+    \ aliases in your config are used ONLY by the 'claude' backend, not opencode (opencode\
+    \ uses full IDs like openai/gpt-5.5). 'sonnet' is a Claude Code alias that maps\
+    \ to whatever Sonnet the INSTALLED Claude Code version knows \u2014 it upgrades\
+    \ when you update the CLI, not the moment a new model ships. There's no 'Sonnet\
+    \ 5' yet (latest is Sonnet 4.x), so it wouldn't pick one until that model exists\
+    \ AND the CLI's alias table is updated. Given that, what do you want me to do?"
+  status: answered
+  parent_id: null
+  variants:
+  - "Nothing \u2014 this was just a question, close it"
+  - Pin the claude backend to an explicit Sonnet model ID in config
+  - Add an opencode entry using anthropic/claude-sonnet-* explicitly
+  - Something else (I'll explain)
+  author: agent
+  answer: "Nothing \u2014 this was just a question, close it"
+  created_at: '2026-07-01T10:14:43.588483'
+  updated_at: '2026-07-01T10:16:05.567723'
+  answered_by_role: human
+  resolved_at: '2026-07-01T10:16:05.567723'
+- id: MSG-005
+  role: agent
+  kind: context
+  body: 'Question answered; human chose to close with no changes. Summary: ''sonnet''
+    is a Claude Code backend alias mapping to whatever Sonnet the installed CLI knows
+    (not auto-newest, not opencode). No Sonnet 5 exists yet. No code changes required.'
+  status: open
+  parent_id: null
+  variants: []
+  author: agent
+  answer: null
+  created_at: '2026-07-01T10:16:17.506788'
+  updated_at: '2026-07-01T10:16:17.506797'
+- id: MSG-006
+  role: human
+  kind: review_edit
+  body: Check now, i'm update claude code - is kanban will take sonnet 5 by default?
+  status: open
+  parent_id: null
+  variants: []
+  author: user
+  answer: null
+  created_at: '2026-07-01T10:17:58.329620'
+  updated_at: '2026-07-01T10:17:58.329625'
+- id: MSG-007
+  role: agent
+  kind: context
+  body: 'Re-checked after Claude Code update. Installed CLI is now v2.1.197 (/opt/claude-code/bin/claude).
+    Verified DIRECTLY from the compiled binary: the bare alias ''sonnet'' now maps
+    to claude-sonnet-5 (found string sonnet:"claude-sonnet-5" and resolution logic:
+    if(n==="sonnet"){ if(oo(i)==="claude-sonnet-5") ... }). So Sonnet 5 now EXISTS
+    and the ''sonnet'' alias resolves to it in this CLI version. HOWEVER, two caveats
+    about ''by default'': (1) kanban''s global default backend is OPENCODE not claude
+    (auto_launch.default_agent: opencode, config), so a brand-new default task launches
+    opencode -> openai/gpt-5.5 and never touches the sonnet alias at all. (2) Only
+    tasks run on the CLAUDE backend with no per-task ai_model override get ''--model
+    sonnet'' (claude backend default model: sonnet, config), which NOW = Sonnet 5.
+    Per-task ai_model still overrides it (operations.py:923: model = task.ai_model
+    or settings.get(''model'')) -- e.g. this task is pinned to opus. No code changes
+    needed; alias behavior updated automatically with the CLI upgrade.'
+  status: open
+  parent_id: null
+  variants: []
+  author: agent
+  answer: null
+  created_at: '2026-07-01T10:20:22.113381'
+  updated_at: '2026-07-01T10:20:22.113390'
+- id: MSG-008
+  role: agent
+  kind: question
+  body: 'Verified after your Claude Code update (now v2.1.197): the ''sonnet'' alias
+    NOW resolves to claude-sonnet-5 (confirmed straight from the CLI binary: sonnet="claude-sonnet-5").
+    So on the CLAUDE backend, a task with model ''sonnet'' and no override will get
+    Sonnet 5. BUT two ''by default'' caveats: (1) kanban''s global default backend
+    is OPENCODE, so a brand-new default task runs opencode/gpt-5.5 and never uses
+    ''sonnet'' at all; (2) a per-task ai_model (like this task''s ''opus'') always
+    overrides the backend default. No code change is required for the alias to pick
+    up Sonnet 5 - it happened automatically with the CLI update. What would you like?'
+  status: answered
+  parent_id: null
+  variants:
+  - Nothing - answered, close it
+  - Make 'claude' the default backend so 'sonnet'=Sonnet 5 is used by default
+  - Pin the claude backend to an explicit claude-sonnet-5 ID instead of the alias
+  - Something else (I'll explain)
+  author: agent
+  answer: Nothing - answered, close it
+  created_at: '2026-07-01T10:20:46.784796'
+  updated_at: '2026-07-01T10:21:09.147722'
+  answered_by_role: human
+  resolved_at: '2026-07-01T10:21:09.147722'
+- id: MSG-009
+  role: agent
+  kind: context
+  body: 'Relaunched with human''s close decision. No pending question and no code
+    change requested. Confirmed conclusion: on the CLAUDE backend, ''sonnet'' now
+    resolves to claude-sonnet-5 (CLI v2.1.197) automatically; kanban passes the alias
+    verbatim, per-task ai_model still overrides, and global default backend is opencode.
+    Marking task done.'
+  status: open
+  parent_id: null
+  variants: []
+  author: agent
+  answer: null
+  created_at: '2026-07-01T10:21:21.774887'
+  updated_at: '2026-07-01T10:21:21.774892'
