@@ -1,0 +1,18 @@
+# Rust
+/target
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Kanban board runtime
+.kanban/sessions/
+.kanban/context/
+.kanban/logs/
+.kanban/backups/
+.kanban/cache/
+.kanban/compaction.log
+.kanban/.lock
