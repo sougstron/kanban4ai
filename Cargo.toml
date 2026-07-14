@@ -1,0 +1,40 @@
+[package]
+name = "kanban4ai"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+authors = ["sougstron"]
+description = "Fast native kanban board CLI + TUI driven by AI coding agents"
+license = "MIT"
+repository = "https://github.com/sougstron/kanban4ai"
+homepage = "https://github.com/sougstron/kanban4ai"
+readme = "README.md"
+categories = ["command-line-utilities"]
+keywords = ["kanban", "tui", "agents", "opencode", "claude"]
+
+[dependencies]
+chrono = "0.4.45"
+clap = { version = "4.6.1", features = ["derive"] }
+fs2 = "0.4.3"
+libc = "0.2.186"
+regex = "1.13.0"
+notify = "8.2.0"
+ratatui = { version = "0.29.0", features = ["crossterm"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+serde_yaml_ng = "0.10.0"
+shlex = "2.0.1"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tui-textarea = "0.7.0"
+unicode-width = "=0.2.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
+insta = "1.43.2"
+predicates = "3.1.4"
