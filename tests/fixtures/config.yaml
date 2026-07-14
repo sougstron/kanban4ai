@@ -1,0 +1,80 @@
+columns:
+- name: To Do
+  id: todo
+- name: In Progress
+  id: in_progress
+- name: Review
+  id: review
+- name: Done
+  id: done
+rules:
+  one_task_per_instance: true
+  user_only_review_to_done: true
+  auto_move_on_assign: true
+  auto_move_on_complete: true
+  questions_go_to_review: false
+  auto_launch_on_delegate: true
+  auto_launch_chained: true
+thresholds:
+  context_embed_max_size: 5120
+  context_warning: 51200
+  context_auto_compact: 102400
+  session_heartbeat_timeout: 300
+  context_summary_max_length: 5000
+  tui_refresh_interval: 1
+  question_poll_interval: 3
+  question_wait_timeout: 600
+tui:
+  card_height_lines: 4
+  max_tasks_per_column: 100
+  theme: nord
+  name: Kanban develop
+auto_launch:
+  enabled: true
+  use_tmux: true
+  terminal_fallback: true
+  auto_complete_on_exit: false
+  model: openai/gpt-5.5
+  models:
+  - openai/gpt-5.5
+  - opencode/deepseek-v4-flash-free
+  - opencode-go/kimi-k2.7-code
+  - opencode-go/deepseek-v4-flash
+  agent: hephaestus
+  default_agent: opencode
+notifications:
+  enabled: true
+  questions: true
+  completion: true
+  chained_start: true
+  command: notify-send
+  timeout: 3
+  max_body_chars: 240
+agents:
+  opencode:
+    command: opencode
+    model: openai/gpt-5.5
+    models:
+    - openai/gpt-5.5
+    - opencode/deepseek-v4-flash-free
+    - opencode-go/kimi-k2.7-code
+    - opencode-go/deepseek-v4-flash
+    - opencode-go/mimo-v2.5
+    - opencode-go/minimax-m3
+    agent: hephaestus
+    agent_options:
+    - sisyphus
+    - prometheus
+    - hephaestus
+    - atlas
+    extra_args: []
+  claude:
+    command: claude
+    model: sonnet
+    models:
+    - sonnet
+    - opus
+    - haiku
+    agent: null
+    extra_args:
+    - --dangerously-skip-permissions
