@@ -33,8 +33,8 @@
 ## Релизный процесс
 
 1. Выполнить проверки из `README.md`, включая packaging smoke test.
-2. Для стабильного AUR-рецепта заменить bootstrap `SKIP` реальным SHA-256
-   source-архива и обновить `.SRCINFO` по `packaging/aur/README.md`.
+2. Для стабильного AUR-рецепта обновить SHA-256 source-архива и `.SRCINFO`
+   по `packaging/aur/README.md`.
 3. Создать тег `v<version>` только после успешной проверки. Release workflow
    повторно запускает fmt, clippy, tests и release build, затем публикует
    Linux-архивы и `.sha256` файлы.

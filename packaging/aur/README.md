@@ -4,9 +4,8 @@
 - `kanban4ai-git/` builds the current `main` branch and derives `pkgver` from
   Git tags.
 
-The stable recipe intentionally uses `SKIP` only while the first `v0.1.0`
-source archive does not exist. Before publishing or updating the AUR package,
-download the exact GitHub source archive, replace `SKIP` with its SHA-256
+The stable recipe pins the SHA-256 checksum of the matching GitHub tag archive.
+When updating it, set `pkgver`, download the exact source archive, refresh the
 checksum, increment `pkgrel` when appropriate, and regenerate `.SRCINFO`:
 
 ```sh

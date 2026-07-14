@@ -15,10 +15,7 @@ optdepends=(
   'xclip: paste images under X11'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Bootstrap only: v0.1.0 does not exist until the first release is tagged.
-# Before publishing to AUR, replace SKIP with the checksum from the matching
-# GitHub source archive and regenerate .SRCINFO with makepkg --printsrcinfo.
-sha256sums=('SKIP')
+sha256sums=('da3681644f6d90242b964e15d8c1608502432192a66511f71eb6e358f0ed6a29')
 
 prepare() {
   cd "$pkgname-$pkgver"
