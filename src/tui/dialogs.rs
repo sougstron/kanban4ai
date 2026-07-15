@@ -51,7 +51,7 @@ pub enum Modal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BulkAction {
     ArchiveAllDone,
-    BulkToReview,
+    MarkReviewDone,
 }
 
 /// Kinds offered by the Add-message dialog, indexed by `kind_selected`.
@@ -175,7 +175,7 @@ impl ModalState {
             form_scroll: 0,
             error: None,
             discard_confirm: false,
-            confirm_yes_selected: true,
+            confirm_yes_selected: false,
             initial_values: None,
             backend_options: Vec::new(),
             backend_selected: 0,
@@ -830,7 +830,7 @@ fn render_bulk_confirm(
 ) {
     let prompt = match action {
         BulkAction::ArchiveAllDone => format!("Archive {count} Done task(s)?"),
-        BulkAction::BulkToReview => format!("Move {count} task(s) to Review?"),
+        BulkAction::MarkReviewDone => format!("Mark {count} Review task(s) Done?"),
     };
     let text = vec![
         Line::from(prompt),
