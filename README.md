@@ -142,7 +142,7 @@ kanban4ai
 Use `↑`/`↓`/`←`/`→` to move focus, `Tab` or `Shift+Tab` to change columns,
 `Enter` for task details, `r` to run the task on an agent (immediate, no
 confirmation), `n` to create in the focused column, `A` to archive all Done
-tasks, `b` to bulk-move all In Progress tasks to Review (`R` also works), `e` to edit, `m` to move, `w` to answer a
+tasks, `b` to mark all Review tasks Done (`R` also works), `e` to edit, `m` to move, `w` to answer a
 question, `y` to approve Review → Done, `t` to attach to the task's agent,
 `c` to add context or a suggestion, `u` to recover a crashed task, `a` to view
 archived tasks, `l` to view running sessions, `/` to search, `?` for help, and

@@ -139,6 +139,7 @@ messages:
 - `kanban ask <id> <question> [--wait] [--variants TEXT ...] [--timeout SECONDS] [--session <id>]` - Add question, optionally block until answered
 - `kanban answer <id> <index> <answer>` - Answer question
 - `kanban waiting <id> [--session <id>] [--eta SECONDS] [--note TEXT]` - Declare a long-running wait; records a thread note, keeps the session alive until `eta × waiting_eta_multiplier`, and relaunches the agent after the deadline to check the result
+- `kanban detach <id> [--session <id>] [--eta SECONDS] [--note TEXT] -- <command> [args...]` - Run a command fully detached from the agent session (own `setsid` session, so it survives the tmux host being killed when the reply ends), append output to `.kanban/detached/<task>-<stamp>.log`, write the exit code to the matching `.status` file, and declare the wait in one step; the wait note carries both paths into the relaunch prompt
 - `kanban questions <id>` - List open thread messages
 - `kanban suggest <id> <suggestion>` - Add suggestion
 - `kanban edits <id> <text>` - Set the review-edits buffer
@@ -251,7 +252,7 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `Ctrl+s`: Save the review-edits buffer (detail; save only, no re-run)
 - `a`: Show archived tasks
 - `A`: Confirm archiving all Done tasks
-- `R`: Confirm moving all In Progress tasks to Review
+- `R`: Confirm marking all Review tasks Done
 - `l`: Show running sessions
 - `Ctrl+t`: Quick theme toggle (persisted to config)
 - `/`: Search
@@ -303,15 +304,15 @@ Agents call kanban via shell commands. NOT a plugin. An agent must:
 3. Call `kanban heartbeat` periodically while working
 4. Add context via `kanban context`
 5. Ask questions via `kanban ask`, or `kanban ask --wait --session <id>` when the task is interactive and the question is blocking
-6. For long detached external work, call `kanban waiting <id> --session <id> --eta SECONDS --note TEXT`; the board relaunches the agent after the deadline to check the result
+6. For long detached external work, prefer `kanban detach <id> --session <id> --eta SECONDS --note TEXT -- <command>` (starts the command so it survives the session and declares the wait in one step). A plain shell background job dies with the session's process group; when detaching manually (`setsid` + `nohup`, output to a file), declare the wait with `kanban waiting <id> --session <id> --eta SECONDS --note TEXT`. Either way the board relaunches the agent after the deadline to check the result
 7. Mark done via `kanban done`
 
-Closure invariant for non-interactive agent jobs: after implementation and verification are complete, do not stop at a progress update, green test report, or pending specialist review. Record final context and run `kanban done <id> --session <id> --agent` in the same execution unless a blocking ambiguity requires `kanban ask --agent`, or a long-running detached result requires `kanban waiting --session <id>`, and an immediate stop.
+Closure invariant for non-interactive agent jobs: after implementation and verification are complete, do not stop at a progress update, green test report, or pending specialist review. Record final context and run `kanban done <id> --session <id> --agent` in the same execution unless a blocking ambiguity requires `kanban ask --agent`, or a long-running detached result requires `kanban waiting --session <id>` or `kanban detach --session <id>`, and an immediate stop.
 
 ### Agent Auto-Launch
 When a task is handed to an agent (`take --agent`, or the TUI `r` Run action) and auto-launch is enabled, the CLI spawns the agent itself:
 - Builds a non-interactive command per backend (see "Agent Backends"). Model resolves from `task.ai_model`, else the backend default; reasoning effort from `task.ai_effort`, else the backend `effort` default.
-- The prompt instructs the agent to: work only on this task, use the provided `KANBAN_SESSION`/`KANBAN_TASK_ID` env vars, back up touched files, record progress via `kanban context`, and finish with `kanban done --agent`. When `interactive: true`, blocking questions go through `kanban ask --wait --session <id>`. Long detached waits go through `kanban waiting --session <id>`; clean exits that leave a task In Progress without `done`, `ask`, or `waiting` are automatically resumed up to `max_auto_resumes`. The prompt stays backend-neutral.
+- The prompt instructs the agent to: work only on this task, use the provided `KANBAN_SESSION`/`KANBAN_TASK_ID` env vars, back up touched files, record progress via `kanban context`, and finish with `kanban done --agent`. When `interactive: true`, blocking questions go through `kanban ask --wait --session <id>`. Long detached waits go through `kanban detach --session <id> -- <command>` (preferred; survives the session and records output/exit code under `.kanban/detached/`) or a manual `setsid`/`nohup` launch plus `kanban waiting --session <id>` — the prompt warns that plain background jobs die with the session's process group. Clean exits that leave a task In Progress without `done`, `ask`, or `waiting` are automatically resumed up to `max_auto_resumes`. The prompt stays backend-neutral.
 - If `use_tmux` and tmux is available → runs inside a detached tmux session (reattachable via `kanban attach`); otherwise falls back to a background process. Either way stdout/stderr is teed to `.kanban/logs/<session>.log`. Session ids are prefixed by backend (`ses-<backend>-...`).
 - Agent exit is watched to reconcile task/session state.
 
@@ -335,6 +336,7 @@ Session token estimates are parsed from the agent's `.kanban/logs/<session>.log`
 - `context/` - legacy: large context from older boards (read-only back-compat)
 - `sessions/` - per-session YAML (metadata + heartbeat)
 - `logs/` - per-session agent run logs
+- `detached/` - `kanban detach` job artifacts: `<task_id>-<stamp>.log` (output) and `.status` (exit code); cleared with the task's logs
 - `recent_models` - most recently launched opencode models, newest first (drives TUI model-selector ordering)
 - `backups/<task_id>/` - pre-edit file backups for revert
 - `assets/images/` - pasted image attachments
