@@ -311,6 +311,75 @@ fn archive_flow() {
 }
 
 #[test]
+fn detach_runs_command_and_declares_wait() {
+    let dir = board();
+    kanban(dir.path())
+        .args(["create", "Long export"])
+        .assert()
+        .success();
+    kanban(dir.path())
+        .args(["take", "TASK-001", "--session", "ses-detach-cli", "--agent"])
+        .assert()
+        .success();
+
+    kanban(dir.path())
+        .args([
+            "detach",
+            "TASK-001",
+            "--session",
+            "ses-detach-cli",
+            "--eta",
+            "30",
+            "--note",
+            "cli smoke export",
+            "--",
+            "sh",
+            "-c",
+            "echo cli-detached-ok",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Detached pid"))
+        .stdout(predicate::str::contains(".kanban/detached/TASK-001-"))
+        .stdout(predicate::str::contains("Relaunch deadline:"));
+
+    let detached_dir = dir.path().join(".kanban/detached");
+    let status_file = wait_for_status_file(&detached_dir);
+    assert_eq!(
+        std::fs::read_to_string(&status_file).unwrap().trim(),
+        "0",
+        "detached command records a clean exit"
+    );
+
+    // A command is required after `--`.
+    kanban(dir.path())
+        .args(["detach", "TASK-001", "--session", "ses-detach-cli"])
+        .assert()
+        .failure();
+}
+
+/// Poll `.kanban/detached/` until the job's `.status` file lands.
+fn wait_for_status_file(detached_dir: &std::path::Path) -> std::path::PathBuf {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(entries) = std::fs::read_dir(detached_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "status") {
+                    return path;
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "detached status file never appeared in {}",
+            detached_dir.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[test]
 fn sessions_heartbeat_check_recover() {
     let dir = board();
     kanban(dir.path())

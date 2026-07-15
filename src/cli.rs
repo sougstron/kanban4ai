@@ -222,6 +222,26 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Run a command detached from the agent session so it survives the
+    /// session's exit, then declare a wait for its result. Output is appended
+    /// to .kanban/detached/<task>-<stamp>.log, the exit code is written to
+    /// the matching .status file, and the agent is relaunched after the wait
+    /// deadline to check them.
+    Detach {
+        task_id: String,
+        /// Expected wait in seconds (default: waiting_default_eta threshold)
+        #[arg(long)]
+        eta: Option<i64>,
+        /// What is being waited for
+        #[arg(long)]
+        note: Option<String>,
+        /// Session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Command to run detached (specify after --)
+        #[arg(last = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
     /// Check for crashed sessions.
     #[command(name = "check-sessions")]
     CheckSessions,
@@ -588,6 +608,27 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 "Wait recorded for {task_id} (session {session_id}). \
                  Relaunch deadline: {deadline}. End your reply now; you will be relaunched \
                  after the deadline to check the result."
+            );
+        }
+        Command::Detach {
+            task_id,
+            eta,
+            note,
+            session,
+            command,
+        } => {
+            let session_id = env_session(session);
+            let job = ops.detach_command(&task_id, &session_id, eta, note.as_deref(), &command)?;
+            println!(
+                "Detached pid {} for {task_id} (session {session_id}).\n\
+                 Output: {}\n\
+                 Exit code file: {}\n\
+                 Relaunch deadline: {}. End your reply now; you will be relaunched \
+                 after the deadline to check the result.",
+                job.pid,
+                job.log_file.display(),
+                job.status_file.display(),
+                job.deadline
             );
         }
         Command::CheckSessions => {
