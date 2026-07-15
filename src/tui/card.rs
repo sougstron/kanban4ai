@@ -21,38 +21,34 @@ pub fn render_card(frame: &mut Frame<'_>, app: &App, task: &Task, area: Rect, fo
     } else {
         app.theme.border
     };
-    let title = if focused {
-        Span::styled(
-            sanitize_terminal_text(&task.id),
-            Style::default()
-                .fg(app.theme.focus)
-                .add_modifier(Modifier::BOLD),
-        )
+    let line_width = area.width.saturating_sub(2).max(1) as usize;
+    let query = app.search.text();
+    let id_style = if focused {
+        Style::default()
+            .fg(app.theme.focus)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Span::styled(
-            sanitize_terminal_text(&task.id),
-            Style::default().fg(app.theme.muted),
-        )
+        Style::default().fg(app.theme.muted)
     };
-    let extra = app.board.extras.get(&task.id);
-    let visible_title = truncate_display(
-        &sanitize_terminal_text(&task.title),
-        app.settings.card_line_max_symbols,
-    );
-    let mut title_spans = vec![title, Span::raw(" ")];
-    title_spans.extend(highlight_title_matches(
+    let visible_id = truncate_display(&sanitize_terminal_text(&task.id), line_width);
+    let visible_title = truncate_display(&sanitize_terminal_text(&task.title), line_width);
+    let mut title_spans = highlight_matches(&visible_id, &query, id_style, app.theme.warn);
+    title_spans.push(Span::raw(" "));
+    title_spans.extend(highlight_matches(
         &visible_title,
-        &app.search.text(),
+        &query,
+        Style::default(),
         app.theme.warn,
     ));
     let mut lines = vec![Line::from(title_spans)];
+    let extra = app.board.extras.get(&task.id);
     // The open question goes right under the title: it is the thing the
     // human must act on, and short cards truncate from the bottom.
     if let Some(preview) = extra.and_then(|extra| extra.question_preview.as_deref()) {
         lines.push(Line::from(Span::styled(
             truncate_display(
                 &format!("? {}", sanitize_terminal_text(preview)),
-                app.settings.card_line_max_symbols,
+                line_width,
             ),
             Style::default()
                 .fg(app.theme.warn)
@@ -70,7 +66,7 @@ pub fn render_card(frame: &mut Frame<'_>, app: &App, task: &Task, area: Rect, fo
             .flat_map(|(index, (badge, color))| {
                 let separator = (index > 0).then(|| Span::raw(" "));
                 separator.into_iter().chain(std::iter::once(Span::styled(
-                    badge,
+                    truncate_display(&badge, line_width),
                     Style::default().fg(color),
                 )))
             })
@@ -78,12 +74,15 @@ pub fn render_card(frame: &mut Frame<'_>, app: &App, task: &Task, area: Rect, fo
         lines.push(Line::from(badge_spans));
     }
     if !task.description.is_empty() {
-        lines.push(Line::from(Span::styled(
-            truncate_display(
-                &sanitize_terminal_text(&task.description).replace('\n', " "),
-                app.settings.card_line_max_symbols,
-            ),
+        let description = truncate_display(
+            &sanitize_terminal_text(&task.description).replace('\n', " "),
+            line_width,
+        );
+        lines.push(Line::from(highlight_matches(
+            &description,
+            &query,
             Style::default().fg(app.theme.muted),
+            app.theme.warn,
         )));
     }
     let block = Block::default()
@@ -97,13 +96,23 @@ pub fn render_card(frame: &mut Frame<'_>, app: &App, task: &Task, area: Rect, fo
     );
 }
 
+#[cfg(test)]
 pub fn highlight_title_matches(
     title: &str,
     query: &str,
     warn: ratatui::style::Color,
 ) -> Vec<Span<'static>> {
+    highlight_matches(title, query, Style::default(), warn)
+}
+
+pub fn highlight_matches(
+    title: &str,
+    query: &str,
+    base: Style,
+    warn: ratatui::style::Color,
+) -> Vec<Span<'static>> {
     if query.is_empty() {
-        return vec![Span::raw(title.to_string())];
+        return vec![Span::styled(title.to_string(), base)];
     }
     let chars = title.chars().collect::<Vec<_>>();
     let ranges = case_insensitive_match_ranges(&chars, query);
@@ -111,18 +120,22 @@ pub fn highlight_title_matches(
     let mut plain_start = 0;
     for (start, end) in ranges {
         if plain_start < start {
-            spans.push(Span::raw(
+            spans.push(Span::styled(
                 chars[plain_start..start].iter().collect::<String>(),
+                base,
             ));
         }
         spans.push(Span::styled(
             chars[start..end].iter().collect::<String>(),
-            Style::default().fg(warn),
+            base.fg(warn),
         ));
         plain_start = end;
     }
     if plain_start < chars.len() {
-        spans.push(Span::raw(chars[plain_start..].iter().collect::<String>()));
+        spans.push(Span::styled(
+            chars[plain_start..].iter().collect::<String>(),
+            base,
+        ));
     }
     spans
 }
