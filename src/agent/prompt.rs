@@ -27,16 +27,23 @@ Session contract:\n\
 - Keep the session alive with: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
 - When implementation and verification are complete, run: \"$KANBAN_CMD\" done {} --session {session_id} --agent\n\
 - If blocked, ask with: \"$KANBAN_CMD\" ask {} <question> --agent\n\
-- This session is non-interactive and terminates the moment you end your reply; nothing re-invokes \
-you afterwards, so there is no such thing as waiting for a later notification.\n\
-- Run every subagent, reviewer, or background task in the foreground and collect its result before \
-you continue; never end a reply while anything you launched is still running or unread.\n\
-- The final command of your reply must be the done command above, or the ask command if you are \
-blocked. Ending a reply without one of those crashes the session and strands the task in \
-in_progress.\n",
+- This session is non-interactive and terminates the moment you end your reply; background tasks, \
+monitors, and \"notifications\" die with it, so nothing you launch can re-invoke you later.\n\
+- Long-running foreground commands are safe: the board heartbeats for you while your process runs, \
+with no time limit. Prefer blocking in the foreground and collecting every result before you \
+continue; never end a reply while anything you launched is still running or unread.\n\
+- If a result will take too long to block on (a heavy query, an external job), start the work \
+detached with its output redirected to a file, then declare the wait and end your reply: \
+\"$KANBAN_CMD\" waiting {} --session {session_id} --eta <expected-seconds> --note <what you wait for>\n\
+  The board relaunches you after the deadline (eta plus a safety buffer) to check the result; \
+declare waiting again from the new session if it needs more time.\n\
+- The final command of your reply must be the done command above, the ask command if you are \
+blocked, or the waiting command if you are waiting on a declared long-running result. Ending a \
+reply without one of those strands the task and forces an automatic resume.\n",
         task.id,
         task.title,
         project_path.display(),
+        task.id,
         task.id,
         task.id,
         task.id,

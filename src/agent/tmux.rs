@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::agent::backends::{AutoLaunchConfig, LaunchPlan};
@@ -98,9 +98,10 @@ fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
     // Use the absolute path of the current binary so callbacks always
     // resolve to *this* kanban4ai executable regardless of PATH or
     // invocation name.  Falls back to bare "kanban" (the historical
-    // contract) when current_exe is unavailable.
+    // contract) when no usable path can be resolved.
     let kanban_cmd = std::env::current_exe()
         .ok()
+        .and_then(resolve_callback_binary)
         .map(|p| shell_quote(&p.display().to_string()))
         .unwrap_or_else(|| "kanban".to_string());
     let auto_segment = if plan.auto_complete_on_exit {
@@ -145,6 +146,21 @@ fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
         auto_segment,
         reconcile
     )
+}
+
+/// Resolve the on-disk path of the running binary for wrapper-script
+/// callbacks. When the executable is replaced while running (e.g. a
+/// rebuild of this repo or a package upgrade), Linux reports
+/// `/proc/self/exe` with a " (deleted)" suffix even though a fresh
+/// binary exists at the original path; callbacks must target that fresh
+/// file, not the nonexistent suffixed one. Returns `None` when no
+/// existing path remains.
+fn resolve_callback_binary(exe: PathBuf) -> Option<PathBuf> {
+    if exe.exists() {
+        return Some(exe);
+    }
+    let stripped = PathBuf::from(exe.to_str()?.strip_suffix(" (deleted)")?);
+    stripped.exists().then_some(stripped)
 }
 
 fn command_available(command: &str) -> bool {
@@ -277,6 +293,44 @@ mod tests {
             "bash -n rejected script with auto_complete_on_exit=true:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    /// An existing path is returned unchanged, even when it happens to
+    /// end with the literal " (deleted)" marker.
+    #[test]
+    fn resolve_callback_binary_keeps_existing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("kanban4ai");
+        std::fs::write(&plain, b"").unwrap();
+        assert_eq!(resolve_callback_binary(plain.clone()), Some(plain));
+
+        let literal = dir.path().join("kanban4ai (deleted)");
+        std::fs::write(&literal, b"").unwrap();
+        assert_eq!(resolve_callback_binary(literal.clone()), Some(literal));
+    }
+
+    /// A stale `/proc/self/exe` reading (" (deleted)" suffix after the
+    /// binary was replaced in place) resolves to the fresh file at the
+    /// original path.
+    #[test]
+    fn resolve_callback_binary_strips_deleted_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("kanban4ai");
+        std::fs::write(&fresh, b"").unwrap();
+        let reported = dir.path().join("kanban4ai (deleted)");
+        assert_eq!(resolve_callback_binary(reported), Some(fresh));
+    }
+
+    /// When neither the reported path nor the stripped path exists the
+    /// caller must fall back to the bare "kanban" contract.
+    #[test]
+    fn resolve_callback_binary_missing_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_callback_binary(dir.path().join("kanban4ai (deleted)")),
+            None
+        );
+        assert_eq!(resolve_callback_binary(dir.path().join("kanban4ai")), None);
     }
 
     /// Spawn a real background process via `spawn_background` using
