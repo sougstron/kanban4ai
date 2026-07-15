@@ -56,7 +56,10 @@ agents:
             .starts_with(&["run".to_string(), "--debug".to_string()])
     );
     assert!(has_arg_pair(&plan.args, "--model", "task-model"));
+    // The requested name stays in args; the registered form is resolved at
+    // run time inside the wrapper script (see LaunchPlan::resolve_agent).
     assert!(has_arg_pair(&plan.args, "--agent", "hephaestus"));
+    assert_eq!(plan.resolve_agent.as_deref(), Some("hephaestus"));
     assert!(has_arg_pair(
         &plan.args,
         "--title",

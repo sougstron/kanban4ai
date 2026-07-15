@@ -46,6 +46,13 @@ pub struct LaunchPlan {
     /// board's `session_heartbeat_timeout` so a live agent process is never
     /// marked crashed while it works without calling heartbeat itself.
     pub heartbeat_interval_secs: i64,
+    /// Requested opencode agent name whose registered form must be resolved
+    /// via `opencode agent list` inside the wrapper script at run time.
+    /// Resolving here would block the caller (the TUI event loop) on a
+    /// multi-second opencode CLI startup; deferring it moves that wait into
+    /// the spawned session. `args` carries the requested name as the
+    /// `--agent` value; the wrapper substitutes the resolved one.
+    pub resolve_agent: Option<String>,
 }
 
 pub fn build_launch_plan(
@@ -74,10 +81,10 @@ pub fn build_launch_plan(
         .clone()
         .or_else(|| backend_config.agent.clone())
         .filter(|value| !value.trim().is_empty());
-    let agent = if backend == "opencode" {
-        agent.map(|name| resolve_opencode_agent(&backend_config.command, &name))
+    let resolve_agent = if backend == "opencode" {
+        agent.clone()
     } else {
-        agent
+        None
     };
     let prompt = build_agent_prompt(project_path, task, session_id, revert)?;
     let args = backend_args(
@@ -103,6 +110,7 @@ pub fn build_launch_plan(
         session_id: session_id.to_string(),
         auto_complete_on_exit: auto_launch.auto_complete_on_exit,
         heartbeat_interval_secs,
+        resolve_agent,
     })
 }
 
@@ -230,7 +238,13 @@ fn mapping_sequence(mapping: &Mapping, key: &str) -> Vec<String> {
 
 static OPENCODE_AGENT_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
-fn resolve_opencode_agent(command: &str, requested: &str) -> String {
+/// Match a configured agent name against `opencode agent list` and return
+/// the registered form `--agent` expects, falling back to the requested name
+/// when the CLI is unavailable or lists no match. Starting the opencode CLI
+/// takes seconds, so this runs from the wrapper script's hidden
+/// `resolve-agent` callback inside the spawned session — never on the
+/// launching (TUI) side.
+pub fn resolve_opencode_agent(command: &str, requested: &str) -> String {
     let key = format!("{command}\n{requested}");
     let cache = OPENCODE_AGENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(cached) = cache
