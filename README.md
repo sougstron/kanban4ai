@@ -95,7 +95,17 @@ kanban4ai answer TASK-002 MSG-003 "Use JSON."
 
 For an interactive task, the agent can use `kanban4ai ask ... --agent --wait
 --session ses-login` to wait for the human answer. Questions and context are
-stored in the task's thread. When the agent finishes, it runs
+stored in the task's thread. For long external work that should outlive a
+headless agent reply, the agent can declare a bounded wait instead:
+
+```sh
+kanban4ai waiting TASK-002 --session ses-login --eta 900 --note "waiting for CI"
+```
+
+The board records the wait in the thread, keeps the session alive until the
+deadline (ETA with the configured safety multiplier), and relaunches the agent
+after the deadline to check the result; the agent may call `waiting` again if it
+still needs more time. When the agent finishes, it runs
 `kanban4ai done TASK-002 --session ses-login --agent`, which moves the task to
 Review. The human reviews the work and completes it with:
 
@@ -132,7 +142,7 @@ kanban4ai
 Use `↑`/`↓`/`←`/`→` to move focus, `Tab` or `Shift+Tab` to change columns,
 `Enter` for task details, `r` to run the task on an agent (immediate, no
 confirmation), `n` to create in the focused column, `A` to archive all Done
-tasks, `R` to move all In Progress tasks to Review, `e` to edit, `m` to move, `w` to answer a
+tasks, `b` to bulk-move all In Progress tasks to Review (`R` also works), `e` to edit, `m` to move, `w` to answer a
 question, `y` to approve Review → Done, `t` to attach to the task's agent,
 `c` to add context or a suggestion, `u` to recover a crashed task, `a` to view
 archived tasks, `l` to view running sessions, `/` to search, `?` for help, and
@@ -144,12 +154,13 @@ it fits. `Ctrl+T` remains the quick theme toggle. All action keys work from
 the board and from the detail view, which also offers clickable action buttons
 and an inline panel for answering agent questions.
 
-The sessions view marks each session `▶` live or `✖` crashed; there `Enter`
-attaches, `v` opens a scrollable pager over the session log, `x` kills the
-session after a confirmation, and `o` jumps to the session's task. In the
-archive view `Enter` opens an archived task and `u` restores it to To Do. The
-status bar shows the shortcuts for the current screen and its hints are
-clickable.
+The sessions view marks each session `▶` live, `⏳` in a declared wait, or `✖`
+crashed; there `Enter` attaches, `v` opens a scrollable pager over the session
+log, `x` kills the session after a confirmation, and `o` jumps to the session's
+task. Waiting rows and cards show the deadline (`until HH:MM`), while stuck
+cards show the `u recover` hint. In the archive view `Enter` opens an archived
+task and `u` restores it to To Do. The status bar shows the shortcuts for the
+current screen and its hints are clickable.
 
 ### 5. Sessions, archives, and data
 

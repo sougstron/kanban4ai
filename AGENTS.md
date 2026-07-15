@@ -56,8 +56,8 @@ tests/
 ```
 
 ### Data Model
-- **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, ai_model, ai_effort, agent_backend, agent_name, chained_to, review_edits. `description` is the **user-authored task only** — agent work-context lives in the thread (see "Context, questions & review edits"). `interactive: true` enables the thread-based blocking question loop for delegated agents. `chained_to` is an optional target task id: when that target enters Review, this task auto-runs (see "Task Chaining"). `review_edits` is the single editable buffer for the human's review feedback; it is folded into the thread and cleared on the next re-run from Review.
-- **Session**: id, task_id, started_at, status (active/closed/crashed), last_seen
+- **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, ai_model, ai_effort, agent_backend, agent_name, chained_to, review_edits, auto_resumes. `description` is the **user-authored task only** — agent work-context lives in the thread (see "Context, questions & review edits"). `interactive: true` enables the thread-based blocking question loop for delegated agents. `chained_to` is an optional target task id: when that target enters Review, this task auto-runs (see "Task Chaining"). `review_edits` is the single editable buffer for the human's review feedback; it is folded into the thread and cleared on the next re-run from Review. `auto_resumes` counts consecutive automatic relaunches after clean exits or expired waits and resets on human starts/recoveries.
+- **Session**: id, task_id, started_at, status (active/closed/crashed), last_seen, wait_until, wait_note, wait_exited. `wait_until`/`wait_note` are set by `kanban waiting`; `wait_exited` means the agent process ended during the declared wait and should be relaunched after the deadline.
 - **MessageRole** / **MessageKind** / **MessageStatus**: enums for thread message author, type, and lifecycle state. `MessageKind` is one of `system`, `task`, `question`, `suggestion`, `context`, or `review_edit`.
 - New tasks initialize their sidecar thread with `system` and `task` messages: `MSG-001` records creation metadata, `MSG-002` stores the initial user-authored task body so the TUI can render the whole conversation from the thread.
 - **Message**: thread entry with `id` (MSG-NNN), role, kind, status, body, `parent_id`, `variants`, author, timestamps, and resolution metadata. Answered questions also store `answer` and `answered_by_role`.
@@ -138,6 +138,7 @@ messages:
 - `kanban context <id> <text>` - Add a `context` message to the thread
 - `kanban ask <id> <question> [--wait] [--variants TEXT ...] [--timeout SECONDS] [--session <id>]` - Add question, optionally block until answered
 - `kanban answer <id> <index> <answer>` - Answer question
+- `kanban waiting <id> [--session <id>] [--eta SECONDS] [--note TEXT]` - Declare a long-running wait; records a thread note, keeps the session alive until `eta × waiting_eta_multiplier`, and relaunches the agent after the deadline to check the result
 - `kanban questions <id>` - List open thread messages
 - `kanban suggest <id> <suggestion>` - Add suggestion
 - `kanban edits <id> <text>` - Set the review-edits buffer
@@ -167,11 +168,17 @@ When `interactive: true`, delegated agents are instructed to use `kanban ask --w
 - `context_embed_max_size`: 5120 (5KB) - inline vs separate file
 - `context_warning`: 51200 (50KB) - warn about large context
 - `context_auto_compact`: 102400 (100KB) - auto-compress
-- `session_heartbeat_timeout`: 300 (5 min) - mark crashed
+- `session_heartbeat_timeout`: 1800 (30 min) - mark crashed
 - `context_summary_max_length`: 5000 chars
 - `tui_refresh_interval`: 1 (sec) - TUI refresh fallback (primary refresh is inotify)
 - `question_poll_interval`: 3 (sec) - poll interval for `kanban ask --wait`
 - `question_wait_timeout`: 600 (sec) - default timeout for `kanban ask --wait`
+- `max_auto_resumes`: 3 - cap consecutive automatic relaunches after stranded exits or expired waits
+- `waiting_min_eta`: 10 (sec) - lower bound for `kanban waiting --eta`
+- `waiting_max_eta`: 604800 (sec) - upper bound for `kanban waiting --eta`
+- `waiting_default_eta`: 900 (sec) - default expected wait for `kanban waiting`
+- `waiting_eta_multiplier`: 2 - safety multiplier applied to the ETA before relaunch
+- `waiting_note_max_chars`: 1000 - maximum stored wait note length
 
 ### TUI Settings (.kanban/config.yaml `tui:`)
 - `card_height_lines`: 4 - task card height
@@ -185,6 +192,7 @@ When `interactive: true`, delegated agents are instructed to use `kanban ask --w
 - `questions`: true - notify when a task raises a question
 - `completion`: true - notify when a task is completed or ready for review
 - `chained_start`: true - notify when a chained task auto-starts
+- `waiting`: true - notify when an agent declares a wait
 - `command`: `notify-send` - notification command
 - `timeout`: 3 - command timeout in seconds
 - `max_body_chars`: 240 - truncate notification body beyond this length
@@ -250,14 +258,15 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `?`: Help overlay (scrollable, sized to its content; lists mouse gestures)
 - `q`: Back from detail/secondary screens; quit the TUI with `Ctrl+C` twice
 
-Sessions view: each row shows the session state (`▶` live heartbeat, `✖`
-crashed), its task, and the estimated token count. `Enter` attaches, `v` opens
-a scrollable pager over the tail (last 64 KB) of `.kanban/logs/<id>.log` that
-follows new output on the refresh tick, `x` kills the session after a
-confirmation (`Operations::stop_session`), and `o` opens the session's task
-detail — `Esc` returns to the sessions list. Archive view: `Enter` opens the
-archived task's detail (its action bar offers only Restore/Delete), `u`
-restores the selected task to To Do after a confirmation.
+Sessions view: each row shows the session state (`▶` live heartbeat, `⏳`
+declared wait, `✖` crashed), its task, and the estimated token count; waiting
+rows also show the relaunch deadline. `Enter` attaches, `v` opens a scrollable
+pager over the tail (last 64 KB) of `.kanban/logs/<id>.log` that follows new
+output on the refresh tick, `x` kills the session after a confirmation
+(`Operations::stop_session`), and `o` opens the session's task detail — `Esc`
+returns to the sessions list. Archive view: `Enter` opens the archived task's
+detail (its action bar offers only Restore/Delete), `u` restores the selected
+task to To Do after a confirmation.
 
 The status bar is contextual per screen (Board, Detail, Sessions, Archive, log
 view) and its hotkey segments are clickable; when the terminal is narrow the
@@ -280,7 +289,8 @@ Edit/Move/+Ctx/Revert/Del). When the task has open questions an inline
 custom-input row, typing fills the custom answer, `Enter` submits. Cards with
 open questions show the question text as a preview line; clicking it jumps
 straight to the answer panel. Interactive tasks whose agent is blocked on
-`kanban ask --wait` show a `⏳ waiting` badge. The review-edits editor is
+`kanban ask --wait` show a `⏳ waiting` badge; tasks in declared wait mode show
+`⏳ until HH:MM`, and stuck/crashed tasks show `✖ crashed · u recover`. The review-edits editor is
 editable only while the task is in Review (read-only or hidden otherwise), and
 saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
 `Ctrl+R` / action-bar button. Create/edit dialogs expose an `interactive`
@@ -293,14 +303,15 @@ Agents call kanban via shell commands. NOT a plugin. An agent must:
 3. Call `kanban heartbeat` periodically while working
 4. Add context via `kanban context`
 5. Ask questions via `kanban ask`, or `kanban ask --wait --session <id>` when the task is interactive and the question is blocking
-6. Mark done via `kanban done`
+6. For long detached external work, call `kanban waiting <id> --session <id> --eta SECONDS --note TEXT`; the board relaunches the agent after the deadline to check the result
+7. Mark done via `kanban done`
 
-Closure invariant for non-interactive agent jobs: after implementation and verification are complete, do not stop at a progress update, green test report, or pending specialist review. Record final context and run `kanban done <id> --session <id> --agent` in the same execution unless a blocking ambiguity requires `kanban ask --agent` and an immediate stop.
+Closure invariant for non-interactive agent jobs: after implementation and verification are complete, do not stop at a progress update, green test report, or pending specialist review. Record final context and run `kanban done <id> --session <id> --agent` in the same execution unless a blocking ambiguity requires `kanban ask --agent`, or a long-running detached result requires `kanban waiting --session <id>`, and an immediate stop.
 
 ### Agent Auto-Launch
 When a task is handed to an agent (`take --agent`, or the TUI `r` Run action) and auto-launch is enabled, the CLI spawns the agent itself:
 - Builds a non-interactive command per backend (see "Agent Backends"). Model resolves from `task.ai_model`, else the backend default; reasoning effort from `task.ai_effort`, else the backend `effort` default.
-- The prompt instructs the agent to: work only on this task, use the provided `KANBAN_SESSION`/`KANBAN_TASK_ID` env vars, back up touched files, record progress via `kanban context`, and finish with `kanban done --agent`. When `interactive: true`, blocking questions go through `kanban ask --wait --session <id>`. The prompt stays backend-neutral.
+- The prompt instructs the agent to: work only on this task, use the provided `KANBAN_SESSION`/`KANBAN_TASK_ID` env vars, back up touched files, record progress via `kanban context`, and finish with `kanban done --agent`. When `interactive: true`, blocking questions go through `kanban ask --wait --session <id>`. Long detached waits go through `kanban waiting --session <id>`; clean exits that leave a task In Progress without `done`, `ask`, or `waiting` are automatically resumed up to `max_auto_resumes`. The prompt stays backend-neutral.
 - If `use_tmux` and tmux is available → runs inside a detached tmux session (reattachable via `kanban attach`); otherwise falls back to a background process. Either way stdout/stderr is teed to `.kanban/logs/<session>.log`. Session ids are prefixed by backend (`ses-<backend>-...`).
 - Agent exit is watched to reconcile task/session state.
 
