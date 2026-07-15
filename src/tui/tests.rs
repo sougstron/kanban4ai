@@ -1,28 +1,68 @@
+use std::time::{Duration, Instant};
+
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use tui_textarea::TextArea;
 
 use crate::core::operations::Operations;
 use crate::core::session::SessionManager;
 use crate::core::storage::{NewTask, Storage};
 use crate::core::thread::ThreadManager;
 
-use super::app::{App, Screen};
+use super::app::{App, DetailFocus, HitAction, Screen, UiAction, normalize_command_key};
 use super::board;
-use super::dialogs::{DialogField, Modal};
+use super::dialogs::{DialogField, Modal, ModalButton};
 use super::theme::Theme;
 
 fn app_with_board() -> (tempfile::TempDir, App) {
     let dir = tempfile::tempdir().expect("tempdir");
     Storage::new(dir.path()).init_board().expect("init board");
+    // Point opencode at a nonexistent binary so option lists come from the
+    // configured `models` fallback instead of the machine's live catalog.
     std::fs::write(
         dir.path().join(".kanban/config.yaml"),
-        "notifications:\n  enabled: false\nauto_launch:\n  enabled: false\n",
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: false\nagents:\n  opencode:\n    command: /nonexistent/opencode-disabled-for-tests\n",
     )
     .expect("quiet config");
+    let app = App::new(dir.path()).expect("create app");
+    (dir, app)
+}
+
+fn settings_app() -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(dir.path()).init_board().expect("init board");
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        r#"tui:
+  name: Existing project
+  theme: textual-light
+auto_launch:
+  enabled: false
+  default_agent: opencode
+  model: legacy-model-must-stay
+  agent: legacy-agent-must-stay
+agents:
+  opencode:
+    command: /nonexistent/opencode-disabled-for-tests
+    model: openai/gpt-5.5
+    models: [openai/gpt-5.5]
+    effort: high
+    agent: sisyphus
+    agent_options: [sisyphus, prometheus]
+  claude:
+    command: claude
+    model: sonnet
+    models: [fable, sonnet]
+    effort: medium
+    efforts: [low, medium, high]
+    agent: null
+"#,
+    )
+    .expect("settings config");
     let app = App::new(dir.path()).expect("create app");
     (dir, app)
 }
@@ -64,8 +104,56 @@ fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
+#[cfg(unix)]
+fn make_sleeping_opencode(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let command = dir.join("slow-opencode");
+    std::fs::write(&command, "#!/bin/sh\nsleep 2\nexit 0\n").expect("write fake opencode");
+    let mut permissions = std::fs::metadata(&command)
+        .expect("fake opencode metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&command, permissions).expect("chmod fake opencode");
+    command
+}
+
+#[cfg(unix)]
+fn make_marker_opencode(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let command = dir.join("marker-opencode");
+    let marker = dir.join("opencode-started");
+    std::fs::write(
+        &command,
+        format!("#!/bin/sh\ntouch {}\nsleep 2\nexit 0\n", marker.display()),
+    )
+    .expect("write marker opencode");
+    let mut permissions = std::fs::metadata(&command)
+        .expect("marker opencode metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&command, permissions).expect("chmod marker opencode");
+    (command, marker)
+}
+
+/// Card regions from the hitbox registry as `(column, card, area)` triples.
+fn card_hits(app: &App) -> Vec<(usize, usize, ratatui::layout::Rect)> {
+    app.hitboxes
+        .iter()
+        .filter_map(|hitbox| match hitbox.action {
+            HitAction::FocusCard { column, card } => Some((column, card, hitbox.area)),
+            _ => None,
+        })
+        .collect()
+}
+
 fn render_snapshot(app: &mut App) -> String {
-    let backend = TestBackend::new(96, 28);
+    render_at(app, 96, 28)
+}
+
+fn render_at(app: &mut App, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
     terminal.draw(|frame| board::ui(frame, app)).expect("draw");
     let buffer = terminal.backend().buffer();
@@ -83,23 +171,16 @@ fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
             let line = (0..area.width)
                 .map(|x| buffer.cell((x, y)).expect("cell").symbol())
                 .collect::<String>();
-            normalize_elapsed(line, area.width as usize)
+            normalize_elapsed(line)
         })
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn normalize_elapsed(line: String, width: usize) -> String {
+fn normalize_elapsed(line: String) -> String {
     let timestamp = regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?")
         .expect("static timestamp regex");
-    let mut line = timestamp.replace_all(&line, "<timestamp>").into_owned();
-    if let Some(index) = line.find("│ refreshed ") {
-        line.truncate(index);
-        line.push_str("│ refreshed <elapsed>");
-        let display_width = unicode_width::UnicodeWidthStr::width(line.as_str());
-        line.push_str(&" ".repeat(width.saturating_sub(display_width)));
-    }
-    line
+    timestamp.replace_all(&line, "<timestamp>").into_owned()
 }
 
 fn style_runs(buffer: &Buffer) -> String {
@@ -136,13 +217,99 @@ fn renders_empty_and_populated_boards_in_both_themes() {
     insta::assert_snapshot!("populated_board", render_snapshot(&mut app));
 }
 
+#[cfg(unix)]
+#[test]
+fn new_task_dialog_does_not_wait_for_live_opencode_catalog() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(dir.path()).init_board().expect("init board");
+    let command = make_sleeping_opencode(dir.path());
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        format!(
+            "notifications:\n  enabled: false\nauto_launch:\n  enabled: false\n  default_agent: opencode\n  model: openai/gpt-5.5\n  models: [openai/gpt-5.5]\nagents:\n  opencode:\n    command: {}\n    model: openai/gpt-5.5\n    models: [openai/gpt-5.5]\n",
+            command.display()
+        ),
+    )
+    .expect("slow opencode config");
+
+    let mut app = App::new(dir.path()).expect("create app");
+    let started = Instant::now();
+    app.handle_key(key(KeyCode::Char('n')))
+        .expect("open new task");
+
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "new task dialog waited for opencode catalog"
+    );
+    assert!(matches!(
+        app.modal.as_ref().map(|modal| &modal.modal),
+        Some(Modal::NewTask { .. })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn new_task_dialog_does_not_start_live_opencode_catalog_probe() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(dir.path()).init_board().expect("init board");
+    let (command, marker) = make_marker_opencode(dir.path());
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        format!(
+            "notifications:\n  enabled: false\nauto_launch:\n  enabled: false\n  default_agent: opencode\n  model: openai/gpt-5.5\n  models: [openai/gpt-5.5]\nagents:\n  opencode:\n    command: {}\n    model: openai/gpt-5.5\n    models: [openai/gpt-5.5]\n",
+            command.display()
+        ),
+    )
+    .expect("marker opencode config");
+
+    let mut app = App::new(dir.path()).expect("create app");
+    app.handle_key(key(KeyCode::Char('n')))
+        .expect("open new task");
+    std::thread::sleep(Duration::from_millis(150));
+
+    assert!(
+        !marker.exists(),
+        "opening a new task started the live opencode catalog probe"
+    );
+}
+
+#[test]
+fn new_task_dialog_uses_recent_models_cached_at_startup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(dir.path()).init_board().expect("init board");
+    std::fs::write(dir.path().join(".kanban/recent_models"), "z-model\n")
+        .expect("initial recent models");
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: false\n  default_agent: opencode\nagents:\n  opencode:\n    command: /nonexistent/opencode-disabled-for-tests\n    models: [a-model, m-model, z-model]\n",
+    )
+    .expect("config");
+
+    let mut app = App::new(dir.path()).expect("create app");
+    std::fs::write(dir.path().join(".kanban/recent_models"), "a-model\n")
+        .expect("changed recent models");
+
+    app.handle_key(key(KeyCode::Char('n')))
+        .expect("open new task");
+    let model_values = app
+        .modal
+        .as_ref()
+        .expect("new-task modal")
+        .model_options
+        .iter()
+        .filter_map(|option| option.value.as_deref())
+        .collect::<Vec<_>>();
+
+    assert_eq!(model_values.get(1), Some(&"z-model"));
+}
+
 #[test]
 fn renders_detail_search_and_every_modal() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Enter)).expect("detail");
     insta::assert_snapshot!("detail_thread", render_snapshot(&mut app));
 
-    app.handle_key(key(KeyCode::Esc)).expect("back");
+    app.handle_key(key(KeyCode::Char('q'))).expect("back");
     app.handle_key(key(KeyCode::Char('/')))
         .expect("search open");
     app.handle_key(key(KeyCode::Char('Q')))
@@ -162,8 +329,8 @@ fn renders_detail_search_and_every_modal() {
     app.handle_key(key(KeyCode::Char('d'))).unwrap();
     insta::assert_snapshot!("modal_delete", render_snapshot(&mut app));
     app.handle_key(key(KeyCode::Esc)).unwrap();
-    app.handle_key(key(KeyCode::Char('s'))).unwrap();
-    insta::assert_snapshot!("modal_delegate", render_snapshot(&mut app));
+    app.handle_key(key(KeyCode::Char('c'))).unwrap();
+    insta::assert_snapshot!("modal_add_message", render_snapshot(&mut app));
     app.handle_key(key(KeyCode::Esc)).unwrap();
     app.handle_key(key(KeyCode::Char('w'))).unwrap();
     insta::assert_snapshot!("modal_answer", render_snapshot(&mut app));
@@ -195,11 +362,30 @@ fn task_form_move_and_answer_selectors_follow_keyboard_contract() {
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.active_field(), DialogField::Backend);
     assert_eq!(modal.backend_text().as_deref(), Some("claude"));
-    assert!(
-        modal
-            .model_options
-            .iter()
-            .any(|option| option.value.as_deref() == Some("sonnet"))
+    for claude_model in ["fable", "opus", "sonnet", "haiku"] {
+        assert!(
+            modal
+                .model_options
+                .iter()
+                .any(|option| option.value.as_deref() == Some(claude_model)),
+            "missing claude model {claude_model}"
+        );
+    }
+    let claude_efforts: Vec<Option<&str>> = modal
+        .effort_options
+        .iter()
+        .map(|option| option.value.as_deref())
+        .collect();
+    assert_eq!(
+        claude_efforts,
+        [
+            None,
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+            Some("xhigh"),
+            Some("max")
+        ]
     );
     assert!(
         modal
@@ -212,7 +398,8 @@ fn task_form_move_and_answer_selectors_follow_keyboard_contract() {
         app.modal.as_ref().expect("modal").active_field(),
         DialogField::Description
     );
-    app.handle_key(key(KeyCode::Esc)).expect("close");
+    app.handle_key(key(KeyCode::Esc)).expect("discard prompt");
+    app.handle_key(key(KeyCode::Char('y'))).expect("discard");
 
     app.handle_key(key(KeyCode::Char('m'))).expect("move");
     let modal = app.modal.as_ref().expect("modal");
@@ -240,21 +427,448 @@ fn task_form_move_and_answer_selectors_follow_keyboard_contract() {
 }
 
 #[test]
+fn settings_hotkey_navigates_fields_and_reloads_backend_defaults() {
+    let (_dir, mut app) = settings_app();
+    assert_eq!(app.settings.theme_name, "light", "legacy theme normalizes");
+
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let modal = app.modal.as_ref().expect("settings modal");
+    assert_eq!(modal.modal, Modal::Settings);
+    assert_eq!(modal.active_field(), DialogField::Title);
+    assert_eq!(modal.title_text(), "Existing project");
+    assert_eq!(modal.backend_text().as_deref(), Some("opencode"));
+
+    app.handle_key(key(KeyCode::Tab)).expect("backend field");
+    app.handle_key(key(KeyCode::Down)).expect("choose claude");
+    let modal = app.modal.as_ref().expect("settings modal");
+    assert_eq!(modal.active_field(), DialogField::Backend);
+    assert_eq!(modal.backend_text().as_deref(), Some("claude"));
+    assert_eq!(modal.model_text().as_deref(), Some("sonnet"));
+    assert_eq!(modal.effort_text().as_deref(), Some("medium"));
+    assert_eq!(modal.agent_text(), None);
+    assert_eq!(modal.agent_options[0].label, "No default agent");
+
+    app.handle_key(key(KeyCode::Tab)).expect("model field");
+    app.handle_key(key(KeyCode::Tab)).expect("effort field");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Effort
+    );
+    assert_eq!(
+        app.modal.as_ref().unwrap().effort_options[0].label,
+        "No default effort"
+    );
+
+    app.handle_key(key(KeyCode::Esc))
+        .expect("discard confirmation");
+    assert!(app.modal.as_ref().unwrap().discard_confirm);
+    app.handle_key(key(KeyCode::Char('n')))
+        .expect("keep editing");
+    assert!(app.modal.is_some());
+    app.handle_key(key(KeyCode::Esc))
+        .expect("discard confirmation again");
+    app.handle_key(key(KeyCode::Char('y')))
+        .expect("discard settings");
+    assert!(app.modal.is_none());
+
+    app.ops
+        .create_task(NewTask::titled("Detail settings"))
+        .expect("task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings from detail");
+    assert!(matches!(
+        app.modal.as_ref().map(|modal| &modal.modal),
+        Some(Modal::Settings)
+    ));
+}
+
+#[test]
+fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().expect("settings modal");
+        modal.title = TextArea::new(vec!["Renamed project".to_string()]);
+    }
+    app.handle_key(key(KeyCode::Tab)).expect("backend");
+    app.handle_key(key(KeyCode::Down)).expect("claude");
+    app.handle_key(key(KeyCode::Tab)).expect("model");
+    app.handle_key(key(KeyCode::Left)).expect("clear model");
+    app.handle_key(key(KeyCode::Left)).expect("clear model");
+    app.handle_key(key(KeyCode::Tab)).expect("effort");
+    app.handle_key(key(KeyCode::Left)).expect("clear effort");
+    app.handle_key(key(KeyCode::Left)).expect("clear effort");
+    app.handle_key(key(KeyCode::Tab)).expect("agent");
+    app.handle_key(key(KeyCode::Tab)).expect("theme");
+    app.handle_key(key(KeyCode::Left)).expect("dark theme");
+    app.handle_key(key(KeyCode::Tab)).expect("save");
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+
+    assert!(app.modal.is_none());
+    assert_eq!(app.settings.project_name, "Renamed project");
+    assert_eq!(app.settings.theme_name, "dark");
+    assert_eq!(app.theme.bg, Theme::named("dark").bg);
+
+    let config = app.ops.config.load().expect("cached saved config");
+    assert_eq!(
+        config.tui.get("name").and_then(|value| value.as_str()),
+        Some("Renamed project")
+    );
+    assert_eq!(
+        config.tui.get("theme").and_then(|value| value.as_str()),
+        Some("dark")
+    );
+    assert_eq!(
+        config
+            .auto_launch
+            .get("default_agent")
+            .and_then(|value| value.as_str()),
+        Some("claude")
+    );
+    assert_eq!(
+        config
+            .auto_launch
+            .get("model")
+            .and_then(|value| value.as_str()),
+        Some("legacy-model-must-stay")
+    );
+    assert_eq!(
+        config
+            .auto_launch
+            .get("agent")
+            .and_then(|value| value.as_str()),
+        Some("legacy-agent-must-stay")
+    );
+    let claude = config
+        .agents
+        .get("claude")
+        .and_then(|value| value.as_mapping())
+        .unwrap();
+    for key in ["model", "effort", "agent"] {
+        assert!(
+            claude.get(key).is_some_and(serde_yaml_ng::Value::is_null),
+            "{key} must be null"
+        );
+    }
+}
+
+#[test]
+fn settings_preserves_custom_defaults_missing_from_selector_sources() {
+    let (dir, mut app) = settings_app();
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        r#"tui:
+  name: Custom defaults
+  theme: dark
+auto_launch:
+  enabled: false
+  default_agent: opencode
+agents:
+  opencode:
+    command: /nonexistent/opencode-disabled-for-tests
+    model: custom/model
+    models: [listed/model]
+    effort: custom-effort
+    agent: custom-persona
+    agent_options: [listed-persona]
+"#,
+    )
+    .expect("external settings edit");
+
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let modal = app.modal.as_ref().expect("settings modal");
+    for (value, options) in [
+        ("custom/model", &modal.model_options),
+        ("custom-effort", &modal.effort_options),
+        ("custom-persona", &modal.agent_options),
+    ] {
+        assert!(
+            options
+                .iter()
+                .any(|option| option.value.as_deref() == Some(value)),
+            "missing preserved option {value}"
+        );
+    }
+    let save_field = app.modal.as_ref().unwrap().fields().len() - 2;
+    app.modal.as_mut().unwrap().field_index = save_field;
+    app.handle_key(key(KeyCode::Enter))
+        .expect("save unchanged settings");
+
+    let opencode = app
+        .ops
+        .config
+        .load()
+        .unwrap()
+        .agents
+        .get("opencode")
+        .and_then(|value| value.as_mapping())
+        .unwrap()
+        .clone();
+    assert_eq!(
+        opencode.get("model").and_then(|value| value.as_str()),
+        Some("custom/model")
+    );
+    assert_eq!(
+        opencode.get("effort").and_then(|value| value.as_str()),
+        Some("custom-effort")
+    );
+    assert_eq!(
+        opencode.get("agent").and_then(|value| value.as_str()),
+        Some("custom-persona")
+    );
+    let saved: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+        &std::fs::read_to_string(dir.path().join(".kanban/config.yaml")).unwrap(),
+    )
+    .unwrap();
+    let auto_launch = saved
+        .as_mapping()
+        .and_then(|mapping| mapping.get("auto_launch"))
+        .and_then(|value| value.as_mapping())
+        .unwrap();
+    for key in ["model", "models", "agent"] {
+        assert!(
+            !auto_launch.contains_key(key),
+            "settings must not serialize absent legacy auto_launch.{key}"
+        );
+    }
+}
+
+#[test]
+fn settings_open_uses_fresh_external_config() {
+    let (dir, mut app) = settings_app();
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        r#"tui:
+  name: Fresh external project
+  theme: textual-dark
+auto_launch:
+  enabled: false
+  default_agent: claude
+agents:
+  claude:
+    command: claude
+    model: opus
+    models: [sonnet, opus]
+    effort: high
+    efforts: [low, high]
+    agent: null
+"#,
+    )
+    .expect("external settings edit");
+
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let modal = app.modal.as_ref().expect("settings modal");
+    assert_eq!(modal.title_text(), "Fresh external project");
+    assert_eq!(modal.backend_text().as_deref(), Some("claude"));
+    assert_eq!(modal.model_text().as_deref(), Some("opus"));
+    assert_eq!(modal.effort_text().as_deref(), Some("high"));
+    assert_eq!(modal.theme_text().as_deref(), Some("dark"));
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        r#"tui:
+  name: Fresh external project
+  theme: textual-dark
+auto_launch:
+  enabled: false
+  default_agent: claude
+agents:
+  claude:
+    command: claude
+    model: opus
+    models: [sonnet, opus]
+    effort: high
+    efforts: [low, high]
+    agent: null
+external_integration:
+  preserve_me: true
+"#,
+    )
+    .expect("concurrent external edit");
+    let save_field = app.modal.as_ref().unwrap().fields().len() - 2;
+    app.modal.as_mut().unwrap().field_index = save_field;
+    app.handle_key(key(KeyCode::Enter))
+        .expect("save over fresh external edit");
+    assert_eq!(
+        app.ops
+            .config
+            .load()
+            .unwrap()
+            .extras
+            .get("external_integration")
+            .and_then(|value| value.get("preserve_me"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn settings_symlink_refusal_preserves_modal_and_staged_values() {
+    let (dir, mut app) = settings_app();
+    let config_file = dir.path().join(".kanban/config.yaml");
+    let target = dir.path().join("external-config.yaml");
+    std::fs::rename(&config_file, &target).expect("move config target");
+    std::os::unix::fs::symlink(&target, &config_file).expect("symlink config");
+
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let modal = app.modal.as_mut().expect("settings modal");
+    modal.title = TextArea::new(vec!["Staged project name".to_string()]);
+    modal.field_index = modal.fields().len() - 2;
+    app.handle_key(key(KeyCode::Enter))
+        .expect("refuse symlink save");
+
+    let modal = app.modal.as_ref().expect("settings stays open");
+    assert_eq!(modal.title_text(), "Staged project name");
+    assert!(
+        modal
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("symlinked"))
+    );
+}
+
+#[test]
+fn clicking_selected_settings_backend_preserves_staged_values() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let backend_index = app.modal.as_ref().unwrap().backend_selected;
+    app.modal.as_mut().unwrap().model = TextArea::new(vec!["staged/model".to_string()]);
+    let _ = render_at(&mut app, 120, 32);
+    let hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| matches!(
+            hitbox.action,
+            HitAction::ModalOption { field: DialogField::Backend, index } if index == backend_index
+        ))
+        .copied()
+        .expect("selected backend option hitbox");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: hit.area.x,
+        row: hit.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("click selected backend");
+    assert_eq!(
+        app.modal.as_ref().unwrap().model_text().as_deref(),
+        Some("staged/model")
+    );
+}
+
+#[test]
+fn settings_modal_remains_navigable_at_constrained_height() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    assert!(render_at(&mut app, 80, 16).contains("Project settings"));
+    for _ in 0..5 {
+        app.handle_key(key(KeyCode::Tab))
+            .expect("next settings field");
+    }
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Theme
+    );
+    assert!(render_at(&mut app, 80, 16).contains("Theme"));
+}
+
+#[test]
+fn wide_board_status_bar_opens_settings_by_mouse() {
+    let (_dir, mut app) = settings_app();
+    let _ = render_at(&mut app, 240, 28);
+    let settings_hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::OpenSettings))
+        .copied()
+        .expect("settings status-bar hitbox");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: settings_hit.area.x,
+        row: settings_hit.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("open settings by mouse");
+    assert!(matches!(
+        app.modal.as_ref().map(|modal| &modal.modal),
+        Some(Modal::Settings)
+    ));
+}
+
+#[test]
+fn opencode_model_options_order_default_then_recent_then_alphabetical() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(dir.path()).init_board().expect("init board");
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: false\nagents:\n  opencode:\n    command: /nonexistent/opencode-disabled-for-tests\n",
+    )
+    .expect("quiet config");
+    // Two known recent models (the default among them is not repeated), plus
+    // one that the model list no longer contains.
+    std::fs::write(
+        dir.path().join(".kanban/recent_models"),
+        "opencode-go/minimax-m3\nopenai/gpt-5.5\nopencode-go/mimo-v2.5\ngone/model\n",
+    )
+    .expect("recent models");
+    let mut app = App::new(dir.path()).expect("create app");
+
+    app.handle_key(key(KeyCode::Char('n'))).expect("new");
+    let modal = app.modal.as_ref().expect("modal");
+    let values: Vec<Option<&str>> = modal
+        .model_options
+        .iter()
+        .map(|option| option.value.as_deref())
+        .collect();
+    assert_eq!(
+        values,
+        [
+            None,
+            Some("openai/gpt-5.5"),
+            Some("opencode-go/minimax-m3"),
+            Some("opencode-go/mimo-v2.5"),
+            Some("opencode-go/deepseek-v4-flash"),
+            Some("opencode-go/kimi-k2.7-code"),
+            Some("opencode/deepseek-v4-flash-free"),
+        ]
+    );
+    // Without a live opencode catalog no variants are known, so the effort
+    // selector only offers the backend default.
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.effort_options.len(), 1);
+    assert!(modal.effort_options[0].value.is_none());
+    app.handle_key(key(KeyCode::Esc)).expect("close");
+}
+
+#[test]
 fn mouse_click_focuses_card_and_second_click_opens_detail() {
     let (_dir, mut app) = populated_app();
     let _ = render_snapshot(&mut app);
-    let hitbox = app.card_hitboxes[1];
+    let (column, card, area) = card_hits(&app)[1];
     let click = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: hitbox.area.x + 1,
-        row: hitbox.area.y + 1,
+        column: area.x + 1,
+        row: area.y + 1,
         modifiers: KeyModifiers::NONE,
     };
     app.handle_mouse(click).expect("focus");
-    assert_eq!(app.focused_column, hitbox.column);
-    assert_eq!(app.focused_card, hitbox.card);
+    assert_eq!(app.focused_column, column);
+    assert_eq!(app.focused_card, card);
     assert_eq!(app.screen, Screen::Board);
     app.handle_mouse(click).expect("detail");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..click
+    })
+    .expect("release second click");
     assert_eq!(app.screen, Screen::Detail);
 }
 
@@ -262,11 +876,11 @@ fn mouse_click_focuses_card_and_second_click_opens_detail() {
 fn modal_and_help_block_mouse_click_through() {
     let (_dir, mut app) = populated_app();
     let _ = render_snapshot(&mut app);
-    let hitbox = app.card_hitboxes[1];
+    let (_, _, area) = card_hits(&app)[1];
     let click = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: hitbox.area.x + 1,
-        row: hitbox.area.y + 1,
+        column: area.x + 1,
+        row: area.y + 1,
         modifiers: KeyModifiers::NONE,
     };
     let original_focus = (app.focused_column, app.focused_card);
@@ -286,23 +900,102 @@ fn review_editor_navigation_and_thread_focus_are_distinct() {
     let (_dir, mut app) = app_with_board();
     let task = app.ops.create_task(NewTask::titled("Edit review")).unwrap();
     app.ops.set_review_edits(&task.id, "abcdef").unwrap();
+    app.ops.move_task(&task.id, "review", false).unwrap();
     app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
     app.handle_key(key(KeyCode::Enter)).unwrap();
 
+    // Thread is focused by default: plain typing must not reach the editor.
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+    app.handle_key(key(KeyCode::Char('х'))).unwrap();
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
+        "abcdef"
+    );
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().scroll, 1);
+
+    // Tab focuses the editor (task is in Review, no open questions).
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
     app.handle_key(key(KeyCode::End)).unwrap();
     assert_eq!(app.detail.as_ref().unwrap().review_edits.cursor(), (0, 6));
     app.handle_key(key(KeyCode::Left)).unwrap();
-    assert_eq!(app.detail.as_ref().unwrap().review_edits.cursor(), (0, 5));
+    app.handle_key(key(KeyCode::Char('т'))).unwrap();
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
+        "abcdeтf"
+    );
 
-    app.handle_key(key(KeyCode::Tab)).unwrap();
-    let cursor = app.detail.as_ref().unwrap().review_edits.cursor();
-    app.handle_key(key(KeyCode::Down)).unwrap();
-    assert_eq!(app.detail.as_ref().unwrap().review_edits.cursor(), cursor);
-    assert_eq!(app.detail.as_ref().unwrap().scroll, 1);
+    // Esc leaves the editor first but does not close the task detail.
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert_eq!(app.screen, Screen::Detail);
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert_eq!(app.screen, Screen::Detail);
+    app.handle_key(key(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.screen, Screen::Board);
 }
 
 #[test]
-fn review_edits_save_and_rerun_from_detail() {
+fn mouse_wheel_scrolls_detail_thread_under_cursor() {
+    let (dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Long thread")).unwrap();
+    let thread_manager = ThreadManager::new(dir.path()).unwrap();
+    for index in 0..24 {
+        thread_manager
+            .post(
+                &task.id,
+                crate::core::models::MessageRole::Agent,
+                crate::core::models::MessageKind::Context,
+                &format!("Context line {index}"),
+                None,
+                Vec::new(),
+                Some("agent".to_string()),
+            )
+            .unwrap();
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    let _ = render_at(&mut app, 96, 20);
+    let thread_area = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::DetailThread)
+        .map(|hitbox| hitbox.area)
+        .expect("thread hitbox");
+    assert!(app.detail.as_ref().unwrap().max_scroll > 0);
+
+    let scroll_down = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: thread_area.x + 1,
+        row: thread_area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(scroll_down).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().scroll, 1);
+
+    let scroll_up = MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        ..scroll_down
+    };
+    app.handle_mouse(scroll_up).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().scroll, 0);
+}
+
+fn review_column(app: &App) -> usize {
+    app.board
+        .columns
+        .iter()
+        .position(|column| column.id == "review")
+        .expect("review column")
+}
+
+#[test]
+fn review_edits_save_and_rerun_are_separate_actions() {
     let (dir, mut app) = app_with_board();
     let task = app
         .ops
@@ -312,12 +1005,7 @@ fn review_edits_save_and_rerun_from_detail() {
         .move_task(&task.id, "review", false)
         .expect("move to review");
     app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
-    app.focused_column = app
-        .board
-        .columns
-        .iter()
-        .position(|column| column.id == "review")
-        .expect("review column");
+    app.focused_column = review_column(&app);
     app.focused_card = 0;
     app.handle_key(key(KeyCode::Enter)).expect("open detail");
     app.detail
@@ -326,13 +1014,20 @@ fn review_edits_save_and_rerun_from_detail() {
         .review_edits
         .insert_str("Please tighten validation");
 
+    // Ctrl+S only persists the buffer; the task stays in Review.
     app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
-        .expect("save and rerun");
+        .expect("save");
+    let saved = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(saved.status.as_str(), "review");
+    assert_eq!(saved.review_edits, "Please tighten validation");
+    assert_eq!(app.screen, Screen::Detail);
 
+    // Ctrl+R folds the edits into the thread and re-runs the agent.
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .expect("rerun");
     let rerun = app.ops.get_task(&task.id).unwrap().unwrap();
     assert_eq!(rerun.status.as_str(), "in_progress");
     assert!(rerun.review_edits.is_empty());
-    assert_eq!(app.screen, Screen::Board);
     let thread = ThreadManager::new(dir.path())
         .unwrap()
         .load(&task.id)
@@ -343,6 +1038,176 @@ fn review_edits_save_and_rerun_from_detail() {
             .iter()
             .any(|message| message.body == "Please tighten validation")
     );
+}
+
+#[test]
+fn review_edits_rerun_saves_visible_buffer_first() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Review this"))
+        .expect("create task");
+    app.ops
+        .move_task(&task.id, "review", false)
+        .expect("move to review");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.detail
+        .as_mut()
+        .expect("detail")
+        .review_edits
+        .insert_str("Return Escape for closing the task detail");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .expect("rerun");
+
+    let rerun = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(rerun.status.as_str(), "in_progress");
+    assert!(rerun.review_edits.is_empty());
+    let edits = ThreadManager::new(dir.path())
+        .unwrap()
+        .messages_of_kind(&task.id, crate::core::models::MessageKind::ReviewEdit)
+        .unwrap();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].body, "Return Escape for closing the task detail");
+}
+
+#[test]
+fn run_hotkey_starts_task_without_confirmation() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Run me"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+
+    app.handle_key(key(KeyCode::Char('r'))).expect("run");
+
+    assert!(app.modal.is_none(), "run must not open any dialog");
+    assert!(app.status.starts_with("Started"), "status: {}", app.status);
+    let started = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(started.status.as_str(), "in_progress");
+    let session_id = started.session.expect("session assigned");
+    assert!(SessionManager::new(dir.path()).is_session_active(&session_id));
+
+    // A second run is refused while the session is alive. The task moved to
+    // In Progress, so follow it there first.
+    app.focused_column = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == "in_progress")
+        .expect("in_progress column");
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Char('r'))).expect("run again");
+    assert!(app.status.contains("already running"), "{}", app.status);
+}
+
+#[test]
+fn enter_runs_open_detail_task() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Run from detail"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    assert_eq!(app.screen, Screen::Detail);
+    assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
+
+    app.handle_key(key(KeyCode::Enter))
+        .expect("run from detail");
+
+    assert!(app.modal.is_none(), "enter run must not open any dialog");
+    assert!(app.status.starts_with("Started"), "status: {}", app.status);
+    let started = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(started.status.as_str(), "in_progress");
+    let session_id = started.session.expect("session assigned");
+    assert!(SessionManager::new(dir.path()).is_session_active(&session_id));
+}
+
+#[test]
+fn detail_hotkeys_operate_on_open_task() {
+    let (_dir, mut app) = populated_app();
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    let task_id = app.detail.as_ref().unwrap().task_id.clone();
+
+    // Edit opens the form for the detail task.
+    app.handle_key(key(KeyCode::Char('e'))).expect("edit");
+    assert_eq!(
+        app.modal.as_ref().expect("edit modal").modal,
+        Modal::EditTask {
+            task_id: task_id.clone()
+        }
+    );
+    app.handle_key(key(KeyCode::Esc)).expect("discard prompt");
+    app.handle_key(key(KeyCode::Char('y'))).expect("discard");
+
+    // Approve moves the Review task to Done without leaving the detail.
+    app.handle_key(key(KeyCode::Char('y'))).expect("approve");
+    assert_eq!(app.screen, Screen::Detail);
+    let approved = app.ops.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(approved.status.as_str(), "done");
+
+    // Approving again reports the task is no longer in Review.
+    app.handle_key(key(KeyCode::Char('y')))
+        .expect("approve again");
+    assert!(app.status.contains("not in Review"), "{}", app.status);
+}
+
+#[test]
+fn detail_answer_panel_submits_variant_answer() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    let task_id = app.detail.as_ref().unwrap().task_id.clone();
+
+    app.handle_key(key(KeyCode::Tab)).expect("focus answer");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Answer);
+    app.handle_key(key(KeyCode::Down))
+        .expect("select variant 1");
+    app.handle_key(key(KeyCode::Enter)).expect("submit");
+
+    let answered = app.ops.get_task(&task_id).unwrap().unwrap();
+    assert!(!answered.has_questions);
+    let question = app
+        .detail
+        .as_ref()
+        .unwrap()
+        .messages
+        .iter()
+        .find(|message| message.body == "Choose a route?")
+        .expect("question message")
+        .clone();
+    assert_eq!(question.answer.as_deref(), Some("Fast path"));
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+}
+
+#[test]
+fn clicking_question_preview_opens_answer_panel() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let preview = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| matches!(hitbox.action, HitAction::OpenAnswer { .. }))
+        .copied()
+        .expect("question preview hitbox");
+    let click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: preview.area.x,
+        row: preview.area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(click).expect("click preview");
+    assert_eq!(app.screen, Screen::Detail);
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Answer);
 }
 
 #[test]
@@ -384,20 +1249,580 @@ fn stale_debounce_is_ignored_and_thread_change_refreshes_detail() {
 }
 
 #[test]
-fn sessions_enter_requests_terminal_attach() {
+fn sessions_render_and_controls_use_cached_sessions() {
     let (dir, mut app) = app_with_board();
     let task = app
         .ops
         .create_task(NewTask::titled("Running"))
         .expect("create task");
     SessionManager::new(dir.path())
-        .link_session(&task.id, "ses-tmux-live")
+        .link_named_session(&task.id, "ses-tmux-live", "Persisted Running")
         .expect("link session");
+    std::fs::remove_file(
+        dir.path()
+            .join(".kanban/tasks/todo")
+            .join(format!("{}.md", task.id)),
+    )
+    .expect("remove task file");
+    let log_file = dir.path().join(".kanban/logs/ses-tmux-live.log");
+    std::fs::write(&log_file, "tokens: 17").expect("write initial token log");
 
     app.handle_key(key(KeyCode::Char('l')))
         .expect("open sessions");
+    assert_eq!(app.active_sessions.len(), 1);
+    SessionManager::new(dir.path()).unlink_session("ses-tmux-live");
+    std::fs::write(&log_file, "tokens: 99").expect("overwrite token log");
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("ses-tmux-live"));
+    assert!(rendered.contains("Persisted Running"));
+    assert!(rendered.contains("tokens: 17"));
+    assert!(!rendered.contains("tokens: 99"));
+    assert!(render_snapshot(&mut app).contains("ses-tmux-live"));
+    app.handle_key(key(KeyCode::Down))
+        .expect("navigate cached sessions");
     app.handle_key(key(KeyCode::Enter)).expect("request attach");
     assert_eq!(app.take_attach_request().as_deref(), Some("ses-tmux-live"));
+}
+
+#[test]
+fn sessions_cache_refreshes_after_fingerprint_change() {
+    let (dir, mut app) = app_with_board();
+    let first = app
+        .ops
+        .create_task(NewTask::titled("First running"))
+        .expect("create first task");
+    SessionManager::new(dir.path())
+        .link_session(&first.id, "ses-first")
+        .expect("link first session");
+    app.handle_key(key(KeyCode::Char('l')))
+        .expect("open sessions");
+    assert_eq!(app.active_sessions.len(), 1);
+
+    let second = app
+        .ops
+        .create_task(NewTask::titled("Second running"))
+        .expect("create second task");
+    SessionManager::new(dir.path())
+        .link_session(&second.id, "ses-second")
+        .expect("link second session");
+    app.reload_if_changed().expect("refresh sessions cache");
+
+    assert_eq!(app.active_sessions.len(), 2);
+    assert!(
+        app.active_sessions
+            .iter()
+            .any(|active_session| active_session.session.id == "ses-second")
+    );
+}
+
+#[test]
+fn phase_five_search_popup_escape_clears_and_enter_preserves_filter() {
+    let (_dir, mut app) = app_with_board();
+    app.ops
+        .create_task(NewTask::titled("Authentication gateway"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+
+    app.handle_key(key(KeyCode::Char('/')))
+        .expect("open search");
+    for character in "AUTH".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("type search");
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("keep filter");
+    assert!(!app.search.active);
+    assert_eq!(app.search.text(), "AUTH");
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("Filter: \"AUTH\" · Esc clear"));
+    insta::assert_snapshot!("phase_five_filter_indicator_and_highlight", rendered);
+
+    app.handle_key(key(KeyCode::Esc))
+        .expect("clear board filter");
+    assert_eq!(app.screen, Screen::Board);
+    assert!(app.search.text().is_empty());
+    assert!(!app.should_quit);
+    app.handle_key(key(KeyCode::Esc))
+        .expect("ignore board escape");
+    assert!(!app.should_quit);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .expect("first ctrl-c prompts");
+    assert!(!app.should_quit);
+    assert_eq!(app.status, "Press ctrl + C again to close");
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .expect("second ctrl-c exits");
+    assert!(app.should_quit);
+
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('/')))
+        .expect("open search");
+    app.handle_key(key(KeyCode::Char('x')))
+        .expect("type search");
+    app.handle_key(key(KeyCode::Esc)).expect("discard search");
+    assert!(!app.search.active);
+    assert!(app.search.text().is_empty());
+
+    app.search.query.insert_str("kept");
+    app.handle_key(key(KeyCode::Char('q')))
+        .expect("q does not quit from board");
+    assert!(!app.should_quit);
+    assert_eq!(app.status, "Press ctrl + C twice to close");
+    assert_eq!(app.search.text(), "kept", "q must not clear the filter");
+}
+
+#[test]
+fn phase_five_archive_and_sessions_search_filter_and_clamp_selection() {
+    let (dir, mut app) = app_with_board();
+    let archive_match = app
+        .ops
+        .create_task(NewTask::titled("Archived needle"))
+        .expect("create archived match");
+    let archive_other = app
+        .ops
+        .create_task(NewTask::titled("Archived other"))
+        .expect("create archived other");
+    app.ops
+        .move_task(&archive_match.id, "archive", false)
+        .expect("archive match");
+    app.ops
+        .move_task(&archive_other.id, "archive", false)
+        .expect("archive other");
+
+    app.handle_key(key(KeyCode::Char('a')))
+        .expect("open archive");
+    app.archive_selected = 1;
+    app.handle_key(key(KeyCode::Char('/')))
+        .expect("activate archive search");
+    for character in "needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("filter archive");
+    }
+    assert_eq!(app.archive_selected, 0);
+    app.handle_key(key(KeyCode::Enter))
+        .expect("close archive search");
+    let archive = render_snapshot(&mut app);
+    assert!(archive.contains("Archived needle"));
+    assert!(!archive.contains("Archived other"));
+    app.handle_key(key(KeyCode::Esc))
+        .expect("return from archive");
+    assert_eq!(app.screen, Screen::Board);
+
+    app.search = Default::default();
+    let session_match = app
+        .ops
+        .create_task(NewTask::titled("Session needle"))
+        .expect("create session match");
+    let session_other = app
+        .ops
+        .create_task(NewTask::titled("Session other"))
+        .expect("create session other");
+    SessionManager::new(dir.path())
+        .link_session(&session_match.id, "ses-needle")
+        .expect("link matching session");
+    SessionManager::new(dir.path())
+        .link_session(&session_other.id, "ses-other")
+        .expect("link other session");
+    app.handle_key(key(KeyCode::Char('l')))
+        .expect("open sessions");
+    app.session_selected = 1;
+    app.handle_key(key(KeyCode::Char('/')))
+        .expect("activate sessions search");
+    for character in "needle".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("filter sessions");
+    }
+    assert_eq!(app.session_selected, 0);
+    app.handle_key(key(KeyCode::Enter))
+        .expect("close sessions search");
+    let sessions = render_snapshot(&mut app);
+    assert!(sessions.contains("ses-needle"));
+    assert!(!sessions.contains("ses-other"));
+
+    app.handle_key(key(KeyCode::Char('/')))
+        .expect("open no-match search");
+    for character in "absent".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("filter to no sessions");
+    }
+    app.handle_key(key(KeyCode::Enter))
+        .expect("close no-match search");
+    assert!(render_snapshot(&mut app).contains("No sessions match filter"));
+}
+
+#[test]
+fn phase_five_archive_cache_filters_ids_and_does_not_load_during_render() {
+    let (dir, mut app) = app_with_board();
+    let first = app
+        .ops
+        .create_task(NewTask::titled("Archive title without identifier"))
+        .expect("create first archive task");
+    let second = app
+        .ops
+        .create_task(NewTask::titled("Cached after file removal"))
+        .expect("create second archive task");
+    app.ops
+        .move_task(&first.id, "archive", false)
+        .expect("archive first task");
+    app.ops
+        .move_task(&second.id, "archive", false)
+        .expect("archive second task");
+
+    app.handle_key(key(KeyCode::Char('a')))
+        .expect("open refreshed archive");
+    app.search.query.insert_str(first.id.to_lowercase());
+    assert_eq!(app.filtered_archived_tasks().len(), 1);
+    assert_eq!(app.filtered_archived_tasks()[0].id, first.id);
+    app.search = Default::default();
+
+    let archived_file = dir
+        .path()
+        .join(".kanban/tasks/archive")
+        .join(format!("{}.md", second.id));
+    std::fs::remove_file(archived_file).expect("remove archived source after cache refresh");
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("Cached after file removal"));
+    assert_eq!(
+        app.archived_tasks.len(),
+        2,
+        "render must use cached archive data"
+    );
+}
+
+#[test]
+fn phase_five_archive_refresh_clamps_selection_and_enter_uses_visible_cache_row() {
+    let (_dir, mut app) = app_with_board();
+    let first = app
+        .ops
+        .create_task(NewTask::titled("First remaining archive task"))
+        .expect("create first archive task");
+    let second = app
+        .ops
+        .create_task(NewTask::titled("Removed archive task"))
+        .expect("create second archive task");
+    app.ops
+        .move_task(&first.id, "archive", false)
+        .expect("archive first task");
+    app.ops
+        .move_task(&second.id, "archive", false)
+        .expect("archive second task");
+    app.handle_key(key(KeyCode::Char('a')))
+        .expect("open archive");
+    app.archive_selected = 1;
+
+    app.ops
+        .move_task(&second.id, "todo", false)
+        .expect("external archive change");
+    app.reload_if_changed().expect("refresh archive cache");
+    assert_eq!(app.archived_tasks.len(), 1);
+    assert_eq!(app.archive_selected, 0);
+    assert_eq!(app.filtered_archived_tasks()[0].id, first.id);
+
+    app.handle_key(key(KeyCode::Enter))
+        .expect("open visible archived task");
+    assert_eq!(app.screen, Screen::Detail);
+    assert_eq!(app.detail.as_ref().expect("detail").task_id, first.id);
+}
+
+#[test]
+fn phase_five_title_highlights_only_the_visible_truncated_text() {
+    use ratatui::style::Color;
+
+    let visible = super::card::truncate_display("Authentication overflow", 8);
+    assert_eq!(visible, "Authent…");
+    let spans = super::card::highlight_title_matches(&visible, "AUTH", Color::Yellow);
+    assert_eq!(
+        spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>(),
+        visible
+    );
+    assert_eq!(
+        spans
+            .iter()
+            .filter(|span| span.style.fg == Some(Color::Yellow))
+            .count(),
+        1
+    );
+    assert!(
+        super::card::highlight_title_matches(&visible, "overflow", Color::Yellow)
+            .iter()
+            .all(|span| span.style.fg != Some(Color::Yellow))
+    );
+}
+
+#[test]
+fn phase_five_unicode_filter_and_highlight_cover_the_same_original_title_span() {
+    use ratatui::style::Color;
+
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("İstanbul"))
+        .expect("create Unicode title");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
+    app.search.query.insert_str("i");
+
+    assert!(
+        app.visible_tasks_for_column(0)
+            .iter()
+            .any(|visible| visible.id == task.id),
+        "the Board filter must match the title"
+    );
+    let spans = super::card::highlight_title_matches("İstanbul", &app.search.text(), Color::Yellow);
+    assert_eq!(spans[0].content.as_ref(), "İ");
+    assert_eq!(spans[0].style.fg, Some(Color::Yellow));
+}
+
+#[test]
+fn russian_layout_maps_commands_without_changing_text_input() {
+    for (russian, latin) in [
+        ('й', 'q'),
+        ('т', 'n'),
+        ('у', 'e'),
+        ('ь', 'm'),
+        ('ы', 's'),
+        ('ц', 'w'),
+        ('в', 'd'),
+        ('к', 'r'),
+        ('н', 'y'),
+        ('г', 'u'),
+        ('ф', 'a'),
+        ('д', 'l'),
+        ('с', 'c'),
+        ('е', 't'),
+        ('м', 'v'),
+        ('Ф', 'A'),
+        ('К', 'R'),
+        ('ч', 'x'),
+        ('щ', 'o'),
+        ('.', '/'),
+        (',', '?'),
+    ] {
+        assert_eq!(
+            normalize_command_key(key(KeyCode::Char(russian))).code,
+            KeyCode::Char(latin)
+        );
+    }
+    for (russian, latin) in [('с', 'c'), ('е', 't'), ('ы', 's'), ('м', 'v')] {
+        assert_eq!(
+            normalize_command_key(KeyEvent::new(KeyCode::Char(russian), KeyModifiers::CONTROL))
+                .code,
+            KeyCode::Char(latin)
+        );
+    }
+
+    let (_dir, mut app) = app_with_board();
+    app.ops
+        .create_task(NewTask::titled("Russian commands"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.handle_key(key(KeyCode::Char('д')))
+        .expect("RU sessions hotkey");
+    assert_eq!(app.screen, Screen::Sessions);
+    app.handle_key(key(KeyCode::Char('й')))
+        .expect("RU back hotkey");
+    assert_eq!(app.screen, Screen::Board);
+    app.handle_key(key(KeyCode::Char('т')))
+        .expect("RU new-task hotkey");
+    app.handle_key(key(KeyCode::Char('т')))
+        .expect("title text input");
+    assert_eq!(app.modal.as_ref().expect("new modal").title_text(), "т");
+    app.handle_key(key(KeyCode::Esc)).expect("discard prompt");
+    app.handle_key(key(KeyCode::Char('y'))).expect("discard");
+
+    // Run via the Cyrillic alias: immediate, no confirmation dialog.
+    app.handle_key(key(KeyCode::Char('к'))).expect("RU run");
+    assert!(app.modal.is_none());
+    assert!(app.status.starts_with("Started"), "{}", app.status);
+
+    app.handle_key(key(KeyCode::Char('/')))
+        .expect("open search");
+    app.handle_key(key(KeyCode::Char('т')))
+        .expect("search text input");
+    assert_eq!(app.search.text(), "т");
+}
+
+#[test]
+fn board_scrolls_only_after_focus_leaves_rendered_viewport() {
+    let (_dir, mut app) = app_with_board();
+    let _ = render_snapshot(&mut app);
+    let capacity = app.visible_card_capacities[0];
+    for index in 0..=capacity {
+        app.ops
+            .create_task(NewTask::titled(format!("Card {index}")))
+            .expect("create card");
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+    let _ = render_snapshot(&mut app);
+
+    for _ in 1..capacity {
+        app.handle_key(key(KeyCode::Down))
+            .expect("move within viewport");
+        assert_eq!(app.column_offsets[0], 0);
+    }
+    app.handle_key(key(KeyCode::Down))
+        .expect("move beyond viewport");
+    assert_eq!(app.focused_card, capacity);
+    assert_eq!(app.column_offsets[0], 1);
+}
+
+#[test]
+fn board_capacity_matches_bordered_inner_viewport_at_height_25() {
+    let (_dir, mut app) = app_with_board();
+    for index in 0..6 {
+        app.ops
+            .create_task(NewTask::titled(format!("Boundary card {index}")))
+            .expect("create card");
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    let _ = render_at(&mut app, 96, 25);
+
+    let capacity = app.visible_card_capacities[0];
+    let rendered_cards = card_hits(&app)
+        .iter()
+        .filter(|(column, _, _)| *column == 0)
+        .count();
+    assert_eq!(capacity, 5);
+    assert_eq!(capacity, rendered_cards);
+
+    for _ in 1..=capacity {
+        app.handle_key(key(KeyCode::Down))
+            .expect("move across boundary");
+    }
+    let _ = render_at(&mut app, 96, 25);
+    assert!(
+        card_hits(&app)
+            .iter()
+            .any(|(column, card, _)| *column == 0 && *card == app.focused_card)
+    );
+}
+
+#[test]
+fn mouse_wheel_scrolls_column_under_cursor_without_stealing_focus() {
+    let (_dir, mut app) = app_with_board();
+    let _ = render_snapshot(&mut app);
+    let capacity = app.visible_card_capacities[0];
+    for index in 0..capacity + 2 {
+        app.ops
+            .create_task(NewTask::titled(format!("Card {index}")))
+            .expect("create card");
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Right)).expect("focus column 1");
+    assert_eq!(app.focused_column, 1);
+    let _ = render_snapshot(&mut app);
+
+    let (_, _, area) = card_hits(&app)
+        .into_iter()
+        .find(|(column, card, _)| *column == 0 && *card == 0)
+        .expect("first card of column 0");
+    let scroll_down = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: area.x + 1,
+        row: area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(scroll_down).expect("scroll down");
+    assert_eq!(app.column_offsets[0], 1);
+    assert_eq!(app.focused_column, 1, "wheel must not steal focus");
+
+    let scroll_up = MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        ..scroll_down
+    };
+    app.handle_mouse(scroll_up).expect("scroll up");
+    assert_eq!(app.column_offsets[0], 0);
+}
+
+#[test]
+fn mouse_wheel_on_focused_column_drags_focus_into_view() {
+    let (_dir, mut app) = app_with_board();
+    let _ = render_snapshot(&mut app);
+    let capacity = app.visible_card_capacities[0];
+    for index in 0..capacity + 2 {
+        app.ops
+            .create_task(NewTask::titled(format!("Card {index}")))
+            .expect("create card");
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+    let _ = render_snapshot(&mut app);
+    assert_eq!(app.focused_card, 0);
+
+    let (_, _, area) = card_hits(&app)
+        .into_iter()
+        .find(|(column, card, _)| *column == 0 && *card == 0)
+        .expect("first card of column 0");
+    let scroll_down = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: area.x + 1,
+        row: area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(scroll_down).expect("scroll down");
+    assert_eq!(app.column_offsets[0], 1);
+    assert_eq!(
+        app.focused_card, 1,
+        "focus follows the viewport so the render clamp keeps the scroll"
+    );
+    let _ = render_snapshot(&mut app);
+    assert_eq!(app.column_offsets[0], 1, "render must not undo the scroll");
+}
+
+#[test]
+fn footer_does_not_render_refresh_elapsed_text() {
+    let (_dir, mut app) = app_with_board();
+    app.ops
+        .create_task(NewTask::titled("External board change"))
+        .expect("create task");
+    app.reload_if_changed().expect("reload board");
+    assert!(
+        !render_snapshot(&mut app)
+            .to_lowercase()
+            .contains("refreshed")
+    );
+}
+
+#[test]
+fn sessions_keeps_global_ctrl_shortcuts_with_russian_aliases() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('l')))
+        .expect("open sessions");
+
+    let initial_theme = app.settings.theme_name.clone();
+    app.handle_key(KeyEvent::new(KeyCode::Char('е'), KeyModifiers::CONTROL))
+        .expect("switch theme from sessions");
+    assert_ne!(app.settings.theme_name, initial_theme);
+    assert_eq!(app.screen, Screen::Sessions);
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL))
+        .expect("prompt from sessions");
+    assert!(!app.should_quit);
+    assert_eq!(app.status, "Press ctrl + C again to close");
+    app.handle_key(KeyEvent::new(KeyCode::Char('с'), KeyModifiers::CONTROL))
+        .expect("quit from sessions");
+    assert!(app.should_quit);
+}
+
+#[test]
+fn ctrl_c_exit_prompt_expires_after_three_seconds() {
+    let (_dir, mut app) = app_with_board();
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .expect("first ctrl-c prompts");
+    assert_eq!(app.status, "Press ctrl + C again to close");
+
+    app.expire_ctrl_c_prompt_at(Instant::now() + Duration::from_secs(4));
+    assert!(!app.should_quit);
+    assert!(app.status.is_empty());
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .expect("expired prompt restarts");
+    assert!(!app.should_quit);
+    assert_eq!(app.status, "Press ctrl + C again to close");
 }
 
 #[test]
@@ -418,4 +1843,809 @@ fn archive_enter_opens_selected_archived_task() {
 
     assert_eq!(app.screen, Screen::Detail);
     assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
+}
+
+#[test]
+fn phase_three_headers_targeted_creation_and_bulk_confirmation_work() {
+    let (_dir, mut app) = app_with_board();
+    let in_progress = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == "in_progress")
+        .expect("in progress column");
+    app.focused_column = in_progress;
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let modal = app.modal.as_mut().expect("new modal");
+    assert_eq!(
+        modal.modal,
+        Modal::NewTask {
+            target_status: Some("in_progress".to_string())
+        }
+    );
+    modal.title.insert_str("Targeted");
+    modal.field_index = modal.fields().len() - 2;
+    app.handle_key(key(KeyCode::Enter))
+        .expect("create targeted task");
+    assert_eq!(
+        app.ops
+            .list_tasks(Some("in_progress"), None, "created", "asc")
+            .unwrap()
+            .len(),
+        1
+    );
+
+    app.handle_key(key(KeyCode::Char('R')))
+        .expect("bulk review dialog");
+    assert!(matches!(
+        app.modal.as_ref().expect("confirm modal").modal,
+        Modal::BulkConfirm { .. }
+    ));
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+    assert!(app.status.contains("Moved 1 task(s) to Review"));
+    assert_eq!(
+        app.ops
+            .list_tasks(Some("review"), None, "created", "asc")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn phase_three_column_headers_render_name_and_count_only() {
+    let (_dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Bulk target")).unwrap();
+    app.ops.move_task(&task.id, "in_progress", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    let rendered = render_snapshot(&mut app);
+
+    assert!(rendered.contains("In Progress (1)"));
+    assert!(!rendered.contains("in_progress"));
+    assert!(!rendered.contains("[+]"));
+    assert!(!rendered.contains("⇒Review"));
+}
+
+#[test]
+fn phase_three_header_question_and_drag_hitboxes_drive_board_state() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let question_hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::FocusQuestions))
+        .copied()
+        .expect("question count hitbox");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: question_hit.area.x,
+        row: question_hit.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("focus first question");
+    assert!(
+        app.focused_task()
+            .expect("focused question task")
+            .has_questions
+    );
+    app.focused_column = 2;
+    app.focused_card = 0;
+
+    let source = card_hits(&app)[0];
+    let source_task = app.visible_tasks_for_column(source.0)[source.1].id.clone();
+    let target = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| matches!(hitbox.action, HitAction::ColumnFocus(2)))
+        .copied()
+        .expect("review column area");
+    let down = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: source.2.x + 1,
+        row: source.2.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(down).expect("start drag");
+    assert!(app.dragging.is_some());
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: target.area.x + 1,
+        row: target.area.y + 10,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("drag over target");
+    assert_eq!(app.dragging.as_ref().unwrap().target_column, Some(2));
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: target.area.x + 1,
+        row: target.area.y + 10,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("drop");
+    assert!(app.dragging.is_none());
+    assert_eq!(
+        app.ops
+            .get_task(&source_task)
+            .unwrap()
+            .unwrap()
+            .status
+            .as_str(),
+        "review"
+    );
+}
+
+#[test]
+fn phase_three_focused_card_can_be_dragged_without_opening_detail() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let (column, card, source) = card_hits(&app)[0];
+    app.focused_column = column;
+    app.focused_card = card;
+    let target_column = (column + 1) % app.board.columns.len();
+    let target = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::ColumnFocus(target_column))
+        .copied()
+        .expect("target column");
+    let task_id = app.visible_tasks_for_column(column)[card].id.clone();
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: source.x + 1,
+        row: source.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("press focused card");
+    assert_eq!(app.screen, Screen::Board);
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: target.area.x + 1,
+        row: target.area.y + 2,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("drag focused card");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: target.area.x + 1,
+        row: target.area.y + 2,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("drop focused card");
+
+    assert_eq!(app.screen, Screen::Board);
+    assert_eq!(
+        app.ops.get_task(&task_id).unwrap().unwrap().status.as_str(),
+        app.board.columns[target_column].id
+    );
+}
+
+#[test]
+fn phase_three_scroll_truncation_and_session_cache_render() {
+    let (dir, mut app) = app_with_board();
+    app.settings.max_tasks_per_column = 2;
+    let mut running = app.ops.create_task(NewTask::titled("Running")).unwrap();
+    SessionManager::new(dir.path())
+        .link_session(&running.id, "ses-running")
+        .unwrap();
+    running.session = Some("ses-running".to_string());
+    app.ops.storage.save_task(&running).unwrap();
+    for number in 0..3 {
+        app.ops
+            .create_task(NewTask::titled(format!("Truncated {number}")))
+            .unwrap();
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    let output = render_at(&mut app, 96, 18);
+    assert!(output.contains("(2 of 4)"));
+    assert!(output.contains("↓ 2 below"));
+    insta::assert_snapshot!("phase_three_scroll_indicators", output);
+    app.settings.max_tasks_per_column = 10;
+    let output = render_at(&mut app, 96, 12);
+    assert!(output.contains("↓"));
+    assert!(output.contains("▶ running"));
+    app.focused_card = 1;
+    app.column_offsets[0] = 1;
+    assert!(render_at(&mut app, 96, 12).contains("↑ 1 above"));
+    assert_eq!(
+        app.board.session_states.get(&running.id),
+        Some(&crate::core::session::SessionState::Live)
+    );
+    SessionManager::new(dir.path())
+        .crash_session("ses-running")
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    assert_eq!(
+        app.board.session_states.get(&running.id),
+        Some(&crate::core::session::SessionState::Crashed)
+    );
+    app.column_offsets[0] = 0;
+    let crashed = render_at(&mut app, 96, 18);
+    assert!(crashed.contains("✖ crashed"));
+    insta::assert_snapshot!("phase_three_crashed_card", crashed);
+}
+
+#[test]
+fn phase_three_bulk_reconfirms_when_source_set_changes() {
+    let (_dir, mut app) = app_with_board();
+    let first = app.ops.create_task(NewTask::titled("First")).unwrap();
+    app.ops.move_task(&first.id, "in_progress", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.handle_key(key(KeyCode::Char('R'))).unwrap();
+
+    let second = app.ops.create_task(NewTask::titled("Second")).unwrap();
+    app.ops.move_task(&second.id, "in_progress", false).unwrap();
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+
+    assert!(app.status.contains("Tasks changed"));
+    assert!(matches!(
+        app.modal.as_ref().map(|modal| &modal.modal),
+        Some(Modal::BulkConfirm { task_ids, .. }) if task_ids.len() == 2
+    ));
+    assert_eq!(
+        app.ops
+            .list_tasks(Some("in_progress"), None, "created", "asc")
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn phase_three_drop_outside_cancels_after_hovering_a_target() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let (column, card, source) = card_hits(&app)[0];
+    let task_id = app.visible_tasks_for_column(column)[card].id.clone();
+    let original = app.ops.get_task(&task_id).unwrap().unwrap().status;
+    let target_column = (column + 1) % app.board.columns.len();
+    let target = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::ColumnFocus(target_column))
+        .copied()
+        .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: source.x + 1,
+        row: source.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: target.area.x + 1,
+        row: target.area.y + 2,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 500,
+        row: 500,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+
+    assert!(app.dragging.is_none());
+    assert_eq!(
+        app.ops.get_task(&task_id).unwrap().unwrap().status,
+        original
+    );
+}
+
+#[test]
+fn phase_three_clamps_nonfocused_offsets_after_filtering() {
+    let (_dir, mut app) = app_with_board();
+    for title in ["Other 1", "Other 2", "Needle", "Other 3"] {
+        let task = app.ops.create_task(NewTask::titled(title)).unwrap();
+        app.ops.move_task(&task.id, "review", false).unwrap();
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    let review = review_column(&app);
+    app.column_offsets[review] = 3;
+    app.search.query.insert_str("Needle");
+    app.clamp_focus();
+
+    assert_eq!(app.column_offsets[review], 0);
+    assert!(render_at(&mut app, 96, 18).contains("Needle"));
+}
+
+#[test]
+fn phase_three_question_count_matches_filtered_and_capped_tasks() {
+    let (_dir, mut app) = app_with_board();
+    app.ops.create_task(NewTask::titled("Visible")).unwrap();
+    let hidden = app.ops.create_task(NewTask::titled("Hidden")).unwrap();
+    app.ops
+        .ask_question(&hidden.id, "Hidden question?", "agent", vec![])
+        .unwrap();
+    app.settings.max_tasks_per_column = 1;
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let output = render_at(&mut app, 96, 18);
+    assert!(!output.contains("? 1 questions"));
+    app.dispatch(UiAction::FocusQuestions).unwrap();
+    assert_eq!(app.status, "No tasks have open questions");
+}
+
+#[test]
+fn phase_three_cached_live_session_expires_without_a_file_change() {
+    let (dir, mut app) = app_with_board();
+    let mut task = app.ops.create_task(NewTask::titled("Expiring")).unwrap();
+    SessionManager::new(dir.path())
+        .link_session(&task.id, "ses-expiring")
+        .unwrap();
+    task.session = Some("ses-expiring".to_string());
+    app.ops.storage.save_task(&task).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    let deadline = app.board.session_deadlines[&task.id];
+
+    app.expire_session_states_at(deadline + chrono::Duration::seconds(1));
+
+    assert_eq!(
+        app.board.session_states.get(&task.id),
+        Some(&crate::core::session::SessionState::Crashed)
+    );
+    assert!(render_at(&mut app, 96, 18).contains("✖ crashed"));
+}
+
+#[test]
+fn phase_three_wide_unicode_headers_stay_minimal() {
+    let (_dir, mut app) = app_with_board();
+    app.board.columns[1].name = "進行中🙂🙂".to_string();
+    let output = render_at(&mut app, 120, 18);
+    assert!(output.contains("(0)"));
+    assert!(!output.contains("[+]"));
+    assert!(!output.contains("⇒Review"));
+    assert!(!output.contains("in_progress"));
+}
+
+#[test]
+fn phase_six_sessions_show_state_kill_confirm_and_log_view() {
+    let (dir, mut app) = app_with_board();
+    let live = app.ops.create_task(NewTask::titled("Live task")).unwrap();
+    let crashed = app
+        .ops
+        .create_task(NewTask::titled("Crashed task"))
+        .unwrap();
+    let manager = SessionManager::new(dir.path());
+    manager.link_session(&live.id, "ses-live").unwrap();
+    manager.link_session(&crashed.id, "ses-lost").unwrap();
+    manager.crash_session("ses-lost").unwrap();
+    std::fs::create_dir_all(dir.path().join(".kanban/logs")).unwrap();
+    std::fs::write(
+        dir.path().join(".kanban/logs/ses-live.log"),
+        "line one\nline two\ntokens: 5\n",
+    )
+    .unwrap();
+
+    app.handle_key(key(KeyCode::Char('l'))).unwrap();
+    assert_eq!(app.active_sessions.len(), 2);
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("▶ ses-live"));
+    assert!(rendered.contains("✖ ses-lost"));
+    insta::assert_snapshot!("phase_six_sessions_states", rendered);
+
+    // `v` opens a pager over the log tail; `q` returns to the list.
+    app.session_selected = app
+        .filtered_active_sessions()
+        .iter()
+        .position(|active| active.session.id == "ses-live")
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('v'))).unwrap();
+    assert_eq!(app.screen, Screen::LogView);
+    let log = render_snapshot(&mut app);
+    assert!(log.contains("line one"));
+    insta::assert_snapshot!("phase_six_log_view", log);
+    app.handle_key(key(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.screen, Screen::Sessions);
+
+    // `x` kills only after the confirmation.
+    app.session_selected = app
+        .filtered_active_sessions()
+        .iter()
+        .position(|active| active.session.id == "ses-live")
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('x'))).unwrap();
+    assert!(matches!(
+        app.modal.as_ref().expect("kill confirm").modal,
+        Modal::KillSessionConfirm { .. }
+    ));
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+    assert!(app.status.starts_with("Stopped ses-live"), "{}", app.status);
+    assert!(
+        app.filtered_active_sessions()
+            .iter()
+            .all(|active| active.session.id != "ses-live")
+    );
+}
+
+#[test]
+fn phase_six_session_task_detail_returns_to_sessions() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Session task"))
+        .unwrap();
+    SessionManager::new(dir.path())
+        .link_session(&task.id, "ses-open")
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('l'))).unwrap();
+    app.handle_key(key(KeyCode::Char('o'))).unwrap();
+    assert_eq!(app.screen, Screen::Detail);
+    assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
+    app.handle_key(key(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.screen, Screen::Sessions);
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert_eq!(app.screen, Screen::Board);
+}
+
+#[test]
+fn phase_six_archive_restore_confirms_and_returns_task_to_todo() {
+    let (_dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Restore me")).unwrap();
+    app.ops.move_task(&task.id, "archive", false).unwrap();
+    app.handle_key(key(KeyCode::Char('a'))).unwrap();
+    app.handle_key(key(KeyCode::Char('u'))).unwrap();
+    assert!(matches!(
+        app.modal.as_ref().expect("restore confirm").modal,
+        Modal::RestoreConfirm { .. }
+    ));
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+    assert!(app.status.contains("Restored"), "{}", app.status);
+    assert_eq!(
+        app.ops.get_task(&task.id).unwrap().unwrap().status.as_str(),
+        "todo"
+    );
+    assert_eq!(app.screen, Screen::Archive);
+
+    // The detail of an archived task offers only Restore/Delete; `u` restores
+    // from there too, and Esc returns to the archive list.
+    let second = app
+        .ops
+        .create_task(NewTask::titled("Archived detail"))
+        .unwrap();
+    app.ops.move_task(&second.id, "archive", false).unwrap();
+    app.reload_if_changed().unwrap();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(app.screen, Screen::Detail);
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("[ Restore u ]"));
+    assert!(!rendered.contains("[ ▶ Run r ]"));
+    app.handle_key(key(KeyCode::Char('u'))).unwrap();
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+    assert_eq!(
+        app.ops
+            .get_task(&second.id)
+            .unwrap()
+            .unwrap()
+            .status
+            .as_str(),
+        "todo"
+    );
+    app.handle_key(key(KeyCode::Char('q'))).unwrap();
+    assert_eq!(app.screen, Screen::Archive);
+}
+
+#[test]
+fn phase_seven_status_bar_is_contextual_and_clickable() {
+    let (_dir, mut app) = app_with_board();
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("n new"));
+    let help_hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::Help))
+        .copied()
+        .expect("help segment hitbox");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: help_hit.area.x + 1,
+        row: help_hit.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    assert_eq!(app.screen, Screen::Help);
+    app.handle_key(key(KeyCode::Char('?'))).unwrap();
+    assert_eq!(app.screen, Screen::Board);
+
+    app.handle_key(key(KeyCode::Char('l'))).unwrap();
+    let sessions = render_snapshot(&mut app);
+    assert!(sessions.contains("x kill"));
+    assert!(
+        app.hitboxes
+            .iter()
+            .any(|hitbox| hitbox.action == HitAction::Action(UiAction::ViewLog))
+    );
+    app.handle_key(key(KeyCode::Char('q'))).unwrap();
+
+    // A narrow terminal drops low-priority segments instead of clipping.
+    let narrow = render_at(&mut app, 48, 18);
+    assert!(narrow.contains("r run"));
+    assert!(!narrow.contains("A archive done"));
+}
+
+#[test]
+fn phase_seven_help_overlay_scrolls_and_toggles() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('?'))).unwrap();
+    let _ = render_at(&mut app, 80, 20);
+    assert!(app.help_max_scroll > 0, "help must scroll at 80x20");
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    assert_eq!(app.help_scroll, 1);
+    app.handle_key(key(KeyCode::End)).unwrap();
+    assert_eq!(app.help_scroll, app.help_max_scroll);
+    app.handle_key(key(KeyCode::Char('?'))).unwrap();
+    assert_eq!(app.screen, Screen::Board);
+}
+
+#[test]
+fn phase_seven_first_click_on_keyboard_focused_card_does_not_open_detail() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let (column, card, area) = card_hits(&app)[0];
+    assert_eq!((app.focused_column, app.focused_card), (column, card));
+    let click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 1,
+        row: area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    let release = MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        ..click
+    };
+    app.handle_mouse(click).unwrap();
+    app.handle_mouse(release).unwrap();
+    assert_eq!(app.screen, Screen::Board, "first click must only select");
+    app.handle_mouse(click).unwrap();
+    app.handle_mouse(release).unwrap();
+    assert_eq!(app.screen, Screen::Detail);
+}
+
+#[test]
+fn phase_four_confirm_buttons_support_one_key_and_mouse() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Delete by click"))
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.handle_key(key(KeyCode::Char('d'))).unwrap();
+    let output = render_at(&mut app, 80, 24);
+    assert!(output.contains("[ Yes ]  [ No ]"));
+    insta::assert_snapshot!("phase_four_confirm_buttons", output);
+    let yes = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::ModalButton(ModalButton::Yes))
+        .copied()
+        .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: yes.area.x,
+        row: yes.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    assert!(app.ops.get_task(&task.id).unwrap().is_none());
+}
+
+#[test]
+fn phase_four_forms_scroll_validate_and_protect_dirty_input() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+    }
+    let output = render_at(&mut app, 80, 24);
+    assert!(output.contains("Chain to"));
+    insta::assert_snapshot!("phase_four_form_scrolled_80x24", output);
+
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    assert!(!app.modal.as_ref().unwrap().is_dirty());
+    for _ in 0..8 {
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.modal.as_ref().unwrap().error.as_deref(),
+        Some("Task title cannot be empty")
+    );
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Title
+    );
+    insta::assert_snapshot!("phase_four_inline_validation", render_at(&mut app, 80, 24));
+    app.modal.as_mut().unwrap().focus_field(DialogField::Title);
+    app.handle_key(key(KeyCode::Char('x'))).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(app.modal.as_ref().unwrap().discard_confirm);
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.modal.as_ref().unwrap().title_text(), "x");
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn phase_four_dirty_escape_preserves_whitespace_only_input() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    app.handle_key(key(KeyCode::Char(' '))).unwrap();
+    assert!(app.modal.as_ref().unwrap().is_dirty());
+
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(app.modal.as_ref().unwrap().discard_confirm);
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    assert_eq!(app.modal.as_ref().unwrap().title.lines(), [" "]);
+}
+
+#[test]
+fn phase_four_scrolled_selector_click_uses_visible_option_index() {
+    let (_dir, mut app) = populated_app();
+    for title in ["Chain one", "Chain two", "Chain three", "Chain four"] {
+        app.ops.create_task(NewTask::titled(title)).unwrap();
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+    }
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Down)).unwrap();
+    }
+    assert_eq!(app.modal.as_ref().unwrap().chain_selected, 4);
+    let expected = app.modal.as_ref().unwrap().chain_options[3].value.clone();
+
+    let _ = render_at(&mut app, 80, 24);
+    let first_visible = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| {
+            hitbox.action
+                == HitAction::ModalOption {
+                    field: DialogField::ChainTo,
+                    index: 3,
+                }
+        })
+        .copied()
+        .expect("first visible scrolled option");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: first_visible.area.x,
+        row: first_visible.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.chain_selected, 3);
+    assert_eq!(modal.chain_text(), expected);
+}
+
+#[test]
+fn phase_four_tall_form_expands_visible_task_selector_options() {
+    let (_dir, mut app) = populated_app();
+    for number in 0..8 {
+        app.ops
+            .create_task(NewTask::titled(format!("Tall chain {number}")))
+            .unwrap();
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Tab)).unwrap();
+    }
+    let _ = render_at(&mut app, 100, 60);
+    let visible_options = app
+        .hitboxes
+        .iter()
+        .filter(|hitbox| {
+            matches!(
+                hitbox.action,
+                HitAction::ModalOption {
+                    field: DialogField::ChainTo,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert!(visible_options > 2, "visible options: {visible_options}");
+}
+
+#[test]
+fn phase_four_answer_reselection_and_boundary_keys_preserve_typed_answer() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('w'))).unwrap();
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+    for character in "typed answer".chars() {
+        app.handle_key(key(KeyCode::Char(character))).unwrap();
+    }
+    app.modal.as_mut().unwrap().error = Some("keep this error".to_string());
+    let _ = render_at(&mut app, 96, 28);
+
+    for field in [
+        DialogField::Variant,
+        DialogField::Question,
+        DialogField::Variant,
+    ] {
+        let hit = app
+            .hitboxes
+            .iter()
+            .find(|hitbox| hitbox.action == HitAction::ModalOption { field, index: 0 })
+            .copied()
+            .unwrap();
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.area.x,
+            row: hit.area.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .unwrap();
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        app.handle_key(key(KeyCode::Up)).unwrap();
+    }
+
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.answer_text(), "typed answer");
+    assert_eq!(modal.error.as_deref(), Some("keep this error"));
+}
+
+#[test]
+fn phase_four_modal_mouse_routes_fields_options_and_add_message_buttons() {
+    let (_dir, mut app) = populated_app();
+    let original_focus = (app.focused_column, app.focused_card);
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    let _ = render_at(&mut app, 96, 28);
+    let option = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| {
+            hitbox.action
+                == HitAction::ModalOption {
+                    field: DialogField::Backend,
+                    index: 1,
+                }
+        })
+        .copied()
+        .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: option.area.x,
+        row: option.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    assert_eq!(
+        app.modal.as_ref().unwrap().backend_text().as_deref(),
+        Some("claude")
+    );
+    assert_eq!((app.focused_column, app.focused_card), original_focus);
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+
+    app.handle_key(key(KeyCode::Char('c'))).unwrap();
+    let output = render_at(&mut app, 96, 28);
+    assert!(output.contains("[ Save ]  [ Cancel ]"));
+    let save = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::ModalButton(ModalButton::Save))
+        .copied()
+        .unwrap();
+    app.modal
+        .as_mut()
+        .unwrap()
+        .description
+        .insert_str("clicked save");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: save.area.x,
+        row: save.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    assert!(app.modal.is_none());
 }
