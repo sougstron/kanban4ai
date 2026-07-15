@@ -2,23 +2,18 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
+};
 
-use crate::core::models::{Message, MessageKind, MessageStatus};
+use crate::core::models::{Message, MessageKind, MessageStatus, Task, TaskStatus};
 use crate::core::timefmt;
 
-use super::app::App;
-use super::card::sanitize_terminal_text;
+use super::app::{App, DetailFocus, HitAction, Hitbox, UiAction};
+use super::card::{sanitize_terminal_text, truncate_display};
+use super::theme::Theme;
 
-pub fn render(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6),
-            Constraint::Min(5),
-            Constraint::Length(6),
-        ])
-        .split(area);
+pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let Some(detail) = app.detail.as_ref() else {
         frame.render_widget(Paragraph::new("No task selected"), area);
         return;
@@ -27,12 +22,110 @@ pub fn render(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new("Task not found"), area);
         return;
     };
-    let meta = vec![
+
+    let theme = app.theme;
+    let waiting = app
+        .board
+        .extras
+        .get(&task.id)
+        .is_some_and(|extra| extra.waiting);
+    let open_questions = detail
+        .open_questions()
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let show_answer = !open_questions.is_empty();
+    let show_edits = detail.show_edits_panel();
+    let edits_editable = detail.edits_editable();
+    let focus = detail.focus;
+    let task = task.clone();
+
+    let meta_height = if waiting { 7 } else { 6 };
+    let answer_height = if show_answer {
+        let question = &open_questions[detail.question_index.min(open_questions.len() - 1)];
+        // borders + question line + option rows (custom + variants) + input
+        4 + (question.variants.len() as u16 + 1).min(4)
+    } else {
+        0
+    };
+    let mut constraints = vec![
+        Constraint::Length(meta_height),
+        Constraint::Min(5),
+        Constraint::Length(answer_height),
+        Constraint::Length(if show_edits { 6 } else { 0 }),
+        Constraint::Length(1),
+    ];
+    if !show_answer {
+        constraints[2] = Constraint::Length(0);
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+
+    render_meta(frame, &theme, &task, waiting, chunks[0]);
+
+    // Thread panel with a clamped scroll and a scrollbar.
+    let thread_lines = thread_lines(&app.detail.as_ref().unwrap().messages, &theme);
+    // Approximation: logical lines; wrapped lines may add a little slack.
+    let content_height = thread_lines.len() as u16;
+    let visible_height = chunks[1].height.saturating_sub(2);
+    let max_scroll = content_height.saturating_sub(visible_height);
+    let scroll = {
+        let detail = app.detail.as_mut().unwrap();
+        detail.max_scroll = max_scroll;
+        detail.scroll = detail.scroll.min(max_scroll);
+        detail.scroll
+    };
+    app.hitboxes.push(Hitbox {
+        area: chunks[1],
+        action: HitAction::DetailThread,
+    });
+    frame.render_widget(
+        Paragraph::new(thread_lines)
+            .block(
+                Block::default()
+                    .title(" Thread ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if focus == DetailFocus::Thread {
+                        theme.focus
+                    } else {
+                        theme.border
+                    })),
+            )
+            .style(Style::default().bg(theme.bg).fg(theme.fg))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        chunks[1],
+    );
+    if max_scroll > 0 {
+        let mut scrollbar_state =
+            ScrollbarState::new(max_scroll as usize).position(scroll as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            chunks[1],
+            &mut scrollbar_state,
+        );
+    }
+
+    if show_answer {
+        render_answer_panel(frame, app, &theme, &open_questions, chunks[2]);
+    }
+
+    if show_edits {
+        render_edits_panel(frame, app, &theme, edits_editable, chunks[3]);
+    }
+
+    render_action_bar(frame, app, &theme, &task, show_answer, chunks[4]);
+}
+
+fn render_meta(frame: &mut Frame<'_>, theme: &Theme, task: &Task, waiting: bool, area: Rect) {
+    let mut meta = vec![
         Line::from(vec![
             Span::styled(
-                &task.id,
+                task.id.clone(),
                 Style::default()
-                    .fg(app.theme.focus)
+                    .fg(theme.focus)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
@@ -45,9 +138,10 @@ pub fn render(frame: &mut Frame<'_>, app: &App, area: Rect) {
             task.interactive
         )),
         Line::from(format!(
-            "Backend: {} │ Model: {} │ Agent: {} │ Chain: {}",
+            "Backend: {} │ Model: {} │ Effort: {} │ Agent: {} │ Chain: {}",
             sanitize_terminal_text(task.agent_backend.as_deref().unwrap_or("-")),
             sanitize_terminal_text(task.ai_model.as_deref().unwrap_or("-")),
+            sanitize_terminal_text(task.ai_effort.as_deref().unwrap_or("-")),
             sanitize_terminal_text(task.agent_name.as_deref().unwrap_or("-")),
             sanitize_terminal_text(task.chained_to.as_deref().unwrap_or("-"))
         )),
@@ -57,61 +151,206 @@ pub fn render(frame: &mut Frame<'_>, app: &App, area: Rect) {
             timefmt::format(&task.updated_at)
         )),
     ];
+    if waiting {
+        meta.push(Line::from(Span::styled(
+            "⏳ Agent is blocked on a question and waits for your answer",
+            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+        )));
+    }
     frame.render_widget(
         Paragraph::new(meta)
             .block(
                 Block::default()
                     .title(" Task ")
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(app.theme.focus)),
+                    .border_style(Style::default().fg(theme.focus)),
             )
-            .style(Style::default().bg(app.theme.bg).fg(app.theme.fg)),
-        chunks[0],
+            .style(Style::default().bg(theme.bg).fg(theme.fg)),
+        area,
     );
+}
 
+fn render_answer_panel(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    theme: &Theme,
+    open_questions: &[Message],
+    area: Rect,
+) {
+    let detail = app.detail.as_ref().unwrap();
+    let focused = detail.focus == DetailFocus::Answer;
+    let index = detail.question_index.min(open_questions.len() - 1);
+    let question = &open_questions[index];
+    let input_text = sanitize_terminal_text(&detail.answer_input.lines().join(" "));
+
+    let title = format!(
+        " Answer question {}/{} · ←→ question · ↑↓ variant · Enter send ",
+        index + 1,
+        open_questions.len()
+    );
+    let mut lines = vec![Line::from(Span::styled(
+        sanitize_terminal_text(&question.body),
+        Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+    ))];
+    let selected = detail.variant_selected;
+    let custom_label = if input_text.is_empty() {
+        "Custom answer: (type to fill)".to_string()
+    } else {
+        format!("Custom answer: {input_text}")
+    };
+    lines.push(option_line(&custom_label, selected == 0, focused, theme));
+    for (variant_index, variant) in question.variants.iter().enumerate() {
+        lines.push(option_line(
+            &format!("{}. {}", variant_index + 1, sanitize_terminal_text(variant)),
+            selected == variant_index + 1,
+            focused,
+            theme,
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(thread_lines(&detail.messages, app))
+        Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(" Thread ")
+                    .title(title)
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(app.theme.border)),
+                    .border_style(Style::default().fg(if focused {
+                        theme.focus
+                    } else {
+                        theme.warn
+                    })),
             )
-            .style(Style::default().bg(app.theme.bg).fg(app.theme.fg))
-            .wrap(Wrap { trim: false })
-            .scroll((detail.scroll, 0)),
-        chunks[1],
+            .style(Style::default().bg(theme.bg).fg(theme.fg)),
+        area,
     );
+}
 
+fn option_line(label: &str, selected: bool, panel_focused: bool, theme: &Theme) -> Line<'static> {
+    let marker = if selected { "› " } else { "  " };
+    let style = if selected && panel_focused {
+        Style::default()
+            .fg(theme.focus)
+            .add_modifier(Modifier::BOLD)
+    } else if selected {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(Span::styled(format!("{marker}{label}"), style))
+}
+
+fn render_edits_panel(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    theme: &Theme,
+    editable: bool,
+    area: Rect,
+) {
+    let detail = app.detail.as_ref().unwrap();
+    let focused = detail.focus == DetailFocus::Edits;
+    let title = if !editable {
+        " Review edits (read-only outside Review) "
+    } else if focused {
+        " Review edits [focused] · Ctrl+S save · Ctrl+R re-run · Esc thread "
+    } else {
+        " Review edits · Tab to edit · Ctrl+S save · Ctrl+R re-run "
+    };
     let mut review_edits = detail.review_edits.clone();
     review_edits.set_block(
         Block::default()
-            .title(if detail.review_editing {
-                " Review edits [focused] · Tab thread · Ctrl+S Save & Re-run "
-            } else {
-                " Review edits · Tab edit · Ctrl+S Save & Re-run "
-            })
+            .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.review)),
+            .border_style(Style::default().fg(if focused {
+                theme.focus
+            } else if editable {
+                theme.review
+            } else {
+                theme.muted
+            })),
     );
-    frame.render_widget(&review_edits, chunks[2]);
+    frame.render_widget(&review_edits, area);
 }
 
-fn thread_lines(messages: &[Message], app: &App) -> Vec<Line<'static>> {
+/// Bottom action bar: contextual buttons that dispatch the same `UiAction`s
+/// as the hotkeys. Registers a hitbox per button.
+fn render_action_bar(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    theme: &Theme,
+    task: &Task,
+    has_questions: bool,
+    area: Rect,
+) {
+    // An archived task offers only what applies to it: restore or delete.
+    let buttons: Vec<(String, UiAction)> = if task.status == TaskStatus::Archive {
+        vec![
+            ("Restore u".to_string(), UiAction::Restore),
+            ("Del d".to_string(), UiAction::DeleteTask),
+        ]
+    } else {
+        let mut buttons: Vec<(String, UiAction)> = vec![("▶ Run r".to_string(), UiAction::Run)];
+        if has_questions {
+            buttons.push(("Answer w".to_string(), UiAction::AnswerQuestion));
+        }
+        if task.status == TaskStatus::Review {
+            buttons.push(("Approve y".to_string(), UiAction::Approve));
+            buttons.push(("Re-run ^R".to_string(), UiAction::Rerun));
+        }
+        if task.session.is_some() {
+            buttons.push(("Attach t".to_string(), UiAction::Attach));
+        }
+        buttons.push(("Edit e".to_string(), UiAction::EditTask));
+        buttons.push(("Move m".to_string(), UiAction::MoveTask));
+        buttons.push(("+Ctx c".to_string(), UiAction::AddContext));
+        if app.ops.task_has_backups(&task.id) {
+            buttons.push(("Revert".to_string(), UiAction::Revert));
+        }
+        buttons.push(("Del d".to_string(), UiAction::DeleteTask));
+        buttons
+    };
+
+    let mut spans = Vec::new();
+    let mut x = area.x;
+    for (label, action) in buttons {
+        let text = format!("[ {label} ]");
+        let width = text.chars().count() as u16;
+        if x + width > area.x + area.width {
+            break;
+        }
+        app.hitboxes.push(Hitbox {
+            area: Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            action: HitAction::Action(action),
+        });
+        spans.push(Span::styled(
+            text,
+            Style::default().fg(theme.fg).bg(theme.border),
+        ));
+        spans.push(Span::raw(" "));
+        x += width + 1;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.bg)),
+        area,
+    );
+}
+
+fn thread_lines(messages: &[Message], theme: &Theme) -> Vec<Line<'static>> {
     if messages.is_empty() {
         return vec![Line::from("No thread messages")];
     }
     let mut lines = Vec::new();
     for message in messages {
         let style = match message.kind {
-            MessageKind::Question => Style::default()
-                .fg(app.theme.warn)
-                .add_modifier(Modifier::BOLD),
-            MessageKind::Suggestion => Style::default().fg(app.theme.focus),
-            MessageKind::Context => Style::default().fg(app.theme.muted),
-            MessageKind::ReviewEdit => Style::default().fg(app.theme.review),
-            MessageKind::Task => Style::default().fg(app.theme.ok),
-            MessageKind::System => Style::default().fg(app.theme.muted),
+            MessageKind::Question => Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+            MessageKind::Suggestion => Style::default().fg(theme.focus),
+            MessageKind::Context => Style::default().fg(theme.muted),
+            MessageKind::ReviewEdit => Style::default().fg(theme.review),
+            MessageKind::Task => Style::default().fg(theme.ok),
+            MessageKind::System => Style::default().fg(theme.muted),
         };
         let status = match message.status {
             MessageStatus::Open => "open",
@@ -126,13 +365,13 @@ fn thread_lines(messages: &[Message], app: &App) -> Vec<Line<'static>> {
         if !message.variants.is_empty() {
             lines.push(Line::from(format!(
                 "Variants: {}",
-                sanitize_terminal_text(&message.variants.join(" | "))
+                truncate_display(&sanitize_terminal_text(&message.variants.join(" | ")), 120)
             )));
         }
         if let Some(answer) = &message.answer {
             lines.push(Line::from(Span::styled(
                 format!("Answer: {}", sanitize_terminal_text(answer)),
-                Style::default().fg(app.theme.ok),
+                Style::default().fg(theme.ok),
             )));
         }
         lines.push(Line::from(""));
