@@ -7,7 +7,11 @@ mod prompt;
 mod tmux;
 
 pub use backends::parse_opencode_agent_list;
-pub use backends::{AgentBackendConfig, AutoLaunchConfig, LaunchPlan, build_launch_plan};
+pub use backends::{
+    AgentBackendConfig, AutoLaunchConfig, LaunchPlan, OpencodeCatalog, build_launch_plan,
+    cached_opencode_catalog, opencode_catalog, parse_opencode_models_verbose, recent_models,
+    record_recent_model, sort_efforts, sort_opencode_models,
+};
 pub use launcher::KanbanLauncher;
 pub use prompt::build_agent_prompt;
-pub use tmux::attach_to_session;
+pub use tmux::{attach_to_session, kill_session};

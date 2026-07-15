@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::agent::backends::{auto_launch_config, build_launch_plan};
+use crate::agent::backends::{auto_launch_config, build_launch_plan, record_recent_model};
 use crate::agent::tmux::spawn_plan;
 use crate::core::config::Config;
 use crate::core::models::Task;
@@ -36,5 +36,12 @@ fn launch(
         return Ok(false);
     }
     let plan = build_launch_plan(project_path, task, session_id, revert)?;
-    spawn_plan(project_path, &plan, &auto_launch)
+    let started = spawn_plan(project_path, &plan, &auto_launch)?;
+    if started
+        && plan.backend == "opencode"
+        && let Some(model) = plan.model.as_deref()
+    {
+        record_recent_model(project_path, model);
+    }
+    Ok(started)
 }
