@@ -353,6 +353,33 @@ fn sessions_heartbeat_check_recover() {
 }
 
 #[test]
+fn sessions_uses_saved_name_when_task_file_is_missing() {
+    let dir = board();
+    kanban(dir.path())
+        .args(["create", "Missing task label"])
+        .assert()
+        .success();
+    kanban(dir.path())
+        .args([
+            "take",
+            "TASK-001",
+            "--session",
+            "ses-missing-task",
+            "--agent",
+        ])
+        .assert()
+        .success();
+    std::fs::remove_file(dir.path().join(".kanban/tasks/in_progress/TASK-001.md")).unwrap();
+
+    kanban(dir.path())
+        .arg("sessions")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ses-missing-task"))
+        .stdout(predicate::str::contains("Missing task label"));
+}
+
+#[test]
 fn compact_reports_no_context() {
     let dir = board();
     kanban(dir.path())
@@ -396,6 +423,11 @@ fn tui_requires_interactive_terminal_and_attach_reports_missing_task() {
     let dir = board();
     kanban(dir.path())
         .arg("tui")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("interactive terminal"));
+
+    kanban(dir.path())
         .assert()
         .failure()
         .stderr(predicate::str::contains("interactive terminal"));

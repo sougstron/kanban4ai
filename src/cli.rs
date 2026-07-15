@@ -25,7 +25,7 @@ use crate::core::timefmt;
 )]
 pub struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -39,6 +39,9 @@ enum Command {
         /// Model to use when this task is delegated (interpreted by the chosen agent backend)
         #[arg(long = "model")]
         ai_model: Option<String>,
+        /// Reasoning effort (claude: low/medium/high/xhigh/max; opencode: a model variant)
+        #[arg(long = "effort")]
+        ai_effort: Option<String>,
         /// Agent backend to run this task (e.g. opencode, claude)
         #[arg(long = "backend")]
         agent_backend: Option<String>,
@@ -231,7 +234,7 @@ fn env_session(explicit: Option<String>) -> String {
 
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
-    match dispatch(cli.command) {
+    match dispatch(cli.command.unwrap_or(Command::Tui)) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("Error: {err}");
@@ -247,6 +250,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             title,
             description,
             ai_model,
+            ai_effort,
             agent_backend,
             agent_name,
             interactive,
@@ -256,6 +260,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 title,
                 description,
                 ai_model,
+                ai_effort,
                 agent_backend,
                 agent_name,
                 interactive,
@@ -502,6 +507,9 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             if let Some(ai_model) = &task.ai_model {
                 println!("AI Model: {ai_model}");
             }
+            if let Some(ai_effort) = &task.ai_effort {
+                println!("Effort: {ai_effort}");
+            }
             if let Some(chained_to) = &task.chained_to {
                 println!("Chained to: {chained_to}");
             }
@@ -579,7 +587,10 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 let last_seen = session.last_seen.format("%Y-%m-%d %H:%M").to_string();
                 let task_label = match ops.get_task(&session.task_id)? {
                     Some(task) => truncate_chars(&format!("{} {}", task.id, task.title), 36),
-                    None => session.task_id.clone(),
+                    None => match session.name.as_deref() {
+                        Some(name) => truncate_chars(&format!("{} {}", session.task_id, name), 36),
+                        None => session.task_id.clone(),
+                    },
                 };
                 let tokens = estimate_session_tokens(Path::new("."), &session.id);
                 let tokens_label = tokens.map_or("unknown".to_string(), format_thousands);
@@ -699,6 +710,7 @@ fn task_to_json(task: &Task) -> serde_json::Value {
         "context_file": task.context_file,
         "context_size": task.context_size,
         "ai_model": task.ai_model,
+        "ai_effort": task.ai_effort,
         "agent_backend": task.agent_backend,
         "agent_name": task.agent_name,
         "interactive": task.interactive,
