@@ -16,3 +16,6 @@
 .kanban/cache/
 .kanban/compaction.log
 .kanban/.lock
+
+# Unreleased change logs (local input for the next version release)
+.changes/
