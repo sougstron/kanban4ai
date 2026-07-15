@@ -44,7 +44,7 @@ pub fn run_event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> 
                 spawn_debounce_timer(tx.clone(), generation);
             }
             AppEvent::FsDebounced(generation) => app.reload_debounced_change(generation)?,
-            AppEvent::Tick => app.reload_if_changed()?,
+            AppEvent::Tick => app.tick()?,
         }
         if let Some(session_id) = app.take_attach_request() {
             let _input_guard = input_gate.lock().map_err(|_| {
@@ -125,7 +125,7 @@ fn spawn_watcher_thread(project_path: &Path, tx: Sender<AppEvent>) {
         let tx_events = tx.clone();
         let mut watcher = match RecommendedWatcher::new(
             move |res: notify::Result<notify::Event>| {
-                if res.is_ok() {
+                if res.is_ok_and(|event| is_board_change(&event.kind)) {
                     let _ = tx_events.send(AppEvent::FsChanged);
                 }
             },
@@ -141,4 +141,24 @@ fn spawn_watcher_thread(project_path: &Path, tx: Sender<AppEvent>) {
             thread::park();
         }
     });
+}
+
+fn is_board_change(kind: &notify::EventKind) -> bool {
+    kind.is_create() || kind.is_modify() || kind.is_remove()
+}
+
+#[cfg(test)]
+mod tests {
+    use notify::EventKind;
+    use notify::event::{AccessKind, CreateKind, ModifyKind, RemoveKind};
+
+    use super::is_board_change;
+
+    #[test]
+    fn watcher_ignores_reads_and_keeps_content_changes() {
+        assert!(!is_board_change(&EventKind::Access(AccessKind::Any)));
+        assert!(is_board_change(&EventKind::Create(CreateKind::Any)));
+        assert!(is_board_change(&EventKind::Modify(ModifyKind::Any)));
+        assert!(is_board_change(&EventKind::Remove(RemoveKind::Any)));
+    }
 }
