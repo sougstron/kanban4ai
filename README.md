@@ -1,12 +1,7 @@
 # kanban4ai
 
-A fast native kanban board CLI and TUI designed for AI coding agents such as
-opencode and Claude Code. Boards are plain Markdown and YAML under `.kanban/`:
-there is no database or language runtime dependency.
-
-The Rust rewrite is complete through phase 5. It preserves the original
-`kanban-cli` command contract and can read existing board files, while shipping
-as one canonical `kanban4ai` executable with `kanban` and `kb` aliases.
+A fast native local-first kanban board CLI and TUI designed for AI coding agents such as Opencode and Claude Code. Boards are plain Markdown and YAML under `.kanban/`:
+there is no database or language runtime dependency. Work without strong link with git, you can start in any local folder with just two commands.
 
 ## Requirements
 
@@ -56,61 +51,56 @@ legacy board-format compatibility.
 ## Usage / Quick start
 
 Run these commands from the project directory that should contain the board.
-The examples use `kanban`. A direct `cargo install` provides only
-`kanban4ai`, so use `kanban4ai` instead, or install with `scripts/install.sh`
-or a package that provides the `kanban` and `kb` aliases.
 
 ### 1. Initialize a board
 
 ```sh
-kanban init
-kanban create "Fix the login flow"
-kanban list
-kanban show TASK-001
+kanban4ai init
+kanban4ai
 ```
 
-`kanban init` creates the local `.kanban/` board. Tasks move through To Do,
+`kanban4ai init` creates the local `.kanban/` board. Tasks move through To Do,
 In Progress, Review, Done, and Archive. The task ID is printed when a task is
-created. Use `kanban tui` for the interactive board, or use the CLI commands
-when scripting or working from an agent.
+created. Use `kanban4ai` or `kanban4ai tui` for the interactive board, or use the CLI commands that described below when scripting or working from an agent.
 
-### 2. Delegate a task to an agent
+### 2. Run a task on an agent CLI
 
 The CLI form stores the backend, model, persona, and interactive behavior on
 the task. For example:
 
 ```sh
-kanban create "Implement the login flow" \
+kanban4ai create "Implement the login flow" \
   --backend opencode \
   --model MODEL_NAME \
   --agent-name sisyphus \
   --interactive
-kanban take TASK-002 --session ses-login --agent
+kanban4ai take TASK-002 --session ses-login --agent
 ```
 
-`kanban take ... --agent` moves the task to In Progress and auto-launches the
+`kanban4ai take ... --agent` moves the task to In Progress and auto-launches the
 configured backend when auto-launch is enabled. The TUI is easier for most
-users: select a To Do task, press `s`, and confirm. The selected task's backend
-must be installed and authenticated separately, for example by signing in to
-opencode or Claude Code before delegation. `tmux` is optional, but enables an
-attachable agent session when configured.
+users: select a To Do task and press `r` — the agent starts immediately, with
+no confirmation. The selected task's backend must be installed and
+authenticated separately, for example by signing in to opencode or Claude Code
+before running a task. `tmux` is optional, but enables an attachable agent
+session when configured.
 
 An agent can record work context and ask a question with:
 
 ```sh
-kanban context TASK-002 "The API uses the existing session middleware."
-kanban ask TASK-002 "Should the new endpoint use JSON or form data?" --agent
-kanban answer TASK-002 MSG-003 "Use JSON."
+kanban4ai context TASK-002 "The API uses the existing session middleware."
+kanban4ai ask TASK-002 "Should the new endpoint use JSON or form data?" --agent
+kanban4ai answer TASK-002 MSG-003 "Use JSON."
 ```
 
-For an interactive task, the agent can use `kanban ask ... --agent --wait
+For an interactive task, the agent can use `kanban4ai ask ... --agent --wait
 --session ses-login` to wait for the human answer. Questions and context are
 stored in the task's thread. When the agent finishes, it runs
-`kanban done TASK-002 --session ses-login --agent`, which moves the task to
+`kanban4ai done TASK-002 --session ses-login --agent`, which moves the task to
 Review. The human reviews the work and completes it with:
 
 ```sh
-kanban done TASK-002
+kanban4ai done TASK-002
 ```
 
 ### 3. Review and rerun
@@ -118,36 +108,58 @@ kanban done TASK-002
 If changes are needed, record feedback and rerun the task's agent:
 
 ```sh
-kanban edits TASK-002 "Handle expired sessions and add a regression test."
-kanban rerun TASK-002
+kanban4ai edits TASK-002 "Handle expired sessions and add a regression test."
+kanban4ai rerun TASK-002
 ```
 
 The review edits are added to the thread when the task is rerun. The TUI also
-provides a Review-edits field and a Save & Re-run action.
+provides a Review-edits field (`Ctrl+S` saves it) and a separate Re-run action
+(`Ctrl+R` or the action-bar button) that folds the saved edits into the thread
+and relaunches the agent.
 
 ### 4. TUI essentials
 
 Start the board with:
 
 ```sh
-kanban tui
+kanban4ai tui
+```
+or
+```sh
+kanban4ai
 ```
 
 Use `↑`/`↓`/`←`/`→` to move focus, `Tab` or `Shift+Tab` to change columns,
-`Enter` for task details, `s` to delegate, `n` to create, `e` to edit, `m` to
-move, `w` to answer a question, `r` to recover a crashed task, `a` to view
+`Enter` for task details, `r` to run the task on an agent (immediate, no
+confirmation), `n` to create in the focused column, `A` to archive all Done
+tasks, `R` to move all In Progress tasks to Review, `e` to edit, `m` to move, `w` to answer a
+question, `y` to approve Review → Done, `t` to attach to the task's agent,
+`c` to add context or a suggestion, `u` to recover a crashed task, `a` to view
 archived tasks, `l` to view running sessions, `/` to search, `?` for help, and
-`q` to quit. Press `Ctrl+T` to change and persist the theme.
+press `Ctrl+C` twice within 3 seconds to quit. Press `s` on the board or task
+detail to open Project Settings, where you can edit the project name, default
+backend, that backend's default model/effort/persona, and theme; the Board
+status-bar hint is clickable when
+it fits. `Ctrl+T` remains the quick theme toggle. All action keys work from
+the board and from the detail view, which also offers clickable action buttons
+and an inline panel for answering agent questions.
+
+The sessions view marks each session `▶` live or `✖` crashed; there `Enter`
+attaches, `v` opens a scrollable pager over the session log, `x` kills the
+session after a confirmation, and `o` jumps to the session's task. In the
+archive view `Enter` opens an archived task and `u` restores it to To Do. The
+status bar shows the shortcuts for the current screen and its hints are
+clickable.
 
 ### 5. Sessions, archives, and data
 
 Useful maintenance commands are:
 
 ```sh
-kanban sessions
-kanban attach TASK-002
-kanban archive
-kanban archive-done
+kanban4ai sessions
+kanban4ai attach TASK-002
+kanban4ai archive
+kanban4ai archive-done
 ```
 
 `attach` connects to a running agent's tmux session when one exists.
