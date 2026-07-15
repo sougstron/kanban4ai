@@ -941,14 +941,13 @@ fn review_editor_navigation_and_thread_focus_are_distinct() {
         "abcdeтf"
     );
 
-    // Esc leaves the editor first but does not close the task detail.
+    // Esc leaves the editor first, then closes the task detail from thread focus.
     app.handle_key(key(KeyCode::Esc)).unwrap();
     assert_eq!(app.screen, Screen::Detail);
     assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
     app.handle_key(key(KeyCode::Esc)).unwrap();
-    assert_eq!(app.screen, Screen::Detail);
-    app.handle_key(key(KeyCode::Char('q'))).unwrap();
     assert_eq!(app.screen, Screen::Board);
+    assert!(app.detail.is_none());
 }
 
 #[test]
@@ -1120,11 +1119,11 @@ fn run_hotkey_starts_task_without_confirmation() {
 }
 
 #[test]
-fn enter_runs_open_detail_task() {
-    let (dir, mut app) = app_with_board();
+fn enter_is_inactive_on_open_detail_task() {
+    let (_dir, mut app) = app_with_board();
     let task = app
         .ops
-        .create_task(NewTask::titled("Run from detail"))
+        .create_task(NewTask::titled("Do not run from detail"))
         .expect("create task");
     app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
     app.clamp_focus();
@@ -1134,16 +1133,15 @@ fn enter_runs_open_detail_task() {
     assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
 
     app.handle_key(key(KeyCode::Enter))
-        .expect("run from detail");
+        .expect("ignore enter in detail");
 
-    assert!(app.modal.is_none(), "enter run must not open any dialog");
-    assert!(app.status.starts_with("Started"), "status: {}", app.status);
-    assert_eq!(app.screen, Screen::Board);
-    assert!(app.detail.is_none(), "run should close the task detail");
-    let started = app.ops.get_task(&task.id).unwrap().unwrap();
-    assert_eq!(started.status.as_str(), "in_progress");
-    let session_id = started.session.expect("session assigned");
-    assert!(SessionManager::new(dir.path()).is_session_active(&session_id));
+    assert!(app.modal.is_none(), "enter must not open any dialog");
+    assert_eq!(app.status, "TUI ready");
+    assert_eq!(app.screen, Screen::Detail);
+    assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
+    let unchanged = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(unchanged.status.as_str(), "todo");
+    assert!(unchanged.session.is_none());
 }
 
 #[test]
@@ -1890,18 +1888,25 @@ fn phase_three_headers_targeted_creation_and_bulk_confirmation_work() {
             .len(),
         1
     );
+    let task = app
+        .ops
+        .list_tasks(Some("in_progress"), None, "created", "asc")
+        .unwrap()
+        .remove(0);
+    app.ops.move_task(&task.id, "review", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
 
     app.handle_key(key(KeyCode::Char('b')))
-        .expect("bulk review dialog");
+        .expect("review-done dialog");
     assert!(matches!(
         app.modal.as_ref().expect("confirm modal").modal,
         Modal::BulkConfirm { .. }
     ));
     app.handle_key(key(KeyCode::Char('y'))).unwrap();
-    assert!(app.status.contains("Moved 1 task(s) to Review"));
+    assert!(app.status.contains("Marked 1 Review task(s) Done"));
     assert_eq!(
         app.ops
-            .list_tasks(Some("review"), None, "created", "asc")
+            .list_tasks(Some("done"), None, "created", "asc")
             .unwrap()
             .len(),
         1
@@ -2082,15 +2087,15 @@ fn phase_three_scroll_truncation_and_session_cache_render() {
 }
 
 #[test]
-fn phase_three_bulk_reconfirms_when_source_set_changes() {
+fn phase_three_mark_review_done_reconfirms_when_source_set_changes() {
     let (_dir, mut app) = app_with_board();
     let first = app.ops.create_task(NewTask::titled("First")).unwrap();
-    app.ops.move_task(&first.id, "in_progress", false).unwrap();
+    app.ops.move_task(&first.id, "review", false).unwrap();
     app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
     app.handle_key(key(KeyCode::Char('b'))).unwrap();
 
     let second = app.ops.create_task(NewTask::titled("Second")).unwrap();
-    app.ops.move_task(&second.id, "in_progress", false).unwrap();
+    app.ops.move_task(&second.id, "review", false).unwrap();
     app.handle_key(key(KeyCode::Char('y'))).unwrap();
 
     assert!(app.status.contains("Tasks changed"));
@@ -2100,7 +2105,7 @@ fn phase_three_bulk_reconfirms_when_source_set_changes() {
     ));
     assert_eq!(
         app.ops
-            .list_tasks(Some("in_progress"), None, "created", "asc")
+            .list_tasks(Some("review"), None, "created", "asc")
             .unwrap()
             .len(),
         2
@@ -2399,7 +2404,7 @@ fn phase_six_sessions_show_state_kill_confirm_and_log_view() {
     let log = render_snapshot(&mut app);
     assert!(log.contains("line one"));
     insta::assert_snapshot!("phase_six_log_view", log);
-    app.handle_key(key(KeyCode::Char('q'))).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
     assert_eq!(app.screen, Screen::Sessions);
 
     // `x` kills only after the confirmation.
@@ -2438,6 +2443,7 @@ fn phase_six_session_task_detail_returns_to_sessions() {
     assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
     app.handle_key(key(KeyCode::Char('q'))).unwrap();
     assert_eq!(app.screen, Screen::Sessions);
+    assert!(app.detail.is_none());
     app.handle_key(key(KeyCode::Esc)).unwrap();
     assert_eq!(app.screen, Screen::Board);
 }
@@ -2485,8 +2491,9 @@ fn phase_six_archive_restore_confirms_and_returns_task_to_todo() {
             .as_str(),
         "todo"
     );
-    app.handle_key(key(KeyCode::Char('q'))).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
     assert_eq!(app.screen, Screen::Archive);
+    assert!(app.detail.is_none());
 }
 
 #[test]
@@ -2494,7 +2501,7 @@ fn phase_seven_status_bar_is_contextual_and_clickable() {
     let (_dir, mut app) = app_with_board();
     let rendered = render_at(&mut app, 140, 18);
     assert!(rendered.contains("n new"));
-    assert!(rendered.contains("b bulk review"));
+    assert!(rendered.contains("b review done"));
     let help_hit = app
         .hitboxes
         .iter()
@@ -2525,7 +2532,7 @@ fn phase_seven_status_bar_is_contextual_and_clickable() {
     // A narrow terminal drops low-priority segments instead of clipping.
     let narrow = render_at(&mut app, 48, 18);
     assert!(narrow.contains("r run"));
-    assert!(!narrow.contains("b bulk review"));
+    assert!(!narrow.contains("b review done"));
 }
 
 #[test]

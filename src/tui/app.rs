@@ -34,6 +34,7 @@ use super::theme::Theme;
 
 const CTRL_C_EXIT_PROMPT: &str = "Press ctrl + C again to close";
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(3);
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -49,7 +50,6 @@ pub enum Screen {
 pub struct TuiSettings {
     pub project_name: String,
     pub card_height_lines: u16,
-    pub card_line_max_symbols: usize,
     pub max_tasks_per_column: usize,
     pub refresh_interval: Duration,
     pub theme_name: String,
@@ -140,8 +140,9 @@ pub enum UiAction {
     OpenSettings,
     SaveReviewEdits,
     ArchiveAllDone,
-    BulkToReview,
+    MarkReviewDone,
     FocusQuestions,
+    ClearSearch,
     ViewLog,
     KillSession,
     OpenSessionTask,
@@ -254,7 +255,7 @@ pub struct App {
     /// The last card selected by a mouse click; a second click on the same
     /// card opens the detail. Keyboard navigation clears it so a card focused
     /// by keys still needs two clicks.
-    last_clicked: Option<(usize, usize)>,
+    last_clicked: Option<(usize, usize, Instant)>,
     pending_attach: Option<String>,
     pending_fs_reload: bool,
     fs_change_generation: u64,
@@ -356,6 +357,7 @@ impl App {
             (KeyCode::Esc, _) if self.screen == Screen::Board && !self.search.text().is_empty() => {
                 self.clear_search();
             }
+            (KeyCode::Esc, _) if self.screen == Screen::Detail => self.close_detail()?,
             (KeyCode::Char('q'), _) => {
                 if self.screen == Screen::Detail {
                     self.close_detail()?;
@@ -379,8 +381,10 @@ impl App {
                 self.dispatch(UiAction::Rerun)?
             }
             (KeyCode::Char('/'), _) => self.dispatch(UiAction::Search)?,
-            (KeyCode::Enter, _) if self.screen == Screen::Detail => self.dispatch(UiAction::Run)?,
-            (KeyCode::Enter, _) => self.dispatch(UiAction::OpenDetail)?,
+            (KeyCode::Enter, _) if self.screen != Screen::Detail => {
+                self.dispatch(UiAction::OpenDetail)?
+            }
+
             (KeyCode::Char('n'), _) if action_screen => self.dispatch(UiAction::NewTask)?,
             (KeyCode::Char('e'), _) if action_screen => self.dispatch(UiAction::EditTask)?,
             (KeyCode::Char('m'), _) if action_screen => self.dispatch(UiAction::MoveTask)?,
@@ -393,16 +397,14 @@ impl App {
             (KeyCode::Char('u'), _) if self.screen == Screen::Archive => {
                 self.dispatch(UiAction::Restore)?
             }
-            (KeyCode::Char('d'), _) | (KeyCode::Delete, _) | (KeyCode::Backspace, _)
-                if action_screen =>
-            {
+            (KeyCode::Char('d'), _) | (KeyCode::Delete, _) if action_screen => {
                 self.dispatch(UiAction::DeleteTask)?;
             }
             (KeyCode::Char('A'), _) if self.screen == Screen::Board => {
                 self.dispatch(UiAction::ArchiveAllDone)?
             }
             (KeyCode::Char('b'), _) | (KeyCode::Char('R'), _) if self.screen == Screen::Board => {
-                self.dispatch(UiAction::BulkToReview)?
+                self.dispatch(UiAction::MarkReviewDone)?
             }
             (KeyCode::Char('a'), _) => self.dispatch(UiAction::OpenArchive)?,
             (KeyCode::Char('l'), _) => self.dispatch(UiAction::OpenSessions)?,
@@ -711,8 +713,9 @@ impl App {
             UiAction::OpenSettings => self.open_settings_dialog(),
             UiAction::SaveReviewEdits => self.save_review_edits()?,
             UiAction::ArchiveAllDone => self.open_bulk_confirm(BulkAction::ArchiveAllDone),
-            UiAction::BulkToReview => self.open_bulk_confirm(BulkAction::BulkToReview),
+            UiAction::MarkReviewDone => self.open_bulk_confirm(BulkAction::MarkReviewDone),
             UiAction::FocusQuestions => self.focus_first_question(),
+            UiAction::ClearSearch => self.clear_search(),
             UiAction::ViewLog => self.open_log_view(),
             UiAction::KillSession => self.open_kill_confirm(),
             UiAction::OpenSessionTask => self.open_session_task_detail()?,
@@ -753,12 +756,11 @@ impl App {
                 .get(card)
                 .map(|task| task.id.clone())
         {
-            let was_clicked =
-                self.screen == Screen::Board && self.last_clicked == Some((column, card));
+            let was_clicked = self.screen == Screen::Board && self.recent_card_click(column, card);
             self.screen = Screen::Board;
             self.focused_column = column;
             self.focused_card = card;
-            self.last_clicked = Some((column, card));
+            self.record_card_click(column, card);
             self.ensure_focused_visible();
             self.dragging = Some(DragState {
                 task_id,
@@ -777,7 +779,9 @@ impl App {
         let target = self.column_at(x, y);
         if let Some(dragging) = self.dragging.as_mut() {
             dragging.target_column = target;
-            dragging.moved = true;
+            if target.is_some_and(|target| target != dragging.from_column) {
+                dragging.moved = true;
+            }
         }
     }
 
@@ -900,12 +904,11 @@ impl App {
     }
 
     fn click_card(&mut self, column: usize, card: usize) -> Result<()> {
-        let already_clicked =
-            self.screen == Screen::Board && self.last_clicked == Some((column, card));
+        let already_clicked = self.screen == Screen::Board && self.recent_card_click(column, card);
         self.screen = Screen::Board;
         self.focused_column = column;
         self.focused_card = card;
-        self.last_clicked = Some((column, card));
+        self.record_card_click(column, card);
         self.ensure_focused_visible();
         if already_clicked {
             self.open_focused_detail()?;
@@ -1026,7 +1029,9 @@ impl App {
 
     pub fn tick(&mut self) -> Result<()> {
         self.reload_if_changed()?;
-        self.expire_ctrl_c_prompt_at(Instant::now());
+        let now = Instant::now();
+        self.expire_ctrl_c_prompt_at(now);
+        self.expire_last_clicked_at(now);
         self.expire_session_states_at(timefmt::now());
         self.resume_expired_waits_throttled();
         // Log writes bypass the fs watcher (it only covers board dirs), so
@@ -1048,6 +1053,25 @@ impl App {
         if self.status == CTRL_C_EXIT_PROMPT {
             self.status.clear();
         }
+    }
+
+    pub(crate) fn expire_last_clicked_at(&mut self, now: Instant) {
+        let Some((_, _, clicked_at)) = self.last_clicked else {
+            return;
+        };
+        if now.duration_since(clicked_at) > DOUBLE_CLICK_WINDOW {
+            self.last_clicked = None;
+        }
+    }
+
+    fn recent_card_click(&mut self, column: usize, card: usize) -> bool {
+        self.expire_last_clicked_at(Instant::now());
+        self.last_clicked
+            .is_some_and(|(last_column, last_card, _)| last_column == column && last_card == card)
+    }
+
+    fn record_card_click(&mut self, column: usize, card: usize) {
+        self.last_clicked = Some((column, card, Instant::now()));
     }
 
     pub(crate) fn expire_session_states_at(&mut self, now: chrono::NaiveDateTime) {
@@ -1488,11 +1512,12 @@ impl App {
         let messages = ThreadManager::new(&self.project_path)?
             .load(task_id)?
             .messages;
-        let review_edits = TextArea::from(
+        let mut review_edits = TextArea::from(
             task.as_ref()
                 .map(|task| lines_or_empty(&task.review_edits))
                 .unwrap_or_else(|| vec![String::new()]),
         );
+        review_edits.set_cursor_line_style(ratatui::style::Style::default());
         self.detail = Some(DetailState {
             task_id: task_id.to_string(),
             task,
@@ -1503,7 +1528,11 @@ impl App {
             max_scroll: u16::MAX,
             review_edits,
             focus: DetailFocus::Thread,
-            answer_input: TextArea::default(),
+            answer_input: {
+                let mut input = TextArea::default();
+                input.set_cursor_line_style(ratatui::style::Style::default());
+                input
+            },
             question_index: 0,
             variant_selected: 0,
         });
@@ -1533,7 +1562,7 @@ impl App {
     fn open_bulk_confirm(&mut self, action: BulkAction) {
         let status = match action {
             BulkAction::ArchiveAllDone => TaskStatus::Done,
-            BulkAction::BulkToReview => TaskStatus::InProgress,
+            BulkAction::MarkReviewDone => TaskStatus::Review,
         };
         let task_ids = self
             .board
@@ -1551,7 +1580,7 @@ impl App {
         if task_ids.is_empty() {
             self.status = match action {
                 BulkAction::ArchiveAllDone => "No Done tasks to archive".to_string(),
-                BulkAction::BulkToReview => "No In Progress tasks to move".to_string(),
+                BulkAction::MarkReviewDone => "No Review tasks to mark done".to_string(),
             };
             return;
         }
@@ -2560,7 +2589,7 @@ impl App {
             Modal::BulkConfirm { action, task_ids } => {
                 let (from, to) = match action {
                     BulkAction::ArchiveAllDone => (TaskStatus::Done, TaskStatus::Archive),
-                    BulkAction::BulkToReview => (TaskStatus::InProgress, TaskStatus::Review),
+                    BulkAction::MarkReviewDone => (TaskStatus::Review, TaskStatus::Done),
                 };
                 let Some(moved) = self.ops.bulk_move_exact(from, to, &task_ids)? else {
                     self.refresh_after_action()?;
@@ -2575,7 +2604,9 @@ impl App {
                 self.refresh_after_action()?;
                 self.status = match action {
                     BulkAction::ArchiveAllDone => format!("Archived {} task(s)", moved.len()),
-                    BulkAction::BulkToReview => format!("Moved {} task(s) to Review", moved.len()),
+                    BulkAction::MarkReviewDone => {
+                        format!("Marked {} Review task(s) Done", moved.len())
+                    }
                 };
             }
             Modal::AddMessage { task_id } => {
@@ -3051,7 +3082,6 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
     Ok(TuiSettings {
         project_name: tui_string(&config.tui, "name", "Kanban"),
         card_height_lines,
-        card_line_max_symbols: tui_int(&config.tui, "card_line_max_symbols", 40).max(1) as usize,
         max_tasks_per_column: tui_int(&config.tui, "max_tasks_per_column", 100).max(1) as usize,
         refresh_interval: Duration::from_secs(
             ops.config.get_threshold("tui_refresh_interval")?.max(1) as u64,

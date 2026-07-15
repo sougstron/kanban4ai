@@ -1,11 +1,12 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 2087
 expression: crashed
 ---
 ┌ To Do (4) ───────────┐┌ In Progress (0) ─────┐┌ Review (0) ──────────┐┌ Done (0) ────────────┐
 │┌────────────────────┐││No tasks              ││No tasks              ││No tasks              │
 ││TASK-001 Running    │││                      ││                      ││                      │
-││✖ crashed · u recove│││                      ││                      ││                      │
+││✖ crashed · u recov…│││                      ││                      ││                      │
 │└────────────────────┘││                      ││                      ││                      │
 │┌────────────────────┐││                      ││                      ││                      │
 ││TASK-002 Truncated 0│││                      ││                      ││                      │

@@ -71,11 +71,7 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             format!("({matching})")
         };
-        let mut title = format!(" {} {count} ", sanitize_terminal_text(&column.name));
-        let available = areas[index].width.saturating_sub(2) as usize;
-        if UnicodeWidthStr::width(title.as_str()) > available {
-            title = format!(" {count} ");
-        }
+        let title = column_title(&column.name, &count, areas[index].width.saturating_sub(2));
         let block = Block::default()
             .title(title.clone())
             .borders(Borders::ALL)
@@ -99,6 +95,25 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         });
     }
     app.hitboxes = hitboxes;
+}
+
+fn column_title(name: &str, count: &str, available: u16) -> String {
+    let name = sanitize_terminal_text(name);
+    let full = format!(" {name} {count} ");
+    let available = available as usize;
+    if UnicodeWidthStr::width(full.as_str()) <= available {
+        return full;
+    }
+    let count_width = UnicodeWidthStr::width(count);
+    let reserved = count_width.saturating_add(3);
+    if available > reserved + 1 {
+        let name_width = available - reserved;
+        format!(" {} {count} ", truncate_display(&name, name_width))
+    } else if available > count_width + 2 {
+        format!(" … {count} ")
+    } else {
+        format!(" {count} ")
+    }
 }
 
 fn render_cards(frame: &mut Frame<'_>, app: &App, column_index: usize, area: Rect) -> Vec<Hitbox> {
@@ -214,8 +229,8 @@ fn seg(label: &'static str, action: Option<UiAction>, priority: u8) -> StatusSeg
     }
 }
 
-fn status_segments(screen: Screen) -> Vec<StatusSegment> {
-    match screen {
+fn status_segments(app: &App) -> Vec<StatusSegment> {
+    match app.screen {
         Screen::Board => vec![
             seg("n new", Some(UiAction::NewTask), 2),
             seg("e edit", Some(UiAction::EditTask), 4),
@@ -223,19 +238,27 @@ fn status_segments(screen: Screen) -> Vec<StatusSegment> {
             seg("m move", Some(UiAction::MoveTask), 4),
             seg("y approve", Some(UiAction::Approve), 5),
             seg("A archive done", Some(UiAction::ArchiveAllDone), 6),
-            seg("b bulk review", Some(UiAction::BulkToReview), 6),
+            seg("b review done", Some(UiAction::MarkReviewDone), 6),
             seg("/ filter", Some(UiAction::Search), 3),
             seg("s settings", Some(UiAction::OpenSettings), 7),
             seg("? help", Some(UiAction::Help), 1),
         ],
-        Screen::Detail => vec![
-            seg("r run", Some(UiAction::Run), 1),
-            seg("w answer", Some(UiAction::AnswerQuestion), 3),
-            seg("y approve", Some(UiAction::Approve), 3),
-            seg("Tab editor", None, 4),
-            seg("Ctrl+S save", Some(UiAction::SaveReviewEdits), 4),
-            seg("q back", None, 2),
-        ],
+        Screen::Detail => {
+            let show_tab = app.detail.as_ref().is_some_and(|detail| {
+                !detail.open_questions().is_empty() || detail.show_edits_panel()
+            });
+            let mut segments = vec![
+                seg("r run", Some(UiAction::Run), 1),
+                seg("w answer", Some(UiAction::AnswerQuestion), 3),
+                seg("y approve", Some(UiAction::Approve), 3),
+            ];
+            if show_tab {
+                segments.push(seg("Tab editor", None, 4));
+                segments.push(seg("Ctrl+S save", Some(UiAction::SaveReviewEdits), 4));
+            }
+            segments.push(seg("q/Esc back", None, 2));
+            segments
+        }
         Screen::Sessions => vec![
             seg("Enter attach", Some(UiAction::OpenDetail), 1),
             seg("v log", Some(UiAction::ViewLog), 2),
@@ -296,6 +319,7 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .count();
     let mut spans = Vec::new();
     let mut x = area.x;
+    let end = area.x.saturating_add(area.width);
     if question_count > 0 {
         let chip = format!(" ? {question_count} questions ");
         let width = UnicodeWidthStr::width(chip.as_str()) as u16;
@@ -314,14 +338,27 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let filter = truncate_display(&sanitize_terminal_text(&app.search.text()), 32);
     if !filter.is_empty() && !app.search.active {
         let chip = format!(" Filter: \"{filter}\" · Esc clear ");
-        x = x.saturating_add(UnicodeWidthStr::width(chip.as_str()) as u16);
+        let width = UnicodeWidthStr::width(chip.as_str()) as u16;
+        app.hitboxes.push(Hitbox {
+            area: Rect {
+                x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            action: HitAction::Action(UiAction::ClearSearch),
+        });
         spans.push(Span::styled(chip, Style::default().fg(app.theme.warn)));
+        x = x.saturating_add(width);
     }
-    let message = format!(" {} │", sanitize_terminal_text(&app.status));
+    let remaining = end.saturating_sub(x);
+    let max_message_width = remaining.saturating_sub(20).max(remaining / 3) as usize;
+    let raw_message = format!(" {} │", sanitize_terminal_text(&app.status));
+    let message = truncate_display(&raw_message, max_message_width.max(1));
     x = x.saturating_add(UnicodeWidthStr::width(message.as_str()) as u16);
     spans.push(Span::raw(message));
-    let available = area.x.saturating_add(area.width).saturating_sub(x);
-    for (index, segment) in fit_segments(status_segments(app.screen), available)
+    let available = end.saturating_sub(x);
+    for (index, segment) in fit_segments(status_segments(app), available)
         .into_iter()
         .enumerate()
     {
@@ -408,16 +445,17 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  w: answer question · y: approve Review → Done"),
         Line::from("  t: attach to the task's agent · c: add context/suggestion"),
         Line::from("  u: recover a crashed task · Ctrl+R: fold edits and re-run"),
-        Line::from("  A: archive all Done · b: move all In Progress to Review (R also works)"),
+        Line::from("  A: archive all Done · b: mark all Review tasks Done (R also works)"),
         Line::from("  a/l: archive and sessions views"),
         Line::from("  /: search · Esc clears an active filter"),
         Line::from("  s: project settings · Ctrl+T: cycle and persist theme"),
         Line::from(""),
         Line::from("Detail"),
-        Line::from("  Tab: cycle thread/answer/editor panels"),
+        Line::from("  Tab: cycle thread/answer/editor panels when present"),
+        Line::from("  r/buttons: run task actions; Enter is inactive in detail"),
         Line::from("  Ctrl+S: save review edits (no re-run) · Ctrl+R: re-run"),
         Line::from("  s: project settings · Ctrl+T: cycle and persist theme"),
-        Line::from("  Home/End: start/end of thread · q: back · Esc leaves text panels"),
+        Line::from("  Home/End: start/end of thread · q/Esc: back · Esc leaves text panels first"),
         Line::from(""),
         Line::from("Sessions"),
         Line::from("  ▶ live · ⏳ declared wait · ✖ crashed heartbeats"),

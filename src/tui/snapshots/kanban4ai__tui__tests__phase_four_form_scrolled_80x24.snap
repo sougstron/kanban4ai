@@ -1,12 +1,12 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 2227
+assertion_line: 2614
 expression: output
 ---
 ┌ To Do (1) ───────┐┌ In Progress (0) ─┐┌ Review (1) ──────┐┌ Done (0) ────────┐
 │┌────────────────┐││No tasks          ││┌────────────────┐││No tasks          │
 ││TASK-001 Questio│││                  │││TASK-002 Impleme│││                  │
-││? Choose a route│││                  │││Dropdown work   │││                  │
+││? Choose a rout…│││                  │││Dropdown work   │││                  │
 │└──────────┌ New task ────────────────────────────────────────────┐           │
 │           │┌ Chain to ──────────────────────────────────────────┐│           │
 │           ││› No chain                                          ││           │
