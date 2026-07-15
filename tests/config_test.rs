@@ -162,6 +162,44 @@ thresholds:
 }
 
 #[test]
+fn unknown_top_level_section_survives_load_save_and_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+custom_integration:
+  endpoint: https://example.test
+  enabled: true
+"#,
+    );
+
+    let board = config.load().unwrap();
+    assert_eq!(
+        board
+            .extras
+            .get("custom_integration")
+            .and_then(|value| value.get("endpoint"))
+            .and_then(|value| value.as_str()),
+        Some("https://example.test")
+    );
+    config.save(&board).unwrap();
+
+    let fresh = Config::new(dir.path());
+    assert_eq!(
+        fresh
+            .load()
+            .unwrap()
+            .extras
+            .get("custom_integration")
+            .and_then(|value| value.get("enabled"))
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
 fn empty_columns_is_an_error_or_defaulted() {
     let dir = tempfile::tempdir().unwrap();
     // completely empty file falls back to full defaults

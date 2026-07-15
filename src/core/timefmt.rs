@@ -23,6 +23,37 @@ pub fn now() -> NaiveDateTime {
         .unwrap_or(now)
 }
 
+/// Quote timestamp-looking YAML scalars so Python's YAML loader keeps them as
+/// strings for the legacy CLI's `datetime.fromisoformat(...)` calls.
+pub fn quote_yaml_timestamp_fields(yaml: &str, keys: &[&str]) -> String {
+    yaml.lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let indent_len = line.len() - trimmed.len();
+            if indent_len <= 2 {
+                for key in keys {
+                    let prefix = format!("{key}: ");
+                    if let Some(value) = trimmed.strip_prefix(&prefix)
+                        && !value.starts_with('\'')
+                        && !value.starts_with('"')
+                        && value != "null"
+                    {
+                        return format!(
+                            "{}{}'{}'",
+                            &line[..indent_len],
+                            prefix,
+                            value.replace('\'', "''")
+                        );
+                    }
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n"
+}
+
 pub mod serde_naive {
     use chrono::NaiveDateTime;
     use serde::{Deserialize, Deserializer, Serializer};
@@ -80,5 +111,16 @@ mod tests {
     fn now_round_trips() {
         let dt = now();
         assert_eq!(parse(&format(&dt)).unwrap(), dt);
+    }
+
+    #[test]
+    fn quotes_yaml_timestamp_fields_without_touching_block_content() {
+        let yaml = "created_at: 2026-07-01T10:13:22\n  updated_at: 2026-07-01T10:13:23\n    created_at: keep body text\nstatus: open\n";
+
+        let quoted = quote_yaml_timestamp_fields(yaml, &["created_at", "updated_at"]);
+
+        assert!(quoted.contains("created_at: '2026-07-01T10:13:22'"));
+        assert!(quoted.contains("  updated_at: '2026-07-01T10:13:23'"));
+        assert!(quoted.contains("    created_at: keep body text"));
     }
 }

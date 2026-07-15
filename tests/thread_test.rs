@@ -50,6 +50,45 @@ fn post_question_and_answer_flow() {
 }
 
 #[test]
+fn saved_thread_quotes_timestamps_for_legacy_python_yaml() {
+    let (dir, manager, task_id) = setup();
+
+    let question = manager
+        .post(
+            &task_id,
+            MessageRole::Agent,
+            MessageKind::Question,
+            "JWT or cookies?",
+            None,
+            vec![],
+            Some("opencode".into()),
+        )
+        .unwrap();
+    manager
+        .answer(&task_id, &question.id, "JWT", MessageRole::Human)
+        .unwrap();
+
+    let raw = std::fs::read_to_string(
+        dir.path()
+            .join(".kanban")
+            .join("threads")
+            .join(format!("{task_id}.yaml")),
+    )
+    .unwrap();
+
+    assert!(raw.contains("  created_at: '"));
+    assert!(raw.contains("  updated_at: '"));
+    assert!(raw.contains("  resolved_at: '"));
+    assert!(!raw.contains("  created_at: 20"));
+    assert!(!raw.contains("  updated_at: 20"));
+    assert!(!raw.contains("  resolved_at: 20"));
+
+    let reloaded = manager.load(&task_id).unwrap();
+    assert_eq!(reloaded.messages.len(), 3);
+    assert_eq!(reloaded.messages[2].status, MessageStatus::Answered);
+}
+
+#[test]
 fn open_messages_defaults_to_questions_and_suggestions() {
     let (_dir, manager, task_id) = setup();
     manager
@@ -221,7 +260,7 @@ fn update_task_message_tracks_description() {
 
 #[test]
 fn remove_kind_deletes_and_bumps_rev() {
-    let (_dir, manager, task_id) = setup();
+    let (dir, manager, task_id) = setup();
     manager
         .post(
             &task_id,
@@ -259,6 +298,18 @@ fn remove_kind_deletes_and_bumps_rev() {
     );
     // untouched kinds survive
     assert_eq!(after.messages.len(), before.messages.len() - 2);
+
+    let raw = std::fs::read_to_string(
+        dir.path()
+            .join(".kanban")
+            .join("threads")
+            .join(format!("{task_id}.yaml")),
+    )
+    .unwrap();
+    assert!(raw.contains("  created_at: '"));
+    assert!(raw.contains("  updated_at: '"));
+    assert!(!raw.contains("  created_at: 20"));
+    assert!(!raw.contains("  updated_at: 20"));
 
     assert_eq!(
         manager.remove_kind(&task_id, MessageKind::Context).unwrap(),

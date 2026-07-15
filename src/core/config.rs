@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value};
 
 use crate::core::error::{KanbanError, Result};
+use crate::core::storage::atomic_write_text;
 
 /// Written verbatim by `kanban init`; also the source of per-key fallbacks.
 /// Mirrors the Python `DEFAULT_CONFIG` exactly.
@@ -82,6 +83,7 @@ agents:
     - opencode-go/deepseek-v4-flash
     - opencode-go/mimo-v2.5
     - opencode-go/minimax-m3
+    effort: null
     agent: null
     agent_options:
     - sisyphus
@@ -93,9 +95,17 @@ agents:
     command: claude
     model: sonnet
     models:
-    - sonnet
+    - fable
     - opus
+    - sonnet
     - haiku
+    effort: null
+    efforts:
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
     agent: null
     extra_args:
     - --dangerously-skip-permissions
@@ -117,6 +127,8 @@ pub struct BoardConfig {
     pub notifications: Mapping,
     #[serde(default)]
     pub agents: Mapping,
+    #[serde(flatten, default)]
+    pub extras: Mapping,
 }
 
 impl Default for BoardConfig {
@@ -222,9 +234,17 @@ impl Config {
         Ok(config)
     }
 
+    /// Discard this instance's cached view and reload the current file.
+    /// Callers that perform a locked read-modify-write use this to avoid
+    /// overwriting changes made by another process after an earlier read.
+    pub fn load_fresh(&self) -> Result<BoardConfig> {
+        *self.cache.borrow_mut() = None;
+        self.load()
+    }
+
     pub fn save(&self, config: &BoardConfig) -> Result<()> {
         fs::create_dir_all(&self.kanban_dir)?;
-        fs::write(&self.config_file, serde_yaml_ng::to_string(config)?)?;
+        atomic_write_text(&self.config_file, &serde_yaml_ng::to_string(config)?)?;
         *self.cache.borrow_mut() = Some(config.clone());
         Ok(())
     }

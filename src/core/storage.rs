@@ -182,25 +182,34 @@ impl Storage {
     }
 
     fn write_task_file(&self, filepath: &Path, task: &Task) -> Result<()> {
-        let frontmatter = serde_yaml_ng::to_string(task)?;
+        let frontmatter = timefmt::quote_yaml_timestamp_fields(
+            &serde_yaml_ng::to_string(task)?,
+            &["created_at", "updated_at"],
+        );
         let content = format!("---\n{frontmatter}---\n{}\n", task.description);
         atomic_write_text(filepath, &content)
     }
 
     pub fn create_task(&self, new_task: NewTask) -> Result<Task> {
+        self.create_task_in_status(new_task, TaskStatus::Todo)
+    }
+
+    pub fn create_task_in_status(&self, new_task: NewTask, status: TaskStatus) -> Result<Task> {
         let _guard = self.lock()?;
         let task_id = self.get_next_id()?;
         let mut task = Task::new(task_id.clone(), new_task.title);
         task.description = new_task.description;
         task.ai_model = new_task.ai_model;
+        task.ai_effort = new_task.ai_effort;
         task.agent_backend = new_task.agent_backend;
         task.agent_name = new_task.agent_name;
         task.interactive = new_task.interactive;
         task.chained_to = new_task.chained_to;
+        task.status = status;
 
         let filepath = self
             .tasks_dir
-            .join(TaskStatus::Todo.as_str())
+            .join(task.status.as_str())
             .join(format!("{task_id}.md"));
         if let Some(parent) = filepath.parent() {
             fs::create_dir_all(parent)?;
@@ -356,6 +365,7 @@ pub struct NewTask {
     pub title: String,
     pub description: String,
     pub ai_model: Option<String>,
+    pub ai_effort: Option<String>,
     pub agent_backend: Option<String>,
     pub agent_name: Option<String>,
     pub interactive: bool,

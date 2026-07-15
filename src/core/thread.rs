@@ -63,10 +63,7 @@ impl ThreadManager {
         };
         merged.task_id = task_id.to_string();
         merged.rev = current.rev + 1;
-        atomic_write_text(
-            &self.thread_file(task_id),
-            &serde_yaml_ng::to_string(&merged)?,
-        )?;
+        atomic_write_text(&self.thread_file(task_id), &serialize_thread(&merged)?)?;
         *thread = merged;
         thread.snapshot_base();
         Ok(())
@@ -267,7 +264,7 @@ impl ThreadManager {
             return Ok(0);
         }
         thread.rev += 1;
-        atomic_write_text(&thread_file, &serde_yaml_ng::to_string(&thread)?)?;
+        atomic_write_text(&thread_file, &serialize_thread(&thread)?)?;
         Ok(removed)
     }
 }
@@ -302,6 +299,14 @@ fn merge_threads(current: &Thread, desired: &Thread) -> Thread {
     }
     merged.messages.sort_by_key(message_sort_key);
     merged
+}
+
+fn serialize_thread(thread: &Thread) -> Result<String> {
+    let yaml = serde_yaml_ng::to_string(thread)?;
+    Ok(timefmt::quote_yaml_timestamp_fields(
+        &yaml,
+        &["created_at", "updated_at", "resolved_at"],
+    ))
 }
 
 fn next_msg_id_for_thread(thread: &Thread) -> String {

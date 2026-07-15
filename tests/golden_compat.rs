@@ -164,6 +164,7 @@ fn parses_python_written_session_files() {
     let session: Session = serde_yaml_ng::from_str(&raw).unwrap();
     assert_eq!(session.id, "ses-claude-20260702-091228");
     assert_eq!(session.task_id, "TASK-087");
+    assert_eq!(session.name, None);
     assert_eq!(session.status, SessionStatus::Closed);
     assert!(session.ended_at.is_some());
 
@@ -204,6 +205,7 @@ fn rust_written_task_is_parseable_and_stable() {
             title: "Round trip".into(),
             description: "line one\n\nline two with --- dashes".into(),
             ai_model: Some("sonnet".into()),
+            ai_effort: Some("high".into()),
             agent_backend: Some("claude".into()),
             agent_name: None,
             interactive: true,

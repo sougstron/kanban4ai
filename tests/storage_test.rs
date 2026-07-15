@@ -46,6 +46,75 @@ fn create_task_assigns_sequential_ids_in_todo() {
 }
 
 #[test]
+fn saved_task_quotes_timestamps_for_legacy_python_yaml() {
+    let (dir, storage) = temp_board();
+    let task = storage.create_task(NewTask::titled("Timestamped")).unwrap();
+
+    let raw = fs::read_to_string(
+        dir.path()
+            .join(".kanban")
+            .join("tasks")
+            .join("todo")
+            .join(format!("{}.md", task.id)),
+    )
+    .unwrap();
+
+    assert!(raw.contains("\ncreated_at: '"));
+    assert!(raw.contains("\nupdated_at: '"));
+    assert!(!raw.contains("\ncreated_at: 20"));
+    assert!(!raw.contains("\nupdated_at: 20"));
+    assert!(storage.load_task(&task.id).unwrap().is_some());
+}
+
+#[test]
+fn saved_session_quotes_timestamps_for_legacy_python_yaml() {
+    let (dir, _storage) = temp_board();
+    let manager = SessionManager::new(dir.path());
+
+    manager.link_session("TASK-001", "ses-test").unwrap();
+    manager.close_session("ses-test").unwrap();
+
+    let raw = fs::read_to_string(
+        dir.path()
+            .join(".kanban")
+            .join("sessions")
+            .join("ses-test.yaml"),
+    )
+    .unwrap();
+
+    assert!(raw.contains("\nstarted_at: '"));
+    assert!(raw.contains("\nlast_seen: '"));
+    assert!(raw.contains("\nended_at: '"));
+    assert!(!raw.contains("\nname:"));
+    assert!(!raw.contains("\nstarted_at: 20"));
+    assert!(!raw.contains("\nlast_seen: 20"));
+    assert!(!raw.contains("\nended_at: 20"));
+    assert!(manager.load_session("ses-test").is_some());
+}
+
+#[test]
+fn named_session_persists_human_readable_task_name() {
+    let (dir, _storage) = temp_board();
+    let manager = SessionManager::new(dir.path());
+
+    manager
+        .link_named_session("TASK-001", "ses-named", "Implement login")
+        .unwrap();
+
+    let loaded = manager.load_session("ses-named").unwrap();
+    assert_eq!(loaded.name.as_deref(), Some("Implement login"));
+
+    let raw = fs::read_to_string(
+        dir.path()
+            .join(".kanban")
+            .join("sessions")
+            .join("ses-named.yaml"),
+    )
+    .unwrap();
+    assert!(raw.contains("\nname: Implement login\n"));
+}
+
+#[test]
 fn concurrent_creates_assign_unique_ids() {
     let (dir, _storage) = temp_board();
     let workers = 8;
