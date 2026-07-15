@@ -128,7 +128,12 @@ fn render_cards(frame: &mut Frame<'_>, app: &App, column_index: usize, area: Rec
         .take(visible)
         .collect::<Vec<_>>();
     if tasks.is_empty() {
-        let paragraph = Paragraph::new("No tasks")
+        let message = if app.board.columns[column_index].id == "todo" {
+            "press n to create task"
+        } else {
+            "No tasks"
+        };
+        let paragraph = Paragraph::new(message)
             .style(Style::default().fg(app.theme.muted))
             .wrap(Wrap { trim: true });
         frame.render_widget(paragraph, area);
@@ -434,7 +439,7 @@ fn render_help(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
 fn help_lines() -> Vec<Line<'static>> {
     vec![
-        Line::from("kanban4ai TUI"),
+        Line::from(concat!("kanban4ai TUI v", env!("CARGO_PKG_VERSION"))),
         Line::from(""),
         Line::from("Board"),
         Line::from("  ←/→ or Tab/Shift+Tab: switch columns"),

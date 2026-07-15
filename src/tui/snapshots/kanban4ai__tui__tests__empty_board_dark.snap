@@ -1,10 +1,9 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 178
 expression: render_snapshot(&mut app)
 ---
 ┌ To Do (0) ───────────┐┌ In Progress (0) ─────┐┌ Review (0) ──────────┐┌ Done (0) ────────────┐
-│No tasks              ││No tasks              ││No tasks              ││No tasks              │
+│press n to create task││No tasks              ││No tasks              ││No tasks              │
 │                      ││                      ││                      ││                      │
 │                      ││                      ││                      ││                      │
 │                      ││                      ││                      ││                      │

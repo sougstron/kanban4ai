@@ -2539,7 +2539,11 @@ fn phase_seven_status_bar_is_contextual_and_clickable() {
 fn phase_seven_help_overlay_scrolls_and_toggles() {
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('?'))).unwrap();
-    let _ = render_at(&mut app, 80, 20);
+    let rendered = render_at(&mut app, 80, 20);
+    assert!(
+        rendered.contains(concat!("kanban4ai TUI v", env!("CARGO_PKG_VERSION"))),
+        "help overlay should show the current app version: {rendered}"
+    );
     assert!(app.help_max_scroll > 0, "help must scroll at 80x20");
     app.handle_key(key(KeyCode::Down)).unwrap();
     assert_eq!(app.help_scroll, 1);
