@@ -108,7 +108,16 @@ fn missing_sections_are_filled_with_defaults() {
     assert!(config.get_rule("auto_move_on_assign").unwrap());
     assert_eq!(
         config.get_threshold("session_heartbeat_timeout").unwrap(),
-        300
+        1800
+    );
+    assert_eq!(config.get_threshold("max_auto_resumes").unwrap(), 3);
+    assert_eq!(config.get_threshold("waiting_min_eta").unwrap(), 10);
+    assert_eq!(config.get_threshold("waiting_max_eta").unwrap(), 604800);
+    assert_eq!(config.get_threshold("waiting_default_eta").unwrap(), 900);
+    assert_eq!(config.get_threshold("waiting_eta_multiplier").unwrap(), 2);
+    assert_eq!(
+        config.get_threshold("waiting_note_max_chars").unwrap(),
+        1000
     );
 
     let board = config.load().unwrap();

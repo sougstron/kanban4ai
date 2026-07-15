@@ -38,11 +38,17 @@ thresholds:
   context_embed_max_size: 5120
   context_warning: 51200
   context_auto_compact: 102400
-  session_heartbeat_timeout: 300
+  session_heartbeat_timeout: 1800
   context_summary_max_length: 5000
   tui_refresh_interval: 1
   question_poll_interval: 3
   question_wait_timeout: 600
+  max_auto_resumes: 3
+  waiting_min_eta: 10
+  waiting_max_eta: 604800
+  waiting_default_eta: 900
+  waiting_eta_multiplier: 2
+  waiting_note_max_chars: 1000
 tui:
   name: Kanban
   card_height_lines: 4
@@ -69,6 +75,7 @@ notifications:
   questions: true
   completion: true
   chained_start: true
+  waiting: true
   command: notify-send
   timeout: 3
   max_body_chars: 240
@@ -322,8 +329,13 @@ impl Config {
             }
         }
 
-        const BOOL_NOTIFICATIONS: [&str; 4] =
-            ["enabled", "questions", "completion", "chained_start"];
+        const BOOL_NOTIFICATIONS: [&str; 5] = [
+            "enabled",
+            "questions",
+            "completion",
+            "chained_start",
+            "waiting",
+        ];
         const INT_NOTIFICATIONS: [&str; 2] = ["timeout", "max_body_chars"];
         let notifications = config.notifications.clone();
         for (key, value) in &notifications {

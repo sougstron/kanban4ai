@@ -11,6 +11,7 @@ pub struct NotificationConfig {
     pub questions: bool,
     pub completion: bool,
     pub chained_start: bool,
+    pub waiting: bool,
     pub command: String,
     pub timeout: u64,
     pub max_body_chars: usize,
@@ -23,6 +24,7 @@ impl Default for NotificationConfig {
             questions: true,
             completion: true,
             chained_start: true,
+            waiting: true,
             command: "notify-send".to_string(),
             timeout: 3,
             max_body_chars: 240,
@@ -40,6 +42,7 @@ impl NotificationConfig {
             questions: get_bool("questions", defaults.questions),
             completion: get_bool("completion", defaults.completion),
             chained_start: get_bool("chained_start", defaults.chained_start),
+            waiting: get_bool("waiting", defaults.waiting),
             command: data
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -83,6 +86,25 @@ impl DesktopNotifier {
             return false;
         }
         self.send(&format!("Kanban task {status}: {task_id}"), title, "normal")
+    }
+
+    pub fn waiting(&self, task_id: &str, title: &str, note: &str, deadline: &str) -> bool {
+        if !self.config.waiting {
+            return false;
+        }
+        self.send(
+            &format!("Kanban task waiting: {task_id}"),
+            &format!("{title}\n{note}\nRelaunch deadline: {deadline}"),
+            "normal",
+        )
+    }
+
+    pub fn stranded(&self, task_id: &str, title: &str, detail: &str) -> bool {
+        self.send(
+            &format!("Kanban task stranded: {task_id}"),
+            &format!("{title}\n{detail}"),
+            "critical",
+        )
     }
 
     pub fn chained_start(&self, task_id: &str, title: &str, target_task_id: &str) -> bool {

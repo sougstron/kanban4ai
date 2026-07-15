@@ -229,6 +229,16 @@ pub struct Task {
     pub chained_to: Option<String>,
     #[serde(default)]
     pub review_edits: String,
+    /// Automatic relaunches consumed after clean agent exits that left the
+    /// task In Progress without `done`/`ask`/`waiting`. Reset whenever a
+    /// human (re)starts the task. Omitted from frontmatter while zero so
+    /// legacy boards round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub auto_resumes: u32,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 fn default_task_status() -> TaskStatus {
@@ -256,6 +266,7 @@ impl Task {
             interactive: false,
             chained_to: None,
             review_edits: String::new(),
+            auto_resumes: 0,
         }
     }
 }
@@ -280,6 +291,27 @@ pub struct Session {
         skip_serializing_if = "Option::is_none"
     )]
     pub ended_at: Option<NaiveDateTime>,
+    /// Deadline of a wait the agent declared via `kanban waiting`. While it
+    /// is in the future the session counts as alive even without heartbeats;
+    /// once it passes, the board relaunches the agent instead of crashing it.
+    #[serde(
+        default,
+        with = "timefmt::serde_naive_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub wait_until: Option<NaiveDateTime>,
+    /// What the agent said it is waiting for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_note: Option<String>,
+    /// Set when the agent process exited while its declared wait was still
+    /// pending, so the deadline relaunch does not need heartbeat heuristics
+    /// to know the process is gone.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub wait_exited: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn default_session_status() -> SessionStatus {
@@ -297,6 +329,9 @@ impl Session {
             status: SessionStatus::Active,
             last_seen: now,
             ended_at: None,
+            wait_until: None,
+            wait_note: None,
+            wait_exited: false,
         }
     }
 
