@@ -13,7 +13,9 @@ use crate::core::session::SessionManager;
 use crate::core::storage::{NewTask, Storage};
 use crate::core::thread::ThreadManager;
 
-use super::app::{App, DetailFocus, HitAction, Screen, UiAction, normalize_command_key};
+use super::app::{
+    App, DetailFocus, HitAction, Screen, UiAction, load_log_tail, normalize_command_key,
+};
 use super::board;
 use super::dialogs::{DialogField, Modal, ModalButton};
 use super::theme::Theme;
@@ -30,6 +32,17 @@ fn app_with_board() -> (tempfile::TempDir, App) {
     .expect("quiet config");
     let app = App::new(dir.path()).expect("create app");
     (dir, app)
+}
+
+#[test]
+fn log_tail_rejects_invalid_session_id() {
+    let (dir, _app) = app_with_board();
+    std::fs::write(dir.path().join("outside.log"), "secret log contents").expect("outside log");
+
+    assert_eq!(
+        load_log_tail(dir.path(), "../outside"),
+        vec!["(invalid session id)".to_string()]
+    );
 }
 
 fn settings_app() -> (tempfile::TempDir, App) {
@@ -1125,6 +1138,8 @@ fn enter_runs_open_detail_task() {
 
     assert!(app.modal.is_none(), "enter run must not open any dialog");
     assert!(app.status.starts_with("Started"), "status: {}", app.status);
+    assert_eq!(app.screen, Screen::Board);
+    assert!(app.detail.is_none(), "run should close the task detail");
     let started = app.ops.get_task(&task.id).unwrap().unwrap();
     assert_eq!(started.status.as_str(), "in_progress");
     let session_id = started.session.expect("session assigned");
@@ -1586,6 +1601,7 @@ fn russian_layout_maps_commands_without_changing_text_input() {
         ('в', 'd'),
         ('к', 'r'),
         ('н', 'y'),
+        ('и', 'b'),
         ('г', 'u'),
         ('ф', 'a'),
         ('д', 'l'),
@@ -1875,7 +1891,7 @@ fn phase_three_headers_targeted_creation_and_bulk_confirmation_work() {
         1
     );
 
-    app.handle_key(key(KeyCode::Char('R')))
+    app.handle_key(key(KeyCode::Char('b')))
         .expect("bulk review dialog");
     assert!(matches!(
         app.modal.as_ref().expect("confirm modal").modal,
@@ -2071,7 +2087,7 @@ fn phase_three_bulk_reconfirms_when_source_set_changes() {
     let first = app.ops.create_task(NewTask::titled("First")).unwrap();
     app.ops.move_task(&first.id, "in_progress", false).unwrap();
     app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
-    app.handle_key(key(KeyCode::Char('R'))).unwrap();
+    app.handle_key(key(KeyCode::Char('b'))).unwrap();
 
     let second = app.ops.create_task(NewTask::titled("Second")).unwrap();
     app.ops.move_task(&second.id, "in_progress", false).unwrap();
@@ -2187,6 +2203,152 @@ fn phase_three_cached_live_session_expires_without_a_file_change() {
         Some(&crate::core::session::SessionState::Crashed)
     );
     assert!(render_at(&mut app, 96, 18).contains("✖ crashed"));
+}
+
+#[test]
+fn phase_three_waiting_session_shows_deadline_across_tui() {
+    let (dir, mut app) = app_with_board();
+    let mut task = app
+        .ops
+        .create_task(NewTask::titled("Waiting export"))
+        .unwrap();
+    task.status = crate::core::models::TaskStatus::InProgress;
+    task.session = Some("ses-wait-card".to_string());
+    app.ops.storage.save_task(&task).unwrap();
+    let manager = SessionManager::new(dir.path());
+    manager.link_session(&task.id, "ses-wait-card").unwrap();
+    let deadline = crate::core::timefmt::now() + chrono::Duration::hours(1);
+    manager
+        .set_wait(
+            "ses-wait-card",
+            deadline,
+            Some("analytics export".to_string()),
+        )
+        .unwrap();
+    let expected = format!("until {}", deadline.format("%H:%M"));
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let board = render_at(&mut app, 120, 18);
+    assert!(board.contains(&expected), "{board}");
+
+    app.focused_column = 1;
+    app.dispatch(UiAction::OpenDetail).unwrap();
+    let detail = render_at(&mut app, 120, 24);
+    assert!(
+        detail.contains(&format!("Waiting until {}", deadline.format("%H:%M"))),
+        "{detail}"
+    );
+    assert!(detail.contains("analytics export"), "{detail}");
+
+    app.handle_key(key(KeyCode::Char('l'))).unwrap();
+    let sessions = render_at(&mut app, 120, 18);
+    assert!(sessions.contains("⏳"), "{sessions}");
+    assert!(sessions.contains("ses-wait-card"), "{sessions}");
+    assert!(sessions.contains(&expected), "{sessions}");
+}
+
+#[test]
+fn phase_three_waiting_session_deadline_expiry_does_not_mark_crashed_locally() {
+    let (dir, mut app) = app_with_board();
+    let mut task = app
+        .ops
+        .create_task(NewTask::titled("Still waiting"))
+        .unwrap();
+    task.status = crate::core::models::TaskStatus::InProgress;
+    task.session = Some("ses-wait-expire".to_string());
+    app.ops.storage.save_task(&task).unwrap();
+    let manager = SessionManager::new(dir.path());
+    manager.link_session(&task.id, "ses-wait-expire").unwrap();
+    let deadline = crate::core::timefmt::now() + chrono::Duration::seconds(1);
+    manager
+        .set_wait("ses-wait-expire", deadline, Some("still alive".to_string()))
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    app.expire_session_states_at(deadline + chrono::Duration::seconds(1));
+
+    assert_eq!(
+        app.board.session_states.get(&task.id),
+        Some(&crate::core::session::SessionState::Waiting)
+    );
+    let board = render_at(&mut app, 120, 18);
+    assert!(!board.contains("✖ crashed"), "{board}");
+}
+
+#[test]
+fn phase_three_live_session_detail_does_not_show_wait_deadline() {
+    let (dir, mut app) = app_with_board();
+    let mut task = app
+        .ops
+        .create_task(NewTask::titled("Just running"))
+        .unwrap();
+    task.status = crate::core::models::TaskStatus::InProgress;
+    task.session = Some("ses-live-detail".to_string());
+    app.ops.storage.save_task(&task).unwrap();
+    SessionManager::new(dir.path())
+        .link_session(&task.id, "ses-live-detail")
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    app.focused_column = 1;
+    app.dispatch(UiAction::OpenDetail).unwrap();
+    let detail = render_at(&mut app, 120, 24);
+
+    assert!(!detail.contains("Waiting until"), "{detail}");
+    assert!(!detail.contains("blocked on a question"), "{detail}");
+}
+
+#[test]
+fn phase_three_questioned_task_with_closed_session_is_not_marked_crashed() {
+    let (dir, mut app) = app_with_board();
+    let mut task = app
+        .ops
+        .create_task(NewTask {
+            title: "Needs answer".to_string(),
+            interactive: true,
+            ..Default::default()
+        })
+        .unwrap();
+    task.status = crate::core::models::TaskStatus::InProgress;
+    task.session = Some("ses-question-closed".to_string());
+    app.ops.storage.save_task(&task).unwrap();
+    app.ops
+        .ask_question(&task.id, "Please answer?", "agent", vec![])
+        .unwrap();
+    let manager = SessionManager::new(dir.path());
+    manager
+        .link_session(&task.id, "ses-question-closed")
+        .unwrap();
+    manager.close_session("ses-question-closed").unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let board = render_at(&mut app, 120, 18);
+
+    assert!(board.contains("? Please answer?"), "{board}");
+    assert!(!board.contains("✖ crashed"), "{board}");
+    assert!(!board.contains("u recover"), "{board}");
+}
+
+#[test]
+fn phase_three_stuck_in_progress_card_and_detail_show_recover_hint() {
+    let (dir, mut app) = app_with_board();
+    let mut task = app.ops.create_task(NewTask::titled("Stranded")).unwrap();
+    task.status = crate::core::models::TaskStatus::InProgress;
+    task.session = Some("ses-closed".to_string());
+    app.ops.storage.save_task(&task).unwrap();
+    let manager = SessionManager::new(dir.path());
+    manager.link_session(&task.id, "ses-closed").unwrap();
+    manager.close_session("ses-closed").unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let board = render_at(&mut app, 120, 18);
+    assert!(board.contains("✖ crashed · u recover"), "{board}");
+
+    app.focused_column = 1;
+    app.dispatch(UiAction::OpenDetail).unwrap();
+    let detail = render_at(&mut app, 120, 24);
+    assert!(detail.contains("press u / Recover"), "{detail}");
+    assert!(detail.contains("[ Recover u ]"), "{detail}");
 }
 
 #[test]
@@ -2330,8 +2492,9 @@ fn phase_six_archive_restore_confirms_and_returns_task_to_todo() {
 #[test]
 fn phase_seven_status_bar_is_contextual_and_clickable() {
     let (_dir, mut app) = app_with_board();
-    let rendered = render_snapshot(&mut app);
+    let rendered = render_at(&mut app, 140, 18);
     assert!(rendered.contains("n new"));
+    assert!(rendered.contains("b bulk review"));
     let help_hit = app
         .hitboxes
         .iter()
@@ -2362,7 +2525,7 @@ fn phase_seven_status_bar_is_contextual_and_clickable() {
     // A narrow terminal drops low-priority segments instead of clipping.
     let narrow = render_at(&mut app, 48, 18);
     assert!(narrow.contains("r run"));
-    assert!(!narrow.contains("A archive done"));
+    assert!(!narrow.contains("b bulk review"));
 }
 
 #[test]

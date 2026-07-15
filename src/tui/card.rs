@@ -61,7 +61,7 @@ pub fn render_card(frame: &mut Frame<'_>, app: &App, task: &Task, area: Rect, fo
     }
     let mut badges = badges(task, session_state, app);
     if extra.is_some_and(|extra| extra.waiting) {
-        badges.push(("⏳ waiting", app.theme.ok));
+        badges.push(("⏳ waiting".to_string(), app.theme.ok));
     }
     if !badges.is_empty() {
         let badge_spans = badges
@@ -167,21 +167,32 @@ pub fn badges(
     task: &Task,
     session_state: Option<SessionState>,
     app: &App,
-) -> Vec<(&'static str, ratatui::style::Color)> {
+) -> Vec<(String, ratatui::style::Color)> {
     let mut badges = Vec::new();
     match session_state {
-        Some(SessionState::Live) => badges.push(("▶ running", app.theme.ok)),
-        Some(SessionState::Crashed) => badges.push(("✖ crashed", app.theme.err)),
+        Some(SessionState::Live) => badges.push(("▶ running".to_string(), app.theme.ok)),
+        Some(SessionState::Waiting) => {
+            let label = app
+                .board
+                .session_wait_deadlines
+                .get(&task.id)
+                .map(|deadline| format!("⏳ until {}", deadline.format("%H:%M")))
+                .unwrap_or_else(|| "⏳ wait mode".to_string());
+            badges.push((label, app.theme.warn));
+        }
+        Some(SessionState::Crashed) => {
+            badges.push(("✖ crashed · u recover".to_string(), app.theme.err))
+        }
         None => {}
     }
     if task.interactive {
-        badges.push(("☑ interactive", app.theme.ok));
+        badges.push(("☑ interactive".to_string(), app.theme.ok));
     }
     if task.chained_to.is_some() {
-        badges.push(("↪ chain", app.theme.ok));
+        badges.push(("↪ chain".to_string(), app.theme.ok));
     }
     if task.has_questions {
-        badges.push(("? questions", app.theme.warn));
+        badges.push(("? questions".to_string(), app.theme.warn));
     }
     badges
 }

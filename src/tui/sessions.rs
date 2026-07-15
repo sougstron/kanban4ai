@@ -36,7 +36,16 @@ pub fn render_sessions(frame: &mut Frame<'_>, app: &App, area: Rect) {
             let session = &active_session.session;
             let (icon, color) = match active_session.state {
                 SessionState::Live => ("▶ ", app.theme.ok),
+                SessionState::Waiting => ("⏳ ", app.theme.warn),
                 SessionState::Crashed => ("✖ ", app.theme.err),
+            };
+            let wait = if active_session.state == SessionState::Waiting {
+                session
+                    .wait_until
+                    .map(|deadline| format!("  until {}", deadline.format("%H:%M")))
+                    .unwrap_or_default()
+            } else {
+                String::new()
             };
             ListItem::new(Line::from(vec![
                 Span::styled(icon, Style::default().fg(color)),
@@ -48,6 +57,7 @@ pub fn render_sessions(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 )),
                 Span::raw("  tokens: "),
                 Span::raw(&active_session.token_display),
+                Span::styled(wait, Style::default().fg(color)),
             ]))
         })
         .collect::<Vec<_>>();

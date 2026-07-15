@@ -77,6 +77,8 @@ pub struct BoardSnapshot {
     pub extras: HashMap<String, CardExtra>,
     pub session_states: HashMap<String, SessionState>,
     pub session_deadlines: HashMap<String, chrono::NaiveDateTime>,
+    pub session_wait_deadlines: HashMap<String, chrono::NaiveDateTime>,
+    pub session_wait_notes: HashMap<String, String>,
     pub fingerprint: (u64, u128),
 }
 
@@ -258,6 +260,8 @@ pub struct App {
     fs_change_generation: u64,
     recent_models: Vec<String>,
     ctrl_c_exit_deadline: Option<Instant>,
+    /// Last time the tick scanned for expired declared waits to relaunch.
+    last_wait_resume: Option<Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,6 +316,7 @@ impl App {
             fs_change_generation: 0,
             recent_models,
             ctrl_c_exit_deadline: None,
+            last_wait_resume: None,
         })
     }
 
@@ -396,7 +401,7 @@ impl App {
             (KeyCode::Char('A'), _) if self.screen == Screen::Board => {
                 self.dispatch(UiAction::ArchiveAllDone)?
             }
-            (KeyCode::Char('R'), _) if self.screen == Screen::Board => {
+            (KeyCode::Char('b'), _) | (KeyCode::Char('R'), _) if self.screen == Screen::Board => {
                 self.dispatch(UiAction::BulkToReview)?
             }
             (KeyCode::Char('a'), _) => self.dispatch(UiAction::OpenArchive)?,
@@ -1023,6 +1028,7 @@ impl App {
         self.reload_if_changed()?;
         self.expire_ctrl_c_prompt_at(Instant::now());
         self.expire_session_states_at(timefmt::now());
+        self.resume_expired_waits_throttled();
         // Log writes bypass the fs watcher (it only covers board dirs), so
         // the pager tail refreshes on the tick.
         if self.screen == Screen::LogView {
@@ -1053,7 +1059,10 @@ impl App {
             .map(|(task_id, _)| task_id.clone())
             .collect::<Vec<_>>();
         for task_id in expired {
-            if self.board.session_states.get(&task_id) == Some(&SessionState::Live) {
+            if matches!(
+                self.board.session_states.get(&task_id),
+                Some(SessionState::Live)
+            ) {
                 self.board
                     .session_states
                     .insert(task_id.clone(), SessionState::Crashed);
@@ -1062,6 +1071,33 @@ impl App {
                 }
             }
             self.board.session_deadlines.remove(&task_id);
+        }
+    }
+
+    /// Relaunch agents whose declared wait deadline expired ("ping" them to
+    /// report status). Throttled: the scan reads every session file, so it
+    /// runs at most once per interval, not on every tick. Errors land in the
+    /// status line instead of killing the TUI.
+    fn resume_expired_waits_throttled(&mut self) {
+        const WAIT_RESUME_INTERVAL: Duration = Duration::from_secs(10);
+        if self
+            .last_wait_resume
+            .is_some_and(|last| last.elapsed() < WAIT_RESUME_INTERVAL)
+        {
+            return;
+        }
+        self.last_wait_resume = Some(Instant::now());
+        match self.ops.resume_expired_waits() {
+            Ok(resumed) if !resumed.is_empty() => {
+                let tasks = resumed
+                    .iter()
+                    .map(|(task_id, _)| task_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.status = format!("Wait deadline passed — relaunched: {tasks}");
+            }
+            Ok(_) => {}
+            Err(err) => self.status = format!("Wait resume failed: {err}"),
         }
     }
 
@@ -1728,14 +1764,25 @@ impl App {
             self.status = "No task selected".to_string();
             return Ok(());
         };
-        match self.ops.start_task(&task_id) {
+        let should_close_detail = self.screen == Screen::Detail;
+        let started = match self.ops.start_task(&task_id) {
             Ok(Some(session_id)) => {
                 self.status = format!("Started {task_id} → {session_id}");
+                true
             }
-            Ok(None) => self.status = format!("Task {task_id} not found"),
-            Err(err) => self.status = err.to_string(),
-        }
+            Ok(None) => {
+                self.status = format!("Task {task_id} not found");
+                false
+            }
+            Err(err) => {
+                self.status = err.to_string();
+                false
+            }
+        };
         self.refresh_after_action()?;
+        if started && should_close_detail {
+            self.close_detail()?;
+        }
         Ok(())
     }
 
@@ -2611,29 +2658,71 @@ impl BoardSnapshot {
             .list_sessions_with_state(heartbeat_timeout)
             .into_iter()
             .map(|(session, state)| {
-                let deadline = (session.status == SessionStatus::Active
-                    && state == SessionState::Live)
-                    .then(|| session.last_seen + chrono::Duration::seconds(heartbeat_timeout));
-                (session.id, (session.task_id, state, deadline))
+                let deadline = match state {
+                    SessionState::Live => (session.status == SessionStatus::Active)
+                        .then(|| session.last_seen + chrono::Duration::seconds(heartbeat_timeout)),
+                    // A waiting card flips to crashed when the declared
+                    // deadline passes; the resume relaunch then reloads it.
+                    SessionState::Waiting => session.wait_until,
+                    SessionState::Crashed => None,
+                };
+                (
+                    session.id,
+                    (session.task_id, state, deadline, session.wait_note),
+                )
             })
             .collect::<HashMap<_, _>>();
-        let session_states = tasks
+        let mut session_states = tasks
             .iter()
             .filter_map(|task| {
                 let session_id = task.session.as_ref()?;
-                let (session_task_id, state, _) = sessions_by_id.get(session_id)?;
+                let (session_task_id, state, _, _) = sessions_by_id.get(session_id)?;
                 if session_task_id != &task.id {
                     return None;
                 }
                 Some((task.id.clone(), *state))
             })
             .collect::<HashMap<_, _>>();
+        // An In Progress task whose session record is closed or gone is
+        // stranded — nothing will move it. Surface it as crashed instead of
+        // letting it look idle.
+        for task in &tasks {
+            if task.status == TaskStatus::InProgress
+                && task.session.is_some()
+                && !session_states.contains_key(&task.id)
+                && !(task.has_questions && ops.first_open_question(&task.id)?.is_some())
+            {
+                session_states.insert(task.id.clone(), SessionState::Crashed);
+            }
+        }
         let session_deadlines = tasks
             .iter()
             .filter_map(|task| {
                 let session_id = task.session.as_ref()?;
-                let (session_task_id, _, deadline) = sessions_by_id.get(session_id)?;
+                let (session_task_id, _, deadline, _) = sessions_by_id.get(session_id)?;
                 if session_task_id != &task.id {
+                    return None;
+                }
+                Some((task.id.clone(), (*deadline)?))
+            })
+            .collect::<HashMap<_, _>>();
+        let session_wait_notes = tasks
+            .iter()
+            .filter_map(|task| {
+                let session_id = task.session.as_ref()?;
+                let (session_task_id, state, _, note) = sessions_by_id.get(session_id)?;
+                if session_task_id != &task.id || *state != SessionState::Waiting {
+                    return None;
+                }
+                note.as_ref().map(|note| (task.id.clone(), note.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        let session_wait_deadlines = tasks
+            .iter()
+            .filter_map(|task| {
+                let session_id = task.session.as_ref()?;
+                let (session_task_id, state, deadline, _) = sessions_by_id.get(session_id)?;
+                if session_task_id != &task.id || *state != SessionState::Waiting {
                     return None;
                 }
                 Some((task.id.clone(), (*deadline)?))
@@ -2660,6 +2749,8 @@ impl BoardSnapshot {
             extras,
             session_states,
             session_deadlines,
+            session_wait_deadlines,
+            session_wait_notes,
             fingerprint: ops.storage.tui_fingerprint(),
         })
     }
@@ -2715,6 +2806,7 @@ pub(super) fn normalize_command_key(mut key: KeyEvent) -> KeyEvent {
         'к' => 'r',
         'К' => 'R',
         'н' | 'Н' => 'y',
+        'и' | 'И' => 'b',
         'г' | 'Г' => 'u',
         'ф' => 'a',
         'Ф' => 'A',
@@ -2757,7 +2849,10 @@ fn lines_or_empty(text: &str) -> Vec<String> {
 /// for a useful tail without holding a multi-megabyte agent log in memory.
 const LOG_TAIL_BYTES: usize = 64 * 1024;
 
-fn load_log_tail(project_path: &Path, session_id: &str) -> Vec<String> {
+pub(super) fn load_log_tail(project_path: &Path, session_id: &str) -> Vec<String> {
+    if crate::core::session::SessionManager::validate_session_id(session_id).is_err() {
+        return vec!["(invalid session id)".to_string()];
+    }
     let log_file = project_path
         .join(".kanban")
         .join("logs")

@@ -7,6 +7,7 @@ use ratatui::widgets::{
 };
 
 use crate::core::models::{Message, MessageKind, MessageStatus, Task, TaskStatus};
+use crate::core::session::SessionState;
 use crate::core::timefmt;
 
 use super::app::{App, DetailFocus, HitAction, Hitbox, UiAction};
@@ -29,6 +30,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .extras
         .get(&task.id)
         .is_some_and(|extra| extra.waiting);
+    let session_state = app.board.session_states.get(&task.id).copied();
+    let wait_deadline = app.board.session_wait_deadlines.get(&task.id).copied();
+    let wait_note = app.board.session_wait_notes.get(&task.id).cloned();
     let open_questions = detail
         .open_questions()
         .into_iter()
@@ -40,7 +44,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let focus = detail.focus;
     let task = task.clone();
 
-    let meta_height = if waiting { 7 } else { 6 };
+    let meta_extra_lines = u16::from(waiting)
+        + u16::from(wait_deadline.is_some())
+        + u16::from(session_state == Some(SessionState::Crashed));
+    let meta_height = 6 + meta_extra_lines;
     let answer_height = if show_answer {
         let question = &open_questions[detail.question_index.min(open_questions.len() - 1)];
         // borders + question line + option rows (custom + variants) + input
@@ -63,7 +70,13 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .constraints(constraints)
         .split(area);
 
-    render_meta(frame, &theme, &task, waiting, chunks[0]);
+    let meta_state = MetaState {
+        waiting,
+        wait_deadline,
+        wait_note: wait_note.as_deref(),
+        session_state,
+    };
+    render_meta(frame, &theme, &task, &meta_state, chunks[0]);
 
     // Thread panel with a clamped scroll and a scrollbar.
     let thread_lines = thread_lines(&app.detail.as_ref().unwrap().messages, &theme);
@@ -119,7 +132,20 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     render_action_bar(frame, app, &theme, &task, show_answer, chunks[4]);
 }
 
-fn render_meta(frame: &mut Frame<'_>, theme: &Theme, task: &Task, waiting: bool, area: Rect) {
+struct MetaState<'a> {
+    waiting: bool,
+    wait_deadline: Option<chrono::NaiveDateTime>,
+    wait_note: Option<&'a str>,
+    session_state: Option<SessionState>,
+}
+
+fn render_meta(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    task: &Task,
+    meta_state: &MetaState<'_>,
+    area: Rect,
+) {
     let mut meta = vec![
         Line::from(vec![
             Span::styled(
@@ -151,10 +177,29 @@ fn render_meta(frame: &mut Frame<'_>, theme: &Theme, task: &Task, waiting: bool,
             timefmt::format(&task.updated_at)
         )),
     ];
-    if waiting {
+    if meta_state.waiting {
         meta.push(Line::from(Span::styled(
             "⏳ Agent is blocked on a question and waits for your answer",
             Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+        )));
+    }
+    if let Some(deadline) = meta_state.wait_deadline {
+        let note = meta_state
+            .wait_note
+            .map(sanitize_terminal_text)
+            .filter(|note| !note.is_empty())
+            .unwrap_or_else(|| "declared wait".to_string());
+        meta.push(Line::from(Span::styled(
+            format!("⏳ Waiting until {} — {note}", deadline.format("%H:%M")),
+            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+        )));
+    }
+    if meta_state.session_state == Some(SessionState::Crashed)
+        && task.status == TaskStatus::InProgress
+    {
+        meta.push(Line::from(Span::styled(
+            "✖ Session is stuck or crashed — press u / Recover to return it to To Do",
+            Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
         )));
     }
     frame.render_widget(
@@ -297,6 +342,9 @@ fn render_action_bar(
         }
         if task.session.is_some() {
             buttons.push(("Attach t".to_string(), UiAction::Attach));
+        }
+        if app.board.session_states.get(&task.id) == Some(&SessionState::Crashed) {
+            buttons.push(("Recover u".to_string(), UiAction::Recover));
         }
         buttons.push(("Edit e".to_string(), UiAction::EditTask));
         buttons.push(("Move m".to_string(), UiAction::MoveTask));
