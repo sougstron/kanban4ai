@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
-use crate::core::error::Result;
+use crate::core::error::{KanbanError, Result};
 use crate::core::models::{MessageKind, MessageRole, Session, SessionStatus};
+use crate::core::storage::{Storage, atomic_write_text};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 
@@ -16,6 +17,9 @@ use crate::core::timefmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     Live,
+    /// The agent declared a wait (`kanban waiting`) whose deadline has not
+    /// passed yet; the session counts as alive even without heartbeats.
+    Waiting,
     Crashed,
 }
 
@@ -24,11 +28,16 @@ fn state_of(
     heartbeat_timeout: i64,
     now: &chrono::NaiveDateTime,
 ) -> SessionState {
-    match session.status {
-        SessionStatus::Active if (*now - session.last_seen).num_seconds() <= heartbeat_timeout => {
-            SessionState::Live
-        }
-        _ => SessionState::Crashed,
+    if session.status != SessionStatus::Active {
+        return SessionState::Crashed;
+    }
+    if session.wait_until.is_some_and(|deadline| *now <= deadline) {
+        return SessionState::Waiting;
+    }
+    if (*now - session.last_seen).num_seconds() <= heartbeat_timeout {
+        SessionState::Live
+    } else {
+        SessionState::Crashed
     }
 }
 
@@ -51,7 +60,24 @@ impl SessionManager {
         self.sessions_dir.join(format!("{session_id}.yaml"))
     }
 
+    pub fn validate_session_id(session_id: &str) -> Result<()> {
+        let valid = !session_id.is_empty()
+            && session_id.len() <= 128
+            && session_id
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            && !session_id.contains("..");
+        if valid {
+            Ok(())
+        } else {
+            Err(KanbanError::Invalid(format!(
+                "Invalid session id: {session_id}"
+            )))
+        }
+    }
+
     pub fn link_session(&self, task_id: &str, session_id: &str) -> Result<Session> {
+        Self::validate_session_id(session_id)?;
         let session = Session::new(session_id, task_id);
         self.save_session(&session)?;
         Ok(session)
@@ -63,12 +89,16 @@ impl SessionManager {
         session_id: &str,
         name: &str,
     ) -> Result<Session> {
+        Self::validate_session_id(session_id)?;
         let session = Session::named(session_id, task_id, name);
         self.save_session(&session)?;
         Ok(session)
     }
 
     pub fn unlink_session(&self, session_id: &str) {
+        if Self::validate_session_id(session_id).is_err() {
+            return;
+        }
         let _ = fs::remove_file(self.session_file(session_id));
     }
 
@@ -133,6 +163,8 @@ impl SessionManager {
     }
 
     pub fn heartbeat(&self, session_id: &str) -> Result<()> {
+        Self::validate_session_id(session_id)?;
+        let _guard = Storage::new(&self.project_path).lock()?;
         if let Some(mut session) = self.load_session(session_id) {
             session.last_seen = timefmt::now();
             self.save_session(&session)?;
@@ -140,7 +172,48 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Record a wait the agent declared: the session stays alive (no crash
+    /// detection) until `wait_until` passes. Returns `false` when the session
+    /// is missing or not active.
+    pub fn set_wait(
+        &self,
+        session_id: &str,
+        wait_until: chrono::NaiveDateTime,
+        note: Option<String>,
+    ) -> Result<bool> {
+        Self::validate_session_id(session_id)?;
+        let _guard = Storage::new(&self.project_path).lock()?;
+        let Some(mut session) = self.load_session(session_id) else {
+            return Ok(false);
+        };
+        if session.status != SessionStatus::Active {
+            return Ok(false);
+        }
+        session.wait_until = Some(wait_until);
+        session.wait_note = note;
+        session.wait_exited = false;
+        session.last_seen = timefmt::now();
+        self.save_session(&session)?;
+        Ok(true)
+    }
+
+    /// Mark that the agent process exited while its declared wait is still
+    /// pending. The session stays active; the deadline relaunch picks it up.
+    pub fn mark_wait_exited(&self, session_id: &str) -> Result<()> {
+        Self::validate_session_id(session_id)?;
+        let _guard = Storage::new(&self.project_path).lock()?;
+        if let Some(mut session) = self.load_session(session_id)
+            && session.status == SessionStatus::Active
+        {
+            session.wait_exited = true;
+            self.save_session(&session)?;
+        }
+        Ok(())
+    }
+
     pub fn close_session(&self, session_id: &str) -> Result<()> {
+        Self::validate_session_id(session_id)?;
+        let _guard = Storage::new(&self.project_path).lock()?;
         if let Some(mut session) = self.load_session(session_id) {
             session.status = SessionStatus::Closed;
             session.ended_at = Some(timefmt::now());
@@ -151,6 +224,8 @@ impl SessionManager {
 
     /// Mark an active session crashed and record a system message on its task.
     pub fn crash_session(&self, session_id: &str) -> Result<()> {
+        Self::validate_session_id(session_id)?;
+        let _guard = Storage::new(&self.project_path).lock()?;
         let Some(mut session) = self.load_session(session_id) else {
             return Ok(());
         };
@@ -181,11 +256,16 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Crash every active session whose heartbeat is older than `timeout` seconds.
+    /// Crash every active session whose heartbeat is older than `timeout`
+    /// seconds. Sessions inside a declared, unexpired wait are exempt: the
+    /// agent said it is waiting, so a silent heartbeat is not a crash.
     pub fn check_sessions(&self, timeout: i64) -> Result<Vec<Session>> {
         let now = timefmt::now();
         let mut crashed = Vec::new();
         for session in self.list_active_sessions() {
+            if session.wait_until.is_some_and(|deadline| now <= deadline) {
+                continue;
+            }
             let elapsed = (now - session.last_seen).num_seconds();
             if elapsed > timeout {
                 self.crash_session(&session.id)?;
@@ -196,18 +276,24 @@ impl SessionManager {
     }
 
     pub fn save_session(&self, session: &Session) -> Result<()> {
+        Self::validate_session_id(&session.id)?;
+        let _guard = Storage::new(&self.project_path).lock()?;
         fs::create_dir_all(&self.sessions_dir)?;
-        fs::write(
-            self.session_file(&session.id),
+        atomic_write_text(
+            &self.session_file(&session.id),
             timefmt::quote_yaml_timestamp_fields(
                 &serde_yaml_ng::to_string(session)?,
-                &["started_at", "last_seen", "ended_at"],
-            ),
+                &["started_at", "last_seen", "ended_at", "wait_until"],
+            )
+            .as_str(),
         )?;
         Ok(())
     }
 
     pub fn load_session(&self, session_id: &str) -> Option<Session> {
+        if Self::validate_session_id(session_id).is_err() {
+            return None;
+        }
         let file = self.session_file(session_id);
         if !file.exists() {
             return None;
@@ -223,6 +309,9 @@ impl SessionManager {
 
 /// Approximate token count parsed from the agent's `.kanban/logs/<session>.log`.
 pub fn estimate_session_tokens(project_path: &Path, session_id: &str) -> Option<i64> {
+    if SessionManager::validate_session_id(session_id).is_err() {
+        return None;
+    }
     let log_file = project_path
         .join(".kanban")
         .join("logs")
