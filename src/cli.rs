@@ -8,7 +8,7 @@ use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
 
-use crate::agent::attach_to_session;
+use crate::agent::{attach_to_session, resolve_opencode_agent};
 use crate::core::compaction::{CompactionManager, CompactionStatus};
 use crate::core::config::Config;
 use crate::core::context::ContextManager;
@@ -267,6 +267,17 @@ enum Command {
         task_id: String,
         #[arg(long)]
         session: String,
+    },
+    /// Internal command used by the agent runtime wrapper: match a configured
+    /// opencode agent name against `<command> agent list` and print the
+    /// registered form. Runs inside the spawned session so the slow opencode
+    /// CLI startup never blocks the launching process.
+    #[command(name = "resolve-agent", hide = true)]
+    ResolveAgent {
+        requested: String,
+        /// Backend CLI to query (the configured opencode command)
+        #[arg(long)]
+        command: String,
     },
 }
 
@@ -738,6 +749,9 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         },
         Command::WaitResume { task_id, session } => {
             wait_resume_monitor(&ops, &task_id, &session)?;
+        }
+        Command::ResolveAgent { requested, command } => {
+            println!("{}", resolve_opencode_agent(&command, &requested));
         }
     }
     Ok(ExitCode::SUCCESS)

@@ -89,12 +89,21 @@ fn spawn_background(project_path: &Path, plan: &LaunchPlan) -> Result<bool> {
 }
 
 fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
-    let command_line = shell_join(
-        std::iter::once(plan.command.as_str())
-            .chain(plan.args.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .as_slice(),
-    );
+    let mut command_parts = std::iter::once(plan.command.as_str())
+        .chain(plan.args.iter().map(String::as_str))
+        .map(shell_quote)
+        .collect::<Vec<_>>();
+    // Opencode agent resolution (`opencode agent list`) takes seconds, so it
+    // is deferred into this script: the `--agent` value becomes a shell
+    // variable filled by a `resolve-agent` callback right before the agent
+    // command runs, keeping the launching process (the TUI) unblocked.
+    if plan.resolve_agent.is_some()
+        && let Some(flag_pos) = plan.args.iter().position(|arg| arg == "--agent")
+        && let Some(value) = command_parts.get_mut(flag_pos + 2)
+    {
+        *value = "\"$KANBAN_AGENT\"".to_string();
+    }
+    let command_line = command_parts.join(" ");
     // Use the absolute path of the current binary so callbacks always
     // resolve to *this* kanban4ai executable regardless of PATH or
     // invocation name.  Falls back to bare "kanban" (the historical
@@ -126,8 +135,23 @@ fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
         shell_quote(&plan.session_id),
         plan.heartbeat_interval_secs
     );
+    // Runs after the heartbeat loop starts, so the session stays alive while
+    // the resolve callback waits on the opencode CLI. Falls back to the
+    // requested name when the callback fails or prints nothing.
+    let resolve_agent = plan
+        .resolve_agent
+        .as_deref()
+        .map(|requested| {
+            format!(
+                "KANBAN_AGENT=\"$({kanban_cmd} resolve-agent --command {} {} 2>/dev/null)\"; [ -n \"$KANBAN_AGENT\" ] || KANBAN_AGENT={}; ",
+                shell_quote(&plan.command),
+                shell_quote(requested),
+                shell_quote(requested),
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; mkdir -p {}; {}{} 2>&1 | tee -a {}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",
+        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; mkdir -p {}; {}{}{} 2>&1 | tee -a {}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",
         shell_quote(&project_path.display().to_string()),
         shell_quote(&plan.session_id),
         shell_quote(&plan.task_id),
@@ -141,6 +165,7 @@ fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
                 .to_string()
         ),
         heartbeat_loop,
+        resolve_agent,
         command_line,
         shell_quote(&plan.log_file.display().to_string()),
         auto_segment,
@@ -187,14 +212,6 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-fn shell_join(parts: &[&str]) -> String {
-    parts
-        .iter()
-        .map(|part| shell_quote(part))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn shell_quote(value: &str) -> String {
     if value
         .chars()
@@ -235,6 +252,7 @@ mod tests {
             session_id: session_id.to_string(),
             auto_complete_on_exit: auto_complete,
             heartbeat_interval_secs: 100,
+            resolve_agent: None,
         }
     }
 
@@ -292,6 +310,106 @@ mod tests {
             output.status.success(),
             "bash -n rejected script with auto_complete_on_exit=true:\n{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// With a deferred opencode agent the script must resolve the name via
+    /// the `resolve-agent` callback (with the requested name as fallback)
+    /// and pass the shell variable — not the literal name — to `--agent`.
+    #[test]
+    fn wrapper_script_defers_agent_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = test_plan(
+            dir.path(),
+            "TASK-004",
+            "ses-resolve-test",
+            "/bin/echo",
+            vec![
+                "run".to_string(),
+                "--agent".to_string(),
+                "hephaestus".to_string(),
+                "prompt".to_string(),
+            ],
+            false,
+        );
+        plan.resolve_agent = Some("hephaestus".to_string());
+        let script = wrapper_script(dir.path(), &plan);
+
+        assert!(script.contains("resolve-agent --command /bin/echo hephaestus"));
+        assert!(script.contains("|| KANBAN_AGENT=hephaestus"));
+        assert!(script.contains("--agent \"$KANBAN_AGENT\""));
+        assert!(!script.contains("--agent hephaestus"));
+
+        let output = Command::new("bash")
+            .args(["-n", "-c", &script])
+            .output()
+            .expect("bash -n should run");
+        assert!(
+            output.status.success(),
+            "bash -n rejected script with deferred agent resolution:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Without a deferred agent the `--agent` value must stay a quoted
+    /// literal even when the flag is present (no accidental substitution).
+    #[test]
+    fn wrapper_script_keeps_literal_agent_without_deferral() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = test_plan(
+            dir.path(),
+            "TASK-005",
+            "ses-literal-test",
+            "/bin/echo",
+            vec![
+                "run".to_string(),
+                "--agent".to_string(),
+                "hephaestus".to_string(),
+                "prompt".to_string(),
+            ],
+            false,
+        );
+        let script = wrapper_script(dir.path(), &plan);
+        assert!(script.contains("--agent hephaestus"));
+        assert!(!script.contains("KANBAN_AGENT"));
+    }
+
+    /// End-to-end through bash: when the resolve callback fails (the test
+    /// binary is not the kanban CLI), the agent command still receives the
+    /// requested name via the fallback assignment.
+    #[test]
+    fn background_launch_falls_back_to_requested_agent() {
+        let project = tempfile::tempdir().unwrap();
+        let logs_dir = project.path().join(".kanban/logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        let marker = "MARKER_AGENT_FALLBACK";
+        let mut plan = test_plan(
+            &logs_dir,
+            "TASK-006",
+            "ses-resolve-bg",
+            "/bin/echo",
+            vec!["--agent".to_string(), marker.to_string()],
+            false,
+        );
+        plan.resolve_agent = Some(marker.to_string());
+
+        let started = spawn_background(project.path(), &plan).unwrap();
+        assert!(started, "spawn_background returned true");
+
+        let log_path = plan.log_file;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut content = String::new();
+        while Instant::now() < deadline {
+            content = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if content.contains(marker) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            content.contains(&format!("--agent {marker}")),
+            "echo should receive the fallback agent name; log content: {content:?}"
         );
     }
 
