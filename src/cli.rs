@@ -1,8 +1,10 @@
 //! The `kanban` command-line interface (clap). Output text mirrors the Python
 //! CLI so existing agent prompts and scripts keep working unchanged.
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
 
@@ -12,7 +14,7 @@ use crate::core::config::Config;
 use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
 use crate::core::models::Task;
-use crate::core::operations::{Operations, QuestionRef, TaskPatch};
+use crate::core::operations::{AgentExitOutcome, Operations, QuestionRef, TaskPatch};
 use crate::core::session::{SessionManager, estimate_session_tokens};
 use crate::core::storage::NewTask;
 use crate::core::timefmt;
@@ -204,6 +206,22 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Declare that the agent is waiting for a long-running result. The
+    /// session stays alive until eta × waiting_eta_multiplier seconds from
+    /// now; if the agent process exits meanwhile, it is relaunched at that
+    /// deadline to check the result. Call again to extend the wait.
+    Waiting {
+        task_id: String,
+        /// Expected wait in seconds (default: waiting_default_eta threshold)
+        #[arg(long)]
+        eta: Option<i64>,
+        /// What is being waited for
+        #[arg(long)]
+        note: Option<String>,
+        /// Session ID
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Check for crashed sessions.
     #[command(name = "check-sessions")]
     CheckSessions,
@@ -223,6 +241,12 @@ enum Command {
         session: String,
         #[arg(long)]
         status: i32,
+    },
+    #[command(name = "wait-resume", hide = true)]
+    WaitResume {
+        task_id: String,
+        #[arg(long)]
+        session: String,
     },
 }
 
@@ -552,7 +576,25 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             SessionManager::new(".").heartbeat(&session_id)?;
             println!("Heartbeat updated for session {session_id}");
         }
+        Command::Waiting {
+            task_id,
+            eta,
+            note,
+            session,
+        } => {
+            let session_id = env_session(session);
+            let deadline = ops.declare_waiting(&task_id, &session_id, eta, note.as_deref())?;
+            println!(
+                "Wait recorded for {task_id} (session {session_id}). \
+                 Relaunch deadline: {deadline}. End your reply now; you will be relaunched \
+                 after the deadline to check the result."
+            );
+        }
         Command::CheckSessions => {
+            let resumed = ops.resume_expired_waits()?;
+            for (task_id, session_id) in &resumed {
+                println!("Resumed {task_id} after wait deadline → {session_id}");
+            }
             let timeout = Config::new(".").get_threshold("session_heartbeat_timeout")?;
             let crashed = SessionManager::new(".").check_sessions(timeout)?;
             if crashed.is_empty() {
@@ -622,19 +664,95 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             task_id,
             session,
             status,
-        } => {
-            let session_mgr = SessionManager::new(".");
-            if status == 0 {
-                session_mgr.close_session(&session)?;
-                println!("Session {session} for {task_id} closed");
-            } else {
-                session_mgr.crash_session(&session)?;
+        } => match ops.reconcile_agent_exit(&task_id, &session, status)? {
+            AgentExitOutcome::Closed => println!("Session {session} for {task_id} closed"),
+            AgentExitOutcome::Waiting => {
+                spawn_wait_resume_monitor(&task_id, &session)?;
+                println!(
+                    "Session {session} for {task_id} is in a declared wait; \
+                     the agent will be relaunched at the wait deadline"
+                )
+            }
+            AgentExitOutcome::Resumed(new_session) => println!(
+                "Session {session} for {task_id} ended without done/ask/waiting; \
+                 auto-resumed as {new_session}"
+            ),
+            AgentExitOutcome::ResumeExhausted => {
+                eprintln!(
+                    "Session {session} for {task_id} ended without done/ask/waiting and the \
+                     auto-resume budget is spent; session marked crashed"
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+            AgentExitOutcome::LaunchFailed(new_session) => {
+                eprintln!(
+                    "Session {session} for {task_id} ended without done/ask/waiting, but auto-resume launch failed; {new_session} marked crashed"
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+            AgentExitOutcome::Crashed => {
                 eprintln!("Session {session} for {task_id} crashed with status {status}");
                 return Ok(ExitCode::FAILURE);
             }
+        },
+        Command::WaitResume { task_id, session } => {
+            wait_resume_monitor(&ops, &task_id, &session)?;
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn wait_resume_monitor(ops: &Operations, task_id: &str, session_id: &str) -> Result<()> {
+    let session_mgr = SessionManager::new(".");
+    loop {
+        let Some(session) = session_mgr.load_session(session_id) else {
+            return Ok(());
+        };
+        if session.task_id != task_id
+            || session.status != crate::core::models::SessionStatus::Active
+        {
+            return Ok(());
+        }
+        let Some(deadline) = session.wait_until else {
+            return Ok(());
+        };
+        let now = timefmt::now();
+        if deadline > now
+            && let Ok(wait) = (deadline - now).to_std()
+        {
+            std::thread::sleep(wait.min(std::time::Duration::from_secs(60)));
+            continue;
+        }
+        let resumed = ops.resume_expired_waits()?;
+        if !resumed.is_empty() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+}
+
+fn spawn_wait_resume_monitor(task_id: &str, session_id: &str) -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let mut command = ProcessCommand::new(exe);
+    command
+        .arg("wait-resume")
+        .arg(task_id)
+        .arg("--session")
+        .arg(session_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn()?;
+    Ok(())
 }
 
 fn chain_command(
