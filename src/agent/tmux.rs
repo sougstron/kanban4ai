@@ -32,6 +32,22 @@ pub fn spawn_plan(
     }
 }
 
+/// Kill the tmux session hosting an agent job. Returns `false` when tmux is
+/// unavailable or no such session exists (background jobs have no tmux host
+/// to signal). The `=` prefix forces exact-name matching so a partial id can
+/// never kill an unrelated session.
+pub fn kill_session(session_id: &str) -> Result<bool> {
+    if !command_available("tmux") {
+        return Ok(false);
+    }
+    let status = Command::new("tmux")
+        .args(["kill-session", "-t", &format!("={session_id}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    Ok(status.success())
+}
+
 pub fn attach_to_session(session_id: &str) -> Result<bool> {
     if !command_available("tmux") {
         eprintln!("tmux is not available; cannot attach to session {session_id}");
@@ -101,11 +117,20 @@ fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
         shell_quote(&plan.task_id),
         shell_quote(&plan.session_id)
     );
+    // Background heartbeat keyed on the wrapper shell's PID: agents can spend
+    // longer than the heartbeat timeout inside subagents without running any
+    // shell command, and a live process must never be marked crashed.
+    let heartbeat_loop = format!(
+        "( while kill -0 $$ 2>/dev/null; do {kanban_cmd} heartbeat --session {} >/dev/null 2>&1 || true; sleep {}; done ) & hb_pid=$!; ",
+        shell_quote(&plan.session_id),
+        plan.heartbeat_interval_secs
+    );
     format!(
-        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; mkdir -p {}; {} 2>&1 | tee -a {}; status=${{PIPESTATUS[0]}}; {}{}; exit $status",
+        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; mkdir -p {}; {}{} 2>&1 | tee -a {}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",
         shell_quote(&project_path.display().to_string()),
         shell_quote(&plan.session_id),
         shell_quote(&plan.task_id),
+        kanban_cmd,
         shell_quote(
             &plan
                 .log_file
@@ -114,6 +139,7 @@ fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
                 .display()
                 .to_string()
         ),
+        heartbeat_loop,
         command_line,
         shell_quote(&plan.log_file.display().to_string()),
         auto_segment,
@@ -186,11 +212,13 @@ mod tests {
             backend: "test".to_string(),
             task_id: task_id.to_string(),
             command: command.to_string(),
+            model: None,
             args,
             prompt: "test prompt".to_string(),
             log_file: log_dir.join(format!("{session_id}.log")),
             session_id: session_id.to_string(),
             auto_complete_on_exit: auto_complete,
+            heartbeat_interval_secs: 100,
         }
     }
 
@@ -209,6 +237,10 @@ mod tests {
             false,
         );
         let script = wrapper_script(dir.path(), &plan);
+        assert!(script.contains("export KANBAN_CMD="));
+        assert!(script.contains("heartbeat --session ses-test-false"));
+        assert!(script.contains("sleep 100"));
+        assert!(script.contains("kill $hb_pid"));
 
         let output = Command::new("bash")
             .args(["-n", "-c", &script])
