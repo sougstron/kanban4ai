@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::core::models::{Message, MessageKind, MessageStatus, Task, TaskStatus};
 use crate::core::session::SessionState;
@@ -44,14 +45,20 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let focus = detail.focus;
     let task = task.clone();
 
+    let description_lines = task_description_lines(&task);
     let meta_extra_lines = u16::from(waiting)
         + u16::from(wait_deadline.is_some())
-        + u16::from(session_state == Some(SessionState::Crashed));
+        + u16::from(session_state == Some(SessionState::Crashed))
+        + description_lines;
     let meta_height = 6 + meta_extra_lines;
     let answer_height = if show_answer {
         let question = &open_questions[detail.question_index.min(open_questions.len() - 1)];
-        // borders + question line + option rows (custom + variants) + input
-        4 + (question.variants.len() as u16 + 1).min(4)
+        let desired = 4 + question.variants.len() as u16 + 1;
+        let reserved = meta_height
+            .saturating_add(if show_edits { 6 } else { 0 })
+            .saturating_add(1)
+            .saturating_add(3);
+        desired.min(area.height.saturating_sub(reserved).max(5))
     } else {
         0
     };
@@ -132,6 +139,14 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     render_action_bar(frame, app, &theme, &task, show_answer, chunks[4]);
 }
 
+fn task_description_lines(task: &Task) -> u16 {
+    if task.description.trim().is_empty() {
+        0
+    } else {
+        1 + task.description.lines().take(3).count() as u16
+    }
+}
+
 struct MetaState<'a> {
     waiting: bool,
     wait_deadline: Option<chrono::NaiveDateTime>,
@@ -177,6 +192,21 @@ fn render_meta(
             timefmt::format(&task.updated_at)
         )),
     ];
+    if !task.description.trim().is_empty() {
+        meta.push(Line::from(Span::styled(
+            "Description:",
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        )));
+        let width = area.width.saturating_sub(4).max(1) as usize;
+        for line in task.description.lines().take(3) {
+            meta.push(Line::from(truncate_display(
+                &sanitize_terminal_text(line),
+                width,
+            )));
+        }
+    }
     if meta_state.waiting {
         meta.push(Line::from(Span::styled(
             "⏳ Agent is blocked on a question and waits for your answer",
@@ -233,24 +263,45 @@ fn render_answer_panel(
         index + 1,
         open_questions.len()
     );
-    let mut lines = vec![Line::from(Span::styled(
-        sanitize_terminal_text(&question.body),
-        Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
-    ))];
     let selected = detail.variant_selected;
     let custom_label = if input_text.is_empty() {
         "Custom answer: (type to fill)".to_string()
     } else {
         format!("Custom answer: {input_text}")
     };
-    lines.push(option_line(&custom_label, selected == 0, focused, theme));
+    let mut options = vec![option_line(&custom_label, selected == 0, focused, theme)];
     for (variant_index, variant) in question.variants.iter().enumerate() {
-        lines.push(option_line(
+        options.push(option_line(
             &format!("{}. {}", variant_index + 1, sanitize_terminal_text(variant)),
             selected == variant_index + 1,
             focused,
             theme,
         ));
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        sanitize_terminal_text(&question.body),
+        Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+    ))];
+    let visible_options = area.height.saturating_sub(3).max(1) as usize;
+    let max_start = options.len().saturating_sub(visible_options);
+    let start = selected
+        .saturating_add(1)
+        .saturating_sub(visible_options)
+        .min(max_start);
+    if start > 0 {
+        lines.push(Line::from(Span::styled(
+            "↑ more variants",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    let already_used = lines.len().saturating_sub(1);
+    let take = visible_options.saturating_sub(already_used);
+    lines.extend(options.iter().skip(start).take(take).cloned());
+    if start + take < options.len() {
+        lines.push(Line::from(Span::styled(
+            "↓ more variants",
+            Style::default().fg(theme.muted),
+        )));
     }
     frame.render_widget(
         Paragraph::new(lines)
@@ -267,6 +318,16 @@ fn render_answer_panel(
             .style(Style::default().bg(theme.bg).fg(theme.fg)),
         area,
     );
+    if focused && selected == 0 && start == 0 {
+        let cursor_x = area.x.saturating_add(3).saturating_add(
+            UnicodeWidthStr::width("Custom answer: ") as u16
+                + UnicodeWidthStr::width(input_text.as_str()) as u16,
+        );
+        frame.set_cursor_position((
+            cursor_x.min(area.x.saturating_add(area.width.saturating_sub(2))),
+            area.y.saturating_add(2),
+        ));
+    }
 }
 
 fn option_line(label: &str, selected: bool, panel_focused: bool, theme: &Theme) -> Line<'static> {
@@ -409,7 +470,14 @@ fn thread_lines(messages: &[Message], theme: &Theme) -> Vec<Line<'static>> {
             format!("{} · {} · {}", message.id, message.kind, status),
             style,
         )));
-        lines.push(Line::from(sanitize_terminal_text(&message.body)));
+        let sanitized_body = sanitize_terminal_text(&message.body);
+        if sanitized_body.is_empty() {
+            lines.push(Line::from(""));
+        } else {
+            for body_line in sanitized_body.lines() {
+                lines.push(Line::from(body_line.to_string()));
+            }
+        }
         if !message.variants.is_empty() {
             lines.push(Line::from(format!(
                 "Variants: {}",
