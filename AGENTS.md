@@ -218,7 +218,7 @@ Each task carries an `agent_backend` field selecting which CLI runs it. When uns
 - `agent_options` (opencode only): personas offered in the TUI and via `kanban create --agent-name` (e.g. `sisyphus`, `prometheus`, `hephaestus`, `atlas`)
 - `extra_args`: extra CLI flags inserted before `--model`
 
-Per-task persona: `task.agent_name` is passed to opencode as `--agent`, overriding the backend default. opencode matches `--agent` against an agent's *exact* registered name (oh-my-openagent personas are decorated strings); at launch the friendly key is resolved via `opencode agent list` (cached). If opencode is unavailable the key is passed through unchanged. The claude backend ignores `agent_name`.
+Per-task persona: `task.agent_name` is passed to opencode as `--agent`, overriding the backend default. opencode matches `--agent` against an agent's *exact* registered name (oh-my-openagent personas are decorated strings), so the friendly key is resolved via `opencode agent list`. Because starting the opencode CLI takes seconds, resolution is deferred into the launch wrapper script: the spawned session calls the hidden `kanban resolve-agent` command and substitutes the result into `--agent`, so the launching process (TUI or CLI) never blocks on it. If opencode is unavailable or lists no match the key is passed through unchanged. The claude backend ignores `agent_name`.
 
 Built-in backends:
 - **opencode**: `opencode run --title "<id>: <title>" [extra_args] [--model M] [--variant E] [--agent A] <prompt>`. A task's `ai_effort` (or the backend `effort` default) is passed as `--variant`, opencode's per-model reasoning-effort selector.
