@@ -1,8 +1,9 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 178
 expression: render_snapshot(&mut app)
 ---
-┌ To Do · todo (0) ────┐┌ In Progress · in_prog┐┌ Review · review (0) ─┐┌ Done · done (0) ─────┐
+┌ To Do (0) ───────────┐┌ In Progress (0) ─────┐┌ Review (0) ──────────┐┌ Done (0) ────────────┐
 │No tasks              ││No tasks              ││No tasks              ││No tasks              │
 │                      ││                      ││                      ││                      │
 │                      ││                      ││                      ││                      │
@@ -29,7 +30,7 @@ expression: render_snapshot(&mut app)
 │                      ││                      ││                      ││                      │
 │                      ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
- TUI ready │ Enter detail │ / search │ n/e/m/d/s/w actions │ a archive │ l sessions │ Ctrl+T the
+ TUI ready │ n new · e edit · r run · m move · y approve · A archive done · / filter · ? help   
 
 --- style runs ---
 0:0-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
