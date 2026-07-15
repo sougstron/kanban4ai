@@ -7,7 +7,7 @@ use kanban4ai::core::context::ContextManager;
 use kanban4ai::core::error::KanbanError;
 use kanban4ai::core::models::{MessageKind, MessageRole, MessageStatus, Task, TaskStatus};
 use kanban4ai::core::operations::{
-    AgentLauncher, NoopLauncher, Operations, QuestionRef, TaskPatch,
+    AgentExitOutcome, AgentLauncher, NoopLauncher, Operations, QuestionRef, TaskPatch,
 };
 use kanban4ai::core::session::{SessionManager, SessionState};
 use kanban4ai::core::storage::NewTask;
@@ -175,6 +175,100 @@ fn one_task_per_instance_blocks_second_take() {
             .unwrap()
             .is_some()
     );
+}
+
+#[test]
+fn take_task_rejects_unsafe_session_id_before_persisting() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Unsafe session")).unwrap();
+
+    assert!(matches!(
+        ops.take_task(&task.id, "../escape", true),
+        Err(KanbanError::Invalid(_))
+    ));
+
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.session, None);
+    assert_eq!(stored.status, TaskStatus::Todo);
+}
+
+#[test]
+fn review_rerun_rejects_unsafe_session_id_before_mutation() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops
+        .create_task(NewTask::titled("Unsafe review rerun"))
+        .unwrap();
+    ops.move_task(&task.id, "review", false).unwrap();
+    ops.set_review_edits(&task.id, "do not fold on invalid session")
+        .unwrap();
+
+    assert!(matches!(
+        ops.rerun_review_task(&task.id, Some("../escape")),
+        Err(KanbanError::Invalid(_))
+    ));
+
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Review);
+    assert_eq!(stored.session, None);
+    assert_eq!(stored.review_edits, "do not fold on invalid session");
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        !thread
+            .messages
+            .iter()
+            .any(|message| message.kind == MessageKind::ReviewEdit)
+    );
+}
+
+#[test]
+fn in_progress_rerun_rejects_unsafe_session_id_before_mutation() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops
+        .create_task(NewTask::titled("Unsafe progress rerun"))
+        .unwrap();
+    ops.take_task(&task.id, "ses-old", true).unwrap().unwrap();
+    SessionManager::new(dir.path())
+        .crash_session("ses-old")
+        .unwrap();
+
+    assert!(matches!(
+        ops.rerun_in_progress_task(&task.id, Some("../escape")),
+        Err(KanbanError::Invalid(_))
+    ));
+
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_eq!(stored.session.as_deref(), Some("ses-old"));
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        !thread
+            .messages
+            .iter()
+            .any(|message| message.body.contains("Task was re-run from In Progress"))
+    );
+}
+
+#[test]
+fn agent_exit_does_not_close_unrelated_session() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let owner = ops.create_task(NewTask::titled("Owner")).unwrap();
+    let other = ops.create_task(NewTask::titled("Other")).unwrap();
+    ops.take_task(&owner.id, "ses-owned", true)
+        .unwrap()
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let outcome = ops.reconcile_agent_exit(&other.id, "ses-owned", 0).unwrap();
+
+    assert_eq!(outcome, AgentExitOutcome::Closed);
+    assert!(SessionManager::new(dir.path()).is_session_active("ses-owned"));
+    assert!(recorder.calls().is_empty());
 }
 
 #[test]
@@ -653,6 +747,287 @@ fn check_sessions_crashes_stale_heartbeats() {
     let tm = ThreadManager::new(dir.path()).unwrap();
     let systems = tm.messages_of_kind(&task.id, MessageKind::System).unwrap();
     assert!(systems.iter().any(|m| m.body.contains("marked crashed")));
+}
+
+#[test]
+fn declared_wait_exempts_stale_session_until_deadline() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Wait safely")).unwrap();
+    let session_mgr = SessionManager::new(dir.path());
+    let mut session = session_mgr.link_session(&task.id, "ses-wait").unwrap();
+    session.last_seen = timefmt::now() - chrono::Duration::seconds(1000);
+    session.wait_until = Some(timefmt::now() + chrono::Duration::seconds(60));
+    session.wait_note = Some("external query".to_string());
+    session_mgr.save_session(&session).unwrap();
+
+    let crashed = session_mgr.check_sessions(300).unwrap();
+
+    assert!(crashed.is_empty());
+    assert!(session_mgr.is_session_active("ses-wait"));
+    assert_eq!(
+        session_mgr.session_state("ses-wait", 300),
+        Some(SessionState::Waiting)
+    );
+}
+
+#[test]
+fn clean_agent_exit_auto_resumes_stranded_in_progress_task() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Resume me")).unwrap();
+    ops.take_task(&task.id, "ses-old", true).unwrap().unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let outcome = ops.reconcile_agent_exit(&task.id, "ses-old", 0).unwrap();
+
+    let AgentExitOutcome::Resumed(new_session) = outcome else {
+        panic!("expected auto-resume, got {outcome:?}");
+    };
+    assert_ne!(new_session, "ses-old");
+    assert_eq!(
+        recorder.calls(),
+        vec![(task.id.clone(), new_session.clone(), false)]
+    );
+    let session_mgr = SessionManager::new(dir.path());
+    assert!(!session_mgr.is_session_active("ses-old"));
+    assert!(session_mgr.is_session_active(&new_session));
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_eq!(stored.session.as_deref(), Some(new_session.as_str()));
+    assert_eq!(stored.auto_resumes, 1);
+
+    let contexts = ThreadManager::new(dir.path())
+        .unwrap()
+        .messages_of_kind(&task.id, MessageKind::Context)
+        .unwrap();
+    assert!(contexts.iter().any(|message| {
+        message.body.contains("ended without completing")
+            && message.body.contains("auto-resuming (attempt 1/3)")
+    }));
+}
+
+#[test]
+fn auto_resume_budget_exhaustion_crashes_stranded_task() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Budget spent")).unwrap();
+    ops.take_task(&task.id, "ses-loop", true).unwrap().unwrap();
+    recorder.calls.lock().unwrap().clear();
+    let mut stored = ops.get_task(&task.id).unwrap().unwrap();
+    stored.auto_resumes = 3;
+    ops.storage.save_task(&stored).unwrap();
+
+    let outcome = ops.reconcile_agent_exit(&task.id, "ses-loop", 0).unwrap();
+
+    assert_eq!(outcome, AgentExitOutcome::ResumeExhausted);
+    assert!(recorder.calls().is_empty());
+    assert_eq!(
+        SessionManager::new(dir.path()).session_state("ses-loop", 300),
+        Some(SessionState::Crashed)
+    );
+}
+
+#[test]
+fn auto_resume_launch_failure_is_reported_and_crashes_new_session() {
+    let (dir, setup_ops, _recorder) = ops_with_recorder(true);
+    let task = setup_ops
+        .create_task(NewTask::titled("Launch failure"))
+        .unwrap();
+    setup_ops
+        .take_task(&task.id, "ses-before-fail", true)
+        .unwrap()
+        .unwrap();
+    let ops = Operations::with_launcher(dir.path(), Box::new(FailingLauncher));
+
+    let outcome = ops
+        .reconcile_agent_exit(&task.id, "ses-before-fail", 0)
+        .unwrap();
+
+    let AgentExitOutcome::LaunchFailed(new_session) = outcome else {
+        panic!("expected launch failure, got {outcome:?}");
+    };
+    assert_eq!(
+        SessionManager::new(dir.path()).session_state(&new_session, 300),
+        Some(SessionState::Crashed)
+    );
+    assert_eq!(
+        ops.get_task(&task.id).unwrap().unwrap().session.as_deref(),
+        Some(new_session.as_str())
+    );
+}
+
+#[test]
+fn clean_agent_exit_during_declared_wait_keeps_session_for_deadline() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Declared wait")).unwrap();
+    ops.take_task(&task.id, "ses-waiting", true)
+        .unwrap()
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let deadline = ops
+        .declare_waiting(&task.id, "ses-waiting", Some(10), Some("analytics query"))
+        .unwrap();
+    let outcome = ops
+        .reconcile_agent_exit(&task.id, "ses-waiting", 0)
+        .unwrap();
+
+    assert_eq!(outcome, AgentExitOutcome::Waiting);
+    assert!(recorder.calls().is_empty());
+    let session = SessionManager::new(dir.path())
+        .load_session("ses-waiting")
+        .unwrap();
+    assert_eq!(session.wait_until, Some(deadline));
+    assert_eq!(session.wait_note.as_deref(), Some("analytics query"));
+    assert!(session.wait_exited);
+    assert_eq!(
+        ops.get_task(&task.id).unwrap().unwrap().session.as_deref(),
+        Some("ses-waiting")
+    );
+}
+
+#[test]
+fn expired_declared_wait_relaunches_agent_to_check_result() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Check later")).unwrap();
+    ops.take_task(&task.id, "ses-wait-old", true)
+        .unwrap()
+        .unwrap();
+    ops.declare_waiting(&task.id, "ses-wait-old", Some(10), Some("batch export"))
+        .unwrap();
+    ops.reconcile_agent_exit(&task.id, "ses-wait-old", 0)
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+    let session_mgr = SessionManager::new(dir.path());
+    let mut session = session_mgr.load_session("ses-wait-old").unwrap();
+    session.wait_until = Some(timefmt::now() - chrono::Duration::seconds(1));
+    session_mgr.save_session(&session).unwrap();
+
+    let resumed = ops.resume_expired_waits().unwrap();
+
+    assert_eq!(resumed.len(), 1);
+    assert_eq!(resumed[0].0, task.id);
+    let new_session = resumed[0].1.clone();
+    assert_eq!(
+        recorder.calls(),
+        vec![(task.id.clone(), new_session.clone(), false)]
+    );
+    assert!(!session_mgr.is_session_active("ses-wait-old"));
+    assert!(session_mgr.is_session_active(&new_session));
+    assert_eq!(
+        ops.get_task(&task.id).unwrap().unwrap().session.as_deref(),
+        Some(new_session.as_str())
+    );
+    let contexts = ThreadManager::new(dir.path())
+        .unwrap()
+        .messages_of_kind(&task.id, MessageKind::Context)
+        .unwrap();
+    assert!(contexts.iter().any(|message| {
+        message.body.contains("Waiting deadline passed")
+            && message.body.contains("batch export")
+            && message.body.contains("declare waiting again")
+    }));
+}
+
+#[test]
+fn expired_declared_wait_launch_failure_crashes_new_session() {
+    let (dir, setup_ops, _recorder) = ops_with_recorder(true);
+    let task = setup_ops
+        .create_task(NewTask::titled("Wait launch failure"))
+        .unwrap();
+    setup_ops
+        .take_task(&task.id, "ses-wait-fail", true)
+        .unwrap()
+        .unwrap();
+    setup_ops
+        .declare_waiting(&task.id, "ses-wait-fail", Some(10), Some("fragile export"))
+        .unwrap();
+    setup_ops
+        .reconcile_agent_exit(&task.id, "ses-wait-fail", 0)
+        .unwrap();
+    let session_mgr = SessionManager::new(dir.path());
+    let mut session = session_mgr.load_session("ses-wait-fail").unwrap();
+    session.wait_until = Some(timefmt::now() - chrono::Duration::seconds(1));
+    session_mgr.save_session(&session).unwrap();
+    let ops = Operations::with_launcher(dir.path(), Box::new(FailingLauncher));
+
+    let resumed = ops.resume_expired_waits().unwrap();
+
+    assert!(resumed.is_empty());
+    assert!(!session_mgr.is_session_active("ses-wait-fail"));
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    let new_session = stored.session.expect("failed relaunch session persisted");
+    assert_ne!(new_session, "ses-wait-fail");
+    assert_eq!(
+        session_mgr.session_state(&new_session, 300),
+        Some(SessionState::Crashed)
+    );
+}
+
+#[test]
+fn expired_declared_wait_without_auto_launch_crashes_old_session() {
+    let (dir, ops, recorder) = ops_with_recorder(false);
+    let task = ops
+        .create_task(NewTask::titled("Wait without launcher"))
+        .unwrap();
+    ops.take_task(&task.id, "ses-wait-disabled", true)
+        .unwrap()
+        .unwrap();
+    ops.declare_waiting(
+        &task.id,
+        "ses-wait-disabled",
+        Some(10),
+        Some("manual export"),
+    )
+    .unwrap();
+    ops.reconcile_agent_exit(&task.id, "ses-wait-disabled", 0)
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+    let session_mgr = SessionManager::new(dir.path());
+    let mut session = session_mgr.load_session("ses-wait-disabled").unwrap();
+    session.wait_until = Some(timefmt::now() - chrono::Duration::seconds(1));
+    session_mgr.save_session(&session).unwrap();
+
+    let resumed = ops.resume_expired_waits().unwrap();
+
+    assert!(resumed.is_empty());
+    assert!(recorder.calls().is_empty());
+    assert_eq!(
+        session_mgr.session_state("ses-wait-disabled", 300),
+        Some(SessionState::Crashed)
+    );
+    assert_eq!(
+        ops.get_task(&task.id).unwrap().unwrap().session.as_deref(),
+        Some("ses-wait-disabled")
+    );
+}
+
+#[test]
+fn expired_declared_wait_respects_auto_resume_budget() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Wait budget")).unwrap();
+    ops.take_task(&task.id, "ses-wait-budget", true)
+        .unwrap()
+        .unwrap();
+    ops.declare_waiting(&task.id, "ses-wait-budget", Some(10), Some("budgeted wait"))
+        .unwrap();
+    ops.reconcile_agent_exit(&task.id, "ses-wait-budget", 0)
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+    let session_mgr = SessionManager::new(dir.path());
+    let mut session = session_mgr.load_session("ses-wait-budget").unwrap();
+    session.wait_until = Some(timefmt::now() - chrono::Duration::seconds(1));
+    session_mgr.save_session(&session).unwrap();
+    let mut stored = ops.get_task(&task.id).unwrap().unwrap();
+    stored.auto_resumes = 3;
+    ops.storage.save_task(&stored).unwrap();
+
+    let resumed = ops.resume_expired_waits().unwrap();
+
+    assert!(resumed.is_empty());
+    assert!(recorder.calls().is_empty());
+    assert_eq!(
+        session_mgr.session_state("ses-wait-budget", 300),
+        Some(SessionState::Crashed)
+    );
 }
 
 #[test]

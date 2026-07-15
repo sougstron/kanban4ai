@@ -12,7 +12,9 @@ use crate::agent::KanbanLauncher;
 use crate::core::config::Config;
 use crate::core::context::{ContextManager, role_for_source};
 use crate::core::error::{KanbanError, Result};
-use crate::core::models::{Message, MessageKind, MessageRole, MessageStatus, Task, TaskStatus};
+use crate::core::models::{
+    Message, MessageKind, MessageRole, MessageStatus, SessionStatus, Task, TaskStatus,
+};
 use crate::core::notifier::{DesktopNotifier, NotificationConfig};
 use crate::core::session::SessionManager;
 use crate::core::storage::{NewTask, Storage};
@@ -58,6 +60,35 @@ pub struct TaskPatch {
 pub enum QuestionRef {
     Index(usize),
     MsgId(String),
+}
+
+/// What [`Operations::reconcile_agent_exit`] decided about an exited agent
+/// process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentExitOutcome {
+    /// Non-zero exit: the session was marked crashed.
+    Crashed,
+    /// Clean exit with nothing left to do (task completed, moved on, or
+    /// waiting for a human answer): the session was closed.
+    Closed,
+    /// Clean exit inside a declared, unexpired wait: the session stays alive
+    /// until its wait deadline relaunches the agent.
+    Waiting,
+    /// Clean exit that stranded an In Progress task: the agent was relaunched
+    /// on the returned session id.
+    Resumed(String),
+    /// Stranded task, but the auto-resume budget is spent: the session was
+    /// marked crashed and the user notified.
+    ResumeExhausted,
+    /// The task was claimed for a resume session, but launching the agent
+    /// failed; the new session was marked crashed.
+    LaunchFailed(String),
+}
+
+enum RespawnOutcome {
+    Spawned(String),
+    Noop,
+    LaunchFailed(String),
 }
 
 pub struct Operations {
@@ -269,6 +300,7 @@ impl Operations {
         };
         task.status = TaskStatus::Todo;
         task.session = None;
+        task.auto_resumes = 0;
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         Ok(Some(task))
@@ -455,6 +487,7 @@ impl Operations {
         is_agent: bool,
     ) -> Result<Option<Task>> {
         let session_mgr = self.session_manager();
+        SessionManager::validate_session_id(session_id)?;
         let (task, previous_status, previous_session) = {
             let _guard = self.storage.lock()?;
             let Some(mut task) = self.storage.load_task(task_id)? else {
@@ -474,6 +507,7 @@ impl Operations {
             }
 
             task.session = Some(session_id.to_string());
+            task.auto_resumes = 0;
             if self.config.get_rule("auto_move_on_assign")? {
                 task.status = TaskStatus::InProgress;
             }
@@ -941,6 +975,9 @@ impl Operations {
         task_id: &str,
         session_id: Option<&str>,
     ) -> Result<Option<Task>> {
+        if let Some(session_id) = session_id {
+            SessionManager::validate_session_id(session_id)?;
+        }
         let (task, session_id) = {
             let _guard = self.storage.lock()?;
             let Some(mut task) = self.storage.load_task(task_id)? else {
@@ -967,6 +1004,7 @@ impl Operations {
             };
             task.review_edits = String::new();
             task.session = Some(session_id.clone());
+            task.auto_resumes = 0;
             task.status = TaskStatus::InProgress;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
@@ -996,6 +1034,9 @@ impl Operations {
         task_id: &str,
         session_id: Option<&str>,
     ) -> Result<Option<Task>> {
+        if let Some(session_id) = session_id {
+            SessionManager::validate_session_id(session_id)?;
+        }
         let session_mgr = self.session_manager();
         let (task, session_id) = {
             let _guard = self.storage.lock()?;
@@ -1048,6 +1089,7 @@ impl Operations {
             )?;
 
             task.session = Some(session_id.clone());
+            task.auto_resumes = 0;
             task.has_questions = tm.has_open_questions(&task.id)?;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
@@ -1129,6 +1171,7 @@ impl Operations {
 
     /// Spawn a revert job restoring every file under the task's backup dir.
     pub fn launch_revert(&self, task_id: &str, session_id: &str) -> Result<bool> {
+        SessionManager::validate_session_id(session_id)?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
             eprintln!("Warning: Task {task_id} not found. Revert not started.");
             return Ok(false);
@@ -1149,6 +1192,332 @@ impl Operations {
             self.session_manager().crash_session(session_id)?;
         }
         Ok(launched)
+    }
+
+    // ----------------------------------------- waiting / exit reconciliation
+
+    /// Record a wait the agent declared with `kanban waiting`: the session is
+    /// kept alive until `eta × waiting_eta_multiplier` seconds from now, and
+    /// if the agent process exits meanwhile it is relaunched at that deadline
+    /// to check the awaited result. Returns the relaunch deadline.
+    pub fn declare_waiting(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        eta: Option<i64>,
+        note: Option<&str>,
+    ) -> Result<chrono::NaiveDateTime> {
+        let min_eta = self.config.get_threshold("waiting_min_eta")?.max(1);
+        let max_eta = self.config.get_threshold("waiting_max_eta")?.max(min_eta);
+        let eta = match eta {
+            Some(value) => value,
+            None => self.config.get_threshold("waiting_default_eta")?,
+        }
+        .clamp(min_eta, max_eta);
+        let multiplier = self.config.get_threshold("waiting_eta_multiplier")?.max(1);
+        let note_max_chars = self.config.get_threshold("waiting_note_max_chars")?.max(1) as usize;
+        let wait_seconds = eta.checked_mul(multiplier).ok_or_else(|| {
+            KanbanError::Invalid("waiting ETA is too large after applying multiplier".to_string())
+        })?;
+        let duration = chrono::Duration::try_seconds(wait_seconds)
+            .ok_or_else(|| KanbanError::Invalid("waiting duration is out of range".to_string()))?;
+        let deadline = timefmt::now()
+            .checked_add_signed(duration)
+            .ok_or_else(|| KanbanError::Invalid("waiting deadline is out of range".to_string()))?;
+
+        let session_mgr = self.session_manager();
+        let task = {
+            let _guard = self.storage.lock()?;
+            let Some(task) = self.storage.load_task(task_id)? else {
+                return Err(KanbanError::Invalid(format!("Task {task_id} not found")));
+            };
+            let valid_session = session_mgr.load_session(session_id).is_some_and(|s| {
+                s.task_id == task_id
+                    && s.status == SessionStatus::Active
+                    && task.status == TaskStatus::InProgress
+                    && task.session.as_deref() == Some(session_id)
+            });
+            if !valid_session {
+                return Err(KanbanError::Invalid(format!(
+                    "Session {session_id} is not the active In Progress session of task {task_id}"
+                )));
+            }
+            let note_text = note
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or("a long-running result")
+                .chars()
+                .take(note_max_chars)
+                .collect::<String>();
+            if !session_mgr.set_wait(session_id, deadline, Some(note_text.clone()))? {
+                return Err(KanbanError::Invalid(format!(
+                    "Session {session_id} is not an active session of task {task_id}"
+                )));
+            }
+            (task, note_text)
+        };
+        let (task, note_text) = task;
+
+        // `context` kind (not `system`) so the note reaches the relaunch prompt.
+        self.thread_manager()?.post(
+            task_id,
+            MessageRole::Agent,
+            MessageKind::Context,
+            &format!(
+                "⏳ Entering wait mode: {note_text}\nExpected ~{eta}s; relaunch deadline {} (×{multiplier} safety buffer).",
+                timefmt::format(&deadline)
+            ),
+            None,
+            vec![],
+            Some("agent".to_string()),
+        )?;
+        if let Ok(notifier) = self.notifier() {
+            notifier.waiting(
+                task_id,
+                &task.title,
+                &note_text,
+                &timefmt::format(&deadline),
+            );
+        }
+        Ok(deadline)
+    }
+
+    /// Reconcile an exited agent process (called by the launch wrapper).
+    ///
+    /// A clean exit that leaves the task In Progress with no `done`, no open
+    /// question, and no declared wait is an unfinished run — typically an
+    /// agent that ended its reply expecting a background notification that
+    /// can never arrive. Such tasks are auto-resumed on a fresh session,
+    /// bounded by the `max_auto_resumes` threshold.
+    pub fn reconcile_agent_exit(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        exit_status: i32,
+    ) -> Result<AgentExitOutcome> {
+        let session_mgr = self.session_manager();
+        let Some(session) = session_mgr.load_session(session_id) else {
+            return Ok(AgentExitOutcome::Closed);
+        };
+        if session.task_id != task_id || session.id != session_id {
+            return Ok(AgentExitOutcome::Closed);
+        }
+        if exit_status != 0 {
+            session_mgr.crash_session(session_id)?;
+            return Ok(AgentExitOutcome::Crashed);
+        }
+
+        let now = timefmt::now();
+        let in_declared_wait = session.status == SessionStatus::Active
+            && session.wait_until.is_some_and(|deadline| now <= deadline);
+        if in_declared_wait {
+            session_mgr.mark_wait_exited(session_id)?;
+            return Ok(AgentExitOutcome::Waiting);
+        }
+
+        let stranded = {
+            let _guard = self.storage.lock()?;
+            self.storage.load_task(task_id)?.filter(|task| {
+                task.status == TaskStatus::InProgress && task.session.as_deref() == Some(session_id)
+            })
+        };
+        let Some(task) = stranded else {
+            session_mgr.close_session(session_id)?;
+            return Ok(AgentExitOutcome::Closed);
+        };
+        if self.thread_manager()?.has_open_questions(&task.id)? {
+            // Waiting for a human answer, not stranded.
+            session_mgr.close_session(session_id)?;
+            return Ok(AgentExitOutcome::Closed);
+        }
+        if !self.auto_launch_enabled()? {
+            session_mgr.close_session(session_id)?;
+            return Ok(AgentExitOutcome::Closed);
+        }
+
+        let max_resumes = self.config.get_threshold("max_auto_resumes")?;
+        if i64::from(task.auto_resumes) >= max_resumes {
+            session_mgr.crash_session(session_id)?;
+            if let Ok(notifier) = self.notifier() {
+                notifier.stranded(
+                    &task.id,
+                    &task.title,
+                    &format!(
+                        "Agent exited without done/ask/waiting {max_resumes} times in a row; \
+                         auto-resume budget is spent. Re-run or recover the task manually."
+                    ),
+                );
+            }
+            return Ok(AgentExitOutcome::ResumeExhausted);
+        }
+
+        session_mgr.close_session(session_id)?;
+        let attempt = task.auto_resumes + 1;
+        let note = format!(
+            "Session {session_id} ended without completing the task, asking a question, or \
+             declaring a wait; auto-resuming (attempt {attempt}/{max_resumes}).\n\
+             If you were waiting on a background process or notification: background work does \
+             not survive the end of a reply, so check its current state now and continue. Block \
+             on long commands in the foreground, or declare long waits with the waiting command."
+        );
+        match self.respawn_session(task_id, session_id, &note, Some(attempt))? {
+            RespawnOutcome::Spawned(new_session) => Ok(AgentExitOutcome::Resumed(new_session)),
+            RespawnOutcome::Noop => Ok(AgentExitOutcome::Closed),
+            RespawnOutcome::LaunchFailed(new_session) => {
+                Ok(AgentExitOutcome::LaunchFailed(new_session))
+            }
+        }
+    }
+
+    /// Relaunch agents whose declared wait deadline has passed while their
+    /// process is gone — the "ping": the fresh session is told to check the
+    /// awaited result, report, and either finish or declare a new wait.
+    /// Called from the TUI tick and `kanban check-sessions`.
+    pub fn resume_expired_waits(&self) -> Result<Vec<(String, String)>> {
+        let session_mgr = self.session_manager();
+        let heartbeat_timeout = self.config.get_threshold("session_heartbeat_timeout")?;
+        let now = timefmt::now();
+        let mut resumed = Vec::new();
+        for session in session_mgr.list_active_sessions() {
+            let Some(wait_until) = session.wait_until else {
+                continue;
+            };
+            if now <= wait_until {
+                continue;
+            }
+            // A live process past its deadline is still working (its wrapper
+            // keeps heartbeating); only relaunch when the process is gone.
+            let process_gone =
+                session.wait_exited || (now - session.last_seen).num_seconds() > heartbeat_timeout;
+            if !process_gone {
+                continue;
+            }
+            let Some(task) = self.storage.load_task(&session.task_id)? else {
+                session_mgr.close_session(&session.id)?;
+                continue;
+            };
+            let max_resumes = self.config.get_threshold("max_auto_resumes")?;
+            if i64::from(task.auto_resumes) >= max_resumes {
+                session_mgr.crash_session(&session.id)?;
+                if let Ok(notifier) = self.notifier() {
+                    notifier.stranded(
+                        &task.id,
+                        &task.title,
+                        &format!(
+                            "Waiting deadline passed, but the auto-resume budget ({max_resumes}) is spent. Re-run or recover the task manually."
+                        ),
+                    );
+                }
+                continue;
+            }
+            let attempt = task.auto_resumes + 1;
+            let note = format!(
+                "⏰ Waiting deadline passed at {}.\nYou were waiting for: {}.\nCheck the awaited \
+                 result now, record what you find with the context command, and continue. If it \
+                 is still not ready, declare waiting again with a new --eta.",
+                timefmt::format(&wait_until),
+                session.wait_note.as_deref().unwrap_or("(no note)")
+            );
+            match self.respawn_session(&session.task_id, &session.id, &note, Some(attempt))? {
+                RespawnOutcome::Spawned(new_session) => {
+                    session_mgr.close_session(&session.id)?;
+                    resumed.push((session.task_id.clone(), new_session));
+                }
+                RespawnOutcome::LaunchFailed(new_session) => {
+                    session_mgr.close_session(&session.id)?;
+                    if let Ok(notifier) = self.notifier() {
+                        notifier.stranded(
+                            &task.id,
+                            &task.title,
+                            &format!(
+                                "Waiting deadline passed, but relaunch failed; {new_session} was marked crashed. Re-run or recover the task manually."
+                            ),
+                        );
+                    }
+                }
+                RespawnOutcome::Noop => {
+                    let still_stranded =
+                        self.storage
+                            .load_task(&session.task_id)?
+                            .is_some_and(|task| {
+                                task.status == TaskStatus::InProgress
+                                    && task.session.as_deref() == Some(session.id.as_str())
+                            });
+                    if still_stranded {
+                        session_mgr.crash_session(&session.id)?;
+                        if let Ok(notifier) = self.notifier() {
+                            notifier.stranded(
+                                &task.id,
+                                &task.title,
+                                "Waiting deadline passed, but the task could not be relaunched automatically. Re-run or recover it manually.",
+                            );
+                        }
+                    } else {
+                        session_mgr.close_session(&session.id)?;
+                    }
+                }
+            }
+        }
+        Ok(resumed)
+    }
+
+    /// Relaunch a task's agent on a fresh session after `expected_session`
+    /// ended. No-op (returns `None`) when the task is gone, no longer In
+    /// Progress, or already handed to a different session — the guard that
+    /// makes concurrent resume paths (TUI tick vs `check-sessions`) safe.
+    fn respawn_session(
+        &self,
+        task_id: &str,
+        expected_session: &str,
+        note: &str,
+        resume_attempt: Option<u32>,
+    ) -> Result<RespawnOutcome> {
+        if !self.auto_launch_enabled()? {
+            return Ok(RespawnOutcome::Noop);
+        }
+        let session_mgr = self.session_manager();
+        let new_session_id = {
+            let _guard = self.storage.lock()?;
+            let Some(mut task) = self.storage.load_task(task_id)? else {
+                return Ok(RespawnOutcome::Noop);
+            };
+            if task.status != TaskStatus::InProgress
+                || task.session.as_deref() != Some(expected_session)
+            {
+                return Ok(RespawnOutcome::Noop);
+            }
+            let backend = self.resolve_backend(&task)?;
+            let backend = safe_session_component(&backend);
+            let new_session_id = format!(
+                "ses-{}-{}",
+                backend,
+                timefmt::now().format("%Y%m%d-%H%M%S-%6f")
+            );
+            // `context` kind so the relaunch prompt carries the reason.
+            self.thread_manager()?.post(
+                &task.id,
+                MessageRole::System,
+                MessageKind::Context,
+                note,
+                None,
+                vec![],
+                Some("kanban".to_string()),
+            )?;
+            if let Some(attempt) = resume_attempt {
+                task.auto_resumes = attempt;
+            }
+            task.session = Some(new_session_id.clone());
+            task.updated_at = timefmt::now();
+            self.storage.save_task(&task)?;
+            session_mgr.link_named_session(&task.id, &new_session_id, &task.title)?;
+            new_session_id
+        };
+
+        if !self.launch_agent(task_id, &new_session_id, false)? {
+            session_mgr.crash_session(&new_session_id)?;
+            return Ok(RespawnOutcome::LaunchFailed(new_session_id));
+        }
+        Ok(RespawnOutcome::Spawned(new_session_id))
     }
 
     // ------------------------------------------------- per-task housekeeping
@@ -1185,11 +1554,10 @@ impl Operations {
     fn clear_task_logs_and_sessions(&self, task: &Task) {
         let kanban_dir = self.project_path().join(".kanban");
         for session_id in self.task_session_ids(task) {
-            let _ = fs::remove_file(
-                kanban_dir
-                    .join("sessions")
-                    .join(format!("{session_id}.yaml")),
-            );
+            if SessionManager::validate_session_id(&session_id).is_err() {
+                continue;
+            }
+            self.session_manager().unlink_session(&session_id);
             let _ = fs::remove_file(kanban_dir.join("logs").join(format!("{session_id}.log")));
         }
     }
@@ -1313,6 +1681,24 @@ impl Operations {
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         Ok(task)
+    }
+}
+
+fn safe_session_component(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if safe.is_empty() {
+        "agent".to_string()
+    } else {
+        safe
     }
 }
 
