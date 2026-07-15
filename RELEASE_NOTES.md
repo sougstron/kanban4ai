@@ -1,13 +1,13 @@
-# kanban4ai 0.2.0
+# kanban4ai 0.2.1
 
 ## Highlights
 
-- Reworked agent launching so delegated jobs receive `KANBAN_CMD`, keep automatic heartbeats while running, preserve task thread/review context in prompts, and support opencode model variants plus Claude reasoning effort.
-- Expanded the TUI with direct Run actions, project settings, clickable status/action bars, add-context/suggestion flows, archive restore, session management, log viewing, search, scroll indicators, and safer confirmation dialogs.
-- Improved task/session operations with named sessions, exact bulk moves, stop-session support, archive restore, direct creation in target columns, first-question previews, and YAML timestamp compatibility for legacy Python tooling.
-- Updated user and agent documentation for the current Rust CLI/TUI workflow, AUR packaging, release automation, and backend configuration.
+- Added declared agent waits with `kanban waiting`: agents can record bounded long-running waits, keep sessions alive until a relaunch deadline, and be resumed automatically to check the result.
+- Hardened agent exit reconciliation with bounded auto-resume, explicit launch-failure reporting, safe session-id validation, atomic session writes, and clearer stranded-session recovery.
+- Improved TUI visibility and controls for waiting, crashed, and stuck work: waiting deadlines are shown on cards/details/session rows, stuck tasks expose Recover, detail Run closes back to the board, and `b` is the discoverable bulk-review hotkey.
+- Improved agent callback robustness when a running executable has been replaced on disk, documented the long-wait workflow for agent operators, and raised the default heartbeat timeout from 5 minutes to 30 minutes.
 
 ## Verification coverage
 
-- Added and refreshed CLI, operations, storage, thread, config, agent, and TUI snapshot tests for the new workflows.
-- Release CI continues to run rustfmt, clippy with warnings denied, locked tests, release builds, and installer packaging smoke tests before publishing tagged artifacts.
+- Added regression coverage for declared waits, expired-wait relaunches, expired-wait launch failures/no-op recovery, auto-resume budget exhaustion, unsafe session IDs, waiting/crashed TUI rendering, log-tail session sanitization, detail Run behavior, and bulk-review shortcut routing.
+- Release checks for this version include rustfmt, clippy with warnings denied, locked tests, a release build, and installer packaging smoke tests.
