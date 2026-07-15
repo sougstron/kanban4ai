@@ -15,6 +15,7 @@ use kanban4ai::core::thread::ThreadManager;
 use kanban4ai::core::timefmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[test]
 fn targeted_creation_writes_directly_to_requested_status() {
@@ -882,6 +883,84 @@ fn clean_agent_exit_during_declared_wait_keeps_session_for_deadline() {
         ops.get_task(&task.id).unwrap().unwrap().session.as_deref(),
         Some("ses-waiting")
     );
+}
+
+#[test]
+fn detach_command_records_output_status_and_wait() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Detached job")).unwrap();
+    ops.take_task(&task.id, "ses-detach", true)
+        .unwrap()
+        .unwrap();
+
+    let job = ops
+        .detach_command(
+            &task.id,
+            "ses-detach",
+            Some(10),
+            Some("demo export"),
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo detached-output; exit 7".to_string(),
+            ],
+        )
+        .unwrap();
+
+    let poll_deadline = Instant::now() + Duration::from_secs(10);
+    while !job.status_file.exists() && Instant::now() < poll_deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        fs::read_to_string(&job.status_file).unwrap().trim(),
+        "7",
+        "detached job records its exit code"
+    );
+    assert!(
+        fs::read_to_string(&job.log_file)
+            .unwrap()
+            .contains("detached-output")
+    );
+
+    let session = SessionManager::new(dir.path())
+        .load_session("ses-detach")
+        .unwrap();
+    assert_eq!(session.wait_until, Some(job.deadline));
+    let note = session.wait_note.expect("wait note recorded");
+    assert!(note.contains("demo export"));
+    assert!(note.contains(".kanban/detached/"));
+    assert!(note.contains("exit code"));
+
+    ops.abandon_task(&task.id).unwrap();
+    assert!(!job.log_file.exists());
+    assert!(!job.status_file.exists());
+}
+
+#[test]
+fn detach_command_requires_owning_active_session_and_a_command() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Guarded detach")).unwrap();
+    ops.take_task(&task.id, "ses-owner", true).unwrap().unwrap();
+
+    let cmd = vec!["true".to_string()];
+    assert!(
+        ops.detach_command(&task.id, "ses-other", Some(10), None, &cmd)
+            .is_err()
+    );
+    assert!(
+        ops.detach_command(&task.id, "ses-owner", Some(10), None, &[])
+            .is_err()
+    );
+
+    let detached_dir = dir.path().join(".kanban/detached");
+    let leftovers = fs::read_dir(&detached_dir)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(leftovers, 0, "rejected detach must not leave artifacts");
+    let session = SessionManager::new(dir.path())
+        .load_session("ses-owner")
+        .unwrap();
+    assert!(session.wait_until.is_none(), "no wait may be declared");
 }
 
 #[test]

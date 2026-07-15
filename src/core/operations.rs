@@ -91,6 +91,17 @@ enum RespawnOutcome {
     LaunchFailed(String),
 }
 
+/// A long-running command started by [`Operations::detach_command`]: fully
+/// detached from the agent session, with output and exit status recorded on
+/// disk so the relaunched agent can check the result.
+#[derive(Debug, Clone)]
+pub struct DetachedJob {
+    pub pid: u32,
+    pub log_file: PathBuf,
+    pub status_file: PathBuf,
+    pub deadline: chrono::NaiveDateTime,
+}
+
 pub struct Operations {
     pub storage: Storage,
     pub config: Config,
@@ -1282,6 +1293,126 @@ impl Operations {
         Ok(deadline)
     }
 
+    /// Start `command` fully detached from the agent session, then declare a
+    /// wait for its result (see [`Operations::declare_waiting`]).
+    ///
+    /// Agent sessions run inside a disposable tmux session whose whole
+    /// process group is signalled when the agent's reply ends, so a plain
+    /// shell background job never survives the session. This helper runs the
+    /// command as its own session leader (`setsid`) with stdin from
+    /// /dev/null, appends stdout/stderr to a log file under
+    /// `.kanban/detached/`, and writes the exit code to a `.status` file next
+    /// to it, so the relaunched agent can check the outcome. The wait note
+    /// carries both paths into the relaunch prompt.
+    pub fn detach_command(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        eta: Option<i64>,
+        note: Option<&str>,
+        command: &[String],
+    ) -> Result<DetachedJob> {
+        if command.is_empty() {
+            return Err(KanbanError::Invalid(
+                "detach requires a command to run (after --)".to_string(),
+            ));
+        }
+        // Cheap pre-check so an invalid session does not spawn a process;
+        // declare_waiting re-validates under the board lock afterwards.
+        let session_ok = self
+            .session_manager()
+            .load_session(session_id)
+            .is_some_and(|session| {
+                session.task_id == task_id && session.status == SessionStatus::Active
+            });
+        if !session_ok {
+            return Err(KanbanError::Invalid(format!(
+                "Session {session_id} is not the active In Progress session of task {task_id}"
+            )));
+        }
+
+        let detached_dir = self.project_path().join(".kanban").join("detached");
+        fs::create_dir_all(&detached_dir)?;
+        let stamp = timefmt::now().format("%Y%m%d-%H%M%S%3f");
+        let log_file = detached_dir.join(format!("{task_id}-{stamp}.log"));
+        let status_file = detached_dir.join(format!("{task_id}-{stamp}.status"));
+
+        let quote_err =
+            |_| KanbanError::Invalid("detach command contains an unquotable argument".to_string());
+        let command_line =
+            shlex::try_join(command.iter().map(String::as_str)).map_err(quote_err)?;
+        let log_quoted = shlex::try_quote(&log_file.display().to_string())
+            .map_err(quote_err)?
+            .into_owned();
+        let status_quoted = shlex::try_quote(&status_file.display().to_string())
+            .map_err(quote_err)?
+            .into_owned();
+        // The wrapper records the exit code atomically (tmp + rename) so a
+        // present .status file always holds the final result.
+        let script = format!(
+            "{command_line} </dev/null >>{log_quoted} 2>&1; status=$?; \
+             printf '%s\\n' \"$status\" >{status_quoted}.tmp && \
+             mv {status_quoted}.tmp {status_quoted}; exit $status"
+        );
+
+        let mut child_cmd = std::process::Command::new("bash");
+        child_cmd
+            .args(["-c", &script])
+            .current_dir(self.project_path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            // New session: no controlling terminal, own process group, so
+            // the job outlives the tmux session hosting the agent.
+            child_cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = child_cmd.spawn()?;
+        let pid = child.id();
+
+        let base_note = note
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .unwrap_or("a detached command result");
+        let rel = |path: &Path| {
+            path.strip_prefix(self.project_path())
+                .unwrap_or(path)
+                .display()
+                .to_string()
+        };
+        let full_note = format!(
+            "{base_note} [detached pid {pid}; output: {}; exit code: {}]",
+            rel(&log_file),
+            rel(&status_file)
+        );
+        let deadline = match self.declare_waiting(task_id, session_id, eta, Some(&full_note)) {
+            Ok(deadline) => deadline,
+            Err(err) => {
+                // The wait was never recorded, so nothing will ever check on
+                // this job; stop its whole process group rather than leak it.
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGTERM);
+                }
+                return Err(err);
+            }
+        };
+
+        Ok(DetachedJob {
+            pid,
+            log_file,
+            status_file,
+            deadline,
+        })
+    }
+
     /// Reconcile an exited agent process (called by the launch wrapper).
     ///
     /// A clean exit that leaves the task In Progress with no `done`, no open
@@ -1559,6 +1690,24 @@ impl Operations {
             }
             self.session_manager().unlink_session(&session_id);
             let _ = fs::remove_file(kanban_dir.join("logs").join(format!("{session_id}.log")));
+        }
+        self.clear_task_detached(&task.id);
+    }
+
+    /// Remove `.kanban/detached/` log/status files recorded for this task's
+    /// detached jobs (named `<task_id>-<stamp>.*`).
+    fn clear_task_detached(&self, task_id: &str) {
+        let detached_dir = self.project_path().join(".kanban").join("detached");
+        let Ok(entries) = fs::read_dir(&detached_dir) else {
+            return;
+        };
+        let prefix = format!("{task_id}-");
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(&prefix) && entry.path().is_file() {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 
