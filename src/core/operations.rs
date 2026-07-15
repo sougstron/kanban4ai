@@ -46,6 +46,7 @@ pub struct TaskPatch {
     pub description: Option<String>,
     pub status: Option<String>,
     pub ai_model: Option<Option<String>>,
+    pub ai_effort: Option<Option<String>>,
     pub agent_backend: Option<Option<String>>,
     pub agent_name: Option<Option<String>>,
     pub interactive: Option<bool>,
@@ -131,6 +132,16 @@ impl Operations {
         self.storage.create_task(new_task)
     }
 
+    /// Create directly in the requested board column, without exposing an
+    /// intermediate To Do task to other board users.
+    pub fn create_task_in_status(&self, new_task: NewTask, status: TaskStatus) -> Result<Task> {
+        let task = self.storage.create_task_in_status(new_task, status)?;
+        if status == TaskStatus::Review {
+            self.trigger_chained_tasks(&task.id)?;
+        }
+        Ok(task)
+    }
+
     pub fn update_task(&self, task_id: &str, patch: TaskPatch) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
@@ -147,6 +158,9 @@ impl Operations {
         }
         if let Some(ai_model) = patch.ai_model {
             task.ai_model = ai_model;
+        }
+        if let Some(ai_effort) = patch.ai_effort {
+            task.ai_effort = ai_effort;
         }
         if let Some(agent_backend) = patch.agent_backend {
             task.agent_backend = agent_backend;
@@ -260,6 +274,23 @@ impl Operations {
         Ok(Some(task))
     }
 
+    /// Restore an archived task to To Do. Returns `None` when the task is
+    /// missing or not archived.
+    pub fn unarchive_task(&self, task_id: &str) -> Result<Option<Task>> {
+        let _guard = self.storage.lock()?;
+        let Some(mut task) = self.storage.load_task(task_id)? else {
+            return Ok(None);
+        };
+        if task.status != TaskStatus::Archive {
+            return Ok(None);
+        }
+        task.status = TaskStatus::Todo;
+        task.session = None;
+        task.updated_at = timefmt::now();
+        self.storage.save_task(&task)?;
+        Ok(Some(task))
+    }
+
     // ------------------------------------------------------------------ moves
 
     pub fn move_task(
@@ -319,25 +350,78 @@ impl Operations {
         Ok(moved)
     }
 
-    pub fn archive_done_tasks(&self) -> Result<Vec<Task>> {
-        let mut archived = Vec::new();
-        for mut task in self.storage.list_tasks(Some(TaskStatus::Done.as_str()))? {
-            task.status = TaskStatus::Archive;
-            task.updated_at = timefmt::now();
-            self.storage.save_task(&task)?;
-            archived.push(task);
+    /// Move every task in `from` to `to` as one locked batch, with human-mode
+    /// rules (bulk moves are a board-owner action). Moving into Done runs the
+    /// per-task cleanup path; tasks that entered Review fire their chained
+    /// tasks after the batch commits.
+    pub fn bulk_move(&self, from: TaskStatus, to: TaskStatus) -> Result<Vec<Task>> {
+        if from == to {
+            return Ok(Vec::new());
         }
-        Ok(archived)
+        let moved = {
+            let _guard = self.storage.lock()?;
+            let tasks = self.storage.list_tasks(Some(from.as_str()))?;
+            self.move_tasks_locked(tasks, to)?
+        };
+        self.trigger_bulk_review_chains(to, &moved)?;
+        Ok(moved)
+    }
+
+    /// Move exactly the set the user confirmed. `None` means the source
+    /// column changed while its confirmation dialog was open.
+    pub fn bulk_move_exact(
+        &self,
+        from: TaskStatus,
+        to: TaskStatus,
+        expected_ids: &[String],
+    ) -> Result<Option<Vec<Task>>> {
+        if from == to {
+            return Ok(Some(Vec::new()));
+        }
+        let moved = {
+            let _guard = self.storage.lock()?;
+            let tasks = self.storage.list_tasks(Some(from.as_str()))?;
+            let mut current_ids = tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
+            let mut confirmed_ids = expected_ids.to_vec();
+            current_ids.sort();
+            confirmed_ids.sort();
+            if current_ids != confirmed_ids {
+                return Ok(None);
+            }
+            self.move_tasks_locked(tasks, to)?
+        };
+        self.trigger_bulk_review_chains(to, &moved)?;
+        Ok(Some(moved))
+    }
+
+    fn move_tasks_locked(&self, tasks: Vec<Task>, to: TaskStatus) -> Result<Vec<Task>> {
+        let mut moved = Vec::new();
+        for task in tasks {
+            let result = if to == TaskStatus::Done {
+                self.move_task_to_done(&task, false)?
+            } else {
+                self.storage.move_task(&task.id, to.as_str())?
+            };
+            moved.extend(result);
+        }
+        Ok(moved)
+    }
+
+    fn trigger_bulk_review_chains(&self, to: TaskStatus, moved: &[Task]) -> Result<()> {
+        if to == TaskStatus::Review {
+            for task in moved {
+                self.trigger_chained_tasks(&task.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn archive_done_tasks(&self) -> Result<Vec<Task>> {
+        self.bulk_move(TaskStatus::Done, TaskStatus::Archive)
     }
 
     pub fn mark_review_tasks_done(&self) -> Result<Vec<Task>> {
-        let mut moved = Vec::new();
-        for task in self.storage.list_tasks(Some(TaskStatus::Review.as_str()))? {
-            if let Some(done) = self.move_task_to_done(&task, false)? {
-                moved.push(done);
-            }
-        }
-        Ok(moved)
+        self.bulk_move(TaskStatus::Review, TaskStatus::Done)
     }
 
     /// Clear per-task artifacts and move the task to Done. Callers may already
@@ -395,7 +479,7 @@ impl Operations {
             }
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
-            session_mgr.link_session(task_id, session_id)?;
+            session_mgr.link_named_session(task_id, session_id, &task.title)?;
             (task, previous_status, previous_session)
         };
 
@@ -415,6 +499,71 @@ impl Operations {
             return Ok(None);
         }
 
+        Ok(Some(task))
+    }
+
+    /// The human "Run" action: start a task on a fresh agent session
+    /// immediately, with no confirmation flow. Returns the new session id,
+    /// `Ok(None)` when the task does not exist, and an error when the task is
+    /// already running or the agent fails to launch.
+    pub fn start_task(&self, task_id: &str) -> Result<Option<String>> {
+        let session_mgr = self.session_manager();
+        let backend = {
+            let _guard = self.storage.lock()?;
+            let Some(task) = self.storage.load_task(task_id)? else {
+                return Ok(None);
+            };
+            if let Some(session) = task.session.as_deref()
+                && session_mgr.is_session_active(session)
+            {
+                return Err(KanbanError::Invalid(format!(
+                    "Task {task_id} is already running (session {session})"
+                )));
+            }
+            self.resolve_backend(&task)?
+        };
+        let session_id = format!("ses-{}-{}", backend, timefmt::now().format("%Y%m%d-%H%M%S"));
+        if self.take_task(task_id, &session_id, true)?.is_none() {
+            return Err(KanbanError::Invalid(format!(
+                "Agent launch failed for {task_id}"
+            )));
+        }
+        Ok(Some(session_id))
+    }
+
+    /// Stop a running agent session: kill its tmux host when present, mark the
+    /// session closed, and detach it from its task. Background (non-tmux)
+    /// agent processes cannot be signalled — their session record is still
+    /// closed so the board stops treating the task as running. The task keeps
+    /// its current status; recover or rerun decide what happens next.
+    pub fn stop_session(&self, session_id: &str) -> Result<Option<Task>> {
+        let session_mgr = self.session_manager();
+        let Some(session) = session_mgr.load_session(session_id) else {
+            return Ok(None);
+        };
+        let _ = crate::agent::kill_session(session_id);
+        session_mgr.close_session(session_id)?;
+        let task = {
+            let _guard = self.storage.lock()?;
+            let Some(mut task) = self.storage.load_task(&session.task_id)? else {
+                return Ok(None);
+            };
+            if task.session.as_deref() == Some(session_id) {
+                task.session = None;
+                task.updated_at = timefmt::now();
+                self.storage.save_task(&task)?;
+            }
+            task
+        };
+        self.thread_manager()?.post(
+            &task.id,
+            MessageRole::System,
+            MessageKind::System,
+            &format!("Session {session_id} was stopped by the user."),
+            None,
+            vec![],
+            Some("kanban".to_string()),
+        )?;
         Ok(Some(task))
     }
 
@@ -623,7 +772,7 @@ impl Operations {
             current.session = Some(session_id.clone());
             current.updated_at = timefmt::now();
             self.storage.save_task(&current)?;
-            session_mgr.link_session(&current.id, &session_id)?;
+            session_mgr.link_named_session(&current.id, &session_id, &current.title)?;
             (current, session_id)
         };
 
@@ -675,6 +824,17 @@ impl Operations {
             return Ok(Vec::new());
         };
         tm.open_messages(&task.id, None)
+    }
+
+    /// Earliest open question on a task, for board-card previews. Read-only:
+    /// no lock and no legacy-thread migration, so it is cheap enough for
+    /// snapshot building.
+    pub fn first_open_question(&self, task_id: &str) -> Result<Option<Message>> {
+        Ok(self
+            .thread_manager()?
+            .open_messages(task_id, Some(MessageKind::Question))?
+            .into_iter()
+            .next())
     }
 
     /// Post the question, then block until it is answered or the timeout
@@ -810,7 +970,8 @@ impl Operations {
             task.status = TaskStatus::InProgress;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
-            self.session_manager().link_session(&task.id, &session_id)?;
+            self.session_manager()
+                .link_named_session(&task.id, &session_id, &task.title)?;
             (task, session_id)
         };
 
@@ -890,7 +1051,7 @@ impl Operations {
             task.has_questions = tm.has_open_questions(&task.id)?;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
-            session_mgr.link_session(&task.id, &session_id)?;
+            session_mgr.link_named_session(&task.id, &session_id, &task.title)?;
             (task, session_id)
         };
 
@@ -981,7 +1142,8 @@ impl Operations {
         task.status = TaskStatus::InProgress;
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
-        self.session_manager().link_session(task_id, session_id)?;
+        self.session_manager()
+            .link_named_session(task_id, session_id, &task.title)?;
         let launched = self.launch_agent(task_id, session_id, true)?;
         if !launched {
             self.session_manager().crash_session(session_id)?;

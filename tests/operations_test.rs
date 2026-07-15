@@ -9,11 +9,65 @@ use kanban4ai::core::models::{MessageKind, MessageRole, MessageStatus, Task, Tas
 use kanban4ai::core::operations::{
     AgentLauncher, NoopLauncher, Operations, QuestionRef, TaskPatch,
 };
-use kanban4ai::core::session::SessionManager;
+use kanban4ai::core::session::{SessionManager, SessionState};
 use kanban4ai::core::storage::NewTask;
 use kanban4ai::core::thread::ThreadManager;
 use kanban4ai::core::timefmt;
+use std::fs;
 use std::path::{Path, PathBuf};
+
+#[test]
+fn targeted_creation_writes_directly_to_requested_status() {
+    let (_dir, ops, _recorder) = ops_with_recorder(false);
+    let task = ops
+        .create_task_in_status(NewTask::titled("Direct review"), TaskStatus::Review)
+        .unwrap();
+
+    assert_eq!(task.status, TaskStatus::Review);
+    assert!(
+        ops.list_tasks(Some("todo"), None, "created", "asc")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        ops.list_tasks(Some("review"), None, "created", "asc")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn exact_bulk_move_refuses_a_changed_source_set() {
+    let (_dir, ops, _recorder) = ops_with_recorder(false);
+    let first = ops.create_task(NewTask::titled("First")).unwrap();
+    ops.move_task(&first.id, "in_progress", false).unwrap();
+    let confirmed = vec![first.id.clone()];
+
+    let second = ops.create_task(NewTask::titled("Second")).unwrap();
+    ops.move_task(&second.id, "in_progress", false).unwrap();
+    assert!(
+        ops.bulk_move_exact(TaskStatus::InProgress, TaskStatus::Review, &confirmed)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        ops.list_tasks(Some("in_progress"), None, "created", "asc")
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let moved = ops
+        .bulk_move_exact(
+            TaskStatus::InProgress,
+            TaskStatus::Review,
+            &[first.id, second.id],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(moved.len(), 2);
+}
 
 #[test]
 fn agent_take_moves_to_in_progress_and_links_session() {
@@ -23,7 +77,12 @@ fn agent_take_moves_to_in_progress_and_links_session() {
     let taken = ops.take_task(&task.id, "ses-1", true).unwrap().unwrap();
     assert_eq!(taken.status, TaskStatus::InProgress);
     assert_eq!(taken.session.as_deref(), Some("ses-1"));
-    assert!(SessionManager::new(dir.path()).is_session_active("ses-1"));
+    let session_mgr = SessionManager::new(dir.path());
+    assert!(session_mgr.is_session_active("ses-1"));
+    assert_eq!(
+        session_mgr.load_session("ses-1").unwrap().name,
+        Some(task.title.clone())
+    );
     // auto_launch_on_delegate fired the launcher
     assert_eq!(
         recorder.calls(),
@@ -305,6 +364,13 @@ fn answering_last_question_resumes_interactive_agent() {
     assert_eq!(calls[0].0, task.id);
     assert!(calls[0].1.starts_with("ses-opencode-"));
     assert!(answered.session.is_some());
+    assert_eq!(
+        SessionManager::new(_dir.path())
+            .load_session(&calls[0].1)
+            .unwrap()
+            .name,
+        Some(task.title)
+    );
 }
 
 #[test]
@@ -390,6 +456,13 @@ fn chained_task_launches_when_target_enters_review() {
     let chained_now = ops.get_task(&chained.id).unwrap().unwrap();
     assert_eq!(chained_now.status, TaskStatus::InProgress);
     assert!(chained_now.session.is_some());
+    assert_eq!(
+        SessionManager::new(dir.path())
+            .load_session(chained_now.session.as_deref().unwrap())
+            .unwrap()
+            .name,
+        Some(chained.title)
+    );
 }
 
 #[test]
@@ -455,6 +528,13 @@ fn review_edits_fold_into_thread_on_rerun() {
     assert_eq!(rerun.status, TaskStatus::InProgress);
     assert_eq!(rerun.review_edits, "");
     assert!(rerun.session.is_some());
+    assert_eq!(
+        SessionManager::new(dir.path())
+            .load_session(rerun.session.as_deref().unwrap())
+            .unwrap()
+            .name,
+        Some(task.title.clone())
+    );
     assert_eq!(recorder.calls().len(), 1);
 
     let tm = ThreadManager::new(dir.path()).unwrap();
@@ -478,6 +558,13 @@ fn rerun_in_progress_restarts_stalled_session() {
 
     let rerun = ops.rerun_in_progress_task(&task.id, None).unwrap().unwrap();
     assert_ne!(rerun.session.as_deref(), Some("ses-dead"));
+    assert_eq!(
+        SessionManager::new(dir.path())
+            .load_session(rerun.session.as_deref().unwrap())
+            .unwrap()
+            .name,
+        Some(task.title.clone())
+    );
     assert_eq!(recorder.calls().len(), 1);
 
     let tm = ThreadManager::new(dir.path()).unwrap();
@@ -645,5 +732,241 @@ fn context_append_updates_size_and_compaction_dedupes() {
     assert_eq!(
         compacted, "line\nWorking on a\n## Head\n\nend",
         "duplicates, chatter runs, and blank runs collapse"
+    );
+}
+
+#[test]
+fn bulk_move_moves_column_and_triggers_chains() {
+    let (_dir, ops, recorder) = ops_with_recorder(true);
+    let a = ops.create_task(NewTask::titled("First")).unwrap();
+    let b = ops.create_task(NewTask::titled("Second")).unwrap();
+    ops.move_task(&a.id, "in_progress", false).unwrap();
+    ops.move_task(&b.id, "in_progress", false).unwrap();
+    let chained = ops.create_task(NewTask::titled("Chained")).unwrap();
+    ops.update_task(
+        &chained.id,
+        TaskPatch {
+            chained_to: Some(Some(a.id.clone())),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let moved = ops
+        .bulk_move(TaskStatus::InProgress, TaskStatus::Review)
+        .unwrap();
+    assert_eq!(moved.len(), 2);
+    assert!(moved.iter().all(|t| t.status == TaskStatus::Review));
+    assert!(
+        ops.list_tasks(Some("in_progress"), None, "created", "asc")
+            .unwrap()
+            .iter()
+            .all(|t| t.id == chained.id),
+        "only the auto-launched chained task may occupy In Progress"
+    );
+
+    // Entering Review fired the task chained to `a`.
+    assert!(
+        recorder
+            .calls()
+            .iter()
+            .any(|(task, _, _)| task == &chained.id)
+    );
+
+    // Re-running over the now-empty source column is a no-op.
+    assert!(
+        ops.bulk_move(TaskStatus::InProgress, TaskStatus::Review)
+            .unwrap()
+            .iter()
+            .all(|t| t.id == chained.id)
+    );
+}
+
+#[test]
+fn bulk_move_empty_and_same_status_are_noops() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    assert!(
+        ops.bulk_move(TaskStatus::InProgress, TaskStatus::Review)
+            .unwrap()
+            .is_empty()
+    );
+    let task = ops.create_task(NewTask::titled("Stay")).unwrap();
+    assert!(
+        ops.bulk_move(TaskStatus::Todo, TaskStatus::Todo)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        ops.get_task(&task.id).unwrap().unwrap().status,
+        TaskStatus::Todo
+    );
+}
+
+#[test]
+fn unarchive_task_restores_to_todo() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Old")).unwrap();
+    assert!(
+        ops.unarchive_task(&task.id).unwrap().is_none(),
+        "non-archived tasks are not restored"
+    );
+    ops.move_task(&task.id, "archive", false).unwrap();
+
+    let restored = ops.unarchive_task(&task.id).unwrap().unwrap();
+    assert_eq!(restored.status, TaskStatus::Todo);
+    assert_eq!(restored.session, None);
+    assert!(ops.list_archived_tasks(None).unwrap().is_empty());
+    assert!(ops.unarchive_task("TASK-999").unwrap().is_none());
+}
+
+#[test]
+fn start_task_launches_fresh_session_and_blocks_double_start() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Run me")).unwrap();
+
+    let session_id = ops.start_task(&task.id).unwrap().unwrap();
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_eq!(stored.session.as_deref(), Some(session_id.as_str()));
+    let session_mgr = SessionManager::new(dir.path());
+    assert!(session_mgr.is_session_active(&session_id));
+    assert_eq!(
+        session_mgr.load_session(&session_id).unwrap().name,
+        Some(task.title)
+    );
+    assert_eq!(recorder.calls().len(), 1);
+
+    // A second run while the session is live is refused, without a launch.
+    assert!(matches!(
+        ops.start_task(&task.id),
+        Err(KanbanError::Invalid(_))
+    ));
+    assert_eq!(recorder.calls().len(), 1);
+
+    assert!(ops.start_task("TASK-999").unwrap().is_none());
+}
+
+#[test]
+fn start_task_launch_failure_surfaces_error_and_rolls_back() {
+    let (dir, _storage) = common::quiet_board(true);
+    let ops = Operations::with_launcher(dir.path(), Box::new(FailingLauncher));
+    let task = ops.create_task(NewTask::titled("Fails")).unwrap();
+
+    assert!(matches!(
+        ops.start_task(&task.id),
+        Err(KanbanError::Invalid(_))
+    ));
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Todo);
+    assert_eq!(stored.session, None);
+}
+
+#[test]
+fn launch_revert_persists_session_name() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Revert me")).unwrap();
+    let backup_dir = ops.backup_dir(&task.id);
+    fs::create_dir_all(&backup_dir).unwrap();
+    fs::write(backup_dir.join("changed.txt"), "backup").unwrap();
+
+    assert!(ops.launch_revert(&task.id, "ses-revert-test").unwrap());
+
+    assert_eq!(
+        recorder.calls(),
+        vec![(task.id.clone(), "ses-revert-test".to_string(), true)]
+    );
+    assert_eq!(
+        SessionManager::new(dir.path())
+            .load_session("ses-revert-test")
+            .unwrap()
+            .name,
+        Some(task.title)
+    );
+}
+
+#[test]
+fn stop_session_closes_session_and_detaches_task() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Stop me")).unwrap();
+    ops.take_task(&task.id, "ses-stop", true).unwrap().unwrap();
+
+    let stopped = ops.stop_session("ses-stop").unwrap().unwrap();
+    assert_eq!(stopped.session, None);
+    assert_eq!(
+        stopped.status,
+        TaskStatus::InProgress,
+        "stopping a session must not change task status"
+    );
+    assert!(!SessionManager::new(dir.path()).is_session_active("ses-stop"));
+
+    let tm = ThreadManager::new(dir.path()).unwrap();
+    let systems = tm.messages_of_kind(&task.id, MessageKind::System).unwrap();
+    assert!(
+        systems
+            .iter()
+            .any(|m| m.body.contains("stopped by the user"))
+    );
+
+    assert!(ops.stop_session("ses-missing").unwrap().is_none());
+}
+
+#[test]
+fn session_states_reflect_heartbeats_without_mutating() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let a = ops.create_task(NewTask::titled("Fresh")).unwrap();
+    let b = ops.create_task(NewTask::titled("Stale")).unwrap();
+    ops.take_task(&a.id, "ses-fresh", true).unwrap().unwrap();
+    ops.take_task(&b.id, "ses-stale", true).unwrap().unwrap();
+
+    let mgr = SessionManager::new(dir.path());
+    let mut stale = mgr.load_session("ses-stale").unwrap();
+    stale.last_seen = timefmt::now() - chrono::Duration::seconds(1000);
+    mgr.save_session(&stale).unwrap();
+
+    assert_eq!(
+        mgr.session_state("ses-fresh", 300),
+        Some(SessionState::Live)
+    );
+    assert_eq!(
+        mgr.session_state("ses-stale", 300),
+        Some(SessionState::Crashed)
+    );
+    // Read-only: the stale session is still Active on disk.
+    assert!(mgr.is_session_active("ses-stale"));
+
+    let states = mgr.list_sessions_with_state(300);
+    assert_eq!(states.len(), 2);
+
+    mgr.close_session("ses-fresh").unwrap();
+    assert_eq!(mgr.session_state("ses-fresh", 300), None);
+    assert_eq!(mgr.list_sessions_with_state(300).len(), 1);
+    assert_eq!(mgr.session_state("ses-unknown", 300), None);
+}
+
+#[test]
+fn first_open_question_returns_earliest_open() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Ask")).unwrap();
+    assert!(ops.first_open_question(&task.id).unwrap().is_none());
+
+    ops.ask_question(
+        &task.id,
+        "First?",
+        "agent",
+        vec!["A".to_string(), "B".to_string()],
+    )
+    .unwrap();
+    ops.ask_question(&task.id, "Second?", "agent", vec![])
+        .unwrap();
+
+    let first = ops.first_open_question(&task.id).unwrap().unwrap();
+    assert_eq!(first.body, "First?");
+    assert_eq!(first.variants, vec!["A".to_string(), "B".to_string()]);
+
+    ops.answer_question(&task.id, QuestionRef::MsgId(first.id.clone()), "A")
+        .unwrap();
+    assert_eq!(
+        ops.first_open_question(&task.id).unwrap().unwrap().body,
+        "Second?"
     );
 }

@@ -217,6 +217,8 @@ pub struct Task {
     pub context_size: u64,
     #[serde(default)]
     pub ai_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_effort: Option<String>,
     #[serde(default)]
     pub agent_backend: Option<String>,
     #[serde(default)]
@@ -248,6 +250,7 @@ impl Task {
             context_file: None,
             context_size: 0,
             ai_model: None,
+            ai_effort: None,
             agent_backend: None,
             agent_name: None,
             interactive: false,
@@ -263,6 +266,8 @@ impl Task {
 pub struct Session {
     pub id: String,
     pub task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default = "timefmt::now", with = "timefmt::serde_naive")]
     pub started_at: NaiveDateTime,
     #[serde(default = "default_session_status")]
@@ -287,10 +292,21 @@ impl Session {
         Session {
             id: id.into(),
             task_id: task_id.into(),
+            name: None,
             started_at: now,
             status: SessionStatus::Active,
             last_seen: now,
             ended_at: None,
         }
+    }
+
+    pub fn named(
+        id: impl Into<String>,
+        task_id: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Self {
+        let mut session = Self::new(id, task_id);
+        session.name = Some(name.into());
+        session
     }
 }

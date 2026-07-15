@@ -11,6 +11,27 @@ use crate::core::models::{MessageKind, MessageRole, Session, SessionStatus};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 
+/// Display liveness of a session, computed from its record and heartbeat age.
+/// Unlike `SessionStatus` this never requires mutating the session file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Live,
+    Crashed,
+}
+
+fn state_of(
+    session: &Session,
+    heartbeat_timeout: i64,
+    now: &chrono::NaiveDateTime,
+) -> SessionState {
+    match session.status {
+        SessionStatus::Active if (*now - session.last_seen).num_seconds() <= heartbeat_timeout => {
+            SessionState::Live
+        }
+        _ => SessionState::Crashed,
+    }
+}
+
 pub struct SessionManager {
     pub project_path: PathBuf,
     pub sessions_dir: PathBuf,
@@ -32,6 +53,17 @@ impl SessionManager {
 
     pub fn link_session(&self, task_id: &str, session_id: &str) -> Result<Session> {
         let session = Session::new(session_id, task_id);
+        self.save_session(&session)?;
+        Ok(session)
+    }
+
+    pub fn link_named_session(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        name: &str,
+    ) -> Result<Session> {
+        let session = Session::named(session_id, task_id, name);
         self.save_session(&session)?;
         Ok(session)
     }
@@ -73,6 +105,31 @@ impl SessionManager {
             .into_iter()
             .filter(|s| s.status == SessionStatus::Active)
             .collect()
+    }
+
+    /// Non-closed sessions with their computed display state: `Live` for an
+    /// active session with a fresh heartbeat, `Crashed` for explicitly crashed
+    /// ones and actives whose heartbeat went stale. Read-only: unlike
+    /// `check_sessions`, nothing is marked crashed on disk.
+    pub fn list_sessions_with_state(&self, heartbeat_timeout: i64) -> Vec<(Session, SessionState)> {
+        let now = timefmt::now();
+        self.list_sessions()
+            .into_iter()
+            .filter(|s| s.status != SessionStatus::Closed)
+            .map(|s| {
+                let state = state_of(&s, heartbeat_timeout, &now);
+                (s, state)
+            })
+            .collect()
+    }
+
+    /// Display state of one session; `None` for missing or closed sessions.
+    pub fn session_state(&self, session_id: &str, heartbeat_timeout: i64) -> Option<SessionState> {
+        let session = self.load_session(session_id)?;
+        if session.status == SessionStatus::Closed {
+            return None;
+        }
+        Some(state_of(&session, heartbeat_timeout, &timefmt::now()))
     }
 
     pub fn heartbeat(&self, session_id: &str) -> Result<()> {
@@ -142,7 +199,10 @@ impl SessionManager {
         fs::create_dir_all(&self.sessions_dir)?;
         fs::write(
             self.session_file(&session.id),
-            serde_yaml_ng::to_string(session)?,
+            timefmt::quote_yaml_timestamp_fields(
+                &serde_yaml_ng::to_string(session)?,
+                &["started_at", "last_seen", "ended_at"],
+            ),
         )?;
         Ok(())
     }
