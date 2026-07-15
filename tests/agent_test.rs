@@ -76,6 +76,18 @@ agents:
     assert!(plan.prompt.contains(
         "\"$KANBAN_CMD\" ask TASK-001 <question> --agent --wait --session ses-opencode-test"
     ));
+    assert!(plan.prompt.contains(
+        "\"$KANBAN_CMD\" detach TASK-001 --session ses-opencode-test --eta <expected-seconds> \
+         --note <what you wait for> -- <command> [args...]"
+    ));
+    assert!(plan.prompt.contains(
+        "\"$KANBAN_CMD\" waiting TASK-001 --session ses-opencode-test --eta <expected-seconds> \
+         --note <what you wait for>"
+    ));
+    assert!(
+        plan.prompt
+            .contains("never start it as a plain shell background job")
+    );
 }
 
 #[test]

@@ -32,17 +32,25 @@ monitors, and \"notifications\" die with it, so nothing you launch can re-invoke
 - Long-running foreground commands are safe: the board heartbeats for you while your process runs, \
 with no time limit. Prefer blocking in the foreground and collecting every result before you \
 continue; never end a reply while anything you launched is still running or unread.\n\
-- If a result will take too long to block on (a heavy query, an external job), start the work \
-detached with its output redirected to a file, then declare the wait and end your reply: \
+- If a result will take too long to block on (a heavy query, an external job), never start it as \
+a plain shell background job: this session's whole process group is killed when your reply ends, \
+so backgrounded work silently dies even after you declare a wait. Instead run: \
+\"$KANBAN_CMD\" detach {} --session {session_id} --eta <expected-seconds> --note <what you wait for> -- <command> [args...]\n\
+  It starts the command fully detached (it survives this session), appends its output to \
+.kanban/detached/<task>-<stamp>.log, writes the exit code to the matching .status file, and \
+declares the wait for you. If you must detach manually instead, launch with setsid and nohup, \
+redirect stdin/stdout/stderr away from the terminal to a result file, and then declare the wait \
+yourself before ending your reply: \
 \"$KANBAN_CMD\" waiting {} --session {session_id} --eta <expected-seconds> --note <what you wait for>\n\
-  The board relaunches you after the deadline (eta plus a safety buffer) to check the result; \
-declare waiting again from the new session if it needs more time.\n\
+  Either way the board relaunches you after the deadline (eta plus a safety buffer) to check the \
+recorded result; declare waiting again from the new session if it needs more time.\n\
 - The final command of your reply must be the done command above, the ask command if you are \
-blocked, or the waiting command if you are waiting on a declared long-running result. Ending a \
-reply without one of those strands the task and forces an automatic resume.\n",
+blocked, or the waiting/detach command if you are waiting on a declared long-running result. \
+Ending a reply without one of those strands the task and forces an automatic resume.\n",
         task.id,
         task.title,
         project_path.display(),
+        task.id,
         task.id,
         task.id,
         task.id,
