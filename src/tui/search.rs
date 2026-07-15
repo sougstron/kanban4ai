@@ -1,7 +1,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear};
 use tui_textarea::TextArea;
 
 use super::app::App;
@@ -34,18 +34,19 @@ impl SearchState {
 pub fn render(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let rect = centered_rect(55, 12, area);
     frame.render_widget(Clear, rect);
-    let text = format!("/{}", app.search.text());
-    let block = Block::default()
-        .title(" Search ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.focus));
-    frame.render_widget(
-        Paragraph::new(text).block(block).style(
-            Style::default()
-                .bg(app.theme.bg)
-                .fg(app.theme.fg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        rect,
+    let mut query = app.search.query.clone();
+    query.set_block(
+        Block::default()
+            .title(" Search · type to filter · Esc close ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.focus)),
     );
+    query.set_style(
+        Style::default()
+            .bg(app.theme.bg)
+            .fg(app.theme.fg)
+            .add_modifier(Modifier::BOLD),
+    );
+    query.set_cursor_line_style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(&query, rect);
 }
