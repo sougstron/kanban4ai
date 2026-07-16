@@ -398,19 +398,26 @@ fn render_edits_panel(
 ) {
     let detail = app.detail.as_ref().unwrap();
     let focused = detail.focus == DetailFocus::Edits;
+    let hovered = app.is_hovered(HitAction::DetailEdits);
     let title = if !editable {
         " Review edits (read-only outside Review) "
     } else if focused {
         " Review edits [focused] · Ctrl+S save · Ctrl+R re-run · Esc thread "
+    } else if hovered {
+        " Review edits [click to focus] · Ctrl+S save · Ctrl+R re-run "
     } else {
         " Review edits · Tab to edit · Ctrl+S save · Ctrl+R re-run "
     };
+    app.hitboxes.push(Hitbox {
+        area,
+        action: HitAction::DetailEdits,
+    });
     let mut review_edits = detail.review_edits.clone();
     review_edits.set_block(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(if focused {
+            .border_style(Style::default().fg(if focused || hovered {
                 theme.focus
             } else if editable {
                 theme.review

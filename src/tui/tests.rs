@@ -955,7 +955,7 @@ fn opencode_model_options_order_default_then_recent_then_alphabetical() {
 }
 
 #[test]
-fn mouse_click_focuses_card_and_second_click_opens_detail() {
+fn mouse_click_opens_card_detail_on_first_release() {
     let (_dir, mut app) = populated_app();
     let _ = render_snapshot(&mut app);
     let (column, card, area) = card_hits(&app)[1];
@@ -965,16 +965,15 @@ fn mouse_click_focuses_card_and_second_click_opens_detail() {
         row: area.y + 1,
         modifiers: KeyModifiers::NONE,
     };
-    app.handle_mouse(click).expect("focus");
+    app.handle_mouse(click).expect("press");
     assert_eq!(app.focused_column, column);
     assert_eq!(app.focused_card, card);
     assert_eq!(app.screen, Screen::Board);
-    app.handle_mouse(click).expect("detail");
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Up(MouseButton::Left),
         ..click
     })
-    .expect("release second click");
+    .expect("release first click");
     assert_eq!(app.screen, Screen::Detail);
 }
 
@@ -1171,6 +1170,45 @@ fn review_editor_navigation_and_thread_focus_are_distinct() {
     app.handle_key(key(KeyCode::Esc)).unwrap();
     assert_eq!(app.screen, Screen::Board);
     assert!(app.detail.is_none());
+}
+
+#[test]
+fn clicking_review_editor_focuses_it_and_highlights_panel() {
+    let (_dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Edit review")).unwrap();
+    app.ops.set_review_edits(&task.id, "abcdef").unwrap();
+    app.ops.move_task(&task.id, "review", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    let initial = render_at(&mut app, 96, 28);
+    assert!(
+        initial.contains("Review edits · Tab to edit"),
+        "initial render should advertise keyboard focus path:\n{initial}"
+    );
+    let edits = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::DetailEdits)
+        .copied()
+        .expect("review edits hitbox");
+
+    let click = MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: edits.area.x + 1,
+        row: edits.area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(click).unwrap();
+
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+    let focused = render_at(&mut app, 96, 28);
+    assert!(
+        focused.contains("Review edits [focused]"),
+        "focused render should show review editor highlight title:\n{focused}"
+    );
 }
 
 #[test]
@@ -1500,6 +1538,58 @@ fn stale_debounce_is_ignored_and_thread_change_refreshes_detail() {
     assert_eq!(
         app.detail.as_ref().unwrap().messages.len(),
         initial_messages + 1
+    );
+}
+
+#[test]
+fn fs_reload_preserves_unsaved_review_edits() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Do not clear review"))
+        .expect("create task");
+    app.ops
+        .move_task(&task.id, "review", false)
+        .expect("move to review");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Tab)).expect("focus edits");
+    app.detail
+        .as_mut()
+        .expect("detail")
+        .review_edits
+        .insert_str("Please keep this while the board refreshes");
+
+    ThreadManager::new(dir.path())
+        .unwrap()
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            "background context update",
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+    app.reload_if_changed().expect("refresh detail");
+
+    let detail = app.detail.as_ref().expect("detail after reload");
+    assert_eq!(detail.focus, DetailFocus::Edits);
+    assert_eq!(
+        detail.review_edits.lines().join("\n"),
+        "Please keep this while the board refreshes"
+    );
+    assert_eq!(detail.messages.len(), 3);
+    assert!(
+        app.ops
+            .get_task(&task.id)
+            .unwrap()
+            .unwrap()
+            .review_edits
+            .is_empty()
     );
 }
 
@@ -2796,7 +2886,7 @@ fn phase_seven_help_overlay_scrolls_and_toggles() {
 }
 
 #[test]
-fn phase_seven_first_click_on_keyboard_focused_card_does_not_open_detail() {
+fn phase_seven_first_click_on_keyboard_focused_card_opens_detail() {
     let (_dir, mut app) = populated_app();
     let _ = render_snapshot(&mut app);
     let (column, card, area) = card_hits(&app)[0];
@@ -2812,9 +2902,11 @@ fn phase_seven_first_click_on_keyboard_focused_card_does_not_open_detail() {
         ..click
     };
     app.handle_mouse(click).unwrap();
-    app.handle_mouse(release).unwrap();
-    assert_eq!(app.screen, Screen::Board, "first click must only select");
-    app.handle_mouse(click).unwrap();
+    assert_eq!(
+        app.screen,
+        Screen::Board,
+        "press still allows drag cancellation"
+    );
     app.handle_mouse(release).unwrap();
     assert_eq!(app.screen, Screen::Detail);
 }

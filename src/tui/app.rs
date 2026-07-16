@@ -36,7 +36,6 @@ use super::theme::Theme;
 
 const CTRL_C_EXIT_PROMPT: &str = "Press ctrl + C again to close";
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(3);
-const DOUBLE_CLICK_WINDOW: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -117,6 +116,7 @@ pub enum HitAction {
         index: usize,
     },
     DetailThread,
+    DetailEdits,
 }
 
 /// A user-level action, triggered equally by a hotkey, a button click, or a
@@ -258,10 +258,6 @@ pub struct App {
     pub help_scroll: u16,
     /// Upper help scroll bound, set by the renderer from the overlay height.
     pub help_max_scroll: u16,
-    /// The last card selected by a mouse click; a second click on the same
-    /// card opens the detail. Keyboard navigation clears it so a card focused
-    /// by keys still needs two clicks.
-    last_clicked: Option<(usize, usize, Instant)>,
     pending_attach: Option<String>,
     pending_fs_reload: bool,
     fs_change_generation: u64,
@@ -278,7 +274,6 @@ pub struct DragState {
     pub from_column: usize,
     pub card: usize,
     pub target_column: Option<usize>,
-    pub was_clicked: bool,
     pub moved: bool,
 }
 
@@ -331,7 +326,6 @@ impl App {
             return_screen: Screen::Board,
             help_scroll: 0,
             help_max_scroll: 0,
-            last_clicked: None,
             pending_attach: None,
             pending_fs_reload: false,
             fs_change_generation: 0,
@@ -807,18 +801,15 @@ impl App {
                 .get(card)
                 .map(|task| task.id.clone())
         {
-            let was_clicked = self.screen == Screen::Board && self.recent_card_click(column, card);
             self.screen = Screen::Board;
             self.focused_column = column;
             self.focused_card = card;
-            self.record_card_click(column, card);
             self.ensure_focused_visible();
             self.dragging = Some(DragState {
                 task_id,
                 from_column: column,
                 card,
                 target_column: None,
-                was_clicked,
                 moved: false,
             });
             return Ok(());
@@ -858,7 +849,7 @@ impl App {
                 self.clamp_focus();
                 self.status = format!("Moved {} to {}", dragging.task_id, target_status);
             }
-        } else if !dragging.moved && dragging.was_clicked {
+        } else if !dragging.moved {
             self.open_focused_detail()?;
         }
         Ok(())
@@ -875,6 +866,7 @@ impl App {
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
                 | HitAction::DetailAnswerOption { .. }
+                | HitAction::DetailEdits
                 | HitAction::DetailThread,
             )
             | None => None,
@@ -920,6 +912,10 @@ impl App {
                 self.set_detail_focus(DetailFocus::Thread);
                 Ok(())
             }
+            Some(HitAction::DetailEdits) => {
+                self.set_detail_focus(DetailFocus::Edits);
+                Ok(())
+            }
             Some(
                 HitAction::ModalField(_)
                 | HitAction::ModalOption { .. }
@@ -963,16 +959,11 @@ impl App {
     }
 
     fn click_card(&mut self, column: usize, card: usize) -> Result<()> {
-        let already_clicked = self.screen == Screen::Board && self.recent_card_click(column, card);
         self.screen = Screen::Board;
         self.focused_column = column;
         self.focused_card = card;
-        self.record_card_click(column, card);
         self.ensure_focused_visible();
-        if already_clicked {
-            self.open_focused_detail()?;
-        }
-        Ok(())
+        self.open_focused_detail()
     }
 
     fn scroll_at(&mut self, x: u16, y: u16, delta: isize) {
@@ -1000,6 +991,7 @@ impl App {
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
                 | HitAction::DetailAnswerOption { .. }
+                | HitAction::DetailEdits
                 | HitAction::DetailThread,
             )
             | None => self.focused_column,
@@ -1079,7 +1071,15 @@ impl App {
             }
             if let Some(detail) = self.detail.as_ref() {
                 let task_id = detail.task_id.clone();
+                let focus = detail.focus;
+                let scroll = detail.scroll;
                 self.load_detail(&task_id)?;
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.scroll = scroll.min(detail.max_scroll);
+                    if detail.focus_available(focus) {
+                        detail.focus = focus;
+                    }
+                }
             }
             self.clamp_focus();
             self.status = "Board updated from disk".to_string();
@@ -1092,7 +1092,6 @@ impl App {
         self.refresh_modal_after_opencode_catalog_warm();
         let now = Instant::now();
         self.expire_ctrl_c_prompt_at(now);
-        self.expire_last_clicked_at(now);
         self.expire_session_states_at(timefmt::now());
         self.resume_expired_waits_throttled();
         // Log writes bypass the fs watcher (it only covers board dirs), so
@@ -1140,25 +1139,6 @@ impl App {
         if self.status == CTRL_C_EXIT_PROMPT {
             self.status.clear();
         }
-    }
-
-    pub(crate) fn expire_last_clicked_at(&mut self, now: Instant) {
-        let Some((_, _, clicked_at)) = self.last_clicked else {
-            return;
-        };
-        if now.duration_since(clicked_at) > DOUBLE_CLICK_WINDOW {
-            self.last_clicked = None;
-        }
-    }
-
-    fn recent_card_click(&mut self, column: usize, card: usize) -> bool {
-        self.expire_last_clicked_at(Instant::now());
-        self.last_clicked
-            .is_some_and(|(last_column, last_card, _)| last_column == column && last_card == card)
-    }
-
-    fn record_card_click(&mut self, column: usize, card: usize) {
-        self.last_clicked = Some((column, card, Instant::now()));
     }
 
     pub(crate) fn expire_session_states_at(&mut self, now: chrono::NaiveDateTime) {
@@ -1214,7 +1194,6 @@ impl App {
 
     fn focus_prev_column(&mut self) {
         self.focused_column = self.focused_column.saturating_sub(1);
-        self.last_clicked = None;
         self.clamp_focus();
     }
 
@@ -1222,13 +1201,11 @@ impl App {
         if self.focused_column + 1 < self.board.columns.len() {
             self.focused_column += 1;
         }
-        self.last_clicked = None;
         self.clamp_focus();
     }
 
     fn focus_prev_card(&mut self) {
         self.focused_card = self.focused_card.saturating_sub(1);
-        self.last_clicked = None;
         self.ensure_focused_visible();
     }
 
@@ -1237,7 +1214,6 @@ impl App {
         if self.focused_card + 1 < len {
             self.focused_card += 1;
         }
-        self.last_clicked = None;
         self.ensure_focused_visible();
     }
 
@@ -1595,6 +1571,17 @@ impl App {
     }
 
     fn load_detail(&mut self, task_id: &str) -> Result<()> {
+        let preserved_review_edits = self.detail.as_ref().and_then(|detail| {
+            if detail.task_id != task_id {
+                return None;
+            }
+            let persisted = detail
+                .task
+                .as_ref()
+                .map(|task| task.review_edits.as_str())
+                .unwrap_or_default();
+            (textarea_text(&detail.review_edits) != persisted).then(|| detail.review_edits.clone())
+        });
         let task = self.ops.get_task(task_id)?;
         let messages = ThreadManager::new(&self.project_path)?
             .load(task_id)?
@@ -1604,6 +1591,9 @@ impl App {
                 .map(|task| lines_or_empty(&task.review_edits))
                 .unwrap_or_else(|| vec![String::new()]),
         );
+        if let Some(editor) = preserved_review_edits {
+            review_edits = editor;
+        }
         review_edits.set_cursor_line_style(ratatui::style::Style::default());
         self.detail = Some(DetailState {
             task_id: task_id.to_string(),
@@ -1686,7 +1676,6 @@ impl App {
             self.screen = Screen::Board;
             self.focused_column = column_index;
             self.focused_card = card;
-            self.last_clicked = None;
             self.ensure_focused_visible();
             self.status = format!("Focused {task_id}");
             return;
@@ -2164,7 +2153,6 @@ impl App {
         match self.screen {
             Screen::Board => {
                 self.focused_card = 0;
-                self.last_clicked = None;
                 self.clamp_focus();
             }
             Screen::Sessions => self.session_selected = 0,
@@ -2961,6 +2949,10 @@ fn lines_or_empty(text: &str) -> Vec<String> {
     } else {
         lines
     }
+}
+
+fn textarea_text(textarea: &TextArea<'_>) -> String {
+    textarea.lines().join("\n")
 }
 
 /// Bytes of `.kanban/logs/<session>.log` kept by the log-view pager. Enough

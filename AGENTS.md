@@ -274,9 +274,8 @@ view) and its hotkey segments are clickable; when the terminal is narrow the
 least important segments are dropped instead of clipping. Column headers show
 only the column name and visible task count; the status-bar question count
 focuses the first questioned task when clicked. Drag a card to a different
-column to move it in human mode. A single click selects a card; a second click
-on the card selected by mouse opens its detail (keyboard focus alone never
-turns the first click into an open).
+column to move it in human mode. A single click on a card opens its detail;
+a drag still moves it between columns without opening the detail view.
 
 Note: the opencode subscription/usage overlay (`u` in the Python version) was
 dropped in the rewrite — it never worked reliably; `u` now means recover.
