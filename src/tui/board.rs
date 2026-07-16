@@ -165,9 +165,16 @@ fn render_cards(frame: &mut Frame<'_>, app: &App, column_index: usize, area: Rec
     for (task_index, task) in tasks.into_iter().enumerate() {
         let absolute_index = offset + task_index;
         let focused = column_index == app.focused_column && absolute_index == app.focused_card;
+        let hovered = app.is_hovered(HitAction::FocusCard {
+            column: column_index,
+            card: absolute_index,
+        }) || app.is_hovered(HitAction::OpenAnswer {
+            column: column_index,
+            card: absolute_index,
+        });
         let row = rows[row_index];
         row_index += 1;
-        card::render_card(frame, app, task, row, focused);
+        card::render_card(frame, app, task, row, focused, hovered);
         // The question-preview line (second content line of the card) jumps
         // straight to the answer panel; register it before the card region.
         let has_preview = app
@@ -457,7 +464,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Detail"),
         Line::from("  Tab: cycle thread/answer/editor panels when present"),
-        Line::from("  r/buttons: run task actions; Enter is inactive in detail"),
+        Line::from("  Enter: run To Do tasks only · r/buttons: run task actions"),
         Line::from("  Ctrl+S: save review edits (no re-run) · Ctrl+R: re-run"),
         Line::from("  s: project settings · Ctrl+T: cycle and persist theme"),
         Line::from("  Home/End: start/end of thread · q/Esc: back · Esc leaves text panels first"),

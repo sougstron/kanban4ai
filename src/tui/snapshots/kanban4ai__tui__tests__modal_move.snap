@@ -15,7 +15,7 @@ expression: render_snapshot(&mut app)
 │             │└────────────────────────────────────────────────────────────────┘│             │
 │             │┌────────────────────────────────────────────────────────────────┐│             │
 │             ││[ Save ]  [ Cancel ]                                            ││             │
-│             ││                                                                ││             │
+│             ││(Ctrl + S)                    use Tab or Shift + Tab to navigate││             │
 │             │└────────────────────────────────────────────────────────────────┘│             │
 │             │                                                                  │             │
 │             │                                                                  │             │
@@ -136,7 +136,9 @@ expression: render_snapshot(&mut app)
 13:1-14 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:14-15 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:15-16 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-13:16-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+13:16-26 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+13:26-46 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+13:46-80 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:80-81 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:81-82 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:82-95 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

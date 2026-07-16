@@ -6,6 +6,7 @@ use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use ratatui::style::{Modifier, Style};
 use tui_textarea::TextArea;
 
 use crate::core::operations::Operations;
@@ -150,6 +151,34 @@ fn make_marker_opencode(dir: &std::path::Path) -> (std::path::PathBuf, std::path
     (command, marker)
 }
 
+#[cfg(unix)]
+fn make_catalog_opencode(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let command = dir.join(format!(
+        "catalog-opencode-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos()
+    ));
+    let marker = dir.join("opencode-catalog-started");
+    std::fs::write(
+        &command,
+        format!(
+            "#!/bin/sh\ntouch {}\ncat <<'EOF'\nopenai/gpt-5.5\n{{\n  \"variants\": {{\n    \"high\": {{\n      \"reasoningEffort\": \"high\"\n    }}\n  }}\n}}\nopencode-go/minimax-m3\n{{\n  \"variants\": {{}}\n}}\nEOF\n",
+            marker.display()
+        ),
+    )
+    .expect("write catalog opencode");
+    let mut permissions = std::fs::metadata(&command)
+        .expect("catalog opencode metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&command, permissions).expect("chmod catalog opencode");
+    (command, marker)
+}
+
 /// Card regions from the hitbox registry as `(column, card, area)` triples.
 fn card_hits(app: &App) -> Vec<(usize, usize, ratatui::layout::Rect)> {
     app.hitboxes
@@ -175,6 +204,18 @@ fn render_at(app: &mut App, width: u16, height: u16) -> String {
         buffer_to_string(buffer),
         style_runs(buffer)
     )
+}
+
+fn style_at(app: &mut App, width: u16, height: u16, x: u16, y: u16) -> Style {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| board::ui(frame, app)).expect("draw");
+    terminal
+        .backend()
+        .buffer()
+        .cell((x, y))
+        .expect("cell")
+        .style()
 }
 
 fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
@@ -276,6 +317,13 @@ fn new_task_dialog_does_not_start_live_opencode_catalog_probe() {
     .expect("marker opencode config");
 
     let mut app = App::new(dir.path()).expect("create app");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !marker.exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(marker.exists(), "startup did not start the catalog warmup");
+    std::fs::remove_file(&marker).expect("clear startup marker");
+
     app.handle_key(key(KeyCode::Char('n')))
         .expect("open new task");
     std::thread::sleep(Duration::from_millis(150));
@@ -284,6 +332,51 @@ fn new_task_dialog_does_not_start_live_opencode_catalog_probe() {
         !marker.exists(),
         "opening a new task started the live opencode catalog probe"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn startup_warms_live_opencode_catalog_without_blocking_dialogs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(dir.path()).init_board().expect("init board");
+    let (command, marker) = make_catalog_opencode(dir.path());
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        format!(
+            "notifications:\n  enabled: false\nauto_launch:\n  enabled: false\n  default_agent: opencode\n  model: openai/gpt-5.5\n  models: [fallback/model]\nagents:\n  opencode:\n    command: {}\n    model: openai/gpt-5.5\n    models: [fallback/model]\n",
+            command.display()
+        ),
+    )
+    .expect("catalog opencode config");
+
+    let started = Instant::now();
+    let mut app = App::new(dir.path()).expect("create app");
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "App::new waited for opencode catalog"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline && !marker.exists() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(marker.exists(), "startup did not warm the opencode catalog");
+
+    app.handle_key(key(KeyCode::Char('n')))
+        .expect("open new task");
+    app.tick().expect("refresh warm catalog");
+    let values = app
+        .modal
+        .as_ref()
+        .expect("modal")
+        .model_options
+        .iter()
+        .map(|option| option.value.as_deref())
+        .collect::<Vec<_>>();
+
+    assert!(values.contains(&Some("openai/gpt-5.5")));
+    assert!(values.contains(&Some("opencode-go/minimax-m3")));
+    assert!(!values.contains(&Some("fallback/model")));
 }
 
 #[test]
@@ -886,6 +979,136 @@ fn mouse_click_focuses_card_and_second_click_opens_detail() {
 }
 
 #[test]
+fn mouse_move_highlights_board_cards() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let (column, card, area) = card_hits(&app)[1];
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: area.x + 1,
+        row: area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover card");
+
+    assert!(app.is_hovered(HitAction::FocusCard { column, card }));
+    let style = style_at(&mut app, 96, 28, area.x, area.y);
+    assert_eq!(style.fg, Some(app.theme.focus));
+}
+
+#[test]
+fn mouse_move_highlights_detail_buttons_and_answer_choices() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let (column, card, _) = card_hits(&app)[0];
+    app.focused_column = column;
+    app.focused_card = card;
+    app.handle_key(key(KeyCode::Enter)).expect("detail");
+
+    let _ = render_snapshot(&mut app);
+    let run_hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::Run))
+        .copied()
+        .expect("run button hitbox");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: run_hit.area.x + 2,
+        row: run_hit.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover run button");
+    let button_style = style_at(&mut app, 96, 28, run_hit.area.x + 2, run_hit.area.y);
+    assert_eq!(button_style.fg, Some(app.theme.focus));
+    assert!(button_style.add_modifier.contains(Modifier::BOLD));
+
+    let _ = render_snapshot(&mut app);
+    let answer_hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::DetailAnswerOption { index: 1 })
+        .copied()
+        .expect("answer option hitbox");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: answer_hit.area.x + 1,
+        row: answer_hit.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover answer option");
+    let answer_style = style_at(&mut app, 96, 28, answer_hit.area.x + 1, answer_hit.area.y);
+    assert_eq!(answer_style.fg, Some(app.theme.focus));
+    assert!(answer_style.add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
+fn mouse_move_highlights_modal_fields_options_and_buttons() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+
+    let _ = render_at(&mut app, 120, 32);
+    let backend_hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::ModalField(DialogField::Backend))
+        .copied()
+        .expect("backend field hitbox");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: backend_hit.area.x + 1,
+        row: backend_hit.area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover backend field");
+    let field_style = style_at(&mut app, 120, 32, backend_hit.area.x, backend_hit.area.y);
+    assert_eq!(field_style.fg, Some(app.theme.focus));
+
+    let _ = render_at(&mut app, 120, 32);
+    let option_hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| {
+            hitbox.action
+                == HitAction::ModalOption {
+                    field: DialogField::Backend,
+                    index: 0,
+                }
+        })
+        .copied()
+        .expect("backend option hitbox");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: option_hit.area.x + 1,
+        row: option_hit.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover backend option");
+    let option_style = style_at(&mut app, 120, 32, option_hit.area.x + 1, option_hit.area.y);
+    assert_eq!(option_style.fg, Some(app.theme.focus));
+    assert!(option_style.add_modifier.contains(Modifier::BOLD));
+
+    let _ = render_at(&mut app, 120, 32);
+    let save_hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::ModalButton(ModalButton::Save))
+        .copied()
+        .expect("save button hitbox");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: save_hit.area.x + 2,
+        row: save_hit.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover save button");
+    let save_style = style_at(&mut app, 120, 32, save_hit.area.x + 2, save_hit.area.y);
+    assert_eq!(save_style.fg, Some(app.theme.focus));
+    assert!(save_style.add_modifier.contains(Modifier::BOLD));
+}
+
+#[test]
 fn modal_and_help_block_mouse_click_through() {
     let (_dir, mut app) = populated_app();
     let _ = render_snapshot(&mut app);
@@ -1119,11 +1342,11 @@ fn run_hotkey_starts_task_without_confirmation() {
 }
 
 #[test]
-fn enter_is_inactive_on_open_detail_task() {
-    let (_dir, mut app) = app_with_board();
+fn enter_launches_todo_task_from_detail() {
+    let (dir, mut app) = app_with_board();
     let task = app
         .ops
-        .create_task(NewTask::titled("Do not run from detail"))
+        .create_task(NewTask::titled("Run from detail"))
         .expect("create task");
     app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
     app.clamp_focus();
@@ -1133,14 +1356,33 @@ fn enter_is_inactive_on_open_detail_task() {
     assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
 
     app.handle_key(key(KeyCode::Enter))
+        .expect("run from detail");
+
+    assert!(app.modal.is_none(), "enter must not open any dialog");
+    assert_eq!(app.screen, Screen::Board);
+    assert!(app.status.starts_with("Started"), "status: {}", app.status);
+    let started = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(started.status.as_str(), "in_progress");
+    let session_id = started.session.expect("session assigned");
+    assert!(SessionManager::new(dir.path()).is_session_active(&session_id));
+}
+
+#[test]
+fn enter_is_inactive_on_non_todo_detail_task() {
+    let (_dir, mut app) = populated_app();
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    let task_id = app.detail.as_ref().unwrap().task_id.clone();
+
+    app.handle_key(key(KeyCode::Enter))
         .expect("ignore enter in detail");
 
     assert!(app.modal.is_none(), "enter must not open any dialog");
-    assert_eq!(app.status, "TUI ready");
     assert_eq!(app.screen, Screen::Detail);
-    assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
-    let unchanged = app.ops.get_task(&task.id).unwrap().unwrap();
-    assert_eq!(unchanged.status.as_str(), "todo");
+    assert_eq!(app.detail.as_ref().unwrap().task_id, task_id);
+    let unchanged = app.ops.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(unchanged.status.as_str(), "review");
     assert!(unchanged.session.is_none());
 }
 
@@ -2803,6 +3045,16 @@ fn phase_four_modal_mouse_routes_fields_options_and_add_message_buttons() {
     app.handle_key(key(KeyCode::Char('c'))).unwrap();
     let output = render_at(&mut app, 96, 28);
     assert!(output.contains("[ Save ]  [ Cancel ]"));
+    let save_hint = "(Ctrl + S)";
+    let nav_hint = "use Tab or Shift + Tab to navigate";
+    let hint_line = output
+        .lines()
+        .find(|line| line.contains(save_hint))
+        .expect("save hint row");
+    let save_hint_start = hint_line.find(save_hint).expect("save hint position");
+    let nav_hint_start = hint_line.find(nav_hint).expect("navigation hint position");
+    assert!(hint_line[..save_hint_start].ends_with('│'));
+    assert!(hint_line[nav_hint_start + nav_hint.len()..].starts_with('│'));
     let save = app
         .hitboxes
         .iter()

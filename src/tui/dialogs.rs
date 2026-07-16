@@ -887,7 +887,8 @@ fn render_add_message(
         &kind_options,
         modal.kind_selected,
         rows[1],
-        modal.active_field() == DialogField::MessageKind,
+        modal.active_field() == DialogField::MessageKind
+            || app.is_hovered(HitAction::ModalField(DialogField::MessageKind)),
     );
     register_field(hitboxes, rows[1], DialogField::MessageKind);
     register_options(
@@ -903,7 +904,8 @@ fn render_add_message(
         &modal.description,
         rows[2],
         "Text",
-        modal.active_field() == DialogField::Description,
+        modal.active_field() == DialogField::Description
+            || app.is_hovered(HitAction::ModalField(DialogField::Description)),
     );
     register_field(hitboxes, rows[2], DialogField::Description);
     render_form_buttons(frame, app, modal, rows[3], hitboxes);
@@ -1044,7 +1046,8 @@ fn render_move(
         &modal.status_options,
         modal.status_selected,
         rows[1],
-        modal.active_field() == DialogField::TargetStatus,
+        modal.active_field() == DialogField::TargetStatus
+            || app.is_hovered(HitAction::ModalField(DialogField::TargetStatus)),
     );
     register_field(hitboxes, rows[1], DialogField::TargetStatus);
     register_options(
@@ -1128,12 +1131,21 @@ fn render_answer(
     );
     let question_items = questions
         .iter()
-        .map(|question| {
+        .enumerate()
+        .map(|(index, question)| {
+            let style = option_hover_style(
+                app,
+                HitAction::ModalOption {
+                    field: DialogField::Question,
+                    index,
+                },
+            );
             ListItem::new(format!(
                 "{}  {}",
                 sanitize_terminal_text(&question.message_id),
                 super::card::truncate_display(&sanitize_terminal_text(&question.body), 64)
             ))
+            .style(style)
         })
         .collect::<Vec<_>>();
     render_list(
@@ -1143,16 +1155,32 @@ fn render_answer(
         question_items,
         modal.question_selected,
         rows[1],
-        modal.active_field() == DialogField::Question,
+        modal.active_field() == DialogField::Question
+            || select_field_hovered(app, DialogField::Question, questions.len()),
     );
-    let mut variant_items = vec![ListItem::new("Custom answer textarea")];
+    let mut variant_items =
+        vec![
+            ListItem::new("Custom answer textarea").style(option_hover_style(
+                app,
+                HitAction::ModalOption {
+                    field: DialogField::Variant,
+                    index: 0,
+                },
+            )),
+        ];
     if let Some(question) = question {
-        variant_items.extend(
-            question
-                .variants
-                .iter()
-                .map(|variant| ListItem::new(sanitize_terminal_text(variant))),
-        );
+        variant_items.extend(question.variants.iter().enumerate().map(
+            |(variant_index, variant)| {
+                let index = variant_index + 1;
+                ListItem::new(sanitize_terminal_text(variant)).style(option_hover_style(
+                    app,
+                    HitAction::ModalOption {
+                        field: DialogField::Variant,
+                        index,
+                    },
+                ))
+            },
+        ));
     }
     let variant_count = variant_items.len();
     render_list(
@@ -1162,7 +1190,8 @@ fn render_answer(
         variant_items,
         modal.variant_selected.unwrap_or(0),
         rows[2],
-        modal.active_field() == DialogField::Variant,
+        modal.active_field() == DialogField::Variant
+            || select_field_hovered(app, DialogField::Variant, variant_count),
     );
     render_textarea(
         frame,
@@ -1170,7 +1199,8 @@ fn render_answer(
         &modal.answer,
         rows[3],
         "Custom answer / selected variant",
-        modal.active_field() == DialogField::Answer,
+        modal.active_field() == DialogField::Answer
+            || app.is_hovered(HitAction::ModalField(DialogField::Answer)),
     );
     register_field(hitboxes, rows[1], DialogField::Question);
     register_options(
@@ -1210,7 +1240,7 @@ fn render_selector_field(
             } else {
                 "Title"
             },
-            modal.active_field() == field,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::Description => render_textarea(
             frame,
@@ -1218,7 +1248,7 @@ fn render_selector_field(
             &modal.description,
             area,
             "Description (Ctrl+V image paste)",
-            modal.active_field() == field,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::Backend => render_select(
             frame,
@@ -1227,7 +1257,7 @@ fn render_selector_field(
             &modal.backend_options,
             modal.backend_selected,
             area,
-            modal.active_field() == field,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::Model => render_select(
             frame,
@@ -1236,7 +1266,7 @@ fn render_selector_field(
             &modal.model_options,
             modal.model_selected,
             area,
-            modal.active_field() == field,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::Effort => render_select(
             frame,
@@ -1245,7 +1275,7 @@ fn render_selector_field(
             &modal.effort_options,
             modal.effort_selected,
             area,
-            modal.active_field() == field,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::Agent => render_select(
             frame,
@@ -1254,7 +1284,7 @@ fn render_selector_field(
             &modal.agent_options,
             modal.agent_selected,
             area,
-            modal.active_field() == field,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::ChainTo => render_select(
             frame,
@@ -1263,7 +1293,7 @@ fn render_selector_field(
             &modal.chain_options,
             modal.chain_selected,
             area,
-            modal.active_field() == field,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::Interactive => render_interactive(frame, app, modal, area),
         DialogField::Theme => render_select(
@@ -1273,7 +1303,7 @@ fn render_selector_field(
             &modal.theme_options,
             modal.theme_selected,
             area,
-            modal.active_field() == field,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         _ => {}
     }
@@ -1306,12 +1336,26 @@ fn render_select(
     area: Rect,
     active: bool,
 ) {
+    let field = select_field_from_title(title);
+    let active = field
+        .map(|field| active || select_field_hovered(app, field, options.len()))
+        .unwrap_or(active);
     let items = if options.is_empty() {
         vec![ListItem::new("-")]
     } else {
         options
             .iter()
-            .map(|option| ListItem::new(sanitize_terminal_text(&option.label)))
+            .enumerate()
+            .map(|(index, option)| {
+                let mut item = ListItem::new(sanitize_terminal_text(&option.label));
+                if let Some(field) = field {
+                    item = item.style(option_hover_style(
+                        app,
+                        HitAction::ModalOption { field, index },
+                    ));
+                }
+                item
+            })
             .collect()
     };
     render_list(
@@ -1323,6 +1367,35 @@ fn render_select(
         area,
         active,
     );
+}
+
+fn select_field_hovered(app: &App, field: DialogField, option_count: usize) -> bool {
+    app.is_hovered(HitAction::ModalField(field))
+        || (0..option_count).any(|index| app.is_hovered(HitAction::ModalOption { field, index }))
+}
+
+fn select_field_from_title(title: &str) -> Option<DialogField> {
+    match title {
+        "Kind" => Some(DialogField::MessageKind),
+        "Status" => Some(DialogField::TargetStatus),
+        "Backend" => Some(DialogField::Backend),
+        "Model" => Some(DialogField::Model),
+        "Effort" => Some(DialogField::Effort),
+        "Agent" => Some(DialogField::Agent),
+        "Chain to" => Some(DialogField::ChainTo),
+        "Theme" => Some(DialogField::Theme),
+        _ => None,
+    }
+}
+
+fn option_hover_style(app: &App, action: HitAction) -> Style {
+    if app.is_hovered(action) {
+        Style::default()
+            .fg(app.theme.focus)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    }
 }
 
 fn render_list(
@@ -1388,8 +1461,10 @@ fn render_form_buttons(
             error_area,
         );
     }
-    let save_active = modal.active_field() == DialogField::Confirm;
-    let cancel_active = modal.active_field() == DialogField::Cancel;
+    let save_active = modal.active_field() == DialogField::Confirm
+        || app.is_hovered(HitAction::ModalButton(ModalButton::Save));
+    let cancel_active = modal.active_field() == DialogField::Cancel
+        || app.is_hovered(HitAction::ModalButton(ModalButton::Cancel));
     render_buttons(
         frame,
         app,
@@ -1419,9 +1494,9 @@ fn render_confirm_buttons(
         app,
         buttons,
         "Yes",
-        modal.confirm_yes_selected,
+        modal.confirm_yes_selected || app.is_hovered(HitAction::ModalButton(ModalButton::Yes)),
         "No",
-        !modal.confirm_yes_selected,
+        !modal.confirm_yes_selected || app.is_hovered(HitAction::ModalButton(ModalButton::No)),
     );
     register_buttons(hitboxes, buttons, ModalButton::Yes, ModalButton::No);
 }
@@ -1457,13 +1532,34 @@ fn render_buttons(
 ) {
     let left_style = button_style(app, left_active);
     let right_style = button_style(app, right_active);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
+    let content = if left == "Save" && right == "Cancel" {
+        let save_hint = "(Ctrl + S)";
+        let nav_hint = "use Tab or Shift + Tab to navigate";
+        let hint_width = area.width.saturating_sub(2) as usize;
+        let hint_gap = hint_width
+            .saturating_sub(save_hint.len() + nav_hint.len())
+            .max(1);
+        vec![
+            Line::from(vec![
+                ratatui::text::Span::styled(format!("[ {left} ]"), left_style),
+                ratatui::text::Span::raw("  "),
+                ratatui::text::Span::styled(format!("[ {right} ]"), right_style),
+            ]),
+            Line::from(vec![
+                ratatui::text::Span::styled(save_hint, Style::default().fg(app.theme.muted)),
+                ratatui::text::Span::raw(" ".repeat(hint_gap)),
+                ratatui::text::Span::styled(nav_hint, Style::default().fg(app.theme.muted)),
+            ]),
+        ]
+    } else {
+        vec![Line::from(vec![
             ratatui::text::Span::styled(format!("[ {left} ]"), left_style),
             ratatui::text::Span::raw("  "),
             ratatui::text::Span::styled(format!("[ {right} ]"), right_style),
-        ]))
-        .block(
+        ])]
+    };
+    frame.render_widget(
+        Paragraph::new(content).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(app.theme.border)),
@@ -1558,7 +1654,8 @@ fn register_buttons(hitboxes: &mut Vec<Hitbox>, area: Rect, left: ModalButton, r
 }
 
 fn render_interactive(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
-    let active = modal.active_field() == DialogField::Interactive;
+    let active = modal.active_field() == DialogField::Interactive
+        || app.is_hovered(HitAction::ModalField(DialogField::Interactive));
     let border = if active {
         app.theme.focus
     } else {

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 
 use serde_yaml_ng::{Mapping, Value};
 
@@ -289,6 +290,7 @@ impl OpencodeCatalog {
 
 static OPENCODE_CATALOG_CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<OpencodeCatalog>>>>> =
     OnceLock::new();
+static OPENCODE_CATALOG_WARMING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 /// Model list and variants from `opencode models --verbose`, cached per
 /// command for the process lifetime. `None` when the CLI is unavailable —
@@ -317,6 +319,33 @@ pub fn opencode_catalog(command: &str) -> Option<Arc<OpencodeCatalog>> {
         values.insert(command.to_string(), fetched.clone());
     }
     fetched
+}
+
+/// Start a best-effort background fetch of the opencode model catalog.
+///
+/// This keeps latency-sensitive UI paths on `cached_opencode_catalog()` while
+/// making the live CLI catalog available shortly after startup.
+pub fn warm_opencode_catalog(command: String) {
+    if command.trim().is_empty() || cached_opencode_catalog(&command).is_some() {
+        return;
+    }
+    let warming = OPENCODE_CATALOG_WARMING.get_or_init(|| Mutex::new(HashSet::new()));
+    if let Ok(mut commands) = warming.lock() {
+        if !commands.insert(command.clone()) {
+            return;
+        }
+    } else {
+        return;
+    }
+
+    thread::spawn(move || {
+        let _ = opencode_catalog(&command);
+        if let Some(warming) = OPENCODE_CATALOG_WARMING.get()
+            && let Ok(mut commands) = warming.lock()
+        {
+            commands.remove(&command);
+        }
+    });
 }
 
 /// Return a previously fetched opencode catalog without invoking the CLI.

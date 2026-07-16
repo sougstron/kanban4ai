@@ -11,7 +11,9 @@ use ratatui::layout::Rect;
 use serde_yaml_ng::{Mapping, Value};
 use tui_textarea::TextArea;
 
-use crate::agent::{cached_opencode_catalog, recent_models, sort_opencode_models};
+use crate::agent::{
+    cached_opencode_catalog, recent_models, sort_opencode_models, warm_opencode_catalog,
+};
 use crate::core::config::BoardConfig;
 use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
@@ -111,6 +113,9 @@ pub enum HitAction {
         index: usize,
     },
     ModalButton(ModalButton),
+    DetailAnswerOption {
+        index: usize,
+    },
     DetailThread,
 }
 
@@ -244,6 +249,7 @@ pub struct App {
     pub should_quit: bool,
     pub status: String,
     pub hitboxes: Vec<Hitbox>,
+    hovered: Option<HitAction>,
     pub dragging: Option<DragState>,
     pub log_view: Option<LogViewState>,
     /// Where closing the detail screen returns to (Sessions `o`, Archive
@@ -263,6 +269,7 @@ pub struct App {
     ctrl_c_exit_deadline: Option<Instant>,
     /// Last time the tick scanned for expired declared waits to relaunch.
     last_wait_resume: Option<Instant>,
+    opencode_catalog_ready: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,6 +290,18 @@ impl App {
         let board = BoardSnapshot::load(&ops)?;
         let archived_tasks = ops.list_archived_tasks(None)?;
         let recent_models = recent_models(project_path);
+        let opencode_command = ops
+            .config
+            .load()
+            .ok()
+            .and_then(|config| configured_opencode_command(&config));
+        if let Some(command) = opencode_command.as_ref() {
+            warm_opencode_catalog(command.clone());
+        }
+        let opencode_catalog_ready = opencode_command
+            .as_deref()
+            .and_then(cached_opencode_catalog)
+            .is_some();
         let column_offsets = vec![0; board.columns.len()];
         let visible_card_capacities = vec![1; board.columns.len()];
         Ok(Self {
@@ -306,6 +325,7 @@ impl App {
             should_quit: false,
             status: "TUI ready".to_string(),
             hitboxes: Vec::new(),
+            hovered: None,
             dragging: None,
             log_view: None,
             return_screen: Screen::Board,
@@ -318,6 +338,7 @@ impl App {
             recent_models,
             ctrl_c_exit_deadline: None,
             last_wait_resume: None,
+            opencode_catalog_ready,
         })
     }
 
@@ -381,6 +402,14 @@ impl App {
                 self.dispatch(UiAction::Rerun)?
             }
             (KeyCode::Char('/'), _) => self.dispatch(UiAction::Search)?,
+            (KeyCode::Enter, _)
+                if self.screen == Screen::Detail
+                    && self
+                        .current_task()
+                        .is_some_and(|task| task.status == TaskStatus::Todo) =>
+            {
+                self.dispatch(UiAction::Run)?
+            }
             (KeyCode::Enter, _) if self.screen != Screen::Detail => {
                 self.dispatch(UiAction::OpenDetail)?
             }
@@ -726,27 +755,49 @@ impl App {
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
         if self.modal.is_some() {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.handle_modal_click(mouse.column, mouse.row)?;
+            match mouse.kind {
+                MouseEventKind::Moved => self.update_hover(mouse.column, mouse.row),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.update_hover(mouse.column, mouse.row);
+                    self.handle_modal_click(mouse.column, mouse.row)?;
+                }
+                _ => {}
             }
             // A modal owns all mouse input; board cards and drag targets must
             // never receive a click-through event.
             return Ok(());
         }
         if self.screen == Screen::Help {
+            self.hovered = None;
             return Ok(());
         }
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.mouse_down(mouse.column, mouse.row)?,
+            MouseEventKind::Moved => self.update_hover(mouse.column, mouse.row),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.update_hover(mouse.column, mouse.row);
+                self.mouse_down(mouse.column, mouse.row)?;
+            }
             MouseEventKind::Drag(MouseButton::Left) => {
+                self.update_hover(mouse.column, mouse.row);
                 self.update_drag_target(mouse.column, mouse.row)
             }
-            MouseEventKind::Up(MouseButton::Left) => self.finish_drag(mouse.column, mouse.row)?,
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.update_hover(mouse.column, mouse.row);
+                self.finish_drag(mouse.column, mouse.row)?;
+            }
             MouseEventKind::ScrollUp => self.scroll_at(mouse.column, mouse.row, -1),
             MouseEventKind::ScrollDown => self.scroll_at(mouse.column, mouse.row, 1),
             _ => {}
         }
         Ok(())
+    }
+
+    pub fn is_hovered(&self, action: HitAction) -> bool {
+        self.hovered == Some(action)
+    }
+
+    fn update_hover(&mut self, x: u16, y: u16) {
+        self.hovered = self.hit_at(x, y);
     }
 
     fn mouse_down(&mut self, x: u16, y: u16) -> Result<()> {
@@ -823,6 +874,7 @@ impl App {
                 | HitAction::ModalField(_)
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
+                | HitAction::DetailAnswerOption { .. }
                 | HitAction::DetailThread,
             )
             | None => None,
@@ -849,6 +901,13 @@ impl App {
                 Ok(())
             }
             Some(HitAction::Action(action)) => self.dispatch(action),
+            Some(HitAction::DetailAnswerOption { index }) => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.variant_selected = index;
+                }
+                self.set_detail_focus(DetailFocus::Answer);
+                Ok(())
+            }
             // Column areas only steer wheel targeting for now; clicking the
             // empty part of a column focuses it without opening any action.
             Some(HitAction::ColumnFocus(column)) => {
@@ -940,6 +999,7 @@ impl App {
                 | HitAction::ModalField(_)
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
+                | HitAction::DetailAnswerOption { .. }
                 | HitAction::DetailThread,
             )
             | None => self.focused_column,
@@ -1029,6 +1089,7 @@ impl App {
 
     pub fn tick(&mut self) -> Result<()> {
         self.reload_if_changed()?;
+        self.refresh_modal_after_opencode_catalog_warm();
         let now = Instant::now();
         self.expire_ctrl_c_prompt_at(now);
         self.expire_last_clicked_at(now);
@@ -1040,6 +1101,32 @@ impl App {
             self.refresh_log_view();
         }
         Ok(())
+    }
+
+    fn refresh_modal_after_opencode_catalog_warm(&mut self) {
+        if self.opencode_catalog_ready {
+            return;
+        }
+        let Ok(config) = self.ops.config.load() else {
+            return;
+        };
+        let Some(command) = configured_opencode_command(&config) else {
+            return;
+        };
+        if cached_opencode_catalog(&command).is_none() {
+            return;
+        }
+        self.opencode_catalog_ready = true;
+        let should_refresh = self.modal.as_ref().is_some_and(|modal| {
+            matches!(
+                modal.modal,
+                Modal::NewTask { .. } | Modal::EditTask { .. } | Modal::Settings
+            )
+        });
+        if should_refresh && let Some(mut modal) = self.modal.take() {
+            self.refresh_backend_options_with_config(&mut modal, &config);
+            self.modal = Some(modal);
+        }
     }
 
     pub(crate) fn expire_ctrl_c_prompt_at(&mut self, now: Instant) {
@@ -2986,6 +3073,14 @@ fn mapping_str(mapping: Option<&Mapping>, key: &str) -> Option<String> {
 
 fn backend_command(backend: &str, backend_settings: Option<&Mapping>) -> String {
     mapping_str(backend_settings, "command").unwrap_or_else(|| backend.to_string())
+}
+
+fn configured_opencode_command(config: &BoardConfig) -> Option<String> {
+    let backend_settings = config
+        .agents
+        .get(Value::String("opencode".to_string()))
+        .and_then(Value::as_mapping)?;
+    Some(backend_command("opencode", Some(backend_settings)))
 }
 
 fn selected_backend(auto_launch: &Mapping, modal: &ModalState) -> String {

@@ -252,34 +252,51 @@ fn render_answer_panel(
     open_questions: &[Message],
     area: Rect,
 ) {
-    let detail = app.detail.as_ref().unwrap();
-    let focused = detail.focus == DetailFocus::Answer;
-    let index = detail.question_index.min(open_questions.len() - 1);
-    let question = &open_questions[index];
-    let input_text = sanitize_terminal_text(&detail.answer_input.lines().join(" "));
+    let (focused, index, input_text, selected, question_body, variants) = {
+        let detail = app.detail.as_ref().unwrap();
+        let index = detail.question_index.min(open_questions.len() - 1);
+        let question = &open_questions[index];
+        (
+            detail.focus == DetailFocus::Answer,
+            index,
+            sanitize_terminal_text(&detail.answer_input.lines().join(" ")),
+            detail.variant_selected,
+            sanitize_terminal_text(&question.body),
+            question.variants.clone(),
+        )
+    };
 
     let title = format!(
         " Answer question {}/{} · ←→ question · ↑↓ variant · Enter send ",
         index + 1,
         open_questions.len()
     );
-    let selected = detail.variant_selected;
     let custom_label = if input_text.is_empty() {
         "Custom answer: (type to fill)".to_string()
     } else {
         format!("Custom answer: {input_text}")
     };
-    let mut options = vec![option_line(&custom_label, selected == 0, focused, theme)];
-    for (variant_index, variant) in question.variants.iter().enumerate() {
+    let mut options = vec![option_line(
+        &custom_label,
+        selected == 0,
+        focused,
+        app.is_hovered(HitAction::DetailAnswerOption { index: 0 }),
+        theme,
+    )];
+    for (variant_index, variant) in variants.iter().enumerate() {
+        let option_index = variant_index + 1;
         options.push(option_line(
             &format!("{}. {}", variant_index + 1, sanitize_terminal_text(variant)),
-            selected == variant_index + 1,
+            selected == option_index,
             focused,
+            app.is_hovered(HitAction::DetailAnswerOption {
+                index: option_index,
+            }),
             theme,
         ));
     }
     let mut lines = vec![Line::from(Span::styled(
-        sanitize_terminal_text(&question.body),
+        question_body,
         Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
     ))];
     let visible_options = area.height.saturating_sub(3).max(1) as usize;
@@ -296,7 +313,29 @@ fn render_answer_panel(
     }
     let already_used = lines.len().saturating_sub(1);
     let take = visible_options.saturating_sub(already_used);
-    lines.extend(options.iter().skip(start).take(take).cloned());
+    let first_option_row = lines.len();
+    for (visible_offset, (option_index, line)) in options
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(take)
+        .enumerate()
+    {
+        app.hitboxes.push(Hitbox {
+            area: Rect {
+                x: area.x.saturating_add(1),
+                y: area
+                    .y
+                    .saturating_add(1 + (first_option_row + visible_offset) as u16),
+                width: area.width.saturating_sub(2),
+                height: 1,
+            },
+            action: HitAction::DetailAnswerOption {
+                index: option_index,
+            },
+        });
+        lines.push(line.clone());
+    }
     if start + take < options.len() {
         lines.push(Line::from(Span::styled(
             "↓ more variants",
@@ -330,9 +369,15 @@ fn render_answer_panel(
     }
 }
 
-fn option_line(label: &str, selected: bool, panel_focused: bool, theme: &Theme) -> Line<'static> {
-    let marker = if selected { "› " } else { "  " };
-    let style = if selected && panel_focused {
+fn option_line(
+    label: &str,
+    selected: bool,
+    panel_focused: bool,
+    hovered: bool,
+    theme: &Theme,
+) -> Line<'static> {
+    let marker = if selected || hovered { "› " } else { "  " };
+    let style = if (selected && panel_focused) || hovered {
         Style::default()
             .fg(theme.focus)
             .add_modifier(Modifier::BOLD)
@@ -434,10 +479,15 @@ fn render_action_bar(
             },
             action: HitAction::Action(action),
         });
-        spans.push(Span::styled(
-            text,
-            Style::default().fg(theme.fg).bg(theme.border),
-        ));
+        let style = if app.is_hovered(HitAction::Action(action)) {
+            Style::default()
+                .fg(theme.focus)
+                .bg(theme.border)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg).bg(theme.border)
+        };
+        spans.push(Span::styled(text, style));
         spans.push(Span::raw(" "));
         x += width + 1;
     }

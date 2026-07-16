@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 2614
 expression: output
 ---
 ┌ To Do (1) ───────┐┌ In Progress (0) ─┐┌ Review (1) ──────┐┌ Done (0) ────────┐
@@ -20,7 +19,7 @@ expression: output
 │           │                                                      │           │
 │           │┌────────────────────────────────────────────────────┐│           │
 │           ││[ Save ]  [ Cancel ]                                ││           │
-│           ││                                                    ││           │
+│           ││(Ctrl + S)        use Tab or Shift + Tab to navigate││           │
 │           │└────────────────────────────────────────────────────┘│           │
 │           └──────────────────────────────────────────────────────┘           │
 │                  ││                  ││                  ││                  │
@@ -162,7 +161,9 @@ expression: output
 17:1-12 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 17:12-13 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 17:13-14 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-17:14-66 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+17:14-24 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+17:24-32 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+17:32-66 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 17:66-67 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 17:67-68 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 17:68-79 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

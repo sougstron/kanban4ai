@@ -10,20 +10,27 @@ use crate::core::session::SessionState;
 
 use super::app::App;
 
-pub fn render_card(frame: &mut Frame<'_>, app: &App, task: &Task, area: Rect, focused: bool) {
+pub fn render_card(
+    frame: &mut Frame<'_>,
+    app: &App,
+    task: &Task,
+    area: Rect,
+    focused: bool,
+    hovered: bool,
+) {
     let session_state = app.board.session_states.get(&task.id).copied();
     let border = if session_state == Some(SessionState::Crashed) {
         app.theme.err
-    } else if task.has_questions {
+    } else if task.has_questions && !hovered {
         app.theme.warn
-    } else if focused {
+    } else if focused || hovered {
         app.theme.focus
     } else {
         app.theme.border
     };
     let line_width = area.width.saturating_sub(2).max(1) as usize;
     let query = app.search.text();
-    let id_style = if focused {
+    let id_style = if focused || hovered {
         Style::default()
             .fg(app.theme.focus)
             .add_modifier(Modifier::BOLD)
