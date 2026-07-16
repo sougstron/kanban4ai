@@ -1,13 +1,16 @@
-# kanban4ai 0.2.3
+# kanban4ai 0.2.4
 
 ## Highlights
 
-- Deferred opencode persona resolution out of the launch path. Starting a task no longer blocks the TUI or CLI while `opencode agent list` starts; the spawned wrapper resolves the requested persona after the session heartbeat loop is running and falls back to the requested name if resolution fails.
-- Added a hidden `kanban resolve-agent` callback used by runtime wrappers to map friendly opencode persona keys to the exact registered `--agent` name without slowing the launching process.
-- Improved TUI onboarding and version visibility: empty To Do columns now show `press n to create task`, and the help popup header includes the current `kanban4ai` version from Cargo metadata.
+- Warm the opencode model catalog when the TUI starts so task and project settings dialogs can switch from configured fallback models to the live catalog without blocking dialog open.
+- Added hover highlighting across the TUI hitbox registry, including board cards, detail actions, answer choices, modal fields, modal options, and modal buttons.
+- Detail-screen `Enter` now starts the open task only when it is still in To Do, while keeping `Enter` inactive for non-To Do tasks and answer/review text panels.
+- Improved modal Save/Cancel helper hints by placing `(Ctrl + S)` on the left edge and the Tab navigation hint on the right edge of the button box.
 
 ## Verification coverage
 
-- Added regression coverage for deferred opencode persona resolution in wrapper scripts, literal `--agent` preservation when deferral is not requested, fallback behavior when the resolve callback fails, and launch-plan storage of the requested persona.
-- Added regression coverage for the versioned TUI help header and refreshed empty-board snapshots for the To Do hint.
+- Added regression coverage for non-blocking opencode catalog warming and refreshing open forms after the warmed catalog becomes available.
+- Added regression coverage for hover rendering on board cards, detail buttons, answer choices, modal fields, modal options, and modal buttons.
+- Added regression coverage for detail-view To Do launch, non-To Do inactivity, and answer-panel safety.
+- Refreshed affected TUI snapshots for the modal hint and hover rendering updates.
 - Release checks for this version include rustfmt, clippy with warnings denied, locked tests, a release build, and installer packaging smoke tests.
