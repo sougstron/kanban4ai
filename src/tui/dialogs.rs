@@ -3,7 +3,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use tui_textarea::TextArea;
+use ratatui_textarea::{TextArea, WrapMode};
 
 use crate::core::models::Task;
 use crate::core::operations::QuestionRef;
@@ -86,6 +86,7 @@ pub enum DialogField {
     Variant,
     Answer,
     Theme,
+    TaskSort,
     Confirm,
     Cancel,
 }
@@ -101,13 +102,14 @@ const TASK_FORM_FIELDS: [DialogField; 8] = [
     DialogField::Interactive,
 ];
 
-const SETTINGS_FORM_FIELDS: [DialogField; 6] = [
+const SETTINGS_FORM_FIELDS: [DialogField; 7] = [
     DialogField::Title,
     DialogField::Backend,
     DialogField::Model,
     DialogField::Effort,
     DialogField::Agent,
     DialogField::Theme,
+    DialogField::TaskSort,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +133,7 @@ pub struct ModalState {
     pub target_status: TextArea<'static>,
     pub answer: TextArea<'static>,
     pub theme: TextArea<'static>,
+    pub task_sort: TextArea<'static>,
     pub interactive: bool,
     pub form_scroll: usize,
     pub error: Option<String>,
@@ -154,15 +157,22 @@ pub struct ModalState {
     pub variant_selected: Option<usize>,
     pub theme_options: Vec<SelectOption>,
     pub theme_selected: usize,
+    pub task_sort_options: Vec<SelectOption>,
+    pub task_sort_selected: usize,
 }
 
 impl ModalState {
     pub fn new(modal: Modal) -> Self {
+        let wraps_description = matches!(&modal, Modal::NewTask { .. } | Modal::EditTask { .. });
         Self {
             modal,
             field_index: 0,
             title: one_line(""),
-            description: TextArea::default(),
+            description: if wraps_description {
+                wrapped_description(Vec::new())
+            } else {
+                TextArea::default()
+            },
             backend: one_line(""),
             model: one_line(""),
             effort: one_line(""),
@@ -171,6 +181,7 @@ impl ModalState {
             target_status: one_line("todo"),
             answer: TextArea::default(),
             theme: one_line("dark"),
+            task_sort: one_line("task_number"),
             interactive: false,
             form_scroll: 0,
             error: None,
@@ -194,13 +205,15 @@ impl ModalState {
             variant_selected: None,
             theme_options: Vec::new(),
             theme_selected: 0,
+            task_sort_options: Vec::new(),
+            task_sort_selected: 0,
         }
     }
 
     pub fn for_task(modal: Modal, task: &Task) -> Self {
         let mut state = Self::new(modal);
         state.title = one_line(&task.title);
-        state.description = TextArea::new(lines_or_empty(&task.description));
+        state.description = wrapped_description(lines_or_empty(&task.description));
         state.backend = one_line(task.agent_backend.as_deref().unwrap_or(""));
         state.model = one_line(task.ai_model.as_deref().unwrap_or(""));
         state.effort = one_line(task.ai_effort.as_deref().unwrap_or(""));
@@ -254,6 +267,7 @@ impl ModalState {
                 DialogField::Effort,
                 DialogField::Agent,
                 DialogField::Theme,
+                DialogField::TaskSort,
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
@@ -339,6 +353,7 @@ impl ModalState {
             DialogField::Question => Some(SelectorKind::Question),
             DialogField::Variant => Some(SelectorKind::Variant),
             DialogField::Theme => Some(SelectorKind::Theme),
+            DialogField::TaskSort => Some(SelectorKind::TaskSort),
             _ => None,
         };
         if let Some(kind) = kind {
@@ -380,6 +395,7 @@ impl ModalState {
                 self.answer.input(key);
             }
             DialogField::Theme => self.input_select(key, SelectorKind::Theme),
+            DialogField::TaskSort => self.input_select(key, SelectorKind::TaskSort),
             DialogField::Confirm | DialogField::Cancel => {}
         }
         if self.editable_signature() != before {
@@ -402,6 +418,7 @@ impl ModalState {
             DialogField::Question | DialogField::Variant => &mut self.answer,
             DialogField::Answer => &mut self.answer,
             DialogField::Theme => &mut self.theme,
+            DialogField::TaskSort => &mut self.task_sort,
             DialogField::Confirm | DialogField::Cancel => &mut self.answer,
         }
     }
@@ -449,6 +466,13 @@ impl ModalState {
         self.apply_selection(SelectorKind::Theme);
     }
 
+    pub fn set_task_sort_options(&mut self, options: Vec<SelectOption>) {
+        self.task_sort_options = options;
+        self.task_sort_selected =
+            select_matching(&self.task_sort_options, self.task_sort_text().as_deref());
+        self.apply_selection(SelectorKind::TaskSort);
+    }
+
     pub fn title_text(&self) -> String {
         textarea_text(&self.title)
     }
@@ -483,6 +507,10 @@ impl ModalState {
 
     pub fn theme_text(&self) -> Option<String> {
         non_empty(textarea_text(&self.theme))
+    }
+
+    pub fn task_sort_text(&self) -> Option<String> {
+        non_empty(textarea_text(&self.task_sort))
     }
 
     pub fn answer_text(&self) -> String {
@@ -548,6 +576,7 @@ impl ModalState {
             },
             SelectorKind::Variant => self.current_variants().len() + 1,
             SelectorKind::Theme => self.theme_options.len(),
+            SelectorKind::TaskSort => self.task_sort_options.len(),
         }
     }
 
@@ -563,6 +592,7 @@ impl ModalState {
             SelectorKind::Question => &mut self.question_selected,
             SelectorKind::Variant => self.variant_selected.get_or_insert(0),
             SelectorKind::Theme => &mut self.theme_selected,
+            SelectorKind::TaskSort => &mut self.task_sort_selected,
         }
     }
 
@@ -578,6 +608,7 @@ impl ModalState {
             SelectorKind::Question => self.question_selected,
             SelectorKind::Variant => self.variant_selected.unwrap_or(0),
             SelectorKind::Theme => self.theme_selected,
+            SelectorKind::TaskSort => self.task_sort_selected,
         }
     }
 
@@ -623,6 +654,10 @@ impl ModalState {
             SelectorKind::Theme => {
                 let text = selected_value(&self.theme_options, self.theme_selected);
                 self.theme = one_line(text.as_deref().unwrap_or("dark"));
+            }
+            SelectorKind::TaskSort => {
+                let text = selected_value(&self.task_sort_options, self.task_sort_selected);
+                self.task_sort = one_line(text.as_deref().unwrap_or("task_number"));
             }
         }
     }
@@ -682,6 +717,8 @@ impl ModalState {
             raw_textarea_text(&self.answer),
             raw_textarea_text(&self.theme),
             self.theme_selected.to_string(),
+            raw_textarea_text(&self.task_sort),
+            self.task_sort_selected.to_string(),
         ]
         .join("\u{1f}")
     }
@@ -699,9 +736,10 @@ enum SelectorKind {
     Question,
     Variant,
     Theme,
+    TaskSort,
 }
 
-pub fn render(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) -> Vec<Hitbox> {
+pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Rect) -> Vec<Hitbox> {
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(modal_title(&modal.modal))
@@ -772,7 +810,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) 
                     "Restore task {} from Archive?",
                     sanitize_terminal_text(task_id)
                 )),
-                Line::from("The task returns to To Do without a session."),
+                Line::from("The task returns to To Do and keeps its last session record."),
             ],
             &mut hitboxes,
         ),
@@ -790,7 +828,7 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) 
 fn render_settings_form(
     frame: &mut Frame<'_>,
     app: &App,
-    modal: &ModalState,
+    modal: &mut ModalState,
     area: Rect,
     hitboxes: &mut Vec<Hitbox>,
 ) {
@@ -914,7 +952,7 @@ fn render_add_message(
 fn render_task_form(
     frame: &mut Frame<'_>,
     app: &App,
-    modal: &ModalState,
+    modal: &mut ModalState,
     area: Rect,
     hitboxes: &mut Vec<Hitbox>,
 ) {
@@ -924,7 +962,7 @@ fn render_task_form(
 fn render_selector_form(
     frame: &mut Frame<'_>,
     app: &App,
-    modal: &ModalState,
+    modal: &mut ModalState,
     area: Rect,
     hitboxes: &mut Vec<Hitbox>,
     fields: &[DialogField],
@@ -978,6 +1016,14 @@ fn selector_form_rows(
     }
 
     let mut surplus = content_height.saturating_sub(used);
+    if let Some((_, height)) = rows
+        .iter_mut()
+        .find(|(field, _)| *field == DialogField::Description)
+    {
+        let growth = (10 - *height).min(surplus);
+        *height += growth;
+        surplus -= growth;
+    }
     while surplus > 0 {
         let mut grew = false;
         for (field, height) in &mut rows {
@@ -1001,17 +1047,22 @@ fn selector_form_rows(
 fn task_field_min_height(field: DialogField) -> u16 {
     match field {
         DialogField::Title | DialogField::Interactive => 3,
+        DialogField::Description => 5,
         _ => 4,
     }
 }
 
 fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
+    if field == DialogField::Description {
+        return 10;
+    }
     let count = match field {
         DialogField::Backend => modal.backend_options.len(),
         DialogField::Model => modal.model_options.len(),
         DialogField::Effort => modal.effort_options.len(),
         DialogField::Agent => modal.agent_options.len(),
         DialogField::Theme => modal.theme_options.len(),
+        DialogField::TaskSort => modal.task_sort_options.len(),
         DialogField::ChainTo => modal.chain_options.len(),
         _ => return task_field_min_height(field),
     };
@@ -1225,7 +1276,7 @@ fn render_answer(
 fn render_selector_field(
     frame: &mut Frame<'_>,
     app: &App,
-    modal: &ModalState,
+    modal: &mut ModalState,
     field: DialogField,
     area: Rect,
 ) {
@@ -1242,12 +1293,11 @@ fn render_selector_field(
             },
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
-        DialogField::Description => render_textarea(
+        DialogField::Description => render_description_textarea(
             frame,
             app,
-            &modal.description,
+            modal,
             area,
-            "Description (Ctrl+V image paste)",
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::Backend => render_select(
@@ -1305,6 +1355,15 @@ fn render_selector_field(
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
+        DialogField::TaskSort => render_select(
+            frame,
+            app,
+            "Task sorting",
+            &modal.task_sort_options,
+            modal.task_sort_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
         _ => {}
     }
 }
@@ -1321,6 +1380,7 @@ fn register_task_options(
         DialogField::Effort => (modal.effort_options.len(), modal.effort_selected),
         DialogField::Agent => (modal.agent_options.len(), modal.agent_selected),
         DialogField::Theme => (modal.theme_options.len(), modal.theme_selected),
+        DialogField::TaskSort => (modal.task_sort_options.len(), modal.task_sort_selected),
         DialogField::ChainTo => (modal.chain_options.len(), modal.chain_selected),
         _ => (0, 0),
     };
@@ -1384,6 +1444,7 @@ fn select_field_from_title(title: &str) -> Option<DialogField> {
         "Agent" => Some(DialogField::Agent),
         "Chain to" => Some(DialogField::ChainTo),
         "Theme" => Some(DialogField::Theme),
+        "Task sorting" => Some(DialogField::TaskSort),
         _ => None,
     }
 }
@@ -1696,6 +1757,27 @@ fn render_textarea(
     frame.render_widget(&widget, area);
 }
 
+fn render_description_textarea(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &mut ModalState,
+    area: Rect,
+    active: bool,
+) {
+    let border = if active {
+        app.theme.focus
+    } else {
+        app.theme.border
+    };
+    modal.description.set_block(
+        Block::default()
+            .title(" Description (Ctrl+V image paste) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border)),
+    );
+    frame.render_widget(&modal.description, area);
+}
+
 fn modal_title(modal: &Modal) -> &'static str {
     match modal {
         Modal::NewTask { .. } => " New task ",
@@ -1716,6 +1798,12 @@ fn one_line(text: &str) -> TextArea<'static> {
     TextArea::new(vec![sanitize_terminal_text(
         &text.replace(['\n', '\r'], " "),
     )])
+}
+
+fn wrapped_description(lines: Vec<String>) -> TextArea<'static> {
+    let mut textarea = TextArea::new(lines);
+    textarea.set_wrap_mode(WrapMode::WordOrGlyph);
+    textarea
 }
 
 fn input_single_line(textarea: &mut TextArea<'static>, key: ratatui::crossterm::event::KeyEvent) {

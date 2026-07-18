@@ -32,6 +32,35 @@ pub struct AgentBackendConfig {
     pub extra_args: Vec<String>,
 }
 
+/// The backend, model, effort, and agent persona a launch actually uses:
+/// the task's own fields where set, the backend's configured defaults
+/// otherwise. [`Operations`](crate::core::operations::Operations) writes these
+/// back onto the task so its fields keep describing the last session that ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchSettings {
+    pub backend: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub agent: Option<String>,
+}
+
+pub fn resolve_launch_settings(config: &BoardConfig, task: &Task) -> Result<LaunchSettings> {
+    let backend = resolve_backend_name(config, task);
+    let backend_config = backend_config(config, &backend)?;
+    let pick = |task_value: &Option<String>, default: Option<String>| {
+        task_value
+            .clone()
+            .or(default)
+            .filter(|value| !value.trim().is_empty())
+    };
+    Ok(LaunchSettings {
+        model: pick(&task.ai_model, backend_config.model),
+        effort: pick(&task.ai_effort, backend_config.effort),
+        agent: pick(&task.agent_name, backend_config.agent),
+        backend,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
     pub backend: String,
@@ -67,21 +96,13 @@ pub fn build_launch_plan(
     let heartbeat_interval_secs =
         (loader.get_threshold("session_heartbeat_timeout")? / 3).clamp(10, 600);
     let auto_launch = auto_launch_config(&config);
-    let backend = resolve_backend_name(&config, task);
+    let LaunchSettings {
+        backend,
+        model,
+        effort,
+        agent,
+    } = resolve_launch_settings(&config, task)?;
     let backend_config = backend_config(&config, &backend)?;
-    let model = task
-        .ai_model
-        .clone()
-        .or_else(|| backend_config.model.clone());
-    let effort = task
-        .ai_effort
-        .clone()
-        .or_else(|| backend_config.effort.clone());
-    let agent = task
-        .agent_name
-        .clone()
-        .or_else(|| backend_config.agent.clone())
-        .filter(|value| !value.trim().is_empty());
     let resolve_agent = if backend == "opencode" {
         agent.clone()
     } else {

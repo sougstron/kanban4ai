@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Clear};
-use tui_textarea::TextArea;
+use ratatui_textarea::TextArea;
 
 use super::app::App;
 use super::board::centered_rect;
@@ -39,7 +39,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Block::default()
             .title(" Search · type to filter · Esc close ")
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.focus)),
+            .border_style(Style::default().fg(app.theme.focus))
+            .style(Style::default().bg(app.theme.bg).fg(app.theme.fg)),
     );
     query.set_style(
         Style::default()

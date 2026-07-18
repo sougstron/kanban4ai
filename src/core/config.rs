@@ -55,6 +55,7 @@ tui:
   card_line_max_symbols: 40
   max_tasks_per_column: 100
   theme: textual-dark
+  task_sort: task_number
 auto_launch:
   enabled: true
   use_tmux: true
@@ -186,6 +187,23 @@ fn merge_missing(target: &mut Mapping, defaults: &Mapping) {
     for (key, value) in defaults {
         if !target.contains_key(key) {
             target.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// Add new built-in choices to an existing catalog while preserving its order
+/// and any user-defined entries.
+fn merge_missing_sequence_values(target: &mut Mapping, defaults: &Mapping, key: &str) {
+    let yaml_key = Value::String(key.to_owned());
+    let Some(default_values) = defaults.get(&yaml_key).and_then(Value::as_sequence) else {
+        return;
+    };
+    let Some(values) = target.get_mut(&yaml_key).and_then(Value::as_sequence_mut) else {
+        return;
+    };
+    for value in default_values {
+        if !values.contains(value) {
+            values.push(value.clone());
         }
     }
 }
@@ -386,6 +404,7 @@ impl Config {
                 Some(Value::Mapping(existing)) => {
                     if let Value::Mapping(default_settings) = settings {
                         merge_missing(existing, default_settings);
+                        merge_missing_sequence_values(existing, default_settings, "models");
                     }
                 }
                 _ => {

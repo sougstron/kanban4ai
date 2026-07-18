@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::style::{Modifier, Style};
-use tui_textarea::TextArea;
+use ratatui_textarea::{TextArea, WrapMode};
 
 use crate::core::operations::Operations;
 use crate::core::session::SessionManager;
@@ -18,7 +18,7 @@ use super::app::{
     App, DetailFocus, HitAction, Screen, UiAction, load_log_tail, normalize_command_key,
 };
 use super::board;
-use super::dialogs::{DialogField, Modal, ModalButton};
+use super::dialogs::{DialogField, Modal, ModalButton, ModalState};
 use super::theme::Theme;
 
 fn app_with_board() -> (tempfile::TempDir, App) {
@@ -44,6 +44,107 @@ fn log_tail_rejects_invalid_session_id() {
         load_log_tail(dir.path(), "../outside"),
         vec!["(invalid session id)".to_string()]
     );
+}
+
+#[test]
+fn task_description_soft_wraps_and_preserves_data_cursor_after_resize() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let prose = "Soft wrapping keeps normal prose readable in a narrow terminal. ";
+    let token = "unbroken".repeat(16);
+    let description = format!("{prose}{token}");
+    {
+        let modal = app.modal.as_mut().expect("new task modal");
+        modal.focus_field(DialogField::Description);
+        modal.description.insert_str(&description);
+        modal.description.input(key(KeyCode::Home));
+    }
+
+    let prose_view = render_at(&mut app, 72, 40);
+    assert!(prose_view.contains("Soft wrapping"));
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .description
+        .input(key(KeyCode::End));
+
+    let _ = render_at(&mut app, 160, 48);
+    let logical_cursor = app.modal.as_ref().expect("modal").description.cursor();
+    let wide_cursor = app
+        .modal
+        .as_ref()
+        .expect("modal")
+        .description
+        .screen_cursor();
+    let narrow = render_at(&mut app, 72, 40);
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(
+        modal.description.lines(),
+        std::slice::from_ref(&description)
+    );
+    assert_eq!(modal.description.cursor(), logical_cursor);
+    assert!(modal.description.screen_cursor().row > wide_cursor.row);
+    assert!(narrow.contains("unbroken"));
+    assert!(!narrow.contains(&token), "long token must be glyph-wrapped");
+
+    let narrow_cursor = modal.description.screen_cursor();
+    let modal = app.modal.as_mut().expect("modal");
+    modal.description.input(key(KeyCode::Up));
+    assert_eq!(
+        modal.description.screen_cursor().row + 1,
+        narrow_cursor.row,
+        "Up must move by one visual wrapped row"
+    );
+    assert_eq!(
+        modal.description.lines(),
+        std::slice::from_ref(&description)
+    );
+    modal.description.input(key(KeyCode::Down));
+    assert_eq!(modal.description.cursor(), logical_cursor);
+    modal
+        .description
+        .input(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+    assert!(modal.description.selection_range().is_some());
+    assert_eq!(modal.description.lines(), [description]);
+}
+
+#[test]
+fn task_description_height_is_bounded_and_other_editors_remain_unwrapped() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let _ = render_at(&mut app, 120, 60);
+
+    let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
+    assert_eq!(description.height, 10);
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.description.wrap_mode(), WrapMode::WordOrGlyph);
+    assert_eq!(modal.title.wrap_mode(), WrapMode::None);
+    assert_eq!(modal.answer.wrap_mode(), WrapMode::None);
+    assert_eq!(app.search.query.wrap_mode(), WrapMode::None);
+
+    let add_message = ModalState::new(Modal::AddMessage {
+        task_id: "TASK-001".to_string(),
+    });
+    assert_eq!(add_message.description.wrap_mode(), WrapMode::None);
+}
+
+#[test]
+fn constrained_task_form_keeps_description_and_buttons_separate() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::Description);
+
+    let _ = render_at(&mut app, 60, 18);
+    let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
+    assert!((5..=10).contains(&description.height));
+    let save = modal_hitbox(&app, HitAction::ModalButton(ModalButton::Save));
+    let cancel = modal_hitbox(&app, HitAction::ModalButton(ModalButton::Cancel));
+    assert!(!overlaps(description, save));
+    assert!(!overlaps(description, cancel));
+    let _ = render_at(&mut app, 24, 8);
 }
 
 fn settings_app() -> (tempfile::TempDir, App) {
@@ -204,6 +305,21 @@ fn render_at(app: &mut App, width: u16, height: u16) -> String {
         buffer_to_string(buffer),
         style_runs(buffer)
     )
+}
+
+fn modal_hitbox(app: &App, action: HitAction) -> ratatui::layout::Rect {
+    app.hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == action)
+        .expect("modal hitbox")
+        .area
+}
+
+fn overlaps(left: ratatui::layout::Rect, right: ratatui::layout::Rect) -> bool {
+    left.x < right.x.saturating_add(right.width)
+        && right.x < left.x.saturating_add(left.width)
+        && left.y < right.y.saturating_add(right.height)
+        && right.y < left.y.saturating_add(left.height)
 }
 
 fn style_at(app: &mut App, width: u16, height: u16, x: u16, y: u16) -> Style {
@@ -594,8 +710,19 @@ fn settings_hotkey_navigates_fields_and_reloads_backend_defaults() {
 #[test]
 fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     let (_dir, mut app) = settings_app();
+    assert_eq!(app.settings.task_sort, "task_number");
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open settings");
+    assert_eq!(
+        app.modal
+            .as_ref()
+            .unwrap()
+            .task_sort_options
+            .iter()
+            .filter_map(|option| option.value.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["task_number", "updated_at_asc", "updated_at_desc"]
+    );
     {
         let modal = app.modal.as_mut().expect("settings modal");
         modal.title = TextArea::new(vec!["Renamed project".to_string()]);
@@ -611,12 +738,16 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     app.handle_key(key(KeyCode::Tab)).expect("agent");
     app.handle_key(key(KeyCode::Tab)).expect("theme");
     app.handle_key(key(KeyCode::Left)).expect("dark theme");
+    app.handle_key(key(KeyCode::Tab)).expect("task sorting");
+    app.handle_key(key(KeyCode::Right))
+        .expect("updated ascending sorting");
     app.handle_key(key(KeyCode::Tab)).expect("save");
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
 
     assert!(app.modal.is_none());
     assert_eq!(app.settings.project_name, "Renamed project");
     assert_eq!(app.settings.theme_name, "dark");
+    assert_eq!(app.settings.task_sort, "updated_at_asc");
     assert_eq!(app.theme.bg, Theme::named("dark").bg);
 
     let config = app.ops.config.load().expect("cached saved config");
@@ -627,6 +758,10 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     assert_eq!(
         config.tui.get("theme").and_then(|value| value.as_str()),
         Some("dark")
+    );
+    assert_eq!(
+        config.tui.get("task_sort").and_then(|value| value.as_str()),
+        Some("updated_at_asc")
     );
     assert_eq!(
         config
@@ -660,6 +795,65 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
             "{key} must be null"
         );
     }
+}
+
+#[test]
+fn updated_sort_setting_applies_both_directions_to_every_column() {
+    let (_dir, mut app) = settings_app();
+    let mut expected_by_column = Vec::new();
+    for status in ["todo", "in_progress", "review", "done"] {
+        let older = app
+            .ops
+            .create_task(NewTask::titled(format!("Older {status}")))
+            .unwrap();
+        let newer = app
+            .ops
+            .create_task(NewTask::titled(format!("Newer {status}")))
+            .unwrap();
+        if status != "todo" {
+            app.ops.move_task(&older.id, status, false).unwrap();
+            app.ops.move_task(&newer.id, status, false).unwrap();
+        }
+        let mut older_task = app.ops.get_task(&older.id).unwrap().unwrap();
+        older_task.updated_at = crate::core::timefmt::parse("2026-07-17T10:00:00").unwrap();
+        app.ops.storage.save_task(&older_task).unwrap();
+        let mut newer_task = app.ops.get_task(&newer.id).unwrap().unwrap();
+        newer_task.updated_at = crate::core::timefmt::parse("2026-07-18T10:00:00").unwrap();
+        app.ops.storage.save_task(&newer_task).unwrap();
+        expected_by_column.push((older.id, newer.id));
+    }
+
+    let mut config = app.ops.config.load_fresh().unwrap();
+    config.tui.insert(
+        serde_yaml_ng::Value::String("task_sort".to_string()),
+        serde_yaml_ng::Value::String("updated_at_asc".to_string()),
+    );
+    app.ops.config.save(&config).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    assert_eq!(app.board.columns.len(), expected_by_column.len());
+    for (column, (older, newer)) in app.board.columns.iter().zip(&expected_by_column) {
+        assert_eq!(column.tasks[0].id, *older);
+        assert_eq!(column.tasks[1].id, *newer);
+    }
+
+    config.tui.insert(
+        serde_yaml_ng::Value::String("task_sort".to_string()),
+        serde_yaml_ng::Value::String("updated_at_desc".to_string()),
+    );
+    app.ops.config.save(&config).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    for (column, (older, newer)) in app.board.columns.iter().zip(&expected_by_column) {
+        assert_eq!(column.tasks[0].id, *newer);
+        assert_eq!(column.tasks[1].id, *older);
+    }
+}
+
+#[test]
+fn legacy_completion_sort_maps_to_updated_descending() {
+    assert_eq!(
+        super::app::normalize_task_sort("completion_date"),
+        "updated_at_desc"
+    );
 }
 
 #[test]
@@ -978,6 +1172,120 @@ fn mouse_click_opens_card_detail_on_first_release() {
 }
 
 #[test]
+fn mouse_drag_selects_rendered_text_and_marks_it_for_copy() {
+    let (_dir, mut app) = app_with_board();
+    app.status = "select me".to_string();
+    let _ = render_at(&mut app, 96, 28);
+    let row = 27;
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: 1,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("start selection");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: 9,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("extend selection");
+
+    let selected_style = style_at(&mut app, 96, 28, 1, row);
+    assert!(selected_style.add_modifier.contains(Modifier::REVERSED));
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: 9,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("copy selection");
+    assert_eq!(app.take_pending_copy().as_deref(), Some("select me"));
+}
+
+#[test]
+fn selected_text_keeps_wide_unicode_cells_once() {
+    let (_dir, mut app) = app_with_board();
+    app.status = "界x".to_string();
+    let _ = render_at(&mut app, 96, 28);
+    let row = 27;
+
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Drag(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        app.handle_mouse(MouseEvent {
+            kind,
+            column: if matches!(kind, MouseEventKind::Down(_)) {
+                1
+            } else {
+                3
+            },
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("select unicode text");
+    }
+
+    assert_eq!(app.take_pending_copy().as_deref(), Some("界x"));
+}
+
+#[test]
+fn drag_selects_card_text_without_moving_or_opening_it() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let (column, card, area) = card_hits(&app)[0];
+    let task_id = app.visible_tasks_for_column(column)[card].id.clone();
+    let original_status = app.ops.get_task(&task_id).unwrap().unwrap().status;
+    let row = area.y + 1;
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 2,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("start card text selection");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: area.x + 8,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("select card text");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Up(MouseButton::Left),
+        column: area.x + 8,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("copy card text");
+
+    assert!(app.take_pending_copy().is_some());
+    assert_eq!(app.screen, Screen::Board);
+    assert!(app.dragging.is_none());
+    assert_eq!(
+        app.ops.get_task(&task_id).unwrap().unwrap().status,
+        original_status
+    );
+}
+
+#[test]
+fn copied_notice_restores_previous_status_after_three_seconds() {
+    let (_dir, mut app) = app_with_board();
+    app.status = "previous status".to_string();
+
+    app.finish_copy(Ok(()));
+    assert_eq!(app.status, "Copied selected text to clipboard");
+    app.finish_copy(Ok(()));
+    app.expire_copy_notice_at(Instant::now() + Duration::from_secs(4));
+    assert_eq!(app.status, "previous status");
+}
+
+#[test]
 fn mouse_move_highlights_board_cards() {
     let (_dir, mut app) = populated_app();
     let _ = render_snapshot(&mut app);
@@ -1209,6 +1517,46 @@ fn clicking_review_editor_focuses_it_and_highlights_panel() {
         focused.contains("Review edits [focused]"),
         "focused render should show review editor highlight title:\n{focused}"
     );
+}
+
+/// The thread wraps its lines, so a narrow terminal renders one logical line
+/// over several rows. End must still reach the thread's last row there.
+#[test]
+fn detail_thread_scrolls_to_last_line_in_a_narrow_terminal() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Wrapped thread"))
+        .unwrap();
+    let thread_manager = ThreadManager::new(dir.path()).unwrap();
+    let long_body = "wrapped body ".repeat(16);
+    for index in 0..12 {
+        thread_manager
+            .post(
+                &task.id,
+                crate::core::models::MessageRole::Agent,
+                crate::core::models::MessageKind::Context,
+                &format!("{long_body} marker{index}"),
+                None,
+                Vec::new(),
+                Some("agent".to_string()),
+            )
+            .unwrap();
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    for width in [40, 60, 96] {
+        app.detail.as_mut().unwrap().scroll = 0;
+        let _ = render_at(&mut app, width, 14);
+        app.handle_key(key(KeyCode::End)).unwrap();
+        let bottom = render_at(&mut app, width, 14);
+        assert!(
+            bottom.contains("marker11"),
+            "End must reach the thread's last line at width {width}:\n{bottom}"
+        );
+    }
 }
 
 #[test]

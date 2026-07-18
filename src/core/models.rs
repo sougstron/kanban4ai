@@ -209,6 +209,14 @@ pub struct Task {
     pub created_at: NaiveDateTime,
     #[serde(default = "timefmt::now", with = "timefmt::serde_naive")]
     pub updated_at: NaiveDateTime,
+    /// Most recent time work reached Review or Done. Re-running a reviewed
+    /// task preserves this value until the next completion replaces it.
+    #[serde(
+        default,
+        with = "timefmt::serde_naive_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub completed_at: Option<NaiveDateTime>,
     #[serde(default)]
     pub has_questions: bool,
     #[serde(default)]
@@ -256,6 +264,7 @@ impl Task {
             session: None,
             created_at: now,
             updated_at: now,
+            completed_at: None,
             has_questions: false,
             context_file: None,
             context_size: 0,

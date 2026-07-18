@@ -152,6 +152,49 @@ agents:
 }
 
 #[test]
+fn existing_agent_model_catalog_gets_new_defaults_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+agents:
+  claude:
+    models:
+    - sonnet
+    - opus
+    - haiku
+    - custom-model
+    extra_args: []
+"#,
+    );
+
+    let board = config.load().unwrap();
+    let claude = board.agents.get("claude").unwrap();
+    let models = claude
+        .get("models")
+        .and_then(|value| value.as_sequence())
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        models,
+        vec!["sonnet", "opus", "haiku", "custom-model", "fable"]
+    );
+    assert!(
+        claude
+            .get("extra_args")
+            .and_then(|value| value.as_sequence())
+            .unwrap()
+            .is_empty(),
+        "user-customized non-catalog sequences must not be merged"
+    );
+}
+
+#[test]
 fn custom_keys_survive_save_and_reload() {
     let dir = tempfile::tempdir().unwrap();
     let config = write_config(

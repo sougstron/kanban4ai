@@ -5,6 +5,41 @@ use std::process::Command;
 
 use crate::core::error::{KanbanError, Result};
 
+pub fn copy_text(text: &str) -> Result<()> {
+    let sequence = osc52_sequence(text);
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(sequence.as_bytes())?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn osc52_sequence(text: &str) -> String {
+    format!("\u{1b}]52;c;{}\u{1b}\\", base64(text.as_bytes()))
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        encoded.push(ALPHABET[usize::from(first >> 2)] as char);
+        encoded.push(ALPHABET[usize::from(((first & 0b11) << 4) | (second >> 4))] as char);
+        encoded.push(if chunk.len() > 1 {
+            ALPHABET[usize::from(((second & 0b1111) << 2) | (third >> 6))] as char
+        } else {
+            '='
+        });
+        encoded.push(if chunk.len() > 2 {
+            ALPHABET[usize::from(third & 0b11_1111)] as char
+        } else {
+            '='
+        });
+    }
+    encoded
+}
+
 pub fn paste_image_markdown(project_path: &Path) -> Result<String> {
     let bytes = clipboard_bytes()?;
     let image_bytes = if let Some(path) = clipboard_path(&bytes) {
@@ -113,7 +148,7 @@ fn stable_hash(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::sniff_extension;
+    use super::{osc52_sequence, sniff_extension};
 
     #[test]
     fn sniffs_common_image_types() {
@@ -122,5 +157,11 @@ mod tests {
         assert_eq!(sniff_extension(b"GIF89arest"), Some("gif"));
         assert_eq!(sniff_extension(b"RIFFxxxxWEBPrest"), Some("webp"));
         assert_eq!(sniff_extension(b"text"), None);
+    }
+
+    #[test]
+    fn osc52_encodes_utf8_text_for_the_clipboard() {
+        assert_eq!(osc52_sequence("foo"), "\u{1b}]52;c;Zm9v\u{1b}\\");
+        assert_eq!(osc52_sequence("✓"), "\u{1b}]52;c;4pyT\u{1b}\\");
     }
 }

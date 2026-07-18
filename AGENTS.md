@@ -56,7 +56,7 @@ tests/
 ```
 
 ### Data Model
-- **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, ai_model, ai_effort, agent_backend, agent_name, chained_to, review_edits, auto_resumes. `description` is the **user-authored task only** — agent work-context lives in the thread (see "Context, questions & review edits"). `interactive: true` enables the thread-based blocking question loop for delegated agents. `chained_to` is an optional target task id: when that target enters Review, this task auto-runs (see "Task Chaining"). `review_edits` is the single editable buffer for the human's review feedback; it is folded into the thread and cleared on the next re-run from Review. `auto_resumes` counts consecutive automatic relaunches after clean exits or expired waits and resets on human starts/recoveries.
+- **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, ai_model, ai_effort, agent_backend, agent_name, chained_to, review_edits, auto_resumes, completed_at. `description` is the **user-authored task only** — agent work-context lives in the thread (see "Context, questions & review edits"). `interactive: true` enables the thread-based blocking question loop for delegated agents. `chained_to` is an optional target task id: when that target enters Review, this task auto-runs (see "Task Chaining"). `review_edits` is the single editable buffer for the human's review feedback; it is folded into the thread and cleared on the next re-run from Review. `auto_resumes` counts consecutive automatic relaunches after clean exits or expired waits and resets on human starts/recoveries. `completed_at` records the most recent transition that completed work into Review or Done; a rerun keeps the previous value while active and replaces it when the agent completes again. `session` names the **last** session that worked the task, not only a running one: it survives the session's end (done, stop, recover, unarchive, failed launch) so the task keeps a record of who ran it, and is overwritten by the next session. Whether that session is alive is decided by its session record — never by this field being set. `agent_backend`/`ai_model`/`ai_effort`/`agent_name` are likewise a record of the last launch: each launch pins the value it resolved (the task's own field where set, the backend's configured default otherwise) onto the task.
 - **Session**: id, task_id, started_at, status (active/closed/crashed), last_seen, wait_until, wait_note, wait_exited. `wait_until`/`wait_note` are set by `kanban waiting`; `wait_exited` means the agent process ended during the declared wait and should be relaunched after the deadline.
 - **MessageRole** / **MessageKind** / **MessageStatus**: enums for thread message author, type, and lifecycle state. `MessageKind` is one of `system`, `task`, `question`, `suggestion`, `context`, or `review_edit`.
 - New tasks initialize their sidecar thread with `system` and `task` messages: `MSG-001` records creation metadata, `MSG-002` stores the initial user-authored task body so the TUI can render the whole conversation from the thread.
@@ -187,6 +187,9 @@ When `interactive: true`, delegated agents are instructed to use `kanban ask --w
 - `max_tasks_per_column`: 100 - cap rendered per column
 - `name`: project name shown in Project Settings
 - `theme`: theme name (quick-toggle/persist via `Ctrl+T`, or edit in Project Settings)
+- `task_sort`: `task_number` (default, ascending TASK id), `updated_at_asc`
+  (least recently modified first), or `updated_at_desc` (most recently modified
+  first). Legacy `completion_date` values are read as `updated_at_desc`.
 
 ### Notification Settings (.kanban/config.yaml `notifications:`)
 - `enabled`: true - master switch for desktop notifications
@@ -321,7 +324,7 @@ A task may carry a `chained_to` target task id. When the **target** task enters 
 ### Backup & Revert
 - Delegated agents are told to copy each existing file they touch into `.kanban/backups/<task_id>/` preserving its repo-relative path.
 - Revert spawns a second agent job whose prompt restores every file under that backup dir. Requires existing backups.
-- Completing/abandoning a task clears its backups, logs, and session files.
+- Completing/abandoning a task clears its backups, logs, and session files. The task's `session` field still keeps the id of the session that did the work, even though that session's files are gone.
 
 ### Image Attachments
 Paste an image from the clipboard (`wl-paste`/`xclip`, or a file path in clipboard text), sniff the type by magic bytes (png/jpg/gif/webp), write it atomically under `.kanban/assets/images/`, and embed Markdown (`![pasted image](...)`) in the task description.

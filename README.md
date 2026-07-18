@@ -148,7 +148,8 @@ question, `y` to approve Review → Done, `t` to attach to the task's agent,
 archived tasks, `l` to view running sessions, `/` to search, `?` for help, and
 press `Ctrl+C` twice within 3 seconds to quit. Press `s` on the board or task
 detail to open Project Settings, where you can edit the project name, default
-backend, that backend's default model/effort/persona, and theme; the Board
+backend, that backend's default model/effort/persona, theme, and task sorting
+(task number or modification date, oldest or newest first); the Board
 status-bar hint is clickable when
 it fits. `Ctrl+T` remains the quick theme toggle. All action keys work from
 the board and from the detail view, which also offers clickable action buttons

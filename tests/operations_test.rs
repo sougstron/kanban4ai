@@ -7,7 +7,7 @@ use kanban4ai::core::context::ContextManager;
 use kanban4ai::core::error::KanbanError;
 use kanban4ai::core::models::{MessageKind, MessageRole, MessageStatus, Task, TaskStatus};
 use kanban4ai::core::operations::{
-    AgentExitOutcome, AgentLauncher, NoopLauncher, Operations, QuestionRef, TaskPatch,
+    AgentExitOutcome, AgentLauncher, NoopLauncher, Operations, QuestionRef, TaskPatch, sort_tasks,
 };
 use kanban4ai::core::session::{SessionManager, SessionState};
 use kanban4ai::core::storage::NewTask;
@@ -122,7 +122,8 @@ fn failed_agent_launch_rolls_back_take_assignment() {
 
     let stored = ops.get_task(&task.id).unwrap().unwrap();
     assert_eq!(stored.status, TaskStatus::Todo);
-    assert_eq!(stored.session, None);
+    // The status rolls back; the crashed session stays as the last one tried.
+    assert_eq!(stored.session.as_deref(), Some("ses-fail"));
     assert!(!SessionManager::new(dir.path()).is_session_active("ses-fail"));
 }
 
@@ -139,7 +140,7 @@ fn failed_review_rerun_rolls_back_to_review_without_live_session() {
 
     let stored = ops.get_task(&task.id).unwrap().unwrap();
     assert_eq!(stored.status, TaskStatus::Review);
-    assert_eq!(stored.session, None);
+    assert!(stored.session.is_some());
     assert!(stored.review_edits.is_empty());
     let thread = ThreadManager::new(dir.path())
         .unwrap()
@@ -308,7 +309,7 @@ fn move_to_invalid_status_lists_valid_ones() {
 }
 
 #[test]
-fn recover_task_moves_to_todo_and_clears_session() {
+fn recover_task_moves_to_todo_and_keeps_last_session() {
     let (_dir, ops, _recorder) = ops_with_recorder(false);
     let task = ops.create_task(NewTask::titled("Recover me")).unwrap();
     ops.take_task(&task.id, "ses-stale", false)
@@ -317,7 +318,9 @@ fn recover_task_moves_to_todo_and_clears_session() {
 
     let recovered = ops.recover_task(&task.id).unwrap().unwrap();
     assert_eq!(recovered.status, TaskStatus::Todo);
-    assert_eq!(recovered.session, None);
+    // The stale session is no longer running, but it stays on the task as the
+    // record of the last session that worked it.
+    assert_eq!(recovered.session.as_deref(), Some("ses-stale"));
     assert!(ops.recover_task("TASK-999").unwrap().is_none());
 }
 
@@ -340,7 +343,8 @@ fn agent_done_requires_context_then_moves_to_review() {
         .unwrap()
         .unwrap();
     assert_eq!(reviewed.status, TaskStatus::Review);
-    assert_eq!(reviewed.session, None);
+    assert!(reviewed.completed_at.is_some());
+    assert_eq!(reviewed.session.as_deref(), Some("ses-flow"));
     assert!(!SessionManager::new(dir.path()).is_session_active("ses-flow"));
 
     // a second agent done from Review is refused
@@ -349,6 +353,145 @@ fn agent_done_requires_context_then_moves_to_review() {
             .unwrap()
             .is_none()
     );
+}
+
+#[test]
+fn completion_sort_is_latest_first_and_keeps_unfinished_tasks_last() {
+    let (_dir, ops, _recorder) = ops_with_recorder(false);
+    let first = ops.create_task(NewTask::titled("First")).unwrap();
+    let second = ops.create_task(NewTask::titled("Second")).unwrap();
+    let third = ops.create_task(NewTask::titled("Third")).unwrap();
+
+    let mut first = ops.get_task(&first.id).unwrap().unwrap();
+    first.completed_at = Some(timefmt::parse("2026-07-17T10:00:00").unwrap());
+    ops.storage.save_task(&first).unwrap();
+    let mut second = ops.get_task(&second.id).unwrap().unwrap();
+    second.completed_at = Some(timefmt::parse("2026-07-18T10:00:00").unwrap());
+    ops.storage.save_task(&second).unwrap();
+
+    let by_completion = ops.list_tasks(None, None, "completed", "desc").unwrap();
+    assert_eq!(
+        by_completion
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![second.id.as_str(), first.id.as_str(), third.id.as_str()]
+    );
+
+    let by_number = ops.list_tasks(None, None, "id", "asc").unwrap();
+    assert_eq!(
+        by_number
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![first.id.as_str(), second.id.as_str(), third.id.as_str()]
+    );
+}
+
+#[test]
+fn task_number_sort_is_numeric_past_the_zero_padding_boundary() {
+    let mut tasks = vec![
+        Task::new("TASK-1000", "Thousand"),
+        Task::new("TASK-999", "Nine hundred ninety-nine"),
+    ];
+
+    sort_tasks(&mut tasks, "id", "asc");
+
+    assert_eq!(tasks[0].id, "TASK-999");
+    assert_eq!(tasks[1].id, "TASK-1000");
+}
+
+#[test]
+fn updated_sort_supports_both_directions_with_stable_id_ties() {
+    let mut oldest = Task::new("TASK-003", "Oldest");
+    oldest.updated_at = timefmt::parse("2026-07-17T10:00:00").unwrap();
+    let mut tied_first = Task::new("TASK-001", "First tied task");
+    tied_first.updated_at = timefmt::parse("2026-07-18T10:00:00").unwrap();
+    let mut tied_second = Task::new("TASK-002", "Second tied task");
+    tied_second.updated_at = tied_first.updated_at;
+    let mut tasks = vec![tied_second, oldest, tied_first];
+
+    sort_tasks(&mut tasks, "updated", "asc");
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["TASK-003", "TASK-001", "TASK-002"]
+    );
+
+    sort_tasks(&mut tasks, "updated", "desc");
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["TASK-001", "TASK-002", "TASK-003"]
+    );
+}
+
+#[test]
+fn repeated_done_without_a_transition_preserves_completion_timestamp() {
+    let (_dir, ops, _recorder) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Already done")).unwrap();
+    ops.move_task(&task.id, "done", false).unwrap();
+
+    let original_completion = timefmt::parse("2020-01-01T00:00:00").unwrap();
+    let mut done = ops.get_task(&task.id).unwrap().unwrap();
+    done.completed_at = Some(original_completion);
+    ops.storage.save_task(&done).unwrap();
+
+    let repeated = ops.move_task(&task.id, "done", false).unwrap().unwrap();
+    assert_eq!(repeated.status, TaskStatus::Done);
+    assert_eq!(repeated.completed_at, Some(original_completion));
+}
+
+#[test]
+fn rerun_completion_replaces_the_previous_completion_timestamp() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Complete twice")).unwrap();
+    assert!(task.completed_at.is_none());
+    let todo_path = dir
+        .path()
+        .join(".kanban/tasks/todo")
+        .join(format!("{}.md", task.id));
+    assert!(
+        !fs::read_to_string(todo_path)
+            .unwrap()
+            .contains("completed_at:")
+    );
+
+    ops.take_task(&task.id, "ses-first", true).unwrap();
+    ContextManager::new(dir.path())
+        .append_context(&task.id, "first pass", "agent", &ops.storage)
+        .unwrap();
+    let first_completion = ops
+        .complete_task(&task.id, "ses-first", true)
+        .unwrap()
+        .unwrap();
+    assert!(first_completion.completed_at.is_some());
+
+    let rerun = ops
+        .rerun_review_task(&task.id, Some("ses-rerun"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(rerun.completed_at, first_completion.completed_at);
+
+    let old = timefmt::parse("2020-01-01T00:00:00").unwrap();
+    let mut stored = ops.get_task(&task.id).unwrap().unwrap();
+    stored.completed_at = Some(old);
+    ops.storage.save_task(&stored).unwrap();
+    let second_completion = ops
+        .complete_task(&task.id, "ses-rerun", true)
+        .unwrap()
+        .unwrap();
+    assert!(second_completion.completed_at.unwrap() > old);
+    let review_path = dir
+        .path()
+        .join(".kanban/tasks/review")
+        .join(format!("{}.md", task.id));
+    let raw = fs::read_to_string(review_path).unwrap();
+    assert!(raw.contains("completed_at: '"));
 }
 
 #[test]
@@ -365,7 +508,9 @@ fn human_done_completes_and_cleans_artifacts() {
         .unwrap()
         .unwrap();
     assert_eq!(done.status, TaskStatus::Done);
-    assert_eq!(done.session, None);
+    // The session's files go, but the task keeps naming the session that did
+    // the work.
+    assert_eq!(done.session.as_deref(), Some("ses-clean"));
     // context cleared with the move to done
     let context = ContextManager::new(dir.path())
         .get_context(&task.id, &ops.storage)
@@ -500,7 +645,13 @@ fn failed_interactive_resume_preserves_concurrent_status_change() {
 
     let stored = ops.get_task(&task.id).unwrap().unwrap();
     assert_eq!(stored.status, TaskStatus::Review);
-    assert_eq!(stored.session, None);
+    assert!(stored.session.is_some());
+    assert!(
+        SessionManager::new(dir.path())
+            .list_active_sessions()
+            .is_empty(),
+        "the resume session crashed and must not be left running"
+    );
 }
 
 #[test]
@@ -1312,7 +1463,7 @@ fn start_task_launch_failure_surfaces_error_and_rolls_back() {
     ));
     let stored = ops.get_task(&task.id).unwrap().unwrap();
     assert_eq!(stored.status, TaskStatus::Todo);
-    assert_eq!(stored.session, None);
+    assert!(stored.session.is_some());
 }
 
 #[test]
@@ -1339,13 +1490,17 @@ fn launch_revert_persists_session_name() {
 }
 
 #[test]
-fn stop_session_closes_session_and_detaches_task() {
+fn stop_session_closes_session_and_keeps_it_on_the_task() {
     let (dir, ops, _recorder) = ops_with_recorder(true);
     let task = ops.create_task(NewTask::titled("Stop me")).unwrap();
     ops.take_task(&task.id, "ses-stop", true).unwrap().unwrap();
 
     let stopped = ops.stop_session("ses-stop").unwrap().unwrap();
-    assert_eq!(stopped.session, None);
+    assert_eq!(
+        stopped.session.as_deref(),
+        Some("ses-stop"),
+        "a stopped session stays on the task as its last session"
+    );
     assert_eq!(
         stopped.status,
         TaskStatus::InProgress,

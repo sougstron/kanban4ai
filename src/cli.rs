@@ -702,7 +702,14 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 eprintln!("Task {task_id} not found");
                 return Ok(ExitCode::FAILURE);
             };
-            let Some(session_id) = task.session.as_deref() else {
+            // A task keeps its last session id after that session ends, so
+            // presence alone does not mean there is anything to attach to.
+            let session_mgr = SessionManager::new(".");
+            let Some(session_id) = task
+                .session
+                .as_deref()
+                .filter(|session_id| session_mgr.is_session_active(session_id))
+            else {
                 eprintln!("Task {task_id} has no active session");
                 return Ok(ExitCode::FAILURE);
             };

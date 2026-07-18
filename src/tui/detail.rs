@@ -87,8 +87,15 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     // Thread panel with a clamped scroll and a scrollbar.
     let thread_lines = thread_lines(&app.detail.as_ref().unwrap().messages, &theme);
-    // Approximation: logical lines; wrapped lines may add a little slack.
-    let content_height = thread_lines.len() as u16;
+    let thread = Paragraph::new(thread_lines)
+        .style(Style::default().bg(theme.bg).fg(theme.fg))
+        .wrap(Wrap { trim: false });
+    // Measure the rows the wrap actually produces at this width: a logical line
+    // spans several rows in a narrow terminal, and counting logical lines would
+    // stop the scroll short of the thread's last row. The block is attached
+    // after measuring so `line_count` sees the inner width only.
+    let inner_width = chunks[1].width.saturating_sub(2);
+    let content_height = u16::try_from(thread.line_count(inner_width)).unwrap_or(u16::MAX);
     let visible_height = chunks[1].height.saturating_sub(2);
     let max_scroll = content_height.saturating_sub(visible_height);
     let scroll = {
@@ -102,7 +109,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         action: HitAction::DetailThread,
     });
     frame.render_widget(
-        Paragraph::new(thread_lines)
+        thread
             .block(
                 Block::default()
                     .title(" Thread ")
@@ -113,8 +120,6 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                         theme.border
                     })),
             )
-            .style(Style::default().bg(theme.bg).fg(theme.fg))
-            .wrap(Wrap { trim: false })
             .scroll((scroll, 0)),
         chunks[1],
     );

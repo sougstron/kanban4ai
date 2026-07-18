@@ -4,12 +4,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
+use ratatui_textarea::TextArea;
 use serde_yaml_ng::{Mapping, Value};
-use tui_textarea::TextArea;
+use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{
     cached_opencode_catalog, recent_models, sort_opencode_models, warm_opencode_catalog,
@@ -36,6 +39,12 @@ use super::theme::Theme;
 
 const CTRL_C_EXIT_PROMPT: &str = "Press ctrl + C again to close";
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(3);
+const COPY_NOTICE: &str = "Copied selected text to clipboard";
+const COPY_NOTICE_WINDOW: Duration = Duration::from_secs(3);
+const TASK_SORT_NUMBER: &str = "task_number";
+const TASK_SORT_UPDATED_ASC: &str = "updated_at_asc";
+const TASK_SORT_UPDATED_DESC: &str = "updated_at_desc";
+const TASK_SORT_LEGACY_COMPLETION: &str = "completion_date";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -54,6 +63,7 @@ pub struct TuiSettings {
     pub max_tasks_per_column: usize,
     pub refresh_interval: Duration,
     pub theme_name: String,
+    pub task_sort: String,
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +261,11 @@ pub struct App {
     pub hitboxes: Vec<Hitbox>,
     hovered: Option<HitAction>,
     pub dragging: Option<DragState>,
+    rendered_screen: RenderedScreen,
+    text_selection: Option<TextSelection>,
+    pending_copy: Option<String>,
+    copy_notice_deadline: Option<Instant>,
+    status_before_copy: Option<String>,
     pub log_view: Option<LogViewState>,
     /// Where closing the detail screen returns to (Sessions `o`, Archive
     /// Enter); reset to Board once consumed.
@@ -275,6 +290,126 @@ pub struct DragState {
     pub card: usize,
     pub target_column: Option<usize>,
     pub moved: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct RenderedScreen {
+    area: Rect,
+    cells: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextSelection {
+    anchor: (u16, u16),
+    head: (u16, u16),
+    dragged: bool,
+}
+
+impl RenderedScreen {
+    fn capture(&mut self, buffer: &Buffer) {
+        self.area = buffer.area;
+        self.cells.clear();
+        self.cells
+            .reserve(usize::from(self.area.width).saturating_mul(usize::from(self.area.height)));
+        for y in self.area.y..self.area.y.saturating_add(self.area.height) {
+            for x in self.area.x..self.area.x.saturating_add(self.area.width) {
+                self.cells.push(
+                    buffer
+                        .cell((x, y))
+                        .map(|cell| cell.symbol().to_string())
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
+
+    fn contains(&self, x: u16, y: u16) -> bool {
+        contains(self.area, x, y)
+    }
+
+    fn clamp(&self, x: u16, y: u16) -> (u16, u16) {
+        let right = self
+            .area
+            .x
+            .saturating_add(self.area.width.saturating_sub(1));
+        let bottom = self
+            .area
+            .y
+            .saturating_add(self.area.height.saturating_sub(1));
+        (x.clamp(self.area.x, right), y.clamp(self.area.y, bottom))
+    }
+
+    fn positions(&self, selection: TextSelection) -> Vec<(u16, u16)> {
+        if self.area.is_empty() {
+            return Vec::new();
+        }
+        let (start, end) = ordered_points(
+            self.clamp(selection.anchor.0, selection.anchor.1),
+            self.clamp(selection.head.0, selection.head.1),
+        );
+        let left = self.area.x;
+        let right = self
+            .area
+            .x
+            .saturating_add(self.area.width.saturating_sub(1));
+        let mut positions = Vec::new();
+        for y in start.1..=end.1 {
+            let row_start = if y == start.1 { start.0 } else { left };
+            let row_end = if y == end.1 { end.0 } else { right };
+            positions.extend((row_start..=row_end).map(|x| (x, y)));
+        }
+        positions
+    }
+
+    fn selected_text(&self, selection: TextSelection) -> String {
+        let mut lines = Vec::new();
+        let mut current_y = None;
+        let mut line = String::new();
+        let mut skip_cells = 0usize;
+        for (x, y) in self.positions(selection) {
+            if current_y != Some(y) {
+                if current_y.is_some() {
+                    lines.push(line.trim_end().to_string());
+                    line.clear();
+                }
+                current_y = Some(y);
+                skip_cells = 0;
+            }
+            if skip_cells > 0 {
+                skip_cells -= 1;
+                continue;
+            }
+            let Some(symbol) = self.cell(x, y) else {
+                continue;
+            };
+            line.push_str(symbol);
+            skip_cells = UnicodeWidthStr::width(symbol).saturating_sub(1);
+        }
+        if current_y.is_some() {
+            lines.push(line.trim_end().to_string());
+        }
+        lines.join("\n").trim_matches('\n').to_string()
+    }
+
+    fn cell(&self, x: u16, y: u16) -> Option<&str> {
+        if !self.contains(x, y) {
+            return None;
+        }
+        let row = usize::from(y.saturating_sub(self.area.y));
+        let column = usize::from(x.saturating_sub(self.area.x));
+        let index = row
+            .checked_mul(usize::from(self.area.width))?
+            .checked_add(column)?;
+        self.cells.get(index).map(String::as_str)
+    }
+}
+
+fn ordered_points(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    }
 }
 
 impl App {
@@ -322,6 +457,11 @@ impl App {
             hitboxes: Vec::new(),
             hovered: None,
             dragging: None,
+            rendered_screen: RenderedScreen::default(),
+            text_selection: None,
+            pending_copy: None,
+            copy_notice_deadline: None,
+            status_before_copy: None,
             log_view: None,
             return_screen: Screen::Board,
             help_scroll: 0,
@@ -748,6 +888,9 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        if self.handle_text_selection(mouse) {
+            return Ok(());
+        }
         if self.modal.is_some() {
             match mouse.kind {
                 MouseEventKind::Moved => self.update_hover(mouse.column, mouse.row),
@@ -784,6 +927,109 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_text_selection(&mut self, mouse: MouseEvent) -> bool {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if self.can_start_text_selection(
+                    mouse.column,
+                    mouse.row,
+                    mouse.modifiers.contains(KeyModifiers::SHIFT),
+                ) =>
+            {
+                self.text_selection = Some(TextSelection {
+                    anchor: (mouse.column, mouse.row),
+                    head: (mouse.column, mouse.row),
+                    dragged: false,
+                });
+                // Shift explicitly chooses text selection over an otherwise
+                // interactive region such as a card or button.
+                mouse.modifiers.contains(KeyModifiers::SHIFT)
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.text_selection.is_some() => {
+                let crossing_card_columns = !mouse.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.dragging.as_ref().is_some_and(|dragging| {
+                        self.column_at(mouse.column, mouse.row)
+                            .is_some_and(|column| column != dragging.from_column)
+                    });
+                if crossing_card_columns {
+                    self.text_selection = None;
+                    return false;
+                }
+                if let Some(selection) = self.text_selection.as_mut() {
+                    selection.head = self.rendered_screen.clamp(mouse.column, mouse.row);
+                    selection.dragged = selection.head != selection.anchor;
+                }
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.text_selection.is_some() => {
+                let selection = self.text_selection.take().expect("selection checked above");
+                if selection.dragged {
+                    self.dragging = None;
+                    let text = self.rendered_screen.selected_text(selection);
+                    if !text.is_empty() {
+                        self.pending_copy = Some(text);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn can_start_text_selection(&self, x: u16, y: u16, shift: bool) -> bool {
+        if !self.rendered_screen.contains(x, y) {
+            return false;
+        }
+        match self.hit_at(x, y) {
+            Some(HitAction::FocusCard { .. }) => true,
+            Some(
+                HitAction::OpenAnswer { .. }
+                | HitAction::Action(_)
+                | HitAction::ModalField(_)
+                | HitAction::ModalOption { .. }
+                | HitAction::ModalButton(_)
+                | HitAction::DetailAnswerOption { .. }
+                | HitAction::DetailEdits,
+            ) => shift,
+            Some(HitAction::ColumnFocus(_) | HitAction::DetailThread) | None => true,
+        }
+    }
+
+    pub(crate) fn capture_and_highlight(&mut self, buffer: &mut Buffer) {
+        self.rendered_screen.capture(buffer);
+        let Some(selection) = self.text_selection.filter(|selection| selection.dragged) else {
+            return;
+        };
+        for (x, y) in self.rendered_screen.positions(selection) {
+            if let Some(cell) = buffer.cell_mut((x, y)) {
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
+
+    pub(crate) fn take_pending_copy(&mut self) -> Option<String> {
+        self.pending_copy.take()
+    }
+
+    pub(crate) fn finish_copy(&mut self, result: Result<()>) {
+        match result {
+            Ok(()) => {
+                if self.copy_notice_deadline.is_none() || self.status != COPY_NOTICE {
+                    self.status_before_copy = Some(std::mem::take(&mut self.status));
+                }
+                self.status = COPY_NOTICE.to_string();
+                self.copy_notice_deadline = Some(Instant::now() + COPY_NOTICE_WINDOW);
+            }
+            Err(err) => {
+                self.status = format!("Could not copy selected text: {err}");
+                self.copy_notice_deadline = None;
+                self.status_before_copy = None;
+            }
+        }
     }
 
     pub fn is_hovered(&self, action: HitAction) -> bool {
@@ -1092,6 +1338,7 @@ impl App {
         self.refresh_modal_after_opencode_catalog_warm();
         let now = Instant::now();
         self.expire_ctrl_c_prompt_at(now);
+        self.expire_copy_notice_at(now);
         self.expire_session_states_at(timefmt::now());
         self.resume_expired_waits_throttled();
         // Log writes bypass the fs watcher (it only covers board dirs), so
@@ -1138,6 +1385,20 @@ impl App {
         self.ctrl_c_exit_deadline = None;
         if self.status == CTRL_C_EXIT_PROMPT {
             self.status.clear();
+        }
+    }
+
+    pub(crate) fn expire_copy_notice_at(&mut self, now: Instant) {
+        let Some(deadline) = self.copy_notice_deadline else {
+            return;
+        };
+        if now <= deadline {
+            return;
+        }
+        self.copy_notice_deadline = None;
+        let previous = self.status_before_copy.take().unwrap_or_default();
+        if self.status == COPY_NOTICE {
+            self.status = previous;
         }
     }
 
@@ -1720,6 +1981,10 @@ impl App {
         modal.theme = TextArea::new(vec![
             Theme::normalize_name(&tui_string(&config.tui, "theme", "dark")).to_string(),
         ]);
+        modal.task_sort = TextArea::new(vec![
+            normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
+                .to_string(),
+        ]);
         self.populate_settings_form_options(&mut modal);
         modal.capture_initial_values();
         self.modal = Some(modal);
@@ -1839,6 +2104,20 @@ impl App {
                 value: Some("light".to_string()),
             },
         ]);
+        modal.set_task_sort_options(vec![
+            SelectOption {
+                label: "Task number".to_string(),
+                value: Some(TASK_SORT_NUMBER.to_string()),
+            },
+            SelectOption {
+                label: "Updated (oldest first)".to_string(),
+                value: Some(TASK_SORT_UPDATED_ASC.to_string()),
+            },
+            SelectOption {
+                label: "Updated (newest first)".to_string(),
+                value: Some(TASK_SORT_UPDATED_DESC.to_string()),
+            },
+        ]);
         self.refresh_backend_options_with_config(modal, &config);
     }
 
@@ -1912,7 +2191,14 @@ impl App {
             self.status = "No task selected".to_string();
             return;
         };
-        match task.session.as_deref() {
+        // The session id outlives the session it names, so only an active one
+        // can be attached to.
+        let session_mgr = SessionManager::new(&self.project_path);
+        match task
+            .session
+            .as_deref()
+            .filter(|session_id| session_mgr.is_session_active(session_id))
+        {
             Some(session_id) => {
                 self.pending_attach = Some(session_id.to_string());
                 self.status = format!("Attaching to {session_id}");
@@ -2500,6 +2786,12 @@ impl App {
                 }
                 let theme_name =
                     Theme::normalize_name(&modal.theme_text().unwrap_or_default()).to_string();
+                let task_sort = normalize_task_sort(
+                    &modal
+                        .task_sort_text()
+                        .unwrap_or_else(|| TASK_SORT_NUMBER.to_string()),
+                )
+                .to_string();
                 let save_result = (|| -> Result<()> {
                     ensure_config_write_target_is_safe(&self.ops.config)?;
                     let _lock = self.ops.storage.lock()?;
@@ -2519,6 +2811,10 @@ impl App {
                     config.tui.insert(
                         Value::String("theme".to_string()),
                         Value::String(theme_name.clone()),
+                    );
+                    config.tui.insert(
+                        Value::String("task_sort".to_string()),
+                        Value::String(task_sort.clone()),
                     );
                     config.auto_launch.insert(
                         Value::String("default_agent".to_string()),
@@ -2549,7 +2845,9 @@ impl App {
                 }
                 self.settings.project_name = project_name;
                 self.settings.theme_name = theme_name.clone();
+                self.settings.task_sort = task_sort;
                 self.theme = Theme::named(&theme_name);
+                self.refresh_after_action()?;
                 self.status = "Project settings saved".to_string();
             }
             Modal::NewTask { target_status } => {
@@ -2758,7 +3056,14 @@ impl BoardSnapshot {
             .iter()
             .map(|id| (id.clone(), Vec::new()))
             .collect::<BTreeMap<_, _>>();
-        let tasks = ops.list_tasks(None, None, "created", "asc")?;
+        let task_sort =
+            normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER));
+        let (sort_by, order) = match task_sort {
+            TASK_SORT_UPDATED_ASC => ("updated", "asc"),
+            TASK_SORT_UPDATED_DESC => ("updated", "desc"),
+            _ => ("id", "asc"),
+        };
+        let tasks = ops.list_tasks(None, None, sort_by, order)?;
         let heartbeat_timeout = ops.config.get_threshold("session_heartbeat_timeout")?;
         let sessions_by_id = SessionManager::new(&ops.storage.project_path)
             .list_sessions_with_state(heartbeat_timeout)
@@ -3094,6 +3399,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::Effort => Some(modal.effort_selected),
         DialogField::Agent => Some(modal.agent_selected),
         DialogField::Theme => Some(modal.theme_selected),
+        DialogField::TaskSort => Some(modal.task_sort_selected),
         DialogField::ChainTo => Some(modal.chain_selected),
         DialogField::TargetStatus => Some(modal.status_selected),
         DialogField::MessageKind => Some(modal.kind_selected),
@@ -3174,7 +3480,17 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
             ops.config.get_threshold("tui_refresh_interval")?.max(1) as u64,
         ),
         theme_name: Theme::normalize_name(&tui_string(&config.tui, "theme", "dark")).to_string(),
+        task_sort: normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
+            .to_string(),
     })
+}
+
+pub(super) fn normalize_task_sort(value: &str) -> &'static str {
+    match value {
+        TASK_SORT_UPDATED_ASC => TASK_SORT_UPDATED_ASC,
+        TASK_SORT_UPDATED_DESC | TASK_SORT_LEGACY_COMPLETION => TASK_SORT_UPDATED_DESC,
+        _ => TASK_SORT_NUMBER,
+    }
 }
 
 fn tui_int(map: &Mapping, key: &str, default: i64) -> i64 {

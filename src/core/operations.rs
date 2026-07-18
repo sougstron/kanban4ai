@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
-use crate::agent::KanbanLauncher;
+use crate::agent::{KanbanLauncher, resolve_launch_settings};
 use crate::core::config::Config;
 use crate::core::context::{ContextManager, role_for_source};
 use crate::core::error::{KanbanError, Result};
@@ -196,7 +196,14 @@ impl Operations {
             task.description = description;
         }
         if let Some(status) = patch.status {
-            task.status = status.parse()?;
+            let previous_status = task.status;
+            let next_status = status.parse()?;
+            task.status = next_status;
+            if previous_status != next_status
+                && matches!(next_status, TaskStatus::Review | TaskStatus::Done)
+            {
+                task.completed_at = Some(timefmt::now());
+            }
         }
         if let Some(ai_model) = patch.ai_model {
             task.ai_model = ai_model;
@@ -302,15 +309,16 @@ impl Operations {
         )
     }
 
-    /// Recover a task to To Do and clear its stale session as one locked
-    /// read-modify-write cycle. Used by both CLI and TUI.
+    /// Recover a task to To Do as one locked read-modify-write cycle. Used by
+    /// both CLI and TUI. The stale session id stays on the task as the record
+    /// of its last session; liveness is decided by the session record, not by
+    /// this field being set.
     pub fn recover_task(&self, task_id: &str) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(None);
         };
         task.status = TaskStatus::Todo;
-        task.session = None;
         task.auto_resumes = 0;
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
@@ -328,7 +336,6 @@ impl Operations {
             return Ok(None);
         }
         task.status = TaskStatus::Todo;
-        task.session = None;
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         Ok(Some(task))
@@ -376,7 +383,7 @@ impl Operations {
             }
 
             if target_status == TaskStatus::Done.as_str() {
-                let done = self.move_task_to_done(&task, false)?;
+                let done = self.move_task_to_done(&task)?;
                 (done, false)
             } else {
                 let moved = self.storage.move_task(task_id, target_status)?;
@@ -441,7 +448,7 @@ impl Operations {
         let mut moved = Vec::new();
         for task in tasks {
             let result = if to == TaskStatus::Done {
-                self.move_task_to_done(&task, false)?
+                self.move_task_to_done(&task)?
             } else {
                 self.storage.move_task(&task.id, to.as_str())?
             };
@@ -468,8 +475,10 @@ impl Operations {
     }
 
     /// Clear per-task artifacts and move the task to Done. Callers may already
-    /// hold the board lock — the lock is reentrant per thread.
-    fn move_task_to_done(&self, task: &Task, clear_session: bool) -> Result<Option<Task>> {
+    /// hold the board lock — the lock is reentrant per thread. The session id
+    /// stays on the task even though the session's files are gone: it is the
+    /// record of which session last worked the task.
+    fn move_task_to_done(&self, task: &Task) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
         self.clear_task_assets(task);
         self.context_manager()
@@ -480,11 +489,13 @@ impl Operations {
         let Some(mut current) = self.storage.load_task(&task.id)? else {
             return Ok(None);
         };
+        let entered_done = current.status != TaskStatus::Done;
         current.status = TaskStatus::Done;
-        if clear_session {
-            current.session = None;
+        let now = timefmt::now();
+        current.updated_at = now;
+        if entered_done {
+            current.completed_at = Some(now);
         }
-        current.updated_at = timefmt::now();
         self.storage.save_task(&current)?;
         Ok(Some(current))
     }
@@ -499,13 +510,12 @@ impl Operations {
     ) -> Result<Option<Task>> {
         let session_mgr = self.session_manager();
         SessionManager::validate_session_id(session_id)?;
-        let (task, previous_status, previous_session) = {
+        let (task, previous_status) = {
             let _guard = self.storage.lock()?;
             let Some(mut task) = self.storage.load_task(task_id)? else {
                 return Ok(None);
             };
             let previous_status = task.status;
-            let previous_session = task.session.clone();
 
             if is_agent
                 && self.config.get_rule("one_task_per_instance")?
@@ -525,7 +535,7 @@ impl Operations {
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
             session_mgr.link_named_session(task_id, session_id, &task.title)?;
-            (task, previous_status, previous_session)
+            (task, previous_status)
         };
 
         if is_agent
@@ -533,11 +543,12 @@ impl Operations {
             && self.auto_launch_enabled()?
             && !self.launch_agent(task_id, session_id, false)?
         {
+            // The status rolls back, but the crashed session stays on the task:
+            // it is the last session that was assigned to it.
             session_mgr.crash_session(session_id)?;
             let _guard = self.storage.lock()?;
             if let Some(mut current) = self.storage.load_task(task_id)? {
                 current.status = previous_status;
-                current.session = previous_session;
                 current.updated_at = timefmt::now();
                 self.storage.save_task(&current)?;
             }
@@ -576,11 +587,12 @@ impl Operations {
         Ok(Some(session_id))
     }
 
-    /// Stop a running agent session: kill its tmux host when present, mark the
-    /// session closed, and detach it from its task. Background (non-tmux)
-    /// agent processes cannot be signalled — their session record is still
-    /// closed so the board stops treating the task as running. The task keeps
-    /// its current status; recover or rerun decide what happens next.
+    /// Stop a running agent session: kill its tmux host when present and mark
+    /// the session closed. Background (non-tmux) agent processes cannot be
+    /// signalled — their session record is still closed so the board stops
+    /// treating the task as running. The task keeps its current status and its
+    /// session id (now the last session that worked it); recover or rerun
+    /// decide what happens next.
     pub fn stop_session(&self, session_id: &str) -> Result<Option<Task>> {
         let session_mgr = self.session_manager();
         let Some(session) = session_mgr.load_session(session_id) else {
@@ -588,17 +600,11 @@ impl Operations {
         };
         let _ = crate::agent::kill_session(session_id);
         session_mgr.close_session(session_id)?;
-        let task = {
+        let Some(task) = ({
             let _guard = self.storage.lock()?;
-            let Some(mut task) = self.storage.load_task(&session.task_id)? else {
-                return Ok(None);
-            };
-            if task.session.as_deref() == Some(session_id) {
-                task.session = None;
-                task.updated_at = timefmt::now();
-                self.storage.save_task(&task)?;
-            }
-            task
+            self.storage.load_task(&session.task_id)?
+        }) else {
+            return Ok(None);
         };
         self.thread_manager()?.post(
             &task.id,
@@ -637,7 +643,7 @@ impl Operations {
                     return Ok(None);
                 }
             } else {
-                let Some(done) = self.move_task_to_done(&task, true)? else {
+                let Some(done) = self.move_task_to_done(&task)? else {
                     return Ok(None);
                 };
                 drop(_guard);
@@ -646,8 +652,9 @@ impl Operations {
                 return Ok(Some(done));
             }
 
-            task.session = None;
-            task.updated_at = timefmt::now();
+            let now = timefmt::now();
+            task.updated_at = now;
+            task.completed_at = Some(now);
             self.storage.save_task(&task)?;
             task
         };
@@ -823,14 +830,6 @@ impl Operations {
 
         if !self.launch_agent(&task.id, &session_id, false)? {
             session_mgr.crash_session(&session_id)?;
-            let _guard = self.storage.lock()?;
-            if let Some(mut current) = self.storage.load_task(&task.id)?
-                && current.session.as_deref() == Some(&session_id)
-            {
-                current.session = None;
-                current.updated_at = timefmt::now();
-                self.storage.save_task(&current)?;
-            }
             return Ok(None);
         }
         Ok(Some(task))
@@ -1030,7 +1029,6 @@ impl Operations {
             let _guard = self.storage.lock()?;
             if let Some(mut current) = self.storage.load_task(&task.id)? {
                 current.status = TaskStatus::Review;
-                current.session = None;
                 current.updated_at = timefmt::now();
                 self.storage.save_task(&current)?;
             }
@@ -1110,12 +1108,6 @@ impl Operations {
 
         if self.auto_launch_enabled()? && !self.launch_agent(&task.id, &session_id, false)? {
             session_mgr.crash_session(&session_id)?;
-            let _guard = self.storage.lock()?;
-            if let Some(mut current) = self.storage.load_task(&task.id)? {
-                current.session = None;
-                current.updated_at = timefmt::now();
-                self.storage.save_task(&current)?;
-            }
             return Ok(None);
         }
         Ok(Some(task))
@@ -1175,9 +1167,35 @@ impl Operations {
             eprintln!("Warning: Task {task_id} not found. Agent not started.");
             return Ok(false);
         };
+        let task = self.record_launch_settings(task)?;
         Ok(self
             .launcher
             .launch(self.project_path(), &task, session_id, revert))
+    }
+
+    /// Pin the backend, model, effort, and agent persona this launch resolved
+    /// onto the task, so its fields describe the session that actually ran
+    /// instead of showing nothing when the values came from board config.
+    /// Fields the task already sets are left untouched.
+    fn record_launch_settings(&self, task: Task) -> Result<Task> {
+        let settings = resolve_launch_settings(&self.config.load()?, &task)?;
+        let _guard = self.storage.lock()?;
+        let Some(mut current) = self.storage.load_task(&task.id)? else {
+            return Ok(task);
+        };
+        let recorded = Task {
+            agent_backend: Some(settings.backend),
+            ai_model: settings.model.or(current.ai_model.clone()),
+            ai_effort: settings.effort.or(current.ai_effort.clone()),
+            agent_name: settings.agent.or(current.agent_name.clone()),
+            ..current.clone()
+        };
+        if recorded == current {
+            return Ok(current);
+        }
+        current = recorded;
+        self.storage.save_task(&current)?;
+        Ok(current)
     }
 
     /// Spawn a revert job restoring every file under the task's backup dir.
@@ -1852,14 +1870,56 @@ fn safe_session_component(value: &str) -> String {
 }
 
 pub fn sort_tasks(tasks: &mut [Task], by: &str, order: &str) {
+    if by == "completed" {
+        let descending = order == "desc";
+        tasks.sort_by(|a, b| {
+            match (a.completed_at, b.completed_at) {
+                (Some(a_completed), Some(b_completed)) => {
+                    if descending {
+                        b_completed.cmp(&a_completed)
+                    } else {
+                        a_completed.cmp(&b_completed)
+                    }
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+            .then_with(|| compare_task_ids(&a.id, &b.id))
+        });
+        return;
+    }
+    if by == "updated" {
+        let descending = order == "desc";
+        tasks.sort_by(|a, b| {
+            let by_updated = if descending {
+                b.updated_at.cmp(&a.updated_at)
+            } else {
+                a.updated_at.cmp(&b.updated_at)
+            };
+            by_updated.then_with(|| compare_task_ids(&a.id, &b.id))
+        });
+        return;
+    }
     match by {
-        "updated" => tasks.sort_by_key(|t| t.updated_at),
+        "id" => tasks.sort_by(|a, b| compare_task_ids(&a.id, &b.id)),
         "title" => tasks.sort_by_key(|t| t.title.to_lowercase()),
         _ => tasks.sort_by_key(|t| t.created_at),
     }
     if order == "desc" {
         tasks.reverse();
     }
+}
+
+fn compare_task_ids(a: &str, b: &str) -> std::cmp::Ordering {
+    match (task_number(a), task_number(b)) {
+        (Some(a_number), Some(b_number)) => a_number.cmp(&b_number).then_with(|| a.cmp(b)),
+        _ => a.cmp(b),
+    }
+}
+
+fn task_number(task_id: &str) -> Option<u64> {
+    task_id.strip_prefix("TASK-")?.parse().ok()
 }
 
 struct LegacyBlock<'a> {

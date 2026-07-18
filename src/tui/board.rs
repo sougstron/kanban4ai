@@ -33,13 +33,15 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
     if app.search.active {
         search::render(frame, app, chunks[0]);
     }
-    if let Some(modal) = &app.modal {
-        let modal_hits = dialogs::render(frame, app, modal, centered_rect(70, 70, area));
+    if let Some(mut modal) = app.modal.take() {
+        let modal_hits = dialogs::render(frame, app, &mut modal, centered_rect(70, 70, area));
         // Modal controls must win hit testing over every underlying board or
         // detail region, preventing click-through and drag initiation.
         app.hitboxes.splice(0..0, modal_hits);
+        app.modal = Some(modal);
     }
     render_status(frame, app, chunks[1]);
+    app.capture_and_highlight(frame.buffer_mut());
 }
 
 fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -482,6 +484,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("Mouse"),
         Line::from("  click: open a card, press a button, or pick a dialog field"),
         Line::from("  wheel: scrolls the column under the cursor"),
+        Line::from("  drag across text: copy it · hold Shift to select interactive text"),
         Line::from("  drag a card onto another column: move the task"),
         Line::from("  status-bar hints are clickable; column headers show name and count"),
         Line::from(""),

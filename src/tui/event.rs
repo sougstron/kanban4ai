@@ -23,7 +23,10 @@ pub enum AppEvent {
     Tick,
 }
 
-pub fn run_event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
+pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let input_gate = Arc::new(Mutex::new(()));
     spawn_input_thread(tx.clone(), Arc::clone(&input_gate));
@@ -45,6 +48,9 @@ pub fn run_event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> 
             }
             AppEvent::FsDebounced(generation) => app.reload_debounced_change(generation)?,
             AppEvent::Tick => app.tick()?,
+        }
+        if let Some(text) = app.take_pending_copy() {
+            app.finish_copy(super::image::copy_text(&text));
         }
         if let Some(session_id) = app.take_attach_request() {
             let _input_guard = input_gate.lock().map_err(|_| {

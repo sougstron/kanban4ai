@@ -184,7 +184,7 @@ impl Storage {
     fn write_task_file(&self, filepath: &Path, task: &Task) -> Result<()> {
         let frontmatter = timefmt::quote_yaml_timestamp_fields(
             &serde_yaml_ng::to_string(task)?,
-            &["created_at", "updated_at"],
+            &["created_at", "updated_at", "completed_at"],
         );
         let content = format!("---\n{frontmatter}---\n{}\n", task.description);
         atomic_write_text(filepath, &content)
@@ -206,6 +206,9 @@ impl Storage {
         task.interactive = new_task.interactive;
         task.chained_to = new_task.chained_to;
         task.status = status;
+        if matches!(status, TaskStatus::Review | TaskStatus::Done) {
+            task.completed_at = Some(task.created_at);
+        }
 
         let filepath = self
             .tasks_dir
@@ -307,8 +310,16 @@ impl Storage {
         let Some(mut task) = self.load_task(task_id)? else {
             return Ok(None);
         };
-        task.status = TaskStatus::from_str(target_status)?;
-        task.updated_at = timefmt::now();
+        let previous_status = task.status;
+        let next_status = TaskStatus::from_str(target_status)?;
+        let now = timefmt::now();
+        task.status = next_status;
+        task.updated_at = now;
+        if previous_status != next_status
+            && matches!(next_status, TaskStatus::Review | TaskStatus::Done)
+        {
+            task.completed_at = Some(now);
+        }
         self.save_task(&task)?;
         Ok(Some(task))
     }
