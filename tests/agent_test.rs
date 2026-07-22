@@ -3,9 +3,9 @@ mod common;
 use std::fs;
 
 use kanban4ai::agent::{
-    build_agent_prompt, build_launch_plan, cached_opencode_catalog, parse_opencode_agent_list,
-    parse_opencode_models_verbose, recent_models, record_recent_model, sort_efforts,
-    sort_opencode_models,
+    build_agent_prompt, build_launch_plan, cached_opencode_catalog, parse_omp_models_json,
+    parse_opencode_agent_list, parse_opencode_models_verbose, parse_pi_models_store, recent_models,
+    record_recent_model, sort_efforts, sort_opencode_models,
 };
 use kanban4ai::core::models::{MessageKind, MessageRole, Task};
 use kanban4ai::core::storage::{NewTask, Storage};
@@ -252,6 +252,92 @@ agents:
 }
 
 #[test]
+fn omp_launch_plan_uses_print_and_thinking_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    write_agent_config(
+        dir.path(),
+        r#"auto_launch:
+  enabled: true
+  use_tmux: false
+  terminal_fallback: true
+  default_agent: omp
+notifications:
+  enabled: false
+agents:
+  omp:
+    command: omp
+    model: null
+"#,
+    );
+    let task = storage
+        .create_task(NewTask {
+            title: "Omp task".into(),
+            ai_model: Some("openai-codex/gpt-5.6-sol".into()),
+            ai_effort: Some("high".into()),
+            agent_name: Some("ignored-persona".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let plan = build_launch_plan(dir.path(), &task, "ses-omp-test", false).unwrap();
+
+    assert_eq!(plan.backend, "omp");
+    assert_eq!(plan.command, "omp");
+    // Non-interactive `-p`, prompt as the trailing positional argument.
+    assert_eq!(plan.args[0], "-p");
+    assert_eq!(plan.args.last().unwrap(), &plan.prompt);
+    assert!(has_arg_pair(
+        &plan.args,
+        "--model",
+        "openai-codex/gpt-5.6-sol"
+    ));
+    // Effort maps onto --thinking, not --effort/--variant.
+    assert!(has_arg_pair(&plan.args, "--thinking", "high"));
+    assert!(!plan.args.contains(&"--effort".to_string()));
+    assert!(!plan.args.contains(&"--variant".to_string()));
+    // omp has no launch-time persona and no parseable transcript.
+    assert!(!plan.args.contains(&"--agent".to_string()));
+    assert!(!plan.args.contains(&"ignored-persona".to_string()));
+    assert!(!plan.args.contains(&"--title".to_string()));
+    assert!(plan.transcript_file.is_none());
+    assert!(plan.resolve_agent.is_none());
+}
+
+#[test]
+fn pi_launch_plan_uses_print_and_thinking_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    write_agent_config(
+        dir.path(),
+        r#"auto_launch:
+  enabled: true
+  use_tmux: false
+  terminal_fallback: true
+  default_agent: pi
+notifications:
+  enabled: false
+agents:
+  pi:
+    command: pi
+    model: null
+    effort: minimal
+"#,
+    );
+    let task = storage.create_task(NewTask::titled("Pi task")).unwrap();
+
+    let plan = build_launch_plan(dir.path(), &task, "ses-pi-test", false).unwrap();
+
+    assert_eq!(plan.backend, "pi");
+    assert_eq!(plan.args[0], "-p");
+    // Backend effort default flows through as --thinking.
+    assert!(has_arg_pair(&plan.args, "--thinking", "minimal"));
+    assert!(plan.transcript_file.is_none());
+}
+
+#[test]
 fn claude_launch_plan_passes_effort_with_config_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::new(dir.path());
@@ -357,6 +443,75 @@ opencode/plain
     assert_eq!(catalog.variants_for("openai/gpt-5.5"), ["low", "high"]);
     assert!(catalog.variants_for("opencode/plain").is_empty());
     assert!(catalog.variants_for("unknown/model").is_empty());
+}
+
+#[test]
+fn omp_models_json_yields_models_and_thinking_efforts() {
+    let text = r#"{"models":[
+        {"provider":"openai-codex","id":"gpt-5.6-sol","selector":"openai-codex/gpt-5.6-sol",
+         "thinking":["high","low","max","medium"]},
+        {"provider":"xai-oauth","id":"grok-build","selector":"xai-oauth/grok-build",
+         "thinking":null}
+    ]}"#;
+    let catalog = parse_omp_models_json(text);
+    assert_eq!(
+        catalog.models,
+        ["openai-codex/gpt-5.6-sol", "xai-oauth/grok-build"]
+    );
+    // Efforts are normalized weakest-to-strongest.
+    assert_eq!(
+        catalog.variants_for("openai-codex/gpt-5.6-sol"),
+        ["low", "medium", "high", "max"]
+    );
+    assert!(catalog.variants_for("xai-oauth/grok-build").is_empty());
+}
+
+#[test]
+fn omp_models_json_ignores_invalid_json() {
+    assert!(parse_omp_models_json("not json").models.is_empty());
+}
+
+#[test]
+fn pi_models_store_yields_provider_slash_id_selectors_and_efforts() {
+    let text = r#"{
+      "anthropic": {
+        "models": [
+          {"id":"claude-fable-5","provider":"anthropic",
+           "thinkingLevelMap":{"off":null,"max":"max","xhigh":"xhigh"}},
+          {"id":"claude-haiku-4-5","provider":"anthropic"}
+        ]
+      },
+      "xai": {
+        "models": [
+          {"id":"grok-4.5","provider":"xai","thinking":["high","low"]}
+        ]
+      }
+    }"#;
+    let catalog = parse_pi_models_store(text);
+    assert!(
+        catalog
+            .models
+            .contains(&"anthropic/claude-fable-5".to_string())
+    );
+    assert!(
+        catalog
+            .models
+            .contains(&"anthropic/claude-haiku-4-5".to_string())
+    );
+    assert!(catalog.models.contains(&"xai/grok-4.5".to_string()));
+    // thinkingLevelMap keys become the model's efforts, weakest-to-strongest.
+    assert_eq!(
+        catalog.variants_for("anthropic/claude-fable-5"),
+        ["off", "xhigh", "max"]
+    );
+    // No thinking metadata -> no efforts.
+    assert!(
+        catalog
+            .variants_for("anthropic/claude-haiku-4-5")
+            .is_empty()
+    );
+    // Falls back to a plain `thinking` array when present.
+    assert_eq!(catalog.variants_for("xai/grok-4.5"), ["low", "high"]);
 }
 
 #[test]

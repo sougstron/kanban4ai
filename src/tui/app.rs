@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -15,7 +15,8 @@ use serde_yaml_ng::{Mapping, Value};
 use unicode_width::UnicodeWidthStr;
 
 use crate::agent::{
-    cached_opencode_catalog, recent_models, sort_opencode_models, warm_opencode_catalog,
+    backend_has_catalog, cached_backend_catalog, recent_models, sort_opencode_models,
+    warm_backend_catalog,
 };
 use crate::core::config::BoardConfig;
 use crate::core::context::ContextManager;
@@ -313,7 +314,9 @@ pub struct App {
     ctrl_c_exit_deadline: Option<Instant>,
     /// Last time the tick scanned for expired declared waits to relaunch.
     last_wait_resume: Option<Instant>,
-    opencode_catalog_ready: bool,
+    /// Backends whose warmed model catalog has already been reflected into an
+    /// open modal, so `tick` refreshes options at most once per backend.
+    catalog_ready: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,18 +456,20 @@ impl App {
         let board = BoardSnapshot::load(&ops)?;
         let archived_tasks = ops.list_archived_tasks(None)?;
         let recent_models = recent_models(project_path);
-        let opencode_command = ops
+        let catalog_backends = ops
             .config
             .load()
             .ok()
-            .and_then(|config| configured_opencode_command(&config));
-        if let Some(command) = opencode_command.as_ref() {
-            warm_opencode_catalog(command.clone());
+            .map(|config| catalog_backend_commands(&config))
+            .unwrap_or_default();
+        let mut catalog_ready = HashSet::new();
+        for (backend, command) in &catalog_backends {
+            if cached_backend_catalog(backend, command).is_some() {
+                catalog_ready.insert(backend.clone());
+            } else {
+                warm_backend_catalog(backend.clone(), command.clone());
+            }
         }
-        let opencode_catalog_ready = opencode_command
-            .as_deref()
-            .and_then(cached_opencode_catalog)
-            .is_some();
         let column_offsets = vec![0; board.columns.len()];
         let visible_card_capacities = vec![1; board.columns.len()];
         Ok(Self {
@@ -506,7 +511,7 @@ impl App {
             recent_models,
             ctrl_c_exit_deadline: None,
             last_wait_resume: None,
-            opencode_catalog_ready,
+            catalog_ready,
         })
     }
 
@@ -1439,7 +1444,7 @@ impl App {
 
     pub fn tick(&mut self) -> Result<()> {
         self.reload_if_changed()?;
-        self.refresh_modal_after_opencode_catalog_warm();
+        self.refresh_modal_after_catalog_warm();
         let now = Instant::now();
         self.expire_ctrl_c_prompt_at(now);
         self.expire_copy_notice_at(now);
@@ -1453,20 +1458,23 @@ impl App {
         Ok(())
     }
 
-    fn refresh_modal_after_opencode_catalog_warm(&mut self) {
-        if self.opencode_catalog_ready {
-            return;
-        }
+    fn refresh_modal_after_catalog_warm(&mut self) {
         let Ok(config) = self.ops.config.load() else {
             return;
         };
-        let Some(command) = configured_opencode_command(&config) else {
-            return;
-        };
-        if cached_opencode_catalog(&command).is_none() {
+        let mut newly_ready = false;
+        for (backend, command) in catalog_backend_commands(&config) {
+            if self.catalog_ready.contains(&backend) {
+                continue;
+            }
+            if cached_backend_catalog(&backend, &command).is_some() {
+                self.catalog_ready.insert(backend);
+                newly_ready = true;
+            }
+        }
+        if !newly_ready {
             return;
         }
-        self.opencode_catalog_ready = true;
         let should_refresh = self.modal.as_ref().is_some_and(|modal| {
             matches!(
                 modal.modal,
@@ -2867,10 +2875,10 @@ impl App {
         let configured = options_from_sequence(backend_settings, "models")
             .or_else(|| options_from_sequence(Some(auto_launch), "models"))
             .unwrap_or_default();
-        if backend != "opencode" {
+        if !backend_has_catalog(backend) {
             return configured;
         }
-        let models = cached_opencode_catalog(&backend_command(backend, backend_settings))
+        let models = cached_backend_catalog(backend, &backend_command(backend, backend_settings))
             .map(|catalog| catalog.models.clone())
             .unwrap_or_else(|| {
                 configured
@@ -2878,8 +2886,14 @@ impl App {
                     .filter_map(|option| option.value.clone())
                     .collect()
             });
-        let default_model = mapping_str(backend_settings, "model")
-            .or_else(|| mapping_str(Some(auto_launch), "model"));
+        // Fall back to the global auto-launch model only for opencode, whose
+        // global default names an opencode model; other catalog backends
+        // (omp/pi) would otherwise surface opencode's default as a bogus entry.
+        let default_model = mapping_str(backend_settings, "model").or_else(|| {
+            (backend == "opencode")
+                .then(|| mapping_str(Some(auto_launch), "model"))
+                .flatten()
+        });
         sort_opencode_models(&models, default_model.as_deref(), &self.recent_models)
             .into_iter()
             .map(|model| SelectOption {
@@ -2906,14 +2920,18 @@ impl App {
             .get(Value::String(backend.clone()))
             .and_then(Value::as_mapping);
         let mut efforts = options_from_sequence(backend_settings, "efforts").unwrap_or_default();
-        if backend == "opencode"
+        if backend_has_catalog(&backend)
             && let Some(catalog) =
-                cached_opencode_catalog(&backend_command(&backend, backend_settings))
+                cached_backend_catalog(&backend, &backend_command(&backend, backend_settings))
         {
             let model = modal
                 .model_text()
                 .or_else(|| mapping_str(backend_settings, "model"))
-                .or_else(|| mapping_str(Some(&config.auto_launch), "model"));
+                .or_else(|| {
+                    (backend == "opencode")
+                        .then(|| mapping_str(Some(&config.auto_launch), "model"))
+                        .flatten()
+                });
             efforts = model
                 .map(|model| catalog.variants_for(&model))
                 .unwrap_or_default()
@@ -3685,12 +3703,21 @@ fn backend_command(backend: &str, backend_settings: Option<&Mapping>) -> String 
     mapping_str(backend_settings, "command").unwrap_or_else(|| backend.to_string())
 }
 
-fn configured_opencode_command(config: &BoardConfig) -> Option<String> {
-    let backend_settings = config
+/// (backend, command) pairs for every configured backend whose model/effort
+/// catalog kanban can poll, so the TUI can warm and read each one.
+fn catalog_backend_commands(config: &BoardConfig) -> Vec<(String, String)> {
+    config
         .agents
-        .get(Value::String("opencode".to_string()))
-        .and_then(Value::as_mapping)?;
-    Some(backend_command("opencode", Some(backend_settings)))
+        .iter()
+        .filter_map(|(key, value)| {
+            let backend = key.as_str()?;
+            if !backend_has_catalog(backend) {
+                return None;
+            }
+            let command = backend_command(backend, value.as_mapping());
+            Some((backend.to_string(), command))
+        })
+        .collect()
 }
 
 fn selected_backend(auto_launch: &Mapping, modal: &ModalState) -> String {

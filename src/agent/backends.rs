@@ -213,6 +213,10 @@ fn backend_args(
             "--format".to_string(),
             "json".to_string(),
         ],
+        // omp/pi (the "pi" agent family) run non-interactively with `-p` and
+        // take the prompt as a positional argument. They emit no parseable
+        // transcript, so their stdout is teed to the log unchanged.
+        "omp" | "pi" => vec!["-p".to_string()],
         _ => vec!["run".to_string()],
     };
     args.extend(config.extra_args.clone());
@@ -222,11 +226,12 @@ fn backend_args(
     }
     if let Some(effort) = effort.filter(|value| !value.trim().is_empty()) {
         // claude exposes reasoning effort as --effort; opencode maps it onto
-        // per-model variants selected with --variant.
-        let flag = if backend == "claude" {
-            "--effort"
-        } else {
-            "--variant"
+        // per-model variants selected with --variant; the pi family (omp/pi)
+        // uses --thinking.
+        let flag = match backend {
+            "claude" => "--effort",
+            "omp" | "pi" => "--thinking",
+            _ => "--variant",
         };
         args.push(flag.to_string());
         args.push(effort.to_string());
@@ -317,15 +322,17 @@ pub fn resolve_opencode_agent(command: &str, requested: &str) -> String {
     resolved
 }
 
-/// Model catalog reported by the opencode CLI: every launchable
-/// `provider/model` id plus the reasoning-effort variants each model accepts.
+/// Model catalog reported by an agent backend: every launchable model id plus
+/// the reasoning-effort variants each model accepts. Sourced from the backend
+/// CLI (`opencode models --verbose`, `omp models --json`) or, for pi, its
+/// on-disk `models-store.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OpencodeCatalog {
+pub struct BackendCatalog {
     pub models: Vec<String>,
     variants: HashMap<String, Vec<String>>,
 }
 
-impl OpencodeCatalog {
+impl BackendCatalog {
     pub fn variants_for(&self, model: &str) -> &[String] {
         self.variants
             .get(model)
@@ -334,50 +341,98 @@ impl OpencodeCatalog {
     }
 }
 
-static OPENCODE_CATALOG_CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<OpencodeCatalog>>>>> =
-    OnceLock::new();
-static OPENCODE_CATALOG_WARMING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Backends whose model/effort catalog kanban polls (from the CLI, or from pi's
+/// on-disk store) instead of relying solely on the configured `models` list.
+pub fn backend_has_catalog(backend: &str) -> bool {
+    matches!(backend, "opencode" | "omp" | "pi")
+}
 
-/// Model list and variants from `opencode models --verbose`, cached per
-/// command for the process lifetime. `None` when the CLI is unavailable —
-/// callers fall back to the configured `models` list.
-pub fn opencode_catalog(command: &str) -> Option<Arc<OpencodeCatalog>> {
-    let cache = OPENCODE_CATALOG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+static CATALOG_CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<BackendCatalog>>>>> =
+    OnceLock::new();
+static CATALOG_WARMING: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn catalog_cache_key(backend: &str, command: &str) -> String {
+    format!("{backend}\u{0}{command}")
+}
+
+/// Model catalog for a backend, cached per backend+command for the process
+/// lifetime. `None` when the backend has no catalog, its CLI/store is
+/// unavailable, or no models were parsed — callers then fall back to the
+/// configured `models` list.
+pub fn backend_catalog(backend: &str, command: &str) -> Option<Arc<BackendCatalog>> {
+    if !backend_has_catalog(backend) {
+        return None;
+    }
+    let cache = CATALOG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = catalog_cache_key(backend, command);
     if let Some(cached) = cache
         .lock()
         .ok()
-        .and_then(|values| values.get(command).cloned())
+        .and_then(|values| values.get(&key).cloned())
     {
         return cached;
     }
 
-    let fetched = Command::new(command)
-        .args(["models", "--verbose"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|text| parse_opencode_models_verbose(&text))
+    let fetched = fetch_backend_catalog(backend, command)
         .filter(|catalog| !catalog.models.is_empty())
         .map(Arc::new);
 
     if let Ok(mut values) = cache.lock() {
-        values.insert(command.to_string(), fetched.clone());
+        values.insert(key, fetched.clone());
     }
     fetched
 }
 
-/// Start a best-effort background fetch of the opencode model catalog.
+fn fetch_backend_catalog(backend: &str, command: &str) -> Option<BackendCatalog> {
+    match backend {
+        "opencode" => run_capture(command, &["models", "--verbose"])
+            .map(|t| parse_opencode_models_verbose(&t)),
+        "omp" => run_capture(command, &["models", "--json"]).map(|t| parse_omp_models_json(&t)),
+        // pi has no models subcommand; it maintains the catalog on disk.
+        "pi" => fs::read_to_string(pi_models_store_path())
+            .ok()
+            .map(|t| parse_pi_models_store(&t)),
+        _ => None,
+    }
+}
+
+fn run_capture(command: &str, args: &[&str]) -> Option<String> {
+    Command::new(command)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+}
+
+/// Path to pi's on-disk model catalog. pi has no models subcommand, so its
+/// catalog is read from the agent config directory (`PI_CODING_AGENT_DIR`,
+/// default `~/.pi/agent`).
+fn pi_models_store_path() -> PathBuf {
+    let dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi").join("agent"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".pi").join("agent"));
+    dir.join("models-store.json")
+}
+
+/// Start a best-effort background fetch of a backend's model catalog.
 ///
-/// This keeps latency-sensitive UI paths on `cached_opencode_catalog()` while
-/// making the live CLI catalog available shortly after startup.
-pub fn warm_opencode_catalog(command: String) {
-    if command.trim().is_empty() || cached_opencode_catalog(&command).is_some() {
+/// This keeps latency-sensitive UI paths on `cached_backend_catalog()` while
+/// making the live catalog available shortly after startup.
+pub fn warm_backend_catalog(backend: String, command: String) {
+    if command.trim().is_empty()
+        || !backend_has_catalog(&backend)
+        || cached_backend_catalog(&backend, &command).is_some()
+    {
         return;
     }
-    let warming = OPENCODE_CATALOG_WARMING.get_or_init(|| Mutex::new(HashSet::new()));
-    if let Ok(mut commands) = warming.lock() {
-        if !commands.insert(command.clone()) {
+    let warming = CATALOG_WARMING.get_or_init(|| Mutex::new(HashSet::new()));
+    let key = catalog_cache_key(&backend, &command);
+    if let Ok(mut keys) = warming.lock() {
+        if !keys.insert(key.clone()) {
             return;
         }
     } else {
@@ -385,31 +440,49 @@ pub fn warm_opencode_catalog(command: String) {
     }
 
     thread::spawn(move || {
-        let _ = opencode_catalog(&command);
-        if let Some(warming) = OPENCODE_CATALOG_WARMING.get()
-            && let Ok(mut commands) = warming.lock()
+        let _ = backend_catalog(&backend, &command);
+        if let Some(warming) = CATALOG_WARMING.get()
+            && let Ok(mut keys) = warming.lock()
         {
-            commands.remove(&command);
+            keys.remove(&catalog_cache_key(&backend, &command));
         }
     });
 }
 
-/// Return a previously fetched opencode catalog without invoking the CLI.
-///
-/// The TUI uses this on latency-sensitive paths (opening dialogs) so a cold
-/// `opencode models --verbose` subprocess cannot block the event loop.
-pub fn cached_opencode_catalog(command: &str) -> Option<Arc<OpencodeCatalog>> {
-    OPENCODE_CATALOG_CACHE
+/// Return a previously fetched catalog without invoking the CLI or touching
+/// disk. The TUI uses this on latency-sensitive paths (opening dialogs) so a
+/// cold catalog fetch cannot block the event loop.
+pub fn cached_backend_catalog(backend: &str, command: &str) -> Option<Arc<BackendCatalog>> {
+    CATALOG_CACHE
         .get()
         .and_then(|cache| cache.lock().ok())
-        .and_then(|values| values.get(command).cloned().flatten())
+        .and_then(|values| {
+            values
+                .get(&catalog_cache_key(backend, command))
+                .cloned()
+                .flatten()
+        })
+}
+
+/// Opencode-specific catalog accessors retained for the CLI's opencode paths
+/// and existing tests; each delegates to the generic backend catalog.
+pub fn opencode_catalog(command: &str) -> Option<Arc<BackendCatalog>> {
+    backend_catalog("opencode", command)
+}
+
+pub fn warm_opencode_catalog(command: String) {
+    warm_backend_catalog("opencode".to_string(), command);
+}
+
+pub fn cached_opencode_catalog(command: &str) -> Option<Arc<BackendCatalog>> {
+    cached_backend_catalog("opencode", command)
 }
 
 /// Parse `opencode models --verbose`: each entry is a `provider/model` header
 /// line followed by a pretty-printed JSON blob whose closing brace sits at
 /// column zero. The `variants` object keys are the model's valid efforts.
-pub fn parse_opencode_models_verbose(text: &str) -> OpencodeCatalog {
-    let mut catalog = OpencodeCatalog::default();
+pub fn parse_opencode_models_verbose(text: &str) -> BackendCatalog {
+    let mut catalog = BackendCatalog::default();
     let mut current: Option<String> = None;
     let mut json = String::new();
     let mut in_json = false;
@@ -447,9 +520,109 @@ fn is_model_header(line: &str) -> bool {
     !line.is_empty() && line.contains('/') && !line.chars().any(char::is_whitespace)
 }
 
+/// Parse `omp models --json`: `{ "models": [ { "selector": "provider/id",
+/// "thinking": ["low", ...] | null }, ... ] }`. The `thinking` array lists the
+/// model's valid reasoning efforts.
+pub fn parse_omp_models_json(text: &str) -> BackendCatalog {
+    let mut catalog = BackendCatalog::default();
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
+        return catalog;
+    };
+    let Some(models) = root.get("models").and_then(serde_json::Value::as_array) else {
+        return catalog;
+    };
+    for model in models {
+        let Some(selector) = model
+            .get("selector")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let efforts = model
+            .get("thinking")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| json_string_array(arr))
+            .unwrap_or_default();
+        catalog.models.push(selector.to_string());
+        catalog
+            .variants
+            .insert(selector.to_string(), sort_efforts(efforts));
+    }
+    catalog
+}
+
+/// Parse pi's `models-store.json`: an object keyed by provider, each holding a
+/// `models` array of `{ id, provider, thinkingLevelMap?: {..}, thinking?: [..] }`.
+/// The launchable selector is `provider/id`; a model's efforts are the
+/// `thinkingLevelMap` keys (or `thinking` array) it accepts.
+pub fn parse_pi_models_store(text: &str) -> BackendCatalog {
+    let mut catalog = BackendCatalog::default();
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
+        return catalog;
+    };
+    let Some(providers) = root.as_object() else {
+        return catalog;
+    };
+    for (provider_key, entry) in providers {
+        let Some(models) = entry.get("models").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for model in models {
+            let Some(id) = model
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let provider = model
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(provider_key.as_str());
+            let selector = format!("{provider}/{id}");
+            let efforts = model
+                .get("thinkingLevelMap")
+                .and_then(serde_json::Value::as_object)
+                .map(|map| map.keys().cloned().collect::<Vec<_>>())
+                .or_else(|| {
+                    model
+                        .get("thinking")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|arr| json_string_array(arr))
+                })
+                .unwrap_or_default();
+            if catalog
+                .variants
+                .insert(selector.clone(), sort_efforts(efforts))
+                .is_none()
+            {
+                catalog.models.push(selector);
+            }
+        }
+    }
+    catalog
+}
+
+fn json_string_array(values: &[serde_json::Value]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// Reasoning efforts ordered weakest to strongest; unknown names go last,
 /// alphabetically.
-const EFFORT_ORDER: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_ORDER: [&str; 8] = [
+    "off", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+];
 
 pub fn sort_efforts(mut efforts: Vec<String>) -> Vec<String> {
     let rank = |effort: &String| {

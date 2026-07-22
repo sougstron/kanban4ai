@@ -120,6 +120,40 @@ agents:
     agent: null
     extra_args:
     - --dangerously-skip-permissions
+  omp:
+    command: omp
+    model: null
+    models:
+    - openai-codex/gpt-5.6-sol
+    - xai-oauth/grok-4.5
+    effort: null
+    efforts:
+    - off
+    - minimal
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+    agent: null
+    extra_args: []
+  pi:
+    command: pi
+    model: null
+    models:
+    - anthropic/claude-sonnet-5
+    - openai-codex/gpt-5.6-sol
+    effort: null
+    efforts:
+    - off
+    - minimal
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+    agent: null
+    extra_args: []
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -149,7 +149,7 @@ messages:
 
 ### CLI Commands (implemented)
 - `kanban init` - Initialize .kanban/ board
-- `kanban create <title> [--backend opencode|claude] [--model M] [--effort E] [--agent-name P] [--interactive] [--chain-to TASK-NNN]` - Create task
+- `kanban create <title> [--backend opencode|claude|omp|pi] [--model M] [--effort E] [--agent-name P] [--interactive] [--chain-to TASK-NNN]` - Create task
 - `kanban chain <id> [<target_id>] [--clear]` - Show, set, or clear chaining
 - `kanban list` - List tasks
 - `kanban show <id>` - Show task details
@@ -236,11 +236,11 @@ Controls how delegating a task spawns a background agent job (shared across all 
 Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. The `agents:` map defines one entry per backend:
 - `command`: executable resolved via PATH (e.g. `opencode`, `claude`)
 - `model`: default model when a task has no `ai_model`
-- `models`: list offered in the TUI create/edit dialog for this backend. For opencode this is only a fallback: when the opencode CLI is available the dialog lists the live `opencode models --verbose` catalog instead, ordered default model first, then up to three most recently launched models (`.kanban/recent_models`, newest first), then the rest alphabetically
+- `models`: list offered in the TUI create/edit dialog for this backend. For the catalog backends (opencode, omp, pi) this is only a fallback: when the backend's catalog is available the dialog lists the live catalog instead, ordered default model first, then up to three most recently launched models (`.kanban/recent_models`, newest first), then the rest alphabetically. Catalog sources: opencode → `opencode models --verbose`; omp → `omp models --json`; pi (which has no models subcommand) → its on-disk `models-store.json` under `PI_CODING_AGENT_DIR` (default `~/.pi/agent`). Catalogs are warmed in the background at TUI startup and cached per backend+command for the process lifetime
 - `effort`: default reasoning effort when a task has no `ai_effort`
-- `efforts` (claude): effort levels offered in the TUI dialog (defaults `low`/`medium`/`high`/`xhigh`/`max`, matching `claude --effort`). For opencode the dialog instead offers the selected model's variants reported by the live catalog (e.g. openai models expose `none`/`low`/`medium`/`high`/`xhigh`)
-- `agent`: optional default `--agent` persona (overridden per task by `task.agent_name`)
-- `agent_options` (opencode only): personas offered in the TUI and via `kanban create --agent-name` (e.g. `sisyphus`, `prometheus`, `hephaestus`, `atlas`)
+- `efforts` (claude, omp, pi): effort levels offered in the TUI dialog as a fallback (defaults `low`/`medium`/`high`/`xhigh`/`max`, matching `claude --effort`; omp/pi also expose `off`). For opencode/omp/pi the dialog instead offers the selected model's variants reported by the live catalog when available (opencode exposes them as `variants`, omp as each model's `thinking` list, pi as each model's `thinkingLevelMap` keys)
+- `agent`: optional default `--agent` persona (overridden per task by `task.agent_name`; opencode only)
+- `agent_options` (opencode only): personas offered in the TUI and via `kanban create --agent-name` (e.g. `sisyphus`, `prometheus`, `hephaestus`, `atlas`). omp/pi have no launch-time persona selector, so they expose no personas
 - `extra_args`: extra CLI flags inserted before `--model`
 
 Per-task persona: `task.agent_name` is passed to opencode as `--agent`, overriding the backend default. opencode matches `--agent` against an agent's *exact* registered name (oh-my-openagent personas are decorated strings), so the friendly key is resolved via `opencode agent list`. Because starting the opencode CLI takes seconds, resolution is deferred into the launch wrapper script: the spawned session calls the hidden `kanban resolve-agent` command and substitutes the result into `--agent`, so the launching process (TUI or CLI) never blocks on it. If opencode is unavailable or lists no match the key is passed through unchanged. The claude backend ignores `agent_name`.
@@ -248,6 +248,7 @@ Per-task persona: `task.agent_name` is passed to opencode as `--agent`, overridi
 Built-in backends:
 - **opencode**: `opencode run --title "<id>: <title>" [extra_args] [--model M] [--variant E] [--agent A] <prompt>`. A task's `ai_effort` (or the backend `effort` default) is passed as `--variant`, opencode's per-model reasoning-effort selector.
 - **claude** (Claude Code): `claude --print [extra_args] [--model M] [--effort E] <prompt>`. Default `extra_args` is `["--dangerously-skip-permissions"]` — tighten in config for stricter permissions. Default models are the `fable`/`opus`/`sonnet`/`haiku` aliases; `ai_effort` is passed as `--effort` (`low`/`medium`/`high`/`xhigh`/`max`).
+- **omp** / **pi** (the "pi" agent family): `<command> -p [extra_args] [--model M] [--thinking E] <prompt>`. Run non-interactively with `-p`, taking the prompt as a positional argument; `ai_effort` is passed as `--thinking` (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`). Model uses fuzzy `provider/id` selectors from the live catalog. Neither has a launch-time persona flag, so `agent_name` is ignored. They emit no parseable transcript, so their stdout is teed to the log unchanged (no input-provenance manifest is harvested).
 
 ### TUI Keyboard Shortcuts
 
@@ -365,7 +366,7 @@ Session token estimates are parsed from the agent's `.kanban/logs/<session>.log`
 - `sessions/` - per-session YAML (metadata + heartbeat)
 - `logs/` - per-session agent run logs
 - `detached/` - `kanban detach` job artifacts: `<task_id>-<stamp>.log` (output) and `.status` (exit code); cleared with the task's logs
-- `recent_models` - most recently launched opencode models, newest first (drives TUI model-selector ordering)
+- `recent_models` - most recently launched catalog-backend models (opencode/omp/pi), newest first (drives TUI model-selector ordering)
 - `backups/<task_id>/` - pre-edit file backups for revert
 - `assets/images/` - pasted image attachments
 - `.lock` - board-wide flock serializing read-modify-write cycles
