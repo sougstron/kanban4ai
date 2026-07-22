@@ -9,6 +9,7 @@ use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use clap::{Parser, Subcommand};
 
 use crate::agent::{attach_to_session, resolve_opencode_agent};
+use crate::core::ask_form::AskForm;
 use crate::core::compaction::{CompactionManager, CompactionStatus};
 use crate::core::config::Config;
 use crate::core::context::ContextManager;
@@ -132,6 +133,21 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Post one or more questions from a strict YAML form file (see AGENTS.md
+    /// for the schema). Each entry becomes a question whose `options` are the
+    /// selectable answer variants.
+    AskForm {
+        task_id: String,
+        /// Path to the YAML form file
+        #[arg(long)]
+        file: String,
+        /// Agent is asking
+        #[arg(long)]
+        agent: bool,
+        /// Session ID for agent ownership check
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Answer a question on a task (QUESTION_REF is a MSG-id like MSG-002, or a numeric index).
     Answer {
         task_id: String,
@@ -142,6 +158,11 @@ enum Command {
     Questions { task_id: String },
     /// Add a suggestion to a task.
     Suggest { task_id: String, suggestion: String },
+    /// Reject (quarantine) a thread message so it is excluded from future
+    /// prompts and gathered context, while staying visible for audit.
+    Reject { task_id: String, msg_id: String },
+    /// Restore a previously rejected thread message.
+    Unreject { task_id: String, msg_id: String },
     /// Set the review-edits buffer on a task (folded into the thread on next re-run).
     Edits { task_id: String, text: String },
     /// Fold pending review edits into the thread and re-run the task's agent.
@@ -279,6 +300,12 @@ enum Command {
         #[arg(long)]
         command: String,
     },
+    /// Internal command used by the agent runtime wrapper: read a backend's
+    /// stream-json transcript on stdin and print human-readable text on stdout,
+    /// keeping the session log readable while the raw JSONL is captured to a
+    /// transcript file for input-provenance harvesting.
+    #[command(name = "format-stream", hide = true)]
+    FormatStream,
 }
 
 fn env_session(explicit: Option<String>) -> String {
@@ -400,7 +427,14 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 Some(path) => std::fs::read_to_string(&path)?,
                 None => text,
             };
-            ContextManager::new(".").append_context(&task_id, &text, &source, &ops.storage)?;
+            let session_id = std::env::var("KANBAN_SESSION").ok();
+            ContextManager::new(".").append_context_with_session(
+                &task_id,
+                &text,
+                &source,
+                session_id.as_deref(),
+                &ops.storage,
+            )?;
             println!("Context added to {task_id}");
         }
         Command::Ask {
@@ -430,7 +464,16 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             }
 
             let source = if agent { "agent" } else { "user" };
-            match ops.ask_question(&task_id, &question, source, variants)? {
+            let session_id = agent
+                .then(|| session.or_else(|| std::env::var("KANBAN_SESSION").ok()))
+                .flatten();
+            match ops.ask_question_for_session(
+                &task_id,
+                &question,
+                source,
+                session_id.as_deref(),
+                variants,
+            )? {
                 Some(task) => {
                     println!("Question added to {task_id}");
                     if task.has_questions {
@@ -438,6 +481,28 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                     }
                 }
                 None => eprintln!("Failed to add question to {task_id}"),
+            }
+        }
+        Command::AskForm {
+            task_id,
+            file,
+            agent,
+            session,
+        } => {
+            let text = std::fs::read_to_string(&file)?;
+            let form = AskForm::parse(&text)?;
+            let source = if agent { "agent" } else { "user" };
+            let session_id = agent
+                .then(|| session.or_else(|| std::env::var("KANBAN_SESSION").ok()))
+                .flatten();
+            match ops.ask_form(&task_id, &form, source, session_id.as_deref())? {
+                Some((task, count)) => {
+                    println!("Posted {count} question(s) from form to {task_id}");
+                    if task.has_questions {
+                        println!("Task has pending questions.");
+                    }
+                }
+                None => eprintln!("Failed to add questions to {task_id}"),
             }
         }
         Command::Answer {
@@ -480,6 +545,14 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         } => match ops.suggest_improvement(&task_id, &suggestion, "agent", vec![])? {
             Some(_) => println!("Suggestion added to {task_id}"),
             None => eprintln!("Failed to add suggestion to {task_id}"),
+        },
+        Command::Reject { task_id, msg_id } => match ops.reject_message(&task_id, &msg_id)? {
+            Some(_) => println!("Message {msg_id} rejected on {task_id}"),
+            None => eprintln!("Message {msg_id} not found on {task_id}"),
+        },
+        Command::Unreject { task_id, msg_id } => match ops.unreject_message(&task_id, &msg_id)? {
+            Some(_) => println!("Message {msg_id} restored on {task_id}"),
+            None => eprintln!("Message {msg_id} not found on {task_id}"),
         },
         Command::Edits { task_id, text } => match ops.set_review_edits(&task_id, &text)? {
             Some(_) => println!("Review edits saved on {task_id}"),
@@ -760,8 +833,30 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         Command::ResolveAgent { requested, command } => {
             println!("{}", resolve_opencode_agent(&command, &requested));
         }
+        Command::FormatStream => {
+            format_stream(std::io::stdin().lock(), &mut std::io::stdout().lock())?;
+        }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Reformat a claude stream-json transcript (read line by line) into
+/// human-readable text. Recognized events are rendered (assistant text, tool
+/// one-liners, final result); other JSON events are dropped; non-JSON lines
+/// (backend stderr, banners) pass through untouched so nothing is lost.
+fn format_stream(input: impl std::io::BufRead, output: &mut impl std::io::Write) -> Result<()> {
+    for line in input.lines() {
+        let line = line?;
+        match serde_json::from_str::<serde_json::Value>(line.trim()) {
+            Ok(value) => {
+                if let Some(rendered) = crate::core::provenance::render_stream_event(&value) {
+                    writeln!(output, "{rendered}")?;
+                }
+            }
+            Err(_) => writeln!(output, "{line}")?,
+        }
+    }
+    Ok(())
 }
 
 fn wait_resume_monitor(ops: &Operations, task_id: &str, session_id: &str) -> Result<()> {

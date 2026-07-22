@@ -17,6 +17,7 @@ pub fn render_card(
     area: Rect,
     focused: bool,
     hovered: bool,
+    dragging: bool,
 ) {
     let session_state = app.board.session_states.get(&task.id).copied();
     let border = if session_state == Some(SessionState::Crashed) {
@@ -92,15 +93,21 @@ pub fn render_card(
             app.theme.warn,
         )));
     }
+    // The card in flight is inverted and bold-bordered so the source of a drag
+    // stays visible while the cursor is off over the drop column.
+    let border_style = if dragging {
+        Style::default().fg(border).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(border)
+    };
+    let mut card_style = Style::default().bg(app.theme.bg).fg(app.theme.fg);
+    if dragging {
+        card_style = card_style.add_modifier(Modifier::REVERSED);
+    }
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .style(Style::default().bg(app.theme.bg).fg(app.theme.fg)),
-        area,
-    );
+        .border_style(border_style);
+    frame.render_widget(Paragraph::new(lines).block(block).style(card_style), area);
 }
 
 #[cfg(test)]

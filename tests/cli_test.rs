@@ -223,6 +223,112 @@ fn question_pipeline_via_cli() {
 }
 
 #[test]
+fn ask_form_posts_questions_from_yaml_file() {
+    let dir = board();
+    kanban(dir.path())
+        .args(["create", "Form me"])
+        .assert()
+        .success();
+
+    let form_path = dir.path().join("form.yaml");
+    std::fs::write(
+        &form_path,
+        "questions:\n  - prompt: Which backend?\n    options: [OAuth2, API key]\n  - prompt: Any constraints?\n",
+    )
+    .unwrap();
+
+    kanban(dir.path())
+        .args(["ask-form", "TASK-001", "--file"])
+        .arg(&form_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Posted 2 question(s) from form to TASK-001",
+        ))
+        .stdout(predicate::str::contains("Task has pending questions."));
+
+    kanban(dir.path())
+        .args(["questions", "TASK-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[question] Which backend?"))
+        .stdout(predicate::str::contains("variants: OAuth2, API key"))
+        .stdout(predicate::str::contains("[question] Any constraints?"));
+}
+
+#[test]
+fn ask_form_rejects_an_invalid_form() {
+    let dir = board();
+    kanban(dir.path())
+        .args(["create", "Bad form"])
+        .assert()
+        .success();
+
+    let form_path = dir.path().join("bad.yaml");
+    std::fs::write(&form_path, "questions: []\n").unwrap();
+
+    kanban(dir.path())
+        .args(["ask-form", "TASK-001", "--file"])
+        .arg(&form_path)
+        .assert()
+        .failure();
+
+    // Nothing was posted.
+    kanban(dir.path())
+        .args(["questions", "TASK-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No open messages."));
+}
+
+#[test]
+fn reject_and_unreject_quarantine_a_context_message() {
+    let dir = board();
+    kanban(dir.path())
+        .args(["create", "Reject me"])
+        .assert()
+        .success();
+
+    // MSG-001/002 are the seeded system/task messages, so this context lands
+    // on MSG-003.
+    kanban(dir.path())
+        .args(["context", "TASK-001", "poisoned note", "--source", "agent"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Context added to TASK-001"));
+
+    kanban(dir.path())
+        .args(["reject", "TASK-001", "MSG-003"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Message MSG-003 rejected on TASK-001",
+        ));
+
+    let raw = std::fs::read_to_string(dir.path().join(".kanban/threads/TASK-001.yaml")).unwrap();
+    assert!(raw.contains("status: rejected"));
+
+    kanban(dir.path())
+        .args(["reject", "TASK-001", "MSG-404"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Message MSG-404 not found on TASK-001",
+        ));
+
+    kanban(dir.path())
+        .args(["unreject", "TASK-001", "MSG-003"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Message MSG-003 restored on TASK-001",
+        ));
+
+    let raw = std::fs::read_to_string(dir.path().join(".kanban/threads/TASK-001.yaml")).unwrap();
+    assert!(!raw.contains("status: rejected"));
+}
+
+#[test]
 fn chain_set_show_clear() {
     let dir = board();
     kanban(dir.path())

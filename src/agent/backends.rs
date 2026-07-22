@@ -70,6 +70,11 @@ pub struct LaunchPlan {
     pub args: Vec<String>,
     pub prompt: String,
     pub log_file: PathBuf,
+    /// Machine transcript of the run (claude `--output-format stream-json`
+    /// JSONL), harvested at exit into an input-provenance manifest. `None` for
+    /// backends without a parseable transcript, whose stdout is teed straight
+    /// to `log_file` unchanged.
+    pub transcript_file: Option<PathBuf>,
     pub session_id: String,
     pub auto_complete_on_exit: bool,
     /// Interval for the wrapper's background heartbeat, derived from the
@@ -118,6 +123,11 @@ pub fn build_launch_plan(
         &prompt,
     );
 
+    let logs_dir = project_path.join(".kanban").join("logs");
+    // Both claude and opencode emit a parseable JSONL transcript on stdout.
+    let transcript_file = matches!(backend.as_str(), "claude" | "opencode")
+        .then(|| logs_dir.join(format!("{session_id}.transcript.jsonl")));
+
     Ok(LaunchPlan {
         backend,
         task_id: task.id.clone(),
@@ -125,10 +135,8 @@ pub fn build_launch_plan(
         model,
         args,
         prompt,
-        log_file: project_path
-            .join(".kanban")
-            .join("logs")
-            .join(format!("{session_id}.log")),
+        log_file: logs_dir.join(format!("{session_id}.log")),
+        transcript_file,
         session_id: session_id.to_string(),
         auto_complete_on_exit: auto_launch.auto_complete_on_exit,
         heartbeat_interval_secs,
@@ -187,7 +195,24 @@ fn backend_args(
     prompt: &str,
 ) -> Vec<String> {
     let mut args = match backend {
-        "claude" => vec!["--print".to_string()],
+        // stream-json + verbose makes claude emit one JSON event per line
+        // (init metadata, assistant text, tool_use, result) so the run's real
+        // inputs can be harvested; the wrapper reformats it back to human text
+        // for the log via `kanban format-stream`.
+        "claude" => vec![
+            "--print".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+        ],
+        // opencode emits one JSON event per line on stdout with `--format json`
+        // (tool_use/text/step_*), the same capture-and-reformat contract as
+        // claude, so its real inputs can be harvested too.
+        "opencode" => vec![
+            "run".to_string(),
+            "--format".to_string(),
+            "json".to_string(),
+        ],
         _ => vec!["run".to_string()],
     };
     args.extend(config.extra_args.clone());

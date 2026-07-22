@@ -150,8 +150,22 @@ fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
             )
         })
         .unwrap_or_default();
+    // The agent pipeline: `command | tee -a log`. For backends with a machine
+    // transcript (claude stream-json) the raw JSONL is captured to a separate
+    // file and reformatted to human text for the log by `kanban format-stream`,
+    // so the log stays readable while the transcript feeds provenance harvest.
+    // `PIPESTATUS[0]` is the agent command's status in both shapes (it stays
+    // the head of the pipeline).
+    let log_quoted = shell_quote(&plan.log_file.display().to_string());
+    let run_pipeline = match &plan.transcript_file {
+        Some(transcript) => format!(
+            "{command_line} 2>&1 | tee -a {} | {kanban_cmd} format-stream | tee -a {log_quoted}",
+            shell_quote(&transcript.display().to_string()),
+        ),
+        None => format!("{command_line} 2>&1 | tee -a {log_quoted}"),
+    };
     format!(
-        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; mkdir -p {}; {}{}{} 2>&1 | tee -a {}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",
+        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; mkdir -p {}; {}{}{run_pipeline}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",
         shell_quote(&project_path.display().to_string()),
         shell_quote(&plan.session_id),
         shell_quote(&plan.task_id),
@@ -166,8 +180,6 @@ fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
         ),
         heartbeat_loop,
         resolve_agent,
-        command_line,
-        shell_quote(&plan.log_file.display().to_string()),
         auto_segment,
         reconcile
     )
@@ -249,6 +261,7 @@ mod tests {
             args,
             prompt: "test prompt".to_string(),
             log_file: log_dir.join(format!("{session_id}.log")),
+            transcript_file: None,
             session_id: session_id.to_string(),
             auto_complete_on_exit: auto_complete,
             heartbeat_interval_secs: 100,
@@ -309,6 +322,39 @@ mod tests {
         assert!(
             output.status.success(),
             "bash -n rejected script with auto_complete_on_exit=true:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A plan with a transcript file (claude) reformats stdout through
+    /// `format-stream` and captures raw JSONL to the transcript, while keeping
+    /// the agent command at the head of the pipe (so `PIPESTATUS[0]` is its
+    /// exit code). Still parses under `bash -n`.
+    #[test]
+    fn wrapper_script_pipes_transcript_through_format_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = test_plan(
+            dir.path(),
+            "TASK-007",
+            "ses-transcript",
+            "/bin/echo",
+            vec!["hi".to_string()],
+            false,
+        );
+        plan.transcript_file = Some(dir.path().join("ses-transcript.transcript.jsonl"));
+        let script = wrapper_script(dir.path(), &plan);
+
+        assert!(script.contains("ses-transcript.transcript.jsonl"));
+        assert!(script.contains("format-stream"));
+        assert!(script.contains("status=${PIPESTATUS[0]}"));
+
+        let output = Command::new("bash")
+            .args(["-n", "-c", &script])
+            .output()
+            .expect("bash -n should run");
+        assert!(
+            output.status.success(),
+            "bash -n rejected transcript pipeline:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }

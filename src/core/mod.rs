@@ -1,3 +1,4 @@
+pub mod ask_form;
 pub mod compaction;
 pub mod config;
 pub mod context;
@@ -5,6 +6,7 @@ pub mod error;
 pub mod models;
 pub mod notifier;
 pub mod operations;
+pub mod provenance;
 pub mod session;
 pub mod storage;
 pub mod thread;

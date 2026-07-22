@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::core::error::Result;
-use crate::core::models::{Message, MessageKind, MessageRole};
+use crate::core::models::{Message, MessageKind, MessageRole, MessageStatus};
 use crate::core::storage::Storage;
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
@@ -68,20 +68,45 @@ impl ContextManager {
         source: &str,
         storage: &Storage,
     ) -> Result<()> {
-        self.thread_manager()?.post(
+        self.append_context_with_session(task_id, text, source, None, storage)
+    }
+
+    /// Post a `context` thread message with optional caller session provenance.
+    /// A session-specific origin is accepted only while that session still owns
+    /// the task, preventing a revoked agent from being attributed to its successor.
+    pub fn append_context_with_session(
+        &self,
+        task_id: &str,
+        text: &str,
+        source: &str,
+        session_id: Option<&str>,
+        storage: &Storage,
+    ) -> Result<()> {
+        let _guard = storage.lock()?;
+        let role = role_for_source(source);
+        let task = storage.load_task(task_id)?;
+        let origin = match role {
+            MessageRole::Agent => session_id
+                .filter(|session_id| {
+                    task.as_ref().and_then(|task| task.session.as_deref()) == Some(*session_id)
+                })
+                .map(|session_id| format!("agent:{session_id}"))
+                .or_else(|| Some("agent".to_string())),
+            MessageRole::Human => Some("human".to_string()),
+            MessageRole::System => Some("kanban".to_string()),
+        };
+        self.thread_manager()?.post_with_origin(
             task_id,
-            role_for_source(source),
+            role,
             MessageKind::Context,
             text.trim_matches('\n'),
             None,
             vec![],
             Some(source.to_string()),
+            origin,
         )?;
 
-        // Hold the board lock across load -> save so a concurrent status move
-        // (e.g. `kanban done`) can't interleave.
-        let _guard = storage.lock()?;
-        if let Some(mut task) = storage.load_task(task_id)? {
+        if let Some(mut task) = task {
             let context = self.gather_context(task_id, Some(&task))?;
             task.context_file = None;
             task.context_size = context.len() as u64;
@@ -98,10 +123,14 @@ impl ContextManager {
     ) -> Result<String> {
         let mut parts: Vec<String> = Vec::new();
 
-        // Live context lives in the thread as CONTEXT messages.
+        // Live context lives in the thread as CONTEXT messages. Rejected
+        // messages are quarantined: they stay in the thread for audit but are
+        // never fed back into the supply chain.
         for message in self
             .thread_manager()?
             .messages_of_kind(task_id, MessageKind::Context)?
+            .into_iter()
+            .filter(|message| message.status != MessageStatus::Rejected)
         {
             parts.push(Self::format_entry(&message));
         }

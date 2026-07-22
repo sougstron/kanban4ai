@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
-use crate::agent::{KanbanLauncher, resolve_launch_settings};
+use crate::agent::{KanbanLauncher, build_agent_prompt, resolve_launch_settings};
+use crate::core::ask_form::AskForm;
 use crate::core::config::Config;
 use crate::core::context::{ContextManager, role_for_source};
 use crate::core::error::{KanbanError, Result};
@@ -16,8 +17,11 @@ use crate::core::models::{
     Message, MessageKind, MessageRole, MessageStatus, SessionStatus, Task, TaskStatus,
 };
 use crate::core::notifier::{DesktopNotifier, NotificationConfig};
+use crate::core::provenance::{
+    self, ClaudeHarvester, InputManifest, OpencodeHarvester, TranscriptHarvester,
+};
 use crate::core::session::SessionManager;
-use crate::core::storage::{NewTask, Storage};
+use crate::core::storage::{NewTask, Storage, atomic_write_text};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 
@@ -83,6 +87,20 @@ pub enum AgentExitOutcome {
     /// The task was claimed for a resume session, but launching the agent
     /// failed; the new session was marked crashed.
     LaunchFailed(String),
+}
+
+impl AgentExitOutcome {
+    /// Short human-readable word for the `AgentStep` exit audit line.
+    fn label(&self) -> String {
+        match self {
+            AgentExitOutcome::Crashed => "Crashed".to_string(),
+            AgentExitOutcome::Closed => "Closed".to_string(),
+            AgentExitOutcome::Waiting => "Waiting".to_string(),
+            AgentExitOutcome::Resumed(session) => format!("Resumed({session})"),
+            AgentExitOutcome::ResumeExhausted => "ResumeExhausted".to_string(),
+            AgentExitOutcome::LaunchFailed(session) => format!("LaunchFailed({session})"),
+        }
+    }
 }
 
 enum RespawnOutcome {
@@ -631,18 +649,75 @@ impl Operations {
             };
 
             if is_agent && self.config.get_rule("user_only_review_to_done")? {
-                if task.status != TaskStatus::Review {
-                    let context = self.context_manager().get_context(task_id, &self.storage)?;
-                    if context.trim().is_empty() {
-                        return Err(KanbanError::Permission(
-                            "Agent cannot complete task without recording context".to_string(),
-                        ));
-                    }
-                    task.status = TaskStatus::Review;
-                } else {
+                if task.status == TaskStatus::Review {
                     return Ok(None);
                 }
+                self.require_current_agent_session(&task, session_id)?;
+                let context = self.context_manager().get_context(task_id, &self.storage)?;
+                if context.trim().is_empty() {
+                    return Err(KanbanError::Permission(
+                        "Agent cannot complete task without recording context".to_string(),
+                    ));
+                }
+
+                if let Some(command) = self.config.get_verification_command()? {
+                    let (exit_code, output_tail) =
+                        self.run_verification_command(&command, task_id, session_id)?;
+                    if exit_code != 0 && self.config.get_verification_block_on_failure()? {
+                        task.updated_at = timefmt::now();
+                        self.storage.save_task(&task)?;
+                        let body =
+                            format!("✗ gate failed code={exit_code} cmd={command}\n{output_tail}");
+                        if let Err(err) = self.thread_manager().and_then(|tm| {
+                            tm.post_with_origin(
+                                task_id,
+                                MessageRole::System,
+                                MessageKind::AgentStep,
+                                &body,
+                                None,
+                                vec![],
+                                Some("kanban".to_string()),
+                                Some("kanban".to_string()),
+                            )
+                        }) {
+                            eprintln!("Warning: failed to log gate failure for {}: {err}", task.id);
+                        }
+                        drop(_guard);
+                        self.session_manager().close_session(session_id)?;
+                        if let Ok(notifier) = self.notifier() {
+                            notifier.stranded(
+                                &task.id,
+                                &task.title,
+                                &format!(
+                                    "Verification gate failed (code {exit_code}); \
+                                     task stays In Progress."
+                                ),
+                            );
+                        }
+                        return Ok(Some(task));
+                    }
+                    let body = format!("✓ gate passed cmd={command}");
+                    if let Err(err) = self.thread_manager().and_then(|tm| {
+                        tm.post_with_origin(
+                            task_id,
+                            MessageRole::System,
+                            MessageKind::AgentStep,
+                            &body,
+                            None,
+                            vec![],
+                            Some("kanban".to_string()),
+                            Some("kanban".to_string()),
+                        )
+                    }) {
+                        eprintln!("Warning: failed to log gate pass for {}: {err}", task.id);
+                    }
+                }
+
+                task.status = TaskStatus::Review;
             } else {
+                if is_agent {
+                    self.require_current_agent_session(&task, session_id)?;
+                }
                 let Some(done) = self.move_task_to_done(&task)? else {
                     return Ok(None);
                 };
@@ -666,6 +741,51 @@ impl Operations {
         self.notify_completion(&task);
 
         Ok(Some(task))
+    }
+
+    /// Maximum number of characters from the verification command's combined
+    /// stdout/stderr that is stored in the gate-failed `AgentStep` message.
+    const VERIFICATION_OUTPUT_TAIL: usize = 2000;
+
+    /// Run the configured verification command in the project root and return
+    /// its exit code plus a tail of the combined output.
+    fn run_verification_command(
+        &self,
+        command: &str,
+        task_id: &str,
+        session_id: &str,
+    ) -> Result<(i32, String)> {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(self.project_path())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|err| {
+                KanbanError::Invalid(format!(
+                    "Failed to run verification command for {task_id}: {err}"
+                ))
+            })?;
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        let combined = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        let tail = combined
+            .chars()
+            .rev()
+            .take(Self::VERIFICATION_OUTPUT_TAIL)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        let tail = tail.trim().to_string();
+        if !output.status.success() {
+            eprintln!(
+                "Verification gate failed for {task_id} (session {session_id}): code {exit_code}"
+            );
+        }
+        Ok((exit_code, tail))
     }
 
     // ------------------------------------------------------------- chaining
@@ -725,10 +845,25 @@ impl Operations {
         source: &str,
         variants: Vec<String>,
     ) -> Result<Option<Task>> {
+        self.ask_question_for_session(task_id, question, source, None, variants)
+    }
+
+    pub fn ask_question_for_session(
+        &self,
+        task_id: &str,
+        question: &str,
+        source: &str,
+        session_id: Option<&str>,
+        variants: Vec<String>,
+    ) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
         let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
             return Ok(None);
         };
+
+        if let Some(session_id) = session_id {
+            self.require_current_agent_session(&task, session_id)?;
+        }
 
         tm.post(
             &task.id,
@@ -750,13 +885,58 @@ impl Operations {
         Ok(Some(task))
     }
 
+    /// Post every question in a validated [`AskForm`] as its own `question`
+    /// message, mapping each entry's `options` onto the message `variants`.
+    /// Locks the board once, saves the task once, and notifies once (with the
+    /// question count) so a large form does not fan out into N notifications.
+    /// Returns the updated task plus the number of questions posted.
+    pub fn ask_form(
+        &self,
+        task_id: &str,
+        form: &AskForm,
+        source: &str,
+        session_id: Option<&str>,
+    ) -> Result<Option<(Task, usize)>> {
+        let _guard = self.storage.lock()?;
+        let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
+            return Ok(None);
+        };
+
+        if let Some(session_id) = session_id {
+            self.require_current_agent_session(&task, session_id)?;
+        }
+
+        let role = role_for_source(source);
+        for question in &form.questions {
+            tm.post(
+                &task.id,
+                role,
+                MessageKind::Question,
+                &question.body(),
+                None,
+                question.options.clone(),
+                Some(source.to_string()),
+            )?;
+        }
+
+        let count = form.questions.len();
+        task.has_questions = tm.has_open_questions(&task.id)?;
+        task.updated_at = timefmt::now();
+        if self.config.get_rule("questions_go_to_review")? {
+            task.status = TaskStatus::Review;
+        }
+        self.storage.save_task(&task)?;
+        self.notify_question(&task, &format!("{count} question(s) via form"));
+        Ok(Some((task, count)))
+    }
+
     pub fn answer_question(
         &self,
         task_id: &str,
         question_ref: QuestionRef,
         answer: &str,
     ) -> Result<Option<Task>> {
-        let (mut task, tm) = {
+        let (mut task, tm, expected_session) = {
             let _guard = self.storage.lock()?;
             let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
                 return Ok(None);
@@ -781,7 +961,8 @@ impl Operations {
             task.has_questions = tm.has_open_questions(&task.id)?;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
-            (task, tm)
+            let expected_session = task.session.clone();
+            (task, tm, expected_session)
         };
 
         // Async interactive mode: once every open question is answered,
@@ -789,50 +970,204 @@ impl Operations {
         if task.interactive
             && task.status == TaskStatus::InProgress
             && !tm.has_open_questions(&task.id)?
-            && let Some(resumed) = self.resume_interactive_agent(&task.id)?
+            && let Some(resumed) =
+                self.resume_interactive_agent(&task.id, expected_session.as_deref())?
         {
             task = resumed;
         }
         Ok(Some(task))
     }
 
-    fn resume_interactive_agent(&self, task_id: &str) -> Result<Option<Task>> {
+    fn resume_interactive_agent(
+        &self,
+        task_id: &str,
+        expected_session: Option<&str>,
+    ) -> Result<Option<Task>> {
         if !self.auto_launch_enabled()? {
             return Ok(None);
         }
 
         let session_mgr = self.session_manager();
-        let (task, session_id) = {
+        {
             let _guard = self.storage.lock()?;
-            let Some(mut current) = self.storage.load_task(task_id)? else {
+            let Some(current) = self.storage.load_task(task_id)? else {
                 return Ok(None);
             };
             let tm = self.thread_manager()?;
             if !current.interactive
                 || current.status != TaskStatus::InProgress
                 || tm.has_open_questions(task_id)?
-                || current
-                    .session
-                    .as_deref()
-                    .is_some_and(|session| session_mgr.is_session_active(session))
+                || current.session.as_deref() != expected_session
             {
                 return Ok(None);
             }
+            if expected_session.is_some_and(|session| {
+                session_mgr.load_session(session).is_some_and(|record| {
+                    record.task_id == current.id
+                        && record.status == SessionStatus::Active
+                        && record.wait_until.is_none()
+                })
+            }) {
+                // `ask --wait` is still polling the answered message and wakes
+                // itself. Only a declared wait needs a replacement process.
+                return Ok(None);
+            }
+        }
 
-            let backend = self.resolve_backend(&current)?;
-            let session_id = format!("ses-{}-{}", backend, timefmt::now().format("%Y%m%d-%H%M%S"));
-            current.session = Some(session_id.clone());
-            current.updated_at = timefmt::now();
-            self.storage.save_task(&current)?;
-            session_mgr.link_named_session(&current.id, &session_id, &current.title)?;
-            (current, session_id)
+        self.revoke_in_progress_task(task_id, expected_session)
+    }
+
+    /// Replace the exact session currently assigned to an In Progress task.
+    /// The expected-session comparison fences concurrent answer, timer, exit,
+    /// and manual revoke paths so only one of them can install a successor.
+    pub fn revoke_in_progress_task(
+        &self,
+        task_id: &str,
+        expected_session: Option<&str>,
+    ) -> Result<Option<Task>> {
+        if let Some(session_id) = expected_session {
+            SessionManager::validate_session_id(session_id)?;
+        }
+
+        let session_mgr = self.session_manager();
+        let _guard = self.storage.lock()?;
+        let Some(mut task) = self.storage.load_task(task_id)? else {
+            return Ok(None);
         };
+        if task.status != TaskStatus::InProgress || task.session.as_deref() != expected_session {
+            return Ok(None);
+        }
 
-        if !self.launch_agent(&task.id, &session_id, false)? {
-            session_mgr.crash_session(&session_id)?;
+        if let Some(old_session) = expected_session {
+            let mut record = session_mgr.load_session(old_session);
+            if record
+                .as_ref()
+                .is_some_and(|session| session.task_id != task.id)
+            {
+                return Ok(None);
+            }
+            let process_already_gone = record.as_ref().is_none_or(|session| {
+                session.status != SessionStatus::Active || session.wait_exited
+            });
+            match crate::agent::kill_session(old_session) {
+                Ok(true) => {}
+                Ok(false) if process_already_gone => {}
+                Err(_) if process_already_gone => {}
+                Ok(false) | Err(_)
+                    if record.as_ref().is_some_and(|session| {
+                        session.status == SessionStatus::Active && session.wait_until.is_some()
+                    }) =>
+                {
+                    // A background fallback cannot be signalled safely. Make
+                    // its original timer irrelevant: as soon as the wrapper
+                    // exits, `agent-exit` observes an expired wait and performs
+                    // the normal expected-session respawn.
+                    let Some(session) = record.as_mut() else {
+                        return Err(KanbanError::Invalid(format!(
+                            "Session {old_session} disappeared during revoke"
+                        )));
+                    };
+                    session.wait_until = Some(timefmt::now() - chrono::Duration::seconds(1));
+                    session_mgr.save_session(session)?;
+                    self.thread_manager()?.post_with_origin(
+                        &task.id,
+                        MessageRole::System,
+                        MessageKind::Context,
+                        "Wake requested while the background agent was still exiting; resume immediately after its process ends.",
+                        None,
+                        vec![],
+                        Some("kanban".to_string()),
+                        Some("kanban".to_string()),
+                    )?;
+                    return Ok(Some(task));
+                }
+                Ok(false) => {
+                    return Err(KanbanError::Invalid(format!(
+                        "Cannot revoke active session {old_session}: its process is not hosted in tmux and has not exited"
+                    )));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        let backend = safe_session_component(&self.resolve_backend(&task)?);
+        let new_session_id = self.fresh_session_id(&backend);
+        session_mgr.link_named_session(&task.id, &new_session_id, &task.title)?;
+        if let Err(err) = self.thread_manager()?.post_with_origin(
+            &task.id,
+            MessageRole::System,
+            MessageKind::Context,
+            &format!(
+                "Session {} was revoked. Wake immediately on a fresh session and continue from the current thread context.",
+                expected_session.unwrap_or("none")
+            ),
+            None,
+            vec![],
+            Some("kanban".to_string()),
+            Some("kanban".to_string()),
+        ) {
+            session_mgr.unlink_session(&new_session_id);
+            return Err(err);
+        }
+        task.session = Some(new_session_id.clone());
+        task.auto_resumes = 0;
+        task.updated_at = timefmt::now();
+        if let Err(err) = self.storage.save_task(&task) {
+            session_mgr.unlink_session(&new_session_id);
+            return Err(err);
+        }
+        if let Some(old_session) = expected_session {
+            // Ownership has already moved and the old process is gone. A
+            // failed archival write must not strand the published successor.
+            let _ = session_mgr.close_session(old_session);
+        }
+
+        if self.auto_launch_enabled()? && !self.launch_agent(&task.id, &new_session_id, false)? {
+            session_mgr.crash_session(&new_session_id)?;
             return Ok(None);
         }
         Ok(Some(task))
+    }
+
+    /// Allocate under the board lock; suffixing makes wall-clock repetition
+    /// harmless and prevents an authority token from being overwritten.
+    fn fresh_session_id(&self, backend: &str) -> String {
+        let base = format!(
+            "ses-{}-{}",
+            backend,
+            timefmt::now().format("%Y%m%d-%H%M%S-%6f")
+        );
+        let mut candidate = base.clone();
+        let mut suffix = 2_u32;
+        while self
+            .session_manager()
+            .sessions_dir
+            .join(format!("{candidate}.yaml"))
+            .exists()
+        {
+            candidate = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        candidate
+    }
+
+    fn require_current_agent_session(&self, task: &Task, session_id: &str) -> Result<()> {
+        let valid = task.status == TaskStatus::InProgress
+            && task.session.as_deref() == Some(session_id)
+            && self
+                .session_manager()
+                .load_session(session_id)
+                .is_some_and(|session| {
+                    session.task_id == task.id && session.status == SessionStatus::Active
+                });
+        if valid {
+            Ok(())
+        } else {
+            Err(KanbanError::Permission(format!(
+                "Session {session_id} is no longer the active session of task {}",
+                task.id
+            )))
+        }
     }
 
     pub fn suggest_improvement(
@@ -860,6 +1195,41 @@ impl Operations {
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         Ok(Some(task))
+    }
+
+    /// Quarantine a thread message: `status = rejected` so it is excluded
+    /// from every future agent prompt and gathered context, while staying
+    /// visible in the thread for audit. `Ok(None)` when the task or message
+    /// doesn't exist.
+    pub fn reject_message(&self, task_id: &str, msg_id: &str) -> Result<Option<Message>> {
+        self.set_message_rejected(task_id, msg_id, true)
+    }
+
+    /// Undo [`Operations::reject_message`], restoring the message to `open`
+    /// so it is fed back into the supply chain.
+    pub fn unreject_message(&self, task_id: &str, msg_id: &str) -> Result<Option<Message>> {
+        self.set_message_rejected(task_id, msg_id, false)
+    }
+
+    fn set_message_rejected(
+        &self,
+        task_id: &str,
+        msg_id: &str,
+        rejected: bool,
+    ) -> Result<Option<Message>> {
+        let _guard = self.storage.lock()?;
+        let Some((_task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
+            return Ok(None);
+        };
+        if tm.get_message(task_id, msg_id)?.is_none() {
+            return Ok(None);
+        }
+        let status = if rejected {
+            MessageStatus::Rejected
+        } else {
+            MessageStatus::Open
+        };
+        Ok(Some(tm.resolve(task_id, msg_id, status)?))
     }
 
     pub fn list_open_messages(&self, task_id: &str) -> Result<Vec<Message>> {
@@ -906,6 +1276,9 @@ impl Operations {
             let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
                 return Ok(None);
             };
+            if let Some(session_id) = session_id {
+                self.require_current_agent_session(&task, session_id)?;
+            }
             let message = tm.post(
                 &task.id,
                 MessageRole::Agent,
@@ -929,6 +1302,11 @@ impl Operations {
         let started = Instant::now();
         loop {
             if let Some(session_id) = session_id {
+                let _guard = self.storage.lock()?;
+                let Some(task) = self.storage.load_task(task_id)? else {
+                    return Ok(None);
+                };
+                self.require_current_agent_session(&task, session_id)?;
                 session_mgr.heartbeat(session_id)?;
             }
 
@@ -996,7 +1374,7 @@ impl Operations {
             let tm = self.thread_manager()?;
             let edits = task.review_edits.trim().to_string();
             if !edits.is_empty() {
-                tm.post(
+                tm.post_with_origin(
                     &task.id,
                     MessageRole::Human,
                     MessageKind::ReviewEdit,
@@ -1004,6 +1382,7 @@ impl Operations {
                     None,
                     vec![],
                     Some("user".to_string()),
+                    Some("human".to_string()),
                 )?;
             }
 
@@ -1168,9 +1547,62 @@ impl Operations {
             return Ok(false);
         };
         let task = self.record_launch_settings(task)?;
+        self.log_launch_step(&task, session_id, revert);
         Ok(self
             .launcher
             .launch(self.project_path(), &task, session_id, revert))
+    }
+
+    /// Dump the assembled prompt to `.kanban/logs/<session>.prompt.txt` and
+    /// post an `AgentStep` audit entry recording this launch. Best-effort:
+    /// a failure here must never block the actual launch.
+    fn log_launch_step(&self, task: &Task, session_id: &str, revert: bool) {
+        let prompt_path = self
+            .storage
+            .logs_dir
+            .join(format!("{session_id}.prompt.txt"));
+        match build_agent_prompt(self.project_path(), task, session_id, revert) {
+            Ok(prompt) => {
+                if let Err(err) = atomic_write_text(&prompt_path, &prompt) {
+                    eprintln!(
+                        "Warning: failed to write prompt dump {}: {err}",
+                        prompt_path.display()
+                    );
+                }
+            }
+            Err(err) => {
+                eprintln!("Warning: failed to build prompt dump for {session_id}: {err}");
+            }
+        }
+
+        let rel_prompt_path = prompt_path
+            .strip_prefix(self.project_path())
+            .unwrap_or(&prompt_path)
+            .display();
+        let body = format!(
+            "▶ launch session={session_id} backend={} model={} effort={} agent={} revert={revert} → prompt: {rel_prompt_path}",
+            task.agent_backend.as_deref().unwrap_or("-"),
+            task.ai_model.as_deref().unwrap_or("-"),
+            task.ai_effort.as_deref().unwrap_or("-"),
+            task.agent_name.as_deref().unwrap_or("-"),
+        );
+        if let Err(err) = self.thread_manager().and_then(|tm| {
+            tm.post_with_origin(
+                &task.id,
+                MessageRole::System,
+                MessageKind::AgentStep,
+                &body,
+                None,
+                vec![],
+                Some("kanban".to_string()),
+                Some("kanban".to_string()),
+            )
+        }) {
+            eprintln!(
+                "Warning: failed to log agent launch step for {}: {err}",
+                task.id
+            );
+        }
     }
 
     /// Pin the backend, model, effort, and agent persona this launch resolved
@@ -1288,7 +1720,7 @@ impl Operations {
         let (task, note_text) = task;
 
         // `context` kind (not `system`) so the note reaches the relaunch prompt.
-        self.thread_manager()?.post(
+        self.thread_manager()?.post_with_origin(
             task_id,
             MessageRole::Agent,
             MessageKind::Context,
@@ -1299,6 +1731,7 @@ impl Operations {
             None,
             vec![],
             Some("agent".to_string()),
+            Some(format!("agent:{session_id}")),
         )?;
         if let Ok(notifier) = self.notifier() {
             notifier.waiting(
@@ -1438,7 +1871,96 @@ impl Operations {
     /// agent that ended its reply expecting a background notification that
     /// can never arrive. Such tasks are auto-resumed on a fresh session,
     /// bounded by the `max_auto_resumes` threshold.
+    ///
+    /// Wraps [`Self::reconcile_agent_exit_inner`] with a single `AgentStep`
+    /// audit post, skipped only when `session_id` never belonged to
+    /// `task_id` (a spurious/stale callback, nothing to log).
     pub fn reconcile_agent_exit(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        exit_status: i32,
+    ) -> Result<AgentExitOutcome> {
+        let session_matched_task = self
+            .session_manager()
+            .load_session(session_id)
+            .is_some_and(|session| session.task_id == task_id && session.id == session_id);
+        let outcome = self.reconcile_agent_exit_inner(task_id, session_id, exit_status)?;
+        if session_matched_task {
+            let manifest = self.harvest_provenance(task_id, session_id);
+            self.log_exit_step(
+                task_id,
+                session_id,
+                exit_status,
+                &outcome,
+                manifest.as_ref(),
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// Harvest the backend's machine transcript into an input-provenance
+    /// manifest (`.kanban/provenance/<session>.yaml`) recording what the run
+    /// actually consumed — files read into context (including via Bash), files
+    /// written, URLs, MCP calls. Best-effort and backend-gated: claude and
+    /// opencode emit a parseable transcript, and any failure is a soft warning
+    /// that never disturbs the reconciled exit.
+    fn harvest_provenance(&self, task_id: &str, session_id: &str) -> Option<InputManifest> {
+        let task = self.storage.load_task(task_id).ok().flatten()?;
+        let backend = resolve_launch_settings(&self.config.load().ok()?, &task)
+            .ok()?
+            .backend;
+        let transcript = self
+            .storage
+            .logs_dir
+            .join(format!("{session_id}.transcript.jsonl"));
+        if !transcript.exists() {
+            return None;
+        }
+        let prompt_path = self
+            .storage
+            .logs_dir
+            .join(format!("{session_id}.prompt.txt"));
+        let prompt_dump = prompt_path.exists().then(|| {
+            prompt_path
+                .strip_prefix(self.project_path())
+                .unwrap_or(&prompt_path)
+                .display()
+                .to_string()
+        });
+        let session = session_id.to_string();
+        let harvester: Box<dyn TranscriptHarvester> = match backend.as_str() {
+            "claude" => Box::new(ClaudeHarvester {
+                session_id: session,
+                prompt_dump,
+                root: self.project_path().to_path_buf(),
+            }),
+            "opencode" => Box::new(OpencodeHarvester {
+                session_id: session,
+                prompt_dump,
+                root: self.project_path().to_path_buf(),
+            }),
+            _ => return None,
+        };
+        match harvester.harvest(&transcript) {
+            Ok(manifest) => {
+                if let Err(err) =
+                    provenance::write_manifest(&self.storage.provenance_dir, &manifest)
+                {
+                    eprintln!(
+                        "Warning: failed to write provenance manifest for {session_id}: {err}"
+                    );
+                }
+                Some(manifest)
+            }
+            Err(err) => {
+                eprintln!("Warning: failed to harvest transcript for {session_id}: {err}");
+                None
+            }
+        }
+    }
+
+    fn reconcile_agent_exit_inner(
         &self,
         task_id: &str,
         session_id: &str,
@@ -1515,6 +2037,52 @@ impl Operations {
             RespawnOutcome::LaunchFailed(new_session) => {
                 Ok(AgentExitOutcome::LaunchFailed(new_session))
             }
+        }
+    }
+
+    /// Post an `AgentStep` audit entry summarizing an agent exit. Best-effort:
+    /// a failure here must never propagate — the exit has already been
+    /// reconciled by the time this runs.
+    fn log_exit_step(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        exit_status: i32,
+        outcome: &AgentExitOutcome,
+        manifest: Option<&InputManifest>,
+    ) {
+        let auto_resumes = self
+            .storage
+            .load_task(task_id)
+            .ok()
+            .flatten()
+            .map(|task| task.auto_resumes.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let mut body = format!(
+            "■ exit session={session_id} code={exit_status} outcome={} auto_resumes={auto_resumes}",
+            outcome.label()
+        );
+        // Reference the input-provenance manifest (never inline it — it is
+        // telemetry, kept out of the thread the next prompt is built from).
+        if let Some(manifest) = manifest {
+            body.push_str(&format!(
+                " {} → provenance: .kanban/provenance/{session_id}.yaml",
+                manifest.summary()
+            ));
+        }
+        if let Err(err) = self.thread_manager().and_then(|tm| {
+            tm.post_with_origin(
+                task_id,
+                MessageRole::System,
+                MessageKind::AgentStep,
+                &body,
+                None,
+                vec![],
+                Some("kanban".to_string()),
+                Some("kanban".to_string()),
+            )
+        }) {
+            eprintln!("Warning: failed to log agent exit step for {task_id}: {err}");
         }
     }
 
@@ -1637,13 +2205,9 @@ impl Operations {
             }
             let backend = self.resolve_backend(&task)?;
             let backend = safe_session_component(&backend);
-            let new_session_id = format!(
-                "ses-{}-{}",
-                backend,
-                timefmt::now().format("%Y%m%d-%H%M%S-%6f")
-            );
+            let new_session_id = self.fresh_session_id(&backend);
             // `context` kind so the relaunch prompt carries the reason.
-            self.thread_manager()?.post(
+            self.thread_manager()?.post_with_origin(
                 &task.id,
                 MessageRole::System,
                 MessageKind::Context,
@@ -1651,14 +2215,18 @@ impl Operations {
                 None,
                 vec![],
                 Some("kanban".to_string()),
+                Some("kanban".to_string()),
             )?;
             if let Some(attempt) = resume_attempt {
                 task.auto_resumes = attempt;
             }
             task.session = Some(new_session_id.clone());
             task.updated_at = timefmt::now();
-            self.storage.save_task(&task)?;
             session_mgr.link_named_session(&task.id, &new_session_id, &task.title)?;
+            if let Err(err) = self.storage.save_task(&task) {
+                session_mgr.unlink_session(&new_session_id);
+                return Err(err);
+            }
             new_session_id
         };
 
@@ -1681,6 +2249,46 @@ impl Operations {
     pub fn task_has_backups(&self, task_id: &str) -> bool {
         let backup_dir = self.backup_dir(task_id);
         backup_dir.is_dir() && dir_has_files(&backup_dir)
+    }
+
+    /// The gathered work-context for a task, exactly as fed into agent prompts.
+    /// Empty when the task carries no context.
+    pub fn task_context(&self, task_id: &str) -> Result<String> {
+        self.context_manager().get_context(task_id, &self.storage)
+    }
+
+    fn prompt_dump_path(&self, session_id: &str) -> PathBuf {
+        self.storage
+            .logs_dir
+            .join(format!("{session_id}.prompt.txt"))
+    }
+
+    /// Whether an assembled-prompt dump exists for any of this task's sessions.
+    /// A cheap existence check for the detail-view button (no file read).
+    pub fn task_has_prompt(&self, task: &Task) -> bool {
+        self.task_session_ids(task)
+            .iter()
+            .any(|session_id| self.prompt_dump_path(session_id).exists())
+    }
+
+    /// The most recent assembled-prompt dump recorded for this task across its
+    /// sessions, or `None` if the task has never been launched.
+    pub fn task_prompt(&self, task: &Task) -> Option<String> {
+        let mut newest: Option<(std::time::SystemTime, String)> = None;
+        for session_id in self.task_session_ids(task) {
+            let path = self.prompt_dump_path(&session_id);
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if newest.as_ref().is_some_and(|(seen, _)| *seen >= modified) {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(&path) {
+                newest = Some((modified, text));
+            }
+        }
+        newest.map(|(_, text)| text)
     }
 
     fn clear_task_backups(&self, task_id: &str) {

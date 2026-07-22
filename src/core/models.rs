@@ -74,12 +74,14 @@ string_enum!(MessageKind {
     Suggestion => "suggestion",
     Context => "context",
     ReviewEdit => "review_edit",
+    AgentStep => "agent_step",
 });
 
 string_enum!(MessageStatus {
     Open => "open",
     Answered => "answered",
     Resolved => "resolved",
+    Rejected => "rejected",
 });
 
 fn default_message_role() -> MessageRole {
@@ -128,6 +130,8 @@ pub struct Message {
         skip_serializing_if = "Option::is_none"
     )]
     pub resolved_at: Option<NaiveDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 impl Message {
@@ -152,6 +156,7 @@ impl Message {
             updated_at: now,
             answered_by_role: None,
             resolved_at: None,
+            origin: None,
         }
     }
 }

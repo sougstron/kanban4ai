@@ -1,0 +1,803 @@
+//! Input-provenance manifests (`.kanban/provenance/<session>.yaml`).
+//!
+//! The board records **what a delegated agent actually consumed**, harvested
+//! from the backend's own machine transcript rather than from any prose the
+//! agent chooses to write. Each agent run leaves an immutable manifest listing
+//! the external inputs it pulled — files read *into* context (including those
+//! opened through Bash, not only via the structured `Read` tool), files it
+//! wrote, URLs fetched, MCP tools called — so a poisoned supply-chain link is
+//! attributable to a concrete source. The emphasis is deliberately on *files*
+//! (what fed the model), not on the shell command strings themselves. This is
+//! telemetry, deliberately kept out of the task thread (which is what the
+//! *next* prompt is built from).
+//!
+//! Both supported backends emit a parseable JSONL transcript on stdout —
+//! claude via `--output-format stream-json`, opencode via `run --format json` —
+//! captured to `.kanban/logs/<session>.transcript.jsonl` by the launch wrapper.
+//! Their event shapes differ but never collide on the top-level `type`, so one
+//! [`render_stream_event`] renders both and each backend has its own harvester.
+//! A backend with no parseable transcript simply gets no manifest.
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::core::error::Result;
+use crate::core::models::{Message, MessageKind};
+use crate::core::storage::atomic_write_text;
+use crate::core::timefmt;
+
+/// The external inputs a single agent session consumed, in first-seen order.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputManifest {
+    pub session_id: String,
+    pub backend: String,
+    /// The backend's own session id (e.g. claude's `session_id`), when reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_session_id: Option<String>,
+    /// Repo-relative path of the deterministic prompt dump this run started from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_dump: Option<String>,
+    /// Files taken **into** context — the primary provenance signal. Read/Glob/
+    /// Grep tools plus files named by read-class shell commands (`cat`, `sed -n`,
+    /// `grep <pat> file`, …), so files pulled in through Bash count too, not just
+    /// the ones opened via a structured tool.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reads: Vec<String>,
+    /// Files the run **produced**: Edit/Write/patch tools and shell redirect
+    /// targets (`> out`, `tee out`, `sed -i file`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writes: Vec<String>,
+    /// External network inputs: WebFetch URLs and `search:<query>` for WebSearch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub urls: Vec<String>,
+    /// MCP tools invoked, as `server:tool`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<String>,
+    pub generated_at: String,
+}
+
+impl InputManifest {
+    /// Compact `reads=.. writes=.. urls=.. mcp=..` summary for audit lines.
+    pub fn summary(&self) -> String {
+        format!(
+            "reads={} writes={} urls={} mcp={}",
+            self.reads.len(),
+            self.writes.len(),
+            self.urls.len(),
+            self.mcp.len(),
+        )
+    }
+}
+
+/// Turn a backend transcript into an [`InputManifest`].
+pub trait TranscriptHarvester {
+    fn harvest(&self, transcript: &Path) -> Result<InputManifest>;
+}
+
+/// Harvester for claude's `--output-format stream-json` JSONL transcript.
+pub struct ClaudeHarvester {
+    pub session_id: String,
+    pub prompt_dump: Option<String>,
+    /// Repo root, used to canonicalize recorded paths to repo-relative form.
+    pub root: PathBuf,
+}
+
+impl TranscriptHarvester for ClaudeHarvester {
+    fn harvest(&self, transcript: &Path) -> Result<InputManifest> {
+        let raw = std::fs::read_to_string(transcript)?;
+        let mut manifest = InputManifest {
+            session_id: self.session_id.clone(),
+            backend: "claude".to_string(),
+            prompt_dump: self.prompt_dump.clone(),
+            generated_at: timefmt::format(&timefmt::now()),
+            ..InputManifest::default()
+        };
+        for line in raw.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue; // stderr noise or partial lines — ignore for the manifest
+            };
+            match value.get("type").and_then(Value::as_str) {
+                Some("system") if value.get("subtype").and_then(Value::as_str) == Some("init") => {
+                    manifest.backend_session_id = value
+                        .get("session_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                Some("assistant") => {
+                    if let Some(content) = value
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                        .and_then(Value::as_array)
+                    {
+                        for block in content {
+                            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                                record_claude_tool_use(&mut manifest, block);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        canonicalize_paths(&mut manifest.reads, &self.root);
+        canonicalize_paths(&mut manifest.writes, &self.root);
+        Ok(manifest)
+    }
+}
+
+/// Harvester for opencode's `run --format json` JSONL transcript. Tool calls
+/// arrive as `{"type":"tool_use","sessionID":..,"part":{"tool":..,"state":{"input":..}}}`;
+/// there is no init event, so the backend session id is read from the first
+/// event that carries `sessionID`.
+pub struct OpencodeHarvester {
+    pub session_id: String,
+    pub prompt_dump: Option<String>,
+    /// Repo root, used to canonicalize recorded paths to repo-relative form.
+    pub root: PathBuf,
+}
+
+impl TranscriptHarvester for OpencodeHarvester {
+    fn harvest(&self, transcript: &Path) -> Result<InputManifest> {
+        let raw = std::fs::read_to_string(transcript)?;
+        let mut manifest = InputManifest {
+            session_id: self.session_id.clone(),
+            backend: "opencode".to_string(),
+            prompt_dump: self.prompt_dump.clone(),
+            generated_at: timefmt::format(&timefmt::now()),
+            ..InputManifest::default()
+        };
+        for line in raw.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if manifest.backend_session_id.is_none()
+                && let Some(session) = value.get("sessionID").and_then(Value::as_str)
+            {
+                manifest.backend_session_id = Some(session.to_string());
+            }
+            if value.get("type").and_then(Value::as_str) == Some("tool_use")
+                && let Some(part) = value.get("part")
+            {
+                record_opencode_tool_use(&mut manifest, part);
+            }
+        }
+        canonicalize_paths(&mut manifest.reads, &self.root);
+        canonicalize_paths(&mut manifest.writes, &self.root);
+        Ok(manifest)
+    }
+}
+
+/// Persist a manifest to `provenance_dir/<session>.yaml`.
+pub fn write_manifest(provenance_dir: &Path, manifest: &InputManifest) -> Result<()> {
+    std::fs::create_dir_all(provenance_dir)?;
+    let path = provenance_dir.join(format!("{}.yaml", manifest.session_id));
+    atomic_write_text(&path, &serde_yaml_ng::to_string(manifest)?)
+}
+
+/// Load a session's manifest if it exists (the TUI provenance panel).
+pub fn load_manifest(provenance_dir: &Path, session_id: &str) -> Option<InputManifest> {
+    let raw = std::fs::read_to_string(provenance_dir.join(format!("{session_id}.yaml"))).ok()?;
+    serde_yaml_ng::from_str(&raw).ok()
+}
+
+/// Every input manifest referenced by a task's thread, in first-seen order.
+/// `agent_step` audit lines carry `session=<id>`; each distinct session's
+/// manifest is loaded once. Sessions without a manifest (non-claude backends,
+/// crashes before any tool call) are simply absent.
+pub fn collect_for_thread(provenance_dir: &Path, messages: &[Message]) -> Vec<InputManifest> {
+    let mut seen = std::collections::HashSet::new();
+    let mut manifests = Vec::new();
+    for message in messages {
+        if message.kind != MessageKind::AgentStep {
+            continue;
+        }
+        for session in message
+            .body
+            .split_whitespace()
+            .filter_map(|token| token.strip_prefix("session="))
+        {
+            if seen.insert(session.to_string())
+                && let Some(manifest) = load_manifest(provenance_dir, session)
+            {
+                manifests.push(manifest);
+            }
+        }
+    }
+    manifests
+}
+
+/// Render harvested manifests as the plain text shown in the TUI inputs popup
+/// (opened with `v`): one block per agent run listing the files it read and
+/// wrote, URLs fetched, and MCP calls. Terminal-safety sanitization happens at
+/// render time in the text pager, so this stays plain text. Empty when no run
+/// left a manifest.
+pub fn render_manifests(manifests: &[InputManifest]) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for manifest in manifests {
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!(
+            "session {} [{}] {}",
+            manifest.session_id,
+            manifest.backend,
+            manifest.summary()
+        ));
+        for (label, values) in [
+            ("read", &manifest.reads),
+            ("wrote", &manifest.writes),
+            ("url", &manifest.urls),
+            ("mcp", &manifest.mcp),
+        ] {
+            for value in values {
+                lines.push(format!("  {label:<5} {value}"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Render one backend stream event (claude or opencode) as human-readable log
+/// text, or `None` for events with nothing worth showing. Callers pass non-JSON
+/// lines through untouched; this only decides recognized JSON events. The two
+/// backends' `type` values are disjoint, so a single match handles both.
+pub fn render_stream_event(value: &Value) -> Option<String> {
+    match value.get("type").and_then(Value::as_str)? {
+        // claude
+        "assistant" => {
+            let content = value.get("message")?.get("content")?.as_array()?;
+            let mut out = String::new();
+            for block in content {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                out.push_str(text);
+                                out.push('\n');
+                            }
+                        }
+                    }
+                    Some("tool_use") => {
+                        out.push_str("  → ");
+                        out.push_str(&claude_tool_summary(block));
+                        out.push('\n');
+                    }
+                    _ => {}
+                }
+            }
+            let out = out.trim_end();
+            (!out.is_empty()).then(|| out.to_string())
+        }
+        "result" => value
+            .get("result")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|result| !result.is_empty())
+            .map(str::to_string),
+        // opencode
+        "text" => value
+            .get("part")?
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
+        "tool_use" => value
+            .get("part")
+            .map(|part| format!("  → {}", opencode_tool_summary(part))),
+        _ => None,
+    }
+}
+
+/// `Read src/x.rs`, `Bash cargo test`, `mcp github:list_prs`, …
+fn claude_tool_summary(block: &Value) -> String {
+    let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+    if let Some(server_tool) = name.strip_prefix("mcp__") {
+        return format!("mcp {}", server_tool.replacen("__", ":", 1));
+    }
+    let input = block.get("input").cloned().unwrap_or(Value::Null);
+    match str_field(
+        &input,
+        &[
+            "file_path",
+            "notebook_path",
+            "path",
+            "url",
+            "query",
+            "command",
+            "pattern",
+        ],
+    ) {
+        Some(detail) => format!("{name} {detail}"),
+        None => name.to_string(),
+    }
+}
+
+/// `read src/x.rs`, `bash cargo test`, `webfetch https://…`, …
+fn opencode_tool_summary(part: &Value) -> String {
+    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+    let input = part
+        .get("state")
+        .and_then(|state| state.get("input"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    match str_field(
+        &input,
+        &["filePath", "file_path", "path", "url", "command", "pattern"],
+    ) {
+        Some(detail) => format!("{tool} {detail}"),
+        None => tool.to_string(),
+    }
+}
+
+fn record_claude_tool_use(manifest: &mut InputManifest, block: &Value) {
+    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+    if let Some(server_tool) = name.strip_prefix("mcp__") {
+        push_unique(&mut manifest.mcp, server_tool.replacen("__", ":", 1));
+        return;
+    }
+    let input = block.get("input").cloned().unwrap_or(Value::Null);
+    match name {
+        "Read" | "NotebookRead" => {
+            if let Some(path) = str_field(&input, &["file_path", "notebook_path", "path"]) {
+                push_unique(&mut manifest.reads, path);
+            }
+        }
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
+            if let Some(path) = str_field(&input, &["file_path", "notebook_path", "path"]) {
+                push_unique(&mut manifest.writes, path);
+            }
+        }
+        "Glob" | "Grep" => {
+            if let Some(path) = str_field(&input, &["path"]) {
+                push_unique(&mut manifest.reads, path);
+            } else if let Some(pattern) = str_field(&input, &["pattern"]) {
+                push_unique(&mut manifest.reads, format!("pattern:{pattern}"));
+            }
+        }
+        "WebFetch" => {
+            if let Some(url) = str_field(&input, &["url"]) {
+                push_unique(&mut manifest.urls, url);
+            }
+        }
+        "WebSearch" => {
+            if let Some(query) = str_field(&input, &["query"]) {
+                push_unique(&mut manifest.urls, format!("search:{query}"));
+            }
+        }
+        "Bash" => {
+            if let Some(command) = str_field(&input, &["command"]) {
+                record_bash_files(manifest, &command);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// opencode tool names are lowercase and its inputs use `filePath`. MCP/plugin
+/// tools are not namespaced (`mcp__…`) as in claude — they surface as flat
+/// names (`websearch_web_search_exa`, `playwright_browser_navigate`,
+/// `ssh-mcp_exec`, …). So the built-in toolset is classified explicitly and
+/// anything outside it is treated as an external capability recorded under
+/// `mcp`, which is exactly the supply-chain link worth auditing.
+fn record_opencode_tool_use(manifest: &mut InputManifest, part: &Value) {
+    let tool = part.get("tool").and_then(Value::as_str).unwrap_or("");
+    let input = part
+        .get("state")
+        .and_then(|state| state.get("input"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    match tool {
+        "read" => {
+            if let Some(path) = str_field(&input, &["filePath", "file_path", "path"]) {
+                push_unique(&mut manifest.reads, path);
+            }
+        }
+        "edit" | "write" | "patch" | "apply_patch" => {
+            if let Some(path) = str_field(&input, &["filePath", "file_path", "path"]) {
+                push_unique(&mut manifest.writes, path);
+            }
+        }
+        "glob" | "grep" | "list" => {
+            if let Some(path) = str_field(&input, &["path"]) {
+                push_unique(&mut manifest.reads, path);
+            } else if let Some(pattern) = str_field(&input, &["pattern"]) {
+                push_unique(&mut manifest.reads, format!("pattern:{pattern}"));
+            }
+        }
+        "webfetch" => {
+            if let Some(url) = str_field(&input, &["url"]) {
+                push_unique(&mut manifest.urls, url);
+            }
+        }
+        "bash" => {
+            if let Some(command) = str_field(&input, &["command"]) {
+                record_bash_files(manifest, &command);
+            }
+        }
+        // Built-in tools that consume no external supply-chain input.
+        "todowrite" | "todoread" | "task" | "delegate_task" | "lsp_diagnostics"
+        | "background_output" | "question" | "skill" | "invalid" | "webfetch_format" => {}
+        // Any other tool is an external plugin/MCP capability.
+        other if !other.is_empty() => push_unique(&mut manifest.mcp, other.to_string()),
+        _ => {}
+    }
+}
+
+/// Shell commands whose file operands enter the model's context. The named
+/// files are recorded as `reads`, putting Bash-driven file access on the same
+/// footing as the structured `Read` tool.
+const BASH_READ_CMDS: &[&str] = &[
+    "cat", "head", "tail", "tac", "nl", "bat", "less", "more", "grep", "egrep", "fgrep", "rg",
+    "ag", "ack", "sed", "awk", "diff", "xxd", "od", "hexdump", "strings",
+];
+
+/// Commands whose first non-flag operand is a pattern/script, not a file
+/// (`grep <pat> file`, `sed <script> file`, `awk <prog> file`).
+const BASH_PATTERN_FIRST: &[&str] = &["grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk"];
+
+/// Mine a shell command line for the concrete files it touches: read-class
+/// commands (`cat`, `sed -n`, `grep <pat> file`, …) contribute `reads`, and
+/// redirect / in-place targets (`> out`, `tee out`, `sed -i file`) contribute
+/// `writes`. Best-effort: this is a heuristic tokenizer, not a shell parser, so
+/// it favours precision (skip anything ambiguous) over catching every case. The
+/// env-guard segment opencode prepends (`export CI=…`) is not read-class and so
+/// contributes nothing on its own.
+fn record_bash_files(manifest: &mut InputManifest, command: &str) {
+    // Split the line into pipeline/sequence segments; each is one simple command.
+    let normalized = command
+        .replace("&&", "\n")
+        .replace("||", "\n")
+        .replace([';', '|'], "\n");
+    for segment in normalized.lines() {
+        record_bash_segment(manifest, segment);
+    }
+}
+
+fn record_bash_segment(manifest: &mut InputManifest, segment: &str) {
+    let tokens: Vec<&str> = segment.split_whitespace().collect();
+    let Some((&head, rest)) = tokens.split_first() else {
+        return;
+    };
+    let cmd = head.rsplit('/').next().unwrap_or(head);
+    let read_class = BASH_READ_CMDS.contains(&cmd);
+    let is_tee = cmd == "tee";
+    // `sed -i` / `--in-place` rewrites its operand rather than reading it.
+    let in_place = cmd == "sed"
+        && rest
+            .iter()
+            .any(|t| *t == "-i" || t.starts_with("--in-place"));
+    let mut pattern_pending = BASH_PATTERN_FIRST.contains(&cmd);
+
+    let mut i = 0;
+    while i < rest.len() {
+        let tok = rest[i];
+        match tok {
+            ">" | ">>" | "1>" | "2>" | "&>" => {
+                if let Some(path) = rest.get(i + 1).and_then(|t| clean_path(t)) {
+                    push_unique(&mut manifest.writes, path);
+                }
+                i += 2;
+                continue;
+            }
+            "<" => {
+                if let Some(path) = rest.get(i + 1).and_then(|t| clean_path(t)) {
+                    push_unique(&mut manifest.reads, path);
+                }
+                i += 2;
+                continue;
+            }
+            _ if tok.starts_with('-') => {
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        // A bare operand of a read-class command.
+        if pattern_pending {
+            pattern_pending = false; // this operand is the search pattern/script
+            i += 1;
+            continue;
+        }
+        if let Some(path) = clean_path(tok) {
+            if is_tee || in_place {
+                push_unique(&mut manifest.writes, path);
+            } else if read_class {
+                push_unique(&mut manifest.reads, path);
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Accept a token as a concrete file path, or reject it. Rejects flags, shell
+/// expansions/globs/subshells, and non-path words, so only real filenames land
+/// in the manifest.
+fn clean_path(token: &str) -> Option<String> {
+    let token = token.trim_matches(|c| c == '"' || c == '\'');
+    if token.is_empty()
+        || token == "."
+        || token == ".."
+        || token == "/dev/null"
+        || token.contains(['$', '*', '`', '?'])
+    {
+        return None;
+    }
+    // Something path-shaped: a directory separator or a filename with an extension.
+    (token.contains('/') || token.contains('.')).then(|| token.to_string())
+}
+
+fn str_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|found| !found.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn push_unique(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+/// Reduce a recorded read/write path to a single canonical repo-relative
+/// spelling. Different tools name the same file differently — the structured
+/// `Read` tool emits absolute paths while Bash-mined operands (`sed`, `grep`,
+/// `cat`) are repo-relative — so without this the same file lands twice under
+/// two spellings. Absolute paths under `root` are made relative; a leading
+/// `./` and any trailing `/` (e.g. a recursive-grep directory root like `src/`)
+/// are stripped. `pattern:…` sentinels are not paths and pass through unchanged.
+fn normalize_read_write_path(raw: &str, root: &Path) -> String {
+    if raw.starts_with("pattern:") {
+        return raw.to_string();
+    }
+    let path = Path::new(raw);
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let text = rel.to_string_lossy();
+    let text = text.strip_prefix("./").unwrap_or(&text);
+    text.trim_end_matches('/').to_string()
+}
+
+/// Normalize every entry to its canonical repo-relative form, then dedupe while
+/// preserving first-seen order (same contract as [`push_unique`]).
+fn canonicalize_paths(list: &mut Vec<String>, root: &Path) {
+    let mut seen = std::collections::HashSet::new();
+    let mut canonical = Vec::with_capacity(list.len());
+    for entry in list.drain(..) {
+        let normalized = normalize_read_write_path(&entry, root);
+        if seen.insert(normalized.clone()) {
+            canonical.push(normalized);
+        }
+    }
+    *list = canonical;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TRANSCRIPT: &str = r#"
+{"type":"system","subtype":"init","session_id":"claude-abc-123","tools":["Read"],"mcp_servers":[{"name":"github"}]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Looking at the code."},{"type":"tool_use","name":"Read","input":{"file_path":"src/core/operations.rs"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","content":"..."}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"WebFetch","input":{"url":"https://example.com/doc"}},{"type":"tool_use","name":"Read","input":{"file_path":"src/core/operations.rs"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/core/config.rs"}},{"type":"tool_use","name":"Bash","input":{"command":"sed -n '1,40p' src/agent/prompt.rs && cat README.md > out.txt"}},{"type":"tool_use","name":"mcp__github__list_prs","input":{"state":"open"}}]}}
+not json at all
+{"type":"result","subtype":"success","result":"done"}
+"#;
+
+    fn write_transcript(text: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ses.transcript.jsonl"), text).unwrap();
+        dir
+    }
+
+    #[test]
+    fn harvests_files_urls_commands_mcp() {
+        let dir = write_transcript(TRANSCRIPT);
+        let harvester = ClaudeHarvester {
+            session_id: "ses-x".to_string(),
+            prompt_dump: Some(".kanban/logs/ses-x.prompt.txt".to_string()),
+            root: PathBuf::from("/repo"),
+        };
+        let manifest = harvester
+            .harvest(&dir.path().join("ses.transcript.jsonl"))
+            .unwrap();
+
+        assert_eq!(manifest.session_id, "ses-x");
+        assert_eq!(manifest.backend, "claude");
+        assert_eq!(
+            manifest.backend_session_id.as_deref(),
+            Some("claude-abc-123")
+        );
+        // Read appears twice but is deduped and order-preserving; the Bash
+        // `sed -n … prompt.rs` file is mined into reads (its `1,40p` script is
+        // skipped), while the `> out.txt` redirect and the Edit are writes.
+        assert_eq!(
+            manifest.reads,
+            vec!["src/core/operations.rs", "src/agent/prompt.rs", "README.md"]
+        );
+        assert_eq!(manifest.writes, vec!["src/core/config.rs", "out.txt"]);
+        assert_eq!(manifest.urls, vec!["https://example.com/doc"]);
+        assert_eq!(manifest.mcp, vec!["github:list_prs"]);
+        assert_eq!(manifest.summary(), "reads=3 writes=2 urls=1 mcp=1");
+    }
+
+    #[test]
+    fn bash_file_mining_classifies_reads_writes_and_skips_noise() {
+        let mut manifest = InputManifest::default();
+        // env-guard preamble contributes nothing; cat/grep operands are reads;
+        // the grep pattern and bare flags are skipped; redirects are writes.
+        record_bash_files(
+            &mut manifest,
+            "export CI=true EDITOR=:; cat src/a.rs | grep -n TODO src/b.rs",
+        );
+        record_bash_files(&mut manifest, "sed -i 's/x/y/' src/c.rs");
+        record_bash_files(&mut manifest, "cargo build --release --locked");
+        record_bash_files(&mut manifest, "git status --short");
+
+        assert_eq!(manifest.reads, vec!["src/a.rs", "src/b.rs"]);
+        assert_eq!(manifest.writes, vec!["src/c.rs"]);
+        // Pure build/VCS commands name no files, so they leave no trace.
+        assert!(manifest.urls.is_empty() && manifest.mcp.is_empty());
+    }
+
+    #[test]
+    fn absolute_and_relative_spellings_of_one_file_collapse() {
+        // Reproduces the TASK-145 defect: the Read tool names files by absolute
+        // path while Bash-mined `sed`/`grep` operands are repo-relative, so the
+        // same file was counted twice. After canonicalization it appears once as
+        // repo-relative, and a recursive-grep directory root (`src/`) loses its
+        // trailing slash rather than masquerading as a distinct file.
+        let transcript = r#"
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"grep -rni drag src/"}},{"type":"tool_use","name":"Read","input":{"file_path":"/repo/src/tui/board.rs"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"sed -n '1,20p' src/tui/board.rs"}},{"type":"tool_use","name":"Edit","input":{"file_path":"/repo/src/tui/board.rs"}}]}}
+"#;
+        let dir = write_transcript(transcript);
+        let manifest = ClaudeHarvester {
+            session_id: "ses-dup".to_string(),
+            prompt_dump: None,
+            root: PathBuf::from("/repo"),
+        }
+        .harvest(&dir.path().join("ses.transcript.jsonl"))
+        .unwrap();
+
+        assert_eq!(manifest.reads, vec!["src", "src/tui/board.rs"]);
+        assert_eq!(manifest.writes, vec!["src/tui/board.rs"]);
+        assert_eq!(manifest.summary(), "reads=2 writes=1 urls=0 mcp=0");
+    }
+
+    #[test]
+    fn manifest_round_trips_through_yaml() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = InputManifest {
+            session_id: "ses-y".to_string(),
+            backend: "claude".to_string(),
+            reads: vec!["a.rs".to_string()],
+            generated_at: "2026-07-21T00:00:00".to_string(),
+            ..InputManifest::default()
+        };
+        write_manifest(dir.path(), &manifest).unwrap();
+        let loaded = load_manifest(dir.path(), "ses-y").unwrap();
+        assert_eq!(loaded, manifest);
+        assert!(loaded.urls.is_empty());
+    }
+
+    #[test]
+    fn renders_assistant_text_and_tool_lines() {
+        let value: Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Hi"},{"type":"tool_use","name":"Read","input":{"file_path":"a.rs"}}]}}"#,
+        )
+        .unwrap();
+        let rendered = render_stream_event(&value).unwrap();
+        assert!(rendered.contains("Hi"));
+        assert!(rendered.contains("→ Read a.rs"));
+    }
+
+    #[test]
+    fn drops_uninteresting_events() {
+        let value: Value = serde_json::from_str(r#"{"type":"system","subtype":"init"}"#).unwrap();
+        assert_eq!(render_stream_event(&value), None);
+    }
+
+    const OPENCODE_TRANSCRIPT: &str = r#"
+{"type":"step_start","sessionID":"ses_abc","part":{"type":"step-start"}}
+{"type":"text","sessionID":"ses_abc","part":{"type":"text","text":"Reading files."}}
+{"type":"tool_use","sessionID":"ses_abc","part":{"type":"tool","tool":"read","state":{"status":"completed","input":{"filePath":"src/main.rs"}}}}
+{"type":"tool_use","sessionID":"ses_abc","part":{"type":"tool","tool":"webfetch","state":{"input":{"url":"https://example.com/doc"}}}}
+{"type":"tool_use","sessionID":"ses_abc","part":{"type":"tool","tool":"bash","state":{"input":{"command":"cat docs/spec.md"}}}}
+{"type":"tool_use","sessionID":"ses_abc","part":{"type":"tool","tool":"write","state":{"input":{"filePath":"src/out.rs"}}}}
+{"type":"tool_use","sessionID":"ses_abc","part":{"type":"tool","tool":"todowrite","state":{"input":{"todos":[]}}}}
+{"type":"tool_use","sessionID":"ses_abc","part":{"type":"tool","tool":"playwright_browser_navigate","state":{"input":{"url":"https://ex.com"}}}}
+{"type":"step_finish","sessionID":"ses_abc","part":{"type":"step-finish"}}
+"#;
+
+    #[test]
+    fn opencode_harvester_classifies_builtin_and_plugin_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ses.transcript.jsonl"), OPENCODE_TRANSCRIPT).unwrap();
+        let manifest = OpencodeHarvester {
+            session_id: "ses-oc".to_string(),
+            prompt_dump: None,
+            root: PathBuf::from("/repo"),
+        }
+        .harvest(&dir.path().join("ses.transcript.jsonl"))
+        .unwrap();
+
+        assert_eq!(manifest.backend, "opencode");
+        assert_eq!(manifest.backend_session_id.as_deref(), Some("ses_abc"));
+        // read tool + the `cat docs/spec.md` bash file are reads; write is a write.
+        assert_eq!(manifest.reads, vec!["src/main.rs", "docs/spec.md"]);
+        assert_eq!(manifest.writes, vec!["src/out.rs"]);
+        assert_eq!(manifest.urls, vec!["https://example.com/doc"]);
+        // todowrite is a no-op input; the unknown plugin tool is an external link.
+        assert_eq!(manifest.mcp, vec!["playwright_browser_navigate"]);
+    }
+
+    #[test]
+    fn renders_opencode_text_and_tool_events() {
+        let text: Value =
+            serde_json::from_str(r#"{"type":"text","part":{"type":"text","text":"Hi there"}}"#)
+                .unwrap();
+        assert_eq!(render_stream_event(&text).as_deref(), Some("Hi there"));
+
+        let tool: Value = serde_json::from_str(
+            r#"{"type":"tool_use","part":{"type":"tool","tool":"read","state":{"input":{"filePath":"a.rs"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(render_stream_event(&tool).as_deref(), Some("  → read a.rs"));
+
+        let step: Value = serde_json::from_str(r#"{"type":"step_finish","part":{}}"#).unwrap();
+        assert_eq!(render_stream_event(&step), None);
+    }
+
+    #[test]
+    fn collect_for_thread_loads_referenced_manifests() {
+        use crate::core::models::{Message, MessageKind, MessageRole};
+
+        let dir = tempfile::tempdir().unwrap();
+        write_manifest(
+            dir.path(),
+            &InputManifest {
+                session_id: "ses-1".to_string(),
+                backend: "claude".to_string(),
+                reads: vec!["a.rs".to_string()],
+                generated_at: "t".to_string(),
+                ..InputManifest::default()
+            },
+        )
+        .unwrap();
+
+        let step = Message::new(
+            "MSG-001",
+            MessageRole::System,
+            MessageKind::AgentStep,
+            "■ exit session=ses-1 code=0 outcome=Closed",
+        );
+        // A non-step message referencing a session must be ignored, and a step
+        // for a session with no manifest on disk must be skipped silently.
+        let noise = Message::new(
+            "MSG-002",
+            MessageRole::Agent,
+            MessageKind::Context,
+            "worked on session=ses-999",
+        );
+        let missing = Message::new(
+            "MSG-003",
+            MessageRole::System,
+            MessageKind::AgentStep,
+            "▶ launch session=ses-2 backend=opencode",
+        );
+
+        let manifests = collect_for_thread(dir.path(), &[step, noise, missing]);
+        assert_eq!(manifests.len(), 1);
+        assert_eq!(manifests[0].session_id, "ses-1");
+    }
+}

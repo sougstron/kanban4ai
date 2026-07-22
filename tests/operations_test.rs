@@ -355,6 +355,79 @@ fn agent_done_requires_context_then_moves_to_review() {
     );
 }
 
+fn write_verification_config(project: &Path, command: &str, block_on_failure: bool) {
+    let mut config = fs::read_to_string(project.join(".kanban/config.yaml")).unwrap();
+    config.push_str(&format!(
+        "verification:\n  command: {command:?}\n  block_on_failure: {block_on_failure}\n"
+    ));
+    fs::write(project.join(".kanban/config.yaml"), config).unwrap();
+}
+
+#[test]
+fn agent_done_with_passing_verification_gate_moves_to_review() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    write_verification_config(dir.path(), "true", true);
+    ops.config.load_fresh().unwrap();
+
+    let task = ops.create_task(NewTask::titled("Gate pass")).unwrap();
+    ops.take_task(&task.id, "ses-gate", true).unwrap();
+    ContextManager::new(dir.path())
+        .append_context(&task.id, "implemented and tested", "agent", &ops.storage)
+        .unwrap();
+
+    let reviewed = ops
+        .complete_task(&task.id, "ses-gate", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reviewed.status, TaskStatus::Review);
+
+    let tm = ThreadManager::new(dir.path()).unwrap();
+    let steps = tm
+        .load(&reviewed.id)
+        .unwrap()
+        .messages
+        .into_iter()
+        .filter(|m| m.kind == MessageKind::AgentStep)
+        .collect::<Vec<_>>();
+    assert!(steps.iter().any(|m| m.body.contains("✓ gate passed")));
+}
+
+#[test]
+fn agent_done_with_failing_verification_gate_stops_in_progress() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    write_verification_config(dir.path(), "echo 'bad output'; false", true);
+    ops.config.load_fresh().unwrap();
+
+    let task = ops.create_task(NewTask::titled("Gate fail")).unwrap();
+    ops.take_task(&task.id, "ses-gate", true).unwrap();
+    ContextManager::new(dir.path())
+        .append_context(&task.id, "implemented and tested", "agent", &ops.storage)
+        .unwrap();
+
+    let stopped = ops
+        .complete_task(&task.id, "ses-gate", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stopped.status, TaskStatus::InProgress);
+
+    let tm = ThreadManager::new(dir.path()).unwrap();
+    let steps = tm
+        .load(&stopped.id)
+        .unwrap()
+        .messages
+        .into_iter()
+        .filter(|m| m.kind == MessageKind::AgentStep)
+        .collect::<Vec<_>>();
+    let failed = steps
+        .iter()
+        .find(|m| m.body.contains("✗ gate failed"))
+        .expect("gate-failed agent_step should be posted");
+    assert!(failed.body.contains("code=1"));
+    assert!(failed.body.contains("bad output"));
+
+    assert!(!SessionManager::new(dir.path()).is_session_active("ses-gate"));
+}
+
 #[test]
 fn completion_sort_is_latest_first_and_keeps_unfinished_tasks_last() {
     let (_dir, ops, _recorder) = ops_with_recorder(false);
@@ -546,6 +619,43 @@ fn ask_question_flags_task_and_answer_clears_it() {
 }
 
 #[test]
+fn ask_form_posts_one_question_per_entry_with_variants() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Form")).unwrap();
+
+    let form = kanban4ai::core::ask_form::AskForm::parse(
+        "questions:\n  - prompt: Which backend?\n    options: [OAuth2, API key]\n  - prompt: Any constraints?\n",
+    )
+    .unwrap();
+    let (updated, count) = ops
+        .ask_form(&task.id, &form, "agent", None)
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(count, 2);
+    assert!(updated.has_questions);
+    // questions_go_to_review defaults to false: stays in todo.
+    assert_eq!(updated.status, TaskStatus::Todo);
+
+    let open = ops.list_open_messages(&task.id).unwrap();
+    assert_eq!(open.len(), 2);
+    assert!(open.iter().all(|m| m.kind == MessageKind::Question));
+    assert_eq!(open[0].variants, vec!["OAuth2", "API key"]);
+    assert!(open[1].variants.is_empty());
+}
+
+#[test]
+fn ask_form_missing_task_returns_none() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let form = kanban4ai::core::ask_form::AskForm::parse("questions:\n  - prompt: Hi?\n").unwrap();
+    assert!(
+        ops.ask_form("TASK-999", &form, "agent", None)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn answer_by_msg_id_and_bad_index() {
     let (_dir, ops, _rec) = ops_with_recorder(false);
     let task = ops.create_task(NewTask::titled("Refs")).unwrap();
@@ -611,6 +721,116 @@ fn answering_last_question_resumes_interactive_agent() {
             .name,
         Some(task.title)
     );
+}
+
+#[test]
+fn answering_last_question_revokes_future_declared_wait() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask {
+            title: "Waiting for an answer".into(),
+            interactive: true,
+            ..Default::default()
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-answer-wait", true)
+        .unwrap()
+        .unwrap();
+    ops.ask_question(&task.id, "Continue now?", "agent", vec![])
+        .unwrap();
+    ops.declare_waiting(&task.id, "ses-answer-wait", Some(60), Some("later result"))
+        .unwrap();
+    assert_eq!(
+        ops.reconcile_agent_exit(&task.id, "ses-answer-wait", 0)
+            .unwrap(),
+        AgentExitOutcome::Waiting
+    );
+    recorder.calls.lock().unwrap().clear();
+
+    let answered = ops
+        .answer_question(&task.id, QuestionRef::Index(0), "Continue")
+        .unwrap()
+        .unwrap();
+
+    let new_session = answered.session.expect("replacement session");
+    assert_ne!(new_session, "ses-answer-wait");
+    assert_eq!(recorder.calls().len(), 1);
+    let sessions = SessionManager::new(dir.path());
+    assert!(!sessions.is_session_active("ses-answer-wait"));
+    assert!(sessions.is_session_active(&new_session));
+}
+
+#[test]
+fn answering_last_question_expires_wait_while_background_wrapper_exits() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask {
+            title: "Background wait exit".into(),
+            interactive: true,
+            ..Default::default()
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-answer-exiting", true)
+        .unwrap()
+        .unwrap();
+    ops.ask_question(&task.id, "Wake after exit?", "agent", vec![])
+        .unwrap();
+    ops.declare_waiting(
+        &task.id,
+        "ses-answer-exiting",
+        Some(60),
+        Some("original timer"),
+    )
+    .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let answered = ops
+        .answer_question(&task.id, QuestionRef::Index(0), "Wake")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(answered.session.as_deref(), Some("ses-answer-exiting"));
+    let manager = SessionManager::new(dir.path());
+    assert!(
+        manager
+            .load_session("ses-answer-exiting")
+            .unwrap()
+            .wait_until
+            .is_some_and(|deadline| deadline < timefmt::now())
+    );
+    assert!(recorder.calls().is_empty());
+
+    let outcome = ops
+        .reconcile_agent_exit(&task.id, "ses-answer-exiting", 0)
+        .unwrap();
+    assert!(matches!(outcome, AgentExitOutcome::Resumed(_)));
+    assert_eq!(recorder.calls().len(), 1);
+}
+
+#[test]
+fn answering_question_leaves_live_polling_session_in_place() {
+    let (_dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask {
+            title: "Polling for answer".into(),
+            interactive: true,
+            ..Default::default()
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-answer-live", true)
+        .unwrap()
+        .unwrap();
+    ops.ask_question(&task.id, "Ready?", "agent", vec![])
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let answered = ops
+        .answer_question(&task.id, QuestionRef::Index(0), "Ready")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(answered.session.as_deref(), Some("ses-answer-live"));
+    assert!(recorder.calls().is_empty());
 }
 
 #[test]
@@ -836,6 +1056,147 @@ fn rerun_in_progress_refuses_healthy_session() {
             .is_none()
     );
     assert!(recorder.calls().is_empty());
+}
+
+#[test]
+fn revoke_in_progress_replaces_exited_wait_and_fences_stale_request() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Wake now")).unwrap();
+    ops.take_task(&task.id, "ses-revoke-old", true)
+        .unwrap()
+        .unwrap();
+    ops.declare_waiting(&task.id, "ses-revoke-old", Some(60), Some("wake me"))
+        .unwrap();
+    ops.reconcile_agent_exit(&task.id, "ses-revoke-old", 0)
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let revoked = ops
+        .revoke_in_progress_task(&task.id, Some("ses-revoke-old"))
+        .unwrap()
+        .unwrap();
+    let new_session = revoked.session.expect("replacement session");
+
+    assert_ne!(new_session, "ses-revoke-old");
+    assert_eq!(recorder.calls().len(), 1);
+    let sessions = SessionManager::new(dir.path());
+    assert!(!sessions.is_session_active("ses-revoke-old"));
+    assert!(sessions.is_session_active(&new_session));
+    assert!(
+        ops.revoke_in_progress_task(&task.id, Some("ses-revoke-old"))
+            .unwrap()
+            .is_none(),
+        "a stale snapshot must not replace the successor session"
+    );
+    assert_eq!(recorder.calls().len(), 1);
+
+    let stale_completion = ops.complete_task(&task.id, "ses-revoke-old", true);
+    assert!(
+        matches!(stale_completion, Err(KanbanError::Permission(_))),
+        "the revoked process must not be able to complete its successor's task"
+    );
+}
+
+#[test]
+fn revoke_in_progress_refuses_unhosted_live_process() {
+    let (_dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Still live")).unwrap();
+    ops.take_task(&task.id, "ses-revoke-live", true)
+        .unwrap()
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let result = ops.revoke_in_progress_task(&task.id, Some("ses-revoke-live"));
+
+    assert!(matches!(result, Err(KanbanError::Invalid(_))));
+    assert_eq!(recorder.calls().len(), 0);
+    assert_eq!(
+        ops.get_task(&task.id).unwrap().unwrap().session.as_deref(),
+        Some("ses-revoke-live")
+    );
+}
+
+#[test]
+fn revoke_does_not_touch_session_id_reused_by_another_task() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let old_task = ops.create_task(NewTask::titled("Old owner")).unwrap();
+    ops.take_task(&old_task.id, "ses-reused", true)
+        .unwrap()
+        .unwrap();
+    SessionManager::new(dir.path())
+        .close_session("ses-reused")
+        .unwrap();
+    let new_task = ops.create_task(NewTask::titled("New owner")).unwrap();
+    ops.take_task(&new_task.id, "ses-reused", true)
+        .unwrap()
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let result = ops
+        .revoke_in_progress_task(&old_task.id, Some("ses-reused"))
+        .unwrap();
+
+    assert!(result.is_none());
+    let manager = SessionManager::new(dir.path());
+    assert!(manager.is_session_active("ses-reused"));
+    assert_eq!(
+        manager.load_session("ses-reused").unwrap().task_id,
+        new_task.id
+    );
+    assert!(recorder.calls().is_empty());
+}
+
+#[test]
+fn stale_agent_session_cannot_ask_after_revoke() {
+    let (_dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask::titled("No stale questions"))
+        .unwrap();
+    ops.take_task(&task.id, "ses-ask-old", true)
+        .unwrap()
+        .unwrap();
+    SessionManager::new(_dir.path())
+        .mark_wait_exited("ses-ask-old")
+        .unwrap();
+    ops.revoke_in_progress_task(&task.id, Some("ses-ask-old"))
+        .unwrap()
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let result = ops.ask_question_for_session(
+        &task.id,
+        "Stale question?",
+        "agent",
+        Some("ses-ask-old"),
+        vec![],
+    );
+
+    assert!(matches!(result, Err(KanbanError::Permission(_))));
+    assert!(!ops.get_task(&task.id).unwrap().unwrap().has_questions);
+}
+
+#[test]
+fn revoke_in_progress_starts_sessionless_task() {
+    let (_dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask::titled("Wake sessionless"))
+        .unwrap();
+    ops.update_task(
+        &task.id,
+        TaskPatch {
+            status: Some("in_progress".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let revoked = ops
+        .revoke_in_progress_task(&task.id, None)
+        .unwrap()
+        .unwrap();
+
+    assert!(revoked.session.is_some());
+    assert_eq!(recorder.calls().len(), 1);
 }
 
 #[test]
@@ -1578,4 +1939,370 @@ fn first_open_question_returns_earliest_open() {
         ops.first_open_question(&task.id).unwrap().unwrap().body,
         "Second?"
     );
+}
+
+#[test]
+fn agent_launch_logs_agent_step_and_dumps_prompt() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask {
+            agent_backend: Some("claude".to_string()),
+            ..NewTask::titled("Log launch")
+        })
+        .unwrap();
+
+    ops.take_task(&task.id, "ses-log", true).unwrap().unwrap();
+    assert_eq!(
+        recorder.calls(),
+        vec![(task.id.clone(), "ses-log".to_string(), false)]
+    );
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    let step = thread
+        .messages
+        .iter()
+        .find(|m| m.kind == MessageKind::AgentStep && m.body.starts_with("▶ launch"))
+        .expect("launch step logged");
+    assert!(step.body.contains("session=ses-log"));
+    assert!(step.body.contains("backend=claude"));
+    assert!(
+        step.body
+            .contains("prompt: .kanban/logs/ses-log.prompt.txt")
+    );
+    assert_eq!(step.author.as_deref(), Some("kanban"));
+    assert_eq!(step.origin.as_deref(), Some("kanban"));
+
+    let prompt_path = dir.path().join(".kanban/logs/ses-log.prompt.txt");
+    let dumped = fs::read_to_string(prompt_path).expect("prompt dump exists");
+    assert!(dumped.contains(&task.id));
+}
+
+#[test]
+fn agent_context_records_its_session_origin() {
+    let (dir, ops, _recorder) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Context origin")).unwrap();
+    ops.take_task(&task.id, "ses-context", true)
+        .unwrap()
+        .unwrap();
+
+    ContextManager::new(dir.path())
+        .append_context_with_session(
+            &task.id,
+            "implementation detail",
+            "agent",
+            Some("ses-context"),
+            &ops.storage,
+        )
+        .unwrap();
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    let context = thread
+        .messages
+        .iter()
+        .find(|message| message.kind == MessageKind::Context)
+        .expect("agent context stored");
+    assert_eq!(context.origin.as_deref(), Some("agent:ses-context"));
+
+    let task = ops.storage.load_task(&task.id).unwrap().unwrap();
+    let prompt =
+        kanban4ai::agent::build_agent_prompt(dir.path(), &task, "ses-context", false).unwrap();
+    assert!(prompt.contains("origin=agent:ses-context"));
+
+    ContextManager::new(dir.path())
+        .append_context_with_session(
+            &task.id,
+            "stale process detail",
+            "agent",
+            Some("ses-stale"),
+            &ops.storage,
+        )
+        .unwrap();
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    let stale_context = thread
+        .messages
+        .iter()
+        .find(|message| message.body == "stale process detail")
+        .expect("stale agent context stored");
+    assert_eq!(stale_context.origin.as_deref(), Some("agent"));
+}
+
+#[test]
+fn agent_exit_logs_agent_step_with_code_and_outcome() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+
+    let crashed_task = ops.create_task(NewTask::titled("Exit crash")).unwrap();
+    ops.take_task(&crashed_task.id, "ses-exit-crash", true)
+        .unwrap()
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+    let outcome = ops
+        .reconcile_agent_exit(&crashed_task.id, "ses-exit-crash", 1)
+        .unwrap();
+    assert_eq!(outcome, AgentExitOutcome::Crashed);
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&crashed_task.id)
+        .unwrap();
+    let step = thread
+        .messages
+        .iter()
+        .find(|m| m.kind == MessageKind::AgentStep && m.body.starts_with("■ exit"))
+        .expect("exit step logged");
+    assert!(step.body.contains("session=ses-exit-crash"));
+    assert!(step.body.contains("code=1"));
+    assert!(step.body.contains("outcome=Crashed"));
+
+    let closed_task = ops.create_task(NewTask::titled("Exit closed")).unwrap();
+    ops.take_task(&closed_task.id, "ses-exit-closed", true)
+        .unwrap()
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+    ops.ask_question(&closed_task.id, "Need input?", "agent", vec![])
+        .unwrap();
+    let outcome = ops
+        .reconcile_agent_exit(&closed_task.id, "ses-exit-closed", 0)
+        .unwrap();
+    assert_eq!(outcome, AgentExitOutcome::Closed);
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&closed_task.id)
+        .unwrap();
+    let step = thread
+        .messages
+        .iter()
+        .find(|m| m.kind == MessageKind::AgentStep && m.body.starts_with("■ exit"))
+        .expect("exit step logged");
+    assert!(step.body.contains("code=0"));
+    assert!(step.body.contains("outcome=Closed"));
+}
+
+#[test]
+fn agent_exit_harvests_claude_transcript_into_provenance_manifest() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask {
+            agent_backend: Some("claude".to_string()),
+            ..NewTask::titled("Harvest inputs")
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-harvest", true)
+        .unwrap()
+        .unwrap();
+
+    // Seed the machine transcript the claude wrapper would have captured.
+    let transcript = dir.path().join(".kanban/logs/ses-harvest.transcript.jsonl");
+    fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"system","subtype":"init","session_id":"claude-xyz"}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}},{"type":"tool_use","name":"WebFetch","input":{"url":"https://example.com"}}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let outcome = ops
+        .reconcile_agent_exit(&task.id, "ses-harvest", 1)
+        .unwrap();
+    assert_eq!(outcome, AgentExitOutcome::Crashed);
+
+    // Manifest written as a decoupled sidecar, not into the thread.
+    let manifest_raw = fs::read_to_string(dir.path().join(".kanban/provenance/ses-harvest.yaml"))
+        .expect("provenance manifest written");
+    assert!(manifest_raw.contains("src/lib.rs"));
+    assert!(manifest_raw.contains("https://example.com"));
+    assert!(manifest_raw.contains("claude-xyz"));
+
+    // Exit step references the manifest and carries the input summary.
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    let step = thread
+        .messages
+        .iter()
+        .find(|m| m.kind == MessageKind::AgentStep && m.body.starts_with("■ exit"))
+        .expect("exit step logged");
+    assert!(step.body.contains("reads=1 writes=0 urls=1"));
+    assert!(
+        step.body
+            .contains("provenance: .kanban/provenance/ses-harvest.yaml")
+    );
+    // The manifest content must never leak into the thread as a message.
+    assert!(
+        !thread
+            .messages
+            .iter()
+            .any(|m| m.body.contains("https://example.com"))
+    );
+}
+
+#[test]
+fn agent_exit_harvests_opencode_transcript_into_provenance_manifest() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask {
+            agent_backend: Some("opencode".to_string()),
+            ..NewTask::titled("Harvest opencode inputs")
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-oc-harvest", true)
+        .unwrap()
+        .unwrap();
+
+    // Seed the machine transcript the opencode wrapper (`run --format json`)
+    // would have captured on stdout.
+    let transcript = dir
+        .path()
+        .join(".kanban/logs/ses-oc-harvest.transcript.jsonl");
+    fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"tool_use","sessionID":"ses_real","part":{"type":"tool","tool":"read","state":{"input":{"filePath":"src/lib.rs"}}}}"#,
+            "\n",
+            r#"{"type":"tool_use","sessionID":"ses_real","part":{"type":"tool","tool":"webfetch","state":{"input":{"url":"https://example.com"}}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let outcome = ops
+        .reconcile_agent_exit(&task.id, "ses-oc-harvest", 1)
+        .unwrap();
+    assert_eq!(outcome, AgentExitOutcome::Crashed);
+
+    let manifest_raw =
+        fs::read_to_string(dir.path().join(".kanban/provenance/ses-oc-harvest.yaml"))
+            .expect("opencode provenance manifest written");
+    assert!(manifest_raw.contains("backend: opencode"));
+    assert!(manifest_raw.contains("src/lib.rs"));
+    assert!(manifest_raw.contains("https://example.com"));
+    assert!(manifest_raw.contains("ses_real"));
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    let step = thread
+        .messages
+        .iter()
+        .find(|m| m.kind == MessageKind::AgentStep && m.body.starts_with("■ exit"))
+        .expect("exit step logged");
+    assert!(step.body.contains("reads=1 writes=0 urls=1"));
+}
+
+#[test]
+fn agent_exit_reconciliation_skips_logging_for_unmatched_session() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Unmatched")).unwrap();
+
+    let outcome = ops
+        .reconcile_agent_exit(&task.id, "ses-never-existed", 0)
+        .unwrap();
+    assert_eq!(outcome, AgentExitOutcome::Closed);
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        !thread
+            .messages
+            .iter()
+            .any(|m| m.kind == MessageKind::AgentStep)
+    );
+}
+
+#[test]
+fn agent_step_messages_are_excluded_from_agent_prompt() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Prompt exclude")).unwrap();
+    let taken = ops
+        .take_task(&task.id, "ses-prompt", true)
+        .unwrap()
+        .unwrap();
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread
+            .messages
+            .iter()
+            .any(|m| m.kind == MessageKind::AgentStep)
+    );
+
+    let prompt =
+        kanban4ai::agent::build_agent_prompt(dir.path(), &taken, "ses-prompt", false).unwrap();
+    assert!(!prompt.contains("▶ launch"));
+    assert!(!prompt.contains("agent_step"));
+}
+
+#[test]
+fn rejected_context_is_excluded_from_prompt_and_gathered_context() {
+    let (dir, ops, _recorder) = ops_with_recorder(false);
+    let task = ops
+        .create_task(NewTask::titled("Poisoned context"))
+        .unwrap();
+
+    let ctx = ContextManager::new(dir.path());
+    ctx.append_context(&task.id, "trustworthy note", "agent", &ops.storage)
+        .unwrap();
+    ctx.append_context(&task.id, "poisoned note", "agent", &ops.storage)
+        .unwrap();
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    let poisoned = thread
+        .messages
+        .iter()
+        .find(|m| m.body == "poisoned note")
+        .expect("poisoned context stored")
+        .id
+        .clone();
+
+    let rejected = ops.reject_message(&task.id, &poisoned).unwrap();
+    assert_eq!(rejected.unwrap().status, MessageStatus::Rejected);
+
+    let context = ctx.get_context(&task.id, &ops.storage).unwrap();
+    assert!(context.contains("trustworthy note"));
+    assert!(!context.contains("poisoned note"));
+
+    let task = ops.storage.load_task(&task.id).unwrap().unwrap();
+    let prompt =
+        kanban4ai::agent::build_agent_prompt(dir.path(), &task, "ses-reject", false).unwrap();
+    assert!(prompt.contains("trustworthy note"));
+    assert!(!prompt.contains("poisoned note"));
+
+    // Un-reject restores it to both the gathered context and future prompts.
+    let restored = ops.unreject_message(&task.id, &poisoned).unwrap();
+    assert_eq!(restored.unwrap().status, MessageStatus::Open);
+
+    let context = ctx.get_context(&task.id, &ops.storage).unwrap();
+    assert!(context.contains("poisoned note"));
+    let prompt =
+        kanban4ai::agent::build_agent_prompt(dir.path(), &task, "ses-reject", false).unwrap();
+    assert!(prompt.contains("poisoned note"));
+}
+
+#[test]
+fn reject_message_reports_missing_task_or_message() {
+    let (_dir, ops, _recorder) = ops_with_recorder(false);
+    assert!(ops.reject_message("TASK-999", "MSG-001").unwrap().is_none());
+
+    let task = ops.create_task(NewTask::titled("No such message")).unwrap();
+    assert!(ops.reject_message(&task.id, "MSG-999").unwrap().is_none());
 }

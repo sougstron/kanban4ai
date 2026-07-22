@@ -1519,6 +1519,66 @@ fn clicking_review_editor_focuses_it_and_highlights_panel() {
     );
 }
 
+/// Input-provenance — files read/written, URLs, MCP the agent actually consumed,
+/// sourced from a harvested manifest — is kept out of the thread entirely and
+/// shown only in the `v` popup, so the conversation panel stays clean.
+#[test]
+fn input_provenance_shows_in_v_popup_not_thread() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask {
+            title: "Provenance card".to_string(),
+            agent_backend: Some("claude".to_string()),
+            ..Default::default()
+        })
+        .unwrap();
+    ThreadManager::new(dir.path())
+        .unwrap()
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::System,
+            crate::core::models::MessageKind::AgentStep,
+            "■ exit session=ses-prov code=0 outcome=Closed auto_resumes=0 \
+             reads=1 writes=1 urls=1 mcp=1 → provenance: .kanban/provenance/ses-prov.yaml",
+            None,
+            Vec::new(),
+            Some("kanban".to_string()),
+        )
+        .unwrap();
+    crate::core::provenance::write_manifest(
+        &app.ops.storage.provenance_dir,
+        &crate::core::provenance::InputManifest {
+            session_id: "ses-prov".to_string(),
+            backend: "claude".to_string(),
+            reads: vec!["src/core/operations.rs".to_string()],
+            writes: vec!["src/core/config.rs".to_string()],
+            urls: vec!["https://example.com/doc".to_string()],
+            mcp: vec!["github:list_prs".to_string()],
+            generated_at: "2026-07-21T00:00:00".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    // The thread panel must not carry the provenance section any more.
+    let thread = render_snapshot(&mut app);
+    assert!(
+        !thread.contains("Inputs (provenance)"),
+        "provenance must not render in the thread panel:\n{thread}"
+    );
+
+    // It lives only in the `v` popup.
+    app.handle_key(key(KeyCode::Char('v')))
+        .expect("open inputs popup");
+    assert_eq!(app.screen, Screen::TextView);
+    insta::assert_snapshot!("detail_provenance", render_snapshot(&mut app));
+}
+
 /// The thread wraps its lines, so a narrow terminal renders one logical line
 /// over several rows. End must still reach the thread's last row there.
 #[test]
@@ -1714,8 +1774,7 @@ fn run_hotkey_starts_task_without_confirmation() {
     let session_id = started.session.expect("session assigned");
     assert!(SessionManager::new(dir.path()).is_session_active(&session_id));
 
-    // A second run is refused while the session is alive. The task moved to
-    // In Progress, so follow it there first.
+    // On In Progress the same key becomes Revoke and replaces the session.
     app.focused_column = app
         .board
         .columns
@@ -1723,8 +1782,51 @@ fn run_hotkey_starts_task_without_confirmation() {
         .position(|column| column.id == "in_progress")
         .expect("in_progress column");
     app.focused_card = 0;
-    app.handle_key(key(KeyCode::Char('r'))).expect("run again");
-    assert!(app.status.contains("already running"), "{}", app.status);
+    SessionManager::new(dir.path())
+        .mark_wait_exited(&session_id)
+        .expect("agent process exited");
+    app.handle_key(key(KeyCode::Char('r'))).expect("revoke");
+    assert!(app.status.contains("Revoked and woke"), "{}", app.status);
+    let revoked = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_ne!(revoked.session.as_deref(), Some(session_id.as_str()));
+    assert!(!SessionManager::new(dir.path()).is_session_active(&session_id));
+}
+
+#[test]
+fn in_progress_detail_shows_revoke_instead_of_run() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Revoke me"))
+        .expect("create task");
+    app.ops
+        .take_task(&task.id, "ses-revoke-detail", true)
+        .unwrap()
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.focused_column = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == "in_progress")
+        .unwrap();
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("detail");
+
+    let rendered = render_at(&mut app, 100, 24);
+
+    assert!(rendered.contains("Revoke r"), "{rendered}");
+    assert!(rendered.contains("r revoke"), "{rendered}");
+    assert!(
+        app.hitboxes
+            .iter()
+            .any(|hitbox| hitbox.action == HitAction::Action(UiAction::Revoke))
+    );
+    assert!(
+        app.hitboxes
+            .iter()
+            .all(|hitbox| hitbox.action != HitAction::Action(UiAction::Run))
+    );
 }
 
 #[test]
@@ -1938,6 +2040,47 @@ fn fs_reload_preserves_unsaved_review_edits() {
             .unwrap()
             .review_edits
             .is_empty()
+    );
+}
+
+#[test]
+fn fs_reload_preserves_inline_answer_draft() {
+    let (dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Tab)).expect("focus answer");
+    let detail = app.detail.as_mut().expect("detail");
+    detail
+        .answer_input
+        .insert_str("Keep this answer while the board refreshes");
+    detail.variant_selected = 1;
+
+    let task_id = detail.task_id.clone();
+    ThreadManager::new(dir.path())
+        .unwrap()
+        .post(
+            &task_id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            "background context update",
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+    app.reload_if_changed().expect("refresh detail");
+
+    let detail = app.detail.as_ref().expect("detail after reload");
+    assert_eq!(detail.focus, DetailFocus::Answer);
+    assert_eq!(
+        detail.answer_input.lines().join("\n"),
+        "Keep this answer while the board refreshes"
+    );
+    assert_eq!(detail.variant_selected, 1);
+    assert!(
+        detail
+            .messages
+            .iter()
+            .any(|message| message.body == "background context update")
     );
 }
 
@@ -2672,6 +2815,63 @@ fn phase_three_header_question_and_drag_hitboxes_drive_board_state() {
             .status
             .as_str(),
         "review"
+    );
+}
+
+#[test]
+fn drag_is_visualized_with_lifted_card_drop_target_and_status_hint() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let (column, card, source_rect) = card_hits(&app)[0];
+    app.focused_column = column;
+    app.focused_card = card;
+    let source_task = app.visible_tasks_for_column(column)[card].id.clone();
+    let target_column = (0..app.board.columns.len())
+        .find(|&index| index != column)
+        .expect("a second column");
+    let target_name = app.board.columns[target_column].name.clone();
+    let target = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::ColumnFocus(target_column))
+        .copied()
+        .expect("target column area");
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: source_rect.x + 1,
+        row: source_rect.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("start drag");
+    assert!(app.dragging.is_some());
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: target.area.x + 1,
+        row: target.area.y + 10,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("drag over target");
+    assert_eq!(app.drop_target_column(), Some(target_column));
+
+    let ok = app.theme.ok;
+    let snapshot = render_snapshot(&mut app);
+    assert!(
+        snapshot.contains(&format!("Moving {source_task} → {target_name}")),
+        "status bar should announce the pending move:\n{snapshot}"
+    );
+
+    // The destination column border reads as a bold green drop zone, distinct
+    // from ordinary blue focus.
+    let border = style_at(&mut app, 96, 28, target.area.x, target.area.y);
+    assert_eq!(border.fg, Some(ok));
+    assert!(border.add_modifier.contains(Modifier::BOLD));
+
+    // The card in flight is inverted so its origin stays visible.
+    let lifted = style_at(&mut app, 96, 28, source_rect.x + 1, source_rect.y + 1);
+    assert!(
+        lifted.add_modifier.contains(Modifier::REVERSED),
+        "the dragged source card should render lifted"
     );
 }
 
@@ -3514,4 +3714,161 @@ fn phase_four_modal_mouse_routes_fields_options_and_add_message_buttons() {
     })
     .unwrap();
     assert!(app.modal.is_none());
+}
+
+/// A task with a recorded prompt dump and harvested input-provenance exposes the
+/// two read-only viewer buttons; activating each opens a `TextView` pager over
+/// the matching content and `q` returns to the detail screen. Provenance is not
+/// in the thread — the `v` popup is its only home.
+#[test]
+fn prompt_and_inputs_buttons_open_read_only_viewers() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Viewer task"))
+        .expect("create task");
+
+    // A prompt dump is written per launched session; simulate one launch.
+    let session_id = "ses-viewer-1";
+    let mut stored = app.ops.get_task(&task.id).unwrap().unwrap();
+    stored.session = Some(session_id.to_string());
+    app.ops.storage.save_task(&stored).expect("save session");
+    std::fs::write(
+        dir.path()
+            .join(".kanban/logs")
+            .join(format!("{session_id}.prompt.txt")),
+        "PROMPT-MARKER assembled body\nsecond line\n",
+    )
+    .expect("write prompt dump");
+
+    // Provenance is referenced from an agent_step exit line and loaded by id.
+    ThreadManager::new(dir.path())
+        .unwrap()
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::System,
+            crate::core::models::MessageKind::AgentStep,
+            &format!(
+                "■ exit session={session_id} code=0 outcome=Closed → \
+                 provenance: .kanban/provenance/{session_id}.yaml"
+            ),
+            None,
+            Vec::new(),
+            Some("kanban".to_string()),
+        )
+        .unwrap();
+    crate::core::provenance::write_manifest(
+        &app.ops.storage.provenance_dir,
+        &crate::core::provenance::InputManifest {
+            session_id: session_id.to_string(),
+            backend: "claude".to_string(),
+            reads: vec!["src/INPUT-MARKER.rs".to_string()],
+            generated_at: "2026-07-21T00:00:00".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("write manifest");
+
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    assert_eq!(app.screen, Screen::Detail);
+
+    let detail = app.detail.as_ref().expect("detail state");
+    assert!(detail.has_prompt, "prompt dump should be detected");
+    assert!(detail.has_provenance, "provenance should be detected");
+
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("Prompt p"), "prompt button missing");
+    assert!(rendered.contains("Inputs v"), "inputs button missing");
+
+    // View inputs (provenance).
+    app.handle_key(key(KeyCode::Char('v')))
+        .expect("view inputs");
+    assert_eq!(app.screen, Screen::TextView);
+    let view = app.text_view.as_ref().expect("inputs view");
+    assert!(view.title.contains("Inputs (provenance)"));
+    assert!(view.lines.iter().any(|line| line.contains("INPUT-MARKER")));
+    app.handle_key(key(KeyCode::Char('q')))
+        .expect("back to detail");
+    assert_eq!(app.screen, Screen::Detail);
+    assert!(app.text_view.is_none());
+
+    // View prompt.
+    app.handle_key(key(KeyCode::Char('p')))
+        .expect("view prompt");
+    assert_eq!(app.screen, Screen::TextView);
+    let view = app.text_view.as_ref().expect("prompt view");
+    assert!(view.title.contains("Prompt"));
+    assert!(view.lines.iter().any(|line| line.contains("PROMPT-MARKER")));
+
+    insta::assert_snapshot!("prompt_view", render_snapshot(&mut app));
+
+    app.handle_key(key(KeyCode::Esc))
+        .expect("esc back to detail");
+    assert_eq!(app.screen, Screen::Detail);
+}
+
+/// The prompt viewer wraps a line that is wider than the viewport onto the next
+/// row instead of running past the right edge, so a token that sits beyond the
+/// window width stays visible (matching the detail description panel).
+#[test]
+fn prompt_viewer_wraps_long_lines() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Wrapping task"))
+        .expect("create task");
+
+    let session_id = "ses-wrap-1";
+    let mut stored = app.ops.get_task(&task.id).unwrap().unwrap();
+    stored.session = Some(session_id.to_string());
+    app.ops.storage.save_task(&stored).expect("save session");
+    // A single logical line far wider than the 96-column snapshot viewport, with
+    // a unique marker at the very end that only a wrapped render can show.
+    let long_line = format!("{}END-WRAP-MARKER\n", "filler ".repeat(40));
+    std::fs::write(
+        dir.path()
+            .join(".kanban/logs")
+            .join(format!("{session_id}.prompt.txt")),
+        long_line,
+    )
+    .expect("write prompt dump");
+
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Char('p')))
+        .expect("view prompt");
+    assert_eq!(app.screen, Screen::TextView);
+
+    let rendered = render_snapshot(&mut app);
+    assert!(
+        rendered.contains("END-WRAP-MARKER"),
+        "long line should wrap so its tail stays visible"
+    );
+}
+
+/// A task with neither a prompt dump nor provenance hides both viewer buttons.
+#[test]
+fn viewer_buttons_absent_without_prompt_or_provenance() {
+    let (_dir, mut app) = app_with_board();
+    app.ops
+        .create_task(NewTask::titled("Bare task"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+
+    let detail = app.detail.as_ref().expect("detail state");
+    assert!(!detail.has_prompt);
+    assert!(!detail.has_provenance);
+
+    let rendered = render_snapshot(&mut app);
+    assert!(!rendered.contains("Prompt p"));
+    assert!(!rendered.contains("Inputs v"));
+
+    // The keybindings no-op (with a status hint) rather than opening an
+    // empty viewer.
+    app.handle_key(key(KeyCode::Char('p'))).expect("prompt key");
+    assert_eq!(app.screen, Screen::Detail);
+    app.handle_key(key(KeyCode::Char('v'))).expect("inputs key");
+    assert_eq!(app.screen, Screen::Detail);
 }

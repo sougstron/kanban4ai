@@ -1,6 +1,6 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 323
+assertion_line: 532
 expression: render_snapshot(&mut app)
 ---
 ┌ Task ────────────────────────────────────────────────────────────────────────────────────────┐
@@ -20,7 +20,7 @@ expression: render_snapshot(&mut app)
 │MSG-002 · task · open                                                                         █
 │Needs an answer                                                                               █
 │                                                                                              █
-│MSG-003 · question · open                                                                     ║
+│» MSG-003 · question · open                                                                   ║
 └──────────────────────────────────────────────────────────────────────────────────────────────▼
 ┌ Answer question 1/1 · ←→ question · ↑↓ variant · Enter send ─────────────────────────────────┐
 │Choose a route?                                                                               │
@@ -83,8 +83,8 @@ expression: render_snapshot(&mut app)
 16:1-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 16:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 17:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-17:1-26 Style::new().fg(Color::Rgb(245, 190, 80)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
-17:26-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+17:1-28 Style::new().fg(Color::Rgb(245, 190, 80)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold().reversed()
+17:28-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 17:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 18:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 19:0-96 Style::new().fg(Color::Rgb(245, 190, 80)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

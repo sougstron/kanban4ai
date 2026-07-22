@@ -4,7 +4,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    ScrollbarState,
+    ScrollbarState, Wrap,
 };
 
 use crate::core::session::SessionState;
@@ -171,6 +171,61 @@ pub fn render_log_view(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if log.max_scroll > 0 {
         let mut scrollbar_state =
             ScrollbarState::new(log.max_scroll as usize).position(log.scroll as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut scrollbar_state,
+        );
+    }
+}
+
+/// Read-only pager over a captured text block (a task's assembled prompt or its
+/// gathered context). The scroll is clamped against the real viewport here.
+pub fn render_text_view(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let theme = app.theme;
+    let Some(view) = app.text_view.as_mut() else {
+        frame.render_widget(
+            Paragraph::new("No text to display")
+                .block(Block::default().title(" View ").borders(Borders::ALL)),
+            area,
+        );
+        return;
+    };
+    let title = format!(
+        " {} · ↑/↓ PgUp/PgDn scroll · q back ",
+        truncate_display(&sanitize_terminal_text(&view.title), 60)
+    );
+    let lines = view
+        .lines
+        .iter()
+        .map(|line| Line::from(sanitize_terminal_text(line)))
+        .collect::<Vec<_>>();
+    // Wrap long lines onto the next row instead of running past the right edge,
+    // matching the detail thread/description panels. The scroll bound is measured
+    // from the rows the wrap actually produces at this width, not logical lines,
+    // so a wide prompt line still scrolls to its true end. The block is attached
+    // after measuring so `line_count` sees the inner width only.
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let inner_width = area.width.saturating_sub(2);
+    let content_height = u16::try_from(paragraph.line_count(inner_width)).unwrap_or(u16::MAX);
+    let visible_height = area.height.saturating_sub(2);
+    view.max_scroll = content_height.saturating_sub(visible_height);
+    view.scroll = view.scroll.min(view.max_scroll);
+    frame.render_widget(
+        paragraph
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.focus)),
+            )
+            .style(Style::default().bg(theme.bg).fg(theme.fg))
+            .scroll((view.scroll, 0)),
+        area,
+    );
+    if view.max_scroll > 0 {
+        let mut scrollbar_state =
+            ScrollbarState::new(view.max_scroll as usize).position(view.scroll as usize);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             area,

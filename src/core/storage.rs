@@ -79,6 +79,7 @@ pub struct Storage {
     pub sessions_dir: PathBuf,
     pub threads_dir: PathBuf,
     pub logs_dir: PathBuf,
+    pub provenance_dir: PathBuf,
     pub backups_dir: PathBuf,
     pub assets_dir: PathBuf,
 }
@@ -93,6 +94,7 @@ impl Storage {
             sessions_dir: kanban_dir.join("sessions"),
             threads_dir: kanban_dir.join("threads"),
             logs_dir: kanban_dir.join("logs"),
+            provenance_dir: kanban_dir.join("provenance"),
             backups_dir: kanban_dir.join("backups"),
             assets_dir: kanban_dir.join("assets"),
             kanban_dir,
@@ -134,6 +136,7 @@ impl Storage {
         fs::create_dir_all(&self.sessions_dir)?;
         fs::create_dir_all(&self.threads_dir)?;
         fs::create_dir_all(&self.logs_dir)?;
+        fs::create_dir_all(&self.provenance_dir)?;
         fs::create_dir_all(&self.backups_dir)?;
         fs::create_dir_all(self.assets_dir.join("images"))?;
         for status in TaskStatus::ALL {

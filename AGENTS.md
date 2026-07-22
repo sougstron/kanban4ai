@@ -91,8 +91,29 @@ back-compat, but new context is always written to the thread.
 The task `description` holds **only** what the human wrote. Everything the agent
 adds, and the human's review feedback, lives in the sidecar thread:
 - **Agent context** — `kanban context <id> <text>` posts a `context` message.
-- **Questions** — `kanban ask` posts a `question`; once answered the reply is
-  stored on the same message (`answer` + `answered_by_role`).
+- **Questions** — `kanban ask` posts a single `question`; once answered the
+  reply is stored on the same message (`answer` + `answered_by_role`). For one
+  or more structured questions at once, `kanban ask-form <id> --file <path>`
+  reads a strict YAML form and posts one `question` per entry, mapping each
+  entry's `options` onto the message `variants` (the selectable answers in the
+  TUI answer panel). The form schema (agents are instructed to write this):
+
+  ```yaml
+  questions:
+    - id: q1                 # optional, agent-facing label
+      prompt: Which backend? # required, non-empty
+      options: [OAuth2, API key]   # optional → answer variants
+      allow_custom: true     # optional, default true; false + options appends
+                             # a "pick one of the listed options" hint (advisory)
+    - prompt: Any constraints?     # add as many entries as needed
+  ```
+
+  Empty `questions` or a blank `prompt` is rejected; malformed YAML is a YAML
+  error. Delegated agents are prompted to prefer `ask-form` and to proactively
+  file non-blocking ideas via `kanban suggest`.
+- **Suggestions** — `kanban suggest <id> <text>` posts a non-blocking
+  `suggestion` message. Every delegated-agent prompt now nudges agents to record
+  ideas, risks, and better alternatives this way without stopping their work.
 - **Review edits** — while a task sits in Review the human types feedback into
   the single `review_edits` buffer (`kanban edits`, or the TUI Review-edits
   field). On the next re-run (`kanban rerun` / TUI "Save & Re-run") the buffer
@@ -137,6 +158,7 @@ messages:
 - `kanban move <id> <column>` - Move task
 - `kanban context <id> <text>` - Add a `context` message to the thread
 - `kanban ask <id> <question> [--wait] [--variants TEXT ...] [--timeout SECONDS] [--session <id>]` - Add question, optionally block until answered
+- `kanban ask-form <id> --file <path> [--agent] [--session <id>]` - Post one or more questions from a strict YAML form (each entry's `options` become answer variants)
 - `kanban answer <id> <index> <answer>` - Answer question
 - `kanban waiting <id> [--session <id>] [--eta SECONDS] [--note TEXT]` - Declare a long-running wait; records a thread note, keeps the session alive until `eta × waiting_eta_multiplier`, and relaunches the agent after the deadline to check the result
 - `kanban detach <id> [--session <id>] [--eta SECONDS] [--note TEXT] -- <command> [args...]` - Run a command fully detached from the agent session (own `setsid` session, so it survives the tmux host being killed when the reply ends), append output to `.kanban/detached/<task>-<stamp>.log`, write the exit code to the matching `.status` file, and declare the wait in one step; the wait note carries both paths into the relaunch prompt
@@ -235,7 +257,8 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `Tab` / `Shift+Tab`: Next/previous column (board) · cycle
   thread/answer/editor panels (detail)
 - `Enter`: Show task detail
-- `r`: **Run** — start the task on an agent immediately, no confirmation
+- `r`: **Run / Revoke** — start a task immediately; for an In Progress task,
+  revoke its current session and wake it immediately on a fresh one
   (the board is human-managed and agent-executed; "delegate" terminology and
   its confirmation dialog were removed)
 - `n`: New task in the focused column
@@ -278,7 +301,10 @@ least important segments are dropped instead of clipping. Column headers show
 only the column name and visible task count; the status-bar question count
 focuses the first questioned task when clicked. Drag a card to a different
 column to move it in human mode. A single click on a card opens its detail;
-a drag still moves it between columns without opening the detail view.
+a drag still moves it between columns without opening the detail view. The drag
+is visible: the card in flight is inverted, the destination column's border
+turns green and bold once the cursor crosses into it, and the status bar shows
+`Moving <task> → <column>` so the pending move is never ambiguous.
 
 Note: the opencode subscription/usage overlay (`u` in the Python version) was
 dropped in the rewrite — it never worked reliably; `u` now means recover.

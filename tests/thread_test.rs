@@ -89,6 +89,19 @@ fn saved_thread_quotes_timestamps_for_legacy_python_yaml() {
 }
 
 #[test]
+fn message_without_origin_omits_origin_from_yaml() {
+    let message = Message::new(
+        "MSG-001",
+        MessageRole::Agent,
+        MessageKind::Context,
+        "implementation detail",
+    );
+
+    let yaml = serde_yaml_ng::to_string(&message).unwrap();
+    assert!(!yaml.contains("origin:"));
+}
+
+#[test]
 fn open_messages_defaults_to_questions_and_suggestions() {
     let (_dir, manager, task_id) = setup();
     manager
@@ -165,6 +178,35 @@ fn resolve_marks_suggestion_resolved() {
         .unwrap();
     assert_eq!(reopened.status, MessageStatus::Open);
     assert!(reopened.resolved_at.is_none());
+}
+
+#[test]
+fn resolve_rejects_and_restores_a_context_message() {
+    let (_dir, manager, task_id) = setup();
+    let context = manager
+        .post(
+            &task_id,
+            MessageRole::Agent,
+            MessageKind::Context,
+            "possibly poisoned note",
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+    assert_eq!(context.status, MessageStatus::Open);
+
+    let rejected = manager
+        .resolve(&task_id, &context.id, MessageStatus::Rejected)
+        .unwrap();
+    assert_eq!(rejected.status, MessageStatus::Rejected);
+    assert!(rejected.resolved_at.is_some());
+
+    let restored = manager
+        .resolve(&task_id, &context.id, MessageStatus::Open)
+        .unwrap();
+    assert_eq!(restored.status, MessageStatus::Open);
+    assert!(restored.resolved_at.is_none());
 }
 
 #[test]

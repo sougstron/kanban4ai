@@ -85,9 +85,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     render_meta(frame, &theme, &task, &meta_state, chunks[0]);
 
-    // Thread panel with a clamped scroll and a scrollbar.
-    let thread_lines = thread_lines(&app.detail.as_ref().unwrap().messages, &theme);
-    let thread = Paragraph::new(thread_lines)
+    // Thread panel with a clamped scroll and a scrollbar. Input-provenance
+    // (what the agent actually consumed) is telemetry, not conversation, so it
+    // is kept out of the thread entirely and shown only in the `v` popup.
+    let detail_ref = app.detail.as_ref().unwrap();
+    let panel_lines = thread_lines(&detail_ref.messages, detail_ref.thread_selected, &theme);
+    let thread = Paragraph::new(panel_lines)
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .wrap(Wrap { trim: false });
     // Measure the rows the wrap actually produces at this width: a logical line
@@ -450,7 +453,11 @@ fn render_action_bar(
             ("Del d".to_string(), UiAction::DeleteTask),
         ]
     } else {
-        let mut buttons: Vec<(String, UiAction)> = vec![("▶ Run r".to_string(), UiAction::Run)];
+        let mut buttons: Vec<(String, UiAction)> = if task.status == TaskStatus::InProgress {
+            vec![("↻ Revoke r".to_string(), UiAction::Revoke)]
+        } else {
+            vec![("▶ Run r".to_string(), UiAction::Run)]
+        };
         if has_questions {
             buttons.push(("Answer w".to_string(), UiAction::AnswerQuestion));
         }
@@ -467,6 +474,18 @@ fn render_action_bar(
         buttons.push(("Edit e".to_string(), UiAction::EditTask));
         buttons.push(("Move m".to_string(), UiAction::MoveTask));
         buttons.push(("+Ctx c".to_string(), UiAction::AddContext));
+        // Read-only viewers, shown only when the task actually has a recorded
+        // prompt / context to show.
+        if app.detail.as_ref().is_some_and(|detail| detail.has_prompt) {
+            buttons.push(("Prompt p".to_string(), UiAction::ViewPrompt));
+        }
+        if app
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.has_provenance)
+        {
+            buttons.push(("Inputs v".to_string(), UiAction::ViewContext));
+        }
         if app.ops.task_has_backups(&task.id) {
             buttons.push(("Revert".to_string(), UiAction::Revert));
         }
@@ -509,35 +528,68 @@ fn render_action_bar(
     );
 }
 
-fn thread_lines(messages: &[Message], theme: &Theme) -> Vec<Line<'static>> {
+fn thread_lines(messages: &[Message], selected: usize, theme: &Theme) -> Vec<Line<'static>> {
     if messages.is_empty() {
         return vec![Line::from("No thread messages")];
     }
     let mut lines = Vec::new();
-    for message in messages {
-        let style = match message.kind {
+    for (index, message) in messages.iter().enumerate() {
+        let rejected = message.status == MessageStatus::Rejected;
+        let mut style = match message.kind {
             MessageKind::Question => Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
             MessageKind::Suggestion => Style::default().fg(theme.focus),
             MessageKind::Context => Style::default().fg(theme.muted),
             MessageKind::ReviewEdit => Style::default().fg(theme.review),
             MessageKind::Task => Style::default().fg(theme.ok),
             MessageKind::System => Style::default().fg(theme.muted),
+            MessageKind::AgentStep => Style::default().fg(theme.muted).add_modifier(Modifier::DIM),
         };
+        if rejected {
+            style = Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::DIM | Modifier::CROSSED_OUT);
+        }
+        if index == selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
         let status = match message.status {
             MessageStatus::Open => "open",
             MessageStatus::Answered => "answered",
             MessageStatus::Resolved => "resolved",
+            MessageStatus::Rejected => "rejected",
         };
-        lines.push(Line::from(Span::styled(
-            format!("{} · {} · {}", message.id, message.kind, status),
-            style,
-        )));
+        let marker = if index == selected { "» " } else { "" };
+        let mut header = format!("{marker}{} · {} · {}", message.id, message.kind, status);
+        if let Some(origin) = message
+            .origin
+            .as_deref()
+            .filter(|origin| !origin.trim().is_empty())
+        {
+            if let Some(author) = message
+                .author
+                .as_deref()
+                .filter(|author| !author.trim().is_empty())
+            {
+                header.push_str(" · by ");
+                header.push_str(&sanitize_terminal_text(author.trim()));
+            }
+            header.push_str(" · origin=");
+            header.push_str(&sanitize_terminal_text(origin.trim()));
+        }
+        lines.push(Line::from(Span::styled(header, style)));
+        let mut body_style = Style::default();
+        if rejected {
+            body_style = body_style.add_modifier(Modifier::DIM | Modifier::CROSSED_OUT);
+        }
+        if index == selected {
+            body_style = body_style.add_modifier(Modifier::REVERSED);
+        }
         let sanitized_body = sanitize_terminal_text(&message.body);
         if sanitized_body.is_empty() {
             lines.push(Line::from(""));
         } else {
             for body_line in sanitized_body.lines() {
-                lines.push(Line::from(body_line.to_string()));
+                lines.push(Line::from(Span::styled(body_line.to_string(), body_style)));
             }
         }
         if !message.variants.is_empty() {

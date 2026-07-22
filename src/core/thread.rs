@@ -157,11 +157,27 @@ impl ThreadManager {
         variants: Vec<String>,
         author: Option<String>,
     ) -> Result<Message> {
+        self.post_with_origin(task_id, role, kind, body, parent_id, variants, author, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn post_with_origin(
+        &self,
+        task_id: &str,
+        role: MessageRole,
+        kind: MessageKind,
+        body: &str,
+        parent_id: Option<String>,
+        variants: Vec<String>,
+        author: Option<String>,
+        origin: Option<String>,
+    ) -> Result<Message> {
         let mut thread = self.load(task_id)?;
         let mut message = Message::new(next_msg_id_for_thread(&thread), role, kind, body);
         message.parent_id = parent_id;
         message.variants = variants;
         message.author = author;
+        message.origin = origin;
         let msg_id = message.id.clone();
         thread.messages.push(message);
         self.save(task_id, &mut thread)?;
@@ -185,6 +201,9 @@ impl ThreadManager {
         message.status = MessageStatus::Answered;
         message.updated_at = now;
         message.resolved_at = Some(now);
+        if role == MessageRole::Human && message.origin.is_none() {
+            message.origin = Some("human".to_string());
+        }
         self.save(task_id, &mut thread)?;
         self.get_message(task_id, msg_id)?.ok_or_else(|| {
             KanbanError::Invalid(format!("Failed to answer message {msg_id} for {task_id}"))

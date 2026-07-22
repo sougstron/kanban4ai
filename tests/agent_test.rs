@@ -51,10 +51,16 @@ agents:
 
     assert_eq!(plan.backend, "opencode");
     assert_eq!(plan.command, "/bin/echo");
-    assert!(
-        plan.args
-            .starts_with(&["run".to_string(), "--debug".to_string()])
-    );
+    // `run --format json` enables the machine transcript, then configured
+    // extra_args (`--debug`) follow.
+    assert!(plan.args.starts_with(&[
+        "run".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        "--debug".to_string(),
+    ]));
+    assert!(has_arg_pair(&plan.args, "--format", "json"));
+    assert!(plan.transcript_file.is_some());
     assert!(has_arg_pair(&plan.args, "--model", "task-model"));
     // The requested name stays in args; the registered form is resolved at
     // run time inside the wrapper script (see LaunchPlan::resolve_agent).
@@ -91,6 +97,28 @@ agents:
         plan.prompt
             .contains("never start it as a plain shell background job")
     );
+}
+
+#[test]
+fn prompt_nudges_suggestions_and_ask_form_for_plain_tasks() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    // A plain (non-interactive) task: the guidance must be present anyway.
+    let task = storage
+        .create_task(NewTask {
+            title: "Plain task".into(),
+            description: "Do the thing".into(),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let prompt = build_agent_prompt(dir.path(), &task, "ses-plain", false).unwrap();
+
+    assert!(prompt.contains("\"$KANBAN_CMD\" suggest TASK-001 <idea>"));
+    assert!(prompt.contains("\"$KANBAN_CMD\" ask-form TASK-001 --file .kanban/forms/TASK-001.ask.yaml --agent --session ses-plain"));
+    assert!(prompt.contains("questions:"));
+    assert!(prompt.contains("- prompt: <question text>"));
 }
 
 #[test]

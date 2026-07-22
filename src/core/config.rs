@@ -49,6 +49,9 @@ thresholds:
   waiting_default_eta: 900
   waiting_eta_multiplier: 2
   waiting_note_max_chars: 1000
+verification:
+  command: null
+  block_on_failure: true
 tui:
   name: Kanban
   card_height_lines: 4
@@ -135,6 +138,8 @@ pub struct BoardConfig {
     pub notifications: Mapping,
     #[serde(default)]
     pub agents: Mapping,
+    #[serde(default)]
+    pub verification: Mapping,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
@@ -399,6 +404,7 @@ impl Config {
         merge_missing(&mut config.tui, &defaults.tui);
         merge_missing(&mut config.auto_launch, &defaults.auto_launch);
         merge_missing(&mut config.notifications, &defaults.notifications);
+        merge_missing(&mut config.verification, &defaults.verification);
         for (backend, settings) in &defaults.agents {
             match config.agents.get_mut(backend) {
                 Some(Value::Mapping(existing)) => {
@@ -450,5 +456,38 @@ impl Config {
 
     pub fn get_notifications(&self) -> Result<Mapping> {
         Ok(self.load()?.notifications)
+    }
+
+    /// Verification gate command, if configured and non-empty. Empty or unset
+    /// means the gate is disabled and completions bypass it.
+    pub fn get_verification_command(&self) -> Result<Option<String>> {
+        let config = self.load()?;
+        let command = config
+            .verification
+            .get("command")
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .filter(|s| !s.trim().is_empty());
+        Ok(command)
+    }
+
+    /// Whether a failed verification gate should block the InProgress→Review
+    /// transition. Defaults to true when the verification block is present.
+    pub fn get_verification_block_on_failure(&self) -> Result<bool> {
+        let config = self.load()?;
+        if let Some(value) = config
+            .verification
+            .get("block_on_failure")
+            .and_then(as_bool)
+        {
+            return Ok(value);
+        }
+        BoardConfig::default()
+            .verification
+            .get("block_on_failure")
+            .and_then(as_bool)
+            .ok_or_else(|| KanbanError::Invalid("unknown verification block_on_failure".into()))
     }
 }

@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -25,6 +25,7 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
         Screen::Sessions => sessions::render_sessions(frame, app, chunks[0]),
         Screen::Archive => sessions::render_archive(frame, app, chunks[0]),
         Screen::LogView => sessions::render_log_view(frame, app, chunks[0]),
+        Screen::TextView => sessions::render_text_view(frame, app, chunks[0]),
         Screen::Help => {
             render_board(frame, app, chunks[0]);
             render_help(frame, app, area);
@@ -57,11 +58,15 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     for index in 0..app.board.columns.len() {
         let column = &app.board.columns[index];
         let focused = index == app.focused_column;
-        let drag_target = app
-            .dragging
-            .as_ref()
-            .is_some_and(|dragging| dragging.target_column == Some(index));
-        let border_style = if focused || drag_target {
+        // A card being dropped here (a column other than its own) gets a
+        // distinct bold "drop zone" border so the drag reads differently from
+        // ordinary keyboard focus.
+        let drop_target = app.drop_target_column() == Some(index);
+        let border_style = if drop_target {
+            Style::default()
+                .fg(app.theme.ok)
+                .add_modifier(Modifier::BOLD)
+        } else if focused {
             Style::default().fg(app.theme.focus)
         } else {
             Style::default().fg(app.theme.border)
@@ -176,7 +181,8 @@ fn render_cards(frame: &mut Frame<'_>, app: &App, column_index: usize, area: Rec
         });
         let row = rows[row_index];
         row_index += 1;
-        card::render_card(frame, app, task, row, focused, hovered);
+        let dragging = app.is_dragging_card(column_index, absolute_index);
+        card::render_card(frame, app, task, row, focused, hovered, dragging);
         // The question-preview line (second content line of the card) jumps
         // straight to the answer panel; register it before the card region.
         let has_preview = app
@@ -244,11 +250,19 @@ fn seg(label: &'static str, action: Option<UiAction>, priority: u8) -> StatusSeg
 }
 
 fn status_segments(app: &App) -> Vec<StatusSegment> {
+    let primary_action = if app
+        .current_task()
+        .is_some_and(|task| task.status == crate::core::models::TaskStatus::InProgress)
+    {
+        ("r revoke", UiAction::Revoke)
+    } else {
+        ("r run", UiAction::Run)
+    };
     match app.screen {
         Screen::Board => vec![
             seg("n new", Some(UiAction::NewTask), 2),
             seg("e edit", Some(UiAction::EditTask), 4),
-            seg("r run", Some(UiAction::Run), 1),
+            seg(primary_action.0, Some(primary_action.1), 1),
             seg("m move", Some(UiAction::MoveTask), 4),
             seg("y approve", Some(UiAction::Approve), 5),
             seg("A archive done", Some(UiAction::ArchiveAllDone), 6),
@@ -262,9 +276,10 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
                 !detail.open_questions().is_empty() || detail.show_edits_panel()
             });
             let mut segments = vec![
-                seg("r run", Some(UiAction::Run), 1),
+                seg(primary_action.0, Some(primary_action.1), 1),
                 seg("w answer", Some(UiAction::AnswerQuestion), 3),
                 seg("y approve", Some(UiAction::Approve), 3),
+                seg("x reject", Some(UiAction::ToggleReject), 5),
             ];
             if show_tab {
                 segments.push(seg("Tab editor", None, 4));
@@ -288,6 +303,7 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
             seg("q back", None, 2),
         ],
         Screen::LogView => vec![seg("↑/↓ scroll", None, 2), seg("q back", None, 1)],
+        Screen::TextView => vec![seg("↑/↓ PgUp/PgDn scroll", None, 2), seg("q back", None, 1)],
         Screen::Help => vec![
             seg("↑/↓ scroll", None, 2),
             seg("? close", Some(UiAction::Help), 1),
@@ -367,7 +383,10 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     }
     let remaining = end.saturating_sub(x);
     let max_message_width = remaining.saturating_sub(20).max(remaining / 3) as usize;
-    let raw_message = format!(" {} │", sanitize_terminal_text(&app.status));
+    // A live drag takes over the message slot so the user can see what is
+    // being moved and where; the normal status returns once the drag ends.
+    let message_text = app.drag_hint().unwrap_or_else(|| app.status.clone());
+    let raw_message = format!(" {} │", sanitize_terminal_text(&message_text));
     let message = truncate_display(&raw_message, max_message_width.max(1));
     x = x.saturating_add(UnicodeWidthStr::width(message.as_str()) as u16);
     spans.push(Span::raw(message));
@@ -454,7 +473,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  ←/→ or Tab/Shift+Tab: switch columns"),
         Line::from("  ↑/↓ PgUp/PgDn Home/End: navigate cards"),
         Line::from("  Enter: open task detail"),
-        Line::from("  r: run the task on an agent immediately (no confirmation)"),
+        Line::from("  r: run a task; revoke and wake it when already In Progress"),
         Line::from("  n: new task in focused column · e/m/d: edit, move, delete permanently"),
         Line::from("  w: answer question · y: approve Review → Done"),
         Line::from("  t: attach to the task's agent · c: add context/suggestion"),
@@ -466,10 +485,12 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Detail"),
         Line::from("  Tab: cycle thread/answer/editor panels when present"),
-        Line::from("  Enter: run To Do tasks only · r/buttons: run task actions"),
+        Line::from("  Enter: run To Do tasks only · r/buttons: run or revoke/wake"),
         Line::from("  Ctrl+S: save review edits (no re-run) · Ctrl+R: re-run"),
         Line::from("  s: project settings · Ctrl+T: cycle and persist theme"),
         Line::from("  Home/End: start/end of thread · q/Esc: back · Esc leaves text panels first"),
+        Line::from("  [/]: select a thread message · x: toggle reject (quarantine) on it"),
+        Line::from("  p: view assembled prompt · v: view inputs/provenance (when present)"),
         Line::from(""),
         Line::from("Sessions"),
         Line::from("  ▶ live · ⏳ declared wait · ✖ crashed heartbeats"),
@@ -485,7 +506,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  click: open a card, press a button, or pick a dialog field"),
         Line::from("  wheel: scrolls the column under the cursor"),
         Line::from("  drag across text: copy it · hold Shift to select interactive text"),
-        Line::from("  drag a card onto another column: move the task"),
+        Line::from("  drag a card onto another column: move it (target column"),
+        Line::from("    highlights green; status bar shows what moves where)"),
         Line::from("  status-bar hints are clickable; column headers show name and count"),
         Line::from(""),
         Line::from("?: toggle help · q/Esc: back · Ctrl+C twice: quit"),

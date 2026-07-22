@@ -24,6 +24,7 @@ use crate::core::models::{
     Message, MessageKind, MessageStatus, Session, SessionStatus, Task, TaskStatus,
 };
 use crate::core::operations::{Operations, QuestionRef, TaskPatch};
+use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState, estimate_session_tokens};
 use crate::core::storage::NewTask;
 use crate::core::thread::ThreadManager;
@@ -53,6 +54,9 @@ pub enum Screen {
     Sessions,
     Archive,
     LogView,
+    /// Read-only pager over a static block of text (the assembled prompt or the
+    /// gathered context of a task), opened from the detail view.
+    TextView,
     Help,
 }
 
@@ -142,6 +146,7 @@ pub enum UiAction {
     MoveTask,
     DeleteTask,
     Run,
+    Revoke,
     AnswerQuestion,
     Recover,
     Approve,
@@ -162,6 +167,9 @@ pub enum UiAction {
     KillSession,
     OpenSessionTask,
     Restore,
+    ToggleReject,
+    ViewPrompt,
+    ViewContext,
 }
 
 /// Which detail panel receives keyboard input. `Thread` is the neutral state
@@ -178,6 +186,8 @@ pub struct DetailState {
     pub task_id: String,
     pub task: Option<Task>,
     pub messages: Vec<Message>,
+    /// Index into `messages` of the message `x` will toggle-reject.
+    pub thread_selected: usize,
     pub scroll: u16,
     /// Upper scroll bound, set by the renderer from the thread content height.
     pub max_scroll: u16,
@@ -187,6 +197,16 @@ pub struct DetailState {
     pub question_index: usize,
     /// 0 = custom answer input, 1.. = the question's variants.
     pub variant_selected: usize,
+    /// A prompt dump exists for this task (drives the "Prompt" view button).
+    pub has_prompt: bool,
+    /// Harvested input-provenance exists for this task (drives the "Inputs"
+    /// view button and the `v` popup).
+    pub has_provenance: bool,
+    /// Input-provenance manifests harvested from each of this task's agent
+    /// runs (what was actually consumed: files/URLs/commands/MCP). Rendered as
+    /// a section above the thread, sourced from the manifests — never mixed
+    /// into the conversation messages.
+    pub provenance: Vec<InputManifest>,
 }
 
 impl DetailState {
@@ -238,6 +258,18 @@ pub struct LogViewState {
     pub follow: bool,
 }
 
+/// Read-only pager over a static text block (a task's assembled prompt or its
+/// gathered context). Unlike [`LogViewState`] the content is captured once when
+/// the view opens and never follows.
+#[derive(Clone)]
+pub struct TextViewState {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub scroll: u16,
+    /// Upper scroll bound, set by the renderer from the viewport height.
+    pub max_scroll: u16,
+}
+
 pub struct App {
     pub ops: Operations,
     pub project_path: PathBuf,
@@ -267,6 +299,7 @@ pub struct App {
     copy_notice_deadline: Option<Instant>,
     status_before_copy: Option<String>,
     pub log_view: Option<LogViewState>,
+    pub text_view: Option<TextViewState>,
     /// Where closing the detail screen returns to (Sessions `o`, Archive
     /// Enter); reset to Board once consumed.
     pub return_screen: Screen,
@@ -463,6 +496,7 @@ impl App {
             copy_notice_deadline: None,
             status_before_copy: None,
             log_view: None,
+            text_view: None,
             return_screen: Screen::Board,
             help_scroll: 0,
             help_max_scroll: 0,
@@ -503,6 +537,9 @@ impl App {
         let key = normalize_command_key(key);
         if self.screen == Screen::LogView {
             return self.handle_log_key(key);
+        }
+        if self.screen == Screen::TextView {
+            return self.handle_text_view_key(key);
         }
         if self.screen == Screen::Sessions {
             return self.handle_sessions_key(key);
@@ -551,12 +588,37 @@ impl App {
             (KeyCode::Char('n'), _) if action_screen => self.dispatch(UiAction::NewTask)?,
             (KeyCode::Char('e'), _) if action_screen => self.dispatch(UiAction::EditTask)?,
             (KeyCode::Char('m'), _) if action_screen => self.dispatch(UiAction::MoveTask)?,
-            (KeyCode::Char('r'), _) if action_screen => self.dispatch(UiAction::Run)?,
+            (KeyCode::Char('r'), _) if action_screen => {
+                let action = if self
+                    .current_task()
+                    .is_some_and(|task| task.status == TaskStatus::InProgress)
+                {
+                    UiAction::Revoke
+                } else {
+                    UiAction::Run
+                };
+                self.dispatch(action)?
+            }
             (KeyCode::Char('w'), _) if action_screen => self.dispatch(UiAction::AnswerQuestion)?,
             (KeyCode::Char('y'), _) if action_screen => self.dispatch(UiAction::Approve)?,
             (KeyCode::Char('t'), _) if action_screen => self.dispatch(UiAction::Attach)?,
             (KeyCode::Char('c'), _) if action_screen => self.dispatch(UiAction::AddContext)?,
             (KeyCode::Char('u'), _) if action_screen => self.dispatch(UiAction::Recover)?,
+            (KeyCode::Char('['), _) if self.screen == Screen::Detail => {
+                self.move_thread_selection(-1)
+            }
+            (KeyCode::Char(']'), _) if self.screen == Screen::Detail => {
+                self.move_thread_selection(1)
+            }
+            (KeyCode::Char('x'), _) if self.screen == Screen::Detail => {
+                self.dispatch(UiAction::ToggleReject)?
+            }
+            (KeyCode::Char('p'), _) if self.screen == Screen::Detail => {
+                self.dispatch(UiAction::ViewPrompt)?
+            }
+            (KeyCode::Char('v'), _) if self.screen == Screen::Detail => {
+                self.dispatch(UiAction::ViewContext)?
+            }
             (KeyCode::Char('u'), _) if self.screen == Screen::Archive => {
                 self.dispatch(UiAction::Restore)?
             }
@@ -863,6 +925,7 @@ impl App {
             // The board is human-managed and agent-executed: running a task
             // is the primary action and never asks for confirmation.
             UiAction::Run => self.run_current_task()?,
+            UiAction::Revoke => self.revoke_current_task()?,
             UiAction::AnswerQuestion => self.open_answer_dialog()?,
             UiAction::Recover => self.recover_current_task()?,
             UiAction::Approve => self.approve_current_task()?,
@@ -883,6 +946,9 @@ impl App {
             UiAction::KillSession => self.open_kill_confirm(),
             UiAction::OpenSessionTask => self.open_session_task_detail()?,
             UiAction::Restore => self.open_restore_confirm(),
+            UiAction::ToggleReject => self.toggle_reject_selected_message()?,
+            UiAction::ViewPrompt => self.open_prompt_view()?,
+            UiAction::ViewContext => self.open_context_view()?,
         }
         Ok(())
     }
@@ -1099,6 +1165,44 @@ impl App {
             self.open_focused_detail()?;
         }
         Ok(())
+    }
+
+    /// Contextual status-bar text shown while a card is being dragged, naming
+    /// the task and (once the cursor is over a different column) where a
+    /// release would drop it. `None` when no drag is in flight.
+    pub fn drag_hint(&self) -> Option<String> {
+        let dragging = self.dragging.as_ref()?;
+        match self
+            .drop_target_column()
+            .and_then(|target| self.board.columns.get(target))
+        {
+            Some(column) => Some(format!(
+                "Moving {} → {} · release to move",
+                dragging.task_id, column.name
+            )),
+            None => Some(format!(
+                "Moving {} · drag onto another column to move it",
+                dragging.task_id
+            )),
+        }
+    }
+
+    /// Column a release would drop the dragged card into — only when it differs
+    /// from the source column, so the drop-target highlight never fires while
+    /// hovering the card's own column.
+    pub fn drop_target_column(&self) -> Option<usize> {
+        let dragging = self.dragging.as_ref()?;
+        dragging
+            .target_column
+            .filter(|target| *target != dragging.from_column)
+    }
+
+    /// True for the specific card currently held in a drag, so the renderer can
+    /// mark the source as lifted.
+    pub fn is_dragging_card(&self, column: usize, card: usize) -> bool {
+        self.dragging
+            .as_ref()
+            .is_some_and(|dragging| dragging.from_column == column && dragging.card == card)
     }
 
     fn column_at(&self, x: u16, y: u16) -> Option<usize> {
@@ -1487,6 +1591,7 @@ impl App {
             Screen::Sessions => self.session_selected = self.session_selected.saturating_sub(1),
             Screen::Archive => self.archive_selected = self.archive_selected.saturating_sub(1),
             Screen::LogView => self.scroll_log(-1),
+            Screen::TextView => self.scroll_text_view(-1),
             Screen::Help => self.help_scroll = self.help_scroll.saturating_sub(1),
         }
     }
@@ -1506,6 +1611,7 @@ impl App {
                     next_index(self.archive_selected, self.filtered_archived_tasks().len());
             }
             Screen::LogView => self.scroll_log(1),
+            Screen::TextView => self.scroll_text_view(1),
             Screen::Help => {
                 self.help_scroll = self.help_scroll.saturating_add(1).min(self.help_max_scroll);
             }
@@ -1561,6 +1667,11 @@ impl App {
                     log.follow = false;
                 }
             }
+            Screen::TextView => {
+                if let Some(view) = self.text_view.as_mut() {
+                    view.scroll = 0;
+                }
+            }
             Screen::Help => self.help_scroll = 0,
         }
     }
@@ -1583,6 +1694,11 @@ impl App {
                 if let Some(log) = self.log_view.as_mut() {
                     log.scroll = log.max_scroll;
                     log.follow = true;
+                }
+            }
+            Screen::TextView => {
+                if let Some(view) = self.text_view.as_mut() {
+                    view.scroll = view.max_scroll;
                 }
             }
             Screen::Help => self.help_scroll = self.help_max_scroll,
@@ -1708,7 +1824,7 @@ impl App {
     /// The task an action applies to: the open detail's task, else the
     /// focused board card. Keeps every hotkey/button meaningful from both
     /// screens.
-    fn current_task(&self) -> Option<Task> {
+    pub(super) fn current_task(&self) -> Option<Task> {
         if self.screen == Screen::Detail {
             return self.detail.as_ref().and_then(|detail| detail.task.clone());
         }
@@ -1843,10 +1959,34 @@ impl App {
                 .unwrap_or_default();
             (textarea_text(&detail.review_edits) != persisted).then(|| detail.review_edits.clone())
         });
+        let preserved_answer = self.detail.as_ref().and_then(|detail| {
+            if detail.task_id != task_id {
+                return None;
+            }
+            let question_id = detail
+                .open_questions()
+                .get(detail.question_index)?
+                .id
+                .clone();
+            Some((
+                question_id,
+                detail.answer_input.clone(),
+                detail.variant_selected,
+            ))
+        });
+        let preserved_selected_msg_id = self.detail.as_ref().and_then(|detail| {
+            (detail.task_id == task_id)
+                .then(|| detail.messages.get(detail.thread_selected))
+                .flatten()
+                .map(|message| message.id.clone())
+        });
         let task = self.ops.get_task(task_id)?;
         let messages = ThreadManager::new(&self.project_path)?
             .load(task_id)?
             .messages;
+        let thread_selected = preserved_selected_msg_id
+            .and_then(|msg_id| messages.iter().position(|message| message.id == msg_id))
+            .unwrap_or_else(|| messages.len().saturating_sub(1));
         let mut review_edits = TextArea::from(
             task.as_ref()
                 .map(|task| lines_or_empty(&task.review_edits))
@@ -1856,10 +1996,17 @@ impl App {
             review_edits = editor;
         }
         review_edits.set_cursor_line_style(ratatui::style::Style::default());
-        self.detail = Some(DetailState {
+        let has_prompt = task
+            .as_ref()
+            .is_some_and(|task| self.ops.task_has_prompt(task));
+        let provenance =
+            provenance::collect_for_thread(&self.ops.storage.provenance_dir, &messages);
+        let has_provenance = !provenance.is_empty();
+        let mut detail = DetailState {
             task_id: task_id.to_string(),
             task,
             messages,
+            thread_selected,
             scroll: 0,
             // The real bound is known only at render time; start unbounded so
             // a preserved scroll position survives until the next frame.
@@ -1873,7 +2020,61 @@ impl App {
             },
             question_index: 0,
             variant_selected: 0,
-        });
+            has_prompt,
+            has_provenance,
+            provenance,
+        };
+        if let Some((question_id, answer_input, variant_selected)) = preserved_answer
+            && let Some(question_index) = detail
+                .open_questions()
+                .iter()
+                .position(|question| question.id == question_id)
+        {
+            let variant_count = detail.open_questions()[question_index].variants.len();
+            detail.answer_input = answer_input;
+            detail.question_index = question_index;
+            detail.variant_selected = variant_selected.min(variant_count);
+        }
+        self.detail = Some(detail);
+        Ok(())
+    }
+
+    fn move_thread_selection(&mut self, delta: i32) {
+        let Some(detail) = self.detail.as_mut() else {
+            return;
+        };
+        if detail.messages.is_empty() {
+            return;
+        }
+        let len = detail.messages.len() as i32;
+        let next = (detail.thread_selected as i32 + delta).rem_euclid(len);
+        detail.thread_selected = next as usize;
+    }
+
+    /// Toggle `rejected` on the message selected in the thread panel (`[`/`]`
+    /// to move the selection), quarantining or restoring it from the supply
+    /// chain fed into future agent prompts.
+    fn toggle_reject_selected_message(&mut self) -> Result<()> {
+        let Some(detail) = self.detail.as_ref() else {
+            return Ok(());
+        };
+        let Some(message) = detail.messages.get(detail.thread_selected) else {
+            return Ok(());
+        };
+        let task_id = detail.task_id.clone();
+        let msg_id = message.id.clone();
+        let already_rejected = message.status == MessageStatus::Rejected;
+        let result = if already_rejected {
+            self.ops.unreject_message(&task_id, &msg_id)?
+        } else {
+            self.ops.reject_message(&task_id, &msg_id)?
+        };
+        self.status = match result {
+            Some(_) if already_rejected => format!("{msg_id} restored"),
+            Some(_) => format!("{msg_id} rejected"),
+            None => format!("Message {msg_id} not found"),
+        };
+        self.load_detail(&task_id)?;
         Ok(())
     }
 
@@ -2170,6 +2371,30 @@ impl App {
         Ok(())
     }
 
+    fn revoke_current_task(&mut self) -> Result<()> {
+        let Some(task) = self.current_task() else {
+            self.status = "No task selected".to_string();
+            return Ok(());
+        };
+        if task.status != TaskStatus::InProgress {
+            self.status = format!("{} is not In Progress", task.id);
+            return Ok(());
+        }
+        let task_id = task.id.clone();
+        let expected_session = task.session.clone();
+        let relaunched = self
+            .ops
+            .revoke_in_progress_task(&task_id, expected_session.as_deref())?
+            .is_some();
+        self.refresh_after_action()?;
+        self.status = if relaunched {
+            format!("Revoked and woke {task_id}")
+        } else {
+            format!("Revoke of {task_id} was not started")
+        };
+        Ok(())
+    }
+
     fn approve_current_task(&mut self) -> Result<()> {
         let Some(task) = self.current_task() else {
             self.status = "No task selected".to_string();
@@ -2325,6 +2550,94 @@ impl App {
         }
     }
 
+    /// Open the read-only text pager over the task's most recent assembled
+    /// prompt dump. No-op with a status hint when the task has never launched.
+    fn open_prompt_view(&mut self) -> Result<()> {
+        let Some(task) = self.current_task() else {
+            self.status = "No task selected".to_string();
+            return Ok(());
+        };
+        let Some(prompt) = self.ops.task_prompt(&task) else {
+            self.status = format!("No prompt recorded for {}", task.id);
+            return Ok(());
+        };
+        self.open_text_view(format!("Prompt · {}", task.id), &prompt);
+        Ok(())
+    }
+
+    /// Open the read-only text pager over this task's input-provenance — the
+    /// files each agent run actually read and wrote, plus URLs and MCP calls.
+    /// This is telemetry kept out of the thread; the popup is its only home.
+    fn open_context_view(&mut self) -> Result<()> {
+        let Some(task) = self.current_task() else {
+            self.status = "No task selected".to_string();
+            return Ok(());
+        };
+        let body = self
+            .detail
+            .as_ref()
+            .map(|detail| provenance::render_manifests(&detail.provenance))
+            .unwrap_or_default();
+        if body.trim().is_empty() {
+            self.status = format!("No inputs recorded for {}", task.id);
+            return Ok(());
+        }
+        self.open_text_view(format!("Inputs (provenance) · {}", task.id), &body);
+        Ok(())
+    }
+
+    fn open_text_view(&mut self, title: String, body: &str) {
+        self.status = title.clone();
+        self.text_view = Some(TextViewState {
+            title,
+            lines: body.lines().map(str::to_string).collect(),
+            scroll: 0,
+            // The real bound is known only at render time.
+            max_scroll: u16::MAX,
+        });
+        self.screen = Screen::TextView;
+    }
+
+    /// Text-pager keys: scroll around the captured block, `q`/`Esc` back to the
+    /// detail view it was opened from.
+    fn handle_text_view_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.text_view = None;
+                self.screen = Screen::Detail;
+            }
+            KeyCode::Up => self.scroll_text_view(-1),
+            KeyCode::Down => self.scroll_text_view(1),
+            KeyCode::PageUp => self.scroll_text_view(-10),
+            KeyCode::PageDown => self.scroll_text_view(10),
+            KeyCode::Home => {
+                if let Some(view) = self.text_view.as_mut() {
+                    view.scroll = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(view) = self.text_view.as_mut() {
+                    view.scroll = view.max_scroll;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn scroll_text_view(&mut self, delta: i32) {
+        if let Some(view) = self.text_view.as_mut() {
+            if delta < 0 {
+                view.scroll = view.scroll.saturating_sub(delta.unsigned_abs() as u16);
+            } else {
+                view.scroll = view
+                    .scroll
+                    .saturating_add(delta as u16)
+                    .min(view.max_scroll);
+            }
+        }
+    }
+
     fn open_session_task_detail(&mut self) -> Result<()> {
         let Some(task_id) = self
             .filtered_active_sessions()
@@ -2443,7 +2756,7 @@ impl App {
             }
             Screen::Sessions => self.session_selected = 0,
             Screen::Archive => self.archive_selected = 0,
-            Screen::Detail | Screen::LogView | Screen::Help => {}
+            Screen::Detail | Screen::LogView | Screen::TextView | Screen::Help => {}
         }
     }
 

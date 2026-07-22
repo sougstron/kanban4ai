@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::core::error::Result;
-use crate::core::models::{Message, MessageKind, Task};
+use crate::core::models::{Message, MessageKind, MessageStatus, Task};
 use crate::core::thread::ThreadManager;
 
 pub fn build_agent_prompt(
@@ -59,6 +59,20 @@ Ending a reply without one of those strands the task and forces an automatic res
         task.id,
         task.id
     );
+    prompt.push_str(&format!(
+        "- Proactively record non-blocking ideas, risks, or better alternatives you notice \
+(don't block on them, keep working) with: \"$KANBAN_CMD\" suggest {} <idea>\n",
+        task.id
+    ));
+    prompt.push_str(&format!(
+        "- To ask the human one or more questions, prefer a strict YAML form over free text so \
+each question renders with selectable options. Write .kanban/forms/{}.ask.yaml then submit it:\n  \
+\"$KANBAN_CMD\" ask-form {} --file .kanban/forms/{}.ask.yaml --agent --session {session_id}\n  \
+Schema (options are optional; prompt is required; add as many questions as you need):\n    \
+questions:\n      - prompt: <question text>\n        options: [<choice A>, <choice B>]\n      \
+- prompt: <another question>\n",
+        task.id, task.id, task.id
+    ));
     if task.interactive {
         prompt.push_str(&format!(
             "- This task is interactive: for blocking questions use \"$KANBAN_CMD\" ask {} <question> --agent --wait --session {}; for non-blocking ideas use \"$KANBAN_CMD\" suggest.\n",
@@ -81,7 +95,10 @@ fn append_thread_context(project_path: &Path, task: &Task, prompt: &mut String) 
         .messages
         .into_iter()
         .filter(|message| {
-            !matches!(message.kind, MessageKind::System | MessageKind::Task)
+            !matches!(
+                message.kind,
+                MessageKind::System | MessageKind::Task | MessageKind::AgentStep
+            ) && message.status != MessageStatus::Rejected
                 && !message.body.trim().is_empty()
         })
         .collect();
@@ -110,6 +127,14 @@ fn append_message(prompt: &mut String, message: &Message) {
     {
         prompt.push_str(" by ");
         prompt.push_str(author.trim());
+    }
+    if let Some(origin) = message
+        .origin
+        .as_deref()
+        .filter(|origin| !origin.trim().is_empty())
+    {
+        prompt.push_str(" origin=");
+        prompt.push_str(origin.trim());
     }
     prompt.push_str("] ");
     prompt.push_str(message.body.trim());
