@@ -170,6 +170,50 @@ fn create_task_initializes_thread_with_system_and_task_messages() {
 }
 
 #[test]
+fn create_task_does_not_inherit_the_thread_of_a_deleted_task() {
+    let (dir, storage) = temp_board();
+    let old = storage.create_task(NewTask::titled("Old task")).unwrap();
+    let manager = ThreadManager::new(dir.path()).unwrap();
+    manager
+        .post(
+            &old.id,
+            kanban4ai::core::models::MessageRole::Human,
+            kanban4ai::core::models::MessageKind::Suggestion,
+            "secret from the old task",
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+    // Only the task file goes away, so the id is handed out again while the
+    // sidecar thread is still on disk.
+    storage.delete_task(&old.id).unwrap();
+    assert!(
+        dir.path()
+            .join(".kanban/threads")
+            .join(format!("{}.yaml", old.id))
+            .is_file()
+    );
+
+    let fresh = storage.create_task(NewTask::titled("Fresh task")).unwrap();
+    assert_eq!(fresh.id, old.id);
+
+    let thread = manager.load(&fresh.id).unwrap();
+    assert_eq!(thread.messages.len(), 2);
+    assert!(
+        thread.messages[0]
+            .body
+            .starts_with("Task created: Fresh task")
+    );
+    assert!(
+        !thread
+            .messages
+            .iter()
+            .any(|message| message.body.contains("old task"))
+    );
+}
+
+#[test]
 fn tui_fingerprint_tracks_thread_and_session_sidecars() {
     let (dir, storage) = temp_board();
     let task = storage.create_task(NewTask::titled("Live detail")).unwrap();

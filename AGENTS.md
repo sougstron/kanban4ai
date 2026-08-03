@@ -126,6 +126,13 @@ file, merges concurrent changes by message id (additions from both sides
 survive; a message is only overwritten by a writer that actually changed it
 relative to its loaded base), and writes `rev + 1` atomically.
 
+Task ids are recycled (`Storage::get_next_id` hands out `max + 1`), so a thread
+must never outlive its task: `abandon_task` deletes the sidecar with the task,
+and task creation drops any thread already sitting on the fresh id. Otherwise a
+new task adopts the deleted task's messages — `initialize_task_thread` keeps an
+existing thread as-is — and shows them in the detail view and in the agent's
+prompt.
+
 ```yaml
 task_id: TASK-001
 rev: 3
@@ -286,6 +293,16 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `?`: Help overlay (scrollable, sized to its content; lists mouse gestures)
 - `q`: Back from detail/secondary screens; quit the TUI with `Ctrl+C` twice
 
+Clipboard pastes use bracketed paste: the whole block is inserted into the
+focused text field in one edit (flattened to a single line for one-line fields
+such as Title, search, and the answer box). Without it the terminal replays a
+paste as key events, so tabs jump between dialog fields, newlines press the
+focused button, and a paste on the board fires one shortcut per character — the
+way earlier boards ended up with tasks whose title and description were random
+fragments of the pasted text. A paste with no text field focused is dropped
+with a status hint instead of being executed. `Ctrl+V` (image paste from the
+clipboard) is unaffected.
+
 Sessions view: each row shows the session state (`▶` live heartbeat, `⏳`
 declared wait, `✖` crashed), its task, and the estimated token count; waiting
 rows also show the relaunch deadline. `Enter` attaches, `v` opens a scrollable
@@ -351,7 +368,7 @@ A task may carry a `chained_to` target task id. When the **target** task enters 
 ### Backup & Revert
 - Delegated agents are told to copy each existing file they touch into `.kanban/backups/<task_id>/` preserving its repo-relative path.
 - Revert spawns a second agent job whose prompt restores every file under that backup dir. Requires existing backups.
-- Completing/abandoning a task clears its backups, logs, and session files. The task's `session` field still keeps the id of the session that did the work, even though that session's files are gone.
+- Completing/abandoning a task clears its backups, logs, and session files; abandoning also deletes the task's thread, since the task itself is gone and its id will be reused. The task's `session` field still keeps the id of the session that did the work, even though that session's files are gone.
 
 ### Image Attachments
 Paste an image from the clipboard (`wl-paste`/`xclip`, or a file path in clipboard text), sniff the type by magic bytes (png/jpg/gif/webp), write it atomically under `.kanban/assets/images/`, and embed Markdown (`![pasted image](...)`) in the task description.

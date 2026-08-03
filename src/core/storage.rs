@@ -221,7 +221,12 @@ impl Storage {
             fs::create_dir_all(parent)?;
         }
         self.write_task_file(&filepath, &task)?;
-        ThreadManager::new(&self.project_path)?.initialize_task_thread(&task)?;
+        let threads = ThreadManager::new(&self.project_path)?;
+        // The id is fresh (`max + 1`), so any thread already sitting on it is a
+        // leftover of a deleted task; adopting it would show the new task the
+        // old task's messages and feed them to its agent.
+        threads.discard_thread(&task_id)?;
+        threads.initialize_task_thread(&task)?;
         Ok(task)
     }
 

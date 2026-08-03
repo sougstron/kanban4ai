@@ -243,6 +243,12 @@ pub fn truncate_display(text: &str, max_width: usize) -> String {
     out
 }
 
+/// Clipboard text made safe to insert into a text field: line endings collapse
+/// to `\n`, everything else goes through the terminal sanitizer.
+pub fn sanitize_paste_text(text: &str) -> String {
+    sanitize_terminal_text(&text.replace("\r\n", "\n").replace('\r', "\n"))
+}
+
 pub fn sanitize_terminal_text(text: &str) -> String {
     text.chars()
         .map(|ch| match ch {

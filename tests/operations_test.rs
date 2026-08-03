@@ -1200,6 +1200,25 @@ fn revoke_in_progress_starts_sessionless_task() {
 }
 
 #[test]
+fn abandon_task_removes_the_sidecar_thread() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Doomed")).unwrap();
+    ops.ask_question(&task.id, "Still needed?", "agent", vec![])
+        .unwrap();
+    let thread_file = dir
+        .path()
+        .join(".kanban/threads")
+        .join(format!("{}.yaml", task.id));
+    assert!(thread_file.is_file());
+
+    assert!(ops.abandon_task(&task.id).unwrap());
+    assert!(
+        !thread_file.exists(),
+        "a deleted task must not leave its thread for the next task on this id"
+    );
+}
+
+#[test]
 fn abandon_stalled_tasks_skips_questioned_ones() {
     let (dir, ops, _rec) = ops_with_recorder(false);
     let stalled = ops.create_task(NewTask::titled("Stalled")).unwrap();

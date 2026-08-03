@@ -9,7 +9,7 @@ use crate::core::models::Task;
 use crate::core::operations::QuestionRef;
 
 use super::app::{App, HitAction, Hitbox};
-use super::card::sanitize_terminal_text;
+use super::card::{sanitize_paste_text, sanitize_terminal_text};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
@@ -401,6 +401,32 @@ impl ModalState {
         if self.editable_signature() != before {
             self.error = None;
         }
+    }
+
+    /// Insert clipboard text into the focused field as one edit.
+    ///
+    /// Bracketed paste keeps the terminal from replaying the clipboard as
+    /// keystrokes, where embedded tabs would hop between fields and newlines
+    /// could trigger the focused button.
+    pub fn paste(&mut self, text: &str) -> bool {
+        let before = self.editable_signature();
+        let text = sanitize_paste_text(text);
+        match self.active_field() {
+            DialogField::Title => {
+                self.title.insert_str(text.replace('\n', " "));
+            }
+            DialogField::Description => {
+                self.description.insert_str(&text);
+            }
+            DialogField::Answer => {
+                self.answer.insert_str(&text);
+            }
+            _ => return false,
+        }
+        if self.editable_signature() != before {
+            self.error = None;
+        }
+        true
     }
 
     pub fn active_textarea_mut(&mut self) -> &mut TextArea<'static> {
@@ -1131,7 +1157,7 @@ fn render_confirm(
             sanitize_terminal_text(task_id)
         )),
         Line::from(if action == "Delete permanently" {
-            "Removes the task, backups, session logs, pasted assets, and context. Non-context thread messages are kept."
+            "Removes the task, its thread, backups, session logs, pasted assets, and context."
         } else {
             "Restores files from this task's saved backups."
         }),

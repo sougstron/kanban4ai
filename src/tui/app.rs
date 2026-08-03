@@ -31,7 +31,9 @@ use crate::core::storage::NewTask;
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 
-use super::card::{case_insensitive_match, sanitize_terminal_text, truncate_display};
+use super::card::{
+    case_insensitive_match, sanitize_paste_text, sanitize_terminal_text, truncate_display,
+};
 use super::dialogs::{
     BulkAction, DialogField, Modal, ModalButton, ModalState, QuestionChoice, SelectOption,
 };
@@ -513,6 +515,49 @@ impl App {
             last_wait_resume: None,
             catalog_ready,
         })
+    }
+
+    /// Insert bracketed-paste text into whatever text field has focus.
+    ///
+    /// Without this the terminal replays the clipboard as key events: tabs hop
+    /// between dialog fields, newlines press the focused button, and on the
+    /// board every character fires its shortcut. Pastes that arrive with no
+    /// text field focused are dropped instead of being executed.
+    pub fn handle_paste(&mut self, text: &str) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        if let Some(mut modal) = self.modal.take() {
+            let inserted =
+                !modal.discard_confirm && !is_confirmation_modal(&modal.modal) && modal.paste(text);
+            self.modal = Some(modal);
+            if !inserted {
+                self.status = "Nothing pasted: focus a text field first".to_string();
+            }
+            return Ok(());
+        }
+        if self.search.active {
+            self.search.query.insert_str(one_line_paste(text));
+            return Ok(());
+        }
+        if self.screen == Screen::Detail
+            && let Some(detail) = self.detail.as_mut()
+        {
+            match detail.focus {
+                DetailFocus::Answer => {
+                    detail.answer_input.insert_str(one_line_paste(text));
+                    detail.variant_selected = 0;
+                    return Ok(());
+                }
+                DetailFocus::Edits => {
+                    detail.review_edits.insert_str(sanitize_paste_text(text));
+                    return Ok(());
+                }
+                DetailFocus::Thread => {}
+            }
+        }
+        self.status = "Nothing pasted: focus a text field first".to_string();
+        Ok(())
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -3631,6 +3676,11 @@ fn input_single_line(textarea: &mut TextArea<'static>, key: KeyEvent) {
 
 /// Keys that belong to a focused textarea (typing and cursor movement),
 /// excluding chorded shortcuts.
+/// Flatten pasted text for fields that hold a single line (Enter submits them).
+fn one_line_paste(text: &str) -> String {
+    sanitize_paste_text(text).replace('\n', " ")
+}
+
 fn is_text_input_key(key: KeyEvent) -> bool {
     matches!(
         key.code,

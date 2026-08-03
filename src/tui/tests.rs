@@ -3872,3 +3872,96 @@ fn viewer_buttons_absent_without_prompt_or_provenance() {
     app.handle_key(key(KeyCode::Char('v'))).expect("inputs key");
     assert_eq!(app.screen, Screen::Detail);
 }
+
+/// A bracketed paste is one edit in the focused field: tabs and newlines stay
+/// as text instead of hopping fields and pressing the focused button.
+#[test]
+fn bracketed_paste_lands_whole_in_the_focused_dialog_field() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("new task modal")
+        .focus_field(DialogField::Description);
+
+    app.handle_paste("83\tspeed gen 5\t338ab\n84\tprofit gen 9\t422ab")
+        .expect("paste");
+
+    let modal = app.modal.as_ref().expect("modal still open");
+    assert_eq!(modal.active_field(), DialogField::Description);
+    assert_eq!(
+        modal.description.lines(),
+        ["83\tspeed gen 5\t338ab", "84\tprofit gen 9\t422ab"]
+    );
+}
+
+/// The title holds one line, so a pasted block is flattened rather than
+/// truncated to whatever fragment followed the last newline.
+#[test]
+fn paste_into_single_line_field_keeps_every_line() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("new task modal")
+        .focus_field(DialogField::Title);
+
+    app.handle_paste("first line\r\nsecond line")
+        .expect("paste");
+
+    let modal = app.modal.as_ref().expect("modal still open");
+    assert_eq!(modal.title.lines(), ["first line second line"]);
+}
+
+/// Escape sequences in pasted text never reach the terminal.
+#[test]
+fn paste_sanitizes_control_sequences() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("new task modal")
+        .focus_field(DialogField::Description);
+
+    app.handle_paste("safe\u{001b}[31mred").expect("paste");
+
+    let modal = app.modal.as_ref().expect("modal still open");
+    assert_eq!(modal.description.lines(), ["safe\u{fffd}[31mred"]);
+}
+
+/// On the board a paste is dropped instead of being replayed as shortcuts.
+#[test]
+fn paste_without_a_text_field_is_ignored() {
+    let (_dir, mut app) = app_with_board();
+
+    app.handle_paste("nnnq").expect("paste");
+
+    assert!(app.modal.is_none());
+    assert_eq!(app.screen, Screen::Board);
+    assert!(app.status.contains("Nothing pasted"));
+}
+
+/// The detail answer box takes pasted text on the current line.
+#[test]
+fn paste_fills_the_detail_answer_box() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Question holder"))
+        .expect("create task");
+    app.ops
+        .ask_question(&task.id, "Which one?", "agent", vec![])
+        .expect("ask");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Tab)).expect("focus answer");
+    assert_eq!(
+        app.detail.as_ref().expect("detail state").focus,
+        DetailFocus::Answer
+    );
+
+    app.handle_paste("use\nthe second one").expect("paste");
+
+    let detail = app.detail.as_ref().expect("detail state");
+    assert_eq!(detail.answer_input.lines(), ["use the second one"]);
+}

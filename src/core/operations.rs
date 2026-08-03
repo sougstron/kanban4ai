@@ -253,7 +253,8 @@ impl Operations {
         self.storage.delete_task(task_id)
     }
 
-    /// Delete a task together with its assets, context, backups, and sessions.
+    /// Delete a task together with its thread, assets, context, backups, and
+    /// sessions.
     pub fn abandon_task(&self, task_id: &str) -> Result<bool> {
         let Some(task) = self.storage.load_task(task_id)? else {
             return Ok(false);
@@ -263,7 +264,12 @@ impl Operations {
             .clear_context(&task.id, &self.storage)?;
         self.clear_task_backups(&task.id);
         self.clear_task_logs_and_sessions(&task);
-        self.storage.delete_task(&task.id)
+        let deleted = self.storage.delete_task(&task.id)?;
+        // After the task file is gone, so that nothing rewrites the sidecar:
+        // ids are recycled, and a surviving thread would resurface under the
+        // next task that gets this id.
+        self.thread_manager()?.discard_thread(&task.id)?;
+        Ok(deleted)
     }
 
     /// Abandon in-progress tasks whose session died without leaving questions.

@@ -22,7 +22,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::ExecutableCommand;
 use ratatui::crossterm::cursor::{Hide, Show};
-use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -40,6 +42,7 @@ struct TerminalSetupGuard {
     raw_mode: bool,
     alternate_screen: bool,
     mouse_capture: bool,
+    bracketed_paste: bool,
     cursor_hidden: bool,
     armed: bool,
 }
@@ -66,6 +69,9 @@ impl Drop for TerminalSetupGuard {
         if self.cursor_hidden {
             let _ = stdout.execute(Show);
         }
+        if self.bracketed_paste {
+            let _ = stdout.execute(DisableBracketedPaste);
+        }
         if self.mouse_capture {
             let _ = stdout.execute(DisableMouseCapture);
         }
@@ -88,6 +94,8 @@ impl TerminalGuard {
         setup.alternate_screen = true;
         stdout.execute(EnableMouseCapture)?;
         setup.mouse_capture = true;
+        stdout.execute(EnableBracketedPaste)?;
+        setup.bracketed_paste = true;
         stdout.execute(Hide)?;
         setup.cursor_hidden = true;
         let backend = CrosstermBackend::new(stdout);
@@ -106,6 +114,7 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let backend = self.terminal.backend_mut();
         let _ = backend.execute(Show);
+        let _ = backend.execute(DisableBracketedPaste);
         let _ = backend.execute(DisableMouseCapture);
         let _ = backend.execute(LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
@@ -123,6 +132,7 @@ impl PanicHookGuard {
             let _ = disable_raw_mode();
             let mut stdout = io::stdout();
             let _ = stdout.execute(Show);
+            let _ = stdout.execute(DisableBracketedPaste);
             let _ = stdout.execute(DisableMouseCapture);
             let _ = stdout.execute(LeaveAlternateScreen);
             eprintln!("{info}");
@@ -145,6 +155,7 @@ fn attach_session(session_id: &str) -> Result<bool> {
     let mut stdout = io::stdout();
     let suspended = (|| -> Result<()> {
         stdout.execute(Show)?;
+        stdout.execute(DisableBracketedPaste)?;
         stdout.execute(DisableMouseCapture)?;
         stdout.execute(LeaveAlternateScreen)?;
         disable_raw_mode()?;
@@ -169,6 +180,7 @@ fn restore_terminal() -> Result<()> {
     let mut stdout = io::stdout();
     stdout.execute(EnterAlternateScreen)?;
     stdout.execute(EnableMouseCapture)?;
+    stdout.execute(EnableBracketedPaste)?;
     stdout.execute(Hide)?;
     Ok(())
 }

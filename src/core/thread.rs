@@ -286,6 +286,20 @@ impl ThreadManager {
         atomic_write_text(&thread_file, &serialize_thread(&thread)?)?;
         Ok(removed)
     }
+
+    /// Drop the whole sidecar thread of `task_id`.
+    ///
+    /// Task ids are recycled (`Storage::get_next_id` hands out `max + 1`), so a
+    /// thread left behind by a deleted task would otherwise be adopted by the
+    /// next task that lands on the same id.
+    pub fn discard_thread(&self, task_id: &str) -> Result<bool> {
+        let thread_file = self.thread_file(task_id);
+        if !thread_file.exists() {
+            return Ok(false);
+        }
+        fs::remove_file(&thread_file)?;
+        Ok(true)
+    }
 }
 
 fn task_body_of(task: &Task) -> String {

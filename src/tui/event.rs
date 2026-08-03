@@ -69,6 +69,7 @@ fn handle_input(app: &mut App, input: CrosstermEvent) -> Result<()> {
     match input {
         CrosstermEvent::Key(key) => app.handle_key(key),
         CrosstermEvent::Mouse(mouse) => app.handle_mouse(mouse),
+        CrosstermEvent::Paste(text) => app.handle_paste(&text),
         CrosstermEvent::Resize(_, _) => Ok(()),
         _ => Ok(()),
     }
