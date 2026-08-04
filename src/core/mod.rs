@@ -9,5 +9,6 @@ pub mod operations;
 pub mod provenance;
 pub mod session;
 pub mod storage;
+pub mod telemetry;
 pub mod thread;
 pub mod timefmt;

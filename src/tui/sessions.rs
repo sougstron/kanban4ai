@@ -12,7 +12,7 @@ use crate::core::session::SessionState;
 use super::app::App;
 use super::card::{sanitize_terminal_text, truncate_display};
 
-const SESSIONS_TITLE: &str = " Sessions · Enter attach · v log · x kill · o task · q back ";
+const SESSIONS_TITLE: &str = " Sessions · Enter open · i info · v log · x kill · o task · q back ";
 const ARCHIVE_TITLE: &str = " Archive · Enter detail · u restore · / filter · q back ";
 
 pub fn render_sessions(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -47,16 +47,33 @@ pub fn render_sessions(frame: &mut Frame<'_>, app: &App, area: Rect) {
             } else {
                 String::new()
             };
+            let progress = &active_session.progress;
+            let todos = progress
+                .todos()
+                .map(|(done, total)| format!("  {done}/{total}"))
+                .unwrap_or_default();
+            let activity = progress
+                .last_activity
+                .as_deref()
+                .map(|activity| {
+                    format!(
+                        "  → {}",
+                        truncate_display(&sanitize_terminal_text(activity), 30)
+                    )
+                })
+                .unwrap_or_default();
             ListItem::new(Line::from(vec![
                 Span::styled(icon, Style::default().fg(color)),
                 Span::raw(truncate_display(&sanitize_terminal_text(&session.id), 26)),
                 Span::raw("  "),
                 Span::raw(truncate_display(
                     &sanitize_terminal_text(&active_session.task_label),
-                    38,
+                    32,
                 )),
                 Span::raw("  tokens: "),
                 Span::raw(&active_session.token_display),
+                Span::styled(todos, Style::default().fg(app.theme.ok)),
+                Span::styled(activity, Style::default().fg(app.theme.muted)),
                 Span::styled(wait, Style::default().fg(color)),
             ]))
         })

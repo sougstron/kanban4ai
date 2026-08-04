@@ -2116,8 +2116,11 @@ fn sessions_render_and_controls_use_cached_sessions() {
     assert!(render_snapshot(&mut app).contains("ses-tmux-live"));
     app.handle_key(key(KeyCode::Down))
         .expect("navigate cached sessions");
-    app.handle_key(key(KeyCode::Enter)).expect("request attach");
-    assert_eq!(app.take_attach_request().as_deref(), Some("ses-tmux-live"));
+    app.handle_key(key(KeyCode::Enter)).expect("open session");
+    // The unified open finds no tmux host (and the record was unlinked), so it
+    // falls back to following the session's log rather than queueing an attach.
+    assert!(app.take_terminal_action().is_none());
+    assert_eq!(app.screen, Screen::LogView);
 }
 
 #[test]
@@ -2964,6 +2967,60 @@ fn phase_three_scroll_truncation_and_session_cache_render() {
     let crashed = render_at(&mut app, 96, 18);
     assert!(crashed.contains("✖ crashed"));
     insta::assert_snapshot!("phase_three_crashed_card", crashed);
+}
+
+#[test]
+fn running_card_and_sessions_show_live_telemetry() {
+    let (dir, mut app) = app_with_board();
+    let mut running = app.ops.create_task(NewTask::titled("Telemetry")).unwrap();
+    SessionManager::new(dir.path())
+        .link_session(&running.id, "ses-tel")
+        .unwrap();
+    running.session = Some("ses-tel".to_string());
+    running.agent_backend = Some("claude".to_string());
+    app.ops.storage.save_task(&running).unwrap();
+    // A claude transcript: 2/3 todos completed, usage totalling 12.4k, last
+    // tool an Edit. The card and Sessions list both derive from this on tick.
+    let transcript = dir.path().join(".kanban/logs/ses-tel.transcript.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"usage":{"input_tokens":12000,"output_tokens":400},"content":[{"type":"tool_use","name":"TodoWrite","input":{"todos":[{"content":"a","status":"completed"},{"content":"b","status":"completed"},{"content":"c","status":"pending"}]}},{"type":"tool_use","name":"Edit","input":{"file_path":"src/auth/mod.rs"}}]}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    assert_eq!(
+        app.board.session_states.get(&running.id),
+        Some(&crate::core::session::SessionState::Live)
+    );
+    app.tick().unwrap();
+
+    let board = render_at(&mut app, 120, 18);
+    assert!(board.contains("▓"), "card shows a progress bar:\n{board}");
+    assert!(board.contains("2/3"), "card shows todo count:\n{board}");
+    assert!(
+        board.contains("12.4k"),
+        "card shows humanized tokens:\n{board}"
+    );
+    assert!(
+        board.contains("→ Edit src/auth/mod.rs"),
+        "card shows last activity:\n{board}"
+    );
+
+    // The Sessions list surfaces the same signals.
+    app.handle_key(key(KeyCode::Char('l'))).unwrap();
+    let sessions = render_at(&mut app, 120, 18);
+    assert!(
+        sessions.contains("2/3"),
+        "sessions row shows todos:\n{sessions}"
+    );
+    assert!(
+        sessions.contains("→ Edit"),
+        "sessions row shows activity:\n{sessions}"
+    );
 }
 
 #[test]

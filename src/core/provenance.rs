@@ -293,7 +293,7 @@ pub fn render_stream_event(value: &Value) -> Option<String> {
 }
 
 /// `Read src/x.rs`, `Bash cargo test`, `mcp github:list_prs`, …
-fn claude_tool_summary(block: &Value) -> String {
+pub(crate) fn claude_tool_summary(block: &Value) -> String {
     let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
     if let Some(server_tool) = name.strip_prefix("mcp__") {
         return format!("mcp {}", server_tool.replacen("__", ":", 1));
@@ -317,7 +317,7 @@ fn claude_tool_summary(block: &Value) -> String {
 }
 
 /// `read src/x.rs`, `bash cargo test`, `webfetch https://…`, …
-fn opencode_tool_summary(part: &Value) -> String {
+pub(crate) fn opencode_tool_summary(part: &Value) -> String {
     let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
     let input = part
         .get("state")
@@ -530,7 +530,7 @@ fn clean_path(token: &str) -> Option<String> {
     (token.contains('/') || token.contains('.')).then(|| token.to_string())
 }
 
-fn str_field(value: &Value, keys: &[&str]) -> Option<String> {
+pub(crate) fn str_field(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         value
             .get(key)

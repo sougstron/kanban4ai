@@ -48,6 +48,22 @@ pub fn kill_session(session_id: &str) -> Result<bool> {
     Ok(status.success())
 }
 
+/// Whether a live tmux session with this exact name exists. `false` when tmux
+/// is unavailable (background launches have no tmux host). The `=` prefix forces
+/// exact-name matching so a partial id never matches an unrelated session.
+pub fn session_exists(session_id: &str) -> bool {
+    if !command_available("tmux") {
+        return false;
+    }
+    Command::new("tmux")
+        .args(["has-session", "-t", &format!("={session_id}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
 pub fn attach_to_session(session_id: &str) -> Result<bool> {
     if !command_available("tmux") {
         eprintln!("tmux is not available; cannot attach to session {session_id}");
@@ -57,6 +73,19 @@ pub fn attach_to_session(session_id: &str) -> Result<bool> {
         .args(["attach-session", "-t", session_id])
         .status()?;
     Ok(status.success())
+}
+
+/// Run a command in the foreground, inheriting the terminal, and wait for it to
+/// exit. Used to reopen a stopped background agent's conversation
+/// (`claude --resume <id>`) after the TUI has suspended itself. Returns whether
+/// the child exited successfully.
+pub fn run_foreground(command: &str, args: &[String], cwd: Option<&Path>) -> Result<bool> {
+    let mut cmd = Command::new(command);
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    Ok(cmd.status()?.success())
 }
 
 fn spawn_tmux(project_path: &Path, plan: &LaunchPlan) -> Result<bool> {

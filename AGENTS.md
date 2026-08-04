@@ -278,7 +278,10 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `m`: Move task
 - `w`: Open the answer-question dialog
 - `y`: Approve — move a Review task to Done
-- `t`: Attach to the task's running agent session
+- `t`: Open the task's agent session — attach when it is a live tmux session,
+  follow the log when the agent runs in the background (no terminal to attach
+  to), or reopen the recorded conversation with `<backend> --resume` when the
+  session has stopped
 - `c`: Add a context/suggestion message to the task thread
 - `u`: Recover crashed task (restore to To Do); on an archived task (Archive
   list or its detail) the same key restores it to To Do after a confirmation
@@ -304,12 +307,15 @@ with a status hint instead of being executed. `Ctrl+V` (image paste from the
 clipboard) is unaffected.
 
 Sessions view: each row shows the session state (`▶` live heartbeat, `⏳`
-declared wait, `✖` crashed), its task, and the estimated token count; waiting
-rows also show the relaunch deadline. `Enter` attaches, `v` opens a scrollable
-pager over the tail (last 64 KB) of `.kanban/logs/<id>.log` that follows new
-output on the refresh tick, `x` kills the session after a confirmation
-(`Operations::stop_session`), and `o` opens the session's task detail — `Esc`
-returns to the sessions list. Archive view: `Enter` opens the archived task's
+declared wait, `✖` crashed), its task, the token count, the agent's todo
+progress and its last activity; waiting rows also show the relaunch deadline.
+`Enter` opens the session (attach / follow / resume, as for `t` above), `i`
+opens a read-only session-info panel (elapsed time, tokens, cost, todos, last
+activity, and the input provenance harvested so far) in the text pager, `v`
+opens a scrollable pager over the tail (last 64 KB) of `.kanban/logs/<id>.log`
+that follows new output on the refresh tick, `x` kills the session after a
+confirmation (`Operations::stop_session`), and `o` opens the session's task
+detail — `Esc` returns to the sessions list. Archive view: `Enter` opens the archived task's
 detail (its action bar offers only Restore/Delete), `u` restores the selected
 task to To Do after a confirmation.
 
@@ -373,8 +379,33 @@ A task may carry a `chained_to` target task id. When the **target** task enters 
 ### Image Attachments
 Paste an image from the clipboard (`wl-paste`/`xclip`, or a file path in clipboard text), sniff the type by magic bytes (png/jpg/gif/webp), write it atomically under `.kanban/assets/images/`, and embed Markdown (`![pasted image](...)`) in the task description.
 
-### Token Estimation
-Session token estimates are parsed from the agent's `.kanban/logs/<session>.log` for the running-sessions view.
+### Live Agent Telemetry (`core/telemetry.rs`)
+`read_session_progress` answers *how a run is going right now* by re-reading the
+backend's machine transcript (`.kanban/logs/<session>.transcript.jsonl`) on the
+TUI tick: todo progress, tokens, cost, and the last tool invoked. Where
+`core/provenance.rs` harvests what a run consumed once at exit, this is
+recomputed live and never persisted — the transcript stays the single source of
+truth, so no new on-disk record or fixture surface is introduced.
+
+- claude (`--output-format stream-json`): mid-run there is no cumulative total,
+  so tokens are approximated as `last_input + Σ output`; the final `result`
+  event's cumulative `usage` supersedes it and carries `total_cost_usd`.
+  `TodoWrite` inputs give todo counts (last write wins).
+- opencode (`run --format json`): a `tokens` object on the event `part` is read
+  best-effort (placement is not stable across versions), `todowrite` gives todo
+  counts.
+- Tool summaries reuse the provenance harvesters' helpers so both stay in
+  lock-step on backend event shapes. Invalid session ids are rejected before any
+  filesystem access.
+- Backends that emit no parseable transcript (omp/pi), or a run whose transcript
+  reported no usage, fall back to the log-scraping token estimate parsed from
+  `.kanban/logs/<session>.log`.
+
+On a running card the two telemetry rows (`▓▓▓░░ 2/3  12.4k tok  $0.42`, then
+`→ Edit src/auth/mod.rs`) replace the static description. Cards stay uniform
+within a column, but a column grows to its tallest card, so telemetry and badges
+are never clipped while columns of plain cards keep the configured
+`card_height_lines`; the description is the one row still allowed to clip.
 
 ### Storage Directories (under .kanban/)
 - `tasks/<status>/` - task Markdown files (status = subdirectory)

@@ -124,10 +124,21 @@ fn column_title(name: &str, count: &str, available: u16) -> String {
 }
 
 fn render_cards(frame: &mut Frame<'_>, app: &App, column_index: usize, area: Rect) -> Vec<Hitbox> {
-    let card_height = app.settings.card_height_lines.max(1);
     let offset = app.column_offsets.get(column_index).copied().unwrap_or(0);
     let all_tasks = app.visible_tasks_for_column(column_index);
     let total = app.matching_task_count(column_index);
+    // Cards are uniform within a column but the column grows to its tallest
+    // card, so a running card's telemetry (or a questioned card's badges) is
+    // never clipped, while columns of plain cards stay at the configured
+    // minimum. `+2` accounts for the card border; the content count comes from
+    // `card::card_line_count`.
+    let base_height = app.settings.card_height_lines.max(1);
+    let card_height = all_tasks
+        .iter()
+        .map(|task| card::card_line_count(app, task).saturating_add(2))
+        .max()
+        .unwrap_or(0)
+        .max(base_height);
     let visible = card_capacity_with_indicators(area, card_height, offset, total);
     let tasks = all_tasks
         .into_iter()

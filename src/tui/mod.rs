@@ -151,7 +151,11 @@ impl Drop for PanicHookGuard {
     }
 }
 
-fn attach_session(session_id: &str) -> Result<bool> {
+/// Suspend the TUI, hand the real terminal to a foreground process, then
+/// restore. Shared by tmux attach and `<backend> --resume`: both need the
+/// alternate screen, raw mode, and capture modes torn down while the child owns
+/// the terminal, and rebuilt afterwards regardless of how the child exited.
+fn run_terminal_action(action: &app::TerminalAction) -> Result<bool> {
     let mut stdout = io::stdout();
     let suspended = (|| -> Result<()> {
         stdout.execute(Show)?;
@@ -166,10 +170,15 @@ fn attach_session(session_id: &str) -> Result<bool> {
         return Err(err);
     }
 
-    let attach_result = crate::agent::attach_to_session(session_id);
+    let result = match action {
+        app::TerminalAction::Attach(session_id) => crate::agent::attach_to_session(session_id),
+        app::TerminalAction::Foreground {
+            command, args, cwd, ..
+        } => crate::agent::run_foreground(command, args, Some(cwd)),
+    };
     let restore_result = restore_terminal();
-    match (attach_result, restore_result) {
-        (Ok(attached), Ok(())) => Ok(attached),
+    match (result, restore_result) {
+        (Ok(ok), Ok(())) => Ok(ok),
         (Err(err), _) => Err(err),
         (Ok(_), Err(err)) => Err(err),
     }

@@ -1,8 +1,9 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 3277
 expression: rendered
 ---
-┌ Sessions · Enter attach · v log · x kill · o task · q back ──────────────────────────────────┐
+┌ Sessions · Enter open · i info · v log · x kill · o task · q back ───────────────────────────┐
 │▶ ses-live  TASK-001 Live task  tokens: 5                                                     │
 │✖ ses-lost  TASK-002 Crashed task  tokens: unknown                                            │
 │                                                                                              │

@@ -52,12 +52,12 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
         if let Some(text) = app.take_pending_copy() {
             app.finish_copy(super::image::copy_text(&text));
         }
-        if let Some(session_id) = app.take_attach_request() {
+        if let Some(action) = app.take_terminal_action() {
             let _input_guard = input_gate.lock().map_err(|_| {
                 crate::core::error::KanbanError::Invalid("terminal input lock poisoned".to_string())
             })?;
-            let attached = super::attach_session(&session_id)?;
-            app.finish_attach(&session_id, attached);
+            let ok = super::run_terminal_action(&action)?;
+            app.finish_terminal_action(&action, ok);
             terminal.clear()?;
         }
         terminal.draw(|frame| board::ui(frame, app))?;

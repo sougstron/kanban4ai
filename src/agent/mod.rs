@@ -9,12 +9,12 @@ mod tmux;
 pub use backends::parse_opencode_agent_list;
 pub use backends::{
     AgentBackendConfig, AutoLaunchConfig, BackendCatalog, LaunchPlan, LaunchSettings,
-    backend_catalog, backend_has_catalog, build_launch_plan, cached_backend_catalog,
-    cached_opencode_catalog, opencode_catalog, parse_omp_models_json,
+    backend_catalog, backend_config, backend_has_catalog, build_launch_plan,
+    cached_backend_catalog, cached_opencode_catalog, opencode_catalog, parse_omp_models_json,
     parse_opencode_models_verbose, parse_pi_models_store, recent_models, record_recent_model,
     resolve_launch_settings, resolve_opencode_agent, sort_efforts, sort_opencode_models,
     warm_backend_catalog, warm_opencode_catalog,
 };
 pub use launcher::KanbanLauncher;
 pub use prompt::build_agent_prompt;
-pub use tmux::{attach_to_session, kill_session};
+pub use tmux::{attach_to_session, kill_session, run_foreground, session_exists};

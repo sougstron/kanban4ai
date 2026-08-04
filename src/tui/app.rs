@@ -26,8 +26,9 @@ use crate::core::models::{
 };
 use crate::core::operations::{Operations, QuestionRef, TaskPatch};
 use crate::core::provenance::{self, InputManifest};
-use crate::core::session::{SessionManager, SessionState, estimate_session_tokens};
+use crate::core::session::{SessionManager, SessionState};
 use crate::core::storage::NewTask;
+use crate::core::telemetry::{self, SessionProgress};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 
@@ -241,12 +242,39 @@ impl DetailState {
     }
 }
 
+/// A terminal-taking action the event loop runs after suspending the TUI.
+/// `Attach` re-enters a live tmux session; `Foreground` runs an arbitrary
+/// command to completion (e.g. `claude --resume <id>` for a stopped agent).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TerminalAction {
+    Attach(String),
+    Foreground {
+        command: String,
+        args: Vec<String>,
+        cwd: PathBuf,
+        label: String,
+    },
+}
+
+impl TerminalAction {
+    /// Human-readable target for the post-run status line.
+    pub fn label(&self) -> String {
+        match self {
+            TerminalAction::Attach(session_id) => session_id.clone(),
+            TerminalAction::Foreground { label, .. } => label.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ActiveSession {
     pub session: Session,
     pub state: SessionState,
     pub task_label: String,
     pub token_display: String,
+    /// Live telemetry for the Sessions list (todo progress + last activity),
+    /// derived from the transcript like the card telemetry.
+    pub progress: SessionProgress,
 }
 
 /// Pager over the tail of `.kanban/logs/<session>.log`. While `follow` is on
@@ -289,6 +317,10 @@ pub struct App {
     pub detail: Option<DetailState>,
     pub active_sessions: Vec<ActiveSession>,
     pub session_selected: usize,
+    /// Live per-task agent telemetry (todo progress, tokens, last activity),
+    /// keyed by task id and refreshed each tick for tasks with a running
+    /// agent. Derived from the transcript; never persisted.
+    pub session_progress: HashMap<String, SessionProgress>,
     pub archived_tasks: Vec<Task>,
     pub archive_selected: usize,
     pub should_quit: bool,
@@ -303,13 +335,16 @@ pub struct App {
     status_before_copy: Option<String>,
     pub log_view: Option<LogViewState>,
     pub text_view: Option<TextViewState>,
+    /// Screen the text pager (`q`) returns to; set by `open_text_view` from its
+    /// caller (Detail for prompt/inputs, Sessions for the session-info panel).
+    text_view_return: Screen,
     /// Where closing the detail screen returns to (Sessions `o`, Archive
     /// Enter); reset to Board once consumed.
     pub return_screen: Screen,
     pub help_scroll: u16,
     /// Upper help scroll bound, set by the renderer from the overlay height.
     pub help_max_scroll: u16,
-    pending_attach: Option<String>,
+    pending_terminal: Option<TerminalAction>,
     pending_fs_reload: bool,
     fs_change_generation: u64,
     recent_models: Vec<String>,
@@ -490,6 +525,7 @@ impl App {
             detail: None,
             active_sessions: Vec::new(),
             session_selected: 0,
+            session_progress: HashMap::new(),
             archived_tasks,
             archive_selected: 0,
             should_quit: false,
@@ -504,10 +540,11 @@ impl App {
             status_before_copy: None,
             log_view: None,
             text_view: None,
+            text_view_return: Screen::Detail,
             return_screen: Screen::Board,
             help_scroll: 0,
             help_max_scroll: 0,
-            pending_attach: None,
+            pending_terminal: None,
             pending_fs_reload: false,
             fs_change_generation: 0,
             recent_models,
@@ -901,6 +938,7 @@ impl App {
             KeyCode::Char('x') => self.dispatch(UiAction::KillSession)?,
             KeyCode::Char('v') => self.dispatch(UiAction::ViewLog)?,
             KeyCode::Char('o') => self.dispatch(UiAction::OpenSessionTask)?,
+            KeyCode::Char('i') => self.open_session_info()?,
             KeyCode::Enter => self.open_focused_detail()?,
             KeyCode::Up => self.focus_up(),
             KeyCode::Down => self.focus_down(),
@@ -979,7 +1017,7 @@ impl App {
             UiAction::AnswerQuestion => self.open_answer_dialog()?,
             UiAction::Recover => self.recover_current_task()?,
             UiAction::Approve => self.approve_current_task()?,
-            UiAction::Attach => self.attach_current_task(),
+            UiAction::Attach => self.attach_current_task()?,
             UiAction::AddContext => self.open_add_message_dialog(),
             UiAction::Rerun => self.rerun_current_task()?,
             UiAction::Revert => self.open_revert_dialog(),
@@ -1500,7 +1538,36 @@ impl App {
         if self.screen == Screen::LogView {
             self.refresh_log_view();
         }
+        self.refresh_session_progress();
         Ok(())
+    }
+
+    /// Refresh live agent telemetry for tasks with a running agent. Transcripts
+    /// live under `.kanban/logs/` (unwatched, like the pager), so this reads on
+    /// the tick. Only Live/Waiting tasks are read — a handful at most — and the
+    /// map is rebuilt each pass so a finished agent's line disappears with it.
+    fn refresh_session_progress(&mut self) {
+        let mut progress = HashMap::new();
+        for column in &self.board.columns {
+            for task in &column.tasks {
+                let Some(session_id) = task.session.as_deref() else {
+                    continue;
+                };
+                if !matches!(
+                    self.board.session_states.get(&task.id),
+                    Some(SessionState::Live | SessionState::Waiting)
+                ) {
+                    continue;
+                }
+                let backend = task.agent_backend.as_deref().unwrap_or("claude");
+                let found =
+                    telemetry::read_session_progress(&self.project_path, session_id, backend);
+                if found.has_data() {
+                    progress.insert(task.id.clone(), found);
+                }
+            }
+        }
+        self.session_progress = progress;
     }
 
     fn refresh_modal_after_catalog_warm(&mut self) {
@@ -1948,13 +2015,19 @@ impl App {
 
     fn open_focused_detail(&mut self) -> Result<()> {
         if self.screen == Screen::Sessions {
-            if let Some(session_id) = self
+            let selected = self
                 .filtered_active_sessions()
                 .get(self.session_selected)
-                .map(|active_session| active_session.session.id.clone())
-            {
-                self.pending_attach = Some(session_id.clone());
-                self.status = format!("Attaching to {session_id}");
+                .map(|active| (active.session.id.clone(), active.session.task_id.clone()));
+            if let Some((session_id, task_id)) = selected {
+                let backend = self
+                    .ops
+                    .get_task(&task_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|task| task.agent_backend)
+                    .unwrap_or_else(|| "claude".to_string());
+                self.open_session(&session_id, &backend)?;
             } else {
                 self.status = "No active session selected".to_string();
             }
@@ -2464,25 +2537,72 @@ impl App {
         Ok(())
     }
 
-    fn attach_current_task(&mut self) {
+    fn attach_current_task(&mut self) -> Result<()> {
         let Some(task) = self.current_task() else {
             self.status = "No task selected".to_string();
-            return;
+            return Ok(());
         };
-        // The session id outlives the session it names, so only an active one
-        // can be attached to.
-        let session_mgr = SessionManager::new(&self.project_path);
-        match task
-            .session
-            .as_deref()
-            .filter(|session_id| session_mgr.is_session_active(session_id))
-        {
-            Some(session_id) => {
-                self.pending_attach = Some(session_id.to_string());
-                self.status = format!("Attaching to {session_id}");
-            }
-            None => self.status = format!("{} has no running session", task.id),
+        let Some(session_id) = task.session.clone() else {
+            self.status = format!("{} has no session", task.id);
+            return Ok(());
+        };
+        let backend = task
+            .agent_backend
+            .clone()
+            .unwrap_or_else(|| "claude".to_string());
+        self.open_session(&session_id, &backend)
+    }
+
+    /// Decide how to "open" a session for the user and act on it. tmux-hosted
+    /// live sessions are attached (interactive); a running background agent has
+    /// no live terminal, so its log is followed instead; a stopped agent with a
+    /// recorded backend session id is reopened with `<backend> --resume`.
+    fn open_session(&mut self, session_id: &str, backend: &str) -> Result<()> {
+        if crate::agent::session_exists(session_id) {
+            self.pending_terminal = Some(TerminalAction::Attach(session_id.to_string()));
+            self.status = format!("Attaching to {session_id}");
+            return Ok(());
         }
+        let heartbeat_timeout = self.ops.config.get_threshold("session_heartbeat_timeout")?;
+        let state =
+            SessionManager::new(&self.project_path).session_state(session_id, heartbeat_timeout);
+        if matches!(state, Some(SessionState::Live | SessionState::Waiting)) {
+            self.open_log_view_for(session_id.to_string());
+            self.status =
+                format!("Following {session_id} log (background agent, no terminal to attach)");
+            return Ok(());
+        }
+        if let Some(action) = self.resume_action(session_id, backend)? {
+            self.pending_terminal = Some(action);
+            self.status = format!("Resuming conversation for {session_id}");
+            return Ok(());
+        }
+        // Nothing live and no resumable conversation: fall back to the log.
+        self.open_log_view_for(session_id.to_string());
+        Ok(())
+    }
+
+    /// Build the `<backend> --resume <backend_session_id>` action for a stopped
+    /// session, or `None` when the backend has no known resume flag or the
+    /// backend session id was never captured. Only claude is supported today.
+    fn resume_action(&self, session_id: &str, backend: &str) -> Result<Option<TerminalAction>> {
+        if backend != "claude" {
+            return Ok(None);
+        }
+        let Some(backend_session_id) =
+            provenance::load_manifest(&self.ops.storage.provenance_dir, session_id)
+                .and_then(|manifest| manifest.backend_session_id)
+        else {
+            return Ok(None);
+        };
+        let config = self.ops.config.load()?;
+        let command = crate::agent::backend_config(&config, backend)?.command;
+        Ok(Some(TerminalAction::Foreground {
+            command,
+            args: vec!["--resume".to_string(), backend_session_id],
+            cwd: self.project_path.clone(),
+            label: format!("resume {session_id}"),
+        }))
     }
 
     fn rerun_current_task(&mut self) -> Result<()> {
@@ -2584,6 +2704,12 @@ impl App {
             self.status = "No session selected".to_string();
             return;
         };
+        self.open_log_view_for(session_id);
+    }
+
+    /// Open the follow-mode log pager for an explicit session id (used by the
+    /// unified open action for background agents that have no tmux host).
+    fn open_log_view_for(&mut self, session_id: String) {
         self.log_view = Some(LogViewState {
             lines: load_log_tail(&self.project_path, &session_id),
             session_id: session_id.clone(),
@@ -2614,7 +2740,7 @@ impl App {
             self.status = format!("No prompt recorded for {}", task.id);
             return Ok(());
         };
-        self.open_text_view(format!("Prompt · {}", task.id), &prompt);
+        self.open_text_view(format!("Prompt · {}", task.id), &prompt, Screen::Detail);
         Ok(())
     }
 
@@ -2635,12 +2761,70 @@ impl App {
             self.status = format!("No inputs recorded for {}", task.id);
             return Ok(());
         }
-        self.open_text_view(format!("Inputs (provenance) · {}", task.id), &body);
+        self.open_text_view(
+            format!("Inputs (provenance) · {}", task.id),
+            &body,
+            Screen::Detail,
+        );
         Ok(())
     }
 
-    fn open_text_view(&mut self, title: String, body: &str) {
+    /// One-screen summary for the selected session (Sessions view `i`): elapsed
+    /// time, live tokens/cost, todo progress, last activity, and the input
+    /// provenance harvested so far. Read-only; reuses the text pager.
+    fn open_session_info(&mut self) -> Result<()> {
+        let Some(active) = self
+            .filtered_active_sessions()
+            .get(self.session_selected)
+            .cloned()
+        else {
+            self.status = "No session selected".to_string();
+            return Ok(());
+        };
+        let session = &active.session;
+        let progress = &active.progress;
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!("Session: {}", session.id));
+        lines.push(format!("Task:    {}", active.task_label));
+        lines.push(format!("State:   {:?}", active.state));
+        let elapsed = (timefmt::now() - session.started_at).num_seconds().max(0);
+        lines.push(format!(
+            "Started: {}  (elapsed {})",
+            timefmt::format(&session.started_at),
+            format_elapsed(elapsed),
+        ));
+        match progress.tokens {
+            Some(tokens) => lines.push(format!("Tokens:  {tokens}")),
+            None => lines.push("Tokens:  unknown".to_string()),
+        }
+        if let Some(cost) = progress.cost_usd {
+            lines.push(format!("Cost:    ${cost:.4}"));
+        }
+        if let Some((done, total)) = progress.todos() {
+            lines.push(format!("Todos:   {done}/{total} completed"));
+        }
+        if let Some(activity) = progress.last_activity.as_deref() {
+            lines.push(format!("Last:    {activity}"));
+        }
+        let manifest = provenance::load_manifest(&self.ops.storage.provenance_dir, &session.id);
+        if let Some(manifest) = manifest {
+            lines.push(String::new());
+            lines.push("Inputs (provenance so far):".to_string());
+            lines.push(provenance::render_manifests(std::slice::from_ref(
+                &manifest,
+            )));
+        }
+        self.open_text_view(
+            format!("Session · {}", session.id),
+            &lines.join("\n"),
+            Screen::Sessions,
+        );
+        Ok(())
+    }
+
+    fn open_text_view(&mut self, title: String, body: &str, return_to: Screen) {
         self.status = title.clone();
+        self.text_view_return = return_to;
         self.text_view = Some(TextViewState {
             title,
             lines: body.lines().map(str::to_string).collect(),
@@ -2657,7 +2841,10 @@ impl App {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.text_view = None;
-                self.screen = Screen::Detail;
+                self.screen = self.text_view_return;
+                if self.screen == Screen::Sessions {
+                    self.refresh_active_sessions()?;
+                }
             }
             KeyCode::Up => self.scroll_text_view(-1),
             KeyCode::Down => self.scroll_text_view(1),
@@ -2732,11 +2919,9 @@ impl App {
             .list_sessions_with_state(heartbeat_timeout)
             .into_iter()
             .map(|(session, state)| {
-                let task_label = self
-                    .ops
-                    .get_task(&session.task_id)
-                    .ok()
-                    .flatten()
+                let task = self.ops.get_task(&session.task_id).ok().flatten();
+                let task_label = task
+                    .as_ref()
                     .map(|task| format!("{} {}", task.id, task.title))
                     .or_else(|| {
                         session
@@ -2745,7 +2930,14 @@ impl App {
                             .map(|name| format!("{} {}", session.task_id, name))
                     })
                     .unwrap_or_else(|| session.task_id.clone());
-                let token_display = estimate_session_tokens(&self.project_path, &session.id)
+                let backend = task
+                    .as_ref()
+                    .and_then(|task| task.agent_backend.as_deref())
+                    .unwrap_or("claude");
+                let progress =
+                    telemetry::read_session_progress(&self.project_path, &session.id, backend);
+                let token_display = progress
+                    .tokens
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "unknown".to_string());
                 ActiveSession {
@@ -2753,6 +2945,7 @@ impl App {
                     state,
                     task_label,
                     token_display,
+                    progress,
                 }
             })
             .collect();
@@ -2840,15 +3033,17 @@ impl App {
         Ok(())
     }
 
-    pub fn take_attach_request(&mut self) -> Option<String> {
-        self.pending_attach.take()
+    pub fn take_terminal_action(&mut self) -> Option<TerminalAction> {
+        self.pending_terminal.take()
     }
 
-    pub fn finish_attach(&mut self, session_id: &str, attached: bool) {
-        self.status = if attached {
-            format!("Detached from {session_id}")
-        } else {
-            format!("Could not attach to {session_id}")
+    pub fn finish_terminal_action(&mut self, action: &TerminalAction, ok: bool) {
+        let target = action.label();
+        self.status = match (action, ok) {
+            (TerminalAction::Attach(_), true) => format!("Detached from {target}"),
+            (TerminalAction::Attach(_), false) => format!("Could not attach to {target}"),
+            (TerminalAction::Foreground { .. }, true) => format!("Closed {target}"),
+            (TerminalAction::Foreground { .. }, false) => format!("Could not run {target}"),
         };
     }
 
@@ -3570,6 +3765,18 @@ impl BoardSnapshot {
             );
         }
         Ok(extras)
+    }
+}
+
+/// `1h 04m`, `12m 30s`, or `45s` from a non-negative second count.
+fn format_elapsed(seconds: i64) -> String {
+    let (h, m, s) = (seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
     }
 }
 

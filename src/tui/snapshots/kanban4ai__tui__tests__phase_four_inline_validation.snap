@@ -1,13 +1,14 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 3516
 expression: "render_at(&mut app, 80, 24)"
 ---
 ┌ To Do (1) ───────┐┌ In Progress (0) ─┐┌ Review (1) ──────┐┌ Done (0) ────────┐
 │┌────────────────┐││No tasks          ││┌────────────────┐││No tasks          │
 ││TASK-001 Questio│││                  │││TASK-002 Impleme│││                  │
 ││? Choose a rout…│││                  │││Dropdown work   │││                  │
-│└──────────┌ New task ────────────────────────────────────────────┐           │
-│           │┌ Title ─────────────────────────────────────────────┐│           │
+││☑ interact┌ New task ────────────────────────────────────────────┐           │
+│└──────────│┌ Title ─────────────────────────────────────────────┐│           │
 │           ││                                                    ││           │
 │           │└────────────────────────────────────────────────────┘│           │
 │           │┌ Description (Ctrl+V image paste) ──────────────────┐│           │
@@ -66,12 +67,13 @@ expression: "render_at(&mut app, 80, 24)"
 3:61-79 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 3:79-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 4:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-4:1-12 Style::new().fg(Color::Rgb(245, 190, 80)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+4:1-2 Style::new().fg(Color::Rgb(245, 190, 80)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+4:2-12 Style::new().fg(Color::Rgb(100, 210, 140)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 4:12-68 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 4:68-79 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 4:79-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-5:1-12 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+5:1-12 Style::new().fg(Color::Rgb(245, 190, 80)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:12-68 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:68-79 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:79-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

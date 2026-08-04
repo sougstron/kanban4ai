@@ -1,26 +1,37 @@
-# kanban4ai 0.3.2
+# kanban4ai 0.3.3
 
 ## Highlights
 
-- Deleting a task now removes its sidecar thread. Task ids are recycled
-  (`max + 1`), so a leftover `.kanban/threads/TASK-NNN.yaml` was being adopted
-  by the next task on that id — the detail view and the agent prompt both saw
-  the deleted task's messages. Creation also discards any thread already sitting
-  on a freshly allocated id, healing boards cleaned up by hand.
-- Bracketed paste is enabled in the TUI. Clipboard text lands as one edit in the
-  focused field (dialog Title/Description/Answer, search, detail answer box,
-  review-edits editor) instead of being replayed as keystrokes. Tabs no longer
-  hop between dialog fields, newlines no longer submit the focused button, and a
-  paste on the board is dropped with a status hint rather than firing shortcuts.
-- One-line fields flatten pasted newlines; control sequences are sanitized.
-  `Ctrl+V` image paste is unchanged.
+- Running cards now show live agent telemetry instead of their static
+  description: a todo progress bar, tokens spent, cost, and a
+  `→ Edit src/auth/mod.rs` activity line for the last tool the agent invoked.
+  It is derived from the backend's transcript on every refresh tick and never
+  persisted, so the transcript stays the single source of truth. claude reports
+  todos, live tokens and (at exit) cost; opencode reports todos and tokens
+  best-effort; backends without a parseable transcript keep the old
+  log-scraped token estimate.
+- Columns grow to their tallest card, so telemetry rows and badges are no
+  longer clipped while columns of plain cards keep the configured card height.
+  The `☑ interactive` badge is emitted first so a long session-state badge
+  (`✖ crashed · u recover`) can't push it off a narrow card.
+- `Enter` in the Sessions view and `t` on a task now *open* a session rather
+  than only attaching: a live tmux session attaches as before, a background
+  agent with no terminal follows its log, and a stopped session whose backend
+  conversation id was recorded reopens with `<backend> --resume` (claude
+  today). Previously anything but a live tmux session reported "no running
+  session" and left you with nothing.
+- New session-info panel: `i` in the Sessions view shows elapsed time, tokens,
+  cost, todo progress, last activity, and the input provenance harvested so
+  far. The Sessions list itself gained todo progress and an activity column.
 
 ## Verification coverage
 
-- Storage/operations tests: create after a bare delete does not inherit the old
-  thread; abandon removes the sidecar.
-- TUI tests: whole-block paste into Description, single-line flatten, control
-  sanitization, board paste ignored, detail answer box accepts paste.
-- Delete-modal snapshots updated for the new wording.
+- Telemetry tests: claude live-token estimate, the final `result` event
+  superseding it with cost, opencode part parsing, unparseable and missing
+  transcripts producing no data without panicking, and rejection of an invalid
+  session id.
+- Card tests: progress-bar fill and rounding (including an empty todo list) and
+  compact token formatting; TUI tests and snapshots updated for the new badge
+  order and grown card rows.
 - Release checks for this version include rustfmt, clippy with warnings denied,
   locked tests, a release build, and installer packaging smoke tests.

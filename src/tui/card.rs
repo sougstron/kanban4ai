@@ -7,6 +7,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::core::models::Task;
 use crate::core::session::SessionState;
+use crate::core::telemetry::SessionProgress;
 
 use super::app::App;
 
@@ -81,7 +82,13 @@ pub fn render_card(
             .collect::<Vec<_>>();
         lines.push(Line::from(badge_spans));
     }
-    if !task.description.is_empty() {
+    // Live agent telemetry replaces the description on a running card: what the
+    // agent is doing now is more actionable than the static blurb, and it keeps
+    // the card's height bounded.
+    let progress = app.session_progress.get(&task.id).filter(|p| p.has_data());
+    if let Some(progress) = progress {
+        lines.extend(telemetry_lines(progress, app, line_width));
+    } else if !task.description.is_empty() {
         let description = truncate_display(
             &sanitize_terminal_text(&task.description).replace('\n', " "),
             line_width,
@@ -196,6 +203,12 @@ pub fn badges(
     app: &App,
 ) -> Vec<(String, ratatui::style::Color)> {
     let mut badges = Vec::new();
+    // Interactive is a persistent task flag, emitted first so a long volatile
+    // session-state badge (`✖ crashed · u recover`) can never push it past the
+    // card's right edge in a narrow column.
+    if task.interactive {
+        badges.push(("☑ interactive".to_string(), app.theme.ok));
+    }
     match session_state {
         Some(SessionState::Live) => badges.push(("▶ running".to_string(), app.theme.ok)),
         Some(SessionState::Waiting) => {
@@ -212,9 +225,6 @@ pub fn badges(
         }
         None => {}
     }
-    if task.interactive {
-        badges.push(("☑ interactive".to_string(), app.theme.ok));
-    }
     if task.chained_to.is_some() {
         badges.push(("↪ chain".to_string(), app.theme.ok));
     }
@@ -222,6 +232,95 @@ pub fn badges(
         badges.push(("? questions".to_string(), app.theme.warn));
     }
     badges
+}
+
+/// The two live-telemetry rows for a running agent: a stats line (todo progress
+/// bar, tokens, cost) and, when known, a `→ <last tool>` activity line. Either
+/// may be empty; callers only reach here when [`SessionProgress::has_data`].
+fn telemetry_lines(progress: &SessionProgress, app: &App, line_width: usize) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    let mut stats: Vec<String> = Vec::new();
+    if let Some((done, total)) = progress.todos() {
+        stats.push(format!("{} {done}/{total}", progress_bar(done, total, 5)));
+    }
+    if let Some(tokens) = progress.tokens {
+        stats.push(format!("{} tok", format_tokens(tokens)));
+    }
+    if let Some(cost) = progress.cost_usd {
+        stats.push(format!("${cost:.2}"));
+    }
+    if !stats.is_empty() {
+        rows.push(Line::from(Span::styled(
+            truncate_display(&stats.join("  "), line_width),
+            Style::default().fg(app.theme.ok),
+        )));
+    }
+    if let Some(activity) = progress.last_activity.as_deref() {
+        rows.push(Line::from(Span::styled(
+            truncate_display(
+                &format!("→ {}", sanitize_terminal_text(activity)),
+                line_width,
+            ),
+            Style::default().fg(app.theme.muted),
+        )));
+    }
+    rows
+}
+
+/// A fixed-width block-glyph progress bar (`▓▓▓░░`). An empty list renders all
+/// hollow rather than dividing by zero.
+fn progress_bar(done: usize, total: usize, width: usize) -> String {
+    // Round to the nearest cell so a nearly-complete bar is not shown full;
+    // `checked_div` yields `None` (→ 0 filled) when the list is empty.
+    let filled = ((done * width) + total / 2)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(width);
+    "▓".repeat(filled) + &"░".repeat(width - filled)
+}
+
+/// Compact token count: `842`, `12.4k`, `1.2M`.
+fn format_tokens(tokens: i64) -> String {
+    match tokens {
+        n if n < 1_000 => n.to_string(),
+        n if n < 1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),
+        n => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// Inner content-line count a card needs (excludes the border). The column
+/// layout grows every card to the tallest card in that column, so this must
+/// mirror the line-pushing order in [`render_card`] exactly.
+pub(crate) fn card_line_count(app: &App, task: &Task) -> u16 {
+    let session_state = app.board.session_states.get(&task.id).copied();
+    let extra = app.board.extras.get(&task.id);
+    let mut lines: u16 = 1; // title
+    if extra
+        .and_then(|extra| extra.question_preview.as_deref())
+        .is_some()
+    {
+        lines += 1;
+    }
+    let mut badge_count = badges(task, session_state, app).len();
+    if extra.is_some_and(|extra| extra.waiting) {
+        badge_count += 1;
+    }
+    if badge_count > 0 {
+        lines += 1;
+    }
+    // The description is deliberately excluded: it stays the one row allowed to
+    // clip, so a column of plain described cards keeps the configured height and
+    // only questioned/running cards grow. Telemetry rows, by contrast, are
+    // must-see and force growth.
+    if let Some(progress) = app.session_progress.get(&task.id).filter(|p| p.has_data()) {
+        if progress.todos().is_some() || progress.tokens.is_some() || progress.cost_usd.is_some() {
+            lines += 1;
+        }
+        if progress.last_activity.is_some() {
+            lines += 1;
+        }
+    }
+    lines
 }
 
 pub fn truncate_display(text: &str, max_width: usize) -> String {
@@ -265,8 +364,27 @@ mod tests {
     use ratatui::style::Color;
 
     use super::{
-        case_insensitive_match, highlight_title_matches, sanitize_terminal_text, truncate_display,
+        case_insensitive_match, format_tokens, highlight_title_matches, progress_bar,
+        sanitize_terminal_text, truncate_display,
     };
+
+    #[test]
+    fn progress_bar_fills_and_rounds() {
+        assert_eq!(progress_bar(0, 5, 5), "░░░░░");
+        assert_eq!(progress_bar(5, 5, 5), "▓▓▓▓▓");
+        assert_eq!(progress_bar(3, 5, 5), "▓▓▓░░");
+        // 4/5 rounds up to 4 cells but must never overfill.
+        assert_eq!(progress_bar(4, 5, 5), "▓▓▓▓░");
+        // An empty list divides safely to all-hollow.
+        assert_eq!(progress_bar(0, 0, 5), "░░░░░");
+    }
+
+    #[test]
+    fn format_tokens_is_compact() {
+        assert_eq!(format_tokens(842), "842");
+        assert_eq!(format_tokens(12_400), "12.4k");
+        assert_eq!(format_tokens(1_200_000), "1.2M");
+    }
 
     #[test]
     fn sanitizes_terminal_control_sequences() {
