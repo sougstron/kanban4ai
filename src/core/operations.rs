@@ -18,7 +18,7 @@ use crate::core::models::{
 };
 use crate::core::notifier::{DesktopNotifier, NotificationConfig};
 use crate::core::provenance::{
-    self, ClaudeHarvester, InputManifest, OpencodeHarvester, TranscriptHarvester,
+    self, ClaudeHarvester, InputManifest, OpencodeHarvester, PiFamilyHarvester, TranscriptHarvester,
 };
 use crate::core::session::SessionManager;
 use crate::core::storage::{NewTask, Storage, atomic_write_text};
@@ -1943,6 +1943,12 @@ impl Operations {
             }),
             "opencode" => Box::new(OpencodeHarvester {
                 session_id: session,
+                prompt_dump,
+                root: self.project_path().to_path_buf(),
+            }),
+            "pi" | "omp" => Box::new(PiFamilyHarvester {
+                session_id: session,
+                backend: backend.clone(),
                 prompt_dump,
                 root: self.project_path().to_path_buf(),
             }),

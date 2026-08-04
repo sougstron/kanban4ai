@@ -297,11 +297,13 @@ agents:
     assert!(has_arg_pair(&plan.args, "--thinking", "high"));
     assert!(!plan.args.contains(&"--effort".to_string()));
     assert!(!plan.args.contains(&"--variant".to_string()));
-    // omp has no launch-time persona and no parseable transcript.
+    // omp has no launch-time persona, but `--mode json` gives it a parseable
+    // transcript harvested exactly like claude/opencode.
     assert!(!plan.args.contains(&"--agent".to_string()));
     assert!(!plan.args.contains(&"ignored-persona".to_string()));
     assert!(!plan.args.contains(&"--title".to_string()));
-    assert!(plan.transcript_file.is_none());
+    assert!(has_arg_pair(&plan.args, "--mode", "json"));
+    assert!(plan.transcript_file.is_some());
     assert!(plan.resolve_agent.is_none());
 }
 
@@ -334,7 +336,9 @@ agents:
     assert_eq!(plan.args[0], "-p");
     // Backend effort default flows through as --thinking.
     assert!(has_arg_pair(&plan.args, "--thinking", "minimal"));
-    assert!(plan.transcript_file.is_none());
+    // `--mode json` yields a parseable transcript for telemetry/provenance.
+    assert!(has_arg_pair(&plan.args, "--mode", "json"));
+    assert!(plan.transcript_file.is_some());
 }
 
 #[test]

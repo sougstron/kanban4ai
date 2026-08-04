@@ -255,7 +255,7 @@ Per-task persona: `task.agent_name` is passed to opencode as `--agent`, overridi
 Built-in backends:
 - **opencode**: `opencode run --title "<id>: <title>" [extra_args] [--model M] [--variant E] [--agent A] <prompt>`. A task's `ai_effort` (or the backend `effort` default) is passed as `--variant`, opencode's per-model reasoning-effort selector.
 - **claude** (Claude Code): `claude --print [extra_args] [--model M] [--effort E] <prompt>`. Default `extra_args` is `["--dangerously-skip-permissions"]` — tighten in config for stricter permissions. Default models are the `fable`/`opus`/`sonnet`/`haiku` aliases; `ai_effort` is passed as `--effort` (`low`/`medium`/`high`/`xhigh`/`max`).
-- **omp** / **pi** (the "pi" agent family): `<command> -p [extra_args] [--model M] [--thinking E] <prompt>`. Run non-interactively with `-p`, taking the prompt as a positional argument; `ai_effort` is passed as `--thinking` (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`). Model uses fuzzy `provider/id` selectors from the live catalog. Neither has a launch-time persona flag, so `agent_name` is ignored. They emit no parseable transcript, so their stdout is teed to the log unchanged (no input-provenance manifest is harvested).
+- **omp** / **pi** (the "pi" agent family): `<command> -p --mode json [extra_args] [--model M] [--thinking E] <prompt>`. Run non-interactively with `-p`, taking the prompt as a positional argument; `ai_effort` is passed as `--thinking` (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`). Model uses fuzzy `provider/id` selectors from the live catalog. Neither has a launch-time persona flag, so `agent_name` is ignored. `--mode json` makes them emit the same NDJSON event stream on stdout as their session files, so their runs are harvested for telemetry and input provenance exactly like claude/opencode. Both probe stdin even under `-p` and hang forever on an inherited pane TTY, so the wrapper closes their stdin (`< /dev/null`).
 
 ### TUI Keyboard Shortcuts
 
@@ -394,11 +394,19 @@ truth, so no new on-disk record or fixture surface is introduced.
 - opencode (`run --format json`): a `tokens` object on the event `part` is read
   best-effort (placement is not stable across versions), `todowrite` gives todo
   counts.
+- pi / omp (`--mode json`): each assistant turn is finalized in one
+  `message_end` carrying that turn's `usage` (`input`/`output` and
+  `cost.total`) and tool calls, so tokens follow claude's live accounting
+  (`last_input + Σ output`) and cost is summed per turn. `message_start` is a
+  zeroed placeholder and `turn_end` duplicates the last message; both are
+  skipped so nothing is double counted. omp's `todo` tool is replayed
+  (`init`/`append`/`done`) into the progress counts; pi has no todo tool and
+  reports none.
 - Tool summaries reuse the provenance harvesters' helpers so both stay in
   lock-step on backend event shapes. Invalid session ids are rejected before any
   filesystem access.
-- Backends that emit no parseable transcript (omp/pi), or a run whose transcript
-  reported no usage, fall back to the log-scraping token estimate parsed from
+- A backend with no parseable transcript, or a run whose transcript reported no
+  usage, falls back to the log-scraping token estimate parsed from
   `.kanban/logs/<session>.log`.
 
 On a running card the two telemetry rows (`▓▓▓░░ 2/3  12.4k tok  $0.42`, then

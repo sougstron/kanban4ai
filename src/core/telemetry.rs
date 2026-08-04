@@ -10,11 +10,12 @@
 //! provenance harvesters and reuses their tool-summary helpers so the two stay
 //! in lock-step on backend event shapes.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::Value;
 
-use crate::core::provenance::{claude_tool_summary, opencode_tool_summary};
+use crate::core::provenance::{claude_tool_summary, opencode_tool_summary, pi_tool_summary};
 use crate::core::session::{SessionManager, estimate_session_tokens};
 
 /// A snapshot of an agent run's progress, all fields best-effort and independent
@@ -26,11 +27,14 @@ pub struct SessionProgress {
     /// live-vs-final accounting). `None` when neither the transcript nor the
     /// log yielded a number.
     pub tokens: Option<i64>,
-    /// Total cost in USD, only reported by claude's final `result` event.
+    /// Total cost in USD, reported by claude's final `result` event and summed
+    /// per-turn for the pi family (pi/omp). `None` for backends that omit it.
     pub cost_usd: Option<f64>,
-    /// Completed items in the agent's most recent `TodoWrite` list.
+    /// Completed items in the agent's todo list (claude/opencode `TodoWrite`, or
+    /// omp's replayed `todo` tool).
     pub todos_done: usize,
-    /// Total items in that list; `0` means the agent has posted no todos.
+    /// Total items in that list; `0` means the agent has posted no todos (always
+    /// the case for pi, which has no todo tool).
     pub todos_total: usize,
     /// Human-readable summary of the last tool call (`Edit src/x.rs`, …).
     pub last_activity: Option<String>,
@@ -51,10 +55,10 @@ impl SessionProgress {
     }
 }
 
-/// Read progress for one session. `backend` selects the transcript dialect
-/// (anything other than `"opencode"` is parsed as claude, the default backend).
-/// Falls back to the log-scraping [`estimate_session_tokens`] for the token
-/// count when the transcript is absent or reported no usage.
+/// Read progress for one session. `backend` selects the transcript dialect:
+/// `opencode`, the pi family (`pi`/`omp`), or claude (the default for anything
+/// else). Falls back to the log-scraping [`estimate_session_tokens`] for the
+/// token count when the transcript is absent or reported no usage.
 pub fn read_session_progress(
     project_path: &Path,
     session_id: &str,
@@ -71,6 +75,7 @@ pub fn read_session_progress(
     if let Ok(raw) = std::fs::read_to_string(&transcript) {
         match backend {
             "opencode" => parse_opencode(&raw, &mut progress),
+            "pi" | "omp" => parse_pi_family(&raw, &mut progress),
             _ => parse_claude(&raw, &mut progress),
         }
     }
@@ -209,6 +214,122 @@ fn parse_opencode(raw: &str, progress: &mut SessionProgress) {
     }
 }
 
+/// Replay one omp `todo` tool call into the running item/done sets. `init`
+/// establishes the full phase→items tree (resetting prior state); `append` adds
+/// items; `done` marks one item complete by its text; `view` is a no-op. pi has
+/// no todo tool, so this is only ever driven by omp transcripts.
+fn apply_pi_todo(args: &Value, items: &mut Vec<String>, done: &mut HashSet<String>) {
+    match args.get("op").and_then(Value::as_str) {
+        Some("init") => {
+            items.clear();
+            done.clear();
+            if let Some(list) = args.get("list").and_then(Value::as_array) {
+                for phase in list {
+                    if let Some(phase_items) = phase.get("items").and_then(Value::as_array) {
+                        items.extend(
+                            phase_items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string),
+                        );
+                    }
+                }
+            }
+        }
+        Some("append") => {
+            if let Some(phase_items) = args.get("items").and_then(Value::as_array) {
+                items.extend(
+                    phase_items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string),
+                );
+            }
+        }
+        Some("done") => {
+            if let Some(task) = args.get("task").and_then(Value::as_str) {
+                done.insert(task.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Parse the pi family (pi/omp) `--mode json` NDJSON stream. Each assistant turn
+/// is finalized in one `message_end` carrying cumulative-per-message `usage`
+/// (`input`/`output`, and `cost.total`) and that turn's tool calls;
+/// `message_start` is a zeroed placeholder and `turn_end` duplicates the last
+/// message, so both are skipped to avoid double counting. Tokens follow the same
+/// live accounting as claude (`last_input + Σ output`); cost sums each turn's
+/// `cost.total`. omp's `todo` tool is replayed into the progress counts, while
+/// pi (no todo tool) simply reports none.
+fn parse_pi_family(raw: &str, progress: &mut SessionProgress) {
+    let mut sum_output: i64 = 0;
+    let mut last_input: i64 = 0;
+    let mut saw_usage = false;
+    let mut total_cost = 0.0_f64;
+    let mut saw_cost = false;
+    let mut todo_items: Vec<String> = Vec::new();
+    let mut todo_done: HashSet<String> = HashSet::new();
+
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("message_end") {
+            continue;
+        }
+        let Some(message) = value.get("message") else {
+            continue;
+        };
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if let Some(usage) = message.get("usage") {
+            last_input = usage
+                .get("input")
+                .and_then(Value::as_i64)
+                .unwrap_or(last_input);
+            sum_output += usage.get("output").and_then(Value::as_i64).unwrap_or(0);
+            saw_usage = true;
+            if let Some(cost) = usage
+                .get("cost")
+                .and_then(|cost| cost.get("total"))
+                .and_then(Value::as_f64)
+            {
+                total_cost += cost;
+                saw_cost = true;
+            }
+        }
+        if let Some(content) = message.get("content").and_then(Value::as_array) {
+            for block in content {
+                if block.get("type").and_then(Value::as_str) != Some("toolCall") {
+                    continue;
+                }
+                if block.get("name").and_then(Value::as_str) == Some("todo") {
+                    let args = block.get("arguments").cloned().unwrap_or(Value::Null);
+                    apply_pi_todo(&args, &mut todo_items, &mut todo_done);
+                }
+                progress.last_activity = Some(pi_tool_summary(block));
+            }
+        }
+    }
+
+    if saw_usage {
+        progress.tokens = Some(last_input + sum_output);
+    }
+    if saw_cost {
+        progress.cost_usd = Some(total_cost);
+    }
+    if !todo_items.is_empty() {
+        progress.todos_total = todo_items.len();
+        progress.todos_done = todo_items
+            .iter()
+            .filter(|item| todo_done.contains(*item))
+            .count();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +383,51 @@ mod tests {
         assert_eq!(progress.todos(), Some((1, 2)));
         assert_eq!(progress.tokens, Some(2150));
         assert_eq!(progress.last_activity.as_deref(), Some("todowrite"));
+    }
+
+    // omp `--mode json` stream: assistant turns finalize in `message_end` with
+    // `usage.cost.total` and `todo`/tool calls; `message_start`/`turn_end` are
+    // decoys that must not be double counted.
+    const OMP_TRANSCRIPT: &str = r#"
+{"type":"session","id":"019-omp","cwd":"/repo"}
+{"type":"message_start","message":{"role":"assistant","content":[],"usage":{"input":0,"output":0,"cost":{"total":0}}}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","name":"todo","arguments":{"op":"init","list":[{"phase":"P","items":["a","b","c"]}]}}],"usage":{"input":1000,"output":50,"cost":{"total":0.01}}}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","name":"todo","arguments":{"op":"done","task":"a"}},{"type":"toolCall","name":"todo","arguments":{"op":"done","task":"b"}}],"usage":{"input":1200,"output":80,"cost":{"total":0.02}}}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","name":"edit","arguments":{"path":"src/auth/mod.rs","i":"Fix auth"}}],"usage":{"input":1300,"output":40,"cost":{"total":0.005}}}}
+{"type":"turn_end","message":{"role":"assistant","content":[],"usage":{"input":1300,"output":40,"cost":{"total":0.005}}}}
+"#;
+
+    #[test]
+    fn omp_progress_todos_tokens_cost_and_activity() {
+        let mut progress = SessionProgress::default();
+        parse_pi_family(OMP_TRANSCRIPT, &mut progress);
+
+        // init a,b,c (total 3); done a,b → 2/3.
+        assert_eq!(progress.todos(), Some((2, 3)));
+        // last_input(1300) + Σoutput(50+80+40); turn_end/message_start ignored.
+        assert_eq!(progress.tokens, Some(1300 + 170));
+        // Σ cost.total across the three message_end turns.
+        assert_eq!(progress.cost_usd, Some(0.01 + 0.02 + 0.005));
+        assert_eq!(
+            progress.last_activity.as_deref(),
+            Some("edit src/auth/mod.rs")
+        );
+    }
+
+    #[test]
+    fn pi_reports_tokens_cost_activity_but_no_todos() {
+        // pi shares omp's stream shape but has no todo tool.
+        let transcript = r#"
+{"type":"session","id":"pi-1"}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","name":"read","arguments":{"path":"Cargo.toml"}}],"usage":{"input":2000,"output":30,"cost":{"total":0.05}}}}
+"#;
+        let mut progress = SessionProgress::default();
+        parse_pi_family(transcript, &mut progress);
+
+        assert_eq!(progress.tokens, Some(2030));
+        assert_eq!(progress.cost_usd, Some(0.05));
+        assert_eq!(progress.todos(), None);
+        assert_eq!(progress.last_activity.as_deref(), Some("read Cargo.toml"));
     }
 
     #[test]

@@ -11,12 +11,13 @@
 //! telemetry, deliberately kept out of the task thread (which is what the
 //! *next* prompt is built from).
 //!
-//! Both supported backends emit a parseable JSONL transcript on stdout —
-//! claude via `--output-format stream-json`, opencode via `run --format json` —
-//! captured to `.kanban/logs/<session>.transcript.jsonl` by the launch wrapper.
-//! Their event shapes differ but never collide on the top-level `type`, so one
-//! [`render_stream_event`] renders both and each backend has its own harvester.
-//! A backend with no parseable transcript simply gets no manifest.
+//! Every supported backend emits a parseable JSONL transcript on stdout —
+//! claude via `--output-format stream-json`, opencode via `run --format json`,
+//! and the pi family (pi/omp) via `--mode json` — captured to
+//! `.kanban/logs/<session>.transcript.jsonl` by the launch wrapper. Their event
+//! shapes differ but never collide on the top-level `type`, so one
+//! [`render_stream_event`] renders all of them and each backend has its own
+//! harvester. A backend with no parseable transcript simply gets no manifest.
 
 use std::path::{Path, PathBuf};
 
@@ -169,6 +170,65 @@ impl TranscriptHarvester for OpencodeHarvester {
     }
 }
 
+/// Harvester for the pi family (pi/omp) `--mode json` NDJSON stream. The backend
+/// session id is the `session` event's `id`; tool calls arrive as `toolCall`
+/// blocks inside each assistant `message_end`. `backend` is carried through so
+/// the manifest names the actual engine (`pi` or `omp`).
+pub struct PiFamilyHarvester {
+    pub session_id: String,
+    pub backend: String,
+    pub prompt_dump: Option<String>,
+    /// Repo root, used to canonicalize recorded paths to repo-relative form.
+    pub root: PathBuf,
+}
+
+impl TranscriptHarvester for PiFamilyHarvester {
+    fn harvest(&self, transcript: &Path) -> Result<InputManifest> {
+        let raw = std::fs::read_to_string(transcript)?;
+        let mut manifest = InputManifest {
+            session_id: self.session_id.clone(),
+            backend: self.backend.clone(),
+            prompt_dump: self.prompt_dump.clone(),
+            generated_at: timefmt::format(&timefmt::now()),
+            ..InputManifest::default()
+        };
+        for line in raw.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            match value.get("type").and_then(Value::as_str) {
+                Some("session") if manifest.backend_session_id.is_none() => {
+                    manifest.backend_session_id =
+                        value.get("id").and_then(Value::as_str).map(str::to_string);
+                }
+                Some("message_end")
+                    if value
+                        .get("message")
+                        .and_then(|message| message.get("role"))
+                        .and_then(Value::as_str)
+                        == Some("assistant") =>
+                {
+                    if let Some(content) = value
+                        .get("message")
+                        .and_then(|message| message.get("content"))
+                        .and_then(Value::as_array)
+                    {
+                        for block in content {
+                            if block.get("type").and_then(Value::as_str) == Some("toolCall") {
+                                record_pi_tool_use(&mut manifest, block);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        canonicalize_paths(&mut manifest.reads, &self.root);
+        canonicalize_paths(&mut manifest.writes, &self.root);
+        Ok(manifest)
+    }
+}
+
 /// Persist a manifest to `provenance_dir/<session>.yaml`.
 pub fn write_manifest(provenance_dir: &Path, manifest: &InputManifest) -> Result<()> {
     std::fs::create_dir_all(provenance_dir)?;
@@ -288,6 +348,38 @@ pub fn render_stream_event(value: &Value) -> Option<String> {
         "tool_use" => value
             .get("part")
             .map(|part| format!("  → {}", opencode_tool_summary(part))),
+        // pi family (pi/omp). Each assistant turn is finalized in one `message_end`
+        // carrying its text and tool calls; `message_start` (placeholder) and
+        // `turn_end` (a duplicate of the last message) are skipped to avoid noise.
+        "message_end" => {
+            let message = value.get("message")?;
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                return None;
+            }
+            let content = message.get("content")?.as_array()?;
+            let mut out = String::new();
+            for block in content {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = block.get("text").and_then(Value::as_str) {
+                            let text = text.trim();
+                            if !text.is_empty() {
+                                out.push_str(text);
+                                out.push('\n');
+                            }
+                        }
+                    }
+                    Some("toolCall") => {
+                        out.push_str("  → ");
+                        out.push_str(&pi_tool_summary(block));
+                        out.push('\n');
+                    }
+                    _ => {}
+                }
+            }
+            let out = out.trim_end();
+            (!out.is_empty()).then(|| out.to_string())
+        }
         _ => None,
     }
 }
@@ -330,6 +422,25 @@ pub(crate) fn opencode_tool_summary(part: &Value) -> String {
     ) {
         Some(detail) => format!("{tool} {detail}"),
         None => tool.to_string(),
+    }
+}
+
+/// `read src/x.rs`, `bash cargo test`, `todo Track release steps`, … for the pi
+/// family (pi/omp). Tool inputs live under `arguments` and use `path`; when no
+/// concrete target is present the short `i` intent label (e.g. omp's
+/// `"Read release notes"`) is used before falling back to the bare tool name.
+pub(crate) fn pi_tool_summary(block: &Value) -> String {
+    let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+    let args = block.get("arguments").cloned().unwrap_or(Value::Null);
+    if let Some(detail) = str_field(
+        &args,
+        &["file_path", "path", "filePath", "url", "pattern", "command"],
+    ) {
+        return format!("{name} {detail}");
+    }
+    match str_field(&args, &["i"]) {
+        Some(intent) => format!("{name} {intent}"),
+        None => name.to_string(),
     }
 }
 
@@ -422,6 +533,53 @@ fn record_opencode_tool_use(manifest: &mut InputManifest, part: &Value) {
         "todowrite" | "todoread" | "task" | "delegate_task" | "lsp_diagnostics"
         | "background_output" | "question" | "skill" | "invalid" | "webfetch_format" => {}
         // Any other tool is an external plugin/MCP capability.
+        other if !other.is_empty() => push_unique(&mut manifest.mcp, other.to_string()),
+        _ => {}
+    }
+}
+
+/// pi-family (pi/omp) tool names are lowercase and their inputs live under
+/// `arguments` keyed by `path`. Built-in tools that consume no external
+/// supply-chain input are ignored; anything unrecognized is recorded under `mcp`
+/// as an external capability, mirroring the opencode classifier.
+fn record_pi_tool_use(manifest: &mut InputManifest, block: &Value) {
+    let name = block.get("name").and_then(Value::as_str).unwrap_or("");
+    let input = block.get("arguments").cloned().unwrap_or(Value::Null);
+    match name {
+        "read" => {
+            if let Some(path) = str_field(&input, &["path", "file_path", "filePath"]) {
+                push_unique(&mut manifest.reads, path);
+            }
+        }
+        "edit" | "write" | "patch" | "apply_patch" => {
+            if let Some(path) = str_field(&input, &["path", "file_path", "filePath"]) {
+                push_unique(&mut manifest.writes, path);
+            }
+        }
+        "glob" | "grep" | "list" => {
+            if let Some(path) = str_field(&input, &["path"]) {
+                push_unique(&mut manifest.reads, path);
+            } else if let Some(pattern) = str_field(&input, &["pattern"]) {
+                push_unique(&mut manifest.reads, format!("pattern:{pattern}"));
+            }
+        }
+        "web_search" | "websearch" => {
+            if let Some(query) = str_field(&input, &["query", "q"]) {
+                push_unique(&mut manifest.urls, format!("search:{query}"));
+            }
+        }
+        "webfetch" | "fetch" => {
+            if let Some(url) = str_field(&input, &["url"]) {
+                push_unique(&mut manifest.urls, url);
+            }
+        }
+        "bash" => {
+            if let Some(command) = str_field(&input, &["command"]) {
+                record_bash_files(manifest, &command);
+            }
+        }
+        // Built-in tools with no external supply-chain input.
+        "todo" | "ask" | "subagent" | "question" | "eval" => {}
         other if !other.is_empty() => push_unique(&mut manifest.mcp, other.to_string()),
         _ => {}
     }
@@ -756,6 +914,59 @@ not json at all
 
         let step: Value = serde_json::from_str(r#"{"type":"step_finish","part":{}}"#).unwrap();
         assert_eq!(render_stream_event(&step), None);
+    }
+
+    // pi family (pi/omp) `--mode json` stream: tool calls live under
+    // `arguments`; the backend session id is the `session` event's `id`.
+    const PI_FAMILY_TRANSCRIPT: &str = r#"
+{"type":"session","version":3,"id":"019f-omp-1","cwd":"/repo"}
+{"type":"message_start","message":{"role":"assistant","content":[]}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","name":"read","arguments":{"path":"src/main.rs"}},{"type":"toolCall","name":"bash","arguments":{"command":"cat docs/spec.md"}}]}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"toolCall","name":"write","arguments":{"path":"src/out.rs"}},{"type":"toolCall","name":"todo","arguments":{"op":"done","task":"a"}},{"type":"toolCall","name":"web_search","arguments":{"query":"ratatui"}},{"type":"toolCall","name":"playwright_navigate","arguments":{"url":"https://ex.com"}}]}}
+"#;
+
+    #[test]
+    fn pi_family_harvester_classifies_tools_and_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("ses.transcript.jsonl"),
+            PI_FAMILY_TRANSCRIPT,
+        )
+        .unwrap();
+        let manifest = PiFamilyHarvester {
+            session_id: "ses-omp".to_string(),
+            backend: "omp".to_string(),
+            prompt_dump: None,
+            root: PathBuf::from("/repo"),
+        }
+        .harvest(&dir.path().join("ses.transcript.jsonl"))
+        .unwrap();
+
+        assert_eq!(manifest.backend, "omp");
+        assert_eq!(manifest.backend_session_id.as_deref(), Some("019f-omp-1"));
+        assert_eq!(manifest.reads, vec!["src/main.rs", "docs/spec.md"]);
+        assert_eq!(manifest.writes, vec!["src/out.rs"]);
+        assert_eq!(manifest.urls, vec!["search:ratatui"]);
+        // todo is a built-in no-op; the unknown tool is an external link.
+        assert_eq!(manifest.mcp, vec!["playwright_navigate"]);
+    }
+
+    #[test]
+    fn renders_pi_family_message_end() {
+        let value: Value = serde_json::from_str(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Done"},{"type":"toolCall","name":"edit","arguments":{"path":"a.rs"}}]}}"#,
+        )
+        .unwrap();
+        let rendered = render_stream_event(&value).unwrap();
+        assert!(rendered.contains("Done"));
+        assert!(rendered.contains("→ edit a.rs"));
+
+        // A user echo and the duplicate turn_end must render nothing.
+        let user: Value = serde_json::from_str(
+            r#"{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(render_stream_event(&user), None);
     }
 
     #[test]

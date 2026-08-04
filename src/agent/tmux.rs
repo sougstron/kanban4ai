@@ -186,12 +186,20 @@ fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
     // `PIPESTATUS[0]` is the agent command's status in both shapes (it stays
     // the head of the pipeline).
     let log_quoted = shell_quote(&plan.log_file.display().to_string());
+    // The pi family (pi/omp) probes stdin even under `-p` and hangs forever when
+    // it inherits the tmux pane's TTY; claude/opencode never read stdin. Closing
+    // stdin for pi/omp keeps the non-interactive run from blocking.
+    let stdin_redirect = if matches!(plan.backend.as_str(), "pi" | "omp") {
+        " < /dev/null"
+    } else {
+        ""
+    };
     let run_pipeline = match &plan.transcript_file {
         Some(transcript) => format!(
-            "{command_line} 2>&1 | tee -a {} | {kanban_cmd} format-stream | tee -a {log_quoted}",
+            "{command_line}{stdin_redirect} 2>&1 | tee -a {} | {kanban_cmd} format-stream | tee -a {log_quoted}",
             shell_quote(&transcript.display().to_string()),
         ),
-        None => format!("{command_line} 2>&1 | tee -a {log_quoted}"),
+        None => format!("{command_line}{stdin_redirect} 2>&1 | tee -a {log_quoted}"),
     };
     format!(
         "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; mkdir -p {}; {}{}{run_pipeline}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",

@@ -124,8 +124,9 @@ pub fn build_launch_plan(
     );
 
     let logs_dir = project_path.join(".kanban").join("logs");
-    // Both claude and opencode emit a parseable JSONL transcript on stdout.
-    let transcript_file = matches!(backend.as_str(), "claude" | "opencode")
+    // claude, opencode, and the pi family (pi/omp, via `--mode json`) all emit a
+    // parseable JSONL transcript on stdout.
+    let transcript_file = matches!(backend.as_str(), "claude" | "opencode" | "pi" | "omp")
         .then(|| logs_dir.join(format!("{session_id}.transcript.jsonl")));
 
     Ok(LaunchPlan {
@@ -214,9 +215,11 @@ fn backend_args(
             "json".to_string(),
         ],
         // omp/pi (the "pi" agent family) run non-interactively with `-p` and
-        // take the prompt as a positional argument. They emit no parseable
-        // transcript, so their stdout is teed to the log unchanged.
-        "omp" | "pi" => vec!["-p".to_string()],
+        // take the prompt as a positional argument. `--mode json` makes them
+        // emit the same NDJSON event stream on stdout as their session files
+        // (`message_end`/`turn_end` carry `usage`, `cost`, and tool calls), so
+        // the wrapper harvests it exactly like claude/opencode.
+        "omp" | "pi" => vec!["-p".to_string(), "--mode".to_string(), "json".to_string()],
         _ => vec!["run".to_string()],
     };
     args.extend(config.extra_args.clone());
