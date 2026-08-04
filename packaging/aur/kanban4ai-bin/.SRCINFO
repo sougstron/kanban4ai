@@ -1,6 +1,6 @@
 pkgbase = kanban4ai-bin
 	pkgdesc = Native kanban board CLI and TUI driven by AI coding agents (prebuilt binary)
-	pkgver = 0.3.2
+	pkgver = 0.3.3
 	pkgrel = 1
 	url = https://github.com/sougstron/kanban4ai
 	arch = x86_64
@@ -8,12 +8,12 @@ pkgbase = kanban4ai-bin
 	license = MIT
 	depends = glibc
 	depends = gcc-libs
-	provides = kanban4ai=0.3.2
+	provides = kanban4ai=0.3.3
 	conflicts = kanban4ai
 	options = !strip
-	source_x86_64 = kanban4ai-bin-0.3.2-x86_64.tar.gz::https://github.com/sougstron/kanban4ai/releases/download/v0.3.2/kanban4ai-v0.3.2-x86_64-unknown-linux-gnu.tar.gz
-	sha256sums_x86_64 = b9e0fc6f40b0cc55261e6cece2378047c0ee37b493e6dbaa10ac1e1923681692
-	source_aarch64 = kanban4ai-bin-0.3.2-aarch64.tar.gz::https://github.com/sougstron/kanban4ai/releases/download/v0.3.2/kanban4ai-v0.3.2-aarch64-unknown-linux-gnu.tar.gz
-	sha256sums_aarch64 = b2b5eb2cc2ed5f9267e1ed16f4ab4a34d86ed6515fc3288ba8ee6ecb28ca1c9f
+	source_x86_64 = kanban4ai-bin-0.3.3-x86_64.tar.gz::https://github.com/sougstron/kanban4ai/releases/download/v0.3.3/kanban4ai-v0.3.3-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums_x86_64 = 589e853b485ed6e090bde77c84051db6cee8c730eea29199ac061ff7104f69fe
+	source_aarch64 = kanban4ai-bin-0.3.3-aarch64.tar.gz::https://github.com/sougstron/kanban4ai/releases/download/v0.3.3/kanban4ai-v0.3.3-aarch64-unknown-linux-gnu.tar.gz
+	sha256sums_aarch64 = 5381a22d7137671b2fa7a803a8471d2e609a7692b9384a286ec37fe2c3fec55e
 
 pkgname = kanban4ai-bin
