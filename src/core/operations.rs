@@ -20,6 +20,7 @@ use crate::core::notifier::{DesktopNotifier, NotificationConfig};
 use crate::core::provenance::{
     self, ClaudeHarvester, InputManifest, OpencodeHarvester, PiFamilyHarvester, TranscriptHarvester,
 };
+use crate::core::reply;
 use crate::core::session::SessionManager;
 use crate::core::storage::{NewTask, Storage, atomic_write_text};
 use crate::core::thread::ThreadManager;
@@ -1894,6 +1895,10 @@ impl Operations {
         let outcome = self.reconcile_agent_exit_inner(task_id, session_id, exit_status)?;
         if session_matched_task {
             let manifest = self.harvest_provenance(task_id, session_id);
+            // The agent's closing answer goes in before the exit audit line so
+            // the thread reads in the order it happened: what the agent said,
+            // then the session closing.
+            self.record_agent_reply(task_id, session_id);
             self.log_exit_step(
                 task_id,
                 session_id,
@@ -1912,10 +1917,7 @@ impl Operations {
     /// opencode emit a parseable transcript, and any failure is a soft warning
     /// that never disturbs the reconciled exit.
     fn harvest_provenance(&self, task_id: &str, session_id: &str) -> Option<InputManifest> {
-        let task = self.storage.load_task(task_id).ok().flatten()?;
-        let backend = resolve_launch_settings(&self.config.load().ok()?, &task)
-            .ok()?
-            .backend;
+        let backend = self.task_backend(task_id)?;
         let transcript = self
             .storage
             .logs_dir
@@ -1969,6 +1971,74 @@ impl Operations {
                 eprintln!("Warning: failed to harvest transcript for {session_id}: {err}");
                 None
             }
+        }
+    }
+
+    /// Backend a task's launches resolve to (its own field, or the board
+    /// default), which decides how its session transcript is parsed at exit.
+    fn task_backend(&self, task_id: &str) -> Option<String> {
+        let task = self.storage.load_task(task_id).ok().flatten()?;
+        Some(
+            resolve_launch_settings(&self.config.load().ok()?, &task)
+                .ok()?
+                .backend,
+        )
+    }
+
+    /// Post the agent's closing answer — the summary it prints as its last
+    /// words — to the task thread as a `context` message authored by
+    /// `agent-reply`. Without this the thread holds only the audit trail
+    /// (launch, agent-written context, exit) while the answer itself stays
+    /// buried in `.kanban/logs/<session>.log`. It is taken from the backend's
+    /// own machine transcript, so it is what the agent actually said rather
+    /// than prose it chose to re-type through `kanban context`.
+    ///
+    /// Best-effort: any failure is a soft warning — the exit has already been
+    /// reconciled by the time this runs. Setting the `agent_reply_max_chars`
+    /// threshold to 0 turns the whole behavior off; otherwise it caps how much
+    /// of a long reply is kept, since every thread entry is replayed into the
+    /// next prompt.
+    fn record_agent_reply(&self, task_id: &str, session_id: &str) {
+        let Ok(max_chars) = self.config.get_threshold("agent_reply_max_chars") else {
+            return;
+        };
+        if max_chars <= 0 {
+            return;
+        }
+        let Some(backend) = self.task_backend(task_id) else {
+            return;
+        };
+        let transcript = self
+            .storage
+            .logs_dir
+            .join(format!("{session_id}.transcript.jsonl"));
+        let Some(text) = reply::final_reply(&backend, &transcript) else {
+            return;
+        };
+        let body = reply::truncate_reply(&text, max_chars as usize);
+        // Agents commonly repeat their summary through `kanban context` before
+        // finishing; posting identical text twice would only duplicate it in
+        // the next prompt.
+        let already_recorded = self
+            .thread_manager()
+            .and_then(|tm| tm.messages_of_kind(task_id, MessageKind::Context))
+            .map(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message.body.trim() == body.trim())
+            })
+            .unwrap_or(false);
+        if already_recorded {
+            return;
+        }
+        if let Err(err) = self.context_manager().append_context_with_session(
+            task_id,
+            &body,
+            "agent-reply",
+            Some(session_id),
+            &self.storage,
+        ) {
+            eprintln!("Warning: failed to record agent reply for {task_id}: {err}");
         }
     }
 

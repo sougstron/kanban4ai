@@ -7,6 +7,7 @@ pub mod models;
 pub mod notifier;
 pub mod operations;
 pub mod provenance;
+pub mod reply;
 pub mod session;
 pub mod storage;
 pub mod telemetry;

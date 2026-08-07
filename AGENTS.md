@@ -114,6 +114,9 @@ adds, and the human's review feedback, lives in the sidecar thread:
 - **Suggestions** — `kanban suggest <id> <text>` posts a non-blocking
   `suggestion` message. Every delegated-agent prompt now nudges agents to record
   ideas, risks, and better alternatives this way without stopping their work.
+- **Agent reply** — when an agent session exits, its closing answer (the
+  summary it printed as its last words) is posted as a `context` message
+  authored by `agent-reply`. See "Agent Reply Capture".
 - **Review edits** — while a task sits in Review the human types feedback into
   the single `review_edits` buffer (`kanban edits`, or the TUI Review-edits
   field). On the next re-run (`kanban rerun` / TUI "Save & Re-run") the buffer
@@ -209,6 +212,7 @@ When `interactive: true`, delegated agents are instructed to use `kanban ask --w
 - `waiting_default_eta`: 900 (sec) - default expected wait for `kanban waiting`
 - `waiting_eta_multiplier`: 2 - safety multiplier applied to the ETA before relaunch
 - `waiting_note_max_chars`: 1000 - maximum stored wait note length
+- `agent_reply_max_chars`: 4000 - maximum length of the agent's closing reply recorded on the thread at exit (`0` disables recording it)
 
 ### TUI Settings (.kanban/config.yaml `tui:`)
 - `card_height_lines`: 4 - task card height
@@ -378,6 +382,30 @@ A task may carry a `chained_to` target task id. When the **target** task enters 
 
 ### Image Attachments
 Paste an image from the clipboard (`wl-paste`/`xclip`, or a file path in clipboard text), sniff the type by magic bytes (png/jpg/gif/webp), write it atomically under `.kanban/assets/images/`, and embed Markdown (`![pasted image](...)`) in the task description.
+
+### Agent Reply Capture (`core/reply.rs`)
+An agent's closing answer used to reach only `.kanban/logs/<session>.log`, so
+the task thread showed the audit trail (launch, agent-written context, exit)
+but never what the agent actually said. At exit `reconcile_agent_exit` extracts
+the final assistant message from the backend's machine transcript and posts it
+as a `context` message (role `agent`, author `agent-reply`) just before the
+`■ exit` audit line, so it is thread content like any other context entry and
+feeds the next prompt.
+
+- claude: the `result` event's `result` is the finished answer; without one
+  (interrupted run) the last `assistant` message's `text` blocks are used,
+  grouped by `message.id` so earlier turns are dropped.
+- opencode: `text` events carry `part.messageID`, so the final message is the
+  last group of text parts sharing one id.
+- pi / omp: the last assistant `message_end` carrying text (`turn_end`
+  duplicates it and is skipped).
+- Backends with no parseable transcript, and runs that ended without printing
+  text, record nothing. Text identical to an existing `context` message is not
+  posted again (agents commonly repeat their summary through `kanban context`),
+  and the body is clamped to `agent_reply_max_chars` with a
+  `... (agent reply truncated)` marker; `0` disables the capture entirely.
+- Unlike `core/provenance.rs` (telemetry, deliberately kept out of the thread)
+  this is the agent's own prose and belongs in the thread.
 
 ### Live Agent Telemetry (`core/telemetry.rs`)
 `read_session_progress` answers *how a run is going right now* by re-reading the

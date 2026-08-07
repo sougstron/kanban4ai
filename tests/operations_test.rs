@@ -2220,6 +2220,156 @@ fn agent_exit_harvests_opencode_transcript_into_provenance_manifest() {
     assert!(step.body.contains("reads=1 writes=0 urls=1"));
 }
 
+/// The agent's closing answer must reach the thread, not just the log file:
+/// claude reports it in the `result` event, and it is posted as a `context`
+/// message ahead of the exit audit line.
+#[test]
+fn agent_exit_appends_claude_final_reply_to_thread() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask {
+            agent_backend: Some("claude".to_string()),
+            ..NewTask::titled("Report back")
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-reply", true).unwrap().unwrap();
+
+    let transcript = dir.path().join(".kanban/logs/ses-reply.transcript.jsonl");
+    fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"Planning the work."}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"msg_2","content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","result":"Основные разделы:\n\n- src/ — Rust code"}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    ops.reconcile_agent_exit(&task.id, "ses-reply", 0).unwrap();
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    let reply_index = thread
+        .messages
+        .iter()
+        .position(|m| m.kind == MessageKind::Context && m.body.contains("Основные разделы"))
+        .expect("final reply posted to the thread");
+    let reply = &thread.messages[reply_index];
+    assert_eq!(reply.role, MessageRole::Agent);
+    assert_eq!(reply.author.as_deref(), Some("agent-reply"));
+    assert_eq!(reply.body, "Основные разделы:\n\n- src/ — Rust code");
+    // Only the closing message counts, never the earlier chatter.
+    assert!(!reply.body.contains("Planning the work"));
+    // The reply reads before the exit audit line it belongs to.
+    let exit_index = thread
+        .messages
+        .iter()
+        .position(|m| m.kind == MessageKind::AgentStep && m.body.starts_with("■ exit"))
+        .expect("exit step logged");
+    assert!(reply_index < exit_index);
+    // Recorded context feeds the next prompt, so its size must be accounted for.
+    assert!(ops.get_task(&task.id).unwrap().unwrap().context_size > 0);
+}
+
+/// Same contract for opencode, whose final message arrives as `text` events
+/// tagged with a `messageID`; a reply the agent already recorded through
+/// `kanban context` is not duplicated.
+#[test]
+fn agent_exit_appends_opencode_final_reply_without_duplicating_context() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask {
+            agent_backend: Some("opencode".to_string()),
+            ..NewTask::titled("Report back too")
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-oc-reply", true)
+        .unwrap()
+        .unwrap();
+
+    let transcript = dir
+        .path()
+        .join(".kanban/logs/ses-oc-reply.transcript.jsonl");
+    fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"text","sessionID":"ses_real","part":{"type":"text","messageID":"msg_a","text":"Reading files."}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_real","part":{"type":"text","messageID":"msg_b","text":"Structure confirmed."}}"#,
+            "\n",
+            r#"{"type":"text","sessionID":"ses_real","part":{"type":"text","messageID":"msg_b","text":"- src/ holds the code"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    ops.reconcile_agent_exit(&task.id, "ses-oc-reply", 0)
+        .unwrap();
+    // A second reconciliation (stale/duplicated callback) must not post twice.
+    ops.reconcile_agent_exit(&task.id, "ses-oc-reply", 0)
+        .unwrap();
+
+    let replies: Vec<_> = ThreadManager::new(dir.path())
+        .unwrap()
+        .messages_of_kind(&task.id, MessageKind::Context)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.body.contains("Structure confirmed"))
+        .collect();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(
+        replies[0].body,
+        "Structure confirmed.\n\n- src/ holds the code"
+    );
+}
+
+/// `agent_reply_max_chars` caps how much of a long reply enters the thread,
+/// since every entry is replayed into the next prompt.
+#[test]
+fn agent_reply_is_truncated_to_the_configured_budget() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "columns:\n- name: To Do\n  id: todo\n- name: In Progress\n  id: in_progress\n\
+         - name: Review\n  id: review\n- name: Done\n  id: done\n\
+         notifications:\n  enabled: false\nauto_launch:\n  enabled: true\n\
+         thresholds:\n  agent_reply_max_chars: 20\n",
+    )
+    .unwrap();
+    let task = ops
+        .create_task(NewTask {
+            agent_backend: Some("claude".to_string()),
+            ..NewTask::titled("Long answer")
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-long", true).unwrap().unwrap();
+
+    let long = "x".repeat(500);
+    fs::write(
+        dir.path().join(".kanban/logs/ses-long.transcript.jsonl"),
+        format!(r#"{{"type":"result","subtype":"success","result":"{long}"}}"#),
+    )
+    .unwrap();
+
+    ops.reconcile_agent_exit(&task.id, "ses-long", 0).unwrap();
+
+    let reply = ThreadManager::new(dir.path())
+        .unwrap()
+        .messages_of_kind(&task.id, MessageKind::Context)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.body.starts_with("xxxx"))
+        .expect("truncated reply posted");
+    assert!(reply.body.starts_with(&"x".repeat(20)));
+    assert!(reply.body.ends_with("(agent reply truncated)"));
+    assert!(reply.body.len() < long.len());
+}
+
 #[test]
 fn agent_exit_reconciliation_skips_logging_for_unmatched_session() {
     let (dir, ops, _recorder) = ops_with_recorder(true);

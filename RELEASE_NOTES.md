@@ -1,37 +1,42 @@
-# kanban4ai 0.3.4
+# kanban4ai 0.3.5
 
 ## Highlights
 
-- The pi agent family (`pi` and `omp`) is no longer launched blind. Both now run
-  with `--mode json`, which streams the same NDJSON event log they persist in
-  their session files, so kanban4ai captures a real transcript for them at
-  `.kanban/logs/<session>.transcript.jsonl` instead of only a raw log tee.
-- Running `pi`/`omp` cards get the same live telemetry as claude and opencode:
-  token count, cost, last tool activity, and — for omp, which has a `todo` tool —
-  a real todo progress bar replayed from its `init`/`append`/`done` calls. Tokens
-  use the same live accounting as claude (`last_input + Σ output`) and cost sums
-  each turn's reported total; the placeholder `message_start` and the duplicate
-  `turn_end` events are skipped so nothing is double counted. pi has no todo
-  tool and reports no todos.
-- Input-provenance manifests are now harvested for `pi`/`omp` runs too. Their
-  tool calls are classified into reads, writes, globs/greps, and URLs, with
-  unrecognized tools recorded as external capabilities and paths canonicalized
-  to repo-relative form — the same treatment opencode runs already got. The
-  session-info panel therefore shows a backend conversation id and provenance
-  for these backends instead of nothing.
-- `kanban format-stream` renders pi/omp turns, so a live pane shows assistant
-  text and `→ edit src/auth/mod.rs` activity lines rather than raw JSON.
-- Fixed: `pi`/`omp` runs could hang forever. Both probe stdin even in
-  non-interactive `-p` mode, and inheriting the tmux pane's TTY left them
-  blocked with no output. The launch wrapper now closes their stdin.
+- The agent's closing answer is now recorded on the task thread. A session's
+  final reply — the summary the backend prints as its last words — used to live
+  only in `.kanban/logs/<session>.log`, so the thread showed the audit trail
+  (launch, agent-written context, exit) but never what the agent actually said.
+  At exit `reconcile_agent_exit` now extracts the final assistant message from
+  the backend's machine transcript and posts it as a `context` message
+  (role `agent`, author `agent-reply`) just before the `■ exit` audit line, so
+  the reply is thread content like any other context entry and feeds the next
+  prompt.
+  - claude: the `result` event's `result` is the finished answer; without one
+    (interrupted run) the last `assistant` message's `text` blocks are used,
+    grouped by `message.id` so earlier turns are dropped.
+  - opencode: `text` events carry `part.messageID`, so the final message is the
+    last group of text parts sharing one id.
+  - pi / omp: the last assistant `message_end` carrying text (`turn_end`
+    duplicates it and is skipped).
+  - Backends with no parseable transcript, and runs that ended without printing
+    text, record nothing. Text identical to an existing `context` message is
+    not posted again (agents commonly repeat their summary through
+    `kanban context`), and the body is clamped to `agent_reply_max_chars` with a
+    `... (agent reply truncated)` marker; `0` disables the capture entirely.
+- New configurable threshold `agent_reply_max_chars` (default 4000) controls the
+  maximum length of the recorded reply; `0` disables agent reply capture. No
+  hardcoded budget in business logic.
 
 ## Verification coverage
 
-- Telemetry tests: an omp transcript yields 2/3 todo progress, correct live
-  token totals with the `message_start`/`turn_end` decoy events ignored, summed
-  cost, and the last tool activity; a pi transcript yields tokens, cost, and
-  activity with no todos.
-- Agent launch-plan tests assert `--mode json` and a captured transcript file
-  for both omp and pi.
-- Release checks for this version include rustfmt, clippy with warnings denied,
-  locked tests, a release build, and installer packaging smoke tests.
+- Unit tests in `src/core/reply.rs`: transcript parsing and truncation for each
+  backend, deduplication against existing context, and the disabled
+  (`agent_reply_max_chars = 0`) case.
+- Integration tests in `tests/operations_test.rs`: `reconcile_agent_exit` posts
+  the reply as `context` / `agent-reply` immediately before the `■ exit` step,
+  and a repeated/stale `agent-exit` callback cannot duplicate it.
+- Verified against real on-disk transcripts: the opencode transcript of an
+  earlier task yields exactly the answer that was missing from its thread;
+  claude transcripts yield their `result` text.
+- Release checks for this version include rustfmt, clippy with warnings
+  denied, locked tests, a release build, and installer packaging smoke tests.
