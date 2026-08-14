@@ -99,6 +99,7 @@ pub enum DialogField {
     Answer,
     Theme,
     TaskSort,
+    EscapeToProjects,
     Confirm,
     Cancel,
     PurgeData,
@@ -115,7 +116,7 @@ const TASK_FORM_FIELDS: [DialogField; 8] = [
     DialogField::Interactive,
 ];
 
-const SETTINGS_FORM_FIELDS: [DialogField; 7] = [
+const SETTINGS_FORM_FIELDS: [DialogField; 8] = [
     DialogField::Title,
     DialogField::Backend,
     DialogField::Model,
@@ -123,6 +124,7 @@ const SETTINGS_FORM_FIELDS: [DialogField; 7] = [
     DialogField::Agent,
     DialogField::Theme,
     DialogField::TaskSort,
+    DialogField::EscapeToProjects,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +150,7 @@ pub struct ModalState {
     pub theme: TextArea<'static>,
     pub task_sort: TextArea<'static>,
     pub interactive: bool,
+    pub escape_to_projects: bool,
     pub form_scroll: usize,
     pub error: Option<String>,
     pub discard_confirm: bool,
@@ -197,6 +200,7 @@ impl ModalState {
             theme: one_line("dark"),
             task_sort: one_line("task_number"),
             interactive: false,
+            escape_to_projects: false,
             form_scroll: 0,
             error: None,
             discard_confirm: false,
@@ -283,6 +287,7 @@ impl ModalState {
                 DialogField::Agent,
                 DialogField::Theme,
                 DialogField::TaskSort,
+                DialogField::EscapeToProjects,
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
@@ -424,6 +429,13 @@ impl ModalState {
                 | ratatui::crossterm::event::KeyCode::Enter => self.interactive = !self.interactive,
                 _ => {}
             },
+            DialogField::EscapeToProjects => match key.code {
+                ratatui::crossterm::event::KeyCode::Char(' ')
+                | ratatui::crossterm::event::KeyCode::Enter => {
+                    self.escape_to_projects = !self.escape_to_projects
+                }
+                _ => {}
+            },
             DialogField::PurgeData => match key.code {
                 ratatui::crossterm::event::KeyCode::Char(' ')
                 | ratatui::crossterm::event::KeyCode::Enter => self.purge_data = !self.purge_data,
@@ -480,7 +492,7 @@ impl ModalState {
             DialogField::Effort => &mut self.effort,
             DialogField::Agent => &mut self.agent,
             DialogField::ChainTo => &mut self.chain_to,
-            DialogField::Interactive => &mut self.answer,
+            DialogField::Interactive | DialogField::EscapeToProjects => &mut self.answer,
             DialogField::TargetStatus => &mut self.target_status,
             DialogField::MessageKind => &mut self.description,
             DialogField::Question | DialogField::Variant => &mut self.answer,
@@ -787,6 +799,7 @@ impl ModalState {
             self.theme_selected.to_string(),
             raw_textarea_text(&self.task_sort),
             self.task_sort_selected.to_string(),
+            self.escape_to_projects.to_string(),
             self.purge_data.to_string(),
         ]
         .join("\u{1f}")
@@ -1139,7 +1152,7 @@ fn selector_form_rows(
 
 fn task_field_min_height(field: DialogField) -> u16 {
     match field {
-        DialogField::Title | DialogField::Interactive => 3,
+        DialogField::Title | DialogField::Interactive | DialogField::EscapeToProjects => 3,
         DialogField::Description => 5,
         _ => 4,
     }
@@ -1439,6 +1452,7 @@ fn render_selector_field(
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::Interactive => render_interactive(frame, app, modal, area),
+        DialogField::EscapeToProjects => render_escape_to_projects(frame, app, modal, area),
         DialogField::Theme => render_select(
             frame,
             app,
@@ -1806,7 +1820,6 @@ fn register_buttons(hitboxes: &mut Vec<Hitbox>, area: Rect, left: ModalButton, r
         action: HitAction::ModalButton(right),
     });
 }
-
 fn render_interactive(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
     let active = modal.active_field() == DialogField::Interactive
         || app.is_hovered(HitAction::ModalField(DialogField::Interactive));
@@ -1820,6 +1833,30 @@ fn render_interactive(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area
         Paragraph::new(format!("{mark} interactive (Space/Enter to toggle)")).block(
             Block::default()
                 .title(" Interactive ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border)),
+        ),
+        area,
+    );
+}
+
+fn render_escape_to_projects(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
+    let active = modal.active_field() == DialogField::EscapeToProjects
+        || app.is_hovered(HitAction::ModalField(DialogField::EscapeToProjects));
+    let border = if active {
+        app.theme.focus
+    } else {
+        app.theme.border
+    };
+    let mark = if modal.escape_to_projects {
+        "☑"
+    } else {
+        "☐"
+    };
+    frame.render_widget(
+        Paragraph::new(format!("{mark} Esc from board opens projects")).block(
+            Block::default()
+                .title(" Escape ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border)),
         ),

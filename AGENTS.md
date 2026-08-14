@@ -46,10 +46,12 @@ src/
     ├── session.rs       # SessionManager: heartbeats, crash detection, token estimate
     ├── context.rs       # ContextManager: thread-based context + legacy back-compat
     ├── compaction.rs    # Rule-based context compaction (no LLM)
+    ├── limits.rs        # Provider subscription limits (claude/codex/grok) + cache
     └── notifier.rs      # Desktop notifications (notify-send)
 Additional modules:
     agent/               # process manager, tmux wrapper, backends, prompts
-    tui/                 # ratatui board, detail, dialogs, search, sessions, projects
+    tui/                 # ratatui board, detail, dialogs, search, sessions, projects,
+                         #   limits row
 .github/workflows/       # CI and tagged Linux release automation
 packaging/aur/           # stable and VCS Arch source packages
 scripts/                 # POSIX installer and packaging smoke test
@@ -199,6 +201,7 @@ messages:
 - `kanban sessions` - List active sessions
 - `kanban archive` - List archived tasks
 - `kanban archive-done` - Move all Done tasks to Archive
+- `kanban limits [--format table|json] [--refresh]` - Remaining subscription capacity per provider (claude, codex, grok); serves the cached snapshot unless it aged out or `--refresh` is given
 - `kanban tui` - Launch the interactive board; with no resolved project, open the projects list
 - `kanban attach <id>` - Attach to the task's running agent tmux session
 
@@ -229,6 +232,7 @@ When `interactive: true`, delegated agents are instructed to use `kanban ask --w
 - `waiting_eta_multiplier`: 2 - safety multiplier applied to the ETA before relaunch
 - `waiting_note_max_chars`: 1000 - maximum stored wait note length
 - `agent_reply_max_chars`: 4000 - maximum length of the agent's closing reply recorded on the thread at exit (`0` disables recording it)
+- `limits_refresh_interval`: 120 (sec) - how long a provider-limits snapshot stays fresh before the TUI refreshes it in the background
 
 ### TUI Settings (.kanban/config.yaml `tui:`)
 - `card_height_lines`: 4 - task card height
@@ -239,6 +243,10 @@ When `interactive: true`, delegated agents are instructed to use `kanban ask --w
 - `task_sort`: `task_number` (default, ascending TASK id), `updated_at_asc`
   (least recently modified first), or `updated_at_desc` (most recently modified
   first). Legacy `completion_date` values are read as `updated_at_desc`.
+- `escape_to_projects`: false - when true, Esc on the Board (with no active
+  search filter) opens the projects list. Toggle in Project Settings.
+- `show_limits`: true - draw the provider subscription-limits row above the
+  status bar on the Board and Projects screens
 
 ### Notification Settings (.kanban/config.yaml `notifications:`)
 - `enabled`: true - master switch for desktop notifications
@@ -291,8 +299,9 @@ Action hotkeys work on both the board (focused card) and the open detail view.
   its confirmation dialog were removed)
 - `n`: New task in the focused column
 - `s`: Open Project Settings from Board or Detail: project name, default backend,
-  its model/effort/persona defaults, and dark/light theme. The Board status-bar
-  `s settings` hint is clickable when it fits.
+  its model/effort/persona defaults, dark/light theme, task sorting, and whether
+  Esc on the Board opens the projects list. The Board status-bar `s settings`
+  hint is clickable when it fits.
 - `e`: Edit task
 - `d` / `Ctrl+d` / `Delete` / `Backspace`: Delete task
 - `m`: Move task
@@ -311,7 +320,8 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `A`: Confirm archiving all Done tasks
 - `R`: Confirm marking all Review tasks Done
 - `l`: Show running sessions
-- `P`: Open the projects list (from Board, Detail, Archive, Sessions; not while typing)
+- `P`: Open the projects list (from Board, Detail, Archive, Sessions; not while typing). The same physical key works on a Russian layout (`З`).
+- `Esc` on the Board: clears an active search filter; if `tui.escape_to_projects` is on and the filter is empty, opens the projects list
 - `Ctrl+t`: Quick theme toggle (persisted to config)
 - `/`: Search
 - `?`: Help overlay (scrollable, sized to its content; lists mouse gestures)
@@ -340,9 +350,11 @@ detail — `Esc` returns to the sessions list. Archive view: `Enter` opens the a
 detail (its action bar offers only Restore/Delete), `u` restores the selected
 task to To Do after a confirmation.
 
-Projects view: each row shows the display name, a `~`-shortened work path
-(struck through when the folder is missing), per-column task counts
-(`todo/in_progress/review/done`), active session count, and last opened.
+Projects view: each row shows the display name, then the project status
+(per-column counts `todo/in_progress/review/done`, a `▶` active-session
+count, and a `●` when Review has unseen tasks) next to the name, a
+`~`-shortened work path (struck through when the folder is missing), and
+last opened on the right.
 When the current directory is not registered, a pinned
 `+ Create project for <cwd>` row is first: `Enter` or `n` on it registers
 immediately (name = folder basename; a local `.kanban` is migrated). `n` on a
@@ -472,6 +484,60 @@ within a column, but a column grows to its tallest card, so telemetry and badges
 are never clipped while columns of plain cards keep the configured
 `card_height_lines`; the description is the one row still allowed to clip.
 
+### Provider Subscription Limits (`core/limits.rs`, `tui/limits.rs`)
+
+How much of each AI subscription window is left, drawn as one row directly
+above the status bar on the Board and Projects screens (`✳ claude 5h 66% ↻3h30m
+· 7d 95% ↻6d11h │ ✺ codex mon 75% ↻18d (7d old) │ ✕ grok 7d 93% ↻4d22h`), and
+printed by `kanban limits`. Percentages are what remains (100 − used), not what
+is spent.
+
+Sources, all read-only and best effort:
+
+- **claude**: `GET https://api.anthropic.com/api/oauth/usage` with the OAuth
+  access token from `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`)
+  and `anthropic-beta: oauth-2025-04-20`. Yields the `five_hour` (`5h`) and
+  `seven_day` (`7d`) windows with `utilization` and `resets_at`.
+- **codex**: no network. The newest `rollout-*.jsonl` under
+  `$CODEX_HOME/sessions/YYYY/MM/DD/` (default `~/.codex`) is streamed for its
+  last `rate_limits` payload (`primary`/`secondary` with `used_percent`,
+  `window_minutes`, epoch `resets_at`). The numbers are only as fresh as the
+  last codex run, so the row appends their age (`(7d old)`).
+- **grok**: `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`
+  with the key and user id from `~/.grok/auth.json` plus
+  `X-XAI-Token-Auth: xai-grok-cli`. Yields one window for the current billing
+  period (`creditUsagePercent`, `currentPeriod.type`/`.end`).
+
+HTTPS goes through `curl -K -`, with the request config (URL and headers) piped
+on stdin: no TLS dependency is linked into the crate, and bearer tokens never
+appear in a command line where `ps` would expose them. `curl` is an optional
+dependency — without it claude and grok degrade to `n/a` and codex still works.
+
+A provider with no credentials on the machine reports `not_configured` and is
+omitted from the row entirely; `401`/`403` becomes `signed out`. Fetches run on
+a background thread started from the event loop (never `App::new`, so no test
+or non-TUI caller polls a provider), and results are cached in memory and in
+`<store>/limits.json` with a `limits_refresh_interval` TTL, because the claude
+usage endpoint rate-limits frequent polling. The renderer only ever draws
+`App::limits`, the snapshot the event loop last pulled from that cache, and
+degrades with width: reset times drop first, then window labels and provider
+names, then whole providers from the right.
+
+**Click refresh**: the codex and grok segments of the row are hitboxes
+(`UiAction::RefreshLimits`); a click refreshes that provider through its own
+CLI on a background thread (`refresh_provider_async`, guarded against
+overlapping runs) and merges the result into the same caches, so the row
+updates on the next tick. codex is queried live over the app-server JSON-RPC
+(`initialize` + `account/rateLimits/read`, camelCase payload, answers in ~1s,
+spends no usage, and falls back to the rollout files on any failure), and
+running `grok models` renews the short-lived OIDC token in `~/.grok/auth.json`
+before the billing fetch — that fixes both "codex numbers only as fresh as the
+last run" and "grok reads signed out after ~6h" without a periodic poller.
+Both CLIs run in the scratch cwd `<store>/limits-refresh-cwd` so stray session
+state never lands in a project. The claude segment is display-only: the only
+open claude item is hardening against the usage endpoint's documented 429s,
+not a freshness fix.
+
 ### Storage Directories (under `<data_root>/.kanban/`)
 
 Board data lives in the projects store, not in the work folder. The layout
@@ -489,6 +555,9 @@ tree at `<work>/.kanban/`.
 - `backups/<task_id>/` - pre-edit file backups for revert
 - `assets/images/` - pasted image attachments
 - `.lock` - board-wide flock serializing read-modify-write cycles
+
+Provider limit snapshots are machine-wide, not per board: they live in
+`<store>/limits.json` (see **Projects & Store**).
 
 ### Projects & Store
 

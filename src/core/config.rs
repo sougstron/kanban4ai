@@ -50,6 +50,7 @@ thresholds:
   waiting_eta_multiplier: 2
   waiting_note_max_chars: 1000
   agent_reply_max_chars: 4000
+  limits_refresh_interval: 120
 verification:
   command: null
   block_on_failure: true
@@ -60,6 +61,8 @@ tui:
   max_tasks_per_column: 100
   theme: textual-dark
   task_sort: task_number
+  show_limits: true
+  escape_to_projects: false
 auto_launch:
   enabled: true
   use_tmux: true

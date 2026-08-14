@@ -4,7 +4,7 @@ expression: rendered
 ---
 ┌ Projects · Enter open · n new · r rename · p path · d delete · / filter · q quit ────────────┐
 │+ Create project for /tmp/k4ai-snap-cwd                                                       │
-│Demo Board           /tmp/k4ai-snap-work                                       1/1/0/0  never │
+│Demo Board           1/1/0/0 /tmp/k4ai-snap-work                                        never │
 │                                                                                              │
 │                                                                                              │
 │                                                                                              │
@@ -37,10 +37,8 @@ expression: rendered
 1:1-95 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset).bold()
 1:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 2:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
-2:1-22 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
-2:22-80 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Reset).underline_color(Color::Reset)
-2:80-87 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
-2:87-94 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Reset).underline_color(Color::Reset)
+2:1-30 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+2:30-94 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Reset).underline_color(Color::Reset)
 2:94-95 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 2:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 3:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)

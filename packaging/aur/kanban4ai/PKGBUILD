@@ -10,6 +10,7 @@ depends=('gcc-libs')
 makedepends=('cargo')
 optdepends=(
   'tmux: attachable background agent sessions'
+  'curl: subscription limits row for claude and grok'
   'libnotify: desktop notifications through notify-send'
   'wl-clipboard: paste images under Wayland'
   'xclip: paste images under X11'

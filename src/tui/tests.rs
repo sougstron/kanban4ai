@@ -747,6 +747,8 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     app.handle_key(key(KeyCode::Tab)).expect("task sorting");
     app.handle_key(key(KeyCode::Right))
         .expect("updated ascending sorting");
+    app.handle_key(key(KeyCode::Tab))
+        .expect("escape to projects");
     app.handle_key(key(KeyCode::Tab)).expect("save");
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
 
@@ -2516,6 +2518,8 @@ fn russian_layout_maps_commands_without_changing_text_input() {
         ('К', 'R'),
         ('ч', 'x'),
         ('щ', 'o'),
+        ('з', 'p'),
+        ('З', 'P'),
         ('.', '/'),
         (',', '?'),
     ] {
@@ -4147,6 +4151,73 @@ fn projects_screen_lists_rows_and_create_cwd() {
 }
 
 #[test]
+fn project_row_places_status_next_to_the_name() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-status-work");
+    let _ = std::fs::remove_dir_all(&work);
+    let (_store, mut app) = projects_app(&work, None);
+    let rendered = render_at(&mut app, 96, 12);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("Demo Board"))
+        .unwrap_or_else(|| panic!("missing project row: {rendered}"));
+    let name_at = line.find("Demo Board").expect("project name");
+    let counts_at = line.find("1/1/0/0").expect("column counts");
+    let path_at = line.find("/tmp/k4ai-status-work").expect("work path");
+    assert!(
+        name_at < counts_at && counts_at < path_at,
+        "status should sit between the project name and the path, got: {line}"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn project_row_places_running_and_unreviewed_status_next_to_the_name() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-status-run");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("work dir");
+    let store_dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(store_dir.path());
+    let added = store.add(&work, Some("Demo Board")).expect("add project");
+    write_task_file(&added.project.data_root, "todo", "TASK-001");
+    write_task_file(&added.project.data_root, "in_progress", "TASK-002");
+    let review_dir = added.project.data_root.join(".kanban/tasks/review");
+    std::fs::create_dir_all(&review_dir).expect("review dir");
+    std::fs::write(
+        review_dir.join("TASK-003.md"),
+        "---\nid: TASK-003\ntitle: TASK-003\nstatus: review\nreview_unseen: true\n---\n",
+    )
+    .expect("unseen review");
+    std::fs::create_dir_all(added.project.data_root.join(".kanban/sessions")).expect("sessions");
+    std::fs::write(
+        added
+            .project
+            .data_root
+            .join(".kanban/sessions/ses-test.yaml"),
+        "id: ses-test\ntask_id: TASK-002\nstatus: active\nstarted_at: '2026-08-14T11:00:00'\nlast_seen: '2026-08-14T11:00:00'\n",
+    )
+    .expect("session");
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let rendered = render_at(&mut app, 96, 12);
+    let line = rendered
+        .lines()
+        .find(|line| line.contains("Demo Board"))
+        .unwrap_or_else(|| panic!("missing project row: {rendered}"));
+    let name_at = line.find("Demo Board").expect("project name");
+    let counts_at = line.find("1/1/1/0").expect("column counts");
+    let running_at = line.find('▶').expect("running sessions");
+    let unseen_at = line.find('●').expect("unreviewed marker");
+    let path_at = line.find("/tmp/k4ai-status-run").expect("work path");
+    assert!(
+        unseen_at < name_at
+            && name_at < counts_at
+            && counts_at < running_at
+            && running_at < path_at,
+        "running and unreviewed status should sit with the project name, got: {line}"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
 fn projects_enter_on_create_cwd_registers_without_a_dialog() {
     let work = tempfile::tempdir().expect("work");
     let cwd = tempfile::tempdir().expect("cwd");
@@ -4185,6 +4256,82 @@ fn board_uppercase_p_switches_to_the_projects_list() {
 }
 
 #[test]
+fn board_russian_uppercase_ze_switches_to_the_projects_list() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('З'))).expect("RU P");
+    match app.take_loop_outcome() {
+        Some(LoopOutcome::ShowProjects { return_to }) => assert!(return_to.is_none()),
+        other => panic!("expected ShowProjects, got {other:?}"),
+    }
+}
+
+#[test]
+fn board_escape_stays_on_board_when_escape_to_projects_is_off() {
+    let (_dir, mut app) = app_with_board();
+    assert!(!app.settings.escape_to_projects);
+    app.handle_key(key(KeyCode::Esc)).expect("Esc");
+    assert_eq!(app.screen, Screen::Board);
+    assert!(app.take_loop_outcome().is_none());
+}
+
+#[test]
+fn board_escape_opens_projects_when_setting_is_on() {
+    let (_dir, mut app) = app_with_board();
+    app.settings.escape_to_projects = true;
+    app.handle_key(key(KeyCode::Esc)).expect("Esc");
+    match app.take_loop_outcome() {
+        Some(LoopOutcome::ShowProjects { return_to }) => assert!(return_to.is_none()),
+        other => panic!("expected ShowProjects, got {other:?}"),
+    }
+}
+
+#[test]
+fn board_escape_clears_search_before_opening_projects() {
+    let (_dir, mut app) = app_with_board();
+    app.settings.escape_to_projects = true;
+    app.handle_key(key(KeyCode::Char('/'))).expect("search");
+    app.handle_key(key(KeyCode::Char('x'))).expect("query");
+    assert!(!app.search.text().is_empty());
+    app.handle_key(key(KeyCode::Esc)).expect("clear search");
+    assert!(app.search.text().is_empty());
+    assert_eq!(app.screen, Screen::Board);
+    assert!(app.take_loop_outcome().is_none());
+}
+
+#[test]
+fn settings_save_persists_escape_to_projects_checkbox() {
+    let (_dir, mut app) = settings_app();
+    assert!(!app.settings.escape_to_projects);
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().expect("settings modal");
+        modal.focus_field(DialogField::EscapeToProjects);
+        assert!(!modal.escape_to_projects);
+    }
+    app.handle_key(key(KeyCode::Char(' '))).expect("toggle");
+    assert!(
+        app.modal
+            .as_ref()
+            .expect("settings modal")
+            .escape_to_projects
+    );
+    app.handle_key(key(KeyCode::Tab)).expect("save");
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+
+    assert!(app.modal.is_none());
+    assert!(app.settings.escape_to_projects);
+    let config = app.ops.config.load().expect("cached saved config");
+    assert_eq!(
+        config
+            .tui
+            .get("escape_to_projects")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
 fn projects_delete_dialog_unregisters_by_default() {
     let work = std::path::PathBuf::from("/tmp/k4ai-snap-work");
     let _ = std::fs::remove_dir_all(&work);
@@ -4199,4 +4346,198 @@ fn projects_delete_dialog_unregisters_by_default() {
     assert!(rendered.contains("also delete board data"), "{rendered}");
     insta::assert_snapshot!("projects_delete", rendered);
     let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A limits snapshot pinned relative to `now` so the rendered countdowns are
+/// stable regardless of when the test runs.
+fn limits_fixture() -> std::sync::Arc<crate::core::limits::LimitsSnapshot> {
+    use crate::core::limits::{LimitWindow, LimitsSnapshot, ProviderLimits, ProviderState};
+
+    let now = chrono::Utc::now().timestamp();
+    let window = |label: &str, remaining: f64, resets_in: i64| LimitWindow {
+        label: label.to_string(),
+        remaining_percent: remaining,
+        resets_at: Some(now + resets_in),
+    };
+    std::sync::Arc::new(LimitsSnapshot {
+        fetched_at: now,
+        providers: vec![
+            ProviderLimits {
+                provider: "claude".to_string(),
+                state: ProviderState::Ready,
+                windows: vec![
+                    window("5h", 66.0, 3 * 3600 + 1830),
+                    window("7d", 95.0, 6 * 86_400 + 11 * 3600 + 30),
+                ],
+                observed_at: None,
+            },
+            ProviderLimits {
+                provider: "codex".to_string(),
+                state: ProviderState::Ready,
+                windows: vec![window("mon", 75.0, 18 * 86_400 + 3600)],
+                observed_at: Some(now - 7 * 86_400 - 3600),
+            },
+            ProviderLimits {
+                provider: "grok".to_string(),
+                state: ProviderState::SignedOut,
+                windows: Vec::new(),
+                observed_at: None,
+            },
+        ],
+    })
+}
+
+fn rendered_lines(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    render_at(app, width, height)
+        .split("\n\n--- style runs ---")
+        .next()
+        .expect("frame text")
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn limits_row_sits_above_the_status_bar_and_lists_every_provider() {
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(limits_fixture());
+
+    let lines = rendered_lines(&mut app, 120, 28);
+    let row = &lines[lines.len() - 2];
+    let status = &lines[lines.len() - 1];
+
+    assert!(
+        row.contains("✳ claude 5h 66% ↻3h30m · 7d 95% ↻6d11h"),
+        "{row}"
+    );
+    assert!(row.contains("✺ codex mon 75% ↻18d (7d old)"), "{row}");
+    assert!(row.contains("✕ grok signed out"), "{row}");
+    // The status bar keeps the last line, and the board keeps its columns.
+    assert!(status.contains("n new"), "{status}");
+    assert!(lines[0].contains("To Do"), "{}", lines[0]);
+    assert!(
+        lines.iter().any(|line| line.contains("Question card")),
+        "{lines:?}"
+    );
+}
+
+#[test]
+fn limits_row_drops_reset_times_then_names_as_the_terminal_narrows() {
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(limits_fixture());
+
+    let medium = rendered_lines(&mut app, 70, 20);
+    let medium_row = medium[medium.len() - 2].clone();
+    let narrow = rendered_lines(&mut app, 30, 20);
+    let narrow_row = narrow[narrow.len() - 2].clone();
+
+    assert!(
+        medium_row.contains("claude 5h 66% · 7d 95%"),
+        "{medium_row}"
+    );
+    assert!(!medium_row.contains('↻'), "{medium_row}");
+    // Too narrow even for names: icons and percentages only, and the providers
+    // that no longer fit are dropped from the right.
+    assert!(narrow_row.contains("✳ 66% · 95%"), "{narrow_row}");
+    assert!(!narrow_row.contains("claude"), "{narrow_row}");
+    assert!(!narrow_row.contains('✕'), "{narrow_row}");
+}
+
+#[test]
+fn limits_row_is_absent_without_a_snapshot_when_disabled_and_off_screen() {
+    let (_dir, mut app) = populated_app();
+
+    let bare = rendered_lines(&mut app, 120, 28);
+    assert!(!bare[bare.len() - 2].contains("claude"), "{bare:?}");
+    assert!(bare[bare.len() - 1].contains("n new"), "{bare:?}");
+
+    app.limits = Some(limits_fixture());
+    app.settings.show_limits = false;
+    let disabled = rendered_lines(&mut app, 120, 28);
+    assert!(
+        !disabled[disabled.len() - 2].contains("claude"),
+        "{disabled:?}"
+    );
+
+    app.settings.show_limits = true;
+    app.screen = Screen::Sessions;
+    let sessions = rendered_lines(&mut app, 120, 28);
+    assert!(
+        !sessions[sessions.len() - 2].contains("claude"),
+        "{sessions:?}"
+    );
+}
+
+#[test]
+fn limits_row_renders_on_the_projects_screen() {
+    let work = tempfile::tempdir().expect("work");
+    let (_store, mut app) = projects_app(work.path(), None);
+    app.limits = Some(limits_fixture());
+
+    let lines = rendered_lines(&mut app, 120, 24);
+    let row = &lines[lines.len() - 2];
+
+    assert_eq!(app.screen, Screen::Projects);
+    assert!(row.contains("✳ claude 5h 66%"), "{row}");
+    assert!(lines[lines.len() - 1].contains("Enter open"), "{lines:?}");
+}
+
+#[test]
+fn limits_row_registers_refresh_hitboxes_on_codex_and_grok_only() {
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(limits_fixture());
+
+    let lines = rendered_lines(&mut app, 120, 28);
+    let row_index = lines.len() - 2;
+    let row_y = row_index as u16;
+    let row_text = &lines[row_index];
+
+    let refresh_hit = |provider: &'static str| {
+        app.hitboxes.iter().find(|hitbox| {
+            hitbox.area.y == row_y
+                && hitbox.action == HitAction::Action(UiAction::RefreshLimits(provider))
+        })
+    };
+    let codex_hit = refresh_hit("codex").expect("codex hitbox");
+    let grok_hit = refresh_hit("grok").expect("grok hitbox");
+    assert!(
+        refresh_hit("claude").is_none(),
+        "claude's segment stays display-only"
+    );
+
+    // Each hitbox covers its provider's own text on the rendered row.
+    let covers = |hitbox: &super::app::Hitbox, text: &str| {
+        let byte = row_text.find(text).expect("provider text");
+        let column = unicode_width::UnicodeWidthStr::width(&row_text[..byte]) as u16;
+        hitbox.area.x <= column && column < hitbox.area.x + hitbox.area.width
+    };
+    assert!(covers(codex_hit, "codex"), "{codex_hit:?} vs {row_text}");
+    assert!(covers(grok_hit, "grok"), "{grok_hit:?} vs {row_text}");
+}
+
+#[test]
+fn clicking_codex_limits_segment_reports_a_refresh_in_the_status() {
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(limits_fixture());
+    let _ = render_at(&mut app, 120, 28);
+
+    let hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::RefreshLimits("codex")))
+        .copied()
+        .expect("codex hitbox");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: hit.area.x,
+        row: hit.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("click");
+
+    assert!(
+        app.status.contains("Refreshing codex limits"),
+        "{}",
+        app.status
+    );
 }

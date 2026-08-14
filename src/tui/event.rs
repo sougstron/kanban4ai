@@ -54,6 +54,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
 ) -> Result<LoopOutcome> {
     let _watcher = start_watcher(app.watch_root(), threads.tx.clone());
 
+    refresh_limits(app);
     terminal.draw(|frame| board::ui(frame, app))?;
     loop {
         if let Some(outcome) = app.take_loop_outcome() {
@@ -71,7 +72,10 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
                 spawn_debounce_timer(threads.tx.clone(), generation);
             }
             AppEvent::FsDebounced(generation) => app.reload_debounced_change(generation)?,
-            AppEvent::Tick => app.tick()?,
+            AppEvent::Tick => {
+                refresh_limits(app);
+                app.tick()?;
+            }
         }
         if let Some(text) = app.take_pending_copy() {
             app.finish_copy(super::image::copy_text(&text));
@@ -89,6 +93,19 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
         }
         terminal.draw(|frame| board::ui(frame, app))?;
     }
+}
+
+/// Keep the provider-limits row current. The fetch itself runs on its own
+/// thread and only starts when the cached snapshot has aged out, so ticking
+/// this every second costs nothing; it lives here rather than in `App::tick`
+/// so nothing outside a real terminal session ever polls a provider.
+fn refresh_limits(app: &mut App) {
+    if !app.settings.show_limits {
+        app.limits = None;
+        return;
+    }
+    crate::core::limits::refresh_if_stale(app.settings.limits_refresh_interval);
+    app.limits = crate::core::limits::cached();
 }
 
 fn handle_input(app: &mut App, input: CrosstermEvent) -> Result<()> {

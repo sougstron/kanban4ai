@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
@@ -21,6 +22,7 @@ use crate::agent::{
 use crate::core::config::BoardConfig;
 use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
+use crate::core::limits::LimitsSnapshot;
 use crate::core::models::{
     Message, MessageKind, MessageStatus, Session, SessionStatus, Task, TaskStatus,
 };
@@ -76,6 +78,11 @@ pub struct TuiSettings {
     pub refresh_interval: Duration,
     pub theme_name: String,
     pub task_sort: String,
+    pub escape_to_projects: bool,
+    /// Draw the provider subscription-limits row above the status bar.
+    pub show_limits: bool,
+    /// Seconds a limits snapshot stays fresh before a background refresh.
+    pub limits_refresh_interval: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +195,7 @@ pub enum UiAction {
     SetProjectPath,
     DeleteProject,
     CreateCwdProject,
+    RefreshLimits(&'static str),
 }
 
 /// Which detail panel receives keyboard input. `Thread` is the neutral state
@@ -335,6 +343,10 @@ pub struct App {
     /// keyed by task id and refreshed each tick for tasks with a running
     /// agent. Derived from the transcript; never persisted.
     pub session_progress: HashMap<String, SessionProgress>,
+    /// Provider subscription limits drawn above the status bar. Pulled from the
+    /// background-refreshed cache by the event loop, so rendering never reaches
+    /// for a global and non-TUI callers (tests) start with no row.
+    pub limits: Option<Arc<LimitsSnapshot>>,
     pub archived_tasks: Vec<Task>,
     pub archive_selected: usize,
     pub should_quit: bool,
@@ -549,6 +561,7 @@ impl App {
             active_sessions: Vec::new(),
             session_selected: 0,
             session_progress: HashMap::new(),
+            limits: None,
             archived_tasks,
             archive_selected: 0,
             should_quit: false,
@@ -636,6 +649,7 @@ impl App {
             active_sessions: Vec::new(),
             session_selected: 0,
             session_progress: HashMap::new(),
+            limits: None,
             archived_tasks: Vec::new(),
             archive_selected: 0,
             should_quit: false,
@@ -811,6 +825,11 @@ impl App {
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) if self.screen == Screen::Board && !self.search.text().is_empty() => {
                 self.clear_search();
+            }
+            (KeyCode::Esc, _)
+                if self.screen == Screen::Board && self.settings.escape_to_projects =>
+            {
+                self.dispatch(UiAction::OpenProjects)?
             }
             (KeyCode::Esc, _) if self.screen == Screen::Detail => self.close_detail()?,
             (KeyCode::Char('q'), _) => {
@@ -1263,8 +1282,20 @@ impl App {
             UiAction::SetProjectPath => self.open_set_path_dialog(),
             UiAction::DeleteProject => self.open_delete_project_dialog(),
             UiAction::CreateCwdProject => self.create_cwd_project()?,
+            UiAction::RefreshLimits(provider) => self.refresh_provider_limits(provider),
         }
         Ok(())
+    }
+
+    /// Limits-row click: refresh one provider through its own CLI on a
+    /// background thread; the row picks the merged snapshot up on the next
+    /// tick (see `core::limits::refresh_provider_async`).
+    fn refresh_provider_limits(&mut self, provider: &'static str) {
+        if crate::core::limits::refresh_provider_async(provider) {
+            self.status = format!("Refreshing {provider} limits…");
+        } else {
+            self.status = format!("{provider} limits are already refreshing");
+        }
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
@@ -2564,6 +2595,7 @@ impl App {
             normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
                 .to_string(),
         ]);
+        modal.escape_to_projects = tui_bool(&config.tui, "escape_to_projects", false);
         self.populate_settings_form_options(&mut modal);
         modal.capture_initial_values();
         self.modal = Some(modal);
@@ -3772,6 +3804,10 @@ impl App {
                         Value::String("task_sort".to_string()),
                         Value::String(task_sort.clone()),
                     );
+                    config.tui.insert(
+                        Value::String("escape_to_projects".to_string()),
+                        Value::Bool(modal.escape_to_projects),
+                    );
                     config.auto_launch.insert(
                         Value::String("default_agent".to_string()),
                         Value::String(backend.clone()),
@@ -3802,6 +3838,7 @@ impl App {
                 self.settings.project_name = project_name;
                 self.settings.theme_name = theme_name.clone();
                 self.settings.task_sort = task_sort;
+                self.settings.escape_to_projects = modal.escape_to_projects;
                 self.theme = Theme::named(&theme_name);
                 self.refresh_after_action()?;
                 self.status = "Project settings saved".to_string();
@@ -4311,6 +4348,8 @@ pub(super) fn normalize_command_key(mut key: KeyEvent) -> KeyEvent {
         'ь' | 'Ь' => 'm',
         'ч' | 'Ч' => 'x',
         'щ' | 'Щ' => 'o',
+        'з' => 'p',
+        'З' => 'P',
         '.' => '/',
         ',' => '?',
         _ => ch,
@@ -4517,6 +4556,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::Title
         | DialogField::Description
         | DialogField::Interactive
+        | DialogField::EscapeToProjects
         | DialogField::Answer
         | DialogField::Confirm
         | DialogField::Cancel
@@ -4587,6 +4627,9 @@ fn default_project_settings() -> TuiSettings {
         refresh_interval: Duration::from_secs(1),
         theme_name: "dark".to_string(),
         task_sort: TASK_SORT_NUMBER.to_string(),
+        escape_to_projects: false,
+        show_limits: true,
+        limits_refresh_interval: crate::core::limits::DEFAULT_REFRESH_INTERVAL,
     }
 }
 
@@ -4603,6 +4646,13 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
         theme_name: Theme::normalize_name(&tui_string(&config.tui, "theme", "dark")).to_string(),
         task_sort: normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
             .to_string(),
+        escape_to_projects: tui_bool(&config.tui, "escape_to_projects", false),
+        show_limits: tui_bool(&config.tui, "show_limits", true),
+        limits_refresh_interval: ops
+            .config
+            .get_threshold("limits_refresh_interval")
+            .unwrap_or(crate::core::limits::DEFAULT_REFRESH_INTERVAL)
+            .max(30),
     })
 }
 
@@ -4630,4 +4680,18 @@ fn tui_string(map: &Mapping, key: &str, default: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or(default)
         .to_string()
+}
+
+fn tui_bool(map: &Mapping, key: &str, default: bool) -> bool {
+    map.get(Value::String(key.to_string()))
+        .and_then(|value| match value {
+            Value::Bool(flag) => Some(*flag),
+            Value::String(text) => match text.to_lowercase().as_str() {
+                "true" | "yes" | "1" => Some(true),
+                "false" | "no" | "0" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(default)
 }

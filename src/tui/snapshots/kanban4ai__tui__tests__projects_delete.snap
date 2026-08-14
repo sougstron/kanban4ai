@@ -3,7 +3,7 @@ source: src/tui/tests.rs
 expression: rendered
 ---
 ┌ Projects · Enter open · n new · r rename · p path · d delete · / filter · q quit ────────────┐
-│Demo Board           /tmp/k4ai-snap-work                                       1/1/0/0  never │
+│Demo Board           1/1/0/0 /tmp/k4ai-snap-work                                        never │
 │                                                                                              │
 │                                                                                              │
 │             ┌ Remove project ──────────────────────────────────────────────────┐             │

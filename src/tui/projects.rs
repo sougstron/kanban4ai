@@ -129,7 +129,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(index, item)| {
-            let line = item_line(app, item, area.width.saturating_sub(4));
+            let line = item_line(app, item, area.width.saturating_sub(3));
             if matches!(item, ProjectListItem::CreateCwd { .. }) {
                 app.hitboxes.push(Hitbox {
                     area: row_area(area, index, items.len()),
@@ -190,7 +190,7 @@ fn project_line(app: &App, row: &ProjectRow, width: u16) -> Line<'static> {
     let sessions = if row.counts.sessions == 0 {
         String::new()
     } else {
-        format!("  ▶{}", row.counts.sessions)
+        format!("▶{} ", row.counts.sessions)
     };
     let opened = format!("  {}", format_opened(row.project.last_opened_at));
     let path_style = if row.missing {
@@ -201,28 +201,24 @@ fn project_line(app: &App, row: &ProjectRow, width: u16) -> Line<'static> {
         Style::default().fg(app.theme.muted)
     };
     let unseen = row.counts.review_unseen > 0;
-    let prefix_width = if unseen { 2 } else { 0 };
+    let prefix_width: usize = if unseen { 2 } else { 0 };
     let path_width = (width as usize)
-        .saturating_sub(
-            name.len()
-                .saturating_add(counts.len())
-                .saturating_add(18 + prefix_width),
-        )
+        .saturating_sub(prefix_width + 21 + counts.len() + 1 + sessions.len() + opened.len())
         .max(8);
     let mut spans = Vec::new();
     if unseen {
         spans.push(Span::styled("● ", Style::default().fg(app.theme.warn)));
     }
     spans.push(Span::raw(format!("{:<20} ", truncate_display(&name, 20))));
+    spans.push(Span::raw(format!("{counts} ")));
+    spans.push(Span::styled(sessions, Style::default().fg(app.theme.ok)));
     spans.push(Span::styled(
         format!(
-            "{:<path_width$} ",
+            "{:<path_width$}",
             truncate_display(&sanitize_terminal_text(&path), path_width)
         ),
         path_style,
     ));
-    spans.push(Span::raw(counts));
-    spans.push(Span::styled(sessions, Style::default().fg(app.theme.ok)));
     spans.push(Span::styled(opened, Style::default().fg(app.theme.muted)));
     Line::from(spans)
 }

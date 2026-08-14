@@ -9,7 +9,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, HitAction, Hitbox, Screen, UiAction};
 use super::card::{sanitize_terminal_text, truncate_display};
-use super::{card, detail, dialogs, projects, search, sessions};
+use super::{card, detail, dialogs, limits, projects, search, sessions};
 
 pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
@@ -20,9 +20,16 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(Clear, area);
     // Renderers re-register their regions on every frame.
     app.hitboxes.clear();
+    // Content, the optional provider-limits row, then the status bar. The
+    // limits row is zero-height (and skipped) until a snapshot exists, so the
+    // layout is unchanged on screens and runs that have no limits to show.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(limits::row_height(app)),
+            Constraint::Length(1),
+        ])
         .split(area);
     match app.screen {
         Screen::Board => render_board(frame, app, chunks[0]),
@@ -51,7 +58,8 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
         app.hitboxes.splice(0..0, modal_hits);
         app.modal = Some(modal);
     }
-    render_status(frame, app, chunks[1]);
+    limits::render(frame, app, chunks[1]);
+    render_status(frame, app, chunks[2]);
     app.capture_and_highlight(frame.buffer_mut());
 }
 
@@ -512,7 +520,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  a/l: archive and sessions views"),
         Line::from("  /: search · Esc clears an active filter"),
         Line::from("  s: project settings · Ctrl+T: cycle and persist theme"),
-        Line::from("  P: projects list"),
+        Line::from("  P: projects list (also З on a Russian layout)"),
+        Line::from("  Esc: projects list when enabled in settings"),
         Line::from(""),
         Line::from("Detail"),
         Line::from("  Tab: cycle thread/answer/editor panels when present"),
@@ -546,6 +555,11 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  drag a card onto another column: move it (target column"),
         Line::from("    highlights green; status bar shows what moves where)"),
         Line::from("  status-bar hints are clickable; column headers show name and count"),
+        Line::from(""),
+        Line::from("Provider limits (row above the status bar, Board and Projects)"),
+        Line::from("  ✳ claude · ✺ codex · ✕ grok: % of each window left, ↻ time to reset"),
+        Line::from("  refreshed in the background; codex shows the age of its last session"),
+        Line::from("  hide the row with tui.show_limits: false · kanban limits prints it"),
         Line::from(""),
         Line::from("?: toggle help · q/Esc: back · Ctrl+C twice: quit"),
     ]

@@ -20,6 +20,7 @@ use crate::core::compaction::{CompactionManager, CompactionStatus};
 use crate::core::config::Config;
 use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
+use crate::core::limits;
 use crate::core::models::Task;
 use crate::core::operations::{AgentExitOutcome, Operations, QuestionRef, TaskPatch};
 use crate::core::session::{SessionManager, estimate_session_tokens};
@@ -288,6 +289,15 @@ enum Command {
     Recover { task_id: String },
     /// List active sessions.
     Sessions,
+    /// Show remaining subscription limits for the agent providers (claude, codex, grok).
+    Limits {
+        /// Output format
+        #[arg(long = "format", value_parser = ["table", "json"], default_value = "table")]
+        output_format: String,
+        /// Poll the providers even when the cached snapshot is still fresh
+        #[arg(long)]
+        refresh: bool,
+    },
     /// Launch the TUI kanban board.
     Tui,
     /// Attach to a running agent session for a task.
@@ -376,6 +386,63 @@ fn launch_tui(selector: Option<&str>) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `kanban limits`: remaining subscription capacity per provider. Reuses the
+/// snapshot the TUI caches unless it is stale (or `--refresh` is given), so
+/// repeated calls do not re-poll the providers.
+fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
+    let snapshot = match limits::cached() {
+        Some(snapshot)
+            if !refresh
+                && snapshot.age(chrono::Utc::now().timestamp())
+                    < limits::DEFAULT_REFRESH_INTERVAL =>
+        {
+            snapshot
+        }
+        _ => limits::refresh_blocking(),
+    };
+    if output_format == "json" {
+        let json = serde_json::to_string_pretty(snapshot.as_ref())
+            .map_err(|err| KanbanError::Invalid(format!("cannot serialize limits: {err}")))?;
+        println!("{json}");
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    for provider in limits::PROVIDERS {
+        let Some(entry) = snapshot.get(provider) else {
+            continue;
+        };
+        let note = match &entry.state {
+            limits::ProviderState::Ready => None,
+            limits::ProviderState::NotConfigured => Some("not configured".to_string()),
+            limits::ProviderState::SignedOut => Some("signed out".to_string()),
+            limits::ProviderState::Unavailable(reason) => Some(reason.clone()),
+        };
+        if let Some(note) = note {
+            println!("{provider:<8} {note}");
+            continue;
+        }
+        let age = entry
+            .data_age(now)
+            .filter(|age| *age >= 60)
+            .map(|age| format!("  (from a session {} ago)", limits::format_span(age)))
+            .unwrap_or_default();
+        for (index, window) in entry.windows.iter().enumerate() {
+            let name = if index == 0 { provider } else { "" };
+            let reset = window
+                .resets_in(now)
+                .map(|seconds| format!("resets in {}", limits::format_span(seconds)))
+                .unwrap_or_else(|| "reset unknown".to_string());
+            println!(
+                "{name:<8} {:<4}{:>4.0}% left  {reset}{}",
+                window.label,
+                window.remaining_percent,
+                if index == 0 { age.as_str() } else { "" }
+            );
+        }
+    }
+    Ok(())
+}
+
 fn dispatch(cli: Cli) -> Result<ExitCode> {
     let command = cli.command.unwrap_or(Command::Tui);
     match command {
@@ -387,6 +454,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Command::FormatStream => {
             format_stream(std::io::stdin().lock(), &mut std::io::stdout().lock())?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::Limits {
+            output_format,
+            refresh,
+        } => {
+            print_limits(&output_format, refresh)?;
             return Ok(ExitCode::SUCCESS);
         }
         Command::Tui => return launch_tui(cli.project.as_deref()),
@@ -832,7 +906,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 );
             }
         }
-        Command::Tui => unreachable!("handled before resolve"),
+        Command::Tui | Command::Limits { .. } => unreachable!("handled before resolve"),
         Command::Attach { task_id } => {
             let Some(task) = ops.storage.load_task(&task_id)? else {
                 eprintln!("Task {task_id} not found");
