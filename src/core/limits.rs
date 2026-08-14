@@ -5,15 +5,35 @@
 //! provider that is not installed, not signed in, or unreachable degrades to a
 //! note instead of an error:
 //!
-//! - **claude**: `GET /api/oauth/usage` on the Anthropic API with the OAuth
-//!   access token from `~/.claude/.credentials.json`. Reports a 5-hour session
-//!   window and a 7-day window.
+//! - **claude**: the statusline bridge — Claude Code (>= 2.1.80) pipes
+//!   `rate_limits` to its statusLine command on every turn, so a small shim
+//!   (installed by `kanban limits bridge install`) records them to
+//!   `<store>/claude-rate-limits.json` without spending any API budget. While
+//!   the bridge holds current windows the usage endpoint is not polled at
+//!   all. Fallback: `GET /api/oauth/usage` on the Anthropic API with the OAuth
+//!   access token from `~/.claude/.credentials.json`, which reports a 5-hour
+//!   session window and a 7-day window — but the endpoint is rate-limited to
+//!   a handful of requests per access token and 429s for hours, so it is only
+//!   a fallback.
 //! - **codex**: no network at all. The newest `rollout-*.jsonl` under
 //!   `~/.codex/sessions/` carries the `rate_limits` payload the server last
 //!   sent, so the numbers are exactly as fresh as the last codex run — the age
 //!   is surfaced with the value.
 //! - **grok**: `GET /v1/billing` on the grok CLI proxy with the OIDC key from
 //!   `~/.grok/auth.json`. Reports credit usage for the current billing period.
+//! - **zai**: `GET /api/monitor/usage/quota/limit` on `api.z.ai` with the API
+//!   key opencode stores for the GLM Coding Plan
+//!   (`~/.local/share/opencode/auth.json`, `zai-coding-plan.key`). Reports a
+//!   5-hour and a weekly credit window; percentages come from
+//!   `currentValue`/`usage` with the integer `percentage` as fallback.
+//! - **synthetic**: `GET /v2/quotas` on api.synthetic.new (documented as free —
+//!   it never counts against the subscription). The key is `$SYNTHETIC_API_KEY`
+//!   or the `synthetic.key` entry opencode's connect flow stores. Reports the
+//!   rolling five-hour request window (`rollingFiveHourLimit` remaining/max,
+//!   falling back to `subscription` requests/limit, rolling over at
+//!   `subscription.renewsAt`) and the weekly credit window
+//!   (`weeklyTokenLimit.percentRemaining`); both regenerate in small ticks, so
+//!   the reset time is the next capacity gain, not a hard rollover.
 //!
 //! HTTPS is done by piping a config file into `curl -K -` rather than by
 //! linking a TLS stack: it keeps the dependency set unchanged, and it keeps
@@ -21,7 +41,9 @@
 //!
 //! Results are cached in memory and in `<store>/limits.json` so restarts and
 //! repeated CLI calls do not re-poll the providers — the claude endpoint is
-//! documented to rate-limit polling callers.
+//! documented to rate-limit polling callers. A 429 keeps the last good Claude
+//! windows (so the row does not flip to n/a) and doubles the snapshot TTL
+//! before the next background poll, capped at 64×.
 //!
 //! Clicking a provider segment in the TUI limits row can also refresh that
 //! provider through its own CLI (see [`refresh_provider_async`]): codex is
@@ -34,7 +56,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -48,7 +70,7 @@ use crate::core::project::store_root;
 use crate::core::storage::atomic_write_text;
 
 /// Providers rendered on the board, in display order.
-pub const PROVIDERS: [&str; 3] = ["claude", "codex", "grok"];
+pub const PROVIDERS: [&str; 5] = ["claude", "codex", "grok", "zai", "synthetic"];
 
 /// Fallback refresh interval when no board config is available (the projects
 /// screen has no project, so no `.kanban/config.yaml` to read).
@@ -294,12 +316,188 @@ fn fetch_claude() -> ProviderLimits {
             } else {
                 ProviderLimits {
                     windows,
+                    observed_at: Some(now_secs()),
                     ..ProviderLimits::new("claude", ProviderState::Ready)
                 }
             }
         }
         Err(err) => ProviderLimits::new("claude", err.into_state()),
     }
+}
+
+/// Consecutive Claude usage-endpoint 429s. Each one doubles the wait before
+/// the next background poll; a successful / signed-out / unconfigured fetch
+/// resets it. Not persisted — a restart is allowed one extra probe.
+static CLAUDE_429_STREAK: AtomicU32 = AtomicU32::new(0);
+
+/// Cap on TTL doublings after 429s (120s × 64 ≈ 2.1h).
+const CLAUDE_429_BACKOFF_CAP: u32 = 6;
+
+/// How long the TUI should wait before the next background poll after
+/// `consecutive_429s` Claude usage-endpoint 429s.
+const fn next_backoff_ttl(base_ttl: i64, consecutive_429s: u32) -> i64 {
+    let base = if base_ttl < 1 { 1 } else { base_ttl };
+    let shift = if consecutive_429s > CLAUDE_429_BACKOFF_CAP {
+        CLAUDE_429_BACKOFF_CAP
+    } else {
+        consecutive_429s
+    };
+    base.saturating_mul(1_i64 << shift)
+}
+
+fn is_http_429(state: &ProviderState) -> bool {
+    matches!(state, ProviderState::Unavailable(message) if message == "HTTP 429")
+}
+
+/// Keep the last good Claude windows when the usage endpoint 429s, so the
+/// row does not flip to n/a. The bool is whether this response was a 429
+/// (the caller doubles the poll TTL).
+fn apply_claude_429_policy(
+    previous: Option<&ProviderLimits>,
+    fresh: ProviderLimits,
+) -> (ProviderLimits, bool) {
+    if !is_http_429(&fresh.state) {
+        return (fresh, false);
+    }
+    match previous {
+        Some(previous) if previous.is_ready() => (previous.clone(), true),
+        _ => (fresh, true),
+    }
+}
+
+fn resolve_claude(previous: Option<&LimitsSnapshot>) -> ProviderLimits {
+    let previous_entry = previous.and_then(|snapshot| snapshot.get("claude"));
+    let now = now_secs();
+    // A current bridge answers without touching the usage endpoint: its
+    // per-access-token budget is a handful of requests, so polling is what
+    // kept this row 429ing in the first place.
+    if let Some(bridge) = read_claude_bridge().filter(|bridge| claude_bridge_current(bridge, now)) {
+        CLAUDE_429_STREAK.store(0, Ordering::SeqCst);
+        return bridge;
+    }
+    let (resolved, hit_429) = apply_claude_429_policy(previous_entry, fetch_claude());
+    if hit_429 {
+        CLAUDE_429_STREAK.fetch_add(1, Ordering::SeqCst);
+    } else if matches!(
+        resolved.state,
+        ProviderState::Ready | ProviderState::SignedOut | ProviderState::NotConfigured
+    ) {
+        CLAUDE_429_STREAK.store(0, Ordering::SeqCst);
+    }
+    prefer_claude_source(read_claude_bridge(), resolved)
+}
+
+/// Stale bridge windows still beat an endpoint that refuses to answer; when
+/// both hold windows, the fresher observation wins.
+fn prefer_claude_source(bridge: Option<ProviderLimits>, http: ProviderLimits) -> ProviderLimits {
+    let Some(bridge) = bridge else {
+        return http;
+    };
+    if !http.is_ready() || bridge.observed_at.unwrap_or(0) > http.observed_at.unwrap_or(0) {
+        return bridge;
+    }
+    http
+}
+
+// ---------------------------------------------------------------------------
+// claude statusline bridge
+// ---------------------------------------------------------------------------
+
+/// How long bridge windows stay trusted after their last statusline tick when
+/// no window still has a future reset time.
+const CLAUDE_BRIDGE_GRACE_SECS: i64 = 1800;
+
+/// Shape of `<store>/claude-rate-limits.json`, written by the hidden
+/// `kanban statusline-bridge` command and read by [`read_claude_bridge`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ClaudeBridgeFile {
+    updated_at: i64,
+    windows: Vec<LimitWindow>,
+}
+
+/// The machine-wide bridge file, next to the snapshot cache.
+fn claude_bridge_path() -> Option<PathBuf> {
+    store_root()
+        .ok()
+        .map(|root| root.join("claude-rate-limits.json"))
+}
+
+/// Read the `rate_limits` object Claude Code (>= 2.1.80) pipes to statusline
+/// commands on every turn: `five_hour` / `seven_day` carry `used_percentage`
+/// (0-100) and `resets_at` as Unix seconds. The OAuth usage response's
+/// spellings (`utilization`, RFC 3339 `resets_at`) are tolerated so a field
+/// rename degrades instead of going dark. Per-model `seven_day_*` buckets are
+/// ignored — the row lists the account-level windows only.
+pub fn parse_claude_statusline(value: &Value) -> Vec<LimitWindow> {
+    let Some(limits) = value.get("rate_limits") else {
+        return Vec::new();
+    };
+    [("five_hour", "5h"), ("seven_day", "7d")]
+        .into_iter()
+        .filter_map(|(key, label)| {
+            let window = limits.get(key)?;
+            let used = window
+                .get("used_percentage")
+                .and_then(Value::as_f64)
+                .or_else(|| window.get("utilization").and_then(Value::as_f64))?;
+            let resets_at = window
+                .get("resets_at")
+                .and_then(|at| match at {
+                    Value::Number(_) => at.as_i64(),
+                    Value::String(text) => parse_rfc3339(text),
+                    _ => None,
+                })
+                .filter(|at| *at > 0);
+            Some(LimitWindow::new(label, used, resets_at))
+        })
+        .collect()
+}
+
+/// Record fresh windows from the statusline shim. Best effort by design: a
+/// failure here must never break the statusline that called in.
+pub fn store_claude_bridge(windows: &[LimitWindow]) -> bool {
+    let Some(path) = claude_bridge_path() else {
+        return false;
+    };
+    if windows.is_empty() {
+        return false;
+    }
+    if fs::create_dir_all(path.parent().unwrap_or(Path::new("/"))).is_err() {
+        return false;
+    }
+    let file = ClaudeBridgeFile {
+        updated_at: now_secs(),
+        windows: windows.to_vec(),
+    };
+    let Ok(text) = serde_json::to_string(&file) else {
+        return false;
+    };
+    atomic_write_text(&path, &text).is_ok()
+}
+
+/// The recorded statusline bridge windows, when any exist. `observed_at`
+/// carries the last statusline tick so the row can age the numbers honestly.
+fn read_claude_bridge() -> Option<ProviderLimits> {
+    let text = fs::read_to_string(claude_bridge_path()?).ok()?;
+    let file: ClaudeBridgeFile = serde_json::from_str(&text).ok()?;
+    if file.updated_at <= 0 || file.windows.is_empty() {
+        return None;
+    }
+    Some(ProviderLimits {
+        observed_at: Some(file.updated_at),
+        windows: file.windows,
+        ..ProviderLimits::new("claude", ProviderState::Ready)
+    })
+}
+
+/// Bridge windows are current while any window has yet to reset; unknown or
+/// already-past resets get a grace period after the last statusline tick.
+fn claude_bridge_current(bridge: &ProviderLimits, now: i64) -> bool {
+    bridge
+        .windows
+        .iter()
+        .any(|window| window.resets_in(now).is_some())
+        || now.saturating_sub(bridge.observed_at.unwrap_or(0)) < CLAUDE_BRIDGE_GRACE_SECS
 }
 
 /// Read the `five_hour` / `seven_day` objects of the OAuth usage response.
@@ -578,6 +776,230 @@ fn grok_period_label(period_type: &str) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// zai
+// ---------------------------------------------------------------------------
+
+const ZAI_QUOTA_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
+
+/// opencode's credential store, shared by the providers connected through it.
+fn opencode_auth_path() -> Option<PathBuf> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| home_dir().map(|home| home.join(".local").join("share")))?;
+    Some(data.join("opencode").join("auth.json"))
+}
+
+/// The GLM Coding Plan API key from opencode's credential store. An auth.json
+/// without a `zai-coding-plan` entry simply has no plan here.
+fn zai_api_key(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let key = value
+        .get("zai-coding-plan")?
+        .get("key")?
+        .as_str()?
+        .to_string();
+    (!key.is_empty()).then_some(key)
+}
+
+fn fetch_zai() -> ProviderLimits {
+    let Some(path) = opencode_auth_path().filter(|path| path.exists()) else {
+        return ProviderLimits::new("zai", ProviderState::NotConfigured);
+    };
+    let Some(key) = zai_api_key(&path) else {
+        return ProviderLimits::new("zai", ProviderState::NotConfigured);
+    };
+    let headers = [
+        ("Authorization", format!("Bearer {key}")),
+        ("Accept", "application/json".to_string()),
+    ];
+    match http_get_json(ZAI_QUOTA_URL, &headers) {
+        Ok(value) => {
+            let windows = parse_zai_quota(&value);
+            if windows.is_empty() {
+                ProviderLimits::new("zai", ProviderState::Unavailable("no quota".to_string()))
+            } else {
+                ProviderLimits {
+                    windows,
+                    ..ProviderLimits::new("zai", ProviderState::Ready)
+                }
+            }
+        }
+        Err(err) => ProviderLimits::new("zai", err.into_state()),
+    }
+}
+
+/// Window length of one z.ai limit entry in minutes. `unit` is the API's time
+/// unit enum (day/hour/minute/week); the `TIME_LIMIT` pair `(unit 5, number 1)`
+/// is a sentinel meaning the monthly MCP allowance, not a real 1-minute window.
+fn zai_window_minutes(limit: &Value) -> i64 {
+    let number = limit
+        .get("number")
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        .max(0);
+    let unit = limit.get("unit").and_then(Value::as_i64).unwrap_or(0);
+    if limit.get("type").and_then(Value::as_str) == Some("TIME_LIMIT") && unit == 5 && number == 1 {
+        return 43_200;
+    }
+    let per_unit = match unit {
+        1 => 1_440,
+        3 => 60,
+        5 => 1,
+        6 => 10_080,
+        _ => 0,
+    };
+    number.saturating_mul(per_unit)
+}
+
+/// Used percentage of one z.ai limit entry: `currentValue / usage` is exact,
+/// the integer `percentage` is the rounded fallback.
+fn zai_used_percent(limit: &Value) -> Option<f64> {
+    if let Some(total) = limit
+        .get("usage")
+        .and_then(Value::as_f64)
+        .filter(|t| *t > 0.0)
+    {
+        let used = limit
+            .get("currentValue")
+            .and_then(Value::as_f64)
+            .or_else(|| {
+                limit
+                    .get("remaining")
+                    .and_then(Value::as_f64)
+                    .map(|remaining| (total - remaining).max(0.0))
+            });
+        if let Some(used) = used {
+            return Some(used / total * 100.0);
+        }
+    }
+    limit.get("percentage").and_then(Value::as_f64)
+}
+
+/// Read the z.ai quota response: one window per `data.limits[]` entry that
+/// carries a usage percentage, labelled by its window length. `nextResetTime`
+/// is Unix milliseconds.
+pub fn parse_zai_quota(value: &Value) -> Vec<LimitWindow> {
+    let Some(limits) = value.get("data").and_then(|data| data.get("limits")) else {
+        return Vec::new();
+    };
+    limits
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|limit| {
+            let used = zai_used_percent(limit)?;
+            let resets_at = limit
+                .get("nextResetTime")
+                .and_then(Value::as_i64)
+                .filter(|millis| *millis > 0)
+                .map(|millis| millis / 1000);
+            Some(LimitWindow::new(
+                window_label(zai_window_minutes(limit)),
+                used,
+                resets_at,
+            ))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// synthetic
+// ---------------------------------------------------------------------------
+
+const SYNTHETIC_QUOTAS_URL: &str = "https://api.synthetic.new/v2/quotas";
+
+/// The synthetic API key from opencode's credential store, written by its
+/// connect flow. An auth.json without the entry simply has no synthetic
+/// subscription here; `$SYNTHETIC_API_KEY` is honored first in
+/// `fetch_synthetic`.
+fn synthetic_key_from_store(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let key = value.get("synthetic")?.get("key")?.as_str()?.to_string();
+    (!key.is_empty()).then_some(key)
+}
+
+fn fetch_synthetic() -> ProviderLimits {
+    let Some(key) = std::env::var_os("SYNTHETIC_API_KEY")
+        .filter(|key| !key.is_empty())
+        .map(|key| key.to_string_lossy().to_string())
+        .or_else(|| {
+            opencode_auth_path()
+                .filter(|path| path.exists())
+                .and_then(|path| synthetic_key_from_store(&path))
+        })
+    else {
+        return ProviderLimits::new("synthetic", ProviderState::NotConfigured);
+    };
+    let headers = [
+        ("Authorization", format!("Bearer {key}")),
+        ("Accept", "application/json".to_string()),
+    ];
+    match http_get_json(SYNTHETIC_QUOTAS_URL, &headers) {
+        Ok(value) => {
+            let windows = parse_synthetic_quotas(&value);
+            if windows.is_empty() {
+                ProviderLimits::new(
+                    "synthetic",
+                    ProviderState::Unavailable("no quota".to_string()),
+                )
+            } else {
+                ProviderLimits {
+                    windows,
+                    ..ProviderLimits::new("synthetic", ProviderState::Ready)
+                }
+            }
+        }
+        Err(err) => ProviderLimits::new("synthetic", err.into_state()),
+    }
+}
+
+/// Read the quotas response: the five-hour request window — the rolling
+/// regeneration state is the live number, `subscription` requests/limit the
+/// fallback, its `renewsAt` the window rollover — and the weekly credit
+/// window from `percentRemaining`, regenerating at `nextRegenAt`.
+pub fn parse_synthetic_quotas(value: &Value) -> Vec<LimitWindow> {
+    let mut windows = Vec::new();
+    let subscription = value.get("subscription");
+    let used = value
+        .get("rollingFiveHourLimit")
+        .and_then(|rolling| {
+            let max = rolling.get("max")?.as_f64()?;
+            let remaining = rolling.get("remaining")?.as_f64()?;
+            (max > 0.0).then(|| 100.0 - remaining / max * 100.0)
+        })
+        .or_else(|| {
+            let limit = subscription?.get("limit")?.as_f64()?;
+            let requests = subscription?
+                .get("requests")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0);
+            (limit > 0.0).then(|| requests / limit * 100.0)
+        });
+    if let Some(used) = used {
+        let resets_at = subscription
+            .and_then(|subscription| subscription.get("renewsAt"))
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339);
+        windows.push(LimitWindow::new("5h", used, resets_at));
+    }
+    let weekly = value.get("weeklyTokenLimit");
+    if let Some(remaining) = weekly
+        .and_then(|weekly| weekly.get("percentRemaining"))
+        .and_then(Value::as_f64)
+    {
+        let resets_at = weekly
+            .and_then(|weekly| weekly.get("nextRegenAt"))
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339);
+        windows.push(LimitWindow::new("7d", 100.0 - remaining, resets_at));
+    }
+    windows
+}
+
+// ---------------------------------------------------------------------------
 // CLI-driven refresh (TUI limits-row click)
 // ---------------------------------------------------------------------------
 
@@ -767,7 +1189,7 @@ pub fn refresh_provider_now(provider: &str) {
             let _ = refresh_grok_cli();
             fetch_grok()
         }
-        "claude" => fetch_claude(),
+        "claude" => resolve_claude(cached().as_deref()),
         _ => return,
     };
     let mut providers = cached()
@@ -814,9 +1236,16 @@ pub fn refresh_provider_async(provider: &'static str) -> bool {
 
 /// Poll every provider. Blocking: callers on a UI path use [`refresh_if_stale`].
 pub fn fetch_all() -> LimitsSnapshot {
+    let previous = cached();
     LimitsSnapshot {
         fetched_at: now_secs(),
-        providers: vec![fetch_claude(), fetch_codex(), fetch_grok()],
+        providers: vec![
+            resolve_claude(previous.as_deref()),
+            fetch_codex(),
+            fetch_grok(),
+            fetch_zai(),
+            fetch_synthetic(),
+        ],
     }
 }
 
@@ -874,7 +1303,7 @@ pub fn refresh_blocking() -> Arc<LimitsSnapshot> {
 /// seconds. At most one fetch is in flight; the caller never blocks and keeps
 /// drawing the previous snapshot until the new one lands.
 pub fn refresh_if_stale(ttl: i64) {
-    let ttl = ttl.max(1);
+    let ttl = next_backoff_ttl(ttl, CLAUDE_429_STREAK.load(Ordering::SeqCst)).max(1);
     if cached().is_some_and(|snapshot| snapshot.age(now_secs()) < ttl) {
         return;
     }
@@ -989,6 +1418,178 @@ mod tests {
     }
 
     #[test]
+    fn zai_quota_maps_credit_windows() {
+        let value: Value = serde_json::from_str(
+            r#"{"code":200,"msg":"Operation successful","data":{"limits":[
+                {"type":"CREDIT_LIMIT","unit":3,"number":5,"usage":2000,"currentValue":115,"remaining":1884,"percentage":5,"nextResetTime":1786725207626},
+                {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":10000,"currentValue":115,"remaining":9884,"percentage":1,"nextResetTime":1787311039997}],"level":"lite"},"success":true}"#,
+        )
+        .unwrap();
+
+        let windows = parse_zai_quota(&value);
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].remaining_percent, 94.25);
+        assert_eq!(windows[0].resets_at, Some(1_786_725_207));
+        assert_eq!(windows[1].label, "7d");
+        assert_eq!(windows[1].remaining_percent, 98.85);
+        assert_eq!(windows[1].resets_at, Some(1_787_311_039));
+    }
+
+    #[test]
+    fn zai_quota_falls_back_to_percentage_and_remaining() {
+        let value: Value = serde_json::from_str(
+            r#"{"data":{"limits":[
+                {"type":"TOKENS_LIMIT","unit":3,"number":5,"percentage":34,"nextResetTime":0},
+                {"type":"CREDIT_LIMIT","unit":6,"number":1,"usage":10000,"remaining":2500}]}}"#,
+        )
+        .unwrap();
+
+        let windows = parse_zai_quota(&value);
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].remaining_percent, 66.0);
+        assert_eq!(windows[0].resets_at, None);
+        assert_eq!(windows[1].remaining_percent, 25.0);
+    }
+
+    #[test]
+    fn zai_quota_marks_the_monthly_mcp_sentinel_and_skips_empty_entries() {
+        let value: Value = serde_json::from_str(
+            r#"{"data":{"limits":[
+                {"type":"TIME_LIMIT","unit":5,"number":1,"usage":1000,"currentValue":50,"percentage":5},
+                {"type":"TIME_LIMIT","unit":2,"number":1,"percentage":10},
+                {"type":"CREDIT_LIMIT","unit":3,"number":5}]}}"#,
+        )
+        .unwrap();
+
+        let windows = parse_zai_quota(&value);
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "mon");
+        assert_eq!(windows[0].remaining_percent, 95.0);
+        assert_eq!(windows[1].label, "window");
+        assert_eq!(windows[1].remaining_percent, 90.0);
+    }
+
+    #[test]
+    fn zai_quota_without_limits_is_empty() {
+        let value: Value =
+            serde_json::from_str(r#"{"code":200,"success":true,"data":{}}"#).unwrap();
+
+        assert!(parse_zai_quota(&value).is_empty());
+        let error: Value =
+            serde_json::from_str(r#"{"code":1001,"msg":"unauthorized","success":false}"#).unwrap();
+        assert!(parse_zai_quota(&error).is_empty());
+    }
+
+    #[test]
+    fn zai_key_is_read_from_the_opencode_auth_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{"openai":{"type":"oauth"},"zai-coding-plan":{"type":"api","key":"e21665353cfd"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(zai_api_key(&path), Some("e21665353cfd".to_string()));
+
+        fs::write(&path, r#"{"openai":{"type":"oauth"}}"#).unwrap();
+        assert_eq!(zai_api_key(&path), None);
+        assert!(zai_api_key(&dir.path().join("nope.json")).is_none());
+    }
+
+    #[test]
+    fn synthetic_quota_maps_both_windows() {
+        let value: Value = serde_json::from_str(
+            r#"{"subscription":{"limit":500,"requests":0,"renewsAt":"2026-08-14T16:51:44.399Z"},
+                "search":{"hourly":{"limit":250,"requests":0,"renewsAt":"2026-08-14T12:51:44.400Z"}},
+                "freeToolCalls":{"limit":0,"requests":0,"renewsAt":"2026-08-15T11:51:44.402Z"},
+                "weeklyTokenLimit":{"nextRegenAt":"2026-08-14T12:10:54.000Z","percentRemaining":0,"maxCredits":"$24.00","remainingCredits":"$0.00","nextRegenCredits":"$0.48"},
+                "rollingFiveHourLimit":{"nextTickAt":"2026-08-14T12:06:36.000Z","tickPercent":0.05,"remaining":455,"max":500,"limited":false}}"#,
+        )
+        .unwrap();
+
+        let windows = parse_synthetic_quotas(&value);
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].remaining_percent, 91.0);
+        assert_eq!(windows[0].resets_at, Some(1_786_726_304));
+        assert_eq!(windows[1].label, "7d");
+        assert_eq!(windows[1].remaining_percent, 0.0);
+        assert_eq!(windows[1].resets_at, Some(1_786_709_454));
+    }
+
+    #[test]
+    fn synthetic_quota_falls_back_to_the_subscription_block() {
+        let value: Value = serde_json::from_str(
+            r#"{"subscription":{"limit":135,"requests":27,"renewsAt":"2025-09-21T14:36:14.288Z"}}"#,
+        )
+        .unwrap();
+
+        let windows = parse_synthetic_quotas(&value);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].remaining_percent, 80.0);
+        assert_eq!(windows[0].resets_at, Some(1_758_465_374));
+    }
+
+    #[test]
+    fn synthetic_quota_reports_the_weekly_window_alone() {
+        let value: Value = serde_json::from_str(
+            r#"{"weeklyTokenLimit":{"percentRemaining":52.5,"nextRegenAt":"2026-08-20T00:00:00Z"},
+                "rollingFiveHourLimit":{"remaining":500,"max":0}}"#,
+        )
+        .unwrap();
+
+        let windows = parse_synthetic_quotas(&value);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "7d");
+        assert_eq!(windows[0].remaining_percent, 52.5);
+        assert_eq!(windows[0].resets_at, Some(1_787_184_000));
+    }
+
+    #[test]
+    fn synthetic_quota_without_usable_windows_is_empty() {
+        let empty: Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(parse_synthetic_quotas(&empty).is_empty());
+
+        let zero_limits: Value = serde_json::from_str(
+            r#"{"subscription":{"limit":0,"requests":0,"renewsAt":"2026-08-14T16:51:44.399Z"},
+                "rollingFiveHourLimit":{"remaining":0,"max":0}}"#,
+        )
+        .unwrap();
+        assert!(parse_synthetic_quotas(&zero_limits).is_empty());
+    }
+
+    #[test]
+    fn synthetic_key_is_read_from_the_opencode_auth_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{"openai":{"type":"oauth"},"synthetic":{"type":"api","key":"sk-syn-9d1"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            synthetic_key_from_store(&path),
+            Some("sk-syn-9d1".to_string())
+        );
+
+        fs::write(&path, r#"{"synthetic":{"type":"api","key":""}}"#).unwrap();
+        assert_eq!(synthetic_key_from_store(&path), None);
+        fs::write(&path, r#"{"openai":{"type":"oauth"}}"#).unwrap();
+        assert_eq!(synthetic_key_from_store(&path), None);
+        assert!(synthetic_key_from_store(&dir.path().join("nope.json")).is_none());
+    }
+
+    #[test]
     fn window_labels_cover_the_documented_windows() {
         assert_eq!(window_label(300), "5h");
         assert_eq!(window_label(10080), "7d");
@@ -1028,8 +1629,167 @@ mod tests {
             ProviderState::SignedOut
         );
         assert_eq!(
+            HttpError::Status(429).into_state(),
+            ProviderState::Unavailable("HTTP 429".to_string())
+        );
+        assert_eq!(
             HttpError::Status(500).into_state(),
             ProviderState::Unavailable("HTTP 500".to_string())
+        );
+    }
+
+    #[test]
+    fn claude_backoff_ttl_doubles_per_429_then_caps() {
+        assert_eq!(next_backoff_ttl(120, 0), 120);
+        assert_eq!(next_backoff_ttl(120, 1), 240);
+        assert_eq!(next_backoff_ttl(120, 2), 480);
+        assert_eq!(next_backoff_ttl(120, 6), 7680);
+        assert_eq!(next_backoff_ttl(120, 10), 7680);
+        assert_eq!(next_backoff_ttl(0, 1), 2);
+    }
+
+    #[test]
+    fn claude_429_keeps_the_last_ready_windows() {
+        let previous = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 34.0, Some(1_700_001_000))],
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+        let fresh = ProviderLimits::new("claude", ProviderState::Unavailable("HTTP 429".into()));
+
+        let (resolved, hit_429) = apply_claude_429_policy(Some(&previous), fresh);
+
+        assert!(hit_429);
+        assert_eq!(resolved, previous);
+    }
+
+    #[test]
+    fn claude_429_without_prior_windows_stays_unavailable() {
+        let fresh = ProviderLimits::new("claude", ProviderState::Unavailable("HTTP 429".into()));
+
+        let (resolved, hit_429) = apply_claude_429_policy(None, fresh.clone());
+
+        assert!(hit_429);
+        assert_eq!(resolved, fresh);
+    }
+
+    #[test]
+    fn claude_success_after_429_uses_the_fresh_windows() {
+        let previous = ProviderLimits::new("claude", ProviderState::Unavailable("HTTP 429".into()));
+        let fresh = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 10.0, None)],
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+
+        let (resolved, hit_429) = apply_claude_429_policy(Some(&previous), fresh.clone());
+
+        assert!(!hit_429);
+        assert_eq!(resolved, fresh);
+    }
+
+    #[test]
+    fn claude_statusline_payload_maps_both_windows() {
+        let value: Value = serde_json::from_str(
+            r#"{"session_id":"ses","model":{"id":"claude-opus-5"},
+                "rate_limits":{
+                    "five_hour":{"used_percentage":34.5,"resets_at":1786708199},
+                    "seven_day":{"used_percentage":3.0,"resets_at":1787312399},
+                    "seven_day_sonnet":{"used_percentage":9.0,"resets_at":1787312399}}}"#,
+        )
+        .unwrap();
+
+        let windows = parse_claude_statusline(&value);
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].remaining_percent, 65.5);
+        assert_eq!(windows[0].resets_at, Some(1_786_708_199));
+        assert_eq!(windows[1].label, "7d");
+        assert_eq!(windows[1].remaining_percent, 97.0);
+    }
+
+    #[test]
+    fn claude_statusline_payload_tolerates_the_oauth_spellings() {
+        let value: Value = serde_json::from_str(
+            r#"{"rate_limits":{
+                    "five_hour":{"utilization":50.0,"resets_at":"2026-08-14T11:49:59+00:00"},
+                    "seven_day":null}}"#,
+        )
+        .unwrap();
+
+        let windows = parse_claude_statusline(&value);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].remaining_percent, 50.0);
+        assert_eq!(windows[0].resets_at, Some(1_786_708_199));
+    }
+
+    #[test]
+    fn claude_statusline_payload_without_limits_is_empty() {
+        let value: Value = serde_json::from_str(r#"{"session_id":"ses"}"#).unwrap();
+        assert!(parse_claude_statusline(&value).is_empty());
+
+        let nulls: Value =
+            serde_json::from_str(r#"{"rate_limits":{"five_hour":null,"seven_day":null}}"#).unwrap();
+        assert!(parse_claude_statusline(&nulls).is_empty());
+    }
+
+    #[test]
+    fn claude_bridge_is_current_until_reset_or_grace() {
+        let fresh = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 10.0, Some(2_000_000_000))],
+            observed_at: Some(1_000_000_000),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+        let past_reset_in_grace = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 10.0, Some(1_000_000_100))],
+            observed_at: Some(1_000_000_000),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+        let past_reset_past_grace = ProviderLimits {
+            observed_at: Some(1_000_000_000),
+            ..past_reset_in_grace.clone()
+        };
+
+        assert!(claude_bridge_current(&fresh, 1_000_050_000));
+        assert!(claude_bridge_current(&past_reset_in_grace, 1_000_001_000));
+        assert!(!claude_bridge_current(
+            &past_reset_past_grace,
+            1_000_050_000
+        ));
+    }
+
+    #[test]
+    fn claude_bridge_wins_over_unavailable_and_older_http() {
+        let bridge = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 30.0, Some(2_000_000_000))],
+            observed_at: Some(1_500_000_000),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+        let unavailable =
+            ProviderLimits::new("claude", ProviderState::Unavailable("HTTP 429".into()));
+        let older_http = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 20.0, Some(2_000_000_000))],
+            observed_at: Some(1_000_000_000),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+        let newer_http = ProviderLimits {
+            observed_at: Some(1_600_000_000),
+            ..older_http.clone()
+        };
+
+        assert_eq!(prefer_claude_source(None, unavailable.clone()), unavailable);
+        assert_eq!(
+            prefer_claude_source(Some(bridge.clone()), unavailable),
+            bridge
+        );
+        assert_eq!(
+            prefer_claude_source(Some(bridge.clone()), older_http),
+            bridge
+        );
+        assert_eq!(
+            prefer_claude_source(Some(bridge), newer_http.clone()),
+            newer_http
         );
     }
 

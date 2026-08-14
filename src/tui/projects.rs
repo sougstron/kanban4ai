@@ -1,14 +1,20 @@
 //! Projects list screen: registered boards plus the optional create-for-cwd row.
+//!
+//! The list is laid out as a table: fixed columns measured once per frame, a
+//! labelled header with a rule under it, and rows two lines tall (name, then
+//! the work folder) separated by a blank line. Rows are sliced by hand instead
+//! of being handed to `List`, so the mouse hitboxes and the scroll offset are
+//! computed from the same geometry the cells are drawn with.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDateTime;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use serde::Deserialize;
 
 use crate::core::project::{Project, ProjectStore, default_name};
@@ -17,8 +23,19 @@ use crate::core::session::SessionManager;
 use super::app::{App, HitAction, Hitbox, UiAction};
 use super::card::{sanitize_terminal_text, truncate_display};
 
-const TITLE: &str =
-    " Projects · Enter open · n new · r rename · p path · d delete · / filter · q quit ";
+const TITLE: &str = " Projects · Enter open · n new · r rename · p path · s settings · d delete · / filter · q quit ";
+
+/// Column labels plus the rule drawn under them.
+const HEADER_HEIGHT: u16 = 2;
+/// Name line and folder line; the third line of a row is left blank so rows
+/// read as blocks rather than as a wall of text.
+const ROW_CONTENT_HEIGHT: u16 = 2;
+const ROW_HEIGHT: u16 = ROW_CONTENT_HEIGHT + 1;
+const COLUMN_SPACING: u16 = 2;
+/// Below these widths the trailing columns are dropped rather than squeezing
+/// the name and folder down to nothing.
+const AGENTS_MIN_WIDTH: u16 = 64;
+const OPENED_MIN_WIDTH: u16 = 82;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProjectCounts {
@@ -28,6 +45,7 @@ pub struct ProjectCounts {
     pub done: u32,
     pub sessions: u32,
     pub review_unseen: u32,
+    pub questions: u32,
 }
 
 impl ProjectCounts {
@@ -41,18 +59,29 @@ pub struct ProjectRow {
     pub project: Project,
     pub counts: ProjectCounts,
     pub missing: bool,
+    /// What the list shows: the board's own `tui.name` when its settings carry
+    /// one, otherwise the registry name. The registry name starts out as the
+    /// folder basename, so without this a project renamed in its settings kept
+    /// showing the folder it lives in.
+    pub display_name: String,
 }
 
 impl ProjectRow {
     pub fn from_project(project: Project) -> Self {
-        let counts = scan_counts(&project.data_root);
-        let missing = project.work_path_missing();
         Self {
+            counts: scan_counts(&project.data_root),
+            missing: project.work_path_missing(),
+            display_name: display_name(&project),
             project,
-            counts,
-            missing,
         }
     }
+}
+
+/// The name the projects list, the rename dialog and the delete confirmation
+/// all speak: project settings first, the registry entry second.
+pub fn display_name(project: &Project) -> String {
+    crate::core::migrate::board_display_name(&project.data_root)
+        .unwrap_or_else(|| project.name.clone())
 }
 
 /// Visible rows: optional pinned create-cwd action, then matching projects.
@@ -79,14 +108,16 @@ pub fn cwd_create_path(store: &ProjectStore, cwd: &Path) -> Option<PathBuf> {
 
 pub fn scan_counts(data_root: &Path) -> ProjectCounts {
     let tasks = data_root.join(".kanban").join("tasks");
-    let review_dir = tasks.join("review");
+    let [todo, in_progress, review, done] =
+        ["todo", "in_progress", "review", "done"].map(|s| scan_task_dir(&tasks.join(s)));
     ProjectCounts {
-        todo: count_task_files(&tasks.join("todo")),
-        in_progress: count_task_files(&tasks.join("in_progress")),
-        review: count_task_files(&review_dir),
-        done: count_task_files(&tasks.join("done")),
+        todo: todo.files,
+        in_progress: in_progress.files,
+        review: review.files,
+        done: done.files,
         sessions: SessionManager::new(data_root).list_active_sessions().len() as u32,
-        review_unseen: count_review_unseen(&review_dir),
+        review_unseen: review.unseen,
+        questions: todo.questions + in_progress.questions + review.questions + done.questions,
     }
 }
 
@@ -114,171 +145,375 @@ pub fn format_opened(at: Option<NaiveDateTime>) -> String {
         .unwrap_or_else(|| "never".to_string())
 }
 
+/// One table column. The order here is the order on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Column {
+    /// Unreviewed-work and open-question markers, left of the name.
+    Flags,
+    Name,
+    Todo,
+    Doing,
+    Review,
+    Done,
+    Agents,
+    Opened,
+}
+
+impl Column {
+    fn header(self) -> &'static str {
+        match self {
+            Column::Flags => "",
+            Column::Name => "Project",
+            Column::Todo => "To Do",
+            Column::Doing => "Doing",
+            Column::Review => "Review",
+            Column::Done => "Done",
+            Column::Agents => "Agents",
+            Column::Opened => "Last opened",
+        }
+    }
+
+    /// Every column but the name is fixed width, which is what keeps the
+    /// numbers under their labels no matter how long a name or path is.
+    fn constraint(self) -> Constraint {
+        match self {
+            Column::Flags => Constraint::Length(2),
+            Column::Name => Constraint::Min(18),
+            Column::Todo | Column::Doing => Constraint::Length(5),
+            Column::Review => Constraint::Length(6),
+            Column::Done => Constraint::Length(4),
+            Column::Agents => Constraint::Length(6),
+            Column::Opened => Constraint::Length(16),
+        }
+    }
+
+    fn alignment(self) -> Alignment {
+        match self {
+            Column::Flags | Column::Name => Alignment::Left,
+            _ => Alignment::Right,
+        }
+    }
+}
+
+/// The widest column set `width` can hold. The counts are what the list is
+/// read for, so the trailing columns go first when the terminal is narrow.
+fn columns_for(width: u16) -> Vec<Column> {
+    let mut columns = vec![
+        Column::Flags,
+        Column::Name,
+        Column::Todo,
+        Column::Doing,
+        Column::Review,
+        Column::Done,
+    ];
+    if width >= AGENTS_MIN_WIDTH {
+        columns.push(Column::Agents);
+    }
+    if width >= OPENED_MIN_WIDTH {
+        columns.push(Column::Opened);
+    }
+    columns
+}
+
+fn column_rects(columns: &[Column], area: Rect) -> Vec<Rect> {
+    Layout::horizontal(columns.iter().map(|column| column.constraint()))
+        .spacing(COLUMN_SPACING)
+        .split(area)
+        .to_vec()
+}
+
 pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let items = app.visible_project_items();
+    let block = Block::default()
+        .title(TITLE)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.focus));
     if items.is_empty() {
         frame.render_widget(
-            Paragraph::new("No projects. Press n to add this folder or another path.")
-                .block(Block::default().title(TITLE).borders(Borders::ALL)),
+            Paragraph::new("No projects. Press n to add this folder or another path.").block(block),
             area,
         );
         return;
     }
-    let selected = app.project_selected.min(items.len().saturating_sub(1));
-    let list_items = items
-        .iter()
-        .enumerate()
-        .map(|(index, item)| {
-            let line = item_line(app, item, area.width.saturating_sub(3));
-            if matches!(item, ProjectListItem::CreateCwd { .. }) {
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height <= HEADER_HEIGHT {
+        return;
+    }
+
+    let columns = columns_for(inner.width);
+    let rects = column_rects(&columns, inner);
+    render_header(frame, app, &columns, &rects, area, inner);
+
+    let body = Rect {
+        y: inner.y + HEADER_HEIGHT,
+        height: inner.height - HEADER_HEIGHT,
+        ..inner
+    };
+    // The last visible row needs no separator line under it.
+    let per_page = ((body.height + 1) / ROW_HEIGHT).max(1) as usize;
+    let selected = app.project_selected.min(items.len() - 1);
+    app.project_scroll = scroll_offset(app.project_scroll, selected, per_page, items.len());
+
+    for (slot, index) in (app.project_scroll..items.len()).take(per_page).enumerate() {
+        let top = body.y + slot as u16 * ROW_HEIGHT;
+        let height = ROW_CONTENT_HEIGHT.min(body.bottom().saturating_sub(top));
+        if height == 0 {
+            break;
+        }
+        let row = Rect {
+            x: inner.x,
+            y: top,
+            width: inner.width,
+            height,
+        };
+        let focused = index == selected;
+        if focused {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(app.theme.border)),
+                row,
+            );
+        }
+        match &items[index] {
+            ProjectListItem::CreateCwd { path } => {
                 app.hitboxes.push(Hitbox {
-                    area: row_area(area, index, items.len()),
+                    area: row,
                     action: HitAction::Action(UiAction::CreateCwdProject),
                 });
-            } else {
+                render_create_row(frame, app, path, name_area(&rects, row));
+            }
+            ProjectListItem::Project(project) => {
                 app.hitboxes.push(Hitbox {
-                    area: row_area(area, index, items.len()),
+                    area: row,
                     action: HitAction::FocusProject { index },
                 });
+                render_project_row(frame, app, project, &columns, &rects, row, focused);
             }
-            ListItem::new(line)
-        })
-        .collect::<Vec<_>>();
-    let mut state = ListState::default();
-    state.select(Some(selected));
-    frame.render_stateful_widget(
-        List::new(list_items)
-            .block(
-                Block::default()
-                    .title(TITLE)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(app.theme.focus)),
-            )
-            .highlight_style(
-                Style::default()
-                    .fg(app.theme.focus)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        area,
-        &mut state,
-    );
+        }
+    }
 }
 
-fn item_line(app: &App, item: &ProjectListItem, width: u16) -> Line<'static> {
-    match item {
-        ProjectListItem::CreateCwd { path } => Line::from(vec![
+/// Keep the selected row on screen while leaving the offset alone otherwise,
+/// so scrolling does not jump when rows are added, removed or filtered out.
+fn scroll_offset(current: usize, selected: usize, per_page: usize, total: usize) -> usize {
+    let mut offset = current.min(total.saturating_sub(per_page));
+    if selected < offset {
+        offset = selected;
+    }
+    if selected >= offset + per_page {
+        offset = selected + 1 - per_page;
+    }
+    offset
+}
+
+fn render_header(
+    frame: &mut Frame<'_>,
+    app: &App,
+    columns: &[Column],
+    rects: &[Rect],
+    area: Rect,
+    inner: Rect,
+) {
+    let style = Style::default()
+        .fg(app.theme.muted)
+        .add_modifier(Modifier::BOLD);
+    for (column, rect) in columns.iter().zip(rects) {
+        frame.render_widget(
+            Paragraph::new(Span::styled(column.header(), style)).alignment(column.alignment()),
+            Rect { height: 1, ..*rect },
+        );
+    }
+    let border = Style::default().fg(app.theme.border);
+    let rule_y = inner.y + 1;
+    frame.render_widget(
+        Paragraph::new("─".repeat(inner.width as usize)).style(border),
+        Rect {
+            y: rule_y,
+            height: 1,
+            ..inner
+        },
+    );
+    // Tie the rule into the surrounding block so the header reads as the top
+    // of a table rather than as a stray line inside a list.
+    let buffer = frame.buffer_mut();
+    for (x, symbol) in [(area.x, "├"), (area.right().saturating_sub(1), "┤")] {
+        if let Some(cell) = buffer.cell_mut((x, rule_y)) {
+            cell.set_symbol(symbol).set_style(border);
+        }
+    }
+}
+
+/// The create-project row is one line of prose, not a set of cells: it starts
+/// where the names start and runs to the end of the row.
+fn name_area(rects: &[Rect], row: Rect) -> Rect {
+    let x = rects.get(1).map_or(row.x, |name| name.x);
+    Rect {
+        x,
+        width: row.right().saturating_sub(x),
+        ..row
+    }
+}
+
+fn render_create_row(frame: &mut Frame<'_>, app: &App, path: &Path, row: Rect) {
+    let width = row.width.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled("+ ", Style::default().fg(app.theme.ok)),
             Span::raw(truncate_display(
                 &format!(
                     "Create project for {}",
                     sanitize_terminal_text(&shorten_path(path))
                 ),
-                width.saturating_sub(2) as usize,
+                width,
             )),
-        ]),
-        ProjectListItem::Project(row) => project_line(app, row, width),
-    }
-}
-
-fn project_line(app: &App, row: &ProjectRow, width: u16) -> Line<'static> {
-    let name = sanitize_terminal_text(&row.project.name);
-    let path = shorten_path(&row.project.work_path);
-    let counts = format!(
-        "{}/{}/{}/{}",
-        row.counts.todo, row.counts.in_progress, row.counts.review, row.counts.done
+        ])),
+        row,
     );
-    let sessions = if row.counts.sessions == 0 {
-        String::new()
-    } else {
-        format!("▶{} ", row.counts.sessions)
-    };
-    let opened = format!("  {}", format_opened(row.project.last_opened_at));
-    let path_style = if row.missing {
-        Style::default()
-            .fg(app.theme.muted)
-            .add_modifier(Modifier::CROSSED_OUT)
-    } else {
-        Style::default().fg(app.theme.muted)
-    };
-    let unseen = row.counts.review_unseen > 0;
-    let prefix_width: usize = if unseen { 2 } else { 0 };
-    let path_width = (width as usize)
-        .saturating_sub(prefix_width + 21 + counts.len() + 1 + sessions.len() + opened.len())
-        .max(8);
-    let mut spans = Vec::new();
-    if unseen {
-        spans.push(Span::styled("● ", Style::default().fg(app.theme.warn)));
+}
+
+fn render_project_row(
+    frame: &mut Frame<'_>,
+    app: &App,
+    row: &ProjectRow,
+    columns: &[Column],
+    rects: &[Rect],
+    area: Rect,
+    focused: bool,
+) {
+    for (column, rect) in columns.iter().zip(rects) {
+        frame.render_widget(
+            Paragraph::new(project_cell(app, *column, row, rect.width, focused))
+                .alignment(column.alignment()),
+            Rect {
+                y: area.y,
+                height: area.height,
+                ..*rect
+            },
+        );
     }
-    spans.push(Span::raw(format!("{:<20} ", truncate_display(&name, 20))));
-    spans.push(Span::raw(format!("{counts} ")));
-    spans.push(Span::styled(sessions, Style::default().fg(app.theme.ok)));
-    spans.push(Span::styled(
-        format!(
-            "{:<path_width$}",
-            truncate_display(&sanitize_terminal_text(&path), path_width)
+}
+
+/// One cell of a project row: the name column carries both content lines, the
+/// rest sit on the first line and leave the folder line clear.
+fn project_cell(
+    app: &App,
+    column: Column,
+    row: &ProjectRow,
+    width: u16,
+    focused: bool,
+) -> Text<'static> {
+    let counts = row.counts;
+    match column {
+        Column::Flags => Text::from(Line::from(vec![
+            marker(counts.review_unseen > 0, '●', app.theme.warn),
+            marker(counts.questions > 0, '?', app.theme.warn),
+        ])),
+        Column::Name => {
+            let name_style = if focused {
+                Style::default()
+                    .fg(app.theme.focus)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            let mut path_style = Style::default().fg(app.theme.muted);
+            if row.missing {
+                path_style = path_style.add_modifier(Modifier::CROSSED_OUT);
+            }
+            let name = truncate_display(&sanitize_terminal_text(&row.display_name), width as usize);
+            let path = truncate_display(
+                &sanitize_terminal_text(&shorten_path(&row.project.work_path)),
+                width as usize,
+            );
+            Text::from(vec![
+                Line::from(Span::styled(name, name_style)),
+                Line::from(Span::styled(path, path_style)),
+            ])
+        }
+        Column::Todo => count_cell(app, counts.todo, Style::default()),
+        Column::Doing => count_cell(
+            app,
+            counts.in_progress,
+            Style::default().fg(app.theme.focus),
         ),
-        path_style,
-    ));
-    spans.push(Span::styled(opened, Style::default().fg(app.theme.muted)));
-    Line::from(spans)
+        Column::Review => {
+            let style = if counts.review_unseen > 0 {
+                Style::default().fg(app.theme.warn)
+            } else {
+                Style::default().fg(app.theme.review)
+            };
+            count_cell(app, counts.review, style)
+        }
+        Column::Done => count_cell(app, counts.done, Style::default().fg(app.theme.ok)),
+        Column::Agents => {
+            if counts.sessions == 0 {
+                Text::from(Span::styled("·", Style::default().fg(app.theme.muted)))
+            } else {
+                Text::from(Span::styled(
+                    format!("▶{}", counts.sessions),
+                    Style::default().fg(app.theme.ok),
+                ))
+            }
+        }
+        Column::Opened => Text::from(Span::styled(
+            format_opened(row.project.last_opened_at),
+            Style::default().fg(app.theme.muted),
+        )),
+    }
 }
 
-fn row_area(list: Rect, index: usize, total: usize) -> Rect {
-    let inner_y = list.y.saturating_add(1);
-    let inner_h = list.height.saturating_sub(2);
-    let row_y = inner_y.saturating_add(index as u16);
-    if row_y >= inner_y.saturating_add(inner_h) || index >= total {
-        return Rect::new(list.x, list.y, 0, 0);
-    }
-    Rect {
-        x: list.x.saturating_add(1),
-        y: row_y,
-        width: list.width.saturating_sub(2),
-        height: 1,
+fn marker(shown: bool, glyph: char, color: ratatui::style::Color) -> Span<'static> {
+    if shown {
+        Span::styled(glyph.to_string(), Style::default().fg(color))
+    } else {
+        Span::raw(" ")
     }
 }
 
-fn count_task_files(dir: &Path) -> u32 {
+/// Zero reads as background noise, so it stays muted while real work does not.
+fn count_cell(app: &App, count: u32, style: Style) -> Text<'static> {
+    let style = if count == 0 {
+        Style::default().fg(app.theme.muted)
+    } else {
+        style
+    };
+    Text::from(Span::styled(count.to_string(), style))
+}
+
+#[derive(Default)]
+struct DirScan {
+    files: u32,
+    unseen: u32,
+    questions: u32,
+}
+
+#[derive(Deserialize, Default)]
+struct TaskFlags {
+    #[serde(default)]
+    review_unseen: bool,
+    #[serde(default)]
+    has_questions: bool,
+}
+
+fn scan_task_dir(dir: &Path) -> DirScan {
     let Ok(entries) = fs::read_dir(dir) else {
-        return 0;
+        return DirScan::default();
     };
-    entries
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            name.starts_with("TASK-") && name.ends_with(".md")
-        })
-        .count() as u32
-}
-
-/// Count review tasks whose `review_unseen` frontmatter flag is set: the agent
-/// moved them into Review and the user has not yet opened the detail. Drives
-/// the project-level notifier dot in the projects list.
-fn count_review_unseen(review_dir: &Path) -> u32 {
-    #[derive(Deserialize)]
-    struct Flag {
-        #[serde(default)]
-        review_unseen: bool,
+    let mut acc = DirScan::default();
+    for entry in entries.filter_map(Result::ok) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("TASK-") || !name.ends_with(".md") {
+            continue;
+        }
+        acc.files += 1;
+        if let Ok(content) = fs::read_to_string(entry.path())
+            && let Some(frontmatter) = content.split("---").nth(1)
+            && let Ok(flags) = serde_yaml_ng::from_str::<TaskFlags>(frontmatter)
+        {
+            acc.unseen += u32::from(flags.review_unseen);
+            acc.questions += u32::from(flags.has_questions);
+        }
     }
-    let Ok(entries) = fs::read_dir(review_dir) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            (name.starts_with("TASK-") && name.ends_with(".md")).then(|| entry.path())
-        })
-        .filter_map(|path| {
-            let content = fs::read_to_string(&path).ok()?;
-            let mut parts = content.splitn(3, "---");
-            let frontmatter = parts.nth(1)?;
-            serde_yaml_ng::from_str::<Flag>(frontmatter)
-                .ok()
-                .map(|flag| flag.review_unseen)
-        })
-        .filter(|unseen| *unseen)
-        .count() as u32
+    acc
 }

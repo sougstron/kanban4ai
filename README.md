@@ -7,7 +7,7 @@ A fast native local-first kanban board CLI and TUI designed for AI coding agents
 - Linux or another Unix-like environment
 - Rust 1.88 or newer when building from source
 - Optional integrations: `tmux`, `notify-send`, `wl-paste` or `xclip`, `curl`
-  (subscription limits for claude and grok)
+  (subscription limits for claude, grok, and z.ai)
 - Optional agent backends: opencode and/or Claude Code
 
 ## Install
@@ -187,22 +187,28 @@ crashed; there `Enter` attaches, `v` opens a scrollable pager over the session
 log, `x` kills the session after a confirmation, and `o` jumps to the session's
 task. Waiting rows and cards show the deadline (`until HH:MM`), while stuck
 cards show the `u recover` hint. In the archive view `Enter` opens an archived
-task and `u` restores it to To Do. The projects list shows each board's work
-path and column counts; `Enter` opens one, `n` adds, `d` unregisters (Space
-toggles deleting board data). `q`/`Esc` returns to the board you came from.
+task and `u` restores it to To Do. The projects list is a table of the
+settings name, work folder, per-column counts, live agents, and last
+opened; `Enter` opens one, `n` adds, `d` unregisters (Space
+toggles deleting board data), and `s` opens Global Settings (for now the
+Esc-from-board preference), which apply to every board. `q`/`Esc` returns to
+the board you came from.
 The status bar shows the shortcuts for the current screen and its hints are
 clickable.
 
 Directly above the status bar, the Board and Projects screens show how much of
 each AI subscription is left — `✳ claude 5h 66% ↻3h30m · 7d 95% ↻6d11h │ ✺ codex
-mon 75% ↻18d │ ✕ grok 7d 93% ↻4d22h` — with the percentage that **remains** in
-each window and the time until it resets. Providers you are not signed in to are
-left out. The numbers refresh in the background (claude and grok over HTTPS via
-`curl`, codex straight from its local session files, so codex values carry the
-age of your last codex run). Clicking the codex or grok segment refreshes that
-provider on the spot through its own CLI — codex is asked live over its
-app-server RPC and the grok CLI renews its login token. `kanban4ai limits`
-prints the same data, and `tui.show_limits: false` hides the row.
+mon 75% ↻18d │ ✕ grok 7d 93% ↻4d22h │ ◆ zai 5h 85% ↻4h48m · 7d 97% ↻6d23h │ ✦
+synthetic 5h 91% ↻3h59m · 7d 12% ↻3h22m` —
+with the percentage that **remains** in each window and the time until it
+resets. Providers you are not signed in to are left out. The numbers refresh in
+the background (claude, grok, z.ai, and synthetic over HTTPS via `curl`, codex
+straight from its local session files, so codex values carry the age of your
+last codex run). Clicking the codex or grok segment refreshes that provider on
+the spot through its own CLI — codex is asked live over its app-server RPC and
+the grok CLI renews its login token; the z.ai and synthetic segments reuse keys
+from opencode's credential store. `kanban4ai limits` prints the same data, and
+`tui.show_limits: false` hides the row.
 
 ### 5. Sessions, archives, projects, and data
 

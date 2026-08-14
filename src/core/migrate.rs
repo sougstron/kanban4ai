@@ -7,12 +7,13 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde_yaml_ng::Value;
+use serde_yaml_ng::{Mapping, Value};
 
 use crate::core::config::Config;
 use crate::core::error::{KanbanError, Result};
 use crate::core::project::AddOptions;
 use crate::core::session::{SessionManager, SessionState};
+use crate::core::storage::{Storage, atomic_write_text};
 
 const DEFAULT_TUI_NAME: &str = "Kanban";
 const DEFAULT_HEARTBEAT_TIMEOUT: i64 = 1800;
@@ -39,6 +40,37 @@ pub fn board_display_name(data_root: &Path) -> Option<String> {
     } else {
         Some(name.to_string())
     }
+}
+
+/// Set `tui.name` on an existing board so a project renamed from the projects
+/// list carries the same name in its own settings, which is where the list
+/// reads it back from.
+///
+/// The file is edited as raw YAML rather than through `Config::load`/`save`:
+/// loading fills compatibility defaults, and a rename has no business writing
+/// keys the board never had. A board with no config yet is left alone — the
+/// registry name is what the list falls back to.
+pub fn set_board_display_name(data_root: &Path, name: &str) -> Result<()> {
+    let config = Config::new(data_root);
+    if !config.exists() {
+        return Ok(());
+    }
+    let _guard = Storage::new(data_root).lock()?;
+    let mut document: Value = serde_yaml_ng::from_str(&fs::read_to_string(&config.config_file)?)?;
+    let Value::Mapping(root) = &mut document else {
+        return Ok(());
+    };
+    let tui = root
+        .entry(Value::String("tui".to_string()))
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    let Value::Mapping(tui) = tui else {
+        return Ok(());
+    };
+    tui.insert(
+        Value::String("name".to_string()),
+        Value::String(name.to_string()),
+    );
+    atomic_write_text(&config.config_file, &serde_yaml_ng::to_string(&document)?)
 }
 
 /// Move or copy `src` (a `.kanban` directory) to `dest`.

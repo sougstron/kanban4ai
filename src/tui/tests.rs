@@ -747,8 +747,6 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     app.handle_key(key(KeyCode::Tab)).expect("task sorting");
     app.handle_key(key(KeyCode::Right))
         .expect("updated ascending sorting");
-    app.handle_key(key(KeyCode::Tab))
-        .expect("escape to projects");
     app.handle_key(key(KeyCode::Tab)).expect("save");
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
 
@@ -4144,28 +4142,274 @@ fn projects_screen_lists_rows_and_create_cwd() {
     let rendered = render_snapshot(&mut app);
     assert!(rendered.contains("Demo Board"), "{rendered}");
     assert!(rendered.contains("Create project for"), "{rendered}");
-    assert!(rendered.contains("1/1/0/0"), "{rendered}");
+    assert!(
+        rendered.contains("To Do  Doing  Review  Done"),
+        "{rendered}"
+    );
     insta::assert_snapshot!("projects_list", rendered);
     let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::remove_dir_all(&cwd);
 }
 
+/// Column of `needle` in `line`, counted in characters so a row can be
+/// compared against the header line it sits under.
+fn column_of(line: &str, needle: &str) -> usize {
+    let byte = line
+        .find(needle)
+        .unwrap_or_else(|| panic!("missing {needle} in: {line}"));
+    line[..byte].chars().count()
+}
+
+/// The character the row shows in the last column of a right-aligned header.
+fn cell_under(header: &str, row: &str, label: &str) -> char {
+    let end = column_of(header, label) + label.chars().count();
+    row.chars()
+        .nth(end - 1)
+        .unwrap_or_else(|| panic!("row is shorter than the {label} column: {row}"))
+}
+
 #[test]
-fn project_row_places_status_next_to_the_name() {
+fn projects_table_keeps_its_columns_across_mixed_rows() {
+    let store_dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(store_dir.path());
+    let root = std::path::PathBuf::from("/tmp/k4ai-table");
+    let _ = std::fs::remove_dir_all(&root);
+
+    // A busy board: two unreviewed tasks, an open question and a live agent.
+    let busy = root.join("busy-service");
+    std::fs::create_dir_all(&busy).expect("work dir");
+    let added = store.add(&busy, Some("Busy Service")).expect("add busy");
+    for id in ["TASK-001", "TASK-002", "TASK-003"] {
+        write_task_file(&added.project.data_root, "done", id);
+    }
+    let review = added.project.data_root.join(".kanban/tasks/review");
+    std::fs::create_dir_all(&review).expect("review dir");
+    std::fs::write(
+        review.join("TASK-004.md"),
+        "---\nid: TASK-004\ntitle: TASK-004\nstatus: review\nreview_unseen: true\n---\n",
+    )
+    .expect("unseen review");
+    let in_progress = added.project.data_root.join(".kanban/tasks/in_progress");
+    std::fs::create_dir_all(&in_progress).expect("in_progress dir");
+    std::fs::write(
+        in_progress.join("TASK-005.md"),
+        "---\nid: TASK-005\ntitle: TASK-005\nstatus: in_progress\nhas_questions: true\n---\n",
+    )
+    .expect("questioned task");
+    std::fs::create_dir_all(added.project.data_root.join(".kanban/sessions")).expect("sessions");
+    std::fs::write(
+        added.project.data_root.join(".kanban/sessions/ses-a.yaml"),
+        "id: ses-a\ntask_id: TASK-005\nstatus: active\nstarted_at: '2026-08-14T11:00:00'\nlast_seen: '2026-08-14T11:00:00'\n",
+    )
+    .expect("session");
+
+    // A quiet board, and one whose folder was deleted after registration.
+    let quiet = root.join("quiet");
+    std::fs::create_dir_all(&quiet).expect("work dir");
+    store.add(&quiet, Some("Quiet")).expect("add quiet");
+    let gone = root.join("moved-away");
+    std::fs::create_dir_all(&gone).expect("work dir");
+    store
+        .add(&gone, Some("A very long project name that will not fit"))
+        .expect("add gone");
+    std::fs::remove_dir_all(&gone).expect("drop work dir");
+
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    app.project_selected = 1;
+    let rendered = render_at(&mut app, 100, 20);
+    insta::assert_snapshot!("projects_table", rendered);
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn projects_table_drops_trailing_columns_on_a_narrow_terminal() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-narrow-work");
+    let _ = std::fs::remove_dir_all(&work);
+    let (_store, mut app) = projects_app(&work, None);
+
+    let wide = rendered_lines(&mut app, 100, 12).join("\n");
+    assert!(
+        wide.contains("Last opened") && wide.contains("Agents"),
+        "{wide}"
+    );
+
+    let narrow = rendered_lines(&mut app, 70, 12).join("\n");
+    assert!(narrow.contains("To Do"), "counts stay: {narrow}");
+    assert!(
+        narrow.contains("Agents"),
+        "agents still fit at 70: {narrow}"
+    );
+    assert!(!narrow.contains("Last opened"), "{narrow}");
+
+    let tiny = rendered_lines(&mut app, 50, 12).join("\n");
+    assert!(tiny.contains("To Do") && tiny.contains("Done"), "{tiny}");
+    assert!(!tiny.contains("Agents"), "{tiny}");
+    assert!(tiny.contains("Demo Board"), "{tiny}");
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn projects_list_scrolls_the_selection_into_view_and_keeps_hitboxes_on_it() {
+    let store_dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(store_dir.path());
+    let root = tempfile::tempdir().expect("work root");
+    for index in 1..=10 {
+        let work = root.path().join(format!("p{index:02}"));
+        std::fs::create_dir_all(&work).expect("work dir");
+        store
+            .add(&work, Some(&format!("Project {index:02}")))
+            .expect("add project");
+    }
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+
+    let top = rendered_lines(&mut app, 100, 16).join("\n");
+    assert!(top.contains("Project 01"), "{top}");
+    assert!(!top.contains("Project 10"), "{top}");
+
+    for _ in 0..9 {
+        app.handle_key(key(KeyCode::Down)).expect("down");
+    }
+    let lines = rendered_lines(&mut app, 100, 16);
+    let scrolled = lines.join("\n");
+    assert!(scrolled.contains("Project 10"), "{scrolled}");
+    assert!(!scrolled.contains("Project 01"), "{scrolled}");
+
+    // Every row the mouse can hit sits on the project it claims to be.
+    let items = app.visible_project_items();
+    let hits = app
+        .hitboxes
+        .iter()
+        .filter_map(|hitbox| match hitbox.action {
+            HitAction::FocusProject { index } => Some((index, hitbox.area.y)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!hits.is_empty(), "{scrolled}");
+    for (index, y) in hits {
+        let super::projects::ProjectListItem::Project(row) = &items[index] else {
+            panic!("hitbox {index} is not a project row");
+        };
+        assert!(
+            lines[y as usize].contains(&row.display_name),
+            "hitbox for {} is on the wrong line: {}",
+            row.display_name,
+            lines[y as usize]
+        );
+    }
+}
+
+/// Register `work` under its folder name and give the board a settings name.
+fn project_with_board_name(
+    store_dir: &std::path::Path,
+    work: &std::path::Path,
+    board_name: &str,
+) -> ProjectStore {
+    std::fs::create_dir_all(work).expect("work dir");
+    let store = ProjectStore::at(store_dir);
+    let added = store.add(work, None).expect("add project");
+    let kanban = added.project.data_root.join(".kanban");
+    std::fs::create_dir_all(&kanban).expect("kanban dir");
+    std::fs::write(
+        kanban.join("config.yaml"),
+        format!("tui:\n  name: {board_name}\n  theme: textual-dark\n"),
+    )
+    .expect("board config");
+    store
+}
+
+#[test]
+fn projects_list_names_a_project_from_its_board_settings() {
+    let store_dir = tempfile::tempdir().expect("store");
+    let work = tempfile::tempdir().expect("work");
+    let store = project_with_board_name(store_dir.path(), work.path(), "Ledger");
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+
+    let folder = work
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("folder name");
+    assert_eq!(
+        app.projects[0].project.name, folder,
+        "registry keeps the folder name"
+    );
+    assert_eq!(app.projects[0].display_name, "Ledger");
+
+    let rendered = render_at(&mut app, 96, 12);
+    assert!(rendered.contains("Ledger"), "{rendered}");
+}
+
+#[test]
+fn renaming_a_project_also_renames_it_in_the_board_settings() {
+    let store_dir = tempfile::tempdir().expect("store");
+    let work = tempfile::tempdir().expect("work");
+    let store = project_with_board_name(store_dir.path(), work.path(), "Ledger");
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+
+    app.handle_key(key(KeyCode::Char('r'))).expect("rename");
+    let modal = app.modal.as_mut().expect("rename modal");
+    assert_eq!(
+        modal.title_text(),
+        "Ledger",
+        "the dialog offers the shown name"
+    );
+    modal.title = TextArea::new(vec!["Ledger Book".to_string()]);
+    app.handle_key(key(KeyCode::Tab)).expect("focus save");
+    app.handle_key(key(KeyCode::Enter)).expect("save rename");
+    assert!(app.modal.is_none(), "{}", app.status);
+
+    assert_eq!(app.projects[0].display_name, "Ledger Book");
+    assert_eq!(app.projects[0].project.name, "Ledger Book");
+    let config = std::fs::read_to_string(
+        app.projects[0]
+            .project
+            .data_root
+            .join(".kanban/config.yaml"),
+    )
+    .expect("board config");
+    assert!(config.contains("name: Ledger Book"), "{config}");
+    // A rename has no business adding keys the board never had.
+    assert!(!config.contains("auto_launch"), "{config}");
+}
+
+#[test]
+fn project_row_lines_its_counts_up_under_the_column_headers() {
     let work = std::path::PathBuf::from("/tmp/k4ai-status-work");
     let _ = std::fs::remove_dir_all(&work);
     let (_store, mut app) = projects_app(&work, None);
-    let rendered = render_at(&mut app, 96, 12);
-    let line = rendered
-        .lines()
-        .find(|line| line.contains("Demo Board"))
-        .unwrap_or_else(|| panic!("missing project row: {rendered}"));
-    let name_at = line.find("Demo Board").expect("project name");
-    let counts_at = line.find("1/1/0/0").expect("column counts");
-    let path_at = line.find("/tmp/k4ai-status-work").expect("work path");
+    let lines = rendered_lines(&mut app, 96, 12);
+    let row_at = lines
+        .iter()
+        .position(|line| line.contains("Demo Board"))
+        .unwrap_or_else(|| panic!("missing project row: {lines:?}"));
+    let header = lines
+        .iter()
+        .find(|line| line.contains("To Do"))
+        .unwrap_or_else(|| panic!("missing table header: {lines:?}"));
+    let row = &lines[row_at];
+
+    assert_eq!(cell_under(header, row, "To Do"), '1');
+    assert_eq!(cell_under(header, row, "Doing"), '1');
+    assert_eq!(cell_under(header, row, "Review"), '0');
+    assert_eq!(cell_under(header, row, "Done"), '0');
     assert!(
-        name_at < counts_at && counts_at < path_at,
-        "status should sit between the project name and the path, got: {line}"
+        column_of(row, "Demo Board") < column_of(header, "To Do"),
+        "the name column comes first, got: {row}"
+    );
+
+    // The folder sits on the row's second line, under the name.
+    let folder = &lines[row_at + 1];
+    assert_eq!(
+        column_of(folder, "/tmp/k4ai-status-work"),
+        column_of(row, "Demo Board"),
+        "the folder should start in the name column, got: {folder}"
+    );
+    assert_eq!(
+        column_of(header, "Project"),
+        column_of(row, "Demo Board"),
+        "the name should start under its header, got: {row}"
     );
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -4197,24 +4441,117 @@ fn project_row_places_running_and_unreviewed_status_next_to_the_name() {
     )
     .expect("session");
     let mut app = App::projects_at(store, None, None).expect("projects app");
-    let rendered = render_at(&mut app, 96, 12);
-    let line = rendered
-        .lines()
-        .find(|line| line.contains("Demo Board"))
-        .unwrap_or_else(|| panic!("missing project row: {rendered}"));
-    let name_at = line.find("Demo Board").expect("project name");
-    let counts_at = line.find("1/1/1/0").expect("column counts");
-    let running_at = line.find('▶').expect("running sessions");
-    let unseen_at = line.find('●').expect("unreviewed marker");
-    let path_at = line.find("/tmp/k4ai-status-run").expect("work path");
+    let lines = rendered_lines(&mut app, 96, 12);
+    let row_at = lines
+        .iter()
+        .position(|line| line.contains("Demo Board"))
+        .unwrap_or_else(|| panic!("missing project row: {lines:?}"));
+    let header = lines
+        .iter()
+        .find(|line| line.contains("To Do"))
+        .unwrap_or_else(|| panic!("missing table header: {lines:?}"));
+    let row = &lines[row_at];
+
+    let name_at = column_of(row, "Demo Board");
+    let unseen_at = row.chars().position(|ch| ch == '●').expect("unreviewed");
+    let running_at = row.chars().position(|ch| ch == '▶').expect("running");
     assert!(
-        unseen_at < name_at
-            && name_at < counts_at
-            && counts_at < running_at
-            && running_at < path_at,
-        "running and unreviewed status should sit with the project name, got: {line}"
+        unseen_at < name_at && name_at < column_of(header, "To Do") && running_at > name_at,
+        "unreviewed work marks the row and running agents sit in their own column, got: {row}"
+    );
+    assert_eq!(cell_under(header, row, "Review"), '1');
+    assert_eq!(
+        cell_under(header, row, "Agents"),
+        '1',
+        "▶1 is right-aligned"
+    );
+    assert!(
+        lines[row_at + 1].contains("/tmp/k4ai-status-run"),
+        "the folder sits on the row's second line, got: {:?}",
+        lines[row_at + 1]
     );
     let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn scan_counts_includes_open_questions_from_any_column() {
+    let root = tempfile::tempdir().expect("root");
+    write_task_file(root.path(), "todo", "TASK-001");
+    let in_progress = root.path().join(".kanban/tasks/in_progress");
+    std::fs::create_dir_all(&in_progress).expect("in_progress dir");
+    std::fs::write(
+        in_progress.join("TASK-002.md"),
+        "---\nid: TASK-002\ntitle: TASK-002\nstatus: in_progress\nhas_questions: true\n---\n",
+    )
+    .expect("questioned task");
+    let review = root.path().join(".kanban/tasks/review");
+    std::fs::create_dir_all(&review).expect("review dir");
+    std::fs::write(
+        review.join("TASK-003.md"),
+        "---\nid: TASK-003\ntitle: TASK-003\nstatus: review\nreview_unseen: true\n---\n",
+    )
+    .expect("unseen review");
+
+    let counts = super::projects::scan_counts(root.path());
+    assert_eq!(counts.todo, 1);
+    assert_eq!(counts.in_progress, 1);
+    assert_eq!(counts.review, 1);
+    assert_eq!(counts.questions, 1);
+    assert_eq!(counts.review_unseen, 1);
+}
+
+#[test]
+fn project_row_shows_yellow_question_mark_when_any_task_has_a_question() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-status-ask");
+    let cwd = std::path::PathBuf::from("/tmp/k4ai-status-ask-cwd");
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_dir_all(&cwd);
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let store_dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(store_dir.path());
+    let added = store.add(&work, Some("Demo Board")).expect("add project");
+    write_task_file(&added.project.data_root, "todo", "TASK-001");
+    let in_progress = added.project.data_root.join(".kanban/tasks/in_progress");
+    std::fs::create_dir_all(&in_progress).expect("in_progress dir");
+    std::fs::write(
+        in_progress.join("TASK-002.md"),
+        "---\nid: TASK-002\ntitle: TASK-002\nstatus: in_progress\nhas_questions: true\n---\n",
+    )
+    .expect("questioned task");
+    let mut app = App::projects_at(store, None, Some(cwd.clone())).expect("projects app");
+    let rendered = render_at(&mut app, 96, 12);
+    let lines = rendered
+        .split("\n\n--- style runs ---")
+        .next()
+        .expect("frame text")
+        .lines()
+        .collect::<Vec<_>>();
+    let row_y = lines
+        .iter()
+        .position(|line| line.contains("Demo Board"))
+        .unwrap_or_else(|| panic!("missing project row: {rendered}"));
+    let line = lines[row_y];
+    let question_at = line
+        .chars()
+        .position(|ch| ch == '?')
+        .expect("question mark");
+    let name_col = line
+        .find("Demo Board")
+        .map(|index| line[..index].chars().count())
+        .expect("project name");
+    assert!(
+        question_at < name_col,
+        "question mark should sit before the project name, got: {line}"
+    );
+    let style = style_at(&mut app, 96, 12, question_at as u16, row_y as u16);
+    assert_eq!(
+        style.fg,
+        Some(Theme::named("dark").warn),
+        "question mark should be yellow, got: {style:?}"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_dir_all(&cwd);
 }
 
 #[test]
@@ -4299,35 +4636,97 @@ fn board_escape_clears_search_before_opening_projects() {
 }
 
 #[test]
-fn settings_save_persists_escape_to_projects_checkbox() {
+fn project_settings_dialog_no_longer_carries_the_escape_toggle() {
     let (_dir, mut app) = settings_app();
-    assert!(!app.settings.escape_to_projects);
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open settings");
-    {
-        let modal = app.modal.as_mut().expect("settings modal");
-        modal.focus_field(DialogField::EscapeToProjects);
-        assert!(!modal.escape_to_projects);
-    }
+    let modal = app.modal.as_ref().expect("settings modal");
+    assert_eq!(modal.modal, Modal::Settings);
+    assert!(
+        !modal.fields().contains(&DialogField::EscapeToProjects),
+        "the toggle moved to the global settings dialog: {:?}",
+        modal.fields()
+    );
+}
+
+#[test]
+fn projects_screen_global_settings_toggle_persists_to_the_store() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-glob-settings");
+    let _ = std::fs::remove_dir_all(&work);
+    let (store_dir, mut app) = projects_app(&work, None);
+    assert!(!app.settings.escape_to_projects);
+
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open global settings");
+    let modal = app.modal.as_ref().expect("global settings modal");
+    assert_eq!(modal.modal, Modal::GlobalSettings);
+    assert_eq!(modal.active_field(), DialogField::EscapeToProjects);
+    assert!(!modal.escape_to_projects);
+
     app.handle_key(key(KeyCode::Char(' '))).expect("toggle");
     assert!(
         app.modal
             .as_ref()
-            .expect("settings modal")
+            .expect("global settings modal")
             .escape_to_projects
     );
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("Global settings"), "{rendered}");
+    assert!(
+        rendered.contains("Esc from board opens projects"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("☑"), "{rendered}");
     app.handle_key(key(KeyCode::Tab)).expect("save");
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
 
     assert!(app.modal.is_none());
     assert!(app.settings.escape_to_projects);
-    let config = app.ops.config.load().expect("cached saved config");
-    assert_eq!(
-        config
-            .tui
-            .get("escape_to_projects")
-            .and_then(|value| value.as_bool()),
-        Some(true)
+    assert_eq!(app.status, "Global settings saved");
+    let store = ProjectStore::at(store_dir.path());
+    let config = store.load_global_config().expect("saved global config");
+    assert!(config.escape_to_projects());
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn projects_screen_reflects_the_saved_global_escape_setting() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-glob-preload");
+    let _ = std::fs::remove_dir_all(&work);
+    let store_dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(store_dir.path());
+    store
+        .save_global_config(&{
+            let mut config = crate::core::global::GlobalConfig::default();
+            config.set_escape_to_projects(true);
+            config
+        })
+        .expect("seed global config");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let added = store.add(&work, Some("Demo Board")).expect("add project");
+    write_task_file(&added.project.data_root, "todo", "TASK-001");
+
+    let app = App::projects_at(store, None, None).expect("projects app");
+    assert!(app.settings.escape_to_projects);
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn board_app_ignores_stale_per_project_escape_to_projects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(dir.path()).init_board().expect("init board");
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "tui:\n  escape_to_projects: true\nnotifications:\n  enabled: false\nauto_launch:\n  enabled: false\n",
+    )
+    .expect("stale per-project key");
+
+    let app = App::new(dir.path()).expect("create app");
+    assert!(
+        !app.settings.escape_to_projects,
+        "the per-project key must be ignored after the move to store-wide settings"
     );
 }
 

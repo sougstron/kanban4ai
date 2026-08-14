@@ -191,6 +191,7 @@ pub enum UiAction {
     OpenProjects,
     OpenProject,
     NewProject,
+    OpenGlobalSettings,
     RenameProject,
     SetProjectPath,
     DeleteProject,
@@ -383,6 +384,9 @@ pub struct App {
     pub project: Option<Project>,
     pub projects: Vec<ProjectRow>,
     pub project_selected: usize,
+    /// First project row drawn on the projects screen. Owned by the renderer,
+    /// which is the only place that knows how many rows a frame holds.
+    pub project_scroll: usize,
     pub create_cwd: Option<PathBuf>,
     store: Option<ProjectStore>,
     return_project: Option<Project>,
@@ -590,6 +594,7 @@ impl App {
             project: None,
             projects: Vec::new(),
             project_selected: 0,
+            project_scroll: 0,
             create_cwd: None,
             store: None,
             return_project: None,
@@ -678,6 +683,7 @@ impl App {
             project: None,
             projects,
             project_selected: 0,
+            project_scroll: 0,
             create_cwd,
             store: Some(store),
             return_project,
@@ -685,6 +691,11 @@ impl App {
             has_board: false,
             help_return: Screen::Projects,
         };
+        if let Some(store) = app.store.as_ref()
+            && let Ok(config) = store.load_global_config()
+        {
+            app.settings.escape_to_projects = config.escape_to_projects();
+        }
         app.theme = Theme::named(&app.settings.theme_name);
         Ok(app)
     }
@@ -711,6 +722,7 @@ impl App {
                 .iter()
                 .filter(|row| {
                     filter.is_empty()
+                        || case_insensitive_match(&row.display_name, &filter)
                         || case_insensitive_match(&row.project.name, &filter)
                         || case_insensitive_match(&row.project.work_path.to_string_lossy(), &filter)
                         || case_insensitive_match(&row.project.id, &filter)
@@ -1173,6 +1185,7 @@ impl App {
             KeyCode::Char('r') => self.dispatch(UiAction::RenameProject)?,
             KeyCode::Char('p') => self.dispatch(UiAction::SetProjectPath)?,
             KeyCode::Char('d') => self.dispatch(UiAction::DeleteProject)?,
+            KeyCode::Char('s') => self.dispatch(UiAction::OpenGlobalSettings)?,
             KeyCode::Enter if self.selected_is_create_cwd() => {
                 self.dispatch(UiAction::CreateCwdProject)?
             }
@@ -1278,6 +1291,7 @@ impl App {
             UiAction::OpenProjects => self.open_projects_list(),
             UiAction::OpenProject => self.open_selected_project(),
             UiAction::NewProject => self.open_new_project_dialog(),
+            UiAction::OpenGlobalSettings => self.open_global_settings_dialog(),
             UiAction::RenameProject => self.open_rename_project_dialog(),
             UiAction::SetProjectPath => self.open_set_path_dialog(),
             UiAction::DeleteProject => self.open_delete_project_dialog(),
@@ -2595,10 +2609,39 @@ impl App {
             normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
                 .to_string(),
         ]);
-        modal.escape_to_projects = tui_bool(&config.tui, "escape_to_projects", false);
         self.populate_settings_form_options(&mut modal);
         modal.capture_initial_values();
         self.modal = Some(modal);
+    }
+
+    fn open_global_settings_dialog(&mut self) {
+        let Some(store) = &self.store else {
+            self.status = "Global settings are edited from the projects list".to_string();
+            return;
+        };
+        let config = match store.load_global_config() {
+            Ok(config) => config,
+            Err(err) => {
+                self.status = format!("Could not load global settings: {err}");
+                return;
+            }
+        };
+        let mut modal = ModalState::new(Modal::GlobalSettings);
+        modal.escape_to_projects = config.escape_to_projects();
+        modal.capture_initial_values();
+        self.modal = Some(modal);
+    }
+
+    /// Machine-wide settings from the environment store, applied on top of the
+    /// loaded per-project settings. Best effort: an unresolvable or unreadable
+    /// store keeps the defaults. Runtime entry points call this so unit tests
+    /// that build an [`App`] directly never touch the developer's real store.
+    pub fn apply_global_settings(&mut self) {
+        if let Ok(store) = ProjectStore::open()
+            && let Ok(config) = store.load_global_config()
+        {
+            self.settings.escape_to_projects = config.escape_to_projects();
+        }
     }
 
     fn open_move_dialog(&mut self) {
@@ -2667,7 +2710,7 @@ impl App {
         let mut modal = ModalState::new(Modal::RenameProject {
             id: row.project.id.clone(),
         });
-        modal.title = super::dialogs::one_line(&row.project.name);
+        modal.title = super::dialogs::one_line(&row.display_name);
         modal.capture_initial_values();
         self.modal = Some(modal);
     }
@@ -2692,7 +2735,7 @@ impl App {
         };
         self.modal = Some(ModalState::new(Modal::DeleteProject {
             id: row.project.id.clone(),
-            name: row.project.name.clone(),
+            name: row.display_name.clone(),
             task_count: row.counts.total_tasks(),
         }));
     }
@@ -3758,6 +3801,28 @@ impl App {
 
     fn submit_modal(&mut self, mut modal: ModalState) -> Result<()> {
         match modal.modal.clone() {
+            Modal::GlobalSettings => {
+                let save_result = (|| -> Result<()> {
+                    let Some(store) = &self.store else {
+                        return Err(KanbanError::Invalid(
+                            "Global settings are edited from the projects list".into(),
+                        ));
+                    };
+                    let _lock = store.lock()?;
+                    let mut config = store.load_global_config()?;
+                    config.set_escape_to_projects(modal.escape_to_projects);
+                    store.save_global_config(&config)
+                })();
+                if let Err(err) = save_result {
+                    let message = format!("Could not save global settings: {err}");
+                    modal.error = Some(message.clone());
+                    self.status = message;
+                    self.modal = Some(modal);
+                    return Ok(());
+                }
+                self.settings.escape_to_projects = modal.escape_to_projects;
+                self.status = "Global settings saved".to_string();
+            }
             Modal::Settings => {
                 let project_name = modal.title_text();
                 let Some(backend) = modal.backend_text() else {
@@ -3804,10 +3869,6 @@ impl App {
                         Value::String("task_sort".to_string()),
                         Value::String(task_sort.clone()),
                     );
-                    config.tui.insert(
-                        Value::String("escape_to_projects".to_string()),
-                        Value::Bool(modal.escape_to_projects),
-                    );
                     config.auto_launch.insert(
                         Value::String("default_agent".to_string()),
                         Value::String(backend.clone()),
@@ -3835,10 +3896,19 @@ impl App {
                     self.modal = Some(modal);
                     return Ok(());
                 }
+                // The projects list shows this name, so keep the registry
+                // entry — what `--project <name>` resolves against — in step
+                // with it. Best effort: an unregistered board has no entry.
+                if let Some(project) = self.project.as_ref()
+                    && project.name != project_name
+                    && let Ok(renamed) = ProjectStore::open()
+                        .and_then(|store| store.rename(&project.id, &project_name))
+                {
+                    self.project = Some(renamed);
+                }
                 self.settings.project_name = project_name;
                 self.settings.theme_name = theme_name.clone();
                 self.settings.task_sort = task_sort;
-                self.settings.escape_to_projects = modal.escape_to_projects;
                 self.theme = Theme::named(&theme_name);
                 self.refresh_after_action()?;
                 self.status = "Project settings saved".to_string();
@@ -4036,9 +4106,19 @@ impl App {
                     return Ok(());
                 };
                 match store.rename(&id, &name) {
-                    Ok(_) => {
+                    Ok(project) => {
+                        // The list reads the board's own settings name first,
+                        // so a rename that stopped at the registry would look
+                        // like it did nothing.
+                        let settings =
+                            crate::core::migrate::set_board_display_name(&project.data_root, &name);
                         self.refresh_projects()?;
-                        self.status = format!("Renamed project to {name}");
+                        self.status = match settings {
+                            Ok(()) => format!("Renamed project to {name}"),
+                            Err(err) => format!(
+                                "Renamed project to {name}, but its settings kept the old name: {err}"
+                            ),
+                        };
                     }
                     Err(err) => {
                         modal.error = Some(err.to_string());
@@ -4646,7 +4726,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
         theme_name: Theme::normalize_name(&tui_string(&config.tui, "theme", "dark")).to_string(),
         task_sort: normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
             .to_string(),
-        escape_to_projects: tui_bool(&config.tui, "escape_to_projects", false),
+        escape_to_projects: false,
         show_limits: tui_bool(&config.tui, "show_limits", true),
         limits_refresh_interval: ops
             .config

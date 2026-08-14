@@ -185,7 +185,14 @@ fn show(store: &ProjectStore, needle: &str) -> Result<ExitCode> {
 fn rename(store: &ProjectStore, needle: &str, new_name: &str) -> Result<ExitCode> {
     let project = require(store, needle)?;
     let renamed = store.rename(&project.id, new_name)?;
-    println!("Renamed project {} to {}", renamed.id, renamed.name);
+    // List display prefers `tui.name`; keep it in step with the registry.
+    match crate::core::migrate::set_board_display_name(&renamed.data_root, &renamed.name) {
+        Ok(()) => println!("Renamed project {} to {}", renamed.id, renamed.name),
+        Err(err) => println!(
+            "Renamed project {} to {}, but its settings kept the old name: {err}",
+            renamed.id, renamed.name
+        ),
+    }
     Ok(ExitCode::SUCCESS)
 }
 

@@ -2,11 +2,11 @@
 source: src/tui/tests.rs
 expression: rendered
 ---
-┌ Projects · Enter open · n new · r rename · p path · d delete · / filter · q quit ────────────┐
-│Demo Board           1/1/0/0 /tmp/k4ai-snap-work                                        never │
-│                                                                                              │
-│                                                                                              │
-│             ┌ Remove project ──────────────────────────────────────────────────┐             │
+┌ Projects · Enter open · n new · r rename · p path · s settings · d delete · / filter · q quit┐
+│    Project                               To Do  Doing  Review  Done  Agents       Last opened│
+├──────────────────────────────────────────────────────────────────────────────────────────────┤
+│    Demo Board                                1      1       0     0       ·             never│
+│    /tmp/k4ai┌ Remove project ──────────────────────────────────────────────────┐             │
 │             │Unregister project Demo Board? Board data stays in the store.     │             │
 │             │Space toggles whether board data is deleted.                      │             │
 │             │                                                                  │             │
@@ -29,23 +29,46 @@ expression: rendered
 │                                                                                              │
 │                                                                                              │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
- Projects │ Enter open · n new · r rename · p path · d delete · / filter · ? help               
+ Projects │ Enter open · n new · r rename · p path · d delete · s settings · / filter · ? help  
 
 --- style runs ---
 0:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 1:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
-1:1-95 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset).bold()
+1:1-5 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+1:5-12 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Reset).underline_color(Color::Reset).bold()
+1:12-43 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+1:43-48 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Reset).underline_color(Color::Reset).bold()
+1:48-50 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+1:50-55 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Reset).underline_color(Color::Reset).bold()
+1:55-57 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+1:57-63 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Reset).underline_color(Color::Reset).bold()
+1:63-65 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+1:65-69 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Reset).underline_color(Color::Reset).bold()
+1:69-71 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+1:71-77 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Reset).underline_color(Color::Reset).bold()
+1:77-84 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+1:84-95 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Reset).underline_color(Color::Reset).bold()
 1:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
-2:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
-2:1-95 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
-2:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+2:0-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Reset).underline_color(Color::Reset)
 3:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
-3:1-95 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+3:1-5 Style::new().fg(Color::Reset).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+3:5-15 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+3:15-54 Style::new().fg(Color::Reset).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+3:54-55 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+3:55-62 Style::new().fg(Color::Reset).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+3:62-63 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+3:63-68 Style::new().fg(Color::Reset).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+3:68-69 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+3:69-76 Style::new().fg(Color::Reset).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+3:76-77 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+3:77-90 Style::new().fg(Color::Reset).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+3:90-95 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
 3:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 4:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
-4:1-14 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+4:1-5 Style::new().fg(Color::Reset).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+4:5-14 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
 4:14-82 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-4:82-95 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+4:82-95 Style::new().fg(Color::Reset).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
 4:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 5:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 5:1-14 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)

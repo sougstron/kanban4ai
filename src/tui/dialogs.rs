@@ -46,6 +46,9 @@ pub enum Modal {
         questions: Vec<QuestionChoice>,
     },
     Settings,
+    /// Machine-wide settings (`<store>/config.yaml`), edited from the
+    /// projects list where no board context exists.
+    GlobalSettings,
     NewProject,
     RenameProject {
         id: String,
@@ -116,7 +119,7 @@ const TASK_FORM_FIELDS: [DialogField; 8] = [
     DialogField::Interactive,
 ];
 
-const SETTINGS_FORM_FIELDS: [DialogField; 8] = [
+const SETTINGS_FORM_FIELDS: [DialogField; 7] = [
     DialogField::Title,
     DialogField::Backend,
     DialogField::Model,
@@ -124,8 +127,9 @@ const SETTINGS_FORM_FIELDS: [DialogField; 8] = [
     DialogField::Agent,
     DialogField::Theme,
     DialogField::TaskSort,
-    DialogField::EscapeToProjects,
 ];
+
+const GLOBAL_SETTINGS_FORM_FIELDS: [DialogField; 1] = [DialogField::EscapeToProjects];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalButton {
@@ -287,6 +291,10 @@ impl ModalState {
                 DialogField::Agent,
                 DialogField::Theme,
                 DialogField::TaskSort,
+                DialogField::Confirm,
+                DialogField::Cancel,
+            ],
+            Modal::GlobalSettings => &[
                 DialogField::EscapeToProjects,
                 DialogField::Confirm,
                 DialogField::Cancel,
@@ -767,6 +775,7 @@ impl ModalState {
         let fields = match self.modal {
             Modal::NewTask { .. } | Modal::EditTask { .. } => Some(&TASK_FORM_FIELDS[..]),
             Modal::Settings => Some(&SETTINGS_FORM_FIELDS[..]),
+            Modal::GlobalSettings => Some(&GLOBAL_SETTINGS_FORM_FIELDS[..]),
             _ => None,
         };
         if let Some(fields) = fields {
@@ -903,6 +912,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
             render_answer(frame, app, modal, inner, task_id, questions, &mut hitboxes)
         }
         Modal::Settings => render_settings_form(frame, app, modal, inner, &mut hitboxes),
+        Modal::GlobalSettings => {
+            render_global_settings_form(frame, app, modal, inner, &mut hitboxes)
+        }
         Modal::NewProject => render_project_form(
             frame,
             app,
@@ -939,6 +951,23 @@ fn render_settings_form(
     hitboxes: &mut Vec<Hitbox>,
 ) {
     render_selector_form(frame, app, modal, area, hitboxes, &SETTINGS_FORM_FIELDS);
+}
+
+fn render_global_settings_form(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &mut ModalState,
+    area: Rect,
+    hitboxes: &mut Vec<Hitbox>,
+) {
+    render_selector_form(
+        frame,
+        app,
+        modal,
+        area,
+        hitboxes,
+        &GLOBAL_SETTINGS_FORM_FIELDS,
+    );
 }
 
 fn render_simple_confirm(
@@ -2081,6 +2110,7 @@ fn modal_title(modal: &Modal) -> &'static str {
         Modal::AddMessage { .. } => " Add to thread ",
         Modal::AnswerQuestion { .. } => " Answer question ",
         Modal::Settings => " Project settings ",
+        Modal::GlobalSettings => " Global settings ",
         Modal::NewProject => " New project ",
         Modal::RenameProject { .. } => " Rename project ",
         Modal::SetProjectPath { .. } => " Change project path ",

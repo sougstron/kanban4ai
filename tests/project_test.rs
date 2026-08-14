@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use kanban4ai::core::error::KanbanError;
-use kanban4ai::core::migrate::relocate_board;
+use kanban4ai::core::migrate::{board_display_name, relocate_board, set_board_display_name};
 use kanban4ai::core::models::{Session, SessionStatus};
 use kanban4ai::core::project::{AddOptions, Project, ProjectStore, normalize_path, slugify};
 use kanban4ai::core::session::SessionManager;
@@ -194,6 +194,48 @@ fn rename_changes_the_name_but_never_the_id_or_data_root() {
     assert_eq!(store.get("repo").unwrap().unwrap().name, "Renamed");
     assert!(store.rename(&project.id, "   ").is_err());
     assert!(store.rename("nope", "x").is_err());
+}
+
+fn write_board_name(data_root: &Path, yaml: &str) {
+    let kanban = data_root.join(".kanban");
+    fs::create_dir_all(&kanban).expect("kanban dir");
+    fs::write(kanban.join("config.yaml"), yaml).expect("board config");
+}
+
+#[test]
+fn board_display_name_reads_tui_name_and_ignores_the_default() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    assert_eq!(board_display_name(root), None, "no config yet");
+
+    write_board_name(root, "tui:\n  name: Kanban\n  theme: textual-dark\n");
+    assert_eq!(
+        board_display_name(root),
+        None,
+        "the init default is not a user-chosen name"
+    );
+
+    write_board_name(root, "tui:\n  name: Ledger\n  theme: textual-dark\n");
+    assert_eq!(board_display_name(root).as_deref(), Some("Ledger"));
+
+    write_board_name(root, "tui:\n  name: '  '\n");
+    assert_eq!(board_display_name(root), None);
+}
+
+#[test]
+fn set_board_display_name_writes_tui_name_without_adding_other_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    write_board_name(root, "tui:\n  name: Ledger\n  theme: textual-dark\n");
+
+    set_board_display_name(root, "Ledger Book").expect("write name");
+
+    let config = fs::read_to_string(root.join(".kanban/config.yaml")).expect("read config");
+    assert!(config.contains("name: Ledger Book"), "{config}");
+    assert!(config.contains("theme: textual-dark"), "{config}");
+    assert!(!config.contains("auto_launch"), "{config}");
+    assert_eq!(board_display_name(root).as_deref(), Some("Ledger Book"));
 }
 
 #[test]

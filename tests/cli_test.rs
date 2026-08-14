@@ -772,6 +772,33 @@ fn project_add_list_rename_remove_and_path() {
 }
 
 #[test]
+fn project_rename_updates_the_board_settings_name() {
+    let dir = Env::new();
+    kanban(&dir)
+        .args(["project", "add", ".", "--name", "Folder Name"])
+        .assert()
+        .success();
+
+    let config = dir.kanban().join("config.yaml");
+    let before = std::fs::read_to_string(&config).expect("board config");
+    assert!(
+        before.contains("name: Kanban") || before.contains("name: Folder Name"),
+        "{before}"
+    );
+
+    kanban(&dir)
+        .args(["project", "rename", "Folder Name", "Ledger Book"])
+        .assert()
+        .success();
+
+    let after = std::fs::read_to_string(&config).expect("board config after rename");
+    assert!(
+        after.contains("name: Ledger Book"),
+        "the projects list reads tui.name, so a CLI rename must write it: {after}"
+    );
+}
+
+#[test]
 fn project_flag_selects_a_registered_board() {
     let dir = board();
     kanban(&dir).args(["create", "Flagged"]).assert().success();
@@ -878,4 +905,153 @@ fn list_from_a_subdirectory_uses_the_registered_project() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Nested"));
+}
+
+#[test]
+fn statusline_bridge_feeds_the_claude_limits_row() {
+    let dir = Env::new();
+    let payload = r#"{"session_id":"ses-1","model":{"id":"claude-opus-5"},"rate_limits":{
+        "five_hour":{"used_percentage":34.0,"resets_at":2000000000},
+        "seven_day":{"used_percentage":3.0,"resets_at":2000000000}}}"#;
+
+    kanban(&dir)
+        .arg("statusline-bridge")
+        .write_stdin(payload)
+        .assert()
+        .success()
+        .stdout("");
+
+    let bridge: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.store().join("claude-rate-limits.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bridge["windows"][0]["label"], "5h");
+    assert_eq!(bridge["windows"][0]["remaining_percent"], 66.0);
+    assert_eq!(bridge["windows"][1]["label"], "7d");
+    assert_eq!(bridge["windows"][1]["remaining_percent"], 97.0);
+
+    // A current bridge answers without polling the usage endpoint, so the
+    // claude entry is deterministic even with the network unreachable.
+    let output = kanban(&dir)
+        .args(["limits", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let limits: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let claude = limits["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["provider"] == "claude")
+        .unwrap();
+    assert_eq!(claude["state"], "ready");
+    assert_eq!(claude["windows"][0]["label"], "5h");
+    assert_eq!(claude["windows"][0]["remaining_percent"], 66.0);
+}
+
+#[test]
+fn statusline_bridge_ignores_payloads_without_rate_limits() {
+    let dir = Env::new();
+
+    kanban(&dir)
+        .arg("statusline-bridge")
+        .write_stdin(r#"{"session_id":"ses-1","context_window":{"total_input_tokens":10}}"#)
+        .assert()
+        .success()
+        .stdout("");
+
+    assert!(!dir.store().join("claude-rate-limits.json").exists());
+}
+
+#[test]
+fn limits_bridge_install_wraps_and_restores_the_statusline() {
+    let dir = Env::new();
+    let config = tempfile::tempdir().unwrap();
+    let settings = config.path().join("settings.json");
+    std::fs::write(
+        &settings,
+        r#"{"model":"claude-opus-5","statusLine":{"type":"command","command":"tr a-z A-Z","refreshInterval":60}}"#,
+    )
+    .unwrap();
+
+    let install = |dir: &Env| {
+        let mut cmd = kanban(dir);
+        cmd.env("CLAUDE_CONFIG_DIR", config.path());
+        cmd.args(["limits", "bridge", "install"]).assert().success();
+    };
+    install(&dir);
+
+    let settings_json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    let command = settings_json["statusLine"]["command"].as_str().unwrap();
+    assert!(command.contains("claude-statusline-bridge.sh"));
+    assert_eq!(settings_json["statusLine"]["type"], "command");
+    assert_eq!(settings_json["statusLine"]["refreshInterval"], 60);
+    assert_eq!(settings_json["model"], "claude-opus-5");
+    assert!(
+        settings
+            .with_file_name("settings.json.kanban4ai-bak")
+            .exists()
+    );
+
+    let wrapper = dir.store().join("claude-statusline-bridge.sh");
+    let script = std::fs::read_to_string(&wrapper).unwrap();
+    assert!(script.contains("statusline-bridge"));
+    assert!(script.contains("printf '%s' \"$payload\" | tr a-z A-Z"));
+    use std::os::unix::fs::PermissionsExt;
+    assert!(std::fs::metadata(&wrapper).unwrap().permissions().mode() & 0o111 != 0);
+    assert_eq!(
+        std::fs::read_to_string(dir.store().join("claude-statusline-bridge.original"))
+            .unwrap()
+            .trim(),
+        "tr a-z A-Z"
+    );
+
+    // Reinstall does not nest the wrap; the sidecar keeps the true original.
+    install(&dir);
+    let reinstalled: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(
+        reinstalled["statusLine"]["command"].as_str().unwrap(),
+        command
+    );
+
+    // The wrapper records a statusline payload and passes it through to the
+    // original command unchanged.
+    assert_cmd::Command::new("sh")
+        .arg(&wrapper)
+        .env("KANBAN_HOME", dir.store())
+        .write_stdin(
+            r#"{"rate_limits":{"five_hour":{"used_percentage":10.0,"resets_at":2000000000}}}"#,
+        )
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("RATE_LIMITS"));
+    let bridge: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(dir.store().join("claude-rate-limits.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bridge["windows"][0]["remaining_percent"], 90.0);
+
+    let mut cmd = kanban(&dir);
+    cmd.env("CLAUDE_CONFIG_DIR", config.path());
+    cmd.args(["limits", "bridge", "remove"]).assert().success();
+
+    let restored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+    assert_eq!(restored["statusLine"]["command"], "tr a-z A-Z");
+    assert_eq!(restored["model"], "claude-opus-5");
+    assert!(!dir.store().join("claude-statusline-bridge.sh").exists());
+    assert!(
+        !dir.store()
+            .join("claude-statusline-bridge.original")
+            .exists()
+    );
+    assert!(
+        !settings
+            .with_file_name("settings.json.kanban4ai-bak")
+            .exists()
+    );
 }

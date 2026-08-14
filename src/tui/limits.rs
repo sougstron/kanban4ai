@@ -13,7 +13,8 @@
 //! The codex and grok segments are clickable: a click refreshes that provider
 //! through its own CLI (fresh codex numbers via the app-server RPC, a renewed
 //! grok token via the grok CLI — see [`crate::core::limits::refresh_provider_async`]).
-//! Claude has no CLI-side refresh to offer, so its segment is display-only.
+//! Claude, zai, and synthetic have no CLI-side refresh to offer, so their
+//! segments are display-only.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -49,6 +50,8 @@ fn provider_color(app: &App, provider: &str) -> Color {
     match provider {
         "claude" => Color::Rgb(203, 123, 93),
         "codex" => Color::Rgb(90, 190, 160),
+        "zai" => Color::Rgb(112, 145, 219),
+        "synthetic" => Color::Rgb(178, 142, 212),
         _ => app.theme.fg,
     }
 }
@@ -58,6 +61,8 @@ pub fn provider_icon(provider: &str) -> &'static str {
         "claude" => "✳",
         "codex" => "✺",
         "grok" => "✕",
+        "zai" => "◆",
+        "synthetic" => "✦",
         _ => "•",
     }
 }

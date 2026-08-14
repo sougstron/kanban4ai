@@ -222,7 +222,9 @@ pub fn run(start: TuiStart) -> Result<()> {
         match event::run_event_loop(terminal.terminal_mut(), &mut app, &threads)? {
             LoopOutcome::Quit => break,
             LoopOutcome::OpenProject(project) => {
-                app = app::App::for_project(project)?;
+                let mut next = app::App::for_project(project)?;
+                next.apply_global_settings();
+                app = next;
             }
             LoopOutcome::ShowProjects { return_to } => {
                 app = app::App::projects_only(return_to)?;
@@ -234,8 +236,16 @@ pub fn run(start: TuiStart) -> Result<()> {
 
 fn app_from_start(start: TuiStart) -> Result<app::App> {
     match start {
-        TuiStart::Project(project) => app::App::for_project(project),
-        TuiStart::InPlace(path) => app::App::new(&path),
+        TuiStart::Project(project) => {
+            let mut app = app::App::for_project(project)?;
+            app.apply_global_settings();
+            Ok(app)
+        }
+        TuiStart::InPlace(path) => {
+            let mut app = app::App::new(&path)?;
+            app.apply_global_settings();
+            Ok(app)
+        }
         TuiStart::Projects { return_to } => app::App::projects_only(return_to),
     }
 }

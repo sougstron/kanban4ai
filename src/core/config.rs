@@ -62,7 +62,6 @@ tui:
   theme: textual-dark
   task_sort: task_number
   show_limits: true
-  escape_to_projects: false
 auto_launch:
   enabled: true
   use_tmux: true
@@ -204,7 +203,7 @@ impl BoardConfig {
     }
 }
 
-fn as_bool(value: &Value) -> Option<bool> {
+pub(crate) fn as_bool(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(b) => Some(*b),
         Value::String(s) => match s.to_lowercase().as_str() {

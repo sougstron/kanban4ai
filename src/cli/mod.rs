@@ -1,6 +1,7 @@
 //! The `kanban` command-line interface (clap). Output text mirrors the Python
 //! CLI so existing agent prompts and scripts keep working unchanged.
 
+mod bridge;
 mod init;
 mod project;
 mod resolve;
@@ -289,7 +290,7 @@ enum Command {
     Recover { task_id: String },
     /// List active sessions.
     Sessions,
-    /// Show remaining subscription limits for the agent providers (claude, codex, grok).
+    /// Show remaining subscription limits for the agent providers (claude, codex, grok, zai, synthetic).
     Limits {
         /// Output format
         #[arg(long = "format", value_parser = ["table", "json"], default_value = "table")]
@@ -297,6 +298,8 @@ enum Command {
         /// Poll the providers even when the cached snapshot is still fresh
         #[arg(long)]
         refresh: bool,
+        #[command(subcommand)]
+        bridge: Option<bridge::LimitsBridge>,
     },
     /// Launch the TUI kanban board.
     Tui,
@@ -334,6 +337,10 @@ enum Command {
     /// transcript file for input-provenance harvesting.
     #[command(name = "format-stream", hide = true)]
     FormatStream,
+    /// Internal command invoked by the claude statusline bridge shim: record
+    /// the rate_limits Claude Code pipes to the statusline on stdin.
+    #[command(name = "statusline-bridge", hide = true)]
+    StatuslineBridge,
 }
 
 /// Read a file named by an agent on the command line (`context --file`,
@@ -424,7 +431,7 @@ fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
         let age = entry
             .data_age(now)
             .filter(|age| *age >= 60)
-            .map(|age| format!("  (from a session {} ago)", limits::format_span(age)))
+            .map(|age| format!("  ({} old)", limits::format_span(age)))
             .unwrap_or_default();
         for (index, window) in entry.windows.iter().enumerate() {
             let name = if index == 0 { provider } else { "" };
@@ -456,11 +463,22 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             format_stream(std::io::stdin().lock(), &mut std::io::stdout().lock())?;
             return Ok(ExitCode::SUCCESS);
         }
+        Command::StatuslineBridge => {
+            bridge::statusline_bridge(&mut std::io::stdin().lock());
+            return Ok(ExitCode::SUCCESS);
+        }
         Command::Limits {
             output_format,
             refresh,
+            bridge: bridge_command,
         } => {
-            print_limits(&output_format, refresh)?;
+            match bridge_command {
+                Some(bridge::LimitsBridge::Bridge { action }) => match action {
+                    bridge::BridgeAction::Install => bridge::bridge_install()?,
+                    bridge::BridgeAction::Remove => bridge::bridge_remove()?,
+                },
+                None => print_limits(&output_format, refresh)?,
+            }
             return Ok(ExitCode::SUCCESS);
         }
         Command::Tui => return launch_tui(cli.project.as_deref()),
@@ -906,7 +924,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 );
             }
         }
-        Command::Tui | Command::Limits { .. } => unreachable!("handled before resolve"),
+        Command::Tui | Command::Limits { .. } | Command::StatuslineBridge => {
+            unreachable!("handled before resolve")
+        }
         Command::Attach { task_id } => {
             let Some(task) = ops.storage.load_task(&task_id)? else {
                 eprintln!("Task {task_id} not found");

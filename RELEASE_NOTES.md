@@ -1,40 +1,43 @@
-# kanban4ai 0.4.1
+# kanban4ai 0.4.2
 
 ## Highlights
 
-- The Board and Projects screens now show remaining AI subscription capacity
-  in a row above the status bar (`✳ claude 5h 66% ↻3h30m · 7d 95% ↻6d11h │
-  ✺ codex mon 75% ↻18d │ ✕ grok 7d 93% ↻4d22h`). Percentages are what remains,
-  not what is spent. Providers with no credentials on the machine are omitted.
-  `kanban limits [--format table|json] [--refresh]` prints the same data.
-- Sources are read-only and best effort: claude via Anthropic's OAuth usage
-  endpoint, grok via its billing API, both through `curl -K -` so tokens never
-  appear on a command line; codex from the last local `rate_limits` payload
-  (no network), so those numbers carry the age of the last run. Results are
-  cached in memory and in `<store>/limits.json` with a configurable TTL
-  (`limits_refresh_interval`, default 120s). `tui.show_limits` hides the row.
-- Clicking the codex or grok segment refreshes that provider through its own
-  CLI: codex is asked live over the app-server JSON-RPC, and `grok models`
-  renews the short-lived OIDC token before the billing fetch. Claude stays
-  display-only. Both CLIs run in a scratch store cwd so stray session state
-  never lands in a project.
-- Projects-list rows put column counts, the running-session `▶` count, and the
-  unreviewed `●` marker next to the project name. The work path still fills
-  the middle; last opened stays on the right.
-- `P` opens the projects list from a Russian keyboard layout as well (`З`).
-  New opt-in `tui.escape_to_projects` (Project Settings checkbox, default
-  off) makes Esc on the Board open that list after any search filter is
-  cleared.
+- Claude remaining-capacity now prefers the Claude Code statusline bridge
+  (`kanban limits bridge install` / `remove`). Claude Code (>= 2.1.80) pipes
+  `rate_limits` to the statusline on every turn; a generated shim tees that
+  into `<store>/claude-rate-limits.json` while the original command still
+  renders the line. The OAuth usage endpoint is only a fallback, and a 429
+  no longer replaces last-good windows with `n/a` — the snapshot TTL doubles
+  after each consecutive 429 (capped at 64×). Claude windows carry their
+  true observation time so the row can show age the way codex does.
+- The limits row and `kanban limits` now include z.ai (`◆`) and Synthetic
+  (`✦`). z.ai reads the GLM Coding Plan quota from opencode's
+  `zai-coding-plan` key; Synthetic reads `$SYNTHETIC_API_KEY` or opencode's
+  `synthetic.key`. Both segments are display-only (long-lived keys; the
+  background poll keeps them fresh).
+- Machine-wide settings live at `<store>/config.yaml`. The Projects screen
+  opens Global Settings with `s`; the Esc-from-board toggle moved there out
+  of per-project Project Settings. A stale per-project
+  `tui.escape_to_projects` key is ignored — boards that had it on need the
+  toggle re-enabled once globally.
+- The projects list is a labelled two-line table: the board's Project
+  Settings name (or the registry name), the work path, right-aligned column
+  counts, and Agents / Last opened that drop on a narrow terminal. A yellow
+  `?` marks boards with open questions; `●` still marks unseen Review work.
+  `kanban project rename` and the TUI rename write `tui.name` so the list
+  shows the new name.
 
 ## Verification coverage
 
-- Unit tests in `src/core/limits.rs` cover transcript and RPC payload parsing
-  for codex windows, including camelCase app-server responses.
-- TUI tests cover the limits row (placement, width degradation, hide/disable,
-  Projects screen), click hitboxes on codex and grok only, and the click
-  status message.
-- TUI tests cover the Russian `З` projects hotkey, Esc-to-projects on/off and
-  search-clear ordering, persisting the setting, and the projects-row layout
-  snapshots.
+- Unit tests in `src/core/limits.rs` cover Claude statusline and OAuth
+  payload parsing, bridge-vs-HTTP source preference, 429 TTL backoff, z.ai
+  quota mapping (live-shaped payload, fallbacks, monthly-MCP sentinel), and
+  Synthetic quota mapping (live-shaped and docs-example fallbacks).
+- CLI tests cover `kanban limits bridge install` / `remove`, the hidden
+  `statusline-bridge` recorder, and `kanban project rename` writing
+  `tui.name`.
+- `core::global` tests cover the store-root config round trip; TUI tests
+  cover the Global Settings dialog, projects-table layout snapshots, the
+  question-mark flag, and display-name preference.
 - Release checks for this version include rustfmt, clippy with warnings
   denied, locked tests, a release build, and installer packaging smoke tests.
