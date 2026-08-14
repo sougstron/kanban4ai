@@ -1,42 +1,41 @@
-# kanban4ai 0.3.5
+# kanban4ai 0.4.0
 
 ## Highlights
 
-- The agent's closing answer is now recorded on the task thread. A session's
-  final reply — the summary the backend prints as its last words — used to live
-  only in `.kanban/logs/<session>.log`, so the thread showed the audit trail
-  (launch, agent-written context, exit) but never what the agent actually said.
-  At exit `reconcile_agent_exit` now extracts the final assistant message from
-  the backend's machine transcript and posts it as a `context` message
-  (role `agent`, author `agent-reply`) just before the `■ exit` audit line, so
-  the reply is thread content like any other context entry and feeds the next
-  prompt.
-  - claude: the `result` event's `result` is the finished answer; without one
-    (interrupted run) the last `assistant` message's `text` blocks are used,
-    grouped by `message.id` so earlier turns are dropped.
-  - opencode: `text` events carry `part.messageID`, so the final message is the
-    last group of text parts sharing one id.
-  - pi / omp: the last assistant `message_end` carrying text (`turn_end`
-    duplicates it and is skipped).
-  - Backends with no parseable transcript, and runs that ended without printing
-    text, record nothing. Text identical to an existing `context` message is
-    not posted again (agents commonly repeat their summary through
-    `kanban context`), and the body is clamped to `agent_reply_max_chars` with a
-    `... (agent reply truncated)` marker; `0` disables the capture entirely.
-- New configurable threshold `agent_reply_max_chars` (default 4000) controls the
-  maximum length of the recorded reply; `0` disables agent reply capture. No
-  hardcoded budget in business logic.
+- Board data now lives in a central projects store instead of a local
+  `.kanban/` inside the work folder. A project is two paths: the **work path**
+  (agent cwd) and the **data root** (`<store>/projects/<id>/.kanban`). There is
+  no pointer file in the repo. Store root resolution is `$KANBAN_HOME`, then
+  `$XDG_DATA_HOME/kanban4ai`, then `$HOME/.local/share/kanban4ai`.
+- `kanban init` registers the folder in the store and creates the board there.
+  An existing local `.kanban` is migrated (rename first, verified copy on
+  `EXDEV`). Repeat init is a no-op. Unregistered boards found in cwd are
+  adopted silently, or left in place with a warning if sessions are active.
+- New `kanban project` commands: list, add, show, rename, set-path, path,
+  remove, and open. Every subcommand accepts global `--project`, and agent
+  wrappers export `$KANBAN_PROJECT` / `$KANBAN_DATA_DIR` so callbacks stay
+  unambiguous after `cd`. Prompt paths are absolute under the data root.
+- The TUI adds a projects list (`P`). With no resolved project, `kanban` /
+  `kanban tui` open that list instead of exiting. Rows show the work path,
+  column counts, active sessions, and last opened. Unknown cwd gets a pinned
+  create row; delete unregisters by default and can also purge board data.
+- Tasks an agent moves into Review now show a yellow `●` unseen marker on the
+  card and on the project row. Opening the task, answering, rerunning, or any
+  human move clears it. The flag is omitted from frontmatter while false so
+  legacy boards still round-trip byte-identically.
+- The review-edits field now accepts Ctrl+Left/Right/Up/Down for word and
+  paragraph motion, and Ctrl+Backspace / Ctrl+Delete to delete the previous or
+  next word. Ctrl+S and Ctrl+R remain the save and re-run shortcuts.
 
 ## Verification coverage
 
-- Unit tests in `src/core/reply.rs`: transcript parsing and truncation for each
-  backend, deduplication against existing context, and the disabled
-  (`agent_reply_max_chars = 0`) case.
-- Integration tests in `tests/operations_test.rs`: `reconcile_agent_exit` posts
-  the reply as `context` / `agent-reply` immediately before the `■ exit` step,
-  and a repeated/stale `agent-exit` callback cannot duplicate it.
-- Verified against real on-disk transcripts: the opencode transcript of an
-  earlier task yields exactly the answer that was missing from its thread;
-  claude transcripts yield their `result` text.
+- Store tests cover registry CRUD, cwd resolution, rename / EXDEV migration,
+  `--copy` / `--force`, silent adoption, and in-place fallback.
+- CLI tests cover `init`, `project` subcommands, global `--project`, and
+  `$KANBAN_PROJECT` resolution.
+- TUI tests cover the projects list, create-for-cwd row, and delete dialog,
+  plus review-editor word motion/delete and Ctrl+S regression cases.
+- Operations and golden-compat tests cover `review_unseen` set/clear paths and
+  legacy frontmatter round-trip.
 - Release checks for this version include rustfmt, clippy with warnings
   denied, locked tests, a release build, and installer packaging smoke tests.

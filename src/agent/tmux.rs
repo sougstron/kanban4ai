@@ -3,29 +3,33 @@ use std::process::{Command, Stdio};
 
 use crate::agent::backends::{AutoLaunchConfig, LaunchPlan};
 use crate::core::error::{KanbanError, Result};
+use crate::core::project::Roots;
 
-pub fn spawn_plan(
-    project_path: &Path,
+/// Start the planned agent run. The process runs in `roots.work_path`; every
+/// file it is pointed at lives under `roots.data_root`.
+pub fn spawn_plan<'a>(
+    roots: impl Into<Roots<'a>>,
     plan: &LaunchPlan,
     config: &AutoLaunchConfig,
 ) -> Result<bool> {
+    let roots = roots.into();
     if let Some(parent) = plan.log_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
     if config.use_tmux && command_available("tmux") {
-        return spawn_tmux(project_path, plan).or_else(|err| {
+        return spawn_tmux(roots, plan).or_else(|err| {
             if config.terminal_fallback {
                 eprintln!(
                     "Warning: tmux launch failed ({err}); falling back to background process."
                 );
-                spawn_background(project_path, plan)
+                spawn_background(roots, plan)
             } else {
                 Err(err)
             }
         });
     }
     if config.terminal_fallback {
-        spawn_background(project_path, plan)
+        spawn_background(roots, plan)
     } else {
         eprintln!("Warning: tmux is not available and terminal_fallback is disabled.");
         Ok(false)
@@ -88,8 +92,8 @@ pub fn run_foreground(command: &str, args: &[String], cwd: Option<&Path>) -> Res
     Ok(cmd.status()?.success())
 }
 
-fn spawn_tmux(project_path: &Path, plan: &LaunchPlan) -> Result<bool> {
-    let script = wrapper_script(project_path, plan);
+fn spawn_tmux(roots: Roots<'_>, plan: &LaunchPlan) -> Result<bool> {
+    let script = wrapper_script(roots, plan);
     let status = Command::new("tmux")
         .args([
             "new-session",
@@ -105,11 +109,12 @@ fn spawn_tmux(project_path: &Path, plan: &LaunchPlan) -> Result<bool> {
     Ok(status.success())
 }
 
-fn spawn_background(project_path: &Path, plan: &LaunchPlan) -> Result<bool> {
-    let script = wrapper_script(project_path, plan);
+fn spawn_background<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> Result<bool> {
+    let roots = roots.into();
+    let script = wrapper_script(roots, plan);
     Command::new("bash")
         .args(["-c", &script])
-        .current_dir(project_path)
+        .current_dir(roots.work_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -117,7 +122,8 @@ fn spawn_background(project_path: &Path, plan: &LaunchPlan) -> Result<bool> {
     Ok(true)
 }
 
-fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
+fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String {
+    let roots = roots.into();
     let mut command_parts = std::iter::once(plan.command.as_str())
         .chain(plan.args.iter().map(String::as_str))
         .map(shell_quote)
@@ -201,9 +207,20 @@ fn wrapper_script(project_path: &Path, plan: &LaunchPlan) -> String {
         ),
         None => format!("{command_line}{stdin_redirect} 2>&1 | tee -a {log_quoted}"),
     };
+    // The agent runs in the work folder, so it can no longer reach the board
+    // by a relative `.kanban/…` path: export where the data lives (and which
+    // project it belongs to) so callbacks and habits both resolve.
+    let project_export = roots
+        .project_id
+        .map(|id| format!("export KANBAN_PROJECT={}; ", shell_quote(id)))
+        .unwrap_or_default();
+    let data_dir_export = format!(
+        "export KANBAN_DATA_DIR={}; ",
+        shell_quote(&roots.kanban_dir().display().to_string())
+    );
     format!(
-        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; mkdir -p {}; {}{}{run_pipeline}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",
-        shell_quote(&project_path.display().to_string()),
+        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; {project_export}{data_dir_export}mkdir -p {}; {}{}{run_pipeline}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",
+        shell_quote(&roots.work_path.display().to_string()),
         shell_quote(&plan.session_id),
         shell_quote(&plan.task_id),
         kanban_cmd,
@@ -304,6 +321,70 @@ mod tests {
             heartbeat_interval_secs: 100,
             resolve_agent: None,
         }
+    }
+
+    /// With the board in the store, the wrapper must `cd` into the *work*
+    /// folder and hand the agent the board's location through the
+    /// environment — a relative `.kanban/…` would otherwise land in the repo.
+    #[test]
+    fn wrapper_script_runs_in_the_work_folder_and_exports_the_project() {
+        let data_root = tempfile::tempdir().unwrap();
+        let work_path = tempfile::tempdir().unwrap();
+        let logs_dir = data_root.path().join(".kanban/logs");
+        let plan = test_plan(
+            &logs_dir,
+            "TASK-001",
+            "ses-split",
+            "/bin/echo",
+            vec!["hello".to_string()],
+            false,
+        );
+        let roots = Roots::new(data_root.path(), work_path.path(), Some("my-project"));
+
+        let script = wrapper_script(roots, &plan);
+
+        assert!(script.contains(&format!(
+            "cd {}",
+            shell_quote(&work_path.path().display().to_string())
+        )));
+        assert!(script.contains("export KANBAN_PROJECT=my-project"));
+        assert!(script.contains(&format!(
+            "export KANBAN_DATA_DIR={}",
+            shell_quote(&data_root.path().join(".kanban").display().to_string())
+        )));
+        assert!(script.contains(&format!(
+            "mkdir -p {}",
+            shell_quote(&logs_dir.display().to_string())
+        )));
+
+        let output = Command::new("bash")
+            .args(["-n", "-c", &script])
+            .output()
+            .expect("bash -n should run");
+        assert!(
+            output.status.success(),
+            "generated script must be valid bash: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A board used in place has no registration, so no `KANBAN_PROJECT`.
+    #[test]
+    fn wrapper_script_omits_project_export_for_an_in_place_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = test_plan(
+            dir.path(),
+            "TASK-001",
+            "ses-in-place",
+            "/bin/echo",
+            vec![],
+            false,
+        );
+
+        let script = wrapper_script(dir.path(), &plan);
+
+        assert!(!script.contains("KANBAN_PROJECT"));
+        assert!(script.contains("export KANBAN_DATA_DIR="));
     }
 
     /// Verify the generated shell script parses without error under

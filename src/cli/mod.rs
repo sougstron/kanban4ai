@@ -1,12 +1,18 @@
 //! The `kanban` command-line interface (clap). Output text mirrors the Python
 //! CLI so existing agent prompts and scripts keep working unchanged.
 
+mod init;
+mod project;
+mod resolve;
+
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
 use clap::{Parser, Subcommand};
+
+use project::ProjectCommand;
 
 use crate::agent::{attach_to_session, resolve_opencode_agent};
 use crate::core::ask_form::AskForm;
@@ -27,6 +33,9 @@ use crate::core::timefmt;
     about = "Kanban board for local task management within projects."
 )]
 pub struct Cli {
+    /// Project id, name, or work path (overrides cwd / $KANBAN_PROJECT)
+    #[arg(long, global = true)]
+    project: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -58,12 +67,21 @@ enum Command {
         #[arg(long = "chain-to")]
         chained_to: Option<String>,
     },
-    /// Initialize kanban board in current or specified directory.
+    /// Register a project in the store (migrating a local .kanban if present).
     Init {
-        /// Project path to initialize
+        /// Folder to register
         #[arg(long, default_value = ".")]
         path: String,
+        /// Copy the local .kanban into the store instead of moving it
+        #[arg(long)]
+        copy: bool,
+        /// Move even when the board has active agent sessions
+        #[arg(long)]
+        force: bool,
     },
+    /// Manage registered projects.
+    #[command(subcommand)]
+    Project(ProjectCommand),
     /// List all tasks.
     List {
         /// Filter by status
@@ -172,7 +190,7 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Launch a revert agent using files saved under .kanban/backups/<task>.
+    /// Launch a revert agent using files saved under the board's backups/<task>.
     Revert {
         task_id: String,
         /// Session ID for the revert agent
@@ -245,7 +263,7 @@ enum Command {
     },
     /// Run a command detached from the agent session so it survives the
     /// session's exit, then declare a wait for its result. Output is appended
-    /// to .kanban/detached/<task>-<stamp>.log, the exit code is written to
+    /// to the board's detached/<task>-<stamp>.log, the exit code is written to
     /// the matching .status file, and the agent is relaunched after the wait
     /// deadline to check them.
     Detach {
@@ -308,6 +326,30 @@ enum Command {
     FormatStream,
 }
 
+/// Read a file named by an agent on the command line (`context --file`,
+/// `ask-form --file`).
+///
+/// An agent's working directory is the code folder while the board lives under
+/// the data root, so a relative `.kanban/…` path — the shape agents used
+/// before the split, and still write out of habit — is retried against the
+/// board before giving up.
+fn read_agent_file(ops: &Operations, path: &str) -> Result<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(text),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let candidate = Path::new(path);
+            if candidate.is_absolute() {
+                return Err(err.into());
+            }
+            // `.kanban/forms/x.yaml` and `forms/x.yaml` both land in the board.
+            let relative = candidate.strip_prefix(".kanban").unwrap_or(candidate);
+            let in_board = ops.data_root().join(".kanban").join(relative);
+            std::fs::read_to_string(&in_board).map_err(|_| err.into())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn env_session(explicit: Option<String>) -> String {
     explicit
         .or_else(|| std::env::var("KANBAN_SESSION").ok())
@@ -316,7 +358,7 @@ fn env_session(explicit: Option<String>) -> String {
 
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
-    match dispatch(cli.command.unwrap_or(Command::Tui)) {
+    match dispatch(cli) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("Error: {err}");
@@ -325,8 +367,32 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn dispatch(command: Command) -> Result<ExitCode> {
-    let ops = Operations::new(".");
+fn launch_tui(selector: Option<&str>) -> Result<ExitCode> {
+    match resolve::resolve_tui(selector)? {
+        Some(resolve::Resolved::Project(project)) => crate::tui::run_project(project)?,
+        Some(resolve::Resolved::InPlace(path)) => crate::tui::run_in_place(path)?,
+        None => crate::tui::run(crate::tui::TuiStart::Projects { return_to: None })?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn dispatch(cli: Cli) -> Result<ExitCode> {
+    let command = cli.command.unwrap_or(Command::Tui);
+    match command {
+        Command::Init { path, copy, force } => return init::init(&path, copy, force),
+        Command::Project(command) => return project::run(command),
+        Command::ResolveAgent { requested, command } => {
+            println!("{}", resolve_opencode_agent(&command, &requested));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::FormatStream => {
+            format_stream(std::io::stdin().lock(), &mut std::io::stdout().lock())?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::Tui => return launch_tui(cli.project.as_deref()),
+        _ => {}
+    }
+    let ops = resolve::resolve_project(cli.project.as_deref())?.operations();
     match command {
         Command::Create {
             title,
@@ -353,11 +419,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 println!("Chained to {chained_to} (auto-runs when it reaches Review)");
             }
         }
-        Command::Init { path } => {
-            let ops = Operations::new(&path);
-            ops.storage.init_board()?;
-            println!("Initialized kanban board at {path}/.kanban");
-        }
+        Command::Init { .. } | Command::Project(_) => unreachable!("handled before resolve"),
         Command::List {
             status,
             search,
@@ -424,11 +486,11 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             source,
         } => {
             let text = match file {
-                Some(path) => std::fs::read_to_string(&path)?,
+                Some(path) => read_agent_file(&ops, &path)?,
                 None => text,
             };
             let session_id = std::env::var("KANBAN_SESSION").ok();
-            ContextManager::new(".").append_context_with_session(
+            ContextManager::new(ops.data_root()).append_context_with_session(
                 &task_id,
                 &text,
                 &source,
@@ -489,7 +551,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             agent,
             session,
         } => {
-            let text = std::fs::read_to_string(&file)?;
+            let text = read_agent_file(&ops, &file)?;
             let form = AskForm::parse(&text)?;
             let source = if agent { "agent" } else { "user" };
             let session_id = agent
@@ -650,16 +712,18 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 println!("\nDescription:\n{}", task.description);
             }
             if with_context {
-                let context = ContextManager::new(".").get_context(&task_id, &ops.storage)?;
+                let context =
+                    ContextManager::new(ops.data_root()).get_context(&task_id, &ops.storage)?;
                 if !context.is_empty() {
                     println!("\nContext:\n{context}");
                 }
             }
         }
         Command::Compact { task_id, force } => {
-            let config = Config::new(".");
+            let config = Config::new(ops.data_root());
             let threshold = config.get_threshold("context_auto_compact")? as usize;
-            let result = CompactionManager::new(".").compact_context(&task_id, threshold, force)?;
+            let result = CompactionManager::new(ops.data_root())
+                .compact_context(&task_id, threshold, force)?;
             match result.status {
                 CompactionStatus::Compacted => {
                     println!(
@@ -677,7 +741,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         }
         Command::Heartbeat { session } => {
             let session_id = env_session(session);
-            SessionManager::new(".").heartbeat(&session_id)?;
+            SessionManager::new(ops.data_root()).heartbeat(&session_id)?;
             println!("Heartbeat updated for session {session_id}");
         }
         Command::Waiting {
@@ -720,8 +784,9 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             for (task_id, session_id) in &resumed {
                 println!("Resumed {task_id} after wait deadline → {session_id}");
             }
-            let timeout = Config::new(".").get_threshold("session_heartbeat_timeout")?;
-            let crashed = SessionManager::new(".").check_sessions(timeout)?;
+            let timeout =
+                Config::new(ops.data_root()).get_threshold("session_heartbeat_timeout")?;
+            let crashed = SessionManager::new(ops.data_root()).check_sessions(timeout)?;
             if crashed.is_empty() {
                 println!("No crashed sessions found.");
             } else {
@@ -738,7 +803,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             None => eprintln!("Task {task_id} not found"),
         },
         Command::Sessions => {
-            let session_mgr = SessionManager::new(".");
+            let session_mgr = SessionManager::new(ops.data_root());
             let active = session_mgr.list_active_sessions();
             if active.is_empty() {
                 println!("No active sessions.");
@@ -759,7 +824,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                         None => session.task_id.clone(),
                     },
                 };
-                let tokens = estimate_session_tokens(Path::new("."), &session.id);
+                let tokens = estimate_session_tokens(ops.data_root(), &session.id);
                 let tokens_label = tokens.map_or("unknown".to_string(), format_thousands);
                 println!(
                     "▶ {:<26} {:<36} {:<12} {:<16} {}",
@@ -767,9 +832,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
                 );
             }
         }
-        Command::Tui => {
-            crate::tui::run(".")?;
-        }
+        Command::Tui => unreachable!("handled before resolve"),
         Command::Attach { task_id } => {
             let Some(task) = ops.storage.load_task(&task_id)? else {
                 eprintln!("Task {task_id} not found");
@@ -777,7 +840,7 @@ fn dispatch(command: Command) -> Result<ExitCode> {
             };
             // A task keeps its last session id after that session ends, so
             // presence alone does not mean there is anything to attach to.
-            let session_mgr = SessionManager::new(".");
+            let session_mgr = SessionManager::new(ops.data_root());
             let Some(session_id) = task
                 .session
                 .as_deref()
@@ -830,11 +893,8 @@ fn dispatch(command: Command) -> Result<ExitCode> {
         Command::WaitResume { task_id, session } => {
             wait_resume_monitor(&ops, &task_id, &session)?;
         }
-        Command::ResolveAgent { requested, command } => {
-            println!("{}", resolve_opencode_agent(&command, &requested));
-        }
-        Command::FormatStream => {
-            format_stream(std::io::stdin().lock(), &mut std::io::stdout().lock())?;
+        Command::ResolveAgent { .. } | Command::FormatStream => {
+            unreachable!("handled before resolve")
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -860,7 +920,7 @@ fn format_stream(input: impl std::io::BufRead, output: &mut impl std::io::Write)
 }
 
 fn wait_resume_monitor(ops: &Operations, task_id: &str, session_id: &str) -> Result<()> {
-    let session_mgr = SessionManager::new(".");
+    let session_mgr = SessionManager::new(ops.data_root());
     loop {
         let Some(session) = session_mgr.load_session(session_id) else {
             return Ok(());

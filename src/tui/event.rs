@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -10,6 +10,7 @@ use ratatui::backend::Backend;
 use ratatui::crossterm::event::{self, Event as CrosstermEvent};
 
 use crate::core::error::Result;
+use crate::core::project::Project;
 
 use super::app::App;
 use super::board;
@@ -23,28 +24,51 @@ pub enum AppEvent {
     Tick,
 }
 
-pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
-    terminal: &mut Terminal<B>,
-    app: &mut App,
-) -> Result<()> {
+/// Why the per-project event loop returned. `run` keeps the input/tick threads
+/// and starts a new loop for the next target.
+#[derive(Debug, Clone)]
+pub enum LoopOutcome {
+    Quit,
+    OpenProject(Project),
+    ShowProjects { return_to: Option<Project> },
+}
+
+pub struct EventThreads {
+    pub tx: Sender<AppEvent>,
+    pub rx: Receiver<AppEvent>,
+    pub input_gate: Arc<Mutex<()>>,
+}
+
+pub fn spawn_shared_threads(tick: Duration) -> EventThreads {
     let (tx, rx) = mpsc::channel();
     let input_gate = Arc::new(Mutex::new(()));
     spawn_input_thread(tx.clone(), Arc::clone(&input_gate));
-    spawn_watcher_thread(app.project_path.as_path(), tx.clone());
-    spawn_tick_thread(app.settings.refresh_interval, tx.clone());
+    spawn_tick_thread(tick, tx.clone());
+    EventThreads { tx, rx, input_gate }
+}
+
+pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    threads: &EventThreads,
+) -> Result<LoopOutcome> {
+    let _watcher = start_watcher(app.watch_root(), threads.tx.clone());
 
     terminal.draw(|frame| board::ui(frame, app))?;
-    while !app.should_quit {
-        let event = match rx.recv() {
+    loop {
+        if let Some(outcome) = app.take_loop_outcome() {
+            return Ok(outcome);
+        }
+        let event = match threads.rx.recv() {
             Ok(event) => event,
-            Err(_) => break,
+            Err(_) => return Ok(LoopOutcome::Quit),
         };
         match event {
             AppEvent::Input(input) => handle_input(app, input)?,
             AppEvent::InputError(message) => app.stop_after_input_error(message),
             AppEvent::FsChanged => {
                 let generation = app.note_fs_changed();
-                spawn_debounce_timer(tx.clone(), generation);
+                spawn_debounce_timer(threads.tx.clone(), generation);
             }
             AppEvent::FsDebounced(generation) => app.reload_debounced_change(generation)?,
             AppEvent::Tick => app.tick()?,
@@ -53,16 +77,18 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
             app.finish_copy(super::image::copy_text(&text));
         }
         if let Some(action) = app.take_terminal_action() {
-            let _input_guard = input_gate.lock().map_err(|_| {
+            let _input_guard = threads.input_gate.lock().map_err(|_| {
                 crate::core::error::KanbanError::Invalid("terminal input lock poisoned".to_string())
             })?;
             let ok = super::run_terminal_action(&action)?;
             app.finish_terminal_action(&action, ok);
             terminal.clear()?;
         }
+        if let Some(outcome) = app.take_loop_outcome() {
+            return Ok(outcome);
+        }
         terminal.draw(|frame| board::ui(frame, app))?;
     }
-    Ok(())
 }
 
 fn handle_input(app: &mut App, input: CrosstermEvent) -> Result<()> {
@@ -123,31 +149,28 @@ fn spawn_debounce_timer(tx: Sender<AppEvent>, generation: u64) {
     });
 }
 
-fn spawn_watcher_thread(project_path: &Path, tx: Sender<AppEvent>) {
+/// Hold the notify watcher in the calling stack so dropping it unsubscribes.
+/// notify already runs its own thread; the old park-forever wrapper leaked one.
+fn start_watcher(project_path: Option<&Path>, tx: Sender<AppEvent>) -> Option<RecommendedWatcher> {
+    let project_path = project_path?;
     let paths = ["tasks", "threads", "sessions"]
         .into_iter()
         .map(|name| project_path.join(".kanban").join(name))
         .collect::<Vec<_>>();
-    thread::spawn(move || {
-        let tx_events = tx.clone();
-        let mut watcher = match RecommendedWatcher::new(
-            move |res: notify::Result<notify::Event>| {
-                if res.is_ok_and(|event| is_board_change(&event.kind)) {
-                    let _ = tx_events.send(AppEvent::FsChanged);
-                }
-            },
-            Config::default(),
-        ) {
-            Ok(watcher) => watcher,
-            Err(_) => return,
-        };
-        for path in paths.iter().filter(|path| path.exists()) {
-            let _ = watcher.watch(path, RecursiveMode::Recursive);
-        }
-        loop {
-            thread::park();
-        }
-    });
+    let tx_events = tx;
+    let mut watcher = RecommendedWatcher::new(
+        move |res: notify::Result<notify::Event>| {
+            if res.is_ok_and(|event| is_board_change(&event.kind)) {
+                let _ = tx_events.send(AppEvent::FsChanged);
+            }
+        },
+        Config::default(),
+    )
+    .ok()?;
+    for path in paths.iter().filter(|path| path.exists()) {
+        let _ = watcher.watch(path, RecursiveMode::Recursive);
+    }
+    Some(watcher)
 }
 
 fn is_board_change(kind: &notify::EventKind) -> bool {
@@ -156,10 +179,13 @@ fn is_board_change(kind: &notify::EventKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use notify::EventKind;
     use notify::event::{AccessKind, CreateKind, ModifyKind, RemoveKind};
 
-    use super::is_board_change;
+    use super::{is_board_change, start_watcher};
 
     #[test]
     fn watcher_ignores_reads_and_keeps_content_changes() {
@@ -167,5 +193,14 @@ mod tests {
         assert!(is_board_change(&EventKind::Create(CreateKind::Any)));
         assert!(is_board_change(&EventKind::Modify(ModifyKind::Any)));
         assert!(is_board_change(&EventKind::Remove(RemoveKind::Any)));
+    }
+
+    #[test]
+    fn watcher_is_droppable_and_skips_a_missing_root() {
+        let (tx, rx) = mpsc::channel();
+        let watcher = start_watcher(None, tx);
+        assert!(watcher.is_none());
+        drop(watcher);
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
     }
 }

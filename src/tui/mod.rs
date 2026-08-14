@@ -7,6 +7,7 @@ mod detail;
 mod dialogs;
 mod event;
 mod image;
+mod projects;
 mod search;
 mod sessions;
 mod theme;
@@ -16,7 +17,7 @@ mod tests;
 
 use std::io::{self, IsTerminal, Stdout};
 use std::panic;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -30,6 +31,9 @@ use ratatui::crossterm::terminal::{
 };
 
 use crate::core::error::{KanbanError, Result};
+use crate::core::project::{Project, ProjectStore};
+
+use event::LoopOutcome;
 
 type PanicHook = Box<dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
 
@@ -194,7 +198,16 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-pub fn run(project_path: impl AsRef<Path>) -> Result<()> {
+/// How the TUI should open: a registered project, a legacy in-place board, or
+/// the projects list (unknown cwd).
+#[derive(Debug, Clone)]
+pub enum TuiStart {
+    Project(Project),
+    InPlace(PathBuf),
+    Projects { return_to: Option<Project> },
+}
+
+pub fn run(start: TuiStart) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(KanbanError::Invalid(
             "The TUI requires an interactive terminal".to_string(),
@@ -202,6 +215,36 @@ pub fn run(project_path: impl AsRef<Path>) -> Result<()> {
     }
     let _panic_hook = PanicHookGuard::install();
     let mut terminal = TerminalGuard::enter()?;
-    let mut app = app::App::new(project_path.as_ref())?;
-    event::run_event_loop(terminal.terminal_mut(), &mut app)
+    let mut app = app_from_start(start)?;
+    let threads = event::spawn_shared_threads(app.settings.refresh_interval);
+    loop {
+        match event::run_event_loop(terminal.terminal_mut(), &mut app, &threads)? {
+            LoopOutcome::Quit => break,
+            LoopOutcome::OpenProject(project) => {
+                app = app::App::for_project(project)?;
+            }
+            LoopOutcome::ShowProjects { return_to } => {
+                app = app::App::projects_only(return_to)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn app_from_start(start: TuiStart) -> Result<app::App> {
+    match start {
+        TuiStart::Project(project) => app::App::for_project(project),
+        TuiStart::InPlace(path) => app::App::new(&path),
+        TuiStart::Projects { return_to } => app::App::projects_only(return_to),
+    }
+}
+
+/// Open the TUI on a path the same way the pre-store entry point did.
+pub fn run_in_place(project_path: impl AsRef<Path>) -> Result<()> {
+    run(TuiStart::InPlace(project_path.as_ref().to_path_buf()))
+}
+
+pub fn run_project(project: Project) -> Result<()> {
+    let _ = ProjectStore::open()?.touch_opened(&project.id);
+    run(TuiStart::Project(project))
 }

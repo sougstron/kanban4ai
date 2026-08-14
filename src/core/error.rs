@@ -18,6 +18,12 @@ pub enum KanbanError {
 
     #[error("{0}")]
     Permission(String),
+
+    #[error(
+        "cannot move {}: board has active agent sessions (use --force to override)",
+        .0.display()
+    )]
+    ActiveSessions(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, KanbanError>;

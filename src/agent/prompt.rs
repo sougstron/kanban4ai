@@ -1,18 +1,34 @@
-use std::path::Path;
-
 use crate::core::error::Result;
 use crate::core::models::{Message, MessageKind, MessageStatus, Task};
+use crate::core::project::Roots;
 use crate::core::thread::ThreadManager;
 
-pub fn build_agent_prompt(
-    project_path: &Path,
+/// Assemble the prompt handed to a delegated agent.
+///
+/// Every board path in it is absolute: the agent's working directory is the
+/// code folder, while the board lives under `data_root`, so a relative
+/// `.kanban/…` instruction would make the agent write into the user's repo.
+pub fn build_agent_prompt<'a>(
+    roots: impl Into<Roots<'a>>,
     task: &Task,
     session_id: &str,
     revert: bool,
 ) -> Result<String> {
+    let roots = roots.into();
     if revert {
-        return Ok(build_revert_prompt(project_path, task, session_id));
+        return Ok(build_revert_prompt(roots, task, session_id));
     }
+    let backups_dir = roots.data_path("backups").join(&task.id);
+    let backups_dir = format!("{}/", backups_dir.display());
+    let form_file = roots
+        .data_path("forms")
+        .join(format!("{}.ask.yaml", task.id));
+    let form_file = form_file.display().to_string();
+    let detached_log = roots
+        .data_path("detached")
+        .join("<task>-<stamp>.log")
+        .display()
+        .to_string();
 
     let mut prompt = format!(
         "Task: {}: {}\n\n\
@@ -22,7 +38,7 @@ Session contract:\n\
 - KANBAN_SESSION is set to {session_id}.\n\
 - KANBAN_TASK_ID is set to {}.\n\
 - KANBAN_CMD is set to the current kanban4ai executable; use \"$KANBAN_CMD\" instead of bare kanban so callbacks target this binary.\n\
-- Before editing an existing file, copy it to .kanban/backups/{}/ preserving the repo-relative path.\n\
+- Before editing an existing file, copy it to {backups_dir} preserving the repo-relative path.\n\
 - Record important progress with: \"$KANBAN_CMD\" context {} <text> --source agent\n\
 - Keep the session alive with: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
 - When implementation and verification are complete, run: \"$KANBAN_CMD\" done {} --session {session_id} --agent\n\
@@ -37,7 +53,7 @@ a plain shell background job: this session's whole process group is killed when 
 so backgrounded work silently dies even after you declare a wait. Instead run: \
 \"$KANBAN_CMD\" detach {} --session {session_id} --eta <expected-seconds> --note <what you wait for> -- <command> [args...]\n\
   It starts the command fully detached (it survives this session), appends its output to \
-.kanban/detached/<task>-<stamp>.log, writes the exit code to the matching .status file, and \
+{detached_log}, writes the exit code to the matching .status file, and \
 declares the wait for you. If you must detach manually instead, launch with setsid and nohup, \
 redirect stdin/stdout/stderr away from the terminal to a result file, and then declare the wait \
 yourself before ending your reply: \
@@ -49,8 +65,7 @@ blocked, or the waiting/detach command if you are waiting on a declared long-run
 Ending a reply without one of those strands the task and forces an automatic resume.\n",
         task.id,
         task.title,
-        project_path.display(),
-        task.id,
+        roots.work_path.display(),
         task.id,
         task.id,
         task.id,
@@ -66,12 +81,12 @@ Ending a reply without one of those strands the task and forces an automatic res
     ));
     prompt.push_str(&format!(
         "- To ask the human one or more questions, prefer a strict YAML form over free text so \
-each question renders with selectable options. Write .kanban/forms/{}.ask.yaml then submit it:\n  \
-\"$KANBAN_CMD\" ask-form {} --file .kanban/forms/{}.ask.yaml --agent --session {session_id}\n  \
+each question renders with selectable options. Write {form_file} then submit it:\n  \
+\"$KANBAN_CMD\" ask-form {} --file {form_file} --agent --session {session_id}\n  \
 Schema (options are optional; prompt is required; add as many questions as you need):\n    \
 questions:\n      - prompt: <question text>\n        options: [<choice A>, <choice B>]\n      \
 - prompt: <another question>\n",
-        task.id, task.id, task.id
+        task.id
     ));
     if task.interactive {
         prompt.push_str(&format!(
@@ -85,12 +100,12 @@ questions:\n      - prompt: <question text>\n        options: [<choice A>, <choi
     } else {
         prompt.push_str(task.description.trim());
     }
-    append_thread_context(project_path, task, &mut prompt)?;
+    append_thread_context(roots, task, &mut prompt)?;
     Ok(prompt)
 }
 
-fn append_thread_context(project_path: &Path, task: &Task, prompt: &mut String) -> Result<()> {
-    let thread = ThreadManager::new(project_path)?.load(&task.id)?;
+fn append_thread_context(roots: Roots<'_>, task: &Task, prompt: &mut String) -> Result<()> {
+    let thread = ThreadManager::new(roots.data_root)?.load(&task.id)?;
     let messages: Vec<_> = thread
         .messages
         .into_iter()
@@ -149,11 +164,12 @@ fn append_message(prompt: &mut String, message: &Message) {
     prompt.push('\n');
 }
 
-fn build_revert_prompt(project_path: &Path, task: &Task, session_id: &str) -> String {
+fn build_revert_prompt(roots: Roots<'_>, task: &Task, session_id: &str) -> String {
+    let backups_dir = roots.data_path("backups").join(&task.id);
     format!(
         "Task: {}: revert {}\n\n\
 You are a delegated kanban4ai revert agent working in project: {}\n\
-Restore every file from .kanban/backups/{}/ to its original repo-relative path.\n\
+Restore every file from {}/ to its original repo-relative path.\n\
 Do not make unrelated edits. KANBAN_CMD is set to the current kanban4ai executable; \
 use \"$KANBAN_CMD\" instead of bare kanban. After restoring, verify the files exist, \
 record context with \"$KANBAN_CMD\" context {} <text> --source agent, then run: \
@@ -161,8 +177,8 @@ record context with \"$KANBAN_CMD\" context {} <text> --source agent, then run: 
 KANBAN_SESSION={session_id}\nKANBAN_TASK_ID={}\nKANBAN_CMD=$KANBAN_CMD\n",
         task.id,
         task.title,
-        project_path.display(),
-        task.id,
+        roots.work_path.display(),
+        backups_dir.display(),
         task.id,
         task.id,
         task.id

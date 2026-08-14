@@ -3,41 +3,84 @@
 
 mod common;
 
+use std::path::{Path, PathBuf};
+
 use assert_cmd::Command;
+use kanban4ai::core::project::ProjectStore;
 use predicates::prelude::*;
 
-fn kanban(dir: &std::path::Path) -> Command {
+/// Isolated work folder + store. Every binary invocation sets `KANBAN_HOME`
+/// so the suite never touches the developer's real store.
+struct Env {
+    work: tempfile::TempDir,
+    store: tempfile::TempDir,
+}
+
+impl Env {
+    fn new() -> Self {
+        Self {
+            work: tempfile::tempdir().unwrap(),
+            store: tempfile::tempdir().unwrap(),
+        }
+    }
+
+    fn work(&self) -> &Path {
+        self.work.path()
+    }
+
+    fn store(&self) -> &Path {
+        self.store.path()
+    }
+
+    fn data_root(&self) -> PathBuf {
+        ProjectStore::at(self.store.path())
+            .resolve_from_cwd(self.work())
+            .expect("resolve store")
+            .expect("cwd is a registered project")
+            .data_root
+    }
+
+    fn kanban(&self) -> PathBuf {
+        self.data_root().join(".kanban")
+    }
+}
+
+fn kanban(env: &Env) -> Command {
     let mut cmd = Command::cargo_bin("kanban4ai").expect("binary builds");
-    cmd.current_dir(dir);
+    cmd.current_dir(env.work());
+    cmd.env("KANBAN_HOME", env.store.path());
     cmd.env_remove("KANBAN_SESSION");
+    cmd.env_remove("KANBAN_PROJECT");
     cmd
 }
 
-/// Init a board in a temp dir with notifications and auto-launch disabled.
-fn board() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().unwrap();
-    kanban(dir.path()).arg("init").assert().success();
-    common::write_quiet_config(dir.path(), false);
-    dir
+fn board() -> Env {
+    let env = Env::new();
+    kanban(&env).arg("init").assert().success();
+    common::write_quiet_config(&env.data_root(), false);
+    env
 }
 
 #[test]
 fn init_creates_board() {
-    let dir = tempfile::tempdir().unwrap();
-    kanban(dir.path())
+    let dir = Env::new();
+    kanban(&dir)
         .arg("init")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
-            "Initialized kanban board at ./.kanban",
-        ));
-    assert!(dir.path().join(".kanban/config.yaml").is_file());
+        .stdout(predicate::str::contains("Initialized project "))
+        .stdout(predicate::str::contains(" for "));
+    assert!(dir.kanban().join("config.yaml").is_file());
+    assert!(
+        !dir.work().join(".kanban").exists(),
+        "init must not create a local .kanban"
+    );
 }
 
 #[test]
 fn create_list_show_flow() {
     let dir = board();
-    kanban(dir.path())
+    kanban(&dir)
         .args([
             "create",
             "Fix login bug",
@@ -50,14 +93,14 @@ fn create_list_show_flow() {
             "Created task TASK-001: Fix login bug",
         ));
 
-    kanban(dir.path())
+    kanban(&dir)
         .arg("list")
         .assert()
         .success()
         .stdout(predicate::str::contains("TASK-001"))
         .stdout(predicate::str::contains("todo"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["show", "TASK-001"])
         .assert()
         .success()
@@ -68,7 +111,7 @@ fn create_list_show_flow() {
 #[test]
 fn list_json_is_valid_and_complete() {
     let dir = board();
-    kanban(dir.path())
+    kanban(&dir)
         .args([
             "create",
             "Json task",
@@ -80,7 +123,7 @@ fn list_json_is_valid_and_complete() {
         .assert()
         .success();
 
-    let output = kanban(dir.path())
+    let output = kanban(&dir)
         .args(["list", "--format", "json"])
         .output()
         .unwrap();
@@ -96,18 +139,15 @@ fn list_json_is_valid_and_complete() {
 #[test]
 fn move_and_agent_rules() {
     let dir = board();
-    kanban(dir.path())
-        .args(["create", "Rules"])
-        .assert()
-        .success();
+    kanban(&dir).args(["create", "Rules"]).assert().success();
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["move", "TASK-001", "review"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Task TASK-001 moved to review"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["move", "TASK-001", "done", "--agent"])
         .assert()
         .success()
@@ -115,13 +155,13 @@ fn move_and_agent_rules() {
             "Permission denied: Agent cannot move tasks to Done",
         ));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["move", "TASK-001", "nowhere"])
         .assert()
         .success()
         .stderr(predicate::str::contains("Invalid status 'nowhere'"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["move", "TASK-001", "done"])
         .assert()
         .success()
@@ -131,12 +171,12 @@ fn move_and_agent_rules() {
 #[test]
 fn take_and_done_agent_flow() {
     let dir = board();
-    kanban(dir.path())
+    kanban(&dir)
         .args(["create", "Agent job"])
         .assert()
         .success();
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["take", "TASK-001", "--session", "ses-cli", "--agent"])
         .assert()
         .success()
@@ -146,26 +186,26 @@ fn take_and_done_agent_flow() {
         .stdout(predicate::str::contains("Status: in_progress"));
 
     // agent done without context is refused
-    kanban(dir.path())
+    kanban(&dir)
         .args(["done", "TASK-001", "--session", "ses-cli", "--agent"])
         .assert()
         .success()
         .stderr(predicate::str::contains("without recording context"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["context", "TASK-001", "implemented the fix"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Context added to TASK-001"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["done", "TASK-001", "--session", "ses-cli", "--agent"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Task TASK-001 marked as review"));
 
     // human confirms
-    kanban(dir.path())
+    kanban(&dir)
         .args(["done", "TASK-001", "--session", "ses-cli"])
         .assert()
         .success()
@@ -175,12 +215,9 @@ fn take_and_done_agent_flow() {
 #[test]
 fn question_pipeline_via_cli() {
     let dir = board();
-    kanban(dir.path())
-        .args(["create", "Ask me"])
-        .assert()
-        .success();
+    kanban(&dir).args(["create", "Ask me"]).assert().success();
 
-    kanban(dir.path())
+    kanban(&dir)
         .args([
             "ask",
             "TASK-001",
@@ -196,26 +233,26 @@ fn question_pipeline_via_cli() {
         .stdout(predicate::str::contains("Question added to TASK-001"))
         .stdout(predicate::str::contains("Task has pending questions."));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["questions", "TASK-001"])
         .assert()
         .success()
         .stdout(predicate::str::contains("[question] Tabs or spaces?"))
         .stdout(predicate::str::contains("variants: Tabs, Spaces"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["answer", "TASK-001", "0", "Spaces"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Answer added to TASK-001"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["questions", "TASK-001"])
         .assert()
         .success()
         .stdout(predicate::str::contains("No open messages."));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["suggest", "TASK-001", "Could also add linting"])
         .assert()
         .success()
@@ -225,19 +262,16 @@ fn question_pipeline_via_cli() {
 #[test]
 fn ask_form_posts_questions_from_yaml_file() {
     let dir = board();
-    kanban(dir.path())
-        .args(["create", "Form me"])
-        .assert()
-        .success();
+    kanban(&dir).args(["create", "Form me"]).assert().success();
 
-    let form_path = dir.path().join("form.yaml");
+    let form_path = dir.work().join("form.yaml");
     std::fs::write(
         &form_path,
         "questions:\n  - prompt: Which backend?\n    options: [OAuth2, API key]\n  - prompt: Any constraints?\n",
     )
     .unwrap();
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["ask-form", "TASK-001", "--file"])
         .arg(&form_path)
         .assert()
@@ -247,7 +281,7 @@ fn ask_form_posts_questions_from_yaml_file() {
         ))
         .stdout(predicate::str::contains("Task has pending questions."));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["questions", "TASK-001"])
         .assert()
         .success()
@@ -256,25 +290,72 @@ fn ask_form_posts_questions_from_yaml_file() {
         .stdout(predicate::str::contains("[question] Any constraints?"));
 }
 
+/// An agent's cwd is the code folder, so `--file .kanban/forms/…` (the shape
+/// the prompt used before the split, and habit afterwards) cannot be found
+/// there; the path is retried against the board.
 #[test]
-fn ask_form_rejects_an_invalid_form() {
+fn ask_form_and_context_resolve_a_file_against_the_board() {
     let dir = board();
-    kanban(dir.path())
-        .args(["create", "Bad form"])
+    kanban(&dir)
+        .args(["create", "Board-relative file"])
         .assert()
         .success();
 
-    let form_path = dir.path().join("bad.yaml");
+    let forms = dir.kanban().join("forms");
+    std::fs::create_dir_all(&forms).unwrap();
+    std::fs::write(
+        forms.join("TASK-001.ask.yaml"),
+        "questions:\n  - prompt: Which root?\n",
+    )
+    .unwrap();
+    std::fs::write(dir.kanban().join("note.txt"), "board-relative note\n").unwrap();
+
+    kanban(&dir)
+        .args([
+            "ask-form",
+            "TASK-001",
+            "--file",
+            ".kanban/forms/TASK-001.ask.yaml",
+            "--agent",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Posted 1 question(s)"));
+
+    kanban(&dir)
+        .args(["context", "TASK-001", "", "--file", "note.txt"])
+        .assert()
+        .success();
+
+    kanban(&dir)
+        .args(["questions", "TASK-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[question] Which root?"));
+    let thread_file = dir.kanban().join("threads/TASK-001.yaml");
+    assert!(
+        std::fs::read_to_string(&thread_file)
+            .unwrap()
+            .contains("board-relative note")
+    );
+}
+
+#[test]
+fn ask_form_rejects_an_invalid_form() {
+    let dir = board();
+    kanban(&dir).args(["create", "Bad form"]).assert().success();
+
+    let form_path = dir.work().join("bad.yaml");
     std::fs::write(&form_path, "questions: []\n").unwrap();
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["ask-form", "TASK-001", "--file"])
         .arg(&form_path)
         .assert()
         .failure();
 
     // Nothing was posted.
-    kanban(dir.path())
+    kanban(&dir)
         .args(["questions", "TASK-001"])
         .assert()
         .success()
@@ -284,20 +365,20 @@ fn ask_form_rejects_an_invalid_form() {
 #[test]
 fn reject_and_unreject_quarantine_a_context_message() {
     let dir = board();
-    kanban(dir.path())
+    kanban(&dir)
         .args(["create", "Reject me"])
         .assert()
         .success();
 
     // MSG-001/002 are the seeded system/task messages, so this context lands
     // on MSG-003.
-    kanban(dir.path())
+    kanban(&dir)
         .args(["context", "TASK-001", "poisoned note", "--source", "agent"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Context added to TASK-001"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["reject", "TASK-001", "MSG-003"])
         .assert()
         .success()
@@ -305,10 +386,10 @@ fn reject_and_unreject_quarantine_a_context_message() {
             "Message MSG-003 rejected on TASK-001",
         ));
 
-    let raw = std::fs::read_to_string(dir.path().join(".kanban/threads/TASK-001.yaml")).unwrap();
+    let raw = std::fs::read_to_string(dir.kanban().join("threads/TASK-001.yaml")).unwrap();
     assert!(raw.contains("status: rejected"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["reject", "TASK-001", "MSG-404"])
         .assert()
         .success()
@@ -316,7 +397,7 @@ fn reject_and_unreject_quarantine_a_context_message() {
             "Message MSG-404 not found on TASK-001",
         ));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["unreject", "TASK-001", "MSG-003"])
         .assert()
         .success()
@@ -324,41 +405,35 @@ fn reject_and_unreject_quarantine_a_context_message() {
             "Message MSG-003 restored on TASK-001",
         ));
 
-    let raw = std::fs::read_to_string(dir.path().join(".kanban/threads/TASK-001.yaml")).unwrap();
+    let raw = std::fs::read_to_string(dir.kanban().join("threads/TASK-001.yaml")).unwrap();
     assert!(!raw.contains("status: rejected"));
 }
 
 #[test]
 fn chain_set_show_clear() {
     let dir = board();
-    kanban(dir.path())
-        .args(["create", "Target"])
-        .assert()
-        .success();
-    kanban(dir.path())
-        .args(["create", "Follower"])
-        .assert()
-        .success();
+    kanban(&dir).args(["create", "Target"]).assert().success();
+    kanban(&dir).args(["create", "Follower"]).assert().success();
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["chain", "TASK-002", "TASK-001"])
         .assert()
         .success()
         .stdout(predicate::str::contains("TASK-002 chained to TASK-001"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["chain", "TASK-002"])
         .assert()
         .success()
         .stdout(predicate::str::contains("TASK-002 is chained to TASK-001"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["chain", "TASK-002", "TASK-002"])
         .assert()
         .success()
         .stderr(predicate::str::contains("cannot be chained to itself"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["chain", "TASK-002", "--clear"])
         .assert()
         .success()
@@ -368,22 +443,22 @@ fn chain_set_show_clear() {
 #[test]
 fn edits_and_rerun() {
     let dir = board();
-    kanban(dir.path())
+    kanban(&dir)
         .args(["create", "Reviewable"])
         .assert()
         .success();
-    kanban(dir.path())
+    kanban(&dir)
         .args(["move", "TASK-001", "review"])
         .assert()
         .success();
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["edits", "TASK-001", "Handle the edge case too"])
         .assert()
         .success()
         .stdout(predicate::str::contains("Review edits saved on TASK-001"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["rerun", "TASK-001"])
         .assert()
         .success()
@@ -393,22 +468,19 @@ fn edits_and_rerun() {
 #[test]
 fn archive_flow() {
     let dir = board();
-    kanban(dir.path())
-        .args(["create", "Old work"])
-        .assert()
-        .success();
-    kanban(dir.path())
+    kanban(&dir).args(["create", "Old work"]).assert().success();
+    kanban(&dir)
         .args(["move", "TASK-001", "done"])
         .assert()
         .success();
 
-    kanban(dir.path())
+    kanban(&dir)
         .arg("archive-done")
         .assert()
         .success()
         .stdout(predicate::str::contains("Archived 1 done task(s)."));
 
-    kanban(dir.path())
+    kanban(&dir)
         .arg("archive")
         .assert()
         .success()
@@ -419,16 +491,16 @@ fn archive_flow() {
 #[test]
 fn detach_runs_command_and_declares_wait() {
     let dir = board();
-    kanban(dir.path())
+    kanban(&dir)
         .args(["create", "Long export"])
         .assert()
         .success();
-    kanban(dir.path())
+    kanban(&dir)
         .args(["take", "TASK-001", "--session", "ses-detach-cli", "--agent"])
         .assert()
         .success();
 
-    kanban(dir.path())
+    kanban(&dir)
         .args([
             "detach",
             "TASK-001",
@@ -449,7 +521,7 @@ fn detach_runs_command_and_declares_wait() {
         .stdout(predicate::str::contains(".kanban/detached/TASK-001-"))
         .stdout(predicate::str::contains("Relaunch deadline:"));
 
-    let detached_dir = dir.path().join(".kanban/detached");
+    let detached_dir = dir.kanban().join("detached");
     let status_file = wait_for_status_file(&detached_dir);
     assert_eq!(
         std::fs::read_to_string(&status_file).unwrap().trim(),
@@ -458,7 +530,7 @@ fn detach_runs_command_and_declares_wait() {
     );
 
     // A command is required after `--`.
-    kanban(dir.path())
+    kanban(&dir)
         .args(["detach", "TASK-001", "--session", "ses-detach-cli"])
         .assert()
         .failure();
@@ -488,16 +560,13 @@ fn wait_for_status_file(detached_dir: &std::path::Path) -> std::path::PathBuf {
 #[test]
 fn sessions_heartbeat_check_recover() {
     let dir = board();
-    kanban(dir.path())
-        .args(["create", "Crashy"])
-        .assert()
-        .success();
-    kanban(dir.path())
+    kanban(&dir).args(["create", "Crashy"]).assert().success();
+    kanban(&dir)
         .args(["take", "TASK-001", "--session", "ses-hb", "--agent"])
         .assert()
         .success();
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["heartbeat", "--session", "ses-hb"])
         .assert()
         .success()
@@ -505,20 +574,20 @@ fn sessions_heartbeat_check_recover() {
             "Heartbeat updated for session ses-hb",
         ));
 
-    kanban(dir.path())
+    kanban(&dir)
         .arg("sessions")
         .assert()
         .success()
         .stdout(predicate::str::contains("ses-hb"))
         .stdout(predicate::str::contains("Crashy"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .arg("check-sessions")
         .assert()
         .success()
         .stdout(predicate::str::contains("No crashed sessions found."));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["recover", "TASK-001"])
         .assert()
         .success()
@@ -530,11 +599,11 @@ fn sessions_heartbeat_check_recover() {
 #[test]
 fn sessions_uses_saved_name_when_task_file_is_missing() {
     let dir = board();
-    kanban(dir.path())
+    kanban(&dir)
         .args(["create", "Missing task label"])
         .assert()
         .success();
-    kanban(dir.path())
+    kanban(&dir)
         .args([
             "take",
             "TASK-001",
@@ -544,9 +613,9 @@ fn sessions_uses_saved_name_when_task_file_is_missing() {
         ])
         .assert()
         .success();
-    std::fs::remove_file(dir.path().join(".kanban/tasks/in_progress/TASK-001.md")).unwrap();
+    std::fs::remove_file(dir.kanban().join("tasks/in_progress/TASK-001.md")).unwrap();
 
-    kanban(dir.path())
+    kanban(&dir)
         .arg("sessions")
         .assert()
         .success()
@@ -557,11 +626,8 @@ fn sessions_uses_saved_name_when_task_file_is_missing() {
 #[test]
 fn compact_reports_no_context() {
     let dir = board();
-    kanban(dir.path())
-        .args(["create", "Empty"])
-        .assert()
-        .success();
-    kanban(dir.path())
+    kanban(&dir).args(["create", "Empty"]).assert().success();
+    kanban(&dir)
         .args(["compact", "TASK-001"])
         .assert()
         .success()
@@ -571,12 +637,12 @@ fn compact_reports_no_context() {
 #[test]
 fn revert_command_reports_missing_backups() {
     let dir = board();
-    kanban(dir.path())
+    kanban(&dir)
         .args(["create", "Needs revert"])
         .assert()
         .success();
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["revert", "TASK-001", "--session", "ses-revert-test"])
         .assert()
         .failure()
@@ -585,8 +651,8 @@ fn revert_command_reports_missing_backups() {
 
 #[test]
 fn version_flag_works() {
-    let dir = tempfile::tempdir().unwrap();
-    kanban(dir.path())
+    let dir = Env::new();
+    kanban(&dir)
         .arg("--version")
         .assert()
         .success()
@@ -596,20 +662,220 @@ fn version_flag_works() {
 #[test]
 fn tui_requires_interactive_terminal_and_attach_reports_missing_task() {
     let dir = board();
-    kanban(dir.path())
+    kanban(&dir)
         .arg("tui")
         .assert()
         .failure()
         .stderr(predicate::str::contains("interactive terminal"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .assert()
         .failure()
         .stderr(predicate::str::contains("interactive terminal"));
 
-    kanban(dir.path())
+    kanban(&dir)
         .args(["attach", "TASK-404"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("Task TASK-404 not found"));
+}
+
+#[test]
+fn init_is_a_noop_when_already_registered() {
+    let dir = board();
+    kanban(&dir).args(["create", "Keep me"]).assert().success();
+
+    kanban(&dir)
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already initialized"));
+
+    kanban(&dir)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("TASK-001"))
+        .stdout(predicate::str::contains("Keep me"));
+    assert!(!dir.work().join(".kanban").exists());
+}
+
+#[test]
+fn init_migrates_a_legacy_local_board() {
+    let dir = Env::new();
+    std::fs::create_dir_all(dir.work().join(".kanban/tasks/todo")).unwrap();
+    std::fs::write(
+        dir.work().join(".kanban/config.yaml"),
+        "tui:\n  name: Legacy\n",
+    )
+    .unwrap();
+    std::fs::write(dir.work().join(".kanban/tasks/todo/TASK-001.md"), "old").unwrap();
+
+    kanban(&dir)
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Initialized project Legacy"));
+
+    assert!(!dir.work().join(".kanban").exists());
+    assert!(dir.kanban().join("tasks/todo/TASK-001.md").is_file());
+}
+
+#[test]
+fn list_without_a_project_exits_one() {
+    let dir = Env::new();
+    kanban(&dir)
+        .arg("list")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not inside a kanban project"));
+}
+
+#[test]
+fn project_add_list_rename_remove_and_path() {
+    let dir = Env::new();
+    kanban(&dir)
+        .args(["project", "add", ".", "--name", "Board One"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Added project Board One"));
+
+    kanban(&dir)
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Board One"));
+
+    kanban(&dir)
+        .args(["project", "rename", "Board One", "Board Two"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Renamed project"));
+
+    kanban(&dir)
+        .args(["project", "path", "Board Two"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(dir.work().display().to_string()));
+
+    kanban(&dir)
+        .args(["project", "remove", "Board Two", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Unregistered project"));
+
+    kanban(&dir)
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No projects registered."));
+}
+
+#[test]
+fn project_flag_selects_a_registered_board() {
+    let dir = board();
+    kanban(&dir).args(["create", "Flagged"]).assert().success();
+
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("kanban4ai").expect("binary builds");
+    cmd.current_dir(elsewhere.path());
+    cmd.env("KANBAN_HOME", dir.store());
+    cmd.env_remove("KANBAN_SESSION");
+    cmd.env_remove("KANBAN_PROJECT");
+    cmd.args(["--project", dir.work().to_str().unwrap(), "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Flagged"));
+}
+
+#[test]
+fn list_silently_adopts_an_unregistered_local_board() {
+    let dir = Env::new();
+    std::fs::create_dir_all(dir.work().join(".kanban/tasks/todo")).unwrap();
+    std::fs::write(
+        dir.work().join(".kanban/config.yaml"),
+        "tui:\n  name: Adopted\n",
+    )
+    .unwrap();
+
+    kanban(&dir)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No tasks found."));
+
+    assert!(!dir.work().join(".kanban").exists());
+    assert!(dir.kanban().join("config.yaml").is_file());
+
+    kanban(&dir)
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No tasks found."));
+}
+
+#[test]
+fn list_leaves_a_board_in_place_when_a_session_is_live() {
+    let dir = Env::new();
+    std::fs::create_dir_all(dir.work().join(".kanban/sessions")).unwrap();
+    std::fs::write(
+        dir.work().join(".kanban/config.yaml"),
+        "tui:\n  name: Live\n",
+    )
+    .unwrap();
+    let now = kanban4ai::core::timefmt::format(&kanban4ai::core::timefmt::now());
+    std::fs::write(
+        dir.work().join(".kanban/sessions/ses-live.yaml"),
+        format!(
+            "id: ses-live\ntask_id: TASK-001\nstatus: active\nstarted_at: '{now}'\nlast_seen: '{now}'\n"
+        ),
+    )
+    .unwrap();
+
+    kanban(&dir)
+        .arg("list")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("active agent sessions"))
+        .stdout(predicate::str::contains("No tasks found."));
+
+    assert!(dir.work().join(".kanban/config.yaml").is_file());
+}
+
+#[test]
+fn init_copy_leaves_the_local_board() {
+    let dir = Env::new();
+    std::fs::create_dir_all(dir.work().join(".kanban/tasks/todo")).unwrap();
+    std::fs::write(
+        dir.work().join(".kanban/config.yaml"),
+        "tui:\n  name: Copy\n",
+    )
+    .unwrap();
+    std::fs::write(dir.work().join(".kanban/tasks/todo/TASK-001.md"), "stay").unwrap();
+
+    kanban(&dir).args(["init", "--copy"]).assert().success();
+
+    assert!(dir.work().join(".kanban/tasks/todo/TASK-001.md").is_file());
+    assert_eq!(
+        std::fs::read_to_string(dir.kanban().join("tasks/todo/TASK-001.md")).unwrap(),
+        "stay"
+    );
+}
+
+#[test]
+fn list_from_a_subdirectory_uses_the_registered_project() {
+    let dir = board();
+    kanban(&dir).args(["create", "Nested"]).assert().success();
+    let nested = dir.work().join("src/lib");
+    std::fs::create_dir_all(&nested).unwrap();
+
+    let mut cmd = Command::cargo_bin("kanban4ai").expect("binary builds");
+    cmd.current_dir(&nested);
+    cmd.env("KANBAN_HOME", dir.store());
+    cmd.env_remove("KANBAN_SESSION");
+    cmd.env_remove("KANBAN_PROJECT");
+    cmd.arg("list")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Nested"));
 }

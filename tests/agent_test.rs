@@ -8,6 +8,7 @@ use kanban4ai::agent::{
     record_recent_model, sort_efforts, sort_opencode_models,
 };
 use kanban4ai::core::models::{MessageKind, MessageRole, Task};
+use kanban4ai::core::project::Roots;
 use kanban4ai::core::storage::{NewTask, Storage};
 use kanban4ai::core::thread::ThreadManager;
 
@@ -76,7 +77,14 @@ agents:
         plan.prompt
             .contains("KANBAN_SESSION is set to ses-opencode-test")
     );
-    assert!(plan.prompt.contains(".kanban/backups/TASK-001/"));
+    assert!(plan.prompt.contains(&format!(
+        "copy it to {}/",
+        dir.path()
+            .canonicalize()
+            .unwrap()
+            .join(".kanban/backups/TASK-001")
+            .display()
+    )));
     assert!(plan.prompt.contains("KANBAN_CMD is set"));
     assert!(
         plan.prompt
@@ -99,6 +107,66 @@ agents:
     );
 }
 
+/// With the board in the store, board files (log, transcript, prompt paths)
+/// hang off the data root while the agent is told to work in the code folder.
+/// Every `.kanban` path the agent is handed must be absolute — a relative one
+/// would resolve against its cwd and write into the user's repo.
+#[test]
+fn launch_plan_splits_board_files_from_the_agent_work_folder() {
+    let data_root = tempfile::tempdir().unwrap();
+    let work_path = tempfile::tempdir().unwrap();
+    let storage = Storage::new(data_root.path());
+    storage.init_board().unwrap();
+    write_agent_config(
+        data_root.path(),
+        r#"auto_launch:
+  enabled: true
+  use_tmux: false
+notifications:
+  enabled: false
+agents:
+  opencode:
+    command: /bin/echo
+"#,
+    );
+    let task = storage.create_task(NewTask::titled("Split roots")).unwrap();
+
+    let roots = Roots::new(data_root.path(), work_path.path(), Some("split"));
+    let plan = build_launch_plan(roots, &task, "ses-split", false).unwrap();
+
+    let board = data_root.path().canonicalize().unwrap().join(".kanban");
+    assert!(plan.log_file.starts_with(data_root.path().join(".kanban")));
+    assert!(
+        plan.transcript_file
+            .as_ref()
+            .is_some_and(|file| file.starts_with(data_root.path().join(".kanban")))
+    );
+    assert!(plan.prompt.contains(&format!(
+        "working in project: {}",
+        work_path.path().display()
+    )));
+    assert!(plan.prompt.contains(&format!(
+        "copy it to {}/",
+        board.join("backups").join(&task.id).display()
+    )));
+    assert!(
+        plan.prompt.contains(
+            &board
+                .join("detached")
+                .join("<task>-<stamp>.log")
+                .display()
+                .to_string()
+        )
+    );
+    // The prompt-contract guard: no bare `.kanban/…` instruction survives.
+    for line in plan.prompt.lines().filter(|line| line.contains(".kanban")) {
+        assert!(
+            line.contains(&board.display().to_string()),
+            "prompt line points at a relative board path: {line}"
+        );
+    }
+}
+
 #[test]
 fn prompt_nudges_suggestions_and_ask_form_for_plain_tasks() {
     let dir = tempfile::tempdir().unwrap();
@@ -116,7 +184,17 @@ fn prompt_nudges_suggestions_and_ask_form_for_plain_tasks() {
     let prompt = build_agent_prompt(dir.path(), &task, "ses-plain", false).unwrap();
 
     assert!(prompt.contains("\"$KANBAN_CMD\" suggest TASK-001 <idea>"));
-    assert!(prompt.contains("\"$KANBAN_CMD\" ask-form TASK-001 --file .kanban/forms/TASK-001.ask.yaml --agent --session ses-plain"));
+    // Board paths are absolute: the agent's cwd is the code folder.
+    let form_file = dir
+        .path()
+        .canonicalize()
+        .unwrap()
+        .join(".kanban/forms/TASK-001.ask.yaml");
+    assert!(prompt.contains(&format!(
+        "\"$KANBAN_CMD\" ask-form TASK-001 --file {} --agent --session ses-plain",
+        form_file.display()
+    )));
+    assert!(prompt.contains(&format!("Write {} then submit it", form_file.display())));
     assert!(prompt.contains("questions:"));
     assert!(prompt.contains("- prompt: <question text>"));
 }
@@ -551,7 +629,7 @@ fn revert_prompt_is_restrictive() {
         build_agent_prompt(std::path::Path::new("/repo"), &task, "ses-revert", true).unwrap();
 
     assert!(prompt.contains("revert agent"));
-    assert!(prompt.contains("Restore every file from .kanban/backups/TASK-777/"));
+    assert!(prompt.contains("Restore every file from /repo/.kanban/backups/TASK-777/"));
     assert!(prompt.contains("Do not make unrelated edits"));
     assert!(prompt.contains("KANBAN_CMD is set"));
     assert!(prompt.contains("\"$KANBAN_CMD\" done TASK-777 --session ses-revert --agent"));

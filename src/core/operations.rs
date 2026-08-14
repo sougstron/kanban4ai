@@ -17,6 +17,7 @@ use crate::core::models::{
     Message, MessageKind, MessageRole, MessageStatus, SessionStatus, Task, TaskStatus,
 };
 use crate::core::notifier::{DesktopNotifier, NotificationConfig};
+use crate::core::project::{Project, Roots};
 use crate::core::provenance::{
     self, ClaudeHarvester, InputManifest, OpencodeHarvester, PiFamilyHarvester, TranscriptHarvester,
 };
@@ -28,15 +29,18 @@ use crate::core::timefmt;
 
 /// Seam for spawning the actual agent process. Tests inject a recording stub;
 /// production uses the configured launcher in [`Operations::new`].
+///
+/// The launcher receives both roots: board files come from `data_root`, the
+/// spawned process runs in `work_path`.
 pub trait AgentLauncher {
-    fn launch(&self, project_path: &Path, task: &Task, session_id: &str, revert: bool) -> bool;
+    fn launch(&self, roots: Roots<'_>, task: &Task, session_id: &str, revert: bool) -> bool;
 }
 
 /// Test and fallback launcher that deliberately does not spawn processes.
 pub struct NoopLauncher;
 
 impl AgentLauncher for NoopLauncher {
-    fn launch(&self, _project_path: &Path, task: &Task, _session_id: &str, _revert: bool) -> bool {
+    fn launch(&self, _roots: Roots<'_>, task: &Task, _session_id: &str, _revert: bool) -> bool {
         eprintln!(
             "Warning: the configured agent launcher did not start task {}.",
             task.id
@@ -124,6 +128,11 @@ pub struct DetachedJob {
 pub struct Operations {
     pub storage: Storage,
     pub config: Config,
+    /// Where agents run. Equal to the data root for a board used in place;
+    /// the registered project's code folder once the board lives in the store.
+    work_path: PathBuf,
+    /// Registered project id, when this board came from the store.
+    project_id: Option<String>,
     launcher: Box<dyn AgentLauncher>,
 }
 
@@ -137,24 +146,57 @@ impl Operations {
         Operations {
             storage: Storage::new(project_path),
             config: Config::new(project_path),
+            work_path: project_path.to_path_buf(),
+            project_id: None,
             launcher,
         }
     }
 
-    fn project_path(&self) -> &Path {
+    /// Operations on a registered project: board data in the store, agents
+    /// launched in the project's code folder.
+    pub fn for_project(project: &Project) -> Self {
+        Self::for_project_with_launcher(project, Box::new(KanbanLauncher))
+    }
+
+    pub fn for_project_with_launcher(project: &Project, launcher: Box<dyn AgentLauncher>) -> Self {
+        Operations {
+            storage: Storage::new(&project.data_root),
+            config: Config::new(&project.data_root),
+            work_path: project.work_path.clone(),
+            project_id: Some(project.id.clone()),
+            launcher,
+        }
+    }
+
+    /// The board data root: everything under `.kanban` hangs off this.
+    pub fn data_root(&self) -> &Path {
         &self.storage.project_path
     }
 
+    /// The folder agents are launched in, and the only path a user's code is
+    /// ever read from or written to.
+    pub fn work_path(&self) -> &Path {
+        &self.work_path
+    }
+
+    pub fn roots(&self) -> Roots<'_> {
+        Roots::new(
+            self.data_root(),
+            self.work_path(),
+            self.project_id.as_deref(),
+        )
+    }
+
     fn thread_manager(&self) -> Result<ThreadManager> {
-        ThreadManager::new(self.project_path())
+        ThreadManager::new(self.data_root())
     }
 
     fn session_manager(&self) -> SessionManager {
-        SessionManager::new(self.project_path())
+        SessionManager::new(self.data_root())
     }
 
     fn context_manager(&self) -> ContextManager {
-        ContextManager::new(self.project_path())
+        ContextManager::new(self.data_root())
     }
 
     fn notifier(&self) -> Result<DesktopNotifier> {
@@ -411,7 +453,7 @@ impl Operations {
                 let done = self.move_task_to_done(&task)?;
                 (done, false)
             } else {
-                let moved = self.storage.move_task(task_id, target_status)?;
+                let moved = self.storage.move_task(task_id, target_status, is_agent)?;
                 let entered_review = moved.as_ref().is_some_and(|m| {
                     task.status != TaskStatus::Review && m.status == TaskStatus::Review
                 });
@@ -475,7 +517,7 @@ impl Operations {
             let result = if to == TaskStatus::Done {
                 self.move_task_to_done(&task)?
             } else {
-                self.storage.move_task(&task.id, to.as_str())?
+                self.storage.move_task(&task.id, to.as_str(), false)?
             };
             moved.extend(result);
         }
@@ -516,6 +558,7 @@ impl Operations {
         };
         let entered_done = current.status != TaskStatus::Done;
         current.status = TaskStatus::Done;
+        current.review_unseen = false;
         let now = timefmt::now();
         current.updated_at = now;
         if entered_done {
@@ -721,6 +764,7 @@ impl Operations {
                 }
 
                 task.status = TaskStatus::Review;
+                task.review_unseen = true;
             } else {
                 if is_agent {
                     self.require_current_agent_session(&task, session_id)?;
@@ -754,8 +798,9 @@ impl Operations {
     /// stdout/stderr that is stored in the gate-failed `AgentStep` message.
     const VERIFICATION_OUTPUT_TAIL: usize = 2000;
 
-    /// Run the configured verification command in the project root and return
-    /// its exit code plus a tail of the combined output.
+    /// Run the configured verification command in the work folder (it builds
+    /// and tests the user's code, not the board) and return its exit code plus
+    /// a tail of the combined output.
     fn run_verification_command(
         &self,
         command: &str,
@@ -765,7 +810,7 @@ impl Operations {
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(command)
-            .current_dir(self.project_path())
+            .current_dir(self.work_path())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -886,6 +931,7 @@ impl Operations {
         task.updated_at = timefmt::now();
         if self.config.get_rule("questions_go_to_review")? {
             task.status = TaskStatus::Review;
+            task.review_unseen = role_for_source(source) == MessageRole::Agent;
         }
         self.storage.save_task(&task)?;
         self.notify_question(&task, question);
@@ -931,6 +977,7 @@ impl Operations {
         task.updated_at = timefmt::now();
         if self.config.get_rule("questions_go_to_review")? {
             task.status = TaskStatus::Review;
+            task.review_unseen = role == MessageRole::Agent;
         }
         self.storage.save_task(&task)?;
         self.notify_question(&task, &format!("{count} question(s) via form"));
@@ -966,6 +1013,7 @@ impl Operations {
 
             tm.answer(&task.id, &msg_id, answer, MessageRole::Human)?;
             task.has_questions = tm.has_open_questions(&task.id)?;
+            task.review_unseen = false;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
             let expected_session = task.session.clone();
@@ -1299,6 +1347,7 @@ impl Operations {
             task.updated_at = timefmt::now();
             if self.config.get_rule("questions_go_to_review")? {
                 task.status = TaskStatus::Review;
+                task.review_unseen = true;
             }
             self.storage.save_task(&task)?;
             (task, tm, message)
@@ -1349,6 +1398,22 @@ impl Operations {
     }
 
     // ------------------------------------------------------- review / rerun
+
+    /// Clear the `review_unseen` notifier flag. Called when the user opens a
+    /// task's detail view: the act of opening it is the "I've seen it" signal.
+    /// Returns true when the flag was set and is now cleared (a write happened).
+    pub fn mark_review_seen(&self, task_id: &str) -> Result<bool> {
+        let _guard = self.storage.lock()?;
+        let Some(mut task) = self.storage.load_task(task_id)? else {
+            return Ok(false);
+        };
+        if !task.review_unseen {
+            return Ok(false);
+        }
+        task.review_unseen = false;
+        self.storage.save_task(&task)?;
+        Ok(true)
+    }
 
     /// Stash the human's review-edit notes in the per-task buffer. Folded into
     /// the thread and cleared on the next re-run — see [`Self::rerun_review_task`].
@@ -1401,6 +1466,7 @@ impl Operations {
             task.review_edits = String::new();
             task.session = Some(session_id.clone());
             task.auto_resumes = 0;
+            task.review_unseen = false;
             task.status = TaskStatus::InProgress;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
@@ -1557,7 +1623,7 @@ impl Operations {
         self.log_launch_step(&task, session_id, revert);
         Ok(self
             .launcher
-            .launch(self.project_path(), &task, session_id, revert))
+            .launch(self.roots(), &task, session_id, revert))
     }
 
     /// Dump the assembled prompt to `.kanban/logs/<session>.prompt.txt` and
@@ -1568,7 +1634,7 @@ impl Operations {
             .storage
             .logs_dir
             .join(format!("{session_id}.prompt.txt"));
-        match build_agent_prompt(self.project_path(), task, session_id, revert) {
+        match build_agent_prompt(self.roots(), task, session_id, revert) {
             Ok(prompt) => {
                 if let Err(err) = atomic_write_text(&prompt_path, &prompt) {
                     eprintln!(
@@ -1583,7 +1649,7 @@ impl Operations {
         }
 
         let rel_prompt_path = prompt_path
-            .strip_prefix(self.project_path())
+            .strip_prefix(self.data_root())
             .unwrap_or(&prompt_path)
             .display();
         let body = format!(
@@ -1789,7 +1855,7 @@ impl Operations {
             )));
         }
 
-        let detached_dir = self.project_path().join(".kanban").join("detached");
+        let detached_dir = self.data_root().join(".kanban").join("detached");
         fs::create_dir_all(&detached_dir)?;
         let stamp = timefmt::now().format("%Y%m%d-%H%M%S%3f");
         let log_file = detached_dir.join(format!("{task_id}-{stamp}.log"));
@@ -1816,7 +1882,9 @@ impl Operations {
         let mut child_cmd = std::process::Command::new("bash");
         child_cmd
             .args(["-c", &script])
-            .current_dir(self.project_path())
+            // The detached job is the agent's own command line: it runs where
+            // the agent runs, not where the board lives.
+            .current_dir(self.work_path())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -1839,8 +1907,10 @@ impl Operations {
             .map(str::trim)
             .filter(|n| !n.is_empty())
             .unwrap_or("a detached command result");
+        // The note is read back by the relaunched agent, whose cwd is the work
+        // folder: paths outside it (a board in the store) stay absolute.
         let rel = |path: &Path| {
-            path.strip_prefix(self.project_path())
+            path.strip_prefix(self.work_path())
                 .unwrap_or(path)
                 .display()
                 .to_string()
@@ -1931,28 +2001,31 @@ impl Operations {
             .join(format!("{session_id}.prompt.txt"));
         let prompt_dump = prompt_path.exists().then(|| {
             prompt_path
-                .strip_prefix(self.project_path())
+                .strip_prefix(self.data_root())
                 .unwrap_or(&prompt_path)
                 .display()
                 .to_string()
         });
         let session = session_id.to_string();
+        // The harvester's root relativizes the files a run read and wrote:
+        // those are the user's code, so it is the work folder.
+        let repo_root = self.work_path().to_path_buf();
         let harvester: Box<dyn TranscriptHarvester> = match backend.as_str() {
             "claude" => Box::new(ClaudeHarvester {
                 session_id: session,
                 prompt_dump,
-                root: self.project_path().to_path_buf(),
+                root: repo_root,
             }),
             "opencode" => Box::new(OpencodeHarvester {
                 session_id: session,
                 prompt_dump,
-                root: self.project_path().to_path_buf(),
+                root: repo_root,
             }),
             "pi" | "omp" => Box::new(PiFamilyHarvester {
                 session_id: session,
                 backend: backend.clone(),
                 prompt_dump,
-                root: self.project_path().to_path_buf(),
+                root: repo_root,
             }),
             _ => return None,
         };
@@ -2322,7 +2395,7 @@ impl Operations {
     // ------------------------------------------------- per-task housekeeping
 
     pub fn backup_dir(&self, task_id: &str) -> PathBuf {
-        self.project_path()
+        self.data_root()
             .join(".kanban")
             .join("backups")
             .join(task_id)
@@ -2391,7 +2464,7 @@ impl Operations {
     }
 
     fn clear_task_logs_and_sessions(&self, task: &Task) {
-        let kanban_dir = self.project_path().join(".kanban");
+        let kanban_dir = self.data_root().join(".kanban");
         for session_id in self.task_session_ids(task) {
             if SessionManager::validate_session_id(&session_id).is_err() {
                 continue;
@@ -2405,7 +2478,7 @@ impl Operations {
     /// Remove `.kanban/detached/` log/status files recorded for this task's
     /// detached jobs (named `<task_id>-<stamp>.*`).
     fn clear_task_detached(&self, task_id: &str) {
-        let detached_dir = self.project_path().join(".kanban").join("detached");
+        let detached_dir = self.data_root().join(".kanban").join("detached");
         let Ok(entries) = fs::read_dir(&detached_dir) else {
             return;
         };
@@ -2422,13 +2495,13 @@ impl Operations {
     /// Delete pasted images referenced by the task description (only ever
     /// touches files inside `.kanban/assets/`).
     fn clear_task_assets(&self, task: &Task) {
-        let assets_dir = self.project_path().join(".kanban").join("assets");
+        let assets_dir = self.data_root().join(".kanban").join("assets");
         let Ok(assets_dir) = assets_dir.canonicalize() else {
             return;
         };
 
         for raw_path in asset_paths_from_description(&task.description) {
-            let Ok(asset_path) = self.project_path().join(&raw_path).canonicalize() else {
+            let Ok(asset_path) = self.data_root().join(&raw_path).canonicalize() else {
                 continue;
             };
             if !asset_path.starts_with(&assets_dir) {

@@ -9,10 +9,15 @@ use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, HitAction, Hitbox, Screen, UiAction};
 use super::card::{sanitize_terminal_text, truncate_display};
-use super::{card, detail, dialogs, search, sessions};
+use super::{card, detail, dialogs, projects, search, sessions};
 
 pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
+    // Reset the full frame so stale symbols from a previous frame (e.g. a
+    // closed modal or a shorter card list) cannot bleed through. ratatui's
+    // Block only sets style, never clears the cell symbol, so uncovered cells
+    // would otherwise retain whatever the previous widget wrote there.
+    frame.render_widget(Clear, area);
     // Renderers re-register their regions on every frame.
     app.hitboxes.clear();
     let chunks = Layout::default()
@@ -26,8 +31,13 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
         Screen::Archive => sessions::render_archive(frame, app, chunks[0]),
         Screen::LogView => sessions::render_log_view(frame, app, chunks[0]),
         Screen::TextView => sessions::render_text_view(frame, app, chunks[0]),
+        Screen::Projects => projects::render(frame, app, chunks[0]),
         Screen::Help => {
-            render_board(frame, app, chunks[0]);
+            if app.help_return == Screen::Projects {
+                projects::render(frame, app, chunks[0]);
+            } else {
+                render_board(frame, app, chunks[0]);
+            }
             render_help(frame, app, area);
         }
     }
@@ -319,6 +329,15 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
             seg("↑/↓ scroll", None, 2),
             seg("? close", Some(UiAction::Help), 1),
         ],
+        Screen::Projects => vec![
+            seg("Enter open", Some(UiAction::OpenProject), 1),
+            seg("n new", Some(UiAction::NewProject), 2),
+            seg("r rename", Some(UiAction::RenameProject), 3),
+            seg("p path", Some(UiAction::SetProjectPath), 4),
+            seg("d delete", Some(UiAction::DeleteProject), 3),
+            seg("/ filter", Some(UiAction::Search), 4),
+            seg("? help", Some(UiAction::Help), 1),
+        ],
     }
 }
 
@@ -493,6 +512,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  a/l: archive and sessions views"),
         Line::from("  /: search · Esc clears an active filter"),
         Line::from("  s: project settings · Ctrl+T: cycle and persist theme"),
+        Line::from("  P: projects list"),
         Line::from(""),
         Line::from("Detail"),
         Line::from("  Tab: cycle thread/answer/editor panels when present"),
@@ -509,6 +529,12 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Archive"),
         Line::from("  Enter: detail · u: restore the task to To Do"),
+        Line::from(""),
+        Line::from("Projects"),
+        Line::from("  Enter: open · n: new project · r: rename · p: change path · d: remove"),
+        Line::from("  pinned + row creates a project for the current folder with no dialog"),
+        Line::from("  delete unregisters by default; toggle also deletes board data"),
+        Line::from("  q/Esc: back to the board, or quit when this is the entry screen"),
         Line::from(""),
         Line::from("Log view"),
         Line::from("  ↑/↓ PgUp/PgDn Home/End: scroll · End re-enables follow · q: back"),

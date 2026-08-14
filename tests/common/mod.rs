@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use kanban4ai::core::models::Task;
 use kanban4ai::core::operations::{AgentLauncher, Operations};
+use kanban4ai::core::project::Roots;
 use kanban4ai::core::storage::Storage;
 
 pub fn fixtures_dir() -> PathBuf {
@@ -46,9 +47,13 @@ pub fn copy_fixture(fixture_rel: &str, dest: &Path) {
 /// Launch call recorded by [`RecordingLauncher`]: (task_id, session_id, revert).
 pub type LaunchCall = (String, String, bool);
 
+/// The roots a launch was handed: (data_root, work_path, project id).
+pub type LaunchRoots = (PathBuf, PathBuf, Option<String>);
+
 #[derive(Clone, Default)]
 pub struct RecordingLauncher {
     pub calls: Arc<Mutex<Vec<LaunchCall>>>,
+    pub roots: Arc<Mutex<Vec<LaunchRoots>>>,
 }
 
 impl RecordingLauncher {
@@ -59,14 +64,23 @@ impl RecordingLauncher {
     pub fn calls(&self) -> Vec<LaunchCall> {
         self.calls.lock().unwrap().clone()
     }
+
+    pub fn roots(&self) -> Vec<LaunchRoots> {
+        self.roots.lock().unwrap().clone()
+    }
 }
 
 impl AgentLauncher for RecordingLauncher {
-    fn launch(&self, _project: &Path, task: &Task, session_id: &str, revert: bool) -> bool {
+    fn launch(&self, roots: Roots<'_>, task: &Task, session_id: &str, revert: bool) -> bool {
         self.calls
             .lock()
             .unwrap()
             .push((task.id.clone(), session_id.to_string(), revert));
+        self.roots.lock().unwrap().push((
+            roots.data_root.to_path_buf(),
+            roots.work_path.to_path_buf(),
+            roots.project_id.map(str::to_string),
+        ));
         true
     }
 }

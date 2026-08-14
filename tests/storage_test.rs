@@ -245,7 +245,7 @@ fn next_id_scans_all_status_dirs() {
     let (_dir, storage) = temp_board();
     storage.create_task(NewTask::titled("One")).unwrap();
     storage.create_task(NewTask::titled("Two")).unwrap();
-    storage.move_task("TASK-002", "done").unwrap();
+    storage.move_task("TASK-002", "done", false).unwrap();
 
     assert_eq!(storage.get_next_id().unwrap(), "TASK-003");
 }
@@ -255,7 +255,10 @@ fn move_task_relocates_the_file() {
     let (dir, storage) = temp_board();
     storage.create_task(NewTask::titled("Mover")).unwrap();
 
-    let moved = storage.move_task("TASK-001", "review").unwrap().unwrap();
+    let moved = storage
+        .move_task("TASK-001", "review", false)
+        .unwrap()
+        .unwrap();
     assert_eq!(moved.status, TaskStatus::Review);
     assert!(
         dir.path()
@@ -269,7 +272,7 @@ fn move_task_relocates_the_file() {
 fn move_task_to_invalid_status_errors() {
     let (_dir, storage) = temp_board();
     storage.create_task(NewTask::titled("Bad move")).unwrap();
-    assert!(storage.move_task("TASK-001", "nonsense").is_err());
+    assert!(storage.move_task("TASK-001", "nonsense", false).is_err());
 }
 
 #[test]
@@ -301,7 +304,7 @@ fn list_tasks_filters_by_status() {
     let (_dir, storage) = temp_board();
     storage.create_task(NewTask::titled("A")).unwrap();
     storage.create_task(NewTask::titled("B")).unwrap();
-    storage.move_task("TASK-002", "in_progress").unwrap();
+    storage.move_task("TASK-002", "in_progress", false).unwrap();
 
     assert_eq!(storage.get_all_tasks().unwrap().len(), 2);
     let todo = storage.get_tasks_by_status("todo").unwrap();

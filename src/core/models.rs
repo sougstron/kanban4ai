@@ -248,6 +248,13 @@ pub struct Task {
     /// legacy boards round-trip byte-identically.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub auto_resumes: u32,
+    /// Set when an agent moved this task into Review and the user has not yet
+    /// opened its detail. Drives the yellow "unseen review" notifier on the
+    /// board card and the projects list. Cleared by any human action on the
+    /// task (open detail, move, done, rerun, answer). Omitted while false so
+    /// legacy boards round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub review_unseen: bool,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -281,6 +288,7 @@ impl Task {
             chained_to: None,
             review_edits: String::new(),
             auto_resumes: 0,
+            review_unseen: false,
         }
     }
 }

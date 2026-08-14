@@ -25,6 +25,7 @@ use crate::core::models::{
     Message, MessageKind, MessageStatus, Session, SessionStatus, Task, TaskStatus,
 };
 use crate::core::operations::{Operations, QuestionRef, TaskPatch};
+use crate::core::project::{Project, ProjectStore};
 use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
 use crate::core::storage::NewTask;
@@ -38,7 +39,9 @@ use super::card::{
 use super::dialogs::{
     BulkAction, DialogField, Modal, ModalButton, ModalState, QuestionChoice, SelectOption,
 };
+use super::event::LoopOutcome;
 use super::image;
+use super::projects::{self, ProjectListItem, ProjectRow};
 use super::search::SearchState;
 use super::theme::Theme;
 
@@ -62,6 +65,7 @@ pub enum Screen {
     /// gathered context of a task), opened from the detail view.
     TextView,
     Help,
+    Projects,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +139,9 @@ pub enum HitAction {
     },
     DetailThread,
     DetailEdits,
+    FocusProject {
+        index: usize,
+    },
 }
 
 /// A user-level action, triggered equally by a hotkey, a button click, or a
@@ -174,6 +181,13 @@ pub enum UiAction {
     ToggleReject,
     ViewPrompt,
     ViewContext,
+    OpenProjects,
+    OpenProject,
+    NewProject,
+    RenameProject,
+    SetProjectPath,
+    DeleteProject,
+    CreateCwdProject,
 }
 
 /// Which detail panel receives keyboard input. `Thread` is the neutral state
@@ -354,6 +368,15 @@ pub struct App {
     /// Backends whose warmed model catalog has already been reflected into an
     /// open modal, so `tick` refreshes options at most once per backend.
     catalog_ready: HashSet<String>,
+    pub project: Option<Project>,
+    pub projects: Vec<ProjectRow>,
+    pub project_selected: usize,
+    pub create_cwd: Option<PathBuf>,
+    store: Option<ProjectStore>,
+    return_project: Option<Project>,
+    pending_switch: Option<LoopOutcome>,
+    has_board: bool,
+    pub help_return: Screen,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -551,7 +574,154 @@ impl App {
             ctrl_c_exit_deadline: None,
             last_wait_resume: None,
             catalog_ready,
+            project: None,
+            projects: Vec::new(),
+            project_selected: 0,
+            create_cwd: None,
+            store: None,
+            return_project: None,
+            pending_switch: None,
+            has_board: true,
+            help_return: Screen::Board,
         })
+    }
+
+    pub fn for_project(project: Project) -> Result<Self> {
+        let mut app = Self::from_ops(Operations::for_project(&project))?;
+        app.settings.project_name = project.name.clone();
+        app.project = Some(project);
+        let _ = app
+            .project
+            .as_ref()
+            .map(|project| ProjectStore::open().and_then(|store| store.touch_opened(&project.id)));
+        Ok(app)
+    }
+
+    fn from_ops(ops: Operations) -> Result<Self> {
+        Self::new(ops.data_root()).map(|mut app| {
+            app.ops = ops;
+            app
+        })
+    }
+
+    pub fn projects_only(return_project: Option<Project>) -> Result<Self> {
+        let store = ProjectStore::open()?;
+        let create_cwd = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| projects::cwd_create_path(&store, &cwd));
+        Self::projects_at(store, return_project, create_cwd)
+    }
+
+    pub fn projects_at(
+        store: ProjectStore,
+        return_project: Option<Project>,
+        create_cwd: Option<PathBuf>,
+    ) -> Result<Self> {
+        let projects = projects::load_rows(&store)?;
+        let dummy = store.root().join(".no-board");
+        let mut app = Self {
+            ops: Operations::new(&dummy),
+            project_path: dummy,
+            screen: Screen::Projects,
+            board: BoardSnapshot::empty(),
+            settings: default_project_settings(),
+            theme: Theme::named("dark"),
+            focused_column: 0,
+            focused_card: 0,
+            column_offsets: Vec::new(),
+            visible_card_capacities: Vec::new(),
+            search: SearchState::default(),
+            modal: None,
+            detail: None,
+            active_sessions: Vec::new(),
+            session_selected: 0,
+            session_progress: HashMap::new(),
+            archived_tasks: Vec::new(),
+            archive_selected: 0,
+            should_quit: false,
+            status: "Projects".to_string(),
+            hitboxes: Vec::new(),
+            hovered: None,
+            dragging: None,
+            rendered_screen: RenderedScreen::default(),
+            text_selection: None,
+            pending_copy: None,
+            copy_notice_deadline: None,
+            status_before_copy: None,
+            log_view: None,
+            text_view: None,
+            text_view_return: Screen::Projects,
+            return_screen: Screen::Projects,
+            help_scroll: 0,
+            help_max_scroll: 0,
+            pending_terminal: None,
+            pending_fs_reload: false,
+            fs_change_generation: 0,
+            recent_models: Vec::new(),
+            ctrl_c_exit_deadline: None,
+            last_wait_resume: None,
+            catalog_ready: HashSet::new(),
+            project: None,
+            projects,
+            project_selected: 0,
+            create_cwd,
+            store: Some(store),
+            return_project,
+            pending_switch: None,
+            has_board: false,
+            help_return: Screen::Projects,
+        };
+        app.theme = Theme::named(&app.settings.theme_name);
+        Ok(app)
+    }
+
+    pub fn watch_root(&self) -> Option<&Path> {
+        self.has_board.then_some(self.project_path.as_path())
+    }
+
+    pub fn take_loop_outcome(&mut self) -> Option<LoopOutcome> {
+        if let Some(outcome) = self.pending_switch.take() {
+            return Some(outcome);
+        }
+        self.should_quit.then_some(LoopOutcome::Quit)
+    }
+
+    pub fn visible_project_items(&self) -> Vec<ProjectListItem> {
+        let filter = self.search.text();
+        let mut items = Vec::new();
+        if let Some(path) = &self.create_cwd {
+            items.push(ProjectListItem::CreateCwd { path: path.clone() });
+        }
+        items.extend(
+            self.projects
+                .iter()
+                .filter(|row| {
+                    filter.is_empty()
+                        || case_insensitive_match(&row.project.name, &filter)
+                        || case_insensitive_match(&row.project.work_path.to_string_lossy(), &filter)
+                        || case_insensitive_match(&row.project.id, &filter)
+                })
+                .cloned()
+                .map(ProjectListItem::Project),
+        );
+        items
+    }
+
+    fn selected_project_row(&self) -> Option<&ProjectRow> {
+        match self.visible_project_items().get(self.project_selected) {
+            Some(ProjectListItem::Project(row)) => self
+                .projects
+                .iter()
+                .find(|candidate| candidate.project.id == row.project.id),
+            _ => None,
+        }
+    }
+
+    fn selected_is_create_cwd(&self) -> bool {
+        matches!(
+            self.visible_project_items().get(self.project_selected),
+            Some(ProjectListItem::CreateCwd { .. })
+        )
     }
 
     /// Insert bracketed-paste text into whatever text field has focus.
@@ -616,7 +786,10 @@ impl App {
                 ..
             }
         ) {
-            return self.dispatch(UiAction::CycleTheme);
+            if self.has_board {
+                return self.dispatch(UiAction::CycleTheme);
+            }
+            return Ok(());
         }
         if self.screen == Screen::Detail && self.handle_detail_key(key)? {
             return Ok(());
@@ -631,6 +804,9 @@ impl App {
         if self.screen == Screen::Sessions {
             return self.handle_sessions_key(key);
         }
+        if self.screen == Screen::Projects {
+            return self.handle_projects_key(key);
+        }
         let action_screen = matches!(self.screen, Screen::Board | Screen::Detail);
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) if self.screen == Screen::Board && !self.search.text().is_empty() => {
@@ -640,6 +816,8 @@ impl App {
             (KeyCode::Char('q'), _) => {
                 if self.screen == Screen::Detail {
                     self.close_detail()?;
+                } else if self.screen == Screen::Help && self.help_return == Screen::Projects {
+                    self.screen = Screen::Projects;
                 } else if self.screen != Screen::Board {
                     self.screen = Screen::Board;
                     self.detail = None;
@@ -648,8 +826,15 @@ impl App {
                 }
             }
             (KeyCode::Esc, _) if matches!(self.screen, Screen::Archive | Screen::Help) => {
-                self.screen = Screen::Board;
+                self.screen = if self.help_return == Screen::Projects {
+                    Screen::Projects
+                } else {
+                    Screen::Board
+                };
                 self.detail = None;
+            }
+            (KeyCode::Char('P'), _) if !matches!(self.screen, Screen::Help) => {
+                self.dispatch(UiAction::OpenProjects)?
             }
             (KeyCode::Char('?'), _) => self.dispatch(UiAction::Help)?,
             (KeyCode::Char('s'), KeyModifiers::CONTROL) if self.screen == Screen::Detail => {
@@ -773,17 +958,22 @@ impl App {
                 let norm = normalize_command_key(key);
                 if norm.modifiers == KeyModifiers::CONTROL {
                     match norm.code {
-                        KeyCode::Char('s') => self.dispatch(UiAction::SaveReviewEdits)?,
-                        KeyCode::Char('r') => self.dispatch(UiAction::Rerun)?,
+                        KeyCode::Char('s') => {
+                            self.dispatch(UiAction::SaveReviewEdits)?;
+                            return Ok(true);
+                        }
+                        KeyCode::Char('r') => {
+                            self.dispatch(UiAction::Rerun)?;
+                            return Ok(true);
+                        }
                         _ => {}
                     }
-                    return Ok(true);
                 }
                 if key.code == KeyCode::Esc {
                     self.set_detail_focus(DetailFocus::Thread);
                     return Ok(true);
                 }
-                if is_text_input_key(key) {
+                if is_text_input_key(key) || is_word_edit_key(key) {
                     self.input_review_edits(key);
                 }
                 Ok(true)
@@ -931,6 +1121,7 @@ impl App {
 
     fn handle_sessions_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
+            KeyCode::Char('P') => self.dispatch(UiAction::OpenProjects)?,
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.screen = Screen::Board;
             }
@@ -940,6 +1131,33 @@ impl App {
             KeyCode::Char('o') => self.dispatch(UiAction::OpenSessionTask)?,
             KeyCode::Char('i') => self.open_session_info()?,
             KeyCode::Enter => self.open_focused_detail()?,
+            KeyCode::Up => self.focus_up(),
+            KeyCode::Down => self.focus_down(),
+            KeyCode::PageUp => self.page_up(),
+            KeyCode::PageDown => self.page_down(),
+            KeyCode::Home => self.home(),
+            KeyCode::End => self.end(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn handle_projects_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.leave_projects(),
+            KeyCode::Char('/') => self.dispatch(UiAction::Search)?,
+            KeyCode::Char('?') => self.dispatch(UiAction::Help)?,
+            KeyCode::Char('n') if self.selected_is_create_cwd() => {
+                self.dispatch(UiAction::CreateCwdProject)?
+            }
+            KeyCode::Char('n') => self.dispatch(UiAction::NewProject)?,
+            KeyCode::Char('r') => self.dispatch(UiAction::RenameProject)?,
+            KeyCode::Char('p') => self.dispatch(UiAction::SetProjectPath)?,
+            KeyCode::Char('d') => self.dispatch(UiAction::DeleteProject)?,
+            KeyCode::Enter if self.selected_is_create_cwd() => {
+                self.dispatch(UiAction::CreateCwdProject)?
+            }
+            KeyCode::Enter => self.dispatch(UiAction::OpenProject)?,
             KeyCode::Up => self.focus_up(),
             KeyCode::Down => self.focus_down(),
             KeyCode::PageUp => self.page_up(),
@@ -998,8 +1216,9 @@ impl App {
         match action {
             UiAction::Help => {
                 if self.screen == Screen::Help {
-                    self.screen = Screen::Board;
+                    self.screen = self.help_return;
                 } else {
+                    self.help_return = self.screen;
                     self.help_scroll = 0;
                     self.screen = Screen::Help;
                 }
@@ -1037,6 +1256,13 @@ impl App {
             UiAction::ToggleReject => self.toggle_reject_selected_message()?,
             UiAction::ViewPrompt => self.open_prompt_view()?,
             UiAction::ViewContext => self.open_context_view()?,
+            UiAction::OpenProjects => self.open_projects_list(),
+            UiAction::OpenProject => self.open_selected_project(),
+            UiAction::NewProject => self.open_new_project_dialog(),
+            UiAction::RenameProject => self.open_rename_project_dialog(),
+            UiAction::SetProjectPath => self.open_set_path_dialog(),
+            UiAction::DeleteProject => self.open_delete_project_dialog(),
+            UiAction::CreateCwdProject => self.create_cwd_project()?,
         }
         Ok(())
     }
@@ -1149,7 +1375,12 @@ impl App {
                 | HitAction::DetailAnswerOption { .. }
                 | HitAction::DetailEdits,
             ) => shift,
-            Some(HitAction::ColumnFocus(_) | HitAction::DetailThread) | None => true,
+            Some(
+                HitAction::ColumnFocus(_)
+                | HitAction::DetailThread
+                | HitAction::FocusProject { .. },
+            )
+            | None => true,
         }
     }
 
@@ -1305,7 +1536,8 @@ impl App {
                 | HitAction::ModalButton(_)
                 | HitAction::DetailAnswerOption { .. }
                 | HitAction::DetailEdits
-                | HitAction::DetailThread,
+                | HitAction::DetailThread
+                | HitAction::FocusProject { .. },
             )
             | None => None,
         }
@@ -1359,6 +1591,10 @@ impl App {
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_),
             ) => Ok(()),
+            Some(HitAction::FocusProject { index }) => {
+                self.project_selected = index;
+                self.dispatch(UiAction::OpenProject)
+            }
             None => Ok(()),
         }
     }
@@ -1430,7 +1666,8 @@ impl App {
                 | HitAction::ModalButton(_)
                 | HitAction::DetailAnswerOption { .. }
                 | HitAction::DetailEdits
-                | HitAction::DetailThread,
+                | HitAction::DetailThread
+                | HitAction::FocusProject { .. },
             )
             | None => self.focused_column,
         };
@@ -1500,6 +1737,9 @@ impl App {
     }
 
     pub fn reload_if_changed(&mut self) -> Result<()> {
+        if !self.has_board {
+            return self.refresh_projects();
+        }
         let fingerprint = self.ops.storage.tui_fingerprint();
         if fingerprint != self.board.fingerprint {
             self.board = BoardSnapshot::load(&self.ops)?;
@@ -1713,6 +1953,9 @@ impl App {
             Screen::LogView => self.scroll_log(-1),
             Screen::TextView => self.scroll_text_view(-1),
             Screen::Help => self.help_scroll = self.help_scroll.saturating_sub(1),
+            Screen::Projects => {
+                self.project_selected = self.project_selected.saturating_sub(1);
+            }
         }
     }
 
@@ -1734,6 +1977,10 @@ impl App {
             Screen::TextView => self.scroll_text_view(1),
             Screen::Help => {
                 self.help_scroll = self.help_scroll.saturating_add(1).min(self.help_max_scroll);
+            }
+            Screen::Projects => {
+                self.project_selected =
+                    next_index(self.project_selected, self.visible_project_items().len());
             }
         }
     }
@@ -1793,6 +2040,7 @@ impl App {
                 }
             }
             Screen::Help => self.help_scroll = 0,
+            Screen::Projects => self.project_selected = 0,
         }
     }
 
@@ -1822,6 +2070,9 @@ impl App {
                 }
             }
             Screen::Help => self.help_scroll = self.help_max_scroll,
+            Screen::Projects => {
+                self.project_selected = self.visible_project_items().len().saturating_sub(1);
+            }
         }
     }
 
@@ -2047,6 +2298,7 @@ impl App {
         }
         if let Some(task_id) = self.focused_task_id() {
             self.load_detail(&task_id)?;
+            let _ = self.ops.mark_review_seen(&task_id)?;
             self.return_screen = Screen::Board;
             self.screen = Screen::Detail;
         }
@@ -2343,6 +2595,115 @@ impl App {
         }
     }
 
+    fn open_projects_list(&mut self) {
+        self.pending_switch = Some(LoopOutcome::ShowProjects {
+            return_to: self.project.clone(),
+        });
+    }
+
+    fn leave_projects(&mut self) {
+        if let Some(project) = self.return_project.clone() {
+            self.pending_switch = Some(LoopOutcome::OpenProject(project));
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    fn open_selected_project(&mut self) {
+        let Some(row) = self.selected_project_row() else {
+            self.status = "No project selected".to_string();
+            return;
+        };
+        self.pending_switch = Some(LoopOutcome::OpenProject(row.project.clone()));
+    }
+
+    fn open_new_project_dialog(&mut self) {
+        let mut modal = ModalState::new(Modal::NewProject);
+        if let Some(path) = &self.create_cwd {
+            modal.description = super::dialogs::one_line(&path.display().to_string());
+            modal.title = super::dialogs::one_line(&projects::default_project_name(path));
+        }
+        modal.capture_initial_values();
+        self.modal = Some(modal);
+    }
+
+    fn open_rename_project_dialog(&mut self) {
+        let Some(row) = self.selected_project_row() else {
+            self.status = "No project selected".to_string();
+            return;
+        };
+        let mut modal = ModalState::new(Modal::RenameProject {
+            id: row.project.id.clone(),
+        });
+        modal.title = super::dialogs::one_line(&row.project.name);
+        modal.capture_initial_values();
+        self.modal = Some(modal);
+    }
+
+    fn open_set_path_dialog(&mut self) {
+        let Some(row) = self.selected_project_row() else {
+            self.status = "No project selected".to_string();
+            return;
+        };
+        let mut modal = ModalState::new(Modal::SetProjectPath {
+            id: row.project.id.clone(),
+        });
+        modal.description = super::dialogs::one_line(&row.project.work_path.display().to_string());
+        modal.capture_initial_values();
+        self.modal = Some(modal);
+    }
+
+    fn open_delete_project_dialog(&mut self) {
+        let Some(row) = self.selected_project_row() else {
+            self.status = "No project selected".to_string();
+            return;
+        };
+        self.modal = Some(ModalState::new(Modal::DeleteProject {
+            id: row.project.id.clone(),
+            name: row.project.name.clone(),
+            task_count: row.counts.total_tasks(),
+        }));
+    }
+
+    fn create_cwd_project(&mut self) -> Result<()> {
+        let Some(path) = self.create_cwd.clone() else {
+            self.status = "Current folder is already a project".to_string();
+            return Ok(());
+        };
+        self.add_and_open_project(&path, None)
+    }
+
+    fn add_and_open_project(&mut self, path: &Path, name: Option<&str>) -> Result<()> {
+        let Some(store) = self.store.as_ref() else {
+            self.status = "Project store is not available".to_string();
+            return Ok(());
+        };
+        match store.add(path, name) {
+            Ok(added) => {
+                self.pending_switch = Some(LoopOutcome::OpenProject(added.project));
+            }
+            Err(err) => self.status = format!("Could not add project: {err}"),
+        }
+        Ok(())
+    }
+
+    fn refresh_projects(&mut self) -> Result<()> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(());
+        };
+        self.projects = projects::load_rows(store)?;
+        if let Ok(cwd) = std::env::current_dir() {
+            self.create_cwd = projects::cwd_create_path(store, &cwd);
+        }
+        let len = self.visible_project_items().len();
+        if len == 0 {
+            self.project_selected = 0;
+        } else {
+            self.project_selected = self.project_selected.min(len - 1);
+        }
+        Ok(())
+    }
+
     fn open_answer_dialog(&mut self) -> Result<()> {
         let Some(task_id) = self.current_task_id() else {
             return Ok(());
@@ -2600,7 +2961,9 @@ impl App {
         Ok(Some(TerminalAction::Foreground {
             command,
             args: vec!["--resume".to_string(), backend_session_id],
-            cwd: self.project_path.clone(),
+            // Resuming a conversation re-runs the backend the way the agent
+            // ran it: in the code folder, not in the board's data root.
+            cwd: self.ops.work_path().to_path_buf(),
             label: format!("resume {session_id}"),
         }))
     }
@@ -3003,6 +3366,7 @@ impl App {
             Screen::Sessions => self.session_selected = 0,
             Screen::Archive => self.archive_selected = 0,
             Screen::Detail | Screen::LogView | Screen::TextView | Screen::Help => {}
+            Screen::Projects => self.project_selected = 0,
         }
     }
 
@@ -3010,6 +3374,20 @@ impl App {
         let Some(detail) = self.detail.as_mut() else {
             return;
         };
+        if is_word_edit_key(key) {
+            match key.code {
+                KeyCode::Backspace => {
+                    detail.review_edits.delete_word();
+                }
+                KeyCode::Delete => {
+                    detail.review_edits.delete_next_word();
+                }
+                _ => {
+                    detail.review_edits.input(key);
+                }
+            }
+            return;
+        }
         detail.review_edits.input(key);
     }
 
@@ -3218,6 +3596,13 @@ impl App {
                 KeyCode::Enter => modal.discard_confirm = false,
                 _ => {}
             }
+            self.modal = Some(modal);
+            return Ok(true);
+        }
+        if matches!(modal.modal, Modal::DeleteProject { .. })
+            && matches!(command.code, KeyCode::Char(' '))
+        {
+            modal.purge_data = !modal.purge_data;
             self.modal = Some(modal);
             return Ok(true);
         }
@@ -3589,6 +3974,95 @@ impl App {
                 self.refresh_after_action()?;
                 self.status = format!("Answered question on {task_id}");
             }
+            Modal::NewProject => {
+                let path = modal.description_text();
+                if path.trim().is_empty() {
+                    modal.focus_field(DialogField::Description);
+                    modal.error = Some("Folder path cannot be empty".to_string());
+                    self.modal = Some(modal);
+                    return Ok(());
+                }
+                let name = modal.title_text();
+                let name = (!name.trim().is_empty()).then_some(name.as_str());
+                self.add_and_open_project(Path::new(&path), name)?;
+            }
+            Modal::RenameProject { id } => {
+                let name = modal.title_text();
+                if name.trim().is_empty() {
+                    modal.focus_field(DialogField::Title);
+                    modal.error = Some("Project name cannot be empty".to_string());
+                    self.modal = Some(modal);
+                    return Ok(());
+                }
+                let Some(store) = self.store.as_ref() else {
+                    self.status = "Project store is not available".to_string();
+                    return Ok(());
+                };
+                match store.rename(&id, &name) {
+                    Ok(_) => {
+                        self.refresh_projects()?;
+                        self.status = format!("Renamed project to {name}");
+                    }
+                    Err(err) => {
+                        modal.error = Some(err.to_string());
+                        self.modal = Some(modal);
+                        return Ok(());
+                    }
+                }
+            }
+            Modal::SetProjectPath { id } => {
+                let path = modal.description_text();
+                if path.trim().is_empty() {
+                    modal.focus_field(DialogField::Description);
+                    modal.error = Some("Folder path cannot be empty".to_string());
+                    self.modal = Some(modal);
+                    return Ok(());
+                }
+                let Some(store) = self.store.as_ref() else {
+                    self.status = "Project store is not available".to_string();
+                    return Ok(());
+                };
+                match store.set_path(&id, Path::new(&path)) {
+                    Ok(_) => {
+                        self.refresh_projects()?;
+                        self.status = "Updated project path".to_string();
+                    }
+                    Err(err) => {
+                        modal.error = Some(err.to_string());
+                        self.modal = Some(modal);
+                        return Ok(());
+                    }
+                }
+            }
+            Modal::DeleteProject { id, name, .. } => {
+                let purge = modal.purge_data;
+                let Some(store) = self.store.as_ref() else {
+                    self.status = "Project store is not available".to_string();
+                    return Ok(());
+                };
+                match store.remove(&id, purge) {
+                    Ok(()) => {
+                        if self
+                            .return_project
+                            .as_ref()
+                            .is_some_and(|project| project.id == id)
+                        {
+                            self.return_project = None;
+                        }
+                        self.refresh_projects()?;
+                        self.status = if purge {
+                            format!("Deleted project {name} and its board data")
+                        } else {
+                            format!("Unregistered project {name}")
+                        };
+                    }
+                    Err(err) => {
+                        modal.error = Some(err.to_string());
+                        self.modal = Some(modal);
+                        return Ok(());
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -3619,6 +4093,29 @@ impl App {
 }
 
 impl BoardSnapshot {
+    pub fn empty() -> Self {
+        let config = BoardConfig::default();
+        let columns = config
+            .column_ids()
+            .into_iter()
+            .zip(config.column_names())
+            .map(|(id, name)| BoardColumn {
+                id,
+                name,
+                tasks: Vec::new(),
+            })
+            .collect();
+        Self {
+            columns,
+            extras: HashMap::new(),
+            session_states: HashMap::new(),
+            session_deadlines: HashMap::new(),
+            session_wait_deadlines: HashMap::new(),
+            session_wait_notes: HashMap::new(),
+            fingerprint: (0, 0),
+        }
+    }
+
     pub fn load(ops: &Operations) -> Result<Self> {
         let config = ops.config.load()?;
         let ids = config.column_ids();
@@ -3906,6 +4403,20 @@ fn is_text_input_key(key: KeyEvent) -> bool {
     ) && !matches!(key.modifiers, KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
+fn is_word_edit_key(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && !key.modifiers.contains(KeyModifiers::ALT)
+        && matches!(
+            key.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Backspace
+                | KeyCode::Delete
+        )
+}
+
 fn contains(area: Rect, x: u16, y: u16) -> bool {
     x >= area.x
         && x < area.x.saturating_add(area.width)
@@ -3921,6 +4432,7 @@ fn is_confirmation_modal(modal: &Modal) -> bool {
             | Modal::BulkConfirm { .. }
             | Modal::KillSessionConfirm { .. }
             | Modal::RestoreConfirm { .. }
+            | Modal::DeleteProject { .. }
     )
 }
 
@@ -4007,7 +4519,8 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::Interactive
         | DialogField::Answer
         | DialogField::Confirm
-        | DialogField::Cancel => None,
+        | DialogField::Cancel
+        | DialogField::PurgeData => None,
     }
 }
 
@@ -4064,6 +4577,17 @@ fn retain_source_legacy_auto_launch_keys(
         }
     }
     Ok(())
+}
+
+fn default_project_settings() -> TuiSettings {
+    TuiSettings {
+        project_name: "Projects".to_string(),
+        card_height_lines: 4,
+        max_tasks_per_column: 100,
+        refresh_interval: Duration::from_secs(1),
+        theme_name: "dark".to_string(),
+        task_sort: TASK_SORT_NUMBER.to_string(),
+    }
 }
 
 fn load_settings(ops: &Operations) -> Result<TuiSettings> {

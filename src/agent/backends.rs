@@ -11,6 +11,7 @@ use crate::agent::prompt::build_agent_prompt;
 use crate::core::config::{BoardConfig, Config};
 use crate::core::error::{KanbanError, Result};
 use crate::core::models::Task;
+use crate::core::project::Roots;
 use crate::core::storage::atomic_write_text;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,13 +91,17 @@ pub struct LaunchPlan {
     pub resolve_agent: Option<String>,
 }
 
-pub fn build_launch_plan(
-    project_path: &Path,
+/// Build the plan for one agent run. Board files (config, prompt, log,
+/// transcript) come from `data_root`; the process itself is started in
+/// `work_path` by [`crate::agent::tmux::spawn_plan`].
+pub fn build_launch_plan<'a>(
+    roots: impl Into<Roots<'a>>,
     task: &Task,
     session_id: &str,
     revert: bool,
 ) -> Result<LaunchPlan> {
-    let loader = Config::new(project_path);
+    let roots = roots.into();
+    let loader = Config::new(roots.data_root);
     let config = loader.load()?;
     let heartbeat_interval_secs =
         (loader.get_threshold("session_heartbeat_timeout")? / 3).clamp(10, 600);
@@ -113,7 +118,7 @@ pub fn build_launch_plan(
     } else {
         None
     };
-    let prompt = build_agent_prompt(project_path, task, session_id, revert)?;
+    let prompt = build_agent_prompt(roots, task, session_id, revert)?;
     let args = backend_args(
         &backend,
         &backend_config,
@@ -123,7 +128,7 @@ pub fn build_launch_plan(
         &prompt,
     );
 
-    let logs_dir = project_path.join(".kanban").join("logs");
+    let logs_dir = roots.kanban_dir().join("logs");
     // claude, opencode, and the pi family (pi/omp, via `--mode json`) all emit a
     // parseable JSONL transcript on stdout.
     let transcript_file = matches!(backend.as_str(), "claude" | "opencode" | "pi" | "omp")

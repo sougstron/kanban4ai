@@ -9,6 +9,7 @@ use kanban4ai::core::models::{MessageKind, MessageRole, MessageStatus, Task, Tas
 use kanban4ai::core::operations::{
     AgentExitOutcome, AgentLauncher, NoopLauncher, Operations, QuestionRef, TaskPatch, sort_tasks,
 };
+use kanban4ai::core::project::{ProjectStore, Roots};
 use kanban4ai::core::session::{SessionManager, SessionState};
 use kanban4ai::core::storage::NewTask;
 use kanban4ai::core::thread::ThreadManager;
@@ -94,7 +95,7 @@ fn agent_take_moves_to_in_progress_and_links_session() {
 struct FailingLauncher;
 
 impl AgentLauncher for FailingLauncher {
-    fn launch(&self, _project: &Path, _task: &Task, _session_id: &str, _revert: bool) -> bool {
+    fn launch(&self, _roots: Roots<'_>, _task: &Task, _session_id: &str, _revert: bool) -> bool {
         false
     }
 }
@@ -104,7 +105,7 @@ struct MoveThenFailLauncher {
 }
 
 impl AgentLauncher for MoveThenFailLauncher {
-    fn launch(&self, _project: &Path, task: &Task, _session_id: &str, _revert: bool) -> bool {
+    fn launch(&self, _roots: Roots<'_>, task: &Task, _session_id: &str, _revert: bool) -> bool {
         Operations::with_launcher(&self.project, Box::new(NoopLauncher))
             .move_task(&task.id, "review", false)
             .unwrap();
@@ -2474,4 +2475,211 @@ fn reject_message_reports_missing_task_or_message() {
 
     let task = ops.create_task(NewTask::titled("No such message")).unwrap();
     assert!(ops.reject_message(&task.id, "MSG-999").unwrap().is_none());
+}
+
+// ------------------------------------------------ data_root / work_path split
+
+/// A registered project whose board lives in the store, with a quiet config
+/// and a recording launcher: the phase-2 shape of every real command.
+fn split_project_ops(
+    verification: Option<&str>,
+) -> (
+    tempfile::TempDir,
+    tempfile::TempDir,
+    kanban4ai::core::project::Project,
+    Operations,
+    common::RecordingLauncher,
+) {
+    let store = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let project = ProjectStore::at(store.path())
+        .add(work.path(), None)
+        .unwrap()
+        .project;
+    kanban4ai::core::storage::Storage::new(&project.data_root)
+        .init_board()
+        .unwrap();
+    common::write_quiet_config(&project.data_root, true);
+    if let Some(command) = verification {
+        write_verification_config(&project.data_root, command, true);
+    }
+    let recorder = common::RecordingLauncher::new();
+    let ops = Operations::for_project_with_launcher(&project, Box::new(recorder.clone()));
+    (store, work, project, ops, recorder)
+}
+
+/// The board never touches the code folder, and the launcher is handed both
+/// roots plus the project id (which the wrapper exports as `KANBAN_PROJECT`).
+#[test]
+fn for_project_writes_the_board_to_the_store_and_launches_in_the_work_folder() {
+    let (_store, work, project, ops, recorder) = split_project_ops(None);
+
+    assert_eq!(ops.data_root(), project.data_root);
+    assert_eq!(ops.work_path(), project.work_path);
+
+    let task = ops.create_task(NewTask::titled("Split roots")).unwrap();
+    assert!(project.data_root.join(".kanban/tasks").is_dir());
+    assert!(
+        !work.path().join(".kanban").exists(),
+        "the work folder must stay clean"
+    );
+
+    ops.take_task(&task.id, "ses-split", true).unwrap().unwrap();
+    assert_eq!(
+        recorder.roots(),
+        vec![(
+            project.data_root.clone(),
+            project.work_path.clone(),
+            Some(project.id.clone())
+        )]
+    );
+}
+
+/// A detached job is the agent's own command line: it runs in the work folder,
+/// while its log and status stay with the board.
+#[test]
+fn detached_job_runs_in_the_work_folder_and_logs_into_the_store() {
+    let (_store, _work, project, ops, _recorder) = split_project_ops(None);
+    let task = ops.create_task(NewTask::titled("Detached split")).unwrap();
+    ops.take_task(&task.id, "ses-split", true).unwrap().unwrap();
+
+    let job = ops
+        .detach_command(
+            &task.id,
+            "ses-split",
+            Some(10),
+            Some("pwd probe"),
+            &["sh".to_string(), "-c".to_string(), "pwd".to_string()],
+        )
+        .unwrap();
+
+    let poll_deadline = Instant::now() + Duration::from_secs(10);
+    while !job.status_file.exists() && Instant::now() < poll_deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(job.log_file.starts_with(project.data_root.join(".kanban")));
+    assert_eq!(
+        fs::read_to_string(&job.log_file).unwrap().trim(),
+        project.work_path.display().to_string()
+    );
+
+    // The wait note is read back by the relaunched agent, whose cwd is the
+    // work folder, so the board paths in it must be absolute.
+    let note = SessionManager::new(&project.data_root)
+        .load_session("ses-split")
+        .unwrap()
+        .wait_note
+        .expect("wait note recorded");
+    assert!(note.contains(&job.log_file.display().to_string()));
+}
+
+/// The verification gate builds and tests the user's code, so it runs in the
+/// work folder — not in the store.
+#[test]
+fn verification_gate_runs_in_the_work_folder() {
+    let (_store, work, _project, ops, _recorder) = split_project_ops(Some("test -f marker.txt"));
+    ops.config.load_fresh().unwrap();
+    fs::write(work.path().join("marker.txt"), "built").unwrap();
+
+    let task = ops.create_task(NewTask::titled("Gate cwd")).unwrap();
+    ops.take_task(&task.id, "ses-gate", true).unwrap().unwrap();
+    ContextManager::new(ops.data_root())
+        .append_context(&task.id, "implemented and tested", "agent", &ops.storage)
+        .unwrap();
+
+    let reviewed = ops
+        .complete_task(&task.id, "ses-gate", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reviewed.status, TaskStatus::Review);
+}
+
+#[test]
+fn agent_move_to_review_marks_unseen_but_human_move_does_not() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let agent_task = ops.create_task(NewTask::titled("Agent review")).unwrap();
+    ops.move_task(&agent_task.id, "in_progress", false).unwrap();
+    ops.move_task(&agent_task.id, "review", true).unwrap();
+    let stored = ops.get_task(&agent_task.id).unwrap().unwrap();
+    assert!(stored.review_unseen, "agent move to review sets the flag");
+
+    let human_task = ops.create_task(NewTask::titled("Human review")).unwrap();
+    ops.move_task(&human_task.id, "in_progress", false).unwrap();
+    ops.move_task(&human_task.id, "review", false).unwrap();
+    let stored = ops.get_task(&human_task.id).unwrap().unwrap();
+    assert!(
+        !stored.review_unseen,
+        "human move to review does not set the flag"
+    );
+}
+
+#[test]
+fn agent_done_moves_to_review_and_marks_unseen() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Agent done flow")).unwrap();
+    ops.take_task(&task.id, "ses-done", true).unwrap();
+    ContextManager::new(dir.path())
+        .append_context(&task.id, "implemented and tested", "agent", &ops.storage)
+        .unwrap();
+    let reviewed = ops
+        .complete_task(&task.id, "ses-done", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reviewed.status, TaskStatus::Review);
+    assert!(reviewed.review_unseen, "agent done sets review_unseen");
+}
+
+#[test]
+fn human_move_and_done_clear_review_unseen() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Clear flag")).unwrap();
+    ops.move_task(&task.id, "in_progress", false).unwrap();
+    ops.move_task(&task.id, "review", true).unwrap();
+    assert!(ops.get_task(&task.id).unwrap().unwrap().review_unseen);
+
+    ops.move_task(&task.id, "in_progress", false).unwrap();
+    assert!(!ops.get_task(&task.id).unwrap().unwrap().review_unseen);
+
+    ops.move_task(&task.id, "review", true).unwrap();
+    assert!(ops.get_task(&task.id).unwrap().unwrap().review_unseen);
+    ops.move_task(&task.id, "done", false).unwrap();
+    let done = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(done.status, TaskStatus::Done);
+    assert!(!done.review_unseen, "human done clears review_unseen");
+}
+
+#[test]
+fn mark_review_seen_clears_the_flag() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Seen")).unwrap();
+    ops.move_task(&task.id, "in_progress", false).unwrap();
+    ops.move_task(&task.id, "review", true).unwrap();
+    assert!(ops.get_task(&task.id).unwrap().unwrap().review_unseen);
+
+    assert!(
+        ops.mark_review_seen(&task.id).unwrap(),
+        "flag was set, now cleared"
+    );
+    assert!(!ops.get_task(&task.id).unwrap().unwrap().review_unseen);
+
+    assert!(!ops.mark_review_seen(&task.id).unwrap());
+}
+
+#[test]
+fn rerun_review_task_clears_review_unseen() {
+    let (dir, ops, _rec) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Rerun unseen")).unwrap();
+    ops.take_task(&task.id, "ses-rerun", true).unwrap();
+    ContextManager::new(dir.path())
+        .append_context(&task.id, "first pass done", "agent", &ops.storage)
+        .unwrap();
+    let reviewed = ops
+        .complete_task(&task.id, "ses-rerun", true)
+        .unwrap()
+        .unwrap();
+    assert!(reviewed.review_unseen);
+
+    let rerun = ops.rerun_review_task(&task.id, None).unwrap().unwrap();
+    assert_eq!(rerun.status, TaskStatus::InProgress);
+    assert!(!rerun.review_unseen, "rerun clears review_unseen");
 }

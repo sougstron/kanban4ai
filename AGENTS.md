@@ -26,7 +26,11 @@ Python-версии удалены; `tests/fixtures/` сохранены для 
 src/
 ├── main.rs              # Binary entry point (SIGPIPE reset + cli::run)
 ├── lib.rs
-├── cli.rs               # clap CLI: every `kanban` command, Python-compatible output
+├── cli/                 # clap CLI: every `kanban` command, Python-compatible output
+│   ├── mod.rs           # parser + dispatch; global `--project`
+│   ├── init.rs          # store-backed `kanban init`
+│   ├── project.rs       # `kanban project` list/add/show/rename/set-path/path/remove/open
+│   └── resolve.rs       # `--project` / $KANBAN_PROJECT / cwd / silent adoption
 └── core/
     ├── mod.rs
     ├── error.rs         # KanbanError (Io/Yaml/Invalid/Permission) / Result
@@ -37,13 +41,15 @@ src/
     ├── thread.rs        # ThreadManager: sidecar threads, merge-on-save
     ├── operations.rs    # Business-logic hub: CRUD, rules, questions, chaining,
     │                    #   review edits; AgentLauncher seam
+    ├── project.rs       # ProjectStore: registry, store-root resolution, add/migrate
+    ├── migrate.rs       # Relocate a local `.kanban` into the store (rename / EXDEV copy)
     ├── session.rs       # SessionManager: heartbeats, crash detection, token estimate
     ├── context.rs       # ContextManager: thread-based context + legacy back-compat
     ├── compaction.rs    # Rule-based context compaction (no LLM)
     └── notifier.rs      # Desktop notifications (notify-send)
 Additional modules:
     agent/               # process manager, tmux wrapper, backends, prompts
-    tui/                 # ratatui board, detail, dialogs, search, sessions
+    tui/                 # ratatui board, detail, dialogs, search, sessions, projects
 .github/workflows/       # CI and tagged Linux release automation
 packaging/aur/           # stable and VCS Arch source packages
 scripts/                 # POSIX installer and packaging smoke test
@@ -52,6 +58,7 @@ tests/
 ├── golden_compat.rs     # lossless load/round-trip of Python-written files
 ├── storage_test.rs, thread_test.rs, config_test.rs
 ├── operations_test.rs   # agent rules, questions, chaining, review edits
+├── project_test.rs      # store CRUD, cwd resolution, migration, silent adoption
 ├── cli_test.rs          # end-to-end binary tests (assert_cmd)
 ```
 
@@ -158,7 +165,16 @@ messages:
 ```
 
 ### CLI Commands (implemented)
-- `kanban init` - Initialize .kanban/ board
+- Global `--project <id|name|path>` on every subcommand (overrides cwd / `$KANBAN_PROJECT`)
+- `kanban init [--path P] [--copy] [--force]` - Register the folder in the store and create the board there (never a local `.kanban/`). Migrates an existing `<P>/.kanban` into the store. Repeat init is a no-op exit 0
+- `kanban project list [--format table|json]` - List registered projects
+- `kanban project add [PATH] [--name NAME] [--copy] [--force]` - Register a folder (migrating a local `.kanban` if present)
+- `kanban project show <id|name|path>` - Show one project (id, name, work path, data root, timestamps)
+- `kanban project rename <id|name> <new-name>` - Change the display name (id stays put)
+- `kanban project set-path <id|name> <path>` - Repoint the work folder
+- `kanban project path [id|name|path]` - Print the work path (defaults to the current project)
+- `kanban project remove <id|name> [--purge] [--yes]` - Unregister; `--purge` also deletes board data. Interactive confirm unless `--yes`
+- `kanban project open <id|name|path>` - Open the TUI on that project
 - `kanban create <title> [--backend opencode|claude|omp|pi] [--model M] [--effort E] [--agent-name P] [--interactive] [--chain-to TASK-NNN]` - Create task
 - `kanban chain <id> [<target_id>] [--clear]` - Show, set, or clear chaining
 - `kanban list` - List tasks
@@ -183,7 +199,7 @@ messages:
 - `kanban sessions` - List active sessions
 - `kanban archive` - List archived tasks
 - `kanban archive-done` - Move all Done tasks to Archive
-- `kanban tui` - Launch interactive board
+- `kanban tui` - Launch the interactive board; with no resolved project, open the projects list
 - `kanban attach <id>` - Attach to the task's running agent tmux session
 
 ### Agent Rules (Enforced with --agent flag)
@@ -295,6 +311,7 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `A`: Confirm archiving all Done tasks
 - `R`: Confirm marking all Review tasks Done
 - `l`: Show running sessions
+- `P`: Open the projects list (from Board, Detail, Archive, Sessions; not while typing)
 - `Ctrl+t`: Quick theme toggle (persisted to config)
 - `/`: Search
 - `?`: Help overlay (scrollable, sized to its content; lists mouse gestures)
@@ -323,9 +340,20 @@ detail — `Esc` returns to the sessions list. Archive view: `Enter` opens the a
 detail (its action bar offers only Restore/Delete), `u` restores the selected
 task to To Do after a confirmation.
 
-The status bar is contextual per screen (Board, Detail, Sessions, Archive, log
-view) and its hotkey segments are clickable; when the terminal is narrow the
-least important segments are dropped instead of clipping. Column headers show
+Projects view: each row shows the display name, a `~`-shortened work path
+(struck through when the folder is missing), per-column task counts
+(`todo/in_progress/review/done`), active session count, and last opened.
+When the current directory is not registered, a pinned
+`+ Create project for <cwd>` row is first: `Enter` or `n` on it registers
+immediately (name = folder basename; a local `.kanban` is migrated). `n` on a
+normal row opens a path+name dialog. `r` renames, `p` changes the work path,
+`d` opens the remove dialog (unregister by default; Space toggles
+“also delete board data”), `/` filters. `q`/`Esc` returns to the board this
+list was opened from, or quits when the list is the entry screen.
+
+The status bar is contextual per screen (Board, Detail, Sessions, Archive,
+Projects, log view) and its hotkey segments are clickable; when the terminal is
+narrow the least important segments are dropped instead of clipping. Column headers show
 only the column name and visible task count; the status-bar question count
 focuses the first questioned task when clicked. Drag a card to a different
 column to move it in human mode. A single click on a card opens its detail;
@@ -355,7 +383,8 @@ checkbox and a "Chain to task" selector.
 
 ### Integration Model
 Agents call kanban via shell commands. NOT a plugin. An agent must:
-1. Set `KANBAN_SESSION` environment variable
+1. Use the session the launcher exported (`KANBAN_SESSION`, `KANBAN_TASK_ID`,
+   and when registered `KANBAN_PROJECT` / `KANBAN_DATA_DIR`)
 2. Use `--agent` flag for all commands
 3. Call `kanban heartbeat` periodically while working
 4. Add context via `kanban context`
@@ -443,7 +472,13 @@ within a column, but a column grows to its tallest card, so telemetry and badges
 are never clipped while columns of plain cards keep the configured
 `card_height_lines`; the description is the one row still allowed to clip.
 
-### Storage Directories (under .kanban/)
+### Storage Directories (under `<data_root>/.kanban/`)
+
+Board data lives in the projects store, not in the work folder. The layout
+inside `.kanban/` is unchanged (see **Projects & Store** for where
+`<data_root>` is). An unregistered board still used in place keeps the same
+tree at `<work>/.kanban/`.
+
 - `tasks/<status>/` - task Markdown files (status = subdirectory)
 - `threads/` - per-task YAML threads with optimistic `rev` merge
 - `context/` - legacy: large context from older boards (read-only back-compat)
@@ -454,6 +489,60 @@ are never clipped while columns of plain cards keep the configured
 - `backups/<task_id>/` - pre-edit file backups for revert
 - `assets/images/` - pasted image attachments
 - `.lock` - board-wide flock serializing read-modify-write cycles
+
+### Projects & Store
+
+Each registered project splits two roles that used to be the same folder:
+
+- **work path** — the code folder; agent cwd, `kanban project path`
+- **data root** — `<store>/projects/<id>`; contains `.kanban/` and `project.yaml`
+
+Store root resolution (empty or relative values are ignored):
+
+1. `$KANBAN_HOME` (explicit override; required in tests so the suite never
+   touches the developer's real store)
+2. `$XDG_DATA_HOME/kanban4ai`
+3. `$HOME/.local/share/kanban4ai`
+
+```
+<store>/
+├── .lock                       # flock, serializes registry mutations
+└── projects/
+    └── <id>/                   # data_root; slug of the folder name, deduped
+        ├── project.yaml        # id, name, work_path, timestamps, migrated_from
+        └── .kanban/            # same board layout as before
+```
+
+There is no central index and no pointer file in the work folder. Listing is a
+scan of `projects/*/project.yaml`. The `id` is stable (`rename` changes only
+`name`); collisions get `-2`, `-3`, …. A missing work folder stays listed
+(struck through in the TUI); agent launches fail until `project set-path`.
+
+**Which project a command talks to** (`cli::resolve`):
+
+1. `--project <id|name|path>`
+2. `$KANBAN_PROJECT` (exported by the agent wrapper so callbacks stay
+   unambiguous after `cd`)
+3. The registered project whose work path is the deepest ancestor of cwd
+4. Silent adoption: `<cwd>/.kanban` exists but the folder is not registered →
+   register and **move** that board into the store, then continue. Lookup is
+   cwd-only (never an ancestor). On active sessions or a failed move, the
+   board is left in place and one warning is printed to stderr; the next
+   command retries
+5. Nothing resolves: `init` / `project add` create; `tui` / bare `kanban`
+   open the projects list; every other command errors
+   (`not inside a kanban project; run kanban init or kanban project add`)
+
+**Migration** (`init`, `project add`, TUI add, silent adoption) is one path:
+rename first, verified copy on `EXDEV`, source removed last. `--copy` leaves
+the source. Active sessions refuse unless `--force`. Unregister without
+`--purge` renames `project.yaml` to `project.yaml.removed`; re-adding the same
+folder restores that board and id.
+
+Agent-facing paths in the prompt are **absolute** under the data root (cwd is
+the work folder, so a relative `.kanban/…` would land in the repo). The
+wrapper also exports `KANBAN_DATA_DIR`. `ask-form --file` and `context --file`
+try cwd first, then the data root.
 
 ### Development Rules
 - All thresholds configurable via .kanban/config.yaml — no hardcoded values in business logic

@@ -10,6 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{TextArea, WrapMode};
 
 use crate::core::operations::Operations;
+use crate::core::project::ProjectStore;
 use crate::core::session::SessionManager;
 use crate::core::storage::{NewTask, Storage};
 use crate::core::thread::ThreadManager;
@@ -19,6 +20,7 @@ use super::app::{
 };
 use super::board;
 use super::dialogs::{DialogField, Modal, ModalButton, ModalState};
+use super::event::LoopOutcome;
 use super::theme::Theme;
 
 fn app_with_board() -> (tempfile::TempDir, App) {
@@ -217,6 +219,10 @@ fn populated_app() -> (tempfile::TempDir, App) {
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn ctrl_key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::CONTROL)
 }
 
 #[cfg(unix)]
@@ -1481,6 +1487,59 @@ fn review_editor_navigation_and_thread_focus_are_distinct() {
 }
 
 #[test]
+fn review_editor_ctrl_arrows_move_by_word_when_focused() {
+    let (_dir, mut app) = open_focused_review_editor("hello world foo");
+
+    app.handle_key(key(KeyCode::End)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().review_edits.cursor(), (0, 15));
+
+    app.handle_key(ctrl_key(KeyCode::Left)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().review_edits.cursor(), (0, 12));
+    app.handle_key(ctrl_key(KeyCode::Left)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().review_edits.cursor(), (0, 6));
+
+    app.handle_key(ctrl_key(KeyCode::Right)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().review_edits.cursor(), (0, 12));
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
+        "hello world foo"
+    );
+}
+
+#[test]
+fn review_editor_ctrl_backspace_and_delete_remove_words_when_focused() {
+    let (_dir, mut app) = open_focused_review_editor("hello world foo");
+
+    app.handle_key(key(KeyCode::End)).unwrap();
+    app.handle_key(ctrl_key(KeyCode::Backspace)).unwrap();
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
+        "hello world "
+    );
+
+    app.handle_key(key(KeyCode::Home)).unwrap();
+    app.handle_key(ctrl_key(KeyCode::Delete)).unwrap();
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
+        " world "
+    );
+}
+
+#[test]
+fn review_editor_ctrl_s_still_saves_after_word_hotkeys() {
+    let (_dir, mut app) = open_focused_review_editor("hello world foo");
+
+    app.handle_key(key(KeyCode::End)).unwrap();
+    app.handle_key(ctrl_key(KeyCode::Backspace)).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+
+    let task_id = app.detail.as_ref().unwrap().task_id.clone();
+    let saved = app.ops.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(saved.review_edits, "hello world ");
+}
+
+#[test]
 fn clicking_review_editor_focuses_it_and_highlights_panel() {
     let (_dir, mut app) = app_with_board();
     let task = app.ops.create_task(NewTask::titled("Edit review")).unwrap();
@@ -1673,6 +1732,27 @@ fn review_column(app: &App) -> usize {
         .iter()
         .position(|column| column.id == "review")
         .expect("review column")
+}
+
+fn open_focused_review_editor(text: &str) -> (tempfile::TempDir, App) {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Edit review"))
+        .expect("create task");
+    app.ops
+        .set_review_edits(&task.id, text)
+        .expect("set review edits");
+    app.ops
+        .move_task(&task.id, "review", false)
+        .expect("move to review");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Tab)).expect("focus editor");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+    (dir, app)
 }
 
 #[test]
@@ -4021,4 +4101,102 @@ fn paste_fills_the_detail_answer_box() {
 
     let detail = app.detail.as_ref().expect("detail state");
     assert_eq!(detail.answer_input.lines(), ["use the second one"]);
+}
+
+fn write_task_file(root: &std::path::Path, status: &str, id: &str) {
+    let dir = root.join(".kanban/tasks").join(status);
+    std::fs::create_dir_all(&dir).expect("task status dir");
+    std::fs::write(
+        dir.join(format!("{id}.md")),
+        format!("---\nid: {id}\ntitle: {id}\nstatus: {status}\n---\n"),
+    )
+    .expect("task file");
+}
+
+fn projects_app(
+    work: &std::path::Path,
+    create_cwd: Option<std::path::PathBuf>,
+) -> (tempfile::TempDir, App) {
+    let store_dir = tempfile::tempdir().expect("store");
+    std::fs::create_dir_all(work).expect("work dir");
+    let store = ProjectStore::at(store_dir.path());
+    let added = store.add(work, Some("Demo Board")).expect("add project");
+    write_task_file(&added.project.data_root, "todo", "TASK-001");
+    write_task_file(&added.project.data_root, "in_progress", "TASK-002");
+    let app = App::projects_at(store, None, create_cwd).expect("projects app");
+    (store_dir, app)
+}
+
+#[test]
+fn projects_screen_lists_rows_and_create_cwd() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-snap-work");
+    let cwd = std::path::PathBuf::from("/tmp/k4ai-snap-cwd");
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_dir_all(&cwd);
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    let (_store, mut app) = projects_app(&work, Some(cwd.clone()));
+    assert_eq!(app.screen, Screen::Projects);
+    assert_eq!(app.visible_project_items().len(), 2);
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("Demo Board"), "{rendered}");
+    assert!(rendered.contains("Create project for"), "{rendered}");
+    assert!(rendered.contains("1/1/0/0"), "{rendered}");
+    insta::assert_snapshot!("projects_list", rendered);
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+#[test]
+fn projects_enter_on_create_cwd_registers_without_a_dialog() {
+    let work = tempfile::tempdir().expect("work");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let (_store, mut app) = projects_app(work.path(), Some(cwd.path().to_path_buf()));
+    app.project_selected = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("create cwd");
+    match app.take_loop_outcome() {
+        Some(LoopOutcome::OpenProject(project)) => {
+            assert_eq!(project.work_path, cwd.path());
+        }
+        other => panic!("expected OpenProject, got {other:?}"),
+    }
+}
+
+#[test]
+fn projects_enter_opens_the_selected_project() {
+    let work = tempfile::tempdir().expect("work");
+    let (_store, mut app) = projects_app(work.path(), None);
+    app.handle_key(key(KeyCode::Enter)).expect("open");
+    match app.take_loop_outcome() {
+        Some(LoopOutcome::OpenProject(project)) => {
+            assert_eq!(project.name, "Demo Board");
+        }
+        other => panic!("expected OpenProject, got {other:?}"),
+    }
+}
+
+#[test]
+fn board_uppercase_p_switches_to_the_projects_list() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('P'))).expect("P");
+    match app.take_loop_outcome() {
+        Some(LoopOutcome::ShowProjects { return_to }) => assert!(return_to.is_none()),
+        other => panic!("expected ShowProjects, got {other:?}"),
+    }
+}
+
+#[test]
+fn projects_delete_dialog_unregisters_by_default() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-snap-work");
+    let _ = std::fs::remove_dir_all(&work);
+    let (_store, mut app) = projects_app(&work, None);
+    app.project_selected = 0;
+    app.handle_key(key(KeyCode::Char('d'))).expect("delete");
+    let modal = app.modal.as_ref().expect("delete modal");
+    assert!(matches!(modal.modal, Modal::DeleteProject { .. }));
+    assert!(!modal.purge_data);
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("Unregister"), "{rendered}");
+    assert!(rendered.contains("also delete board data"), "{rendered}");
+    insta::assert_snapshot!("projects_delete", rendered);
+    let _ = std::fs::remove_dir_all(&work);
 }

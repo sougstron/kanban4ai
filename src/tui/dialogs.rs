@@ -46,6 +46,18 @@ pub enum Modal {
         questions: Vec<QuestionChoice>,
     },
     Settings,
+    NewProject,
+    RenameProject {
+        id: String,
+    },
+    SetProjectPath {
+        id: String,
+    },
+    DeleteProject {
+        id: String,
+        name: String,
+        task_count: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +101,7 @@ pub enum DialogField {
     TaskSort,
     Confirm,
     Cancel,
+    PurgeData,
 }
 
 const TASK_FORM_FIELDS: [DialogField; 8] = [
@@ -159,6 +172,7 @@ pub struct ModalState {
     pub theme_selected: usize,
     pub task_sort_options: Vec<SelectOption>,
     pub task_sort_selected: usize,
+    pub purge_data: bool,
 }
 
 impl ModalState {
@@ -207,6 +221,7 @@ impl ModalState {
             theme_selected: 0,
             task_sort_options: Vec::new(),
             task_sort_selected: 0,
+            purge_data: false,
         }
     }
 
@@ -271,6 +286,27 @@ impl ModalState {
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
+            Modal::NewProject => &[
+                DialogField::Description,
+                DialogField::Title,
+                DialogField::Confirm,
+                DialogField::Cancel,
+            ],
+            Modal::RenameProject { .. } => &[
+                DialogField::Title,
+                DialogField::Confirm,
+                DialogField::Cancel,
+            ],
+            Modal::SetProjectPath { .. } => &[
+                DialogField::Description,
+                DialogField::Confirm,
+                DialogField::Cancel,
+            ],
+            Modal::DeleteProject { .. } => &[
+                DialogField::PurgeData,
+                DialogField::Confirm,
+                DialogField::Cancel,
+            ],
         }
     }
 
@@ -317,6 +353,7 @@ impl ModalState {
                 | Modal::BulkConfirm { .. }
                 | Modal::KillSessionConfirm { .. }
                 | Modal::RestoreConfirm { .. }
+                | Modal::DeleteProject { .. }
         )
     }
 
@@ -387,6 +424,11 @@ impl ModalState {
                 | ratatui::crossterm::event::KeyCode::Enter => self.interactive = !self.interactive,
                 _ => {}
             },
+            DialogField::PurgeData => match key.code {
+                ratatui::crossterm::event::KeyCode::Char(' ')
+                | ratatui::crossterm::event::KeyCode::Enter => self.purge_data = !self.purge_data,
+                _ => {}
+            },
             DialogField::TargetStatus => self.input_select(key, SelectorKind::TargetStatus),
             DialogField::MessageKind => self.input_select(key, SelectorKind::MessageKind),
             DialogField::Question => self.input_select(key, SelectorKind::Question),
@@ -445,7 +487,7 @@ impl ModalState {
             DialogField::Answer => &mut self.answer,
             DialogField::Theme => &mut self.theme,
             DialogField::TaskSort => &mut self.task_sort,
-            DialogField::Confirm | DialogField::Cancel => &mut self.answer,
+            DialogField::Confirm | DialogField::Cancel | DialogField::PurgeData => &mut self.answer,
         }
     }
 
@@ -745,6 +787,7 @@ impl ModalState {
             self.theme_selected.to_string(),
             raw_textarea_text(&self.task_sort),
             self.task_sort_selected.to_string(),
+            self.purge_data.to_string(),
         ]
         .join("\u{1f}")
     }
@@ -847,6 +890,30 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
             render_answer(frame, app, modal, inner, task_id, questions, &mut hitboxes)
         }
         Modal::Settings => render_settings_form(frame, app, modal, inner, &mut hitboxes),
+        Modal::NewProject => render_project_form(
+            frame,
+            app,
+            modal,
+            inner,
+            "Folder path",
+            Some("Display name"),
+            &mut hitboxes,
+        ),
+        Modal::RenameProject { .. } => render_project_form(
+            frame,
+            app,
+            modal,
+            inner,
+            "Display name",
+            None,
+            &mut hitboxes,
+        ),
+        Modal::SetProjectPath { .. } => {
+            render_project_form(frame, app, modal, inner, "Folder path", None, &mut hitboxes)
+        }
+        Modal::DeleteProject {
+            name, task_count, ..
+        } => render_delete_project(frame, app, modal, inner, name, *task_count, &mut hitboxes),
     }
     hitboxes
 }
@@ -1804,6 +1871,166 @@ fn render_description_textarea(
     frame.render_widget(&modal.description, area);
 }
 
+fn render_project_form(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &mut ModalState,
+    area: Rect,
+    path_label: &str,
+    name_label: Option<&str>,
+    hitboxes: &mut Vec<Hitbox>,
+) {
+    let show_path = matches!(
+        modal.modal,
+        Modal::NewProject | Modal::SetProjectPath { .. }
+    );
+    let show_name = matches!(modal.modal, Modal::NewProject | Modal::RenameProject { .. });
+    let mut constraints = Vec::new();
+    if show_path {
+        constraints.push(Constraint::Length(3));
+    }
+    if show_name {
+        constraints.push(Constraint::Length(3));
+    }
+    constraints.push(Constraint::Min(1));
+    constraints.push(Constraint::Length(3));
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
+    let path_active = modal.active_field() == DialogField::Description
+        || app.is_hovered(HitAction::ModalField(DialogField::Description));
+    let name_active = modal.active_field() == DialogField::Title
+        || app.is_hovered(HitAction::ModalField(DialogField::Title));
+    let mut row = 0;
+    if show_path {
+        render_labeled_textarea(
+            frame,
+            app,
+            &mut modal.description,
+            rows[row],
+            path_label,
+            path_active,
+        );
+        hitboxes.push(Hitbox {
+            area: rows[row],
+            action: HitAction::ModalField(DialogField::Description),
+        });
+        row += 1;
+    }
+    if show_name {
+        let label = name_label.unwrap_or("Display name");
+        render_labeled_textarea(frame, app, &mut modal.title, rows[row], label, name_active);
+        hitboxes.push(Hitbox {
+            area: rows[row],
+            action: HitAction::ModalField(DialogField::Title),
+        });
+        row += 1;
+    }
+    let _ = row;
+    render_form_buttons(
+        frame,
+        app,
+        modal,
+        *rows.last().expect("buttons row"),
+        hitboxes,
+    );
+}
+
+fn render_delete_project(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &ModalState,
+    area: Rect,
+    name: &str,
+    task_count: u32,
+    hitboxes: &mut Vec<Hitbox>,
+) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(4),
+            Constraint::Length(3),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let confirm = if modal.purge_data {
+        format!(
+            "Delete project {} and its board data?",
+            sanitize_terminal_text(name)
+        )
+    } else {
+        format!(
+            "Unregister project {}? Board data stays in the store.",
+            sanitize_terminal_text(name)
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(confirm),
+            Line::from("Space toggles whether board data is deleted."),
+        ])
+        .wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    let mark = if modal.purge_data { "☑" } else { "☐" };
+    let active = modal.active_field() == DialogField::PurgeData
+        || app.is_hovered(HitAction::ModalField(DialogField::PurgeData));
+    let style = if active {
+        Style::default().fg(app.theme.focus)
+    } else {
+        Style::default()
+    };
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{mark} also delete board data ({task_count} tasks)"
+        ))
+        .style(style),
+        rows[1],
+    );
+    hitboxes.push(Hitbox {
+        area: rows[1],
+        action: HitAction::ModalField(DialogField::PurgeData),
+    });
+    let yes = if modal.purge_data {
+        "Delete data"
+    } else {
+        "Unregister"
+    };
+    render_buttons(
+        frame,
+        app,
+        rows[2],
+        yes,
+        modal.confirm_yes_selected || app.is_hovered(HitAction::ModalButton(ModalButton::Yes)),
+        "Cancel",
+        !modal.confirm_yes_selected || app.is_hovered(HitAction::ModalButton(ModalButton::No)),
+    );
+    register_buttons(hitboxes, rows[2], ModalButton::Yes, ModalButton::No);
+}
+
+fn render_labeled_textarea(
+    frame: &mut Frame<'_>,
+    app: &App,
+    textarea: &mut TextArea<'static>,
+    area: Rect,
+    title: &str,
+    active: bool,
+) {
+    let border = if active {
+        app.theme.focus
+    } else {
+        app.theme.border
+    };
+    textarea.set_block(
+        Block::default()
+            .title(format!(" {title} "))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border)),
+    );
+    frame.render_widget(&*textarea, area);
+}
+
 fn modal_title(modal: &Modal) -> &'static str {
     match modal {
         Modal::NewTask { .. } => " New task ",
@@ -1817,10 +2044,14 @@ fn modal_title(modal: &Modal) -> &'static str {
         Modal::AddMessage { .. } => " Add to thread ",
         Modal::AnswerQuestion { .. } => " Answer question ",
         Modal::Settings => " Project settings ",
+        Modal::NewProject => " New project ",
+        Modal::RenameProject { .. } => " Rename project ",
+        Modal::SetProjectPath { .. } => " Change project path ",
+        Modal::DeleteProject { .. } => " Remove project ",
     }
 }
 
-fn one_line(text: &str) -> TextArea<'static> {
+pub(super) fn one_line(text: &str) -> TextArea<'static> {
     TextArea::new(vec![sanitize_terminal_text(
         &text.replace(['\n', '\r'], " "),
     )])

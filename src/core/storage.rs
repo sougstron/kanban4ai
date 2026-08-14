@@ -48,7 +48,7 @@ thread_local! {
     static BOARD_LOCKS: RefCell<HashMap<PathBuf, LockEntry>> = RefCell::new(HashMap::new());
 }
 
-/// RAII guard for the board-wide lock; released (or de-nested) on drop.
+/// RAII guard for a reentrant flock; released (or de-nested) on drop.
 pub struct BoardGuard {
     key: PathBuf,
 }
@@ -69,6 +69,34 @@ impl Drop for BoardGuard {
             }
         });
     }
+}
+
+/// Acquire an exclusive flock on `lock_path` (created if missing; its parent
+/// directory must exist). Reentrant within a thread, like the board lock —
+/// nested calls for the same file bump a depth counter instead of deadlocking.
+pub fn lock_file_reentrant(lock_path: &Path) -> Result<BoardGuard> {
+    // Canonicalize the parent so every alias of the same file maps to one key.
+    let key = match (lock_path.parent(), lock_path.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(name),
+        _ => lock_path.to_path_buf(),
+    };
+    BOARD_LOCKS
+        .with(|locks| {
+            let mut locks = locks.borrow_mut();
+            if let Some(entry) = locks.get_mut(&key) {
+                entry.depth += 1;
+                return Ok(());
+            }
+            let file = File::create(lock_path)?;
+            file.lock_exclusive()?;
+            locks.insert(key.clone(), LockEntry { file, depth: 1 });
+            Ok(())
+        })
+        .map(|_: ()| BoardGuard { key })
+        .map_err(KanbanError::Io)
 }
 
 pub struct Storage {
@@ -106,27 +134,7 @@ impl Storage {
     /// so concurrent `kanban` processes serialize. Reentrant within a thread.
     pub fn lock(&self) -> Result<BoardGuard> {
         fs::create_dir_all(&self.kanban_dir)?;
-        let lock_path = self.kanban_dir.join(".lock");
-        // Canonicalize the parent so every alias of the same board maps to one key.
-        let key = self
-            .kanban_dir
-            .canonicalize()
-            .unwrap_or_else(|_| self.kanban_dir.clone())
-            .join(".lock");
-        BOARD_LOCKS
-            .with(|locks| {
-                let mut locks = locks.borrow_mut();
-                if let Some(entry) = locks.get_mut(&key) {
-                    entry.depth += 1;
-                    return Ok(());
-                }
-                let file = File::create(&lock_path)?;
-                file.lock_exclusive()?;
-                locks.insert(key.clone(), LockEntry { file, depth: 1 });
-                Ok(())
-            })
-            .map(|_: ()| BoardGuard { key })
-            .map_err(KanbanError::Io)
+        lock_file_reentrant(&self.kanban_dir.join(".lock"))
     }
 
     pub fn init_board(&self) -> Result<()> {
@@ -314,7 +322,12 @@ impl Storage {
         self.list_tasks(Some(status))
     }
 
-    pub fn move_task(&self, task_id: &str, target_status: &str) -> Result<Option<Task>> {
+    pub fn move_task(
+        &self,
+        task_id: &str,
+        target_status: &str,
+        is_agent: bool,
+    ) -> Result<Option<Task>> {
         let Some(mut task) = self.load_task(task_id)? else {
             return Ok(None);
         };
@@ -327,6 +340,14 @@ impl Storage {
             && matches!(next_status, TaskStatus::Review | TaskStatus::Done)
         {
             task.completed_at = Some(now);
+        }
+        // An agent moving a task into Review marks it unseen so the board shows
+        // the review notifier until the user opens the detail. A human move
+        // always clears it: the user is acting on the task directly.
+        if is_agent && previous_status != TaskStatus::Review && next_status == TaskStatus::Review {
+            task.review_unseen = true;
+        } else if !is_agent {
+            task.review_unseen = false;
         }
         self.save_task(&task)?;
         Ok(Some(task))

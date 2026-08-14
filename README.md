@@ -1,7 +1,6 @@
 # kanban4ai
 
-A fast native local-first kanban board CLI and TUI designed for AI coding agents such as Opencode and Claude Code. Boards are plain Markdown and YAML under `.kanban/`:
-there is no database or language runtime dependency. Work without strong link with git, you can start in any local folder with just two commands.
+A fast native local-first kanban board CLI and TUI designed for AI coding agents such as Opencode and Claude Code. Boards are plain Markdown and YAML in a central store (`~/.local/share/kanban4ai/projects/<id>/.kanban/`); there is no database or language runtime dependency. Work without a strong link to git — start in any local folder with two commands. The work folder stays clean: board data does not live in the repo.
 
 ## Requirements
 
@@ -50,7 +49,7 @@ legacy board-format compatibility.
 
 ## Usage / Quick start
 
-Run these commands from the project directory that should contain the board.
+Run these commands from the code folder you want the board attached to.
 
 ### 1. Initialize a board
 
@@ -59,9 +58,16 @@ kanban4ai init
 kanban4ai
 ```
 
-`kanban4ai init` creates the local `.kanban/` board. Tasks move through To Do,
-In Progress, Review, Done, and Archive. The task ID is printed when a task is
-created. Use `kanban4ai` or `kanban4ai tui` for the interactive board, or use the CLI commands that described below when scripting or working from an agent.
+`kanban4ai init` registers the current folder in the projects store and creates
+the board there. It never writes a local `.kanban/` into the repo; if one
+already exists, it is moved into the store (use `--copy` to leave the original,
+`--force` to move even while agents are running). Repeat `init` is a no-op.
+Tasks move through To Do, In Progress, Review, Done, and Archive. The task ID
+is printed when a task is created. Use `kanban4ai` or `kanban4ai tui` for the
+interactive board — they open this project's board when the folder is
+registered, or the projects list otherwise. Use the CLI commands below when
+scripting or working from an agent. List, add, or switch projects with
+`kanban4ai project list` / `add` / `open`, or press `P` in the TUI.
 
 ### 2. Run a task on an agent CLI
 
@@ -164,7 +170,8 @@ archive all Done tasks, `b` to mark all Review tasks Done (`R` also works), `e`
 to edit, `m` to move, `w` to answer a question, `y` to approve Review → Done,
 `t` to attach to the task's agent,
 `c` to add context or a suggestion, `u` to recover a crashed task, `a` to view
-archived tasks, `l` to view running sessions, `/` to search, `?` for help, and
+archived tasks, `l` to view running sessions, `P` to open the projects list,
+`/` to search, `?` for help, and
 press `Ctrl+C` twice within 3 seconds to quit. Press `s` on the board or task
 detail to open Project Settings, where you can edit the project name, default
 backend, that backend's default model/effort/persona, theme, and task sorting
@@ -179,10 +186,13 @@ crashed; there `Enter` attaches, `v` opens a scrollable pager over the session
 log, `x` kills the session after a confirmation, and `o` jumps to the session's
 task. Waiting rows and cards show the deadline (`until HH:MM`), while stuck
 cards show the `u recover` hint. In the archive view `Enter` opens an archived
-task and `u` restores it to To Do. The status bar shows the shortcuts for the
-current screen and its hints are clickable.
+task and `u` restores it to To Do. The projects list shows each board's work
+path and column counts; `Enter` opens one, `n` adds, `d` unregisters (Space
+toggles deleting board data). `q`/`Esc` returns to the board you came from.
+The status bar shows the shortcuts for the current screen and its hints are
+clickable.
 
-### 5. Sessions, archives, and data
+### 5. Sessions, archives, projects, and data
 
 Useful maintenance commands are:
 
@@ -191,15 +201,22 @@ kanban4ai sessions
 kanban4ai attach TASK-002
 kanban4ai archive
 kanban4ai archive-done
+kanban4ai project list
+kanban4ai project path
 ```
 
 `attach` connects to a running agent's tmux session when one exists.
 `archive-done` moves all Done tasks to Archive, while `archive` lists archived
-tasks. Board settings are stored in `.kanban/config.yaml`, where you can tune
-columns, agent backends, auto-launch, notifications, TUI settings, and timeouts.
-Task Markdown files live under `.kanban/tasks/` in status subdirectories;
-conversation threads are `.kanban/threads/`, and agent session state is in
-`.kanban/sessions/`. The board is file-based and has no database.
+tasks. `project list` shows every registered board; `project path` prints this
+folder's work path. Point a command at another board with
+`--project <id|name|path>`, or set `$KANBAN_PROJECT`.
+
+Board data lives under `$XDG_DATA_HOME/kanban4ai/projects/<id>/.kanban/`
+(override the store with `$KANBAN_HOME`), not in the repo. Settings are
+`config.yaml` in that directory; tasks are `tasks/<status>/`, threads are
+`threads/`, and agent session state is `sessions/`. An old leftover
+`<folder>/.kanban` is moved into the store the next time a command runs there.
+The board is file-based and has no database.
 
 See `AGENTS.md` for the complete command, configuration, data-model, and TUI
 reference. kanban4ai is licensed under the MIT License.

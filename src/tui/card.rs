@@ -23,7 +23,7 @@ pub fn render_card(
     let session_state = app.board.session_states.get(&task.id).copied();
     let border = if session_state == Some(SessionState::Crashed) {
         app.theme.err
-    } else if task.has_questions && !hovered {
+    } else if task.review_unseen || (task.has_questions && !hovered) {
         app.theme.warn
     } else if focused || hovered {
         app.theme.focus
@@ -41,7 +41,16 @@ pub fn render_card(
     };
     let visible_id = truncate_display(&sanitize_terminal_text(&task.id), line_width);
     let visible_title = truncate_display(&sanitize_terminal_text(&task.title), line_width);
-    let mut title_spans = highlight_matches(&visible_id, &query, id_style, app.theme.warn);
+    let mut title_spans = Vec::new();
+    if task.review_unseen {
+        title_spans.push(Span::styled("● ", Style::default().fg(app.theme.warn)));
+    }
+    title_spans.extend(highlight_matches(
+        &visible_id,
+        &query,
+        id_style,
+        app.theme.warn,
+    ));
     title_spans.push(Span::raw(" "));
     title_spans.extend(highlight_matches(
         &visible_title,

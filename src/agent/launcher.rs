@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use crate::agent::backends::{
     auto_launch_config, backend_has_catalog, build_launch_plan, record_recent_model,
 };
@@ -7,13 +5,14 @@ use crate::agent::tmux::spawn_plan;
 use crate::core::config::Config;
 use crate::core::models::Task;
 use crate::core::operations::AgentLauncher;
+use crate::core::project::Roots;
 
 #[derive(Debug, Default)]
 pub struct KanbanLauncher;
 
 impl AgentLauncher for KanbanLauncher {
-    fn launch(&self, project_path: &Path, task: &Task, session_id: &str, revert: bool) -> bool {
-        match launch(project_path, task, session_id, revert) {
+    fn launch(&self, roots: Roots<'_>, task: &Task, session_id: &str, revert: bool) -> bool {
+        match launch(roots, task, session_id, revert) {
             Ok(started) => started,
             Err(err) => {
                 eprintln!(
@@ -27,23 +26,23 @@ impl AgentLauncher for KanbanLauncher {
 }
 
 fn launch(
-    project_path: &Path,
+    roots: Roots<'_>,
     task: &Task,
     session_id: &str,
     revert: bool,
 ) -> crate::core::error::Result<bool> {
-    let config = Config::new(project_path).load()?;
+    let config = Config::new(roots.data_root).load()?;
     let auto_launch = auto_launch_config(&config);
     if !auto_launch.enabled {
         return Ok(false);
     }
-    let plan = build_launch_plan(project_path, task, session_id, revert)?;
-    let started = spawn_plan(project_path, &plan, &auto_launch)?;
+    let plan = build_launch_plan(roots, task, session_id, revert)?;
+    let started = spawn_plan(roots, &plan, &auto_launch)?;
     if started
         && backend_has_catalog(&plan.backend)
         && let Some(model) = plan.model.as_deref()
     {
-        record_recent_model(project_path, model);
+        record_recent_model(roots.data_root, model);
     }
     Ok(started)
 }
