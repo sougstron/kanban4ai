@@ -257,6 +257,13 @@ they are edited: press `s` on the Projects screen. Saved under the store
   active search filter) opens the projects list. Moved out of the per-project
   `tui.escape_to_projects` (TASK-178): the stale per-project key is now
   ignored, so boards that had it enabled need the toggle re-enabled globally.
+- `tui.file_manager`: unset - command the Projects screen's `o folder` button
+  hands the work folder to (the folder is appended as the last argument;
+  the value is split like a shell word list, e.g. `nautilus --new-window`).
+  Unset means the first of `xdg-open`, `gio open`, `nautilus`, `dolphin`,
+  `thunar`, `nemo`, `pcmanfm`, `caja` found on PATH (`open` on macOS). Set it
+  when that chain picks the wrong application. There is no dialog field for
+  this key; it is edited in the file.
 
 ### Notification Settings (.kanban/config.yaml `notifications:`)
 - `enabled`: true - master switch for desktop notifications
@@ -372,12 +379,21 @@ stay right-aligned under their labels; Agents (`▶N` when live) and
 Last opened drop on a narrow terminal rather than squeezing the name.
 A yellow `?` marks open questions and a `●` marks unseen Review work,
 both in a flags column left of the name.
+The selected row carries a border-coloured background; the row the mouse
+rests on is preselected with a fainter `theme.hover` background, so the
+pointer target is visible without moving the keyboard selection.
 When the current directory is not registered, a pinned
 `+ Create project for <cwd>` row is first: `Enter` or `n` on it registers
 immediately (name = folder basename; a local `.kanban` is migrated). `n` on a
 normal row opens a path+name dialog. `r` renames, `p` changes the work path,
-`s` opens the Global Settings dialog, `d` opens the remove dialog (unregister
-by default; Space toggles
+`o` (status-bar `o folder`) opens the selected row's work folder in the
+desktop's own file manager — outside the TUI, in a real window, using
+`tui.file_manager` or the platform default chain (see "Global Settings"); on
+the pinned create row it opens the folder that row offers to register. The
+opener is spawned detached with its streams closed so it cannot write over the
+frame, and a folder that no longer exists is reported in the status bar instead
+of being launched. `s` opens the Global Settings dialog, `d` opens the remove
+dialog (unregister by default; Space toggles
 “also delete board data”), `/` filters. `q`/`Esc` returns to the board this
 list was opened from, or quits when the list is the entry screen.
 
@@ -524,15 +540,31 @@ Sources, all read-only and best effort:
   pre-bridge command in `claude-statusline-bridge.original`). Yields the
   `five_hour` (`5h`) and `seven_day` (`7d`) windows with `used_percentage` and
   epoch-seconds `resets_at` (the OAuth spellings `utilization`/RFC 3339 are
-  tolerated). While any bridge window has yet to reset the usage endpoint is
-  not polled at all. Fallback: `GET
-  https://api.anthropic.com/api/oauth/usage` with the OAuth access token from
-  `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`) and
-  `anthropic-beta: oauth-2025-04-20` — but the endpoint allows only a handful
-  of requests per access token and then answers 429 for hours, so it is a
-  fallback, not the source. Note the bridge only fires for interactive Claude
-  Code sessions (`--print` runs do not invoke the statusline), which is also
-  when the subscription windows actually move.
+  tolerated). While *every* bridge window has yet to reset the usage endpoint
+  is not polled at all; the moment one of them has rolled over the bridge can
+  no longer say what the window that replaced it holds (an `any` test kept the
+  spent `5h` reading on the row indefinitely, because `7d` resets days out).
+  Second source: `GET https://api.anthropic.com/api/oauth/usage` with the OAuth
+  access token from `~/.claude/.credentials.json` (`claudeAiOauth.accessToken`)
+  and `anthropic-beta: oauth-2025-04-20`. The endpoint allows only a handful of
+  requests per access token and then answers 429 for hours, so it is polled at
+  most once every 15 minutes (`CLAUDE_USAGE_MIN_INTERVAL_SECS`, remembered in
+  `<store>/claude-usage-poll` so a run of CLI processes shares one interval);
+  `kanban limits --refresh` is a user asking now and skips the interval. The
+  two sources are then merged window by window: for each label the fresher
+  observation wins, except that a window which has already reset never
+  displaces one that is still running, and `observed_at` becomes the oldest
+  observation that survived, so the row never claims to be fresher than the
+  stalest number on it. When the stored access token has expired (`expiresAt`,
+  5-minute skew) or the endpoint answers 401, the stored refresh token is
+  traded for a new one at `POST https://platform.claude.com/v1/oauth/token`
+  (`grant_type=refresh_token`, Claude Code's public `client_id`) and the
+  rotated pair is written back into `claudeAiOauth`, preserving every other
+  field and the file's `0600` mode — the grant rotates the refresh token, so
+  keeping the new one private would strand Claude Code with a retired one.
+  Note the bridge only fires for interactive Claude Code sessions (`--print`
+  runs do not invoke the statusline), which is also when the subscription
+  windows actually move; the endpoint is what covers the hours in between.
 - **codex**: no network. The newest `rollout-*.jsonl` under
   `$CODEX_HOME/sessions/YYYY/MM/DD/` (default `~/.codex`) is streamed for its
   last `rate_limits` payload (`primary`/`secondary` with `used_percent`,
@@ -575,7 +607,10 @@ or non-TUI caller polls a provider), and results are cached in memory and in
 usage endpoint rate-limits frequent polling. Claude windows carry their true
 observation time (`observed_at`: the last statusline tick, or the fetch time
 for an HTTP 200), so both the row and the CLI can show their age the way codex
-rollouts do. The renderer only ever draws
+rollouts do. A window whose `resets_at` has passed is dropped from the row and
+from `kanban limits` (its percentage describes a period that is over); a
+provider whose windows have all rolled over reads `stale` rather than freezing
+yesterday's number. The renderer only ever draws
 `App::limits`, the snapshot the event loop last pulled from that cache, and
 degrades with width: reset times drop first, then window labels and provider
 names, then whole providers from the right.
@@ -593,8 +628,9 @@ last run" and "grok reads signed out after ~6h" without a periodic poller.
 Both CLIs run in the scratch cwd `<store>/limits-refresh-cwd` so stray session
 state never lands in a project. The claude, zai, and synthetic segments are
 display-only: claude's numbers arrive from the statusline bridge while its
-sessions run, the zai and synthetic keys are long-lived (the background poll
-keeps them fresh), and there is no CLI that can refresh claude's numbers the
+sessions run and from the usage endpoint on its own interval in between, the
+zai and synthetic keys are long-lived (the background poll keeps them fresh),
+and there is no CLI that can refresh claude's numbers the
 way codex/grok can. A 429 from the
 usage endpoint keeps the last good Claude windows (the row does not flip to
 `n/a`) and doubles the snapshot TTL before the next background poll, capped
@@ -619,7 +655,9 @@ tree at `<work>/.kanban/`.
 - `.lock` - board-wide flock serializing read-modify-write cycles
 
 Provider limit snapshots are machine-wide, not per board: they live in
-`<store>/limits.json` (see **Projects & Store**).
+`<store>/limits.json`, next to the claude statusline bridge's
+`claude-rate-limits.json` and the `claude-usage-poll` marker that spaces out
+the OAuth usage polls (see **Projects & Store**).
 
 ### Projects & Store
 

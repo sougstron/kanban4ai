@@ -8,6 +8,7 @@ pub mod limits;
 pub mod migrate;
 pub mod models;
 pub mod notifier;
+pub mod opener;
 pub mod operations;
 pub mod project;
 pub mod provenance;

@@ -195,7 +195,22 @@ fn provider_spans(
         ));
         return Some(spans);
     }
-    for (index, window) in entry.windows.iter().enumerate() {
+    // Windows that have already rolled over hold a percentage for a period
+    // that is over; the row drops them until a fresh observation lands.
+    let windows = entry.live_windows(now);
+    if windows.is_empty() {
+        spans.push(Span::styled(
+            if detail == Detail::Percent {
+                "n/a"
+            } else {
+                "stale"
+            }
+            .to_string(),
+            Style::default().fg(app.theme.muted),
+        ));
+        return Some(spans);
+    }
+    for (index, window) in windows.into_iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled(
                 " · ".to_string(),

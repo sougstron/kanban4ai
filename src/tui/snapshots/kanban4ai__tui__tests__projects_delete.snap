@@ -29,7 +29,7 @@ expression: rendered
 │                                                                                              │
 │                                                                                              │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
- Projects │ Enter open · n new · r rename · p path · d delete · s settings · / filter · ? help  
+ Projects │ Enter open · n new · r rename · p path · o folder · d delete · / filter · ? help    
 
 --- style runs ---
 0:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)

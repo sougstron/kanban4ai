@@ -5,16 +5,19 @@
 //! provider that is not installed, not signed in, or unreachable degrades to a
 //! note instead of an error:
 //!
-//! - **claude**: the statusline bridge — Claude Code (>= 2.1.80) pipes
-//!   `rate_limits` to its statusLine command on every turn, so a small shim
-//!   (installed by `kanban limits bridge install`) records them to
+//! - **claude**: two sources that top each other up window by window. The
+//!   statusline bridge — Claude Code (>= 2.1.80) pipes `rate_limits` to its
+//!   statusLine command on every turn, so a small shim (installed by
+//!   `kanban limits bridge install`) records them to
 //!   `<store>/claude-rate-limits.json` without spending any API budget. While
-//!   the bridge holds current windows the usage endpoint is not polled at
-//!   all. Fallback: `GET /api/oauth/usage` on the Anthropic API with the OAuth
-//!   access token from `~/.claude/.credentials.json`, which reports a 5-hour
-//!   session window and a 7-day window — but the endpoint is rate-limited to
-//!   a handful of requests per access token and 429s for hours, so it is only
-//!   a fallback.
+//!   *every* bridge window is still open the usage endpoint is not polled at
+//!   all; once any of them has rolled over the bridge can no longer say what
+//!   the new window holds, so `GET /api/oauth/usage` on the Anthropic API is
+//!   polled on its own interval (see [`CLAUDE_USAGE_MIN_INTERVAL_SECS`]) and
+//!   merged per window with whatever the bridge still knows. The OAuth access
+//!   token comes from `~/.claude/.credentials.json`; when it has expired the
+//!   stored refresh token is traded for a new one and the rotated pair is
+//!   written back, so the board keeps working while Claude Code is idle.
 //! - **codex**: no network at all. The newest `rollout-*.jsonl` under
 //!   `~/.codex/sessions/` carries the `rate_limits` payload the server last
 //!   sent, so the numbers are exactly as fresh as the last codex run — the age
@@ -56,7 +59,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -105,6 +108,13 @@ impl LimitWindow {
             .map(|at| at.saturating_sub(now))
             .filter(|remaining| *remaining > 0)
     }
+
+    /// Whether the window has rolled over since it was observed, which makes
+    /// its percentage a reading of a window that no longer exists. A window
+    /// without a known reset time is never treated as expired.
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.resets_at.is_some_and(|at| at <= now)
+    }
 }
 
 /// Why a provider has no usable numbers, if it has none.
@@ -149,6 +159,17 @@ impl ProviderLimits {
         self.state == ProviderState::Ready && !self.windows.is_empty()
     }
 
+    /// The windows still worth showing. A window whose reset time has passed
+    /// describes a period that has since rolled over, so its percentage is
+    /// stale by definition — callers drop it rather than freeze yesterday's
+    /// number on the row until a fresh observation arrives.
+    pub fn live_windows(&self, now: i64) -> Vec<&LimitWindow> {
+        self.windows
+            .iter()
+            .filter(|window| !window.is_expired(now))
+            .collect()
+    }
+
     /// Age of the underlying data in seconds, when it predates the fetch.
     pub fn data_age(&self, now: i64) -> Option<i64> {
         self.observed_at
@@ -187,10 +208,21 @@ fn home_dir() -> Option<PathBuf> {
 // HTTP
 // ---------------------------------------------------------------------------
 
-/// `GET url` through curl, with headers passed on stdin so secrets stay out of
-/// the command line. Returns the parsed JSON body, or the HTTP status when the
-/// request completed with a non-2xx code.
+/// `GET url` through curl. See [`http_request_json`].
 fn http_get_json(url: &str, headers: &[(&str, String)]) -> std::result::Result<Value, HttpError> {
+    http_request_json(url, headers, None)
+}
+
+/// One HTTP request through curl, with headers and any request body passed on
+/// stdin so secrets stay out of the command line (a refresh token in `ps`
+/// output would be as good as the credential file itself). A body makes it a
+/// POST. Returns the parsed JSON body, or the HTTP status when the request
+/// completed with a non-2xx code.
+fn http_request_json(
+    url: &str,
+    headers: &[(&str, String)],
+    body: Option<&str>,
+) -> std::result::Result<Value, HttpError> {
     let mut config = String::new();
     config.push_str(&format!("url = {}\n", quote_curl(url)));
     for (name, value) in headers {
@@ -198,6 +230,9 @@ fn http_get_json(url: &str, headers: &[(&str, String)]) -> std::result::Result<V
             "header = {}\n",
             quote_curl(&format!("{name}: {value}"))
         ));
+    }
+    if let Some(body) = body {
+        config.push_str(&format!("data = {}\n", quote_curl(body)));
     }
     config.push_str("silent\n");
     config.push_str("show-error\n");
@@ -277,50 +312,206 @@ fn split_status(body: &str) -> (&str, u16) {
 
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
+/// Where a Claude Code access token is renewed from its refresh token.
+const CLAUDE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+
+/// Claude Code's public OAuth client id — the same one its own login flow
+/// sends; the refresh grant is rejected without it.
+const CLAUDE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/// Renew the access token this long before its stated expiry, so a poll never
+/// races the boundary.
+const CLAUDE_TOKEN_SKEW_SECS: i64 = 300;
+
 fn claude_credentials_path() -> Option<PathBuf> {
     Some(home_dir()?.join(".claude").join(".credentials.json"))
 }
 
-/// OAuth access token from the Claude Code credential store.
-fn claude_access_token(path: &Path) -> Option<String> {
+/// The OAuth material Claude Code keeps in `~/.claude/.credentials.json`.
+#[derive(Debug, Clone, PartialEq)]
+struct ClaudeCredentials {
+    access_token: String,
+    refresh_token: Option<String>,
+    /// `expiresAt`, converted from the file's milliseconds to Unix seconds.
+    expires_at: Option<i64>,
+}
+
+/// Read the `claudeAiOauth` block of the Claude Code credential store.
+fn read_claude_credentials(path: &Path) -> Option<ClaudeCredentials> {
     let text = fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
-    value
-        .get("claudeAiOauth")?
+    let oauth = value.get("claudeAiOauth")?;
+    let access_token = oauth
         .get("accessToken")?
         .as_str()
         .map(str::to_string)
-        .filter(|token| !token.is_empty())
+        .filter(|token| !token.is_empty())?;
+    Some(ClaudeCredentials {
+        access_token,
+        refresh_token: oauth
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string),
+        expires_at: oauth
+            .get("expiresAt")
+            .and_then(Value::as_i64)
+            .filter(|at| *at > 0)
+            .map(|millis| millis / 1000),
+    })
+}
+
+/// Whether the stored access token is spent (or about to be). Credentials
+/// without a stated expiry are taken at face value — a 401 still triggers the
+/// refresh below.
+fn claude_token_expired(credentials: &ClaudeCredentials, now: i64) -> bool {
+    credentials
+        .expires_at
+        .is_some_and(|at| at.saturating_sub(CLAUDE_TOKEN_SKEW_SECS) <= now)
+}
+
+/// Read an OAuth token response onto the current credentials. `refresh_token`
+/// is only present when the server rotated it, so it falls back to the token
+/// that was just spent; `expires_in` is seconds from now.
+fn parse_claude_token_response(
+    value: &Value,
+    current: &ClaudeCredentials,
+    now: i64,
+) -> Option<ClaudeCredentials> {
+    let access_token = value
+        .get("access_token")?
+        .as_str()
+        .map(str::to_string)
+        .filter(|token| !token.is_empty())?;
+    Some(ClaudeCredentials {
+        access_token,
+        refresh_token: value
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string)
+            .or_else(|| current.refresh_token.clone()),
+        expires_at: value
+            .get("expires_in")
+            .and_then(Value::as_i64)
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| now.saturating_add(seconds)),
+    })
+}
+
+/// Trade the stored refresh token for a fresh access token.
+///
+/// The new pair is written back to Claude Code's own credential store rather
+/// than kept private here: the grant rotates the refresh token, so a copy that
+/// only this process knows about would leave Claude Code holding one the
+/// server has already retired.
+fn refresh_claude_token(
+    path: &Path,
+    credentials: &ClaudeCredentials,
+) -> std::result::Result<ClaudeCredentials, HttpError> {
+    let Some(refresh_token) = credentials.refresh_token.clone() else {
+        // Nothing to renew with — the user has to sign in to Claude Code again.
+        return Err(HttpError::Status(401));
+    };
+    let body = json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_CLIENT_ID,
+    })
+    .to_string();
+    let headers = [
+        ("Content-Type", "application/json".to_string()),
+        ("Accept", "application/json".to_string()),
+    ];
+    let value = http_request_json(CLAUDE_TOKEN_URL, &headers, Some(&body))?;
+    let refreshed = parse_claude_token_response(&value, credentials, now_secs())
+        .ok_or_else(|| HttpError::Transport("no access token in refresh reply".to_string()))?;
+    write_claude_credentials(path, &refreshed);
+    Ok(refreshed)
+}
+
+/// Store renewed tokens, leaving every other field of the credential file — and
+/// its owner-only permissions — as they were. Best effort: a store this process
+/// cannot write still yields a usable token for this run.
+fn write_claude_credentials(path: &Path, credentials: &ClaudeCredentials) {
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(mut value) = serde_json::from_str::<Value>(&text) else {
+        return;
+    };
+    let Some(oauth) = value
+        .get_mut("claudeAiOauth")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    oauth.insert(
+        "accessToken".to_string(),
+        Value::String(credentials.access_token.clone()),
+    );
+    if let Some(refresh_token) = credentials.refresh_token.clone() {
+        oauth.insert("refreshToken".to_string(), Value::String(refresh_token));
+    }
+    if let Some(expires_at) = credentials.expires_at {
+        oauth.insert(
+            "expiresAt".to_string(),
+            Value::from(expires_at.saturating_mul(1000)),
+        );
+    }
+    let Ok(text) = serde_json::to_string(&value) else {
+        return;
+    };
+    if atomic_write_text(path, &text).is_ok() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+}
+
+/// The usage windows the OAuth endpoint reports for one access token.
+fn fetch_claude_usage(token: &str) -> std::result::Result<Vec<LimitWindow>, HttpError> {
+    let headers = [
+        ("Authorization", format!("Bearer {token}")),
+        ("anthropic-beta", "oauth-2025-04-20".to_string()),
+        ("Accept", "application/json".to_string()),
+    ];
+    let value = http_get_json(CLAUDE_USAGE_URL, &headers)?;
+    let windows = parse_claude_usage(&value);
+    if windows.is_empty() {
+        return Err(HttpError::Transport("no usage windows".to_string()));
+    }
+    Ok(windows)
 }
 
 fn fetch_claude() -> ProviderLimits {
     let Some(path) = claude_credentials_path().filter(|path| path.exists()) else {
         return ProviderLimits::new("claude", ProviderState::NotConfigured);
     };
-    let Some(token) = claude_access_token(&path) else {
+    let Some(credentials) = read_claude_credentials(&path) else {
         return ProviderLimits::new("claude", ProviderState::SignedOut);
     };
-    let headers = [
-        ("Authorization", format!("Bearer {token}")),
-        ("anthropic-beta", "oauth-2025-04-20".to_string()),
-        ("Accept", "application/json".to_string()),
-    ];
-    match http_get_json(CLAUDE_USAGE_URL, &headers) {
-        Ok(value) => {
-            let windows = parse_claude_usage(&value);
-            if windows.is_empty() {
-                ProviderLimits::new(
-                    "claude",
-                    ProviderState::Unavailable("no usage windows".to_string()),
-                )
-            } else {
-                ProviderLimits {
-                    windows,
-                    observed_at: Some(now_secs()),
-                    ..ProviderLimits::new("claude", ProviderState::Ready)
-                }
-            }
+    // Claude Code renews the token on its next run, but the board is asking
+    // precisely because Claude Code has been idle, so it renews the token too.
+    let credentials = if claude_token_expired(&credentials, now_secs()) {
+        match refresh_claude_token(&path, &credentials) {
+            Ok(refreshed) => refreshed,
+            Err(err) => return ProviderLimits::new("claude", err.into_state()),
         }
+    } else {
+        credentials
+    };
+    let windows = match fetch_claude_usage(&credentials.access_token) {
+        // The stored expiry disagreed with the server: renew once and retry.
+        Err(HttpError::Status(401)) => refresh_claude_token(&path, &credentials)
+            .and_then(|refreshed| fetch_claude_usage(&refreshed.access_token)),
+        other => other,
+    };
+    match windows {
+        Ok(windows) => ProviderLimits {
+            windows,
+            observed_at: Some(now_secs()),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        },
         Err(err) => ProviderLimits::new("claude", err.into_state()),
     }
 }
@@ -365,16 +556,85 @@ fn apply_claude_429_policy(
     }
 }
 
-fn resolve_claude(previous: Option<&LimitsSnapshot>) -> ProviderLimits {
+/// How often the usage endpoint may be polled once the bridge has stopped
+/// covering every window. Its per-access-token budget is a handful of requests
+/// — polling it on the board's refresh tick is what made this row 429 — while
+/// the shortest window it reports is five hours, so a quarter hour of lag costs
+/// nothing that is visible on the row.
+pub const CLAUDE_USAGE_MIN_INTERVAL_SECS: i64 = 900;
+
+/// When the usage endpoint was last polled. Cached in memory and on disk,
+/// because a run of `kanban limits` calls is a run of fresh processes and the
+/// interval has to hold across all of them.
+static CLAUDE_USAGE_POLLED_AT: AtomicI64 = AtomicI64::new(0);
+
+fn claude_usage_poll_path() -> Option<PathBuf> {
+    store_root().ok().map(|root| root.join("claude-usage-poll"))
+}
+
+fn claude_usage_polled_at() -> i64 {
+    let cached = CLAUDE_USAGE_POLLED_AT.load(Ordering::SeqCst);
+    if cached > 0 {
+        return cached;
+    }
+    let stored = claude_usage_poll_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    CLAUDE_USAGE_POLLED_AT.store(stored, Ordering::SeqCst);
+    stored
+}
+
+fn record_claude_usage_poll(now: i64) {
+    CLAUDE_USAGE_POLLED_AT.store(now, Ordering::SeqCst);
+    if let Some(path) = claude_usage_poll_path() {
+        let _ = fs::create_dir_all(path.parent().unwrap_or(Path::new("/")));
+        let _ = atomic_write_text(&path, &now.to_string());
+    }
+}
+
+/// Whether the usage endpoint may be polled now.
+fn claude_usage_poll_due(now: i64) -> bool {
+    now.saturating_sub(claude_usage_polled_at()) >= CLAUDE_USAGE_MIN_INTERVAL_SECS
+}
+
+/// Claude's windows from the bridge, the usage endpoint, or both.
+///
+/// `force` is a user asking for the numbers now (`kanban limits --refresh`),
+/// which skips the poll interval; the background refresh never does.
+fn resolve_claude(previous: Option<&LimitsSnapshot>, force: bool) -> ProviderLimits {
     let previous_entry = previous.and_then(|snapshot| snapshot.get("claude"));
     let now = now_secs();
-    // A current bridge answers without touching the usage endpoint: its
-    // per-access-token budget is a handful of requests, so polling is what
-    // kept this row 429ing in the first place.
-    if let Some(bridge) = read_claude_bridge().filter(|bridge| claude_bridge_current(bridge, now)) {
+    let bridge = read_claude_bridge();
+    // A bridge that still covers every window answers on its own: the usage
+    // endpoint's budget is a handful of requests per token, so polling it while
+    // a free and current source exists is what kept this row 429ing.
+    if let Some(bridge) = bridge
+        .clone()
+        .filter(|bridge| claude_bridge_current(bridge, now))
+    {
         CLAUDE_429_STREAK.store(0, Ordering::SeqCst);
-        return bridge;
+        // Still merged with what is cached: a statusline payload that carried
+        // only `five_hour` would otherwise drop the 7-day window off the row.
+        return merge_claude_sources(
+            Some(bridge),
+            previous_entry
+                .cloned()
+                .unwrap_or_else(|| ProviderLimits::new("claude", ProviderState::Ready)),
+            now,
+        );
     }
+    // Some window has rolled over since the last statusline tick and only the
+    // endpoint can say what replaced it — but on its own interval, not the
+    // board's. Until then the row keeps the windows that are still running and
+    // drops the reset one (see [`ProviderLimits::live_windows`]).
+    if let Some(previous_entry) = previous_entry
+        && !force
+        && !claude_usage_poll_due(now)
+    {
+        return merge_claude_sources(bridge, previous_entry.clone(), now);
+    }
+    record_claude_usage_poll(now);
     let (resolved, hit_429) = apply_claude_429_policy(previous_entry, fetch_claude());
     if hit_429 {
         CLAUDE_429_STREAK.fetch_add(1, Ordering::SeqCst);
@@ -384,19 +644,81 @@ fn resolve_claude(previous: Option<&LimitsSnapshot>) -> ProviderLimits {
     ) {
         CLAUDE_429_STREAK.store(0, Ordering::SeqCst);
     }
-    prefer_claude_source(read_claude_bridge(), resolved)
+    merge_claude_sources(bridge, resolved, now)
 }
 
-/// Stale bridge windows still beat an endpoint that refuses to answer; when
-/// both hold windows, the fresher observation wins.
-fn prefer_claude_source(bridge: Option<ProviderLimits>, http: ProviderLimits) -> ProviderLimits {
-    let Some(bridge) = bridge else {
+/// Combine the two Claude sources window by window, because neither is
+/// complete on its own: the bridge only learns a window when Claude Code takes
+/// a turn, and the endpoint may only be polled every so often. For each label
+/// the fresher observation wins, except that a window which has already reset
+/// never displaces one that is still running. Stale bridge windows still beat
+/// an endpoint that refuses to answer at all.
+///
+/// `observed_at` becomes the oldest observation that survived the merge, so the
+/// row never claims to be fresher than the stalest number on it.
+fn merge_claude_sources(
+    bridge: Option<ProviderLimits>,
+    http: ProviderLimits,
+    now: i64,
+) -> ProviderLimits {
+    let Some(bridge) = bridge.filter(ProviderLimits::is_ready) else {
         return http;
     };
-    if !http.is_ready() || bridge.observed_at.unwrap_or(0) > http.observed_at.unwrap_or(0) {
+    if !http.is_ready() {
         return bridge;
     }
-    http
+    let http_at = http.observed_at.unwrap_or(0);
+    let bridge_at = bridge.observed_at.unwrap_or(0);
+    let mut merged: Vec<(LimitWindow, i64)> = Vec::new();
+    for (window, observed_at) in http
+        .windows
+        .iter()
+        .map(|window| (window, http_at))
+        .chain(bridge.windows.iter().map(|window| (window, bridge_at)))
+    {
+        match merged
+            .iter_mut()
+            .find(|(existing, _)| existing.label == window.label)
+        {
+            Some(entry) if prefers_window(window, observed_at, &entry.0, entry.1, now) => {
+                *entry = (window.clone(), observed_at);
+            }
+            Some(_) => {}
+            None => merged.push((window.clone(), observed_at)),
+        }
+    }
+    merged.sort_by_key(|(window, _)| claude_window_rank(&window.label));
+    let observed_at = merged.iter().map(|(_, at)| *at).min().filter(|at| *at > 0);
+    ProviderLimits {
+        windows: merged.into_iter().map(|(window, _)| window).collect(),
+        observed_at,
+        ..ProviderLimits::new("claude", ProviderState::Ready)
+    }
+}
+
+/// Whether `candidate` describes a window's current state better than
+/// `current` does: a running window beats a reset one whatever their ages,
+/// otherwise the later observation wins.
+fn prefers_window(
+    candidate: &LimitWindow,
+    candidate_at: i64,
+    current: &LimitWindow,
+    current_at: i64,
+    now: i64,
+) -> bool {
+    if candidate.is_expired(now) != current.is_expired(now) {
+        return !candidate.is_expired(now);
+    }
+    candidate_at > current_at
+}
+
+/// Display order of the claude windows, so a merge cannot reorder the row.
+fn claude_window_rank(label: &str) -> u8 {
+    match label {
+        "5h" => 0,
+        "7d" => 1,
+        _ => 2,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -490,13 +812,18 @@ fn read_claude_bridge() -> Option<ProviderLimits> {
     })
 }
 
-/// Bridge windows are current while any window has yet to reset; unknown or
-/// already-past resets get a grace period after the last statusline tick.
+/// Bridge windows are current while *every* window has yet to reset; unknown
+/// or already-past resets get a grace period after the last statusline tick.
+///
+/// One window still running is not enough: the 7-day window resets days out, so
+/// an `any` test would keep a bridge file whose 5-hour window rolled over hours
+/// ago on the row, and the usage endpoint would never be asked what the new
+/// five-hour window holds.
 fn claude_bridge_current(bridge: &ProviderLimits, now: i64) -> bool {
     bridge
         .windows
         .iter()
-        .any(|window| window.resets_in(now).is_some())
+        .all(|window| window.resets_in(now).is_some())
         || now.saturating_sub(bridge.observed_at.unwrap_or(0)) < CLAUDE_BRIDGE_GRACE_SECS
 }
 
@@ -1189,7 +1516,7 @@ pub fn refresh_provider_now(provider: &str) {
             let _ = refresh_grok_cli();
             fetch_grok()
         }
-        "claude" => resolve_claude(cached().as_deref()),
+        "claude" => resolve_claude(cached().as_deref(), true),
         _ => return,
     };
     let mut providers = cached()
@@ -1235,12 +1562,14 @@ pub fn refresh_provider_async(provider: &'static str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Poll every provider. Blocking: callers on a UI path use [`refresh_if_stale`].
-pub fn fetch_all() -> LimitsSnapshot {
+/// `force` marks a refresh the user asked for, which skips the claude usage
+/// endpoint's poll interval.
+pub fn fetch_all(force: bool) -> LimitsSnapshot {
     let previous = cached();
     LimitsSnapshot {
         fetched_at: now_secs(),
         providers: vec![
-            resolve_claude(previous.as_deref()),
+            resolve_claude(previous.as_deref(), force),
             fetch_codex(),
             fetch_grok(),
             fetch_zai(),
@@ -1293,8 +1622,10 @@ fn store(snapshot: Arc<LimitsSnapshot>, persist: bool) {
 }
 
 /// Fetch now, updating both caches. Used by the CLI, where blocking is fine.
-pub fn refresh_blocking() -> Arc<LimitsSnapshot> {
-    let snapshot = Arc::new(fetch_all());
+/// `force` is `kanban limits --refresh`, as opposed to a snapshot that merely
+/// aged out.
+pub fn refresh_blocking(force: bool) -> Arc<LimitsSnapshot> {
+    let snapshot = Arc::new(fetch_all(force));
     store(Arc::clone(&snapshot), true);
     snapshot
 }
@@ -1311,7 +1642,7 @@ pub fn refresh_if_stale(ttl: i64) {
         return;
     }
     thread::spawn(|| {
-        let snapshot = Arc::new(fetch_all());
+        let snapshot = Arc::new(fetch_all(false));
         store(snapshot, true);
         REFRESHING.store(false, Ordering::SeqCst);
     });
@@ -1735,7 +2066,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_bridge_is_current_until_reset_or_grace() {
+    fn claude_bridge_is_current_only_while_every_window_runs() {
         let fresh = ProviderLimits {
             windows: vec![LimitWindow::new("5h", 10.0, Some(2_000_000_000))],
             observed_at: Some(1_000_000_000),
@@ -1750,6 +2081,16 @@ mod tests {
             observed_at: Some(1_000_000_000),
             ..past_reset_in_grace.clone()
         };
+        // The regression this row shipped with: a spent 5h window next to a 7d
+        // window that resets days out kept the whole file "current" forever.
+        let spent_five_hour = ProviderLimits {
+            windows: vec![
+                LimitWindow::new("5h", 99.0, Some(1_000_010_000)),
+                LimitWindow::new("7d", 5.0, Some(1_000_500_000)),
+            ],
+            observed_at: Some(1_000_000_000),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
 
         assert!(claude_bridge_current(&fresh, 1_000_050_000));
         assert!(claude_bridge_current(&past_reset_in_grace, 1_000_001_000));
@@ -1757,6 +2098,8 @@ mod tests {
             &past_reset_past_grace,
             1_000_050_000
         ));
+        assert!(claude_bridge_current(&spent_five_hour, 1_000_001_000));
+        assert!(!claude_bridge_current(&spent_five_hour, 1_000_050_000));
     }
 
     #[test]
@@ -1777,20 +2120,216 @@ mod tests {
             observed_at: Some(1_600_000_000),
             ..older_http.clone()
         };
+        let now = 1_700_000_000;
 
-        assert_eq!(prefer_claude_source(None, unavailable.clone()), unavailable);
         assert_eq!(
-            prefer_claude_source(Some(bridge.clone()), unavailable),
+            merge_claude_sources(None, unavailable.clone(), now),
+            unavailable
+        );
+        assert_eq!(
+            merge_claude_sources(Some(bridge.clone()), unavailable, now),
             bridge
         );
         assert_eq!(
-            prefer_claude_source(Some(bridge.clone()), older_http),
+            merge_claude_sources(Some(bridge.clone()), older_http, now),
             bridge
         );
         assert_eq!(
-            prefer_claude_source(Some(bridge), newer_http.clone()),
+            merge_claude_sources(Some(bridge), newer_http.clone(), now),
             newer_http
         );
+    }
+
+    #[test]
+    fn claude_sources_merge_window_by_window() {
+        let now = 1_700_000_000;
+        // The bridge saw both windows 13 hours ago; its 5h window has since
+        // rolled over, its 7d window is the only 7d reading anyone has.
+        let bridge = ProviderLimits {
+            windows: vec![
+                LimitWindow::new("5h", 99.0, Some(now - 3_600)),
+                LimitWindow::new("7d", 40.0, Some(now + 400_000)),
+            ],
+            observed_at: Some(now - 46_800),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+        let http = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 17.0, Some(now + 9_000))],
+            observed_at: Some(now),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+
+        let merged = merge_claude_sources(Some(bridge), http, now);
+
+        assert_eq!(merged.windows.len(), 2);
+        assert_eq!(merged.windows[0].label, "5h");
+        assert_eq!(merged.windows[0].remaining_percent, 83.0);
+        assert_eq!(merged.windows[1].label, "7d");
+        assert_eq!(merged.windows[1].remaining_percent, 60.0);
+        // The row is only as fresh as the 7d number it is still borrowing.
+        assert_eq!(merged.observed_at, Some(now - 46_800));
+    }
+
+    #[test]
+    fn a_bridge_window_supplements_rather_than_replaces_the_cached_ones() {
+        let now = 1_700_000_000;
+        // A statusline payload that only carried `five_hour`.
+        let bridge = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 12.0, Some(now + 9_000))],
+            observed_at: Some(now - 60),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+        let cached = ProviderLimits {
+            windows: vec![
+                LimitWindow::new("5h", 30.0, Some(now + 3_000)),
+                LimitWindow::new("7d", 18.0, Some(now + 400_000)),
+            ],
+            observed_at: Some(now - 3_600),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+
+        let merged = merge_claude_sources(Some(bridge), cached, now);
+
+        assert_eq!(merged.windows.len(), 2);
+        assert_eq!(merged.windows[0].label, "5h");
+        assert_eq!(merged.windows[0].remaining_percent, 88.0);
+        assert_eq!(merged.windows[1].label, "7d");
+        assert_eq!(merged.windows[1].remaining_percent, 82.0);
+        assert_eq!(merged.observed_at, Some(now - 3_600));
+    }
+
+    #[test]
+    fn a_running_window_beats_a_newer_reading_of_a_reset_one() {
+        let now = 1_700_000_000;
+        let running = LimitWindow::new("5h", 20.0, Some(now + 600));
+        let reset = LimitWindow::new("5h", 90.0, Some(now - 600));
+
+        assert!(prefers_window(&running, now - 9_000, &reset, now, now));
+        assert!(!prefers_window(&reset, now, &running, now - 9_000, now));
+        assert!(prefers_window(&running, now, &running, now - 60, now));
+        assert!(!prefers_window(&running, now - 60, &running, now, now));
+    }
+
+    #[test]
+    fn reset_windows_are_dropped_from_the_row() {
+        let now = 1_700_000_000;
+        let entry = ProviderLimits {
+            windows: vec![
+                LimitWindow::new("5h", 99.0, Some(now - 1)),
+                LimitWindow::new("7d", 5.0, Some(now + 400_000)),
+                LimitWindow::new("mon", 10.0, None),
+            ],
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+
+        let live = entry.live_windows(now);
+
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[0].label, "7d");
+        // A window with no known reset time is not evidence of being stale.
+        assert_eq!(live[1].label, "mon");
+        assert!(entry.windows[0].is_expired(now));
+        assert!(!entry.windows[2].is_expired(now));
+    }
+
+    #[test]
+    fn claude_credentials_carry_the_refresh_token_and_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"tok-1","refreshToken":"ref-1",
+                "expiresAt":1700000000000,"subscriptionType":"pro"}}"#,
+        )
+        .unwrap();
+
+        let credentials = read_claude_credentials(&path).expect("credentials");
+
+        assert_eq!(credentials.access_token, "tok-1");
+        assert_eq!(credentials.refresh_token.as_deref(), Some("ref-1"));
+        assert_eq!(credentials.expires_at, Some(1_700_000_000));
+        assert!(claude_token_expired(&credentials, 1_700_000_000));
+        assert!(claude_token_expired(&credentials, 1_699_999_800));
+        assert!(!claude_token_expired(&credentials, 1_699_999_000));
+
+        fs::write(&path, r#"{"claudeAiOauth":{"accessToken":""}}"#).unwrap();
+        assert!(read_claude_credentials(&path).is_none());
+        assert!(read_claude_credentials(&dir.path().join("nope.json")).is_none());
+    }
+
+    #[test]
+    fn a_token_without_an_expiry_is_only_expired_when_the_server_says_so() {
+        let credentials = ClaudeCredentials {
+            access_token: "tok-1".to_string(),
+            refresh_token: None,
+            expires_at: None,
+        };
+
+        assert!(!claude_token_expired(&credentials, 1_700_000_000));
+    }
+
+    #[test]
+    fn refresh_reply_keeps_the_refresh_token_the_server_left_out() {
+        let current = ClaudeCredentials {
+            access_token: "old".to_string(),
+            refresh_token: Some("ref-1".to_string()),
+            expires_at: Some(1_700_000_000),
+        };
+        let rotated: Value = serde_json::from_str(
+            r#"{"access_token":"new","refresh_token":"ref-2","expires_in":28800}"#,
+        )
+        .unwrap();
+        let kept: Value =
+            serde_json::from_str(r#"{"access_token":"new","expires_in":28800}"#).unwrap();
+
+        let rotated = parse_claude_token_response(&rotated, &current, 1_700_000_000).unwrap();
+        assert_eq!(rotated.access_token, "new");
+        assert_eq!(rotated.refresh_token.as_deref(), Some("ref-2"));
+        assert_eq!(rotated.expires_at, Some(1_700_028_800));
+
+        let kept = parse_claude_token_response(&kept, &current, 1_700_000_000).unwrap();
+        assert_eq!(kept.refresh_token.as_deref(), Some("ref-1"));
+
+        let refused: Value = serde_json::from_str(r#"{"error":"invalid_grant"}"#).unwrap();
+        assert!(parse_claude_token_response(&refused, &current, 1_700_000_000).is_none());
+    }
+
+    #[test]
+    fn renewed_tokens_are_written_back_without_losing_the_other_fields() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".credentials.json");
+        fs::write(
+            &path,
+            r#"{"claudeAiOauth":{"accessToken":"old","refreshToken":"ref-1","expiresAt":1700000000000,
+                "scopes":["user:inference"],"subscriptionType":"pro"},"other":{"keep":true}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_claude_credentials(
+            &path,
+            &ClaudeCredentials {
+                access_token: "new".to_string(),
+                refresh_token: Some("ref-2".to_string()),
+                expires_at: Some(1_700_028_800),
+            },
+        );
+
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let oauth = value.get("claudeAiOauth").unwrap();
+        assert_eq!(oauth.get("accessToken").unwrap(), "new");
+        assert_eq!(oauth.get("refreshToken").unwrap(), "ref-2");
+        assert_eq!(oauth.get("expiresAt").unwrap(), 1_700_028_800_000_i64);
+        assert_eq!(oauth.get("subscriptionType").unwrap(), "pro");
+        assert_eq!(oauth.get("scopes").unwrap().as_array().unwrap().len(), 1);
+        assert_eq!(value.get("other").unwrap().get("keep").unwrap(), true);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(read_claude_credentials(&path).unwrap().access_token, "new");
     }
 
     #[test]
@@ -1834,7 +2373,7 @@ mod tests {
     #[test]
     fn missing_credentials_report_not_configured() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(claude_access_token(&dir.path().join("nope.json")).is_none());
+        assert!(read_claude_credentials(&dir.path().join("nope.json")).is_none());
         assert!(grok_session(&dir.path().join("nope.json")).is_none());
     }
 
@@ -1860,7 +2399,11 @@ mod tests {
         let path = dir.path().join(".credentials.json");
         fs::write(&path, r#"{"claudeAiOauth":{"accessToken":"tok-1"}}"#).unwrap();
 
-        assert_eq!(claude_access_token(&path), Some("tok-1".to_string()));
+        let credentials = read_claude_credentials(&path).expect("credentials");
+
+        assert_eq!(credentials.access_token, "tok-1");
+        assert_eq!(credentials.refresh_token, None);
+        assert_eq!(credentials.expires_at, None);
     }
 
     #[test]

@@ -342,6 +342,10 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
             seg("n new", Some(UiAction::NewProject), 2),
             seg("r rename", Some(UiAction::RenameProject), 3),
             seg("p path", Some(UiAction::SetProjectPath), 4),
+            // Ties with settings, which is listed after it and so drops
+            // first: the title bar still advertises `s`, but the only hint
+            // for the folder button is here.
+            seg("o folder", Some(UiAction::OpenProjectFolder), 5),
             seg("d delete", Some(UiAction::DeleteProject), 3),
             seg("s settings", Some(UiAction::OpenGlobalSettings), 5),
             seg("/ filter", Some(UiAction::Search), 4),
@@ -542,6 +546,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Projects"),
         Line::from("  Enter: open · n: new project · r: rename · p: change path · d: remove"),
+        Line::from("  o: open the project folder in the desktop file manager"),
         Line::from("  s: global settings, incl. Esc-from-board behavior"),
         Line::from("  pinned + row creates a project for the current folder with no dialog"),
         Line::from("  delete unregisters by default; toggle also deletes board data"),

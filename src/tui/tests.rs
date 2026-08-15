@@ -4251,6 +4251,130 @@ fn projects_table_drops_trailing_columns_on_a_narrow_terminal() {
 }
 
 #[test]
+fn mouse_move_preselects_a_project_row_without_taking_the_selection() {
+    let store_dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(store_dir.path());
+    let root = tempfile::tempdir().expect("work root");
+    for index in 1..=2 {
+        let work = root.path().join(format!("p{index:02}"));
+        std::fs::create_dir_all(&work).expect("work dir");
+        store
+            .add(&work, Some(&format!("Project {index:02}")))
+            .expect("add project");
+    }
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let _ = render_at(&mut app, 100, 16);
+
+    let hovered_row = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::FocusProject { index: 1 })
+        .copied()
+        .expect("second project hitbox")
+        .area;
+    let selected_row = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::FocusProject { index: 0 })
+        .copied()
+        .expect("first project hitbox")
+        .area;
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: hovered_row.x + 1,
+        row: hovered_row.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover project row");
+
+    assert!(app.is_hovered(HitAction::FocusProject { index: 1 }));
+    // Preselection paints a row, it does not move the keyboard selection.
+    assert_eq!(app.project_selected, 0);
+    let hover_style = style_at(&mut app, 100, 16, hovered_row.x, hovered_row.y);
+    let selected_style = style_at(&mut app, 100, 16, selected_row.x, selected_row.y);
+    assert_eq!(hover_style.bg, Some(app.theme.hover));
+    assert_eq!(selected_style.bg, Some(app.theme.border));
+    assert_ne!(app.theme.hover, app.theme.border);
+    assert_ne!(app.theme.hover, app.theme.bg);
+}
+
+/// The status-bar button hands the selected project's work folder to the
+/// configured file manager, with the folder appended to the command.
+#[test]
+fn the_open_folder_button_hands_the_work_folder_to_the_file_manager() {
+    let store_dir = tempfile::tempdir().expect("store");
+    let root = tempfile::tempdir().expect("work root");
+    let work = root.path().join("opened");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let marker = root.path().join("marker");
+    let store = ProjectStore::at(store_dir.path());
+    store.add(&work, Some("Opened")).expect("add project");
+    // A stand-in for the desktop opener: it records the path it was handed
+    // instead of putting a window on the developer's screen.
+    let mut config = store.load_global_config().expect("global config");
+    config.tui.insert(
+        serde_yaml_ng::Value::String("file_manager".to_string()),
+        serde_yaml_ng::Value::String(format!("sh -c 'printf %s \"$0\" > {}'", marker.display())),
+    );
+    store.save_global_config(&config).expect("save config");
+
+    let mut app =
+        App::projects_at(ProjectStore::at(store_dir.path()), None, None).expect("projects app");
+    let rendered = render_at(&mut app, 120, 16);
+    let button = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::OpenProjectFolder))
+        .copied()
+        .expect("open-folder button")
+        .area;
+    assert!(rendered.contains("o folder"), "{rendered}");
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: button.x,
+        row: button.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("press open-folder");
+    assert!(
+        app.status.starts_with("Opened "),
+        "unexpected status: {}",
+        app.status
+    );
+
+    // The opener is spawned detached, so wait for the path it recorded.
+    let mut recorded = None;
+    for _ in 0..200 {
+        if let Ok(content) = std::fs::read_to_string(&marker) {
+            recorded = Some(content);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(recorded.as_deref(), Some(work.to_string_lossy().as_ref()));
+}
+
+#[test]
+fn opening_a_missing_project_folder_reports_it_instead_of_launching() {
+    let store_dir = tempfile::tempdir().expect("store");
+    let root = tempfile::tempdir().expect("work root");
+    let work = root.path().join("gone");
+    std::fs::create_dir_all(&work).expect("work dir");
+    let store = ProjectStore::at(store_dir.path());
+    store.add(&work, Some("Gone")).expect("add project");
+    std::fs::remove_dir_all(&work).expect("remove work dir");
+
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    app.handle_key(key(KeyCode::Char('o'))).expect("press o");
+    assert!(
+        app.status.contains("Folder is missing"),
+        "unexpected status: {}",
+        app.status
+    );
+}
+
+#[test]
 fn projects_list_scrolls_the_selection_into_view_and_keeps_hitboxes_on_it() {
     let store_dir = tempfile::tempdir().expect("store");
     let store = ProjectStore::at(store_dir.path());
@@ -4840,6 +4964,49 @@ fn limits_row_drops_reset_times_then_names_as_the_terminal_narrows() {
     assert!(narrow_row.contains("✳ 66% · 95%"), "{narrow_row}");
     assert!(!narrow_row.contains("claude"), "{narrow_row}");
     assert!(!narrow_row.contains('✕'), "{narrow_row}");
+}
+
+/// A window whose reset time has passed holds a percentage for a period that
+/// is over — the row drops it instead of freezing yesterday's number, and says
+/// so when nothing current is left.
+#[test]
+fn limits_row_drops_windows_that_have_already_reset() {
+    use crate::core::limits::{LimitWindow, LimitsSnapshot, ProviderLimits, ProviderState};
+
+    let (_dir, mut app) = populated_app();
+    let now = chrono::Utc::now().timestamp();
+    let window = |label: &str, remaining: f64, resets_at: i64| LimitWindow {
+        label: label.to_string(),
+        remaining_percent: remaining,
+        resets_at: Some(resets_at),
+    };
+    app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
+        fetched_at: now,
+        providers: vec![
+            ProviderLimits {
+                provider: "claude".to_string(),
+                state: ProviderState::Ready,
+                windows: vec![
+                    window("5h", 1.0, now - 3_600),
+                    window("7d", 95.0, now + 6 * 86_400),
+                ],
+                observed_at: None,
+            },
+            ProviderLimits {
+                provider: "codex".to_string(),
+                state: ProviderState::Ready,
+                windows: vec![window("5h", 40.0, now - 60)],
+                observed_at: Some(now - 86_400),
+            },
+        ],
+    }));
+
+    let lines = rendered_lines(&mut app, 120, 28);
+    let row = &lines[lines.len() - 2];
+
+    assert!(row.contains("✳ claude 7d 95% ↻6d"), "{row}");
+    assert!(!row.contains("1%"), "{row}");
+    assert!(row.contains("✺ codex stale"), "{row}");
 }
 
 #[test]

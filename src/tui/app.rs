@@ -190,6 +190,8 @@ pub enum UiAction {
     ViewContext,
     OpenProjects,
     OpenProject,
+    /// Hand the selected project's work folder to the desktop file manager.
+    OpenProjectFolder,
     NewProject,
     OpenGlobalSettings,
     RenameProject,
@@ -1184,6 +1186,7 @@ impl App {
             KeyCode::Char('n') => self.dispatch(UiAction::NewProject)?,
             KeyCode::Char('r') => self.dispatch(UiAction::RenameProject)?,
             KeyCode::Char('p') => self.dispatch(UiAction::SetProjectPath)?,
+            KeyCode::Char('o') => self.dispatch(UiAction::OpenProjectFolder)?,
             KeyCode::Char('d') => self.dispatch(UiAction::DeleteProject)?,
             KeyCode::Char('s') => self.dispatch(UiAction::OpenGlobalSettings)?,
             KeyCode::Enter if self.selected_is_create_cwd() => {
@@ -1290,6 +1293,7 @@ impl App {
             UiAction::ViewContext => self.open_context_view()?,
             UiAction::OpenProjects => self.open_projects_list(),
             UiAction::OpenProject => self.open_selected_project(),
+            UiAction::OpenProjectFolder => self.open_selected_project_folder(),
             UiAction::NewProject => self.open_new_project_dialog(),
             UiAction::OpenGlobalSettings => self.open_global_settings_dialog(),
             UiAction::RenameProject => self.open_rename_project_dialog(),
@@ -2690,6 +2694,36 @@ impl App {
             return;
         };
         self.pending_switch = Some(LoopOutcome::OpenProject(row.project.clone()));
+    }
+
+    /// Show the selected project's work folder in the desktop file manager,
+    /// outside the TUI. The pinned create-row has no project behind it yet, so
+    /// it opens the folder it offers to register.
+    fn open_selected_project_folder(&mut self) {
+        let path = match self.visible_project_items().get(self.project_selected) {
+            Some(ProjectListItem::CreateCwd { path }) => path.clone(),
+            Some(ProjectListItem::Project(row)) => row.project.work_path.clone(),
+            None => {
+                self.status = "No project selected".to_string();
+                return;
+            }
+        };
+        // Read the override per press rather than caching it: the file is
+        // machine-wide and may be edited while the list is open.
+        let configured = self
+            .store
+            .as_ref()
+            .and_then(|store| store.load_global_config().ok())
+            .and_then(|config| config.file_manager());
+        match crate::core::opener::open_folder(&path, configured.as_deref()) {
+            Ok(()) => {
+                self.status = format!(
+                    "Opened {} in the file manager",
+                    projects::shorten_path(&path)
+                )
+            }
+            Err(err) => self.status = format!("Could not open the folder: {err}"),
+        }
     }
 
     fn open_new_project_dialog(&mut self) {

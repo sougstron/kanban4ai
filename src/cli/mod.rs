@@ -405,7 +405,7 @@ fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
         {
             snapshot
         }
-        _ => limits::refresh_blocking(),
+        _ => limits::refresh_blocking(refresh),
     };
     if output_format == "json" {
         let json = serde_json::to_string_pretty(snapshot.as_ref())
@@ -433,7 +433,14 @@ fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
             .filter(|age| *age >= 60)
             .map(|age| format!("  ({} old)", limits::format_span(age)))
             .unwrap_or_default();
-        for (index, window) in entry.windows.iter().enumerate() {
+        // A window that has already rolled over reports a period that is gone;
+        // say so rather than print the number it froze at.
+        let windows = entry.live_windows(now);
+        if windows.is_empty() {
+            println!("{provider:<8} stale{age}");
+            continue;
+        }
+        for (index, window) in windows.into_iter().enumerate() {
             let name = if index == 0 { provider } else { "" };
             let reset = window
                 .resets_in(now)

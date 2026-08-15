@@ -37,6 +37,18 @@ impl GlobalConfig {
             .unwrap_or(false)
     }
 
+    /// Command the Projects screen hands a work folder to. Unset (the usual
+    /// case) means the platform default chain in [`crate::core::opener`]; a
+    /// value here is for desktops where that picks the wrong application.
+    pub fn file_manager(&self) -> Option<String> {
+        self.tui
+            .get(Value::String("file_manager".to_string()))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(str::to_string)
+    }
+
     pub fn set_escape_to_projects(&mut self, enabled: bool) {
         self.tui.insert(
             Value::String("escape_to_projects".to_string()),

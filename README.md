@@ -190,8 +190,11 @@ cards show the `u recover` hint. In the archive view `Enter` opens an archived
 task and `u` restores it to To Do. The projects list is a table of the
 settings name, work folder, per-column counts, live agents, and last
 opened; `Enter` opens one, `n` adds, `d` unregisters (Space
-toggles deleting board data), and `s` opens Global Settings (for now the
-Esc-from-board preference), which apply to every board. `q`/`Esc` returns to
+toggles deleting board data), `o` opens the selected board's work folder in
+your desktop's file manager, and `s` opens Global Settings (the
+Esc-from-board preference and the file-manager override), which apply to every
+board. The row under the mouse is preselected with a faint background so you
+can see where a click will land. `q`/`Esc` returns to
 the board you came from.
 The status bar shows the shortcuts for the current screen and its hints are
 clickable.
@@ -207,7 +210,9 @@ straight from its local session files, so codex values carry the age of your
 last codex run). Clicking the codex or grok segment refreshes that provider on
 the spot through its own CLI — codex is asked live over its app-server RPC and
 the grok CLI renews its login token; the z.ai and synthetic segments reuse keys
-from opencode's credential store. `kanban4ai limits` prints the same data, and
+from opencode's credential store. A window whose reset time has passed is
+dropped rather than shown frozen, and a provider with nothing current left
+reads `stale`. `kanban4ai limits` prints the same data, and
 `tui.show_limits: false` hides the row.
 
 ### 5. Sessions, archives, projects, and data
