@@ -102,6 +102,55 @@ pub fn load_rows(store: &ProjectStore) -> crate::core::error::Result<Vec<Project
         .collect())
 }
 
+/// Order the rows for the projects list, mirroring the board's task sorting.
+///
+/// - `name`: alphabetical by the name the list displays (default)
+/// - `newest`: most recently created project first
+/// - `smart`: rows with unread work (unseen review or open questions) first,
+///   then rows with running agents, then newest first within every tier
+///
+/// The id is the stable tie-break, and the pinned create-cwd row stays above
+/// whatever this produces (the caller prepends it).
+pub fn sort_rows(rows: &mut [ProjectRow], mode: &str) {
+    use crate::core::global::{PROJECT_SORT_NEWEST, PROJECT_SORT_SMART};
+    match crate::core::global::normalize_project_sort(mode) {
+        PROJECT_SORT_NEWEST => rows.sort_by(|a, b| {
+            b.project
+                .created_at
+                .cmp(&a.project.created_at)
+                .then_with(|| a.project.id.cmp(&b.project.id))
+        }),
+        PROJECT_SORT_SMART => rows.sort_by(|a, b| {
+            smart_rank(a).cmp(&smart_rank(b)).then_with(|| {
+                b.project
+                    .created_at
+                    .cmp(&a.project.created_at)
+                    .then_with(|| a.project.id.cmp(&b.project.id))
+            })
+        }),
+        // `name`, and any unknown value, is the registry's own order
+        // (alphabetical by display name with the id as tie-break).
+        _ => rows.sort_by(|a, b| {
+            a.display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase())
+                .then_with(|| a.project.id.cmp(&b.project.id))
+        }),
+    }
+}
+
+/// Smart tier of a row: 0 unread, 1 running, 2 the rest. Lower sorts first.
+fn smart_rank(row: &ProjectRow) -> u8 {
+    let counts = row.counts;
+    if counts.review_unseen > 0 || counts.questions > 0 {
+        0
+    } else if counts.sessions > 0 {
+        1
+    } else {
+        2
+    }
+}
+
 pub fn cwd_create_path(store: &ProjectStore, cwd: &Path) -> Option<PathBuf> {
     match store.resolve_from_cwd(cwd) {
         Ok(None) => Some(cwd.to_path_buf()),

@@ -103,6 +103,7 @@ pub enum DialogField {
     Theme,
     TaskSort,
     EscapeToProjects,
+    ProjectSort,
     Confirm,
     Cancel,
     PurgeData,
@@ -129,7 +130,8 @@ const SETTINGS_FORM_FIELDS: [DialogField; 7] = [
     DialogField::TaskSort,
 ];
 
-const GLOBAL_SETTINGS_FORM_FIELDS: [DialogField; 1] = [DialogField::EscapeToProjects];
+const GLOBAL_SETTINGS_FORM_FIELDS: [DialogField; 2] =
+    [DialogField::EscapeToProjects, DialogField::ProjectSort];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalButton {
@@ -155,6 +157,7 @@ pub struct ModalState {
     pub task_sort: TextArea<'static>,
     pub interactive: bool,
     pub escape_to_projects: bool,
+    pub project_sort: TextArea<'static>,
     pub form_scroll: usize,
     pub error: Option<String>,
     pub discard_confirm: bool,
@@ -179,6 +182,8 @@ pub struct ModalState {
     pub theme_selected: usize,
     pub task_sort_options: Vec<SelectOption>,
     pub task_sort_selected: usize,
+    pub project_sort_options: Vec<SelectOption>,
+    pub project_sort_selected: usize,
     pub purge_data: bool,
 }
 
@@ -205,6 +210,7 @@ impl ModalState {
             task_sort: one_line("task_number"),
             interactive: false,
             escape_to_projects: false,
+            project_sort: one_line("name"),
             form_scroll: 0,
             error: None,
             discard_confirm: false,
@@ -229,6 +235,8 @@ impl ModalState {
             theme_selected: 0,
             task_sort_options: Vec::new(),
             task_sort_selected: 0,
+            project_sort_options: Vec::new(),
+            project_sort_selected: 0,
             purge_data: false,
         }
     }
@@ -296,6 +304,7 @@ impl ModalState {
             ],
             Modal::GlobalSettings => &[
                 DialogField::EscapeToProjects,
+                DialogField::ProjectSort,
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
@@ -404,6 +413,7 @@ impl ModalState {
             DialogField::Variant => Some(SelectorKind::Variant),
             DialogField::Theme => Some(SelectorKind::Theme),
             DialogField::TaskSort => Some(SelectorKind::TaskSort),
+            DialogField::ProjectSort => Some(SelectorKind::ProjectSort),
             _ => None,
         };
         if let Some(kind) = kind {
@@ -444,6 +454,7 @@ impl ModalState {
                 }
                 _ => {}
             },
+            DialogField::ProjectSort => self.input_select(key, SelectorKind::ProjectSort),
             DialogField::PurgeData => match key.code {
                 ratatui::crossterm::event::KeyCode::Char(' ')
                 | ratatui::crossterm::event::KeyCode::Enter => self.purge_data = !self.purge_data,
@@ -501,6 +512,7 @@ impl ModalState {
             DialogField::Agent => &mut self.agent,
             DialogField::ChainTo => &mut self.chain_to,
             DialogField::Interactive | DialogField::EscapeToProjects => &mut self.answer,
+            DialogField::ProjectSort => &mut self.project_sort,
             DialogField::TargetStatus => &mut self.target_status,
             DialogField::MessageKind => &mut self.description,
             DialogField::Question | DialogField::Variant => &mut self.answer,
@@ -561,6 +573,15 @@ impl ModalState {
         self.apply_selection(SelectorKind::TaskSort);
     }
 
+    pub fn set_project_sort_options(&mut self, options: Vec<SelectOption>) {
+        self.project_sort_options = options;
+        self.project_sort_selected = select_matching(
+            &self.project_sort_options,
+            self.project_sort_text().as_deref(),
+        );
+        self.apply_selection(SelectorKind::ProjectSort);
+    }
+
     pub fn title_text(&self) -> String {
         textarea_text(&self.title)
     }
@@ -599,6 +620,10 @@ impl ModalState {
 
     pub fn task_sort_text(&self) -> Option<String> {
         non_empty(textarea_text(&self.task_sort))
+    }
+
+    pub fn project_sort_text(&self) -> Option<String> {
+        non_empty(textarea_text(&self.project_sort))
     }
 
     pub fn answer_text(&self) -> String {
@@ -665,6 +690,7 @@ impl ModalState {
             SelectorKind::Variant => self.current_variants().len() + 1,
             SelectorKind::Theme => self.theme_options.len(),
             SelectorKind::TaskSort => self.task_sort_options.len(),
+            SelectorKind::ProjectSort => self.project_sort_options.len(),
         }
     }
 
@@ -681,6 +707,7 @@ impl ModalState {
             SelectorKind::Variant => self.variant_selected.get_or_insert(0),
             SelectorKind::Theme => &mut self.theme_selected,
             SelectorKind::TaskSort => &mut self.task_sort_selected,
+            SelectorKind::ProjectSort => &mut self.project_sort_selected,
         }
     }
 
@@ -697,6 +724,7 @@ impl ModalState {
             SelectorKind::Variant => self.variant_selected.unwrap_or(0),
             SelectorKind::Theme => self.theme_selected,
             SelectorKind::TaskSort => self.task_sort_selected,
+            SelectorKind::ProjectSort => self.project_sort_selected,
         }
     }
 
@@ -746,6 +774,10 @@ impl ModalState {
             SelectorKind::TaskSort => {
                 let text = selected_value(&self.task_sort_options, self.task_sort_selected);
                 self.task_sort = one_line(text.as_deref().unwrap_or("task_number"));
+            }
+            SelectorKind::ProjectSort => {
+                let text = selected_value(&self.project_sort_options, self.project_sort_selected);
+                self.project_sort = one_line(text.as_deref().unwrap_or("name"));
             }
         }
     }
@@ -809,6 +841,8 @@ impl ModalState {
             raw_textarea_text(&self.task_sort),
             self.task_sort_selected.to_string(),
             self.escape_to_projects.to_string(),
+            raw_textarea_text(&self.project_sort),
+            self.project_sort_selected.to_string(),
             self.purge_data.to_string(),
         ]
         .join("\u{1f}")
@@ -828,6 +862,7 @@ enum SelectorKind {
     Variant,
     Theme,
     TaskSort,
+    ProjectSort,
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Rect) -> Vec<Hitbox> {
@@ -1198,6 +1233,7 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         DialogField::Agent => modal.agent_options.len(),
         DialogField::Theme => modal.theme_options.len(),
         DialogField::TaskSort => modal.task_sort_options.len(),
+        DialogField::ProjectSort => modal.project_sort_options.len(),
         DialogField::ChainTo => modal.chain_options.len(),
         _ => return task_field_min_height(field),
     };
@@ -1500,6 +1536,15 @@ fn render_selector_field(
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
+        DialogField::ProjectSort => render_select(
+            frame,
+            app,
+            "Project sorting",
+            &modal.project_sort_options,
+            modal.project_sort_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
         _ => {}
     }
 }
@@ -1517,6 +1562,10 @@ fn register_task_options(
         DialogField::Agent => (modal.agent_options.len(), modal.agent_selected),
         DialogField::Theme => (modal.theme_options.len(), modal.theme_selected),
         DialogField::TaskSort => (modal.task_sort_options.len(), modal.task_sort_selected),
+        DialogField::ProjectSort => (
+            modal.project_sort_options.len(),
+            modal.project_sort_selected,
+        ),
         DialogField::ChainTo => (modal.chain_options.len(), modal.chain_selected),
         _ => (0, 0),
     };
@@ -1581,6 +1630,7 @@ fn select_field_from_title(title: &str) -> Option<DialogField> {
         "Chain to" => Some(DialogField::ChainTo),
         "Theme" => Some(DialogField::Theme),
         "Task sorting" => Some(DialogField::TaskSort),
+        "Project sorting" => Some(DialogField::ProjectSort),
         _ => None,
     }
 }

@@ -10,11 +10,11 @@
 //! The row degrades with width: reset times drop first, then window labels and
 //! provider names, then whole providers from the right.
 //!
-//! The codex and grok segments are clickable: a click refreshes that provider
-//! through its own CLI (fresh codex numbers via the app-server RPC, a renewed
-//! grok token via the grok CLI — see [`crate::core::limits::refresh_provider_async`]).
-//! Claude, zai, and synthetic have no CLI-side refresh to offer, so their
-//! segments are display-only.
+//! The claude, codex, and grok segments are clickable: a click refreshes that
+//! provider (claude force-polls the usage endpoint; codex via the app-server
+//! RPC; grok renews its token via the grok CLI — see
+//! [`crate::core::limits::refresh_provider_async`]). zai and synthetic stay
+//! display-only: their keys are long-lived and the background poll is enough.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -30,9 +30,9 @@ use super::app::{App, HitAction, Hitbox, Screen, UiAction};
 /// Between two providers; matches the status bar's divider.
 const SEPARATOR: &str = "  │  ";
 
-/// Providers whose segment of the row refreshes on click; claude has no
-/// CLI-side refresh, so its segment stays display-only.
-const CLICKABLE: [&str; 2] = ["codex", "grok"];
+/// Providers whose segment of the row refreshes on click. zai and synthetic
+/// stay display-only: their keys never expire and the background poll is enough.
+const CLICKABLE: [&str; 3] = ["claude", "codex", "grok"];
 
 /// How much of each provider is spelled out. Tried in order until the row fits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

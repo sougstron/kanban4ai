@@ -49,11 +49,13 @@
 //! before the next background poll, capped at 64×.
 //!
 //! Clicking a provider segment in the TUI limits row can also refresh that
-//! provider through its own CLI (see [`refresh_provider_async`]): codex is
-//! asked for fresh rate limits over its app-server JSON-RPC, and running the
-//! grok CLI renews the short-lived token in `~/.grok/auth.json` that the
-//! billing fetch uses. Both run on a background thread and merge into the
-//! same cache, so the row updates on the next tick.
+//! provider (see [`refresh_provider_async`]): claude force-polls the usage
+//! endpoint (skipping the current-bridge short-circuit and the 15-minute
+//! interval the background refresh honors), codex is asked for fresh rate
+//! limits over its app-server JSON-RPC, and running the grok CLI renews the
+//! short-lived token in `~/.grok/auth.json` that the billing fetch uses. Each
+//! runs on a background thread and merges into the same cache, so the row
+//! updates on the next tick.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -600,18 +602,22 @@ fn claude_usage_poll_due(now: i64) -> bool {
 
 /// Claude's windows from the bridge, the usage endpoint, or both.
 ///
-/// `force` is a user asking for the numbers now (`kanban limits --refresh`),
-/// which skips the poll interval; the background refresh never does.
+/// `force` is a user asking for the numbers now (`kanban limits --refresh`,
+/// or a tap on the claude segment): it skips both the current-bridge
+/// short-circuit and the poll interval. The background refresh never does.
 fn resolve_claude(previous: Option<&LimitsSnapshot>, force: bool) -> ProviderLimits {
     let previous_entry = previous.and_then(|snapshot| snapshot.get("claude"));
     let now = now_secs();
     let bridge = read_claude_bridge();
-    // A bridge that still covers every window answers on its own: the usage
-    // endpoint's budget is a handful of requests per token, so polling it while
-    // a free and current source exists is what kept this row 429ing.
-    if let Some(bridge) = bridge
-        .clone()
-        .filter(|bridge| claude_bridge_current(bridge, now))
+    // A bridge that still covers every window answers on its own — except
+    // when the user asked for a refresh. "Current" only means no window has
+    // reset yet, so a tap hours after the last Claude Code turn would
+    // otherwise replay the same stale file. Background polls never force:
+    // the usage endpoint's budget is a handful of requests per token.
+    if !force
+        && let Some(bridge) = bridge
+            .clone()
+            .filter(|bridge| claude_bridge_current(bridge, now))
     {
         CLAUDE_429_STREAK.store(0, Ordering::SeqCst);
         // Still merged with what is cached: a statusline payload that carried

@@ -188,7 +188,7 @@ fn render_meta(
         )),
         Line::from(format!(
             "Backend: {} │ Model: {} │ Effort: {} │ Agent: {} │ Chain: {}",
-            sanitize_terminal_text(task.agent_backend.as_deref().unwrap_or("-")),
+            sanitize_terminal_text(task.agent_backend.as_deref().unwrap_or("default")),
             sanitize_terminal_text(task.ai_model.as_deref().unwrap_or("-")),
             sanitize_terminal_text(task.ai_effort.as_deref().unwrap_or("-")),
             sanitize_terminal_text(task.agent_name.as_deref().unwrap_or("-")),

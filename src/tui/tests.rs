@@ -572,6 +572,9 @@ fn task_form_move_and_answer_selectors_follow_keyboard_contract() {
     app.handle_key(key(KeyCode::Char('n'))).expect("new");
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.active_field(), DialogField::Title);
+    assert_eq!(modal.backend_options[0].value, None);
+    assert_eq!(modal.backend_options[0].label, "Default backend (opencode)");
+    assert_eq!(modal.backend_text(), None);
     assert!(
         modal
             .backend_options
@@ -587,6 +590,10 @@ fn task_form_move_and_answer_selectors_follow_keyboard_contract() {
     app.handle_key(key(KeyCode::Tab)).expect("description");
     app.handle_key(key(KeyCode::Tab)).expect("backend");
     app.handle_key(key(KeyCode::Down)).expect("select backend");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.active_field(), DialogField::Backend);
+    assert_eq!(modal.backend_text().as_deref(), Some("opencode"));
+    app.handle_key(key(KeyCode::Down)).expect("select claude");
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.active_field(), DialogField::Backend);
     assert_eq!(modal.backend_text().as_deref(), Some("claude"));
@@ -652,6 +659,70 @@ fn task_form_move_and_answer_selectors_follow_keyboard_contract() {
     app.handle_key(key(KeyCode::Down)).expect("first variant");
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.answer_text(), "Fast path");
+}
+#[test]
+fn task_form_default_backend_inherits_settings_agent() {
+    let (_dir, mut app) = populated_app();
+
+    // Create a task without touching the backend selector: the task must
+    // stay unset so the launch path resolves auto_launch.default_agent.
+    app.handle_key(key(KeyCode::Char('n'))).expect("new");
+    let modal = app.modal.as_mut().expect("modal");
+    modal.title.insert_str("Follows settings");
+    modal.field_index = modal.fields().len() - 2;
+    app.handle_key(key(KeyCode::Enter)).expect("save task");
+    let created_id = app.board.columns[0]
+        .tasks
+        .iter()
+        .find(|task| task.title == "Follows settings")
+        .map(|task| task.id.clone())
+        .expect("created task");
+    let task = app
+        .ops
+        .get_task(&created_id)
+        .expect("load task")
+        .expect("task present");
+    assert_eq!(task.agent_backend, None);
+
+    // Editing an unset task keeps Default selected and saving keeps it unset.
+    app.focused_column = 0;
+    app.focused_card = app.board.columns[0]
+        .tasks
+        .iter()
+        .position(|task| task.id == created_id)
+        .expect("created task index");
+    app.handle_key(key(KeyCode::Char('e'))).expect("edit");
+    let modal = app.modal.as_ref().expect("edit modal");
+    assert_eq!(modal.backend_options[0].value, None);
+    assert_eq!(modal.backend_text(), None);
+    let modal = app.modal.as_mut().expect("edit modal");
+    modal.field_index = modal.fields().len() - 2;
+    app.handle_key(key(KeyCode::Enter)).expect("save edit");
+    let task = app
+        .ops
+        .get_task(&created_id)
+        .expect("reload")
+        .expect("task");
+    assert_eq!(task.agent_backend, None);
+
+    // A task with a pinned backend can be switched back to Default, which
+    // clears the pin instead of pinning the current default agent.
+    app.focused_column = 2;
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Char('e')))
+        .expect("edit claude task");
+    let modal = app.modal.as_ref().expect("edit modal");
+    assert_eq!(modal.backend_text().as_deref(), Some("claude"));
+    app.handle_key(key(KeyCode::Tab)).expect("description");
+    app.handle_key(key(KeyCode::Tab)).expect("backend");
+    app.handle_key(key(KeyCode::Up)).expect("to opencode");
+    app.handle_key(key(KeyCode::Up)).expect("to default");
+    assert_eq!(app.modal.as_ref().expect("modal").backend_text(), None);
+    let modal = app.modal.as_mut().expect("edit modal");
+    modal.field_index = modal.fields().len() - 2;
+    app.handle_key(key(KeyCode::Enter)).expect("save edit");
+    let task = app.ops.get_task("TASK-002").expect("reload").expect("task");
+    assert_eq!(task.agent_backend, None);
 }
 
 #[test]
@@ -3815,7 +3886,7 @@ fn phase_four_modal_mouse_routes_fields_options_and_add_message_buttons() {
     .unwrap();
     assert_eq!(
         app.modal.as_ref().unwrap().backend_text().as_deref(),
-        Some("claude")
+        Some("opencode")
     );
     assert_eq!((app.focused_column, app.focused_card), original_focus);
     app.handle_key(key(KeyCode::Esc)).unwrap();
@@ -4115,6 +4186,50 @@ fn write_task_file(root: &std::path::Path, status: &str, id: &str) {
     .expect("task file");
 }
 
+/// Like [`write_task_file`] but with extra frontmatter lines, so a task can
+/// carry `review_unseen: true` or `has_questions: true` for the projects-list
+/// flags scan.
+fn write_task_file_with_flags(root: &std::path::Path, status: &str, id: &str, extra: &str) {
+    let dir = root.join(".kanban/tasks").join(status);
+    std::fs::create_dir_all(&dir).expect("task status dir");
+    std::fs::write(
+        dir.join(format!("{id}.md")),
+        format!("---\nid: {id}\ntitle: {id}\nstatus: {status}\n{extra}---\n"),
+    )
+    .expect("task file");
+}
+
+/// Stamp a project's `created_at` so list ordering by age is deterministic.
+fn set_project_created_at(data_root: &std::path::Path, stamp: &str) {
+    let file = data_root.join("project.yaml");
+    let raw = std::fs::read_to_string(&file).expect("project.yaml");
+    let updated = raw
+        .lines()
+        .map(|line| {
+            if line.starts_with("created_at:") {
+                format!("created_at: '{stamp}'")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&file, format!("{updated}\n")).expect("rewrite project.yaml");
+}
+
+/// A live session file, so the row's Agents count (`▶N`) is nonzero.
+fn write_active_session(data_root: &std::path::Path, id: &str) {
+    let dir = data_root.join(".kanban/sessions");
+    std::fs::create_dir_all(&dir).expect("sessions dir");
+    std::fs::write(
+        dir.join(format!("{id}.yaml")),
+        format!(
+            "id: {id}\ntask_id: TASK-001\nstarted_at: '2026-08-17T10:00:00'\nstatus: active\nlast_seen: '2026-08-17T10:00:00'\n"
+        ),
+    )
+    .expect("session file");
+}
+
 fn projects_app(
     work: &std::path::Path,
     create_cwd: Option<std::path::PathBuf>,
@@ -4126,6 +4241,17 @@ fn projects_app(
     write_task_file(&added.project.data_root, "todo", "TASK-001");
     write_task_file(&added.project.data_root, "in_progress", "TASK-002");
     let app = App::projects_at(store, None, create_cwd).expect("projects app");
+    (store_dir, app)
+}
+
+/// A projects screen opened from a board (via `P`), so a return project
+/// lies behind the list.
+fn projects_app_with_return(work: &std::path::Path) -> (tempfile::TempDir, App) {
+    let store_dir = tempfile::tempdir().expect("store");
+    std::fs::create_dir_all(work).expect("work dir");
+    let store = ProjectStore::at(store_dir.path());
+    let added = store.add(work, Some("Demo Board")).expect("add project");
+    let app = App::projects_at(store, Some(added.project.clone()), None).expect("projects app");
     (store_dir, app)
 }
 
@@ -4707,6 +4833,38 @@ fn projects_enter_opens_the_selected_project() {
 }
 
 #[test]
+fn projects_q_quits_even_when_a_board_lies_behind_the_list() {
+    let work = tempfile::tempdir().expect("work");
+    let (_store, mut app) = projects_app_with_return(work.path());
+    app.handle_key(key(KeyCode::Char('q'))).expect("q");
+    assert!(app.should_quit, "q must quit the TUI, not reopen the board");
+    assert!(matches!(app.take_loop_outcome(), Some(LoopOutcome::Quit)));
+}
+
+#[test]
+fn projects_escape_returns_to_the_board_behind_the_list() {
+    let work = tempfile::tempdir().expect("work");
+    let (_store, mut app) = projects_app_with_return(work.path());
+    app.handle_key(key(KeyCode::Esc)).expect("Esc");
+    assert!(!app.should_quit);
+    match app.take_loop_outcome() {
+        Some(LoopOutcome::OpenProject(project)) => {
+            assert_eq!(project.name, "Demo Board");
+        }
+        other => panic!("expected OpenProject, got {other:?}"),
+    }
+}
+
+#[test]
+fn projects_q_quits_when_the_list_is_the_entry_screen() {
+    let work = tempfile::tempdir().expect("work");
+    let (_store, mut app) = projects_app(work.path(), None);
+    app.handle_key(key(KeyCode::Char('q'))).expect("q");
+    assert!(app.should_quit);
+    assert!(matches!(app.take_loop_outcome(), Some(LoopOutcome::Quit)));
+}
+
+#[test]
 fn board_uppercase_p_switches_to_the_projects_list() {
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('P'))).expect("P");
@@ -4801,6 +4959,7 @@ fn projects_screen_global_settings_toggle_persists_to_the_store() {
         "{rendered}"
     );
     assert!(rendered.contains("☑"), "{rendered}");
+    app.handle_key(key(KeyCode::Tab)).expect("focus sort");
     app.handle_key(key(KeyCode::Tab)).expect("save");
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
 
@@ -4833,6 +4992,208 @@ fn projects_screen_reflects_the_saved_global_escape_setting() {
 
     let app = App::projects_at(store, None, None).expect("projects app");
     assert!(app.settings.escape_to_projects);
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// Registry names of the visible project rows, in list order.
+fn visible_project_names(app: &App) -> Vec<String> {
+    app.visible_project_items()
+        .iter()
+        .filter_map(|item| match item {
+            super::projects::ProjectListItem::Project(row) => Some(row.project.name.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Alpha (oldest, quiet), Beta (newest, one running agent), Gamma (middle
+/// age, one unseen Review task): the three orderings each pick a different
+/// winner.
+fn sorted_projects_store() -> (tempfile::TempDir, ProjectStore) {
+    let store_dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(store_dir.path());
+    let alpha_work = tempfile::tempdir().expect("alpha work");
+    let beta_work = tempfile::tempdir().expect("beta work");
+    let gamma_work = tempfile::tempdir().expect("gamma work");
+    let alpha = store
+        .add(alpha_work.path(), Some("Alpha"))
+        .expect("add alpha");
+    let beta = store.add(beta_work.path(), Some("Beta")).expect("add beta");
+    let gamma = store
+        .add(gamma_work.path(), Some("Gamma"))
+        .expect("add gamma");
+    set_project_created_at(&alpha.project.data_root, "2026-01-01T10:00:00");
+    set_project_created_at(&beta.project.data_root, "2026-03-01T10:00:00");
+    set_project_created_at(&gamma.project.data_root, "2026-02-01T10:00:00");
+    write_active_session(&beta.project.data_root, "ses-pi-sort-live");
+    write_task_file_with_flags(
+        &gamma.project.data_root,
+        "review",
+        "TASK-001",
+        "review_unseen: true\n",
+    );
+    (store_dir, store)
+}
+
+#[test]
+fn projects_screen_orders_rows_by_the_sort_setting() {
+    let (_store_dir, store) = sorted_projects_store();
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+
+    // Default: alphabetical.
+    assert_eq!(app.settings.project_sort, "name");
+    assert_eq!(visible_project_names(&app), ["Alpha", "Beta", "Gamma"]);
+
+    // Newest first: Beta (Mar) before Gamma (Feb) before Alpha (Jan).
+    app.settings.project_sort = "newest".to_string();
+    assert_eq!(visible_project_names(&app), ["Beta", "Gamma", "Alpha"]);
+
+    // Smart: unread Gamma first, running Beta second, quiet Alpha last.
+    app.settings.project_sort = "smart".to_string();
+    assert_eq!(visible_project_names(&app), ["Gamma", "Beta", "Alpha"]);
+
+    // Unknown values fall back to the default order.
+    app.settings.project_sort = "bogus".to_string();
+    assert_eq!(visible_project_names(&app), ["Alpha", "Beta", "Gamma"]);
+}
+
+#[test]
+fn projects_screen_sort_applies_to_the_filtered_list() {
+    let store_dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(store_dir.path());
+    let apple_work = tempfile::tempdir().expect("apple work");
+    let birch_work = tempfile::tempdir().expect("birch work");
+    let cedar_work = tempfile::tempdir().expect("cedar work");
+    let apple = store
+        .add(apple_work.path(), Some("AppleQXK"))
+        .expect("add apple");
+    let birch = store
+        .add(birch_work.path(), Some("BirchQXK"))
+        .expect("add birch");
+    let cedar = store
+        .add(cedar_work.path(), Some("Cedar"))
+        .expect("add cedar");
+    set_project_created_at(&apple.project.data_root, "2026-01-01T10:00:00");
+    set_project_created_at(&birch.project.data_root, "2026-03-01T10:00:00");
+    set_project_created_at(&cedar.project.data_root, "2026-02-01T10:00:00");
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    app.settings.project_sort = "newest".to_string();
+    // Distinctive token so a tempfile path cannot accidentally match.
+    app.search.query.insert_str("QXK");
+    assert_eq!(visible_project_names(&app), ["BirchQXK", "AppleQXK"]);
+    let _ = (store_dir, apple_work, birch_work, cedar_work);
+}
+
+#[test]
+fn projects_screen_sort_keeps_create_cwd_pinned() {
+    let (_store_dir, store) = sorted_projects_store();
+    let cwd = tempfile::tempdir().expect("cwd");
+    let mut app =
+        App::projects_at(store, None, Some(cwd.path().to_path_buf())).expect("projects app");
+    app.settings.project_sort = "newest".to_string();
+    let items = app.visible_project_items();
+    assert!(
+        matches!(
+            items.first(),
+            Some(super::projects::ProjectListItem::CreateCwd { .. })
+        ),
+        "create-cwd stays above the sorted rows: {items:?}"
+    );
+    assert_eq!(visible_project_names(&app), ["Beta", "Gamma", "Alpha"]);
+}
+
+#[test]
+fn projects_screen_smart_sort_prefers_unread_over_running() {
+    let (_store_dir, store) = sorted_projects_store();
+    // Beta (running, newest) also gets unseen review work: unread still wins.
+    let beta_row = store
+        .list()
+        .expect("list")
+        .into_iter()
+        .find(|p| p.name == "Beta")
+        .expect("beta");
+    write_task_file_with_flags(
+        &beta_row.data_root,
+        "review",
+        "TASK-009",
+        "review_unseen: true\n",
+    );
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    app.settings.project_sort = "smart".to_string();
+    // Both unread; the tie-break is newest first, so Beta outranks Gamma.
+    assert_eq!(visible_project_names(&app), ["Beta", "Gamma", "Alpha"]);
+}
+
+#[test]
+fn projects_screen_smart_sort_counts_open_questions_as_unread() {
+    let (_store_dir, store) = sorted_projects_store();
+    let alpha_row = store
+        .list()
+        .expect("list")
+        .into_iter()
+        .find(|p| p.name == "Alpha")
+        .expect("alpha");
+    write_task_file_with_flags(
+        &alpha_row.data_root,
+        "todo",
+        "TASK-007",
+        "has_questions: true\n",
+    );
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    app.settings.project_sort = "smart".to_string();
+    // Alpha (questions) and Gamma (unseen review) share the unread tier;
+    // newest unread wins, and both still outrank running Beta.
+    assert_eq!(visible_project_names(&app), ["Gamma", "Alpha", "Beta"]);
+}
+
+#[test]
+fn projects_screen_reflects_the_saved_global_project_sort() {
+    let (_store_dir, store) = sorted_projects_store();
+    store
+        .save_global_config(&{
+            let mut config = crate::core::global::GlobalConfig::default();
+            config.set_project_sort("newest");
+            config
+        })
+        .expect("seed global config");
+    let app = App::projects_at(store, None, None).expect("projects app");
+    assert_eq!(app.settings.project_sort, "newest");
+    assert_eq!(visible_project_names(&app), ["Beta", "Gamma", "Alpha"]);
+}
+
+#[test]
+fn projects_screen_global_settings_project_sort_persists_to_the_store() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-glob-sort");
+    let _ = std::fs::remove_dir_all(&work);
+    let (store_dir, mut app) = projects_app(&work, None);
+    assert_eq!(app.settings.project_sort, "name");
+
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open global settings");
+    let modal = app.modal.as_ref().expect("global settings modal");
+    assert_eq!(modal.active_field(), DialogField::EscapeToProjects);
+    assert!(modal.fields().contains(&DialogField::ProjectSort));
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("Project sorting"), "{rendered}");
+    assert!(rendered.contains("By name"), "{rendered}");
+
+    // Tab onto the selector, then pick the third option (Smart).
+    app.handle_key(key(KeyCode::Tab)).expect("focus sort");
+    app.handle_key(key(KeyCode::Down)).expect("newest");
+    app.handle_key(key(KeyCode::Down)).expect("smart");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").project_sort_text(),
+        Some("smart".to_string())
+    );
+    app.handle_key(key(KeyCode::Tab)).expect("save");
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+
+    assert!(app.modal.is_none());
+    assert_eq!(app.settings.project_sort, "smart");
+    assert_eq!(app.status, "Global settings saved");
+    let store = ProjectStore::at(store_dir.path());
+    assert_eq!(store.load_global_config().unwrap().project_sort(), "smart");
 
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -5049,7 +5410,7 @@ fn limits_row_renders_on_the_projects_screen() {
 }
 
 #[test]
-fn limits_row_registers_refresh_hitboxes_on_codex_and_grok_only() {
+fn limits_row_registers_refresh_hitboxes_on_claude_codex_and_grok() {
     let (_dir, mut app) = populated_app();
     app.limits = Some(limits_fixture());
 
@@ -5064,11 +5425,12 @@ fn limits_row_registers_refresh_hitboxes_on_codex_and_grok_only() {
                 && hitbox.action == HitAction::Action(UiAction::RefreshLimits(provider))
         })
     };
+    let claude_hit = refresh_hit("claude").expect("claude hitbox");
     let codex_hit = refresh_hit("codex").expect("codex hitbox");
     let grok_hit = refresh_hit("grok").expect("grok hitbox");
     assert!(
-        refresh_hit("claude").is_none(),
-        "claude's segment stays display-only"
+        refresh_hit("zai").is_none() && refresh_hit("synthetic").is_none(),
+        "zai and synthetic stay display-only"
     );
 
     // Each hitbox covers its provider's own text on the rendered row.
@@ -5077,8 +5439,25 @@ fn limits_row_registers_refresh_hitboxes_on_codex_and_grok_only() {
         let column = unicode_width::UnicodeWidthStr::width(&row_text[..byte]) as u16;
         hitbox.area.x <= column && column < hitbox.area.x + hitbox.area.width
     };
+    assert!(covers(claude_hit, "claude"), "{claude_hit:?} vs {row_text}");
     assert!(covers(codex_hit, "codex"), "{codex_hit:?} vs {row_text}");
     assert!(covers(grok_hit, "grok"), "{grok_hit:?} vs {row_text}");
+}
+
+fn click_limits_segment(app: &mut App, provider: &'static str) {
+    let hit = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::RefreshLimits(provider)))
+        .copied()
+        .unwrap_or_else(|| panic!("{provider} hitbox"));
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: hit.area.x,
+        row: hit.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("click");
 }
 
 #[test]
@@ -5087,22 +5466,25 @@ fn clicking_codex_limits_segment_reports_a_refresh_in_the_status() {
     app.limits = Some(limits_fixture());
     let _ = render_at(&mut app, 120, 28);
 
-    let hit = app
-        .hitboxes
-        .iter()
-        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::RefreshLimits("codex")))
-        .copied()
-        .expect("codex hitbox");
-    app.handle_mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: hit.area.x,
-        row: hit.area.y,
-        modifiers: KeyModifiers::NONE,
-    })
-    .expect("click");
+    click_limits_segment(&mut app, "codex");
 
     assert!(
         app.status.contains("Refreshing codex limits"),
+        "{}",
+        app.status
+    );
+}
+
+#[test]
+fn clicking_claude_limits_segment_reports_a_refresh_in_the_status() {
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(limits_fixture());
+    let _ = render_at(&mut app, 120, 28);
+
+    click_limits_segment(&mut app, "claude");
+
+    assert!(
+        app.status.contains("Refreshing claude limits"),
         "{}",
         app.status
     );

@@ -257,6 +257,11 @@ they are edited: press `s` on the Projects screen. Saved under the store
   active search filter) opens the projects list. Moved out of the per-project
   `tui.escape_to_projects` (TASK-178): the stale per-project key is now
   ignored, so boards that had it enabled need the toggle re-enabled globally.
+- `tui.project_sort`: `name` (default, alphabetical by the name the list
+  displays), `newest` (most recently created first), or `smart` (unread work
+  first — unseen Review or open questions — then rows with running agents,
+  then newest). Unknown values read as `name`. Edited from Global Settings
+  (`s` on the Projects screen).
 - `tui.file_manager`: unset - command the Projects screen's `o folder` button
   hands the work folder to (the folder is appended as the last argument;
   the value is split like a shell word list, e.g. `nautilus --new-window`).
@@ -344,7 +349,8 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `Ctrl+t`: Quick theme toggle (persisted to config)
 - `/`: Search
 - `?`: Help overlay (scrollable, sized to its content; lists mouse gestures)
-- `q`: Back from detail/secondary screens; quit the TUI with `Ctrl+C` twice
+- `q`: Back from detail/secondary screens — on the Projects screen `q` quits
+  the TUI; quit the TUI with `Ctrl+C` twice
 
 Clipboard pastes use bracketed paste: the whole block is inserted into the
 focused text field in one edit (flattened to a single line for one-line fields
@@ -394,8 +400,9 @@ opener is spawned detached with its streams closed so it cannot write over the
 frame, and a folder that no longer exists is reported in the status bar instead
 of being launched. `s` opens the Global Settings dialog, `d` opens the remove
 dialog (unregister by default; Space toggles
-“also delete board data”), `/` filters. `q`/`Esc` returns to the board this
-list was opened from, or quits when the list is the entry screen.
+“also delete board data”), `/` filters. `q` quits the TUI outright; `Esc`
+returns to the board this list was opened from, or quits when the list is the
+entry screen.
 
 The status bar is contextual per screen (Board, Detail, Sessions, Archive,
 Projects, log view) and its hotkey segments are clickable; when the terminal is
@@ -425,7 +432,11 @@ straight to the answer panel. Interactive tasks whose agent is blocked on
 editable only while the task is in Review (read-only or hidden otherwise), and
 saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
 `Ctrl+R` / action-bar button. Create/edit dialogs expose an `interactive`
-checkbox and a "Chain to task" selector.
+checkbox and a "Chain to task" selector. The backend selector leads with
+"Default backend", which leaves the task's `agent_backend` unset so launches
+follow `auto_launch.default_agent` from settings; the label shows the agent it
+resolves to, and the detail view shows `default` while no launch has pinned a
+concrete backend.
 
 ### Integration Model
 Agents call kanban via shell commands. NOT a plugin. An agent must:
@@ -550,7 +561,9 @@ Sources, all read-only and best effort:
   requests per access token and then answers 429 for hours, so it is polled at
   most once every 15 minutes (`CLAUDE_USAGE_MIN_INTERVAL_SECS`, remembered in
   `<store>/claude-usage-poll` so a run of CLI processes shares one interval);
-  `kanban limits --refresh` is a user asking now and skips the interval. The
+  `kanban limits --refresh` and a tap on the claude segment are a user asking
+  now: both skip the interval *and* the current-bridge short-circuit, so a
+  tap hours after the last Claude Code turn still hits the endpoint. The
   two sources are then merged window by window: for each label the fresher
   observation wins, except that a window which has already reset never
   displaces one that is still running, and `observed_at` becomes the oldest
@@ -615,23 +628,22 @@ yesterday's number. The renderer only ever draws
 degrades with width: reset times drop first, then window labels and provider
 names, then whole providers from the right.
 
-**Click refresh**: the codex and grok segments of the row are hitboxes
-(`UiAction::RefreshLimits`); a click refreshes that provider through its own
-CLI on a background thread (`refresh_provider_async`, guarded against
-overlapping runs) and merges the result into the same caches, so the row
-updates on the next tick. codex is queried live over the app-server JSON-RPC
-(`initialize` + `account/rateLimits/read`, camelCase payload, answers in ~1s,
-spends no usage, and falls back to the rollout files on any failure), and
-running `grok models` renews the short-lived OIDC token in `~/.grok/auth.json`
-before the billing fetch — that fixes both "codex numbers only as fresh as the
-last run" and "grok reads signed out after ~6h" without a periodic poller.
-Both CLIs run in the scratch cwd `<store>/limits-refresh-cwd` so stray session
-state never lands in a project. The claude, zai, and synthetic segments are
-display-only: claude's numbers arrive from the statusline bridge while its
-sessions run and from the usage endpoint on its own interval in between, the
-zai and synthetic keys are long-lived (the background poll keeps them fresh),
-and there is no CLI that can refresh claude's numbers the
-way codex/grok can. A 429 from the
+**Click refresh**: the claude, codex, and grok segments of the row are hitboxes
+(`UiAction::RefreshLimits`); a click refreshes that provider on a background
+thread (`refresh_provider_async`, guarded against overlapping runs) and merges
+the result into the same caches, so the row updates on the next tick. A click
+on claude force-polls `GET /api/oauth/usage` (skipping the 15-minute interval
+and the current-bridge short-circuit the background refresh honors) and merges
+the result with whatever the statusline bridge still holds. codex is queried
+live over the app-server JSON-RPC (`initialize` + `account/rateLimits/read`,
+camelCase payload, answers in ~1s, spends no usage, and falls back to the
+rollout files on any failure), and running `grok models` renews the short-lived
+OIDC token in `~/.grok/auth.json` before the billing fetch — that fixes both
+"codex numbers only as fresh as the last run" and "grok reads signed out after
+~6h" without a periodic poller. Both CLIs run in the scratch cwd
+`<store>/limits-refresh-cwd` so stray session state never lands in a project.
+The zai and synthetic segments stay display-only: their keys are long-lived and
+the background poll keeps them fresh. A 429 from the
 usage endpoint keeps the last good Claude windows (the row does not flip to
 `n/a`) and doubles the snapshot TTL before the next background poll, capped
 at 64×.

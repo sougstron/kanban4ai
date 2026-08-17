@@ -79,6 +79,8 @@ pub struct TuiSettings {
     pub theme_name: String,
     pub task_sort: String,
     pub escape_to_projects: bool,
+    /// Projects-list ordering (name/newest/smart), a machine-wide setting.
+    pub project_sort: String,
     /// Draw the provider subscription-limits row above the status bar.
     pub show_limits: bool,
     /// Seconds a limits snapshot stays fresh before a background refresh.
@@ -697,6 +699,7 @@ impl App {
             && let Ok(config) = store.load_global_config()
         {
             app.settings.escape_to_projects = config.escape_to_projects();
+            app.settings.project_sort = config.project_sort().to_string();
         }
         app.theme = Theme::named(&app.settings.theme_name);
         Ok(app)
@@ -715,23 +718,24 @@ impl App {
 
     pub fn visible_project_items(&self) -> Vec<ProjectListItem> {
         let filter = self.search.text();
+        let mut rows: Vec<ProjectRow> = self
+            .projects
+            .iter()
+            .filter(|row| {
+                filter.is_empty()
+                    || case_insensitive_match(&row.display_name, &filter)
+                    || case_insensitive_match(&row.project.name, &filter)
+                    || case_insensitive_match(&row.project.work_path.to_string_lossy(), &filter)
+                    || case_insensitive_match(&row.project.id, &filter)
+            })
+            .cloned()
+            .collect();
+        projects::sort_rows(&mut rows, &self.settings.project_sort);
         let mut items = Vec::new();
         if let Some(path) = &self.create_cwd {
             items.push(ProjectListItem::CreateCwd { path: path.clone() });
         }
-        items.extend(
-            self.projects
-                .iter()
-                .filter(|row| {
-                    filter.is_empty()
-                        || case_insensitive_match(&row.display_name, &filter)
-                        || case_insensitive_match(&row.project.name, &filter)
-                        || case_insensitive_match(&row.project.work_path.to_string_lossy(), &filter)
-                        || case_insensitive_match(&row.project.id, &filter)
-                })
-                .cloned()
-                .map(ProjectListItem::Project),
-        );
+        items.extend(rows.into_iter().map(ProjectListItem::Project));
         items
     }
 
@@ -1177,7 +1181,11 @@ impl App {
 
     fn handle_projects_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.leave_projects(),
+            // The title bar advertises `q quit`: `q` leaves the whole TUI
+            // instead of bouncing back into the board this list was opened
+            // from. `Esc` stays the back key.
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Esc => self.leave_projects(),
             KeyCode::Char('/') => self.dispatch(UiAction::Search)?,
             KeyCode::Char('?') => self.dispatch(UiAction::Help)?,
             KeyCode::Char('n') if self.selected_is_create_cwd() => {
@@ -2632,6 +2640,21 @@ impl App {
         };
         let mut modal = ModalState::new(Modal::GlobalSettings);
         modal.escape_to_projects = config.escape_to_projects();
+        modal.project_sort = super::dialogs::one_line(config.project_sort());
+        modal.set_project_sort_options(vec![
+            SelectOption {
+                label: "By name".to_string(),
+                value: Some(crate::core::global::PROJECT_SORT_NAME.to_string()),
+            },
+            SelectOption {
+                label: "Newest first".to_string(),
+                value: Some(crate::core::global::PROJECT_SORT_NEWEST.to_string()),
+            },
+            SelectOption {
+                label: "Smart (unread → running → newest)".to_string(),
+                value: Some(crate::core::global::PROJECT_SORT_SMART.to_string()),
+            },
+        ]);
         modal.capture_initial_values();
         self.modal = Some(modal);
     }
@@ -2645,6 +2668,7 @@ impl App {
             && let Ok(config) = store.load_global_config()
         {
             self.settings.escape_to_projects = config.escape_to_projects();
+            self.settings.project_sort = config.project_sort().to_string();
         }
     }
 
@@ -2680,6 +2704,8 @@ impl App {
         });
     }
 
+    /// Esc: reopen the board this list was opened from, or quit when the
+    /// list is the entry screen (`q` always quits outright).
     fn leave_projects(&mut self) {
         if let Some(project) = self.return_project.clone() {
             self.pending_switch = Some(LoopOutcome::OpenProject(project));
@@ -2843,15 +2869,26 @@ impl App {
         let Ok(config) = self.ops.config.load() else {
             return;
         };
-        let backend_options = config
-            .agents
-            .keys()
-            .filter_map(|key| key.as_str())
-            .map(|backend| SelectOption {
-                label: backend.to_string(),
-                value: Some(backend.to_string()),
-            })
-            .collect::<Vec<_>>();
+        // Task forms lead with a "Default backend" entry (value None) so a
+        // task can follow the project's `auto_launch.default_agent` instead
+        // of pinning a concrete backend at creation time.
+        let default_agent = mapping_str(Some(&config.auto_launch), "default_agent")
+            .unwrap_or_else(|| "opencode".to_string());
+        let backend_options = std::iter::once(SelectOption {
+            label: format!("Default backend ({default_agent})"),
+            value: None,
+        })
+        .chain(
+            config
+                .agents
+                .keys()
+                .filter_map(|key| key.as_str())
+                .map(|backend| SelectOption {
+                    label: backend.to_string(),
+                    value: Some(backend.to_string()),
+                }),
+        )
+        .collect::<Vec<_>>();
         modal.set_backend_options(backend_options);
         self.refresh_backend_options_with_config(modal, &config);
         let mut chain_options = vec![SelectOption {
@@ -3845,6 +3882,11 @@ impl App {
                     let _lock = store.lock()?;
                     let mut config = store.load_global_config()?;
                     config.set_escape_to_projects(modal.escape_to_projects);
+                    config.set_project_sort(
+                        &modal
+                            .project_sort_text()
+                            .unwrap_or_else(|| crate::core::global::PROJECT_SORT_NAME.to_string()),
+                    );
                     store.save_global_config(&config)
                 })();
                 if let Err(err) = save_result {
@@ -3855,6 +3897,12 @@ impl App {
                     return Ok(());
                 }
                 self.settings.escape_to_projects = modal.escape_to_projects;
+                self.settings.project_sort = crate::core::global::normalize_project_sort(
+                    &modal
+                        .project_sort_text()
+                        .unwrap_or_else(|| crate::core::global::PROJECT_SORT_NAME.to_string()),
+                )
+                .to_string();
                 self.status = "Global settings saved".to_string();
             }
             Modal::Settings => {
@@ -4662,6 +4710,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::Agent => Some(modal.agent_selected),
         DialogField::Theme => Some(modal.theme_selected),
         DialogField::TaskSort => Some(modal.task_sort_selected),
+        DialogField::ProjectSort => Some(modal.project_sort_selected),
         DialogField::ChainTo => Some(modal.chain_selected),
         DialogField::TargetStatus => Some(modal.status_selected),
         DialogField::MessageKind => Some(modal.kind_selected),
@@ -4742,6 +4791,7 @@ fn default_project_settings() -> TuiSettings {
         theme_name: "dark".to_string(),
         task_sort: TASK_SORT_NUMBER.to_string(),
         escape_to_projects: false,
+        project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
         show_limits: true,
         limits_refresh_interval: crate::core::limits::DEFAULT_REFRESH_INTERVAL,
     }
@@ -4761,6 +4811,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
         task_sort: normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
             .to_string(),
         escape_to_projects: false,
+        project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
         show_limits: tui_bool(&config.tui, "show_limits", true),
         limits_refresh_interval: ops
             .config

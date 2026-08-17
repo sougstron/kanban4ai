@@ -20,6 +20,23 @@ use super::storage::atomic_write_text;
 /// The settings file directly under the store root.
 pub const GLOBAL_CONFIG_FILE: &str = "config.yaml";
 
+/// Projects-list ordering: alphabetical by display name (the default).
+pub const PROJECT_SORT_NAME: &str = "name";
+/// Projects-list ordering: newest project first.
+pub const PROJECT_SORT_NEWEST: &str = "newest";
+/// Projects-list ordering: unread rows first, then rows with running agents,
+/// then newest first.
+pub const PROJECT_SORT_SMART: &str = "smart";
+
+/// Map any stored value onto a known ordering; unknown values read as `name`.
+pub fn normalize_project_sort(value: &str) -> &'static str {
+    match value {
+        PROJECT_SORT_NEWEST => PROJECT_SORT_NEWEST,
+        PROJECT_SORT_SMART => PROJECT_SORT_SMART,
+        _ => PROJECT_SORT_NAME,
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalConfig {
     #[serde(default)]
@@ -53,6 +70,23 @@ impl GlobalConfig {
         self.tui.insert(
             Value::String("escape_to_projects".to_string()),
             Value::Bool(enabled),
+        );
+    }
+
+    /// How the Projects screen orders its rows. Whatever its storage shape,
+    /// the effective default is `name`.
+    pub fn project_sort(&self) -> &'static str {
+        self.tui
+            .get(Value::String("project_sort".to_string()))
+            .and_then(Value::as_str)
+            .map(normalize_project_sort)
+            .unwrap_or(PROJECT_SORT_NAME)
+    }
+
+    pub fn set_project_sort(&mut self, value: &str) {
+        self.tui.insert(
+            Value::String("project_sort".to_string()),
+            Value::String(normalize_project_sort(value).to_string()),
         );
     }
 }
@@ -126,5 +160,24 @@ mod tests {
             raw.contains("future_section") && raw.contains("keep: me"),
             "unknown keys must survive save: {raw}"
         );
+    }
+
+    #[test]
+    fn project_sort_round_trip_and_normalization() {
+        let dir = tempfile::tempdir().expect("store");
+        let store = ProjectStore::at(dir.path());
+        assert_eq!(store.load_global_config().unwrap().project_sort(), "name");
+
+        let mut config = store.load_global_config().unwrap();
+        config.set_project_sort("smart");
+        store.save_global_config(&config).expect("save");
+        assert_eq!(store.load_global_config().unwrap().project_sort(), "smart");
+
+        // Unknown values normalize to the default rather than erroring, so a
+        // hand-edited file still yields a usable ordering.
+        let mut config = store.load_global_config().unwrap();
+        config.set_project_sort("bogus");
+        store.save_global_config(&config).expect("save");
+        assert_eq!(store.load_global_config().unwrap().project_sort(), "name");
     }
 }
