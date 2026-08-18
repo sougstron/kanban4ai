@@ -336,7 +336,8 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `c`: Add a context/suggestion message to the task thread
 - `u`: Recover crashed task (restore to To Do); on an archived task (Archive
   list or its detail) the same key restores it to To Do after a confirmation
-- `Ctrl+r`: Fold saved review edits into the thread and re-run the agent
+- `Ctrl+r`: Fold saved review edits into the thread, re-run the agent, and
+  switch board focus to the task in In Progress (closes Review detail)
 - `Ctrl+s`: Save the review-edits buffer (detail; save only, no re-run)
 - `a`: Show archived tasks
 - `A`: Confirm archiving all Done tasks

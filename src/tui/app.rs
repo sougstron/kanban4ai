@@ -51,6 +51,10 @@ const CTRL_C_EXIT_PROMPT: &str = "Press ctrl + C again to close";
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(3);
 const COPY_NOTICE: &str = "Copied selected text to clipboard";
 const COPY_NOTICE_WINDOW: Duration = Duration::from_secs(3);
+const DEFAULT_STATUS: &str = "TUI ready";
+const LIMITS_STATUS_WINDOW: Duration = Duration::from_secs(3);
+const STATUS_NOTICE_WINDOW: Duration = Duration::from_secs(3);
+
 const TASK_SORT_NUMBER: &str = "task_number";
 const TASK_SORT_UPDATED_ASC: &str = "updated_at_asc";
 const TASK_SORT_UPDATED_DESC: &str = "updated_at_desc";
@@ -364,6 +368,11 @@ pub struct App {
     pending_copy: Option<String>,
     copy_notice_deadline: Option<Instant>,
     status_before_copy: Option<String>,
+    limits_refresh_provider: Option<&'static str>,
+    limits_status_deadline: Option<Instant>,
+    status_before_limits: Option<String>,
+    transient_status: Option<(String, Instant)>,
+
     pub log_view: Option<LogViewState>,
     pub text_view: Option<TextViewState>,
     /// Screen the text pager (`q`) returns to; set by `open_text_view` from its
@@ -573,7 +582,7 @@ impl App {
             archived_tasks,
             archive_selected: 0,
             should_quit: false,
-            status: "TUI ready".to_string(),
+            status: DEFAULT_STATUS.to_string(),
             hitboxes: Vec::new(),
             hovered: None,
             dragging: None,
@@ -582,6 +591,10 @@ impl App {
             pending_copy: None,
             copy_notice_deadline: None,
             status_before_copy: None,
+            limits_refresh_provider: None,
+            limits_status_deadline: None,
+            status_before_limits: None,
+            transient_status: None,
             log_view: None,
             text_view: None,
             text_view_return: Screen::Detail,
@@ -671,6 +684,10 @@ impl App {
             pending_copy: None,
             copy_notice_deadline: None,
             status_before_copy: None,
+            limits_refresh_provider: None,
+            limits_status_deadline: None,
+            status_before_limits: None,
+            transient_status: None,
             log_view: None,
             text_view: None,
             text_view_return: Screen::Projects,
@@ -1318,9 +1335,14 @@ impl App {
     /// tick (see `core::limits::refresh_provider_async`).
     fn refresh_provider_limits(&mut self, provider: &'static str) {
         if crate::core::limits::refresh_provider_async(provider) {
-            self.status = format!("Refreshing {provider} limits…");
+            if self.status_before_limits.is_none() {
+                self.status_before_limits = Some(self.status.clone());
+            }
+            self.limits_refresh_provider = Some(provider);
+            self.limits_status_deadline = None;
+            self.status = refreshing_limits_status(provider);
         } else {
-            self.status = format!("{provider} limits are already refreshing");
+            self.status = already_refreshing_limits_status(provider);
         }
     }
 
@@ -1828,6 +1850,9 @@ impl App {
         let now = Instant::now();
         self.expire_ctrl_c_prompt_at(now);
         self.expire_copy_notice_at(now);
+        self.settle_limits_refresh();
+        self.expire_limits_status_at(now);
+        self.expire_transient_status_at(now);
         self.expire_session_states_at(timefmt::now());
         self.resume_expired_waits_throttled();
         // Log writes bypass the fs watcher (it only covers board dirs), so
@@ -1920,6 +1945,95 @@ impl App {
         let previous = self.status_before_copy.take().unwrap_or_default();
         if self.status == COPY_NOTICE {
             self.status = previous;
+        }
+    }
+
+    pub(crate) fn settle_limits_refresh(&mut self) {
+        let Some(provider) = self.limits_refresh_provider else {
+            return;
+        };
+        if crate::core::limits::provider_refresh_in_flight() {
+            return;
+        }
+        self.limits_refresh_provider = None;
+        if is_limits_progress_status(&self.status) {
+            self.status = updated_limits_status(provider);
+            self.limits_status_deadline = Some(Instant::now() + LIMITS_STATUS_WINDOW);
+        }
+    }
+
+    pub(crate) fn expire_limits_status_at(&mut self, now: Instant) {
+        let Some(deadline) = self.limits_status_deadline else {
+            return;
+        };
+        if now <= deadline {
+            return;
+        }
+        self.limits_status_deadline = None;
+        let previous = self
+            .status_before_limits
+            .take()
+            .unwrap_or_else(|| DEFAULT_STATUS.to_string());
+        if self.status.ends_with(" limits updated") {
+            self.status = previous;
+        }
+    }
+
+    pub(crate) fn expire_transient_status_at(&mut self, now: Instant) {
+        if !self.is_transient_status() {
+            self.transient_status = None;
+            return;
+        }
+        match self.transient_status.as_ref() {
+            Some((text, deadline)) if text == &self.status => {
+                if now <= *deadline {
+                    return;
+                }
+            }
+            _ => {
+                self.transient_status = Some((self.status.clone(), now + STATUS_NOTICE_WINDOW));
+                return;
+            }
+        }
+        self.transient_status = None;
+        self.status = self.idle_status().to_string();
+    }
+
+    fn idle_status(&self) -> &'static str {
+        if self.screen == Screen::Projects {
+            "Projects"
+        } else {
+            DEFAULT_STATUS
+        }
+    }
+
+    fn is_transient_status(&self) -> bool {
+        let status = self.status.as_str();
+        if status.is_empty() || status == DEFAULT_STATUS || status == self.idle_status() {
+            return false;
+        }
+        if status == CTRL_C_EXIT_PROMPT
+            || status == COPY_NOTICE
+            || is_limits_progress_status(status)
+        {
+            return false;
+        }
+        match self.screen {
+            Screen::Archive if status.starts_with("Archive:") => false,
+            Screen::LogView
+                if status.starts_with("Log of ") || status.starts_with("Following ") =>
+            {
+                false
+            }
+            Screen::TextView
+                if self
+                    .text_view
+                    .as_ref()
+                    .is_some_and(|view| status == view.title) =>
+            {
+                false
+            }
+            _ => true,
         }
     }
 
@@ -2561,6 +2675,23 @@ impl App {
         self.modal = Some(ModalState::new(Modal::BulkConfirm { action, task_ids }));
     }
 
+    /// Point board focus at `task_id` wherever it currently sits.
+    fn focus_task(&mut self, task_id: &str) -> bool {
+        let located = (0..self.board.columns.len()).find_map(|column_index| {
+            self.visible_tasks_for_column(column_index)
+                .iter()
+                .position(|task| task.id == task_id)
+                .map(|card| (column_index, card))
+        });
+        let Some((column_index, card)) = located else {
+            return false;
+        };
+        self.focused_column = column_index;
+        self.focused_card = card;
+        self.ensure_focused_visible();
+        true
+    }
+
     fn focus_first_question(&mut self) {
         let first = (0..self.board.columns.len()).find_map(|column_index| {
             self.visible_tasks_for_column(column_index)
@@ -3119,6 +3250,7 @@ impl App {
             self.status = "No task selected".to_string();
             return Ok(());
         };
+        let from_review = task.status == TaskStatus::Review;
         let relaunched = match task.status {
             TaskStatus::Review => {
                 self.save_visible_review_edits_before_rerun(&task)?;
@@ -3131,6 +3263,14 @@ impl App {
             }
         };
         self.refresh_after_action()?;
+        if relaunched && from_review {
+            // Leave the Review column/detail and show the task where it now
+            // lives — In Progress — so the rework send is visible immediately.
+            if self.screen == Screen::Detail {
+                self.close_detail()?;
+            }
+            let _ = self.focus_task(&task.id);
+        }
         self.status = if relaunched {
             format!("Re-ran {}", task.id)
         } else {
@@ -4474,6 +4614,22 @@ fn format_elapsed(seconds: i64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+fn refreshing_limits_status(provider: &str) -> String {
+    format!("Refreshing {provider} limits…")
+}
+
+fn already_refreshing_limits_status(provider: &str) -> String {
+    format!("{provider} limits are already refreshing")
+}
+
+fn updated_limits_status(provider: &str) -> String {
+    format!("{provider} limits updated")
+}
+
+fn is_limits_progress_status(status: &str) -> bool {
+    status.contains(" limits…") || status.ends_with(" limits are already refreshing")
 }
 
 fn next_index(current: usize, len: usize) -> usize {

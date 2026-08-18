@@ -1563,6 +1563,16 @@ pub fn refresh_provider_async(provider: &'static str) -> bool {
     true
 }
 
+/// Whether a click-driven provider refresh is still running.
+pub fn provider_refresh_in_flight() -> bool {
+    CLI_REFRESHING.load(Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub fn force_provider_refresh_in_flight(in_flight: bool) {
+    CLI_REFRESHING.store(in_flight, Ordering::SeqCst);
+}
+
 // ---------------------------------------------------------------------------
 // fetch + cache
 // ---------------------------------------------------------------------------

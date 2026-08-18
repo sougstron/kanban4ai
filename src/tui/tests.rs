@@ -1805,6 +1805,14 @@ fn review_column(app: &App) -> usize {
         .expect("review column")
 }
 
+fn in_progress_column(app: &App) -> usize {
+    app.board
+        .columns
+        .iter()
+        .position(|column| column.id == "in_progress")
+        .expect("in_progress column")
+}
+
 fn open_focused_review_editor(text: &str) -> (tempfile::TempDir, App) {
     let (dir, mut app) = app_with_board();
     let task = app
@@ -1870,6 +1878,12 @@ fn review_edits_save_and_rerun_are_separate_actions() {
             .iter()
             .any(|message| message.body == "Please tighten validation")
     );
+    assert_eq!(app.screen, Screen::Board);
+    assert_eq!(app.focused_column, in_progress_column(&app));
+    assert_eq!(
+        app.focused_task().map(|focused| focused.id.as_str()),
+        Some(task.id.as_str())
+    );
 }
 
 #[test]
@@ -1904,6 +1918,41 @@ fn review_edits_rerun_saves_visible_buffer_first() {
         .unwrap();
     assert_eq!(edits.len(), 1);
     assert_eq!(edits[0].body, "Return Escape for closing the task detail");
+    assert_eq!(app.screen, Screen::Board);
+    assert_eq!(app.focused_column, in_progress_column(&app));
+    assert_eq!(
+        app.focused_task().map(|focused| focused.id.as_str()),
+        Some(task.id.as_str())
+    );
+}
+
+#[test]
+fn review_rerun_from_board_focuses_in_progress() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Rework me"))
+        .expect("create task");
+    app.ops
+        .move_task(&task.id, "review", false)
+        .expect("move to review");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .expect("rerun");
+
+    assert_eq!(app.screen, Screen::Board);
+    assert_eq!(app.focused_column, in_progress_column(&app));
+    assert_eq!(
+        app.focused_task().map(|focused| focused.id.as_str()),
+        Some(task.id.as_str())
+    );
+    assert_eq!(
+        app.ops.get_task(&task.id).unwrap().unwrap().status.as_str(),
+        "in_progress"
+    );
 }
 
 #[test]
@@ -5488,4 +5537,93 @@ fn clicking_claude_limits_segment_reports_a_refresh_in_the_status() {
         "{}",
         app.status
     );
+}
+
+#[test]
+fn limits_refresh_status_returns_to_ready_after_update() {
+    crate::core::limits::force_provider_refresh_in_flight(false);
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(limits_fixture());
+    let _ = render_at(&mut app, 120, 28);
+
+    crate::core::limits::force_provider_refresh_in_flight(true);
+    click_limits_segment(&mut app, "grok");
+    assert_eq!(app.status, "Refreshing grok limits…");
+
+    app.tick().expect("tick while refreshing");
+    assert_eq!(app.status, "Refreshing grok limits…");
+
+    crate::core::limits::force_provider_refresh_in_flight(false);
+    app.tick().expect("tick after refresh");
+    assert_eq!(app.status, "grok limits updated");
+
+    app.expire_limits_status_at(Instant::now() + Duration::from_secs(4));
+    assert_eq!(app.status, "TUI ready");
+
+    click_limits_segment(&mut app, "codex");
+    assert!(
+        app.status.contains("Refreshing codex limits"),
+        "{}",
+        app.status
+    );
+    app.tick().expect("tick when already complete");
+    assert_eq!(app.status, "codex limits updated");
+}
+
+#[test]
+fn review_editor_focus_status_returns_to_ready() {
+    let (_dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Edit review")).unwrap();
+    app.ops.set_review_edits(&task.id, "abcdef").unwrap();
+    app.ops.move_task(&task.id, "review", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+    assert_eq!(app.status, "Review editor focused");
+
+    app.tick().expect("arm notice timer");
+    assert_eq!(app.status, "Review editor focused");
+
+    app.expire_transient_status_at(Instant::now() + Duration::from_secs(4));
+    assert_eq!(app.status, "TUI ready");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+}
+
+#[test]
+fn action_status_returns_to_ready_after_notice_window() {
+    let (_dir, mut app) = app_with_board();
+    app.status = "Created TASK-001".to_string();
+    app.tick().expect("arm notice timer");
+    assert_eq!(app.status, "Created TASK-001");
+
+    app.expire_transient_status_at(Instant::now() + Duration::from_secs(4));
+    assert_eq!(app.status, "TUI ready");
+}
+
+#[test]
+fn projects_idle_status_does_not_expire() {
+    let store_dir = tempfile::tempdir().expect("tempdir");
+    let store = ProjectStore::at(store_dir.path());
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    assert_eq!(app.status, "Projects");
+    app.expire_transient_status_at(Instant::now() + Duration::from_secs(4));
+    assert_eq!(app.status, "Projects");
+}
+
+#[test]
+fn limits_progress_status_does_not_expire_while_refreshing() {
+    crate::core::limits::force_provider_refresh_in_flight(true);
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(limits_fixture());
+    let _ = render_at(&mut app, 120, 28);
+    click_limits_segment(&mut app, "grok");
+    assert_eq!(app.status, "Refreshing grok limits…");
+
+    app.expire_transient_status_at(Instant::now() + Duration::from_secs(4));
+    assert_eq!(app.status, "Refreshing grok limits…");
+    crate::core::limits::force_provider_refresh_in_flight(false);
 }
