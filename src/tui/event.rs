@@ -88,6 +88,9 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
             app.finish_terminal_action(&action, ok);
             terminal.clear()?;
         }
+        if app.take_full_redraw() {
+            terminal.clear()?;
+        }
         if let Some(outcome) = app.take_loop_outcome() {
             return Ok(outcome);
         }

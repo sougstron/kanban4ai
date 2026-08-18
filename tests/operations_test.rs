@@ -95,8 +95,14 @@ fn agent_take_moves_to_in_progress_and_links_session() {
 struct FailingLauncher;
 
 impl AgentLauncher for FailingLauncher {
-    fn launch(&self, _roots: Roots<'_>, _task: &Task, _session_id: &str, _revert: bool) -> bool {
-        false
+    fn launch(
+        &self,
+        _roots: Roots<'_>,
+        _task: &Task,
+        _session_id: &str,
+        _revert: bool,
+    ) -> kanban4ai::core::error::Result<bool> {
+        Ok(false)
     }
 }
 
@@ -105,12 +111,67 @@ struct MoveThenFailLauncher {
 }
 
 impl AgentLauncher for MoveThenFailLauncher {
-    fn launch(&self, _roots: Roots<'_>, task: &Task, _session_id: &str, _revert: bool) -> bool {
+    fn launch(
+        &self,
+        _roots: Roots<'_>,
+        task: &Task,
+        _session_id: &str,
+        _revert: bool,
+    ) -> kanban4ai::core::error::Result<bool> {
         Operations::with_launcher(&self.project, Box::new(NoopLauncher))
             .move_task(&task.id, "review", false)
             .unwrap();
-        false
+        Ok(false)
     }
+}
+
+struct ErrLauncher;
+
+impl AgentLauncher for ErrLauncher {
+    fn launch(
+        &self,
+        _roots: Roots<'_>,
+        _task: &Task,
+        _session_id: &str,
+        _revert: bool,
+    ) -> kanban4ai::core::error::Result<bool> {
+        Err(KanbanError::Invalid(
+            "tmux new-session failed for ses-x (exit 1): open terminal failed: not a terminal"
+                .to_string(),
+        ))
+    }
+}
+
+#[test]
+fn start_task_surfaces_spawn_error_on_thread_and_status() {
+    let (dir, _storage) = common::quiet_board(true);
+    let ops = Operations::with_launcher(dir.path(), Box::new(ErrLauncher));
+    let task = ops.create_task(NewTask::titled("Will not spawn")).unwrap();
+
+    let err = ops.start_task(&task.id).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("open terminal failed: not a terminal"),
+        "{text}"
+    );
+
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Todo);
+    assert!(stored.session.is_some());
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread.messages.iter().any(|message| {
+            message.kind == MessageKind::AgentStep
+                && message.body.contains("✖ launch")
+                && message.body.contains("open terminal failed")
+        }),
+        "launch error must be posted on the thread: {:?}",
+        thread.messages
+    );
 }
 
 #[test]

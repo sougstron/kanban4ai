@@ -71,7 +71,13 @@ impl RecordingLauncher {
 }
 
 impl AgentLauncher for RecordingLauncher {
-    fn launch(&self, roots: Roots<'_>, task: &Task, session_id: &str, revert: bool) -> bool {
+    fn launch(
+        &self,
+        roots: Roots<'_>,
+        task: &Task,
+        session_id: &str,
+        revert: bool,
+    ) -> kanban4ai::core::error::Result<bool> {
         self.calls
             .lock()
             .unwrap()
@@ -81,7 +87,7 @@ impl AgentLauncher for RecordingLauncher {
             roots.work_path.to_path_buf(),
             roots.project_id.map(str::to_string),
         ));
-        true
+        Ok(true)
     }
 }
 

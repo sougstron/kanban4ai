@@ -3,10 +3,22 @@ use std::process::{Command, Stdio};
 
 use crate::agent::backends::{AutoLaunchConfig, LaunchPlan};
 use crate::core::error::{KanbanError, Result};
+use crate::core::models::{MessageKind, MessageRole};
 use crate::core::project::Roots;
+use crate::core::thread::ThreadManager;
+
+/// Default tmux pane size when the launcher has no controlling TTY (TUI raw
+/// mode). Without `-x`/`-y`, `new-session -d` can fail or inherit a 80×24
+/// that then writes through the live alternate screen.
+const TMUX_DEFAULT_WIDTH: &str = "120";
+const TMUX_DEFAULT_HEIGHT: &str = "40";
 
 /// Start the planned agent run. The process runs in `roots.work_path`; every
 /// file it is pointed at lives under `roots.data_root`.
+///
+/// `tmux new-session` is isolated from the caller's TTY. A non-zero tmux exit
+/// (`Ok(false)`) takes the same background fallback as an I/O `Err`; neither
+/// path writes to stderr, which would tear the TUI.
 pub fn spawn_plan<'a>(
     roots: impl Into<Roots<'a>>,
     plan: &LaunchPlan,
@@ -17,23 +29,39 @@ pub fn spawn_plan<'a>(
         std::fs::create_dir_all(parent)?;
     }
     if config.use_tmux && command_available("tmux") {
-        return spawn_tmux(roots, plan).or_else(|err| {
-            if config.terminal_fallback {
-                eprintln!(
-                    "Warning: tmux launch failed ({err}); falling back to background process."
-                );
-                spawn_background(roots, plan)
-            } else {
-                Err(err)
+        match spawn_tmux(roots, plan) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {
+                let err = tmux_failure_error(plan, None);
+                return fallback_or_err(roots, plan, config, err);
             }
-        });
+            Err(err) => return fallback_or_err(roots, plan, config, err),
+        }
     }
     if config.terminal_fallback {
         spawn_background(roots, plan)
     } else {
-        eprintln!("Warning: tmux is not available and terminal_fallback is disabled.");
-        Ok(false)
+        Err(KanbanError::Invalid(
+            "tmux is not available and terminal_fallback is disabled".to_string(),
+        ))
     }
+}
+
+fn fallback_or_err(
+    roots: Roots<'_>,
+    plan: &LaunchPlan,
+    config: &AutoLaunchConfig,
+    err: KanbanError,
+) -> Result<bool> {
+    if !config.terminal_fallback {
+        return Err(err);
+    }
+    post_launch_note(
+        roots,
+        plan,
+        &format!("⚠ tmux launch failed ({err}); falling back to background process."),
+    );
+    spawn_background(roots, plan)
 }
 
 /// Kill the tmux session hosting an agent job. Returns `false` when tmux is
@@ -94,19 +122,84 @@ pub fn run_foreground(command: &str, args: &[String], cwd: Option<&Path>) -> Res
 
 fn spawn_tmux(roots: Roots<'_>, plan: &LaunchPlan) -> Result<bool> {
     let script = wrapper_script(roots, plan);
+    let work_path = roots.work_path.display().to_string();
+    let err_path = tmux_err_path(plan);
+    if let Some(parent) = err_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let err_file = std::fs::File::create(&err_path)?;
     let status = Command::new("tmux")
-        .args([
-            "new-session",
-            "-d",
-            "-s",
-            &plan.session_id,
-            "--",
-            "bash",
-            "-c",
-            &script,
-        ])
+        .args(tmux_new_session_args(&plan.session_id, &work_path, &script))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(err_file))
         .status()?;
-    Ok(status.success())
+    if status.success() {
+        let _ = std::fs::remove_file(&err_path);
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn tmux_new_session_args<'a>(
+    session_id: &'a str,
+    work_path: &'a str,
+    script: &'a str,
+) -> [&'a str; 14] {
+    [
+        "new-session",
+        "-d",
+        "-x",
+        TMUX_DEFAULT_WIDTH,
+        "-y",
+        TMUX_DEFAULT_HEIGHT,
+        "-c",
+        work_path,
+        "-s",
+        session_id,
+        "--",
+        "bash",
+        "-c",
+        script,
+    ]
+}
+
+fn tmux_err_path(plan: &LaunchPlan) -> PathBuf {
+    plan.log_file.with_extension("tmux.err")
+}
+
+fn tmux_failure_error(plan: &LaunchPlan, status_code: Option<i32>) -> KanbanError {
+    let detail = std::fs::read_to_string(tmux_err_path(plan)).unwrap_or_default();
+    let detail = detail.trim();
+    let code = status_code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "nonzero".to_string());
+    if detail.is_empty() {
+        KanbanError::Invalid(format!(
+            "tmux new-session failed for {} (exit {code})",
+            plan.session_id
+        ))
+    } else {
+        KanbanError::Invalid(format!(
+            "tmux new-session failed for {} (exit {code}): {detail}",
+            plan.session_id
+        ))
+    }
+}
+
+fn post_launch_note(roots: Roots<'_>, plan: &LaunchPlan, body: &str) {
+    let Ok(tm) = ThreadManager::new(roots.data_root) else {
+        return;
+    };
+    let _ = tm.post(
+        &plan.task_id,
+        MessageRole::System,
+        MessageKind::AgentStep,
+        body,
+        None,
+        vec![],
+        Some("kanban".to_string()),
+    );
 }
 
 fn spawn_background<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> Result<bool> {
@@ -137,6 +230,12 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
         && let Some(value) = command_parts.get_mut(flag_pos + 2)
     {
         *value = "\"$KANBAN_AGENT\"".to_string();
+    }
+    if let Some(prompt_file) = &plan.prompt_file {
+        command_parts.push(format!(
+            "\"$(cat -- {})\"",
+            shell_quote(&prompt_file.display().to_string())
+        ));
     }
     let command_line = command_parts.join(" ");
     // Use the absolute path of the current binary so callbacks always
@@ -314,6 +413,7 @@ mod tests {
             model: None,
             args,
             prompt: "test prompt".to_string(),
+            prompt_file: None,
             log_file: log_dir.join(format!("{session_id}.log")),
             transcript_file: None,
             session_id: session_id.to_string(),
@@ -538,6 +638,86 @@ mod tests {
         assert!(!script.contains("KANBAN_AGENT"));
     }
 
+    /// The assembled prompt is read from disk at run time. The body must not
+    /// appear in the `bash -c` script that tmux receives as argv.
+    #[test]
+    fn wrapper_script_reads_prompt_from_file_not_argv() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompt_file = dir.path().join("ses-file.prompt.txt");
+        let body = "PROMPT_BODY_MUST_NOT_APPEAR_IN_SCRIPT\nline two";
+        std::fs::write(&prompt_file, body).unwrap();
+        let mut plan = test_plan(
+            dir.path(),
+            "TASK-008",
+            "ses-file",
+            "/bin/echo",
+            vec!["run".to_string()],
+            false,
+        );
+        plan.prompt = body.to_string();
+        plan.prompt_file = Some(prompt_file.clone());
+        let script = wrapper_script(dir.path(), &plan);
+
+        assert!(script.contains(&format!(
+            "\"$(cat -- {})\"",
+            shell_quote(&prompt_file.display().to_string())
+        )));
+        assert!(
+            !script.contains("PROMPT_BODY_MUST_NOT_APPEAR_IN_SCRIPT"),
+            "prompt body leaked into wrapper argv: {script}"
+        );
+
+        let output = Command::new("bash")
+            .args(["-n", "-c", &script])
+            .output()
+            .expect("bash -n should run");
+        assert!(
+            output.status.success(),
+            "bash -n rejected prompt-file script:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// End-to-end: `/bin/echo` receives the file contents as its last
+    /// argument, so the log contains the prompt body.
+    #[test]
+    fn background_launch_passes_prompt_file_contents() {
+        let project = tempfile::tempdir().unwrap();
+        let logs_dir = project.path().join(".kanban/logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let marker = "MARKER_PROMPT_FILE_OK";
+        let prompt_file = logs_dir.join("ses-prompt-file.prompt.txt");
+        std::fs::write(&prompt_file, marker).unwrap();
+
+        let mut plan = test_plan(
+            &logs_dir,
+            "TASK-009",
+            "ses-prompt-file",
+            "/bin/echo",
+            vec![],
+            false,
+        );
+        plan.prompt_file = Some(prompt_file);
+
+        let started = spawn_background(project.path(), &plan).unwrap();
+        assert!(started, "spawn_background returned true");
+
+        let log_path = plan.log_file;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut content = String::new();
+        while Instant::now() < deadline {
+            content = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if content.contains(marker) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            content.contains(marker),
+            "echo should receive the prompt file contents; log content: {content:?}"
+        );
+    }
+
     /// End-to-end through bash: when the resolve callback fails (the test
     /// binary is not the kanban CLI), the agent command still receives the
     /// requested name via the fallback assignment.
@@ -660,6 +840,191 @@ mod tests {
              Log path: {}\nLog exists: {}",
             log_path.display(),
             log_path.exists()
+        );
+    }
+
+    fn auto_cfg(use_tmux: bool, fallback: bool) -> AutoLaunchConfig {
+        AutoLaunchConfig {
+            enabled: true,
+            use_tmux,
+            terminal_fallback: fallback,
+            auto_complete_on_exit: false,
+            default_agent: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn tmux_new_session_args_set_size_cwd_and_session() {
+        let args = tmux_new_session_args("ses-1", "/tmp/work", "echo hi");
+        assert_eq!(
+            args,
+            [
+                "new-session",
+                "-d",
+                "-x",
+                "120",
+                "-y",
+                "40",
+                "-c",
+                "/tmp/work",
+                "-s",
+                "ses-1",
+                "--",
+                "bash",
+                "-c",
+                "echo hi",
+            ]
+        );
+    }
+
+    #[test]
+    fn tmux_failure_error_includes_captured_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = test_plan(
+            dir.path(),
+            "TASK-199",
+            "ses-err",
+            "/bin/echo",
+            vec![],
+            false,
+        );
+        std::fs::write(
+            tmux_err_path(&plan),
+            "open terminal failed: not a terminal\n",
+        )
+        .unwrap();
+        let err = tmux_failure_error(&plan, Some(1));
+        let text = err.to_string();
+        assert!(text.contains("ses-err"), "{text}");
+        assert!(text.contains("exit 1"), "{text}");
+        assert!(
+            text.contains("open terminal failed: not a terminal"),
+            "{text}"
+        );
+    }
+
+    /// Hold a live tmux session so the next `new-session -s` with the same
+    /// name returns non-zero (`Ok(false)`). Skips when tmux cannot host it.
+    fn occupy_tmux_session(session_id: &str) -> Option<OccupiedTmux> {
+        if !command_available("tmux") {
+            return None;
+        }
+        let status = Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "-s",
+                session_id,
+                "--",
+                "sleep",
+                "30",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .ok()?;
+        if !status.success() || !session_exists(session_id) {
+            return None;
+        }
+        Some(OccupiedTmux {
+            session_id: session_id.to_string(),
+        })
+    }
+
+    struct OccupiedTmux {
+        session_id: String,
+    }
+
+    impl Drop for OccupiedTmux {
+        fn drop(&mut self) {
+            let _ = kill_session(&self.session_id);
+        }
+    }
+
+    /// A duplicate tmux session name makes `new-session` fail. With
+    /// `terminal_fallback` that `Ok(false)` must take the same background
+    /// path as an I/O `Err`, write the agent log, and record the tmux
+    /// error on the thread — never on stderr.
+    #[test]
+    fn spawn_plan_falls_back_when_tmux_session_already_exists() {
+        let session_id = format!("kb4ai-t200-fb-{}", std::process::id());
+        let Some(_hold) = occupy_tmux_session(&session_id) else {
+            return;
+        };
+        let project = tempfile::tempdir().unwrap();
+        let logs_dir = project.path().join(".kanban/logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+
+        let marker = "MARKER_TMUX_FALLBACK_OK";
+        let plan = test_plan(
+            &logs_dir,
+            "TASK-200",
+            &session_id,
+            "/bin/echo",
+            vec![marker.to_string()],
+            false,
+        );
+
+        let started = spawn_plan(project.path(), &plan, &auto_cfg(true, true)).unwrap();
+        assert!(started, "Ok(false) from tmux must fall back to background");
+
+        let log_path = plan.log_file.clone();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut content = String::new();
+        while Instant::now() < deadline {
+            content = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if content.contains(marker) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            content.contains(marker),
+            "fallback background job must write the log; got {content:?}"
+        );
+
+        let thread = ThreadManager::new(project.path())
+            .unwrap()
+            .load("TASK-200")
+            .unwrap();
+        assert!(
+            thread.messages.iter().any(|message| {
+                message.kind == MessageKind::AgentStep
+                    && message.body.contains("tmux launch failed")
+            }),
+            "fallback must post the tmux error on the thread: {:?}",
+            thread.messages
+        );
+    }
+
+    #[test]
+    fn spawn_plan_without_fallback_returns_tmux_error() {
+        let session_id = format!("kb4ai-t200-nf-{}", std::process::id());
+        let Some(_hold) = occupy_tmux_session(&session_id) else {
+            return;
+        };
+        let project = tempfile::tempdir().unwrap();
+        let logs_dir = project.path().join(".kanban/logs");
+        std::fs::create_dir_all(&logs_dir).unwrap();
+        let plan = test_plan(
+            &logs_dir,
+            "TASK-200",
+            &session_id,
+            "/bin/echo",
+            vec![],
+            false,
+        );
+
+        let err = spawn_plan(project.path(), &plan, &auto_cfg(true, false)).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("tmux new-session failed for {session_id}")),
+            "{text}"
         );
     }
 }

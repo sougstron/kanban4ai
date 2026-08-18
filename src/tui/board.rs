@@ -279,13 +279,11 @@ fn seg(label: &'static str, action: Option<UiAction>, priority: u8) -> StatusSeg
 }
 
 fn status_segments(app: &App) -> Vec<StatusSegment> {
-    let primary_action = if app
-        .current_task()
-        .is_some_and(|task| task.status == crate::core::models::TaskStatus::InProgress)
-    {
-        ("r revoke", UiAction::Revoke)
-    } else {
-        ("r run", UiAction::Run)
+    let primary_action = match app.current_task() {
+        Some(task) if app.primary_run_action_for(&task) == UiAction::Revoke => {
+            ("r revoke", UiAction::Revoke)
+        }
+        _ => ("r run", UiAction::Run),
     };
     match app.screen {
         Screen::Board => vec![
@@ -516,7 +514,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  ←/→ or Tab/Shift+Tab: switch columns"),
         Line::from("  ↑/↓ PgUp/PgDn Home/End: navigate cards"),
         Line::from("  Enter: open task detail"),
-        Line::from("  r: run a task; revoke and wake it when already In Progress"),
+        Line::from("  r: run a task; revoke only while a session is live/crashed"),
         Line::from("  n: new task in focused column · e/m/d: edit, move, delete permanently"),
         Line::from("  w: answer question · y: approve Review → Done"),
         Line::from("  t: attach to the task's agent · c: add context/suggestion"),
@@ -530,7 +528,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Detail"),
         Line::from("  Tab: cycle thread/answer/editor panels when present"),
-        Line::from("  Enter: run To Do tasks only · r/buttons: run or revoke/wake"),
+        Line::from("  Enter: run To Do tasks only · r/buttons: run or revoke while live"),
         Line::from("  Ctrl+S: save review edits (no re-run) · Ctrl+R: re-run"),
         Line::from("  s: project settings · Ctrl+T: cycle and persist theme"),
         Line::from("  Home/End: start/end of thread · q/Esc: back · Esc leaves text panels first"),

@@ -70,6 +70,10 @@ pub struct LaunchPlan {
     pub model: Option<String>,
     pub args: Vec<String>,
     pub prompt: String,
+    /// Assembled prompt on disk. The wrapper feeds this file as the last
+    /// argument (`$(cat -- file)`); the body is never placed on the
+    /// tmux/`bash -c` argv.
+    pub prompt_file: Option<PathBuf>,
     pub log_file: PathBuf,
     /// Machine transcript of the run (claude `--output-format stream-json`
     /// JSONL), harvested at exit into an input-provenance manifest. `None` for
@@ -129,6 +133,10 @@ pub fn build_launch_plan<'a>(
     );
 
     let logs_dir = roots.kanban_dir().join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let prompt_file = logs_dir.join(format!("{session_id}.prompt.txt"));
+    atomic_write_text(&prompt_file, &prompt)?;
+
     // claude, opencode, and the pi family (pi/omp, via `--mode json`) all emit a
     // parseable JSONL transcript on stdout.
     let transcript_file = matches!(backend.as_str(), "claude" | "opencode" | "pi" | "omp")
@@ -141,6 +149,7 @@ pub fn build_launch_plan<'a>(
         model,
         args,
         prompt,
+        prompt_file: Some(prompt_file),
         log_file: logs_dir.join(format!("{session_id}.log")),
         transcript_file,
         session_id: session_id.to_string(),
@@ -219,8 +228,9 @@ fn backend_args(
             "--format".to_string(),
             "json".to_string(),
         ],
-        // omp/pi (the "pi" agent family) run non-interactively with `-p` and
-        // take the prompt as a positional argument. `--mode json` makes them
+        // omp/pi (the "pi" agent family) run non-interactively with `-p`.
+        // The prompt body is not an argv element: the wrapper cats
+        // `prompt_file` as the trailing positional. `--mode json` makes them
         // emit the same NDJSON event stream on stdout as their session files
         // (`message_end`/`turn_end` carry `usage`, `cost`, and tool calls), so
         // the wrapper harvests it exactly like claude/opencode.
@@ -254,7 +264,6 @@ fn backend_args(
         args.push("--title".to_string());
         args.push(prompt_title(prompt));
     }
-    args.push(prompt.to_string());
     args
 }
 

@@ -33,19 +33,22 @@ use crate::core::timefmt;
 /// The launcher receives both roots: board files come from `data_root`, the
 /// spawned process runs in `work_path`.
 pub trait AgentLauncher {
-    fn launch(&self, roots: Roots<'_>, task: &Task, session_id: &str, revert: bool) -> bool;
+    fn launch(&self, roots: Roots<'_>, task: &Task, session_id: &str, revert: bool)
+    -> Result<bool>;
 }
 
 /// Test and fallback launcher that deliberately does not spawn processes.
 pub struct NoopLauncher;
 
 impl AgentLauncher for NoopLauncher {
-    fn launch(&self, _roots: Roots<'_>, task: &Task, _session_id: &str, _revert: bool) -> bool {
-        eprintln!(
-            "Warning: the configured agent launcher did not start task {}.",
-            task.id
-        );
-        false
+    fn launch(
+        &self,
+        _roots: Roots<'_>,
+        _task: &Task,
+        _session_id: &str,
+        _revert: bool,
+    ) -> Result<bool> {
+        Ok(false)
     }
 }
 
@@ -609,18 +612,22 @@ impl Operations {
         if is_agent
             && self.config.get_rule("auto_launch_on_delegate")?
             && self.auto_launch_enabled()?
-            && !self.launch_agent(task_id, session_id, false)?
         {
-            // The status rolls back, but the crashed session stays on the task:
-            // it is the last session that was assigned to it.
-            session_mgr.crash_session(session_id)?;
-            let _guard = self.storage.lock()?;
-            if let Some(mut current) = self.storage.load_task(task_id)? {
-                current.status = previous_status;
-                current.updated_at = timefmt::now();
-                self.storage.save_task(&current)?;
+            match self.finish_launch(session_id, self.launch_agent(task_id, session_id, false)) {
+                Ok(true) => {}
+                failed => {
+                    // The status rolls back, but the crashed session stays on the task:
+                    // it is the last session that was assigned to it.
+                    let _guard = self.storage.lock()?;
+                    if let Some(mut current) = self.storage.load_task(task_id)? {
+                        current.status = previous_status;
+                        current.updated_at = timefmt::now();
+                        self.storage.save_task(&current)?;
+                    }
+                    failed?;
+                    return Ok(None);
+                }
             }
-            return Ok(None);
         }
 
         Ok(Some(task))
@@ -718,7 +725,7 @@ impl Operations {
                         self.storage.save_task(&task)?;
                         let body =
                             format!("✗ gate failed code={exit_code} cmd={command}\n{output_tail}");
-                        if let Err(err) = self.thread_manager().and_then(|tm| {
+                        let _ = self.thread_manager().and_then(|tm| {
                             tm.post_with_origin(
                                 task_id,
                                 MessageRole::System,
@@ -729,9 +736,7 @@ impl Operations {
                                 Some("kanban".to_string()),
                                 Some("kanban".to_string()),
                             )
-                        }) {
-                            eprintln!("Warning: failed to log gate failure for {}: {err}", task.id);
-                        }
+                        });
                         drop(_guard);
                         self.session_manager().close_session(session_id)?;
                         if let Ok(notifier) = self.notifier() {
@@ -747,7 +752,7 @@ impl Operations {
                         return Ok(Some(task));
                     }
                     let body = format!("✓ gate passed cmd={command}");
-                    if let Err(err) = self.thread_manager().and_then(|tm| {
+                    let _ = self.thread_manager().and_then(|tm| {
                         tm.post_with_origin(
                             task_id,
                             MessageRole::System,
@@ -758,9 +763,7 @@ impl Operations {
                             Some("kanban".to_string()),
                             Some("kanban".to_string()),
                         )
-                    }) {
-                        eprintln!("Warning: failed to log gate pass for {}: {err}", task.id);
-                    }
+                    });
                 }
 
                 task.status = TaskStatus::Review;
@@ -805,7 +808,7 @@ impl Operations {
         &self,
         command: &str,
         task_id: &str,
-        session_id: &str,
+        _session_id: &str,
     ) -> Result<(i32, String)> {
         let output = std::process::Command::new("sh")
             .arg("-c")
@@ -832,11 +835,6 @@ impl Operations {
             .rev()
             .collect::<String>();
         let tail = tail.trim().to_string();
-        if !output.status.success() {
-            eprintln!(
-                "Verification gate failed for {task_id} (session {session_id}): code {exit_code}"
-            );
-        }
         Ok((exit_code, tail))
     }
 
@@ -1177,8 +1175,12 @@ impl Operations {
             let _ = session_mgr.close_session(old_session);
         }
 
-        if self.auto_launch_enabled()? && !self.launch_agent(&task.id, &new_session_id, false)? {
-            session_mgr.crash_session(&new_session_id)?;
+        if self.auto_launch_enabled()?
+            && !self.finish_launch(
+                &new_session_id,
+                self.launch_agent(&task.id, &new_session_id, false),
+            )?
+        {
             return Ok(None);
         }
         Ok(Some(task))
@@ -1475,16 +1477,20 @@ impl Operations {
             (task, session_id)
         };
 
-        if self.auto_launch_enabled()? && !self.launch_agent(&task.id, &session_id, false)? {
-            let session_mgr = self.session_manager();
-            session_mgr.crash_session(&session_id)?;
-            let _guard = self.storage.lock()?;
-            if let Some(mut current) = self.storage.load_task(&task.id)? {
-                current.status = TaskStatus::Review;
-                current.updated_at = timefmt::now();
-                self.storage.save_task(&current)?;
+        if self.auto_launch_enabled()? {
+            match self.finish_launch(&session_id, self.launch_agent(&task.id, &session_id, false)) {
+                Ok(true) => {}
+                failed => {
+                    let _guard = self.storage.lock()?;
+                    if let Some(mut current) = self.storage.load_task(&task.id)? {
+                        current.status = TaskStatus::Review;
+                        current.updated_at = timefmt::now();
+                        self.storage.save_task(&current)?;
+                    }
+                    failed?;
+                    return Ok(None);
+                }
             }
-            return Ok(None);
         }
         Ok(Some(task))
     }
@@ -1558,8 +1564,9 @@ impl Operations {
             (task, session_id)
         };
 
-        if self.auto_launch_enabled()? && !self.launch_agent(&task.id, &session_id, false)? {
-            session_mgr.crash_session(&session_id)?;
+        if self.auto_launch_enabled()?
+            && !self.finish_launch(&session_id, self.launch_agent(&task.id, &session_id, false))?
+        {
             return Ok(None);
         }
         Ok(Some(task))
@@ -1616,14 +1623,54 @@ impl Operations {
 
     fn launch_agent(&self, task_id: &str, session_id: &str, revert: bool) -> Result<bool> {
         let Some(task) = self.storage.load_task(task_id)? else {
-            eprintln!("Warning: Task {task_id} not found. Agent not started.");
-            return Ok(false);
+            return Err(KanbanError::Invalid(format!(
+                "Task {task_id} not found. Agent not started."
+            )));
         };
         let task = self.record_launch_settings(task)?;
         self.log_launch_step(&task, session_id, revert);
-        Ok(self
+        match self
             .launcher
-            .launch(self.roots(), &task, session_id, revert))
+            .launch(self.roots(), &task, session_id, revert)
+        {
+            Ok(started) => Ok(started),
+            Err(err) => {
+                self.log_launch_failure(&task, session_id, &err.to_string());
+                Err(err)
+            }
+        }
+    }
+
+    fn log_launch_failure(&self, task: &Task, session_id: &str, detail: &str) {
+        let body = format!("✖ launch session={session_id} failed: {detail}");
+        let _ = self.thread_manager().and_then(|tm| {
+            tm.post_with_origin(
+                &task.id,
+                MessageRole::System,
+                MessageKind::AgentStep,
+                &body,
+                None,
+                vec![],
+                Some("kanban".to_string()),
+                Some("kanban".to_string()),
+            )
+        });
+    }
+
+    /// Crash the session when the agent did not start. `Ok(false)` stays a
+    /// soft failure; `Err` is the exact spawn error for the TUI status bar.
+    fn finish_launch(&self, session_id: &str, launched: Result<bool>) -> Result<bool> {
+        match launched {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                self.session_manager().crash_session(session_id)?;
+                Ok(false)
+            }
+            Err(err) => {
+                let _ = self.session_manager().crash_session(session_id);
+                Err(err)
+            }
+        }
     }
 
     /// Dump the assembled prompt to `.kanban/logs/<session>.prompt.txt` and
@@ -1634,18 +1681,8 @@ impl Operations {
             .storage
             .logs_dir
             .join(format!("{session_id}.prompt.txt"));
-        match build_agent_prompt(self.roots(), task, session_id, revert) {
-            Ok(prompt) => {
-                if let Err(err) = atomic_write_text(&prompt_path, &prompt) {
-                    eprintln!(
-                        "Warning: failed to write prompt dump {}: {err}",
-                        prompt_path.display()
-                    );
-                }
-            }
-            Err(err) => {
-                eprintln!("Warning: failed to build prompt dump for {session_id}: {err}");
-            }
+        if let Ok(prompt) = build_agent_prompt(self.roots(), task, session_id, revert) {
+            let _ = atomic_write_text(&prompt_path, &prompt);
         }
 
         let rel_prompt_path = prompt_path
@@ -1659,7 +1696,7 @@ impl Operations {
             task.ai_effort.as_deref().unwrap_or("-"),
             task.agent_name.as_deref().unwrap_or("-"),
         );
-        if let Err(err) = self.thread_manager().and_then(|tm| {
+        let _ = self.thread_manager().and_then(|tm| {
             tm.post_with_origin(
                 &task.id,
                 MessageRole::System,
@@ -1670,12 +1707,7 @@ impl Operations {
                 Some("kanban".to_string()),
                 Some("kanban".to_string()),
             )
-        }) {
-            eprintln!(
-                "Warning: failed to log agent launch step for {}: {err}",
-                task.id
-            );
-        }
+        });
     }
 
     /// Pin the backend, model, effort, and agent persona this launch resolved
@@ -1707,11 +1739,9 @@ impl Operations {
     pub fn launch_revert(&self, task_id: &str, session_id: &str) -> Result<bool> {
         SessionManager::validate_session_id(session_id)?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
-            eprintln!("Warning: Task {task_id} not found. Revert not started.");
             return Ok(false);
         };
         if !self.task_has_backups(task_id) {
-            eprintln!("Warning: no backups found for task {task_id}. Revert not started.");
             return Ok(false);
         }
 
@@ -1721,11 +1751,7 @@ impl Operations {
         self.storage.save_task(&task)?;
         self.session_manager()
             .link_named_session(task_id, session_id, &task.title)?;
-        let launched = self.launch_agent(task_id, session_id, true)?;
-        if !launched {
-            self.session_manager().crash_session(session_id)?;
-        }
-        Ok(launched)
+        self.finish_launch(session_id, self.launch_agent(task_id, session_id, true))
     }
 
     // ----------------------------------------- waiting / exit reconciliation
@@ -2031,19 +2057,10 @@ impl Operations {
         };
         match harvester.harvest(&transcript) {
             Ok(manifest) => {
-                if let Err(err) =
-                    provenance::write_manifest(&self.storage.provenance_dir, &manifest)
-                {
-                    eprintln!(
-                        "Warning: failed to write provenance manifest for {session_id}: {err}"
-                    );
-                }
+                let _ = provenance::write_manifest(&self.storage.provenance_dir, &manifest);
                 Some(manifest)
             }
-            Err(err) => {
-                eprintln!("Warning: failed to harvest transcript for {session_id}: {err}");
-                None
-            }
+            Err(_) => None,
         }
     }
 
@@ -2104,15 +2121,13 @@ impl Operations {
         if already_recorded {
             return;
         }
-        if let Err(err) = self.context_manager().append_context_with_session(
+        let _ = self.context_manager().append_context_with_session(
             task_id,
             &body,
             "agent-reply",
             Some(session_id),
             &self.storage,
-        ) {
-            eprintln!("Warning: failed to record agent reply for {task_id}: {err}");
-        }
+        );
     }
 
     fn reconcile_agent_exit_inner(
@@ -2225,7 +2240,7 @@ impl Operations {
                 manifest.summary()
             ));
         }
-        if let Err(err) = self.thread_manager().and_then(|tm| {
+        let _ = self.thread_manager().and_then(|tm| {
             tm.post_with_origin(
                 task_id,
                 MessageRole::System,
@@ -2236,9 +2251,7 @@ impl Operations {
                 Some("kanban".to_string()),
                 Some("kanban".to_string()),
             )
-        }) {
-            eprintln!("Warning: failed to log agent exit step for {task_id}: {err}");
-        }
+        });
     }
 
     /// Relaunch agents whose declared wait deadline has passed while their
@@ -2385,8 +2398,10 @@ impl Operations {
             new_session_id
         };
 
-        if !self.launch_agent(task_id, &new_session_id, false)? {
-            session_mgr.crash_session(&new_session_id)?;
+        if !self.finish_launch(
+            &new_session_id,
+            self.launch_agent(task_id, &new_session_id, false),
+        )? {
             return Ok(RespawnOutcome::LaunchFailed(new_session_id));
         }
         Ok(RespawnOutcome::Spawned(new_session_id))

@@ -453,11 +453,12 @@ fn render_action_bar(
             ("Del d".to_string(), UiAction::DeleteTask),
         ]
     } else {
-        let mut buttons: Vec<(String, UiAction)> = if task.status == TaskStatus::InProgress {
-            vec![("↻ Revoke r".to_string(), UiAction::Revoke)]
-        } else {
-            vec![("▶ Run r".to_string(), UiAction::Run)]
-        };
+        let mut buttons: Vec<(String, UiAction)> =
+            if app.primary_run_action_for(task) == UiAction::Revoke {
+                vec![("↻ Revoke r".to_string(), UiAction::Revoke)]
+            } else {
+                vec![("▶ Run r".to_string(), UiAction::Run)]
+            };
         if has_questions {
             buttons.push(("Answer w".to_string(), UiAction::AnswerQuestion));
         }

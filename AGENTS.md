@@ -283,7 +283,7 @@ they are edited: press `s` on the Projects screen. Saved under the store
 ### Auto-Launch Settings (.kanban/config.yaml `auto_launch:`)
 Controls how delegating a task spawns a background agent job (shared across all backends):
 - `enabled`: true - master switch for auto-launching
-- `use_tmux`: true - host the agent in a tmux session (falls back to a direct background process if tmux is missing)
+- `use_tmux`: true - host the agent in a tmux session (falls back to a direct background process if tmux is missing or `new-session` fails)
 - `terminal_fallback`: true
 - `auto_complete_on_exit`: false - whether agent exit auto-completes the task
 - `default_agent`: opencode - backend used when a task has no `agent_backend`
@@ -303,9 +303,9 @@ Each task carries an `agent_backend` field selecting which CLI runs it. When uns
 Per-task persona: `task.agent_name` is passed to opencode as `--agent`, overriding the backend default. opencode matches `--agent` against an agent's *exact* registered name (oh-my-openagent personas are decorated strings), so the friendly key is resolved via `opencode agent list`. Because starting the opencode CLI takes seconds, resolution is deferred into the launch wrapper script: the spawned session calls the hidden `kanban resolve-agent` command and substitutes the result into `--agent`, so the launching process (TUI or CLI) never blocks on it. If opencode is unavailable or lists no match the key is passed through unchanged. The claude backend ignores `agent_name`.
 
 Built-in backends:
-- **opencode**: `opencode run --title "<id>: <title>" [extra_args] [--model M] [--variant E] [--agent A] <prompt>`. A task's `ai_effort` (or the backend `effort` default) is passed as `--variant`, opencode's per-model reasoning-effort selector.
-- **claude** (Claude Code): `claude --print [extra_args] [--model M] [--effort E] <prompt>`. Default `extra_args` is `["--dangerously-skip-permissions"]` — tighten in config for stricter permissions. Default models are the `fable`/`opus`/`sonnet`/`haiku` aliases; `ai_effort` is passed as `--effort` (`low`/`medium`/`high`/`xhigh`/`max`).
-- **omp** / **pi** (the "pi" agent family): `<command> -p --mode json [extra_args] [--model M] [--thinking E] <prompt>`. Run non-interactively with `-p`, taking the prompt as a positional argument; `ai_effort` is passed as `--thinking` (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`). Model uses fuzzy `provider/id` selectors from the live catalog. Neither has a launch-time persona flag, so `agent_name` is ignored. `--mode json` makes them emit the same NDJSON event stream on stdout as their session files, so their runs are harvested for telemetry and input provenance exactly like claude/opencode. Both probe stdin even under `-p` and hang forever on an inherited pane TTY, so the wrapper closes their stdin (`< /dev/null`).
+- **opencode**: `opencode run --title "<id>: <title>" [extra_args] [--model M] [--variant E] [--agent A]` plus the prompt file as the last argument. A task's `ai_effort` (or the backend `effort` default) is passed as `--variant`, opencode's per-model reasoning-effort selector.
+- **claude** (Claude Code): `claude --print [extra_args] [--model M] [--effort E]` plus the prompt file as the last argument. Default `extra_args` is `["--dangerously-skip-permissions"]` — tighten in config for stricter permissions. Default models are the `fable`/`opus`/`sonnet`/`haiku` aliases; `ai_effort` is passed as `--effort` (`low`/`medium`/`high`/`xhigh`/`max`).
+- **omp** / **pi** (the "pi" agent family): `<command> -p --mode json [extra_args] [--model M] [--thinking E]` plus the prompt file as the last argument. Run non-interactively with `-p`; `ai_effort` is passed as `--thinking` (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`). Model uses fuzzy `provider/id` selectors from the live catalog. Neither has a launch-time persona flag, so `agent_name` is ignored. `--mode json` makes them emit the same NDJSON event stream on stdout as their session files, so their runs are harvested for telemetry and input provenance exactly like claude/opencode. Both probe stdin even under `-p` and hang forever on an inherited pane TTY, so the wrapper closes their stdin (`< /dev/null`).
 
 ### TUI Keyboard Shortcuts
 
@@ -315,10 +315,11 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `Tab` / `Shift+Tab`: Next/previous column (board) · cycle
   thread/answer/editor panels (detail)
 - `Enter`: Show task detail
-- `r`: **Run / Revoke** — start a task immediately; for an In Progress task,
-  revoke its current session and wake it immediately on a fresh one
-  (the board is human-managed and agent-executed; "delegate" terminology and
-  its confirmation dialog were removed)
+- `r`: **Run / Revoke** — start a task immediately; for an In Progress task
+  whose session is still live, waiting, or crashed, revoke it and wake a
+  fresh one. A cleanly closed session stays idle: `r` is Run again, not
+  recover (the board is human-managed and agent-executed; "delegate"
+  terminology and its confirmation dialog were removed)
 - `n`: New task in the focused column
 - `s`: Open Project Settings from Board or Detail: project name, default backend,
   its model/effort/persona defaults, dark/light theme, and task sorting. On the
@@ -362,6 +363,20 @@ way earlier boards ended up with tasks whose title and description were random
 fragments of the pasted text. A paste with no text field focused is dropped
 with a status hint instead of being executed. `Ctrl+V` (image paste from the
 clipboard) is unaffected.
+
+Copying (drag across text on the board, then release) puts the selection on the
+system clipboard through a native helper first — `pbcopy` on macOS, `wl-copy`
+when `WAYLAND_DISPLAY` is set, `xclip`/`xsel` when `DISPLAY` is set, `clip.exe`
+under WSL — and only falls back to the OSC 52 escape when no helper exists, as
+on a remote session. The helper runs first because OSC 52 is write-only and
+fails silently: tmux drops it unless `set-clipboard`/`allow-passthrough` are
+enabled and several terminals refuse clipboard writes, which leaves the status
+bar reporting a copy that cannot be pasted anywhere. The fallback wraps the
+sequence in the tmux DCS passthrough (sending the bare form too, since only one
+of the two survives any given tmux configuration) and in chunked DCS
+passthroughs under `screen`. Helper output is discarded rather than captured
+because helpers that daemonise to own the X11 selection hold the inherited
+pipes open; a helper still resident after the handoff counts as success.
 
 Sessions view: each row shows the session state (`▶` live heartbeat, `⏳`
 declared wait, `✖` crashed), its task, the token count, the agent's todo
@@ -429,7 +444,10 @@ custom-input row, typing fills the custom answer, `Enter` submits. Cards with
 open questions show the question text as a preview line; clicking it jumps
 straight to the answer panel. Interactive tasks whose agent is blocked on
 `kanban ask --wait` show a `⏳ waiting` badge; tasks in declared wait mode show
-`⏳ until HH:MM`, and stuck/crashed tasks show `✖ crashed · u recover`. The review-edits editor is
+`⏳ until HH:MM`. A session that is actually crashed (status crashed, stale
+heartbeat, or missing session file) shows `✖ crashed · u recover`. A cleanly
+closed session on In Progress is idle — `r` runs a fresh agent; it is not
+painted crashed. The review-edits editor is
 editable only while the task is in Review (read-only or hidden otherwise), and
 saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
 `Ctrl+R` / action-bar button. Create/edit dialogs expose an `interactive`
@@ -455,8 +473,10 @@ Closure invariant for non-interactive agent jobs: after implementation and verif
 ### Agent Auto-Launch
 When a task is handed to an agent (`take --agent`, or the TUI `r` Run action) and auto-launch is enabled, the CLI spawns the agent itself:
 - Builds a non-interactive command per backend (see "Agent Backends"). Model resolves from `task.ai_model`, else the backend default; reasoning effort from `task.ai_effort`, else the backend `effort` default.
+- The assembled prompt is written to `.kanban/logs/<session>.prompt.txt`. The wrapper feeds it as the last argument with `"$(cat -- <file>)"` so the body is never placed on the tmux/`bash -c` argv (ARG_MAX / `ps`).
 - The prompt instructs the agent to: work only on this task, use the provided `KANBAN_SESSION`/`KANBAN_TASK_ID` env vars, back up touched files, record progress via `kanban context`, and finish with `kanban done --agent`. When `interactive: true`, blocking questions go through `kanban ask --wait --session <id>`. Long detached waits go through `kanban detach --session <id> -- <command>` (preferred; survives the session and records output/exit code under `.kanban/detached/`) or a manual `setsid`/`nohup` launch plus `kanban waiting --session <id>` — the prompt warns that plain background jobs die with the session's process group. Clean exits that leave a task In Progress without `done`, `ask`, or `waiting` are automatically resumed up to `max_auto_resumes`. The prompt stays backend-neutral.
-- If `use_tmux` and tmux is available → runs inside a detached tmux session (reattachable via `kanban attach`); otherwise falls back to a background process. Either way stdout/stderr is teed to `.kanban/logs/<session>.log`. Session ids are prefixed by backend (`ses-<backend>-...`).
+- If `use_tmux` and tmux is available → `tmux new-session -d` with stdin/stdout/stderr detached from the TUI TTY (`-x`/`-y` size, `-c` work path; tmux stderr goes to `.kanban/logs/<session>.tmux.err`). A non-zero tmux exit takes the same background fallback as a missing tmux binary; the exact error is posted on the thread and returned to the TUI status bar instead of `eprintln`. Either way agent stdout/stderr is teed to `.kanban/logs/<session>.log`. Session ids are prefixed by backend (`ses-<backend>-...`).
+- While the TUI owns the terminal, `operations` never writes to stderr (`eprintln`). After a TUI-initiated launch (run / revoke / re-run / revert, or an expired-wait relaunch) the event loop `terminal.clear()`s and fully redraws, same as after attach, so a leaked glyph cannot desync ratatui's buffer from the alternate screen.
 - Agent exit is watched to reconcile task/session state.
 
 ### Task Chaining

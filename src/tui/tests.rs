@@ -1942,6 +1942,10 @@ fn review_rerun_from_board_focuses_in_progress() {
 
     app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
         .expect("rerun");
+    assert!(
+        app.take_full_redraw(),
+        "rerun must request a full terminal redraw"
+    );
 
     assert_eq!(app.screen, Screen::Board);
     assert_eq!(app.focused_column, in_progress_column(&app));
@@ -1966,6 +1970,10 @@ fn run_hotkey_starts_task_without_confirmation() {
     app.clamp_focus();
 
     app.handle_key(key(KeyCode::Char('r'))).expect("run");
+    assert!(
+        app.take_full_redraw(),
+        "run must request a full terminal redraw"
+    );
 
     assert!(app.modal.is_none(), "run must not open any dialog");
     assert!(app.status.starts_with("Started"), "status: {}", app.status);
@@ -1986,6 +1994,10 @@ fn run_hotkey_starts_task_without_confirmation() {
         .mark_wait_exited(&session_id)
         .expect("agent process exited");
     app.handle_key(key(KeyCode::Char('r'))).expect("revoke");
+    assert!(
+        app.take_full_redraw(),
+        "revoke must request a full terminal redraw"
+    );
     assert!(app.status.contains("Revoked and woke"), "{}", app.status);
     let revoked = app.ops.get_task(&task.id).unwrap().unwrap();
     assert_ne!(revoked.session.as_deref(), Some(session_id.as_str()));
@@ -3474,15 +3486,52 @@ fn phase_three_questioned_task_with_closed_session_is_not_marked_crashed() {
 }
 
 #[test]
-fn phase_three_stuck_in_progress_card_and_detail_show_recover_hint() {
+fn phase_three_closed_session_in_progress_is_idle_not_crashed() {
     let (dir, mut app) = app_with_board();
-    let mut task = app.ops.create_task(NewTask::titled("Stranded")).unwrap();
+    let mut task = app
+        .ops
+        .create_task(NewTask::titled("Finished asking"))
+        .unwrap();
     task.status = crate::core::models::TaskStatus::InProgress;
     task.session = Some("ses-closed".to_string());
     app.ops.storage.save_task(&task).unwrap();
     let manager = SessionManager::new(dir.path());
     manager.link_session(&task.id, "ses-closed").unwrap();
     manager.close_session("ses-closed").unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let board = render_at(&mut app, 120, 18);
+    assert!(!board.contains("✖ crashed"), "{board}");
+    assert!(!app.board.session_states.contains_key(&task.id));
+    assert!(board.contains("r run"), "{board}");
+    assert!(!board.contains("r revoke"), "{board}");
+
+    app.focused_column = 1;
+    app.dispatch(UiAction::OpenDetail).unwrap();
+    let detail = render_at(&mut app, 120, 24);
+    assert!(!detail.contains("press u / Recover"), "{detail}");
+    assert!(!detail.contains("[ Recover u ]"), "{detail}");
+    assert!(detail.contains("Run r"), "{detail}");
+    assert!(!detail.contains("Revoke r"), "{detail}");
+
+    app.handle_key(key(KeyCode::Char('r'))).unwrap();
+    assert!(
+        app.status.starts_with("Started"),
+        "closed In Progress must run, not revoke: {}",
+        app.status
+    );
+}
+
+#[test]
+fn phase_three_missing_session_file_in_progress_is_still_crashed() {
+    let (_dir, mut app) = app_with_board();
+    let mut task = app
+        .ops
+        .create_task(NewTask::titled("Lost session"))
+        .unwrap();
+    task.status = crate::core::models::TaskStatus::InProgress;
+    task.session = Some("ses-gone".to_string());
+    app.ops.storage.save_task(&task).unwrap();
     app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
 
     let board = render_at(&mut app, 120, 18);

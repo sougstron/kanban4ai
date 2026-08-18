@@ -385,6 +385,11 @@ pub struct App {
     /// Upper help scroll bound, set by the renderer from the overlay height.
     pub help_max_scroll: u16,
     pending_terminal: Option<TerminalAction>,
+    /// Set after a TUI-initiated launch so the event loop can `terminal.clear()`
+    /// and fully redraw. Launch used to `eprintln` (and tmux used to inherit
+    /// the raw TTY); ratatui then diffed against a buffer that no longer
+    /// matched the screen.
+    pending_full_redraw: bool,
     pending_fs_reload: bool,
     fs_change_generation: u64,
     recent_models: Vec<String>,
@@ -602,6 +607,7 @@ impl App {
             help_scroll: 0,
             help_max_scroll: 0,
             pending_terminal: None,
+            pending_full_redraw: false,
             pending_fs_reload: false,
             fs_change_generation: 0,
             recent_models,
@@ -695,6 +701,7 @@ impl App {
             help_scroll: 0,
             help_max_scroll: 0,
             pending_terminal: None,
+            pending_full_redraw: false,
             pending_fs_reload: false,
             fs_change_generation: 0,
             recent_models: Vec::new(),
@@ -915,14 +922,10 @@ impl App {
             (KeyCode::Char('e'), _) if action_screen => self.dispatch(UiAction::EditTask)?,
             (KeyCode::Char('m'), _) if action_screen => self.dispatch(UiAction::MoveTask)?,
             (KeyCode::Char('r'), _) if action_screen => {
-                let action = if self
+                let action = self
                     .current_task()
-                    .is_some_and(|task| task.status == TaskStatus::InProgress)
-                {
-                    UiAction::Revoke
-                } else {
-                    UiAction::Run
-                };
+                    .map(|task| self.primary_run_action_for(&task))
+                    .unwrap_or(UiAction::Run);
                 self.dispatch(action)?
             }
             (KeyCode::Char('w'), _) if action_screen => self.dispatch(UiAction::AnswerQuestion)?,
@@ -2076,6 +2079,7 @@ impl App {
         self.last_wait_resume = Some(Instant::now());
         match self.ops.resume_expired_waits() {
             Ok(resumed) if !resumed.is_empty() => {
+                self.request_full_redraw();
                 let tasks = resumed
                     .iter()
                     .map(|(task_id, _)| task_id.as_str())
@@ -2371,6 +2375,17 @@ impl App {
             return self.detail.as_ref().and_then(|detail| detail.task.clone());
         }
         self.focused_task().cloned()
+    }
+
+    /// `r` revokes only while a session is still Live, Waiting, or Crashed
+    /// (something to replace). A cleanly closed session is idle: `r` runs.
+    pub(super) fn primary_run_action_for(&self, task: &Task) -> UiAction {
+        if task.status == TaskStatus::InProgress && self.board.session_states.contains_key(&task.id)
+        {
+            UiAction::Revoke
+        } else {
+            UiAction::Run
+        }
     }
 
     fn current_task_id(&self) -> Option<String> {
@@ -3114,6 +3129,7 @@ impl App {
             return Ok(());
         };
         let should_close_detail = self.screen == Screen::Detail;
+        self.request_full_redraw();
         let started = match self.ops.start_task(&task_id) {
             Ok(Some(session_id)) => {
                 self.status = format!("Started {task_id} → {session_id}");
@@ -3146,10 +3162,19 @@ impl App {
         }
         let task_id = task.id.clone();
         let expected_session = task.session.clone();
-        let relaunched = self
+        self.request_full_redraw();
+        let relaunched = match self
             .ops
-            .revoke_in_progress_task(&task_id, expected_session.as_deref())?
-            .is_some();
+            .revoke_in_progress_task(&task_id, expected_session.as_deref())
+        {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                self.refresh_after_action()?;
+                self.status = err.to_string();
+                return Ok(());
+            }
+        };
         self.refresh_after_action()?;
         self.status = if relaunched {
             format!("Revoked and woke {task_id}")
@@ -3251,6 +3276,7 @@ impl App {
             return Ok(());
         };
         let from_review = task.status == TaskStatus::Review;
+        self.request_full_redraw();
         let relaunched = match task.status {
             TaskStatus::Review => {
                 self.save_visible_review_edits_before_rerun(&task)?;
@@ -3699,6 +3725,14 @@ impl App {
 
     pub fn take_terminal_action(&mut self) -> Option<TerminalAction> {
         self.pending_terminal.take()
+    }
+
+    fn request_full_redraw(&mut self) {
+        self.pending_full_redraw = true;
+    }
+
+    pub fn take_full_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.pending_full_redraw)
     }
 
     pub fn finish_terminal_action(&mut self, action: &TerminalAction, ok: bool) {
@@ -4237,6 +4271,7 @@ impl App {
             }
             Modal::RevertConfirm { task_id } => {
                 let session_id = format!("ses-revert-{}", timefmt::now().format("%Y%m%d-%H%M%S"));
+                self.request_full_redraw();
                 self.status = if self.ops.launch_revert(&task_id, &session_id)? {
                     format!("Revert of {task_id} launched ({session_id})")
                 } else {
@@ -4472,7 +4507,8 @@ impl BoardSnapshot {
         };
         let tasks = ops.list_tasks(None, None, sort_by, order)?;
         let heartbeat_timeout = ops.config.get_threshold("session_heartbeat_timeout")?;
-        let sessions_by_id = SessionManager::new(&ops.storage.project_path)
+        let session_mgr = SessionManager::new(&ops.storage.project_path);
+        let sessions_by_id = session_mgr
             .list_sessions_with_state(heartbeat_timeout)
             .into_iter()
             .map(|(session, state)| {
@@ -4501,14 +4537,15 @@ impl BoardSnapshot {
                 Some((task.id.clone(), *state))
             })
             .collect::<HashMap<_, _>>();
-        // An In Progress task whose session record is closed or gone is
-        // stranded — nothing will move it. Surface it as crashed instead of
-        // letting it look idle.
+        // A missing session file on In Progress is stranded. A Closed record
+        // is the last agent finishing cleanly — leave the card idle so `r`
+        // is Run. Painting Closed as Crashed was the Idle Racer lie.
         for task in &tasks {
             if task.status == TaskStatus::InProgress
-                && task.session.is_some()
+                && let Some(session_id) = task.session.as_deref()
                 && !session_states.contains_key(&task.id)
                 && !(task.has_questions && ops.first_open_question(&task.id)?.is_some())
+                && session_mgr.load_session(session_id).is_none()
             {
                 session_states.insert(task.id.clone(), SessionState::Crashed);
             }

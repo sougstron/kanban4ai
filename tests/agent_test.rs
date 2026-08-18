@@ -72,7 +72,18 @@ agents:
         "--title",
         "TASK-001: Implement launcher"
     ));
-    assert_eq!(plan.args.last().unwrap(), &plan.prompt);
+    assert!(
+        !plan.args.iter().any(|arg| arg == &plan.prompt),
+        "prompt body must not be placed on argv"
+    );
+    assert_eq!(
+        plan.prompt_file.as_ref(),
+        Some(&plan.log_file.with_file_name("ses-opencode-test.prompt.txt"))
+    );
+    assert_eq!(
+        std::fs::read_to_string(plan.prompt_file.as_ref().unwrap()).unwrap(),
+        plan.prompt
+    );
     assert!(
         plan.prompt
             .contains("KANBAN_SESSION is set to ses-opencode-test")
@@ -363,9 +374,16 @@ agents:
 
     assert_eq!(plan.backend, "omp");
     assert_eq!(plan.command, "omp");
-    // Non-interactive `-p`, prompt as the trailing positional argument.
+    // Non-interactive `-p`; prompt body is on disk, not the trailing argv.
     assert_eq!(plan.args[0], "-p");
-    assert_eq!(plan.args.last().unwrap(), &plan.prompt);
+    assert!(
+        !plan.args.iter().any(|arg| arg == &plan.prompt),
+        "prompt body must not be placed on argv"
+    );
+    assert_eq!(
+        std::fs::read_to_string(plan.prompt_file.as_ref().unwrap()).unwrap(),
+        plan.prompt
+    );
     assert!(has_arg_pair(
         &plan.args,
         "--model",

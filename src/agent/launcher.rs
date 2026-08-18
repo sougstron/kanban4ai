@@ -3,6 +3,7 @@ use crate::agent::backends::{
 };
 use crate::agent::tmux::spawn_plan;
 use crate::core::config::Config;
+use crate::core::error::Result;
 use crate::core::models::Task;
 use crate::core::operations::AgentLauncher;
 use crate::core::project::Roots;
@@ -11,17 +12,14 @@ use crate::core::project::Roots;
 pub struct KanbanLauncher;
 
 impl AgentLauncher for KanbanLauncher {
-    fn launch(&self, roots: Roots<'_>, task: &Task, session_id: &str, revert: bool) -> bool {
-        match launch(roots, task, session_id, revert) {
-            Ok(started) => started,
-            Err(err) => {
-                eprintln!(
-                    "Warning: failed to launch agent for task {} session {}: {}",
-                    task.id, session_id, err
-                );
-                false
-            }
-        }
+    fn launch(
+        &self,
+        roots: Roots<'_>,
+        task: &Task,
+        session_id: &str,
+        revert: bool,
+    ) -> Result<bool> {
+        launch(roots, task, session_id, revert)
     }
 }
 
