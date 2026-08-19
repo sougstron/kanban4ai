@@ -597,6 +597,49 @@ fn sessions_heartbeat_check_recover() {
 }
 
 #[test]
+fn stop_closes_active_session_and_keeps_task_in_progress() {
+    let dir = board();
+    kanban(&dir).args(["create", "Stop me"]).assert().success();
+    kanban(&dir)
+        .args(["take", "TASK-001", "--session", "ses-cli-stop", "--agent"])
+        .assert()
+        .success();
+
+    kanban(&dir)
+        .args(["stop", "TASK-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Stopped TASK-001 session ses-cli-stop",
+        ));
+
+    kanban(&dir)
+        .arg("sessions")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No active sessions."));
+
+    kanban(&dir)
+        .args(["show", "TASK-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Status: in_progress"))
+        .stdout(predicate::str::contains("ses-cli-stop"));
+
+    kanban(&dir)
+        .args(["stop", "TASK-001"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("has no active session"));
+
+    kanban(&dir)
+        .args(["stop", "TASK-404"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Task TASK-404 not found"));
+}
+
+#[test]
 fn sessions_uses_saved_name_when_task_file_is_missing() {
     let dir = board();
     kanban(&dir)

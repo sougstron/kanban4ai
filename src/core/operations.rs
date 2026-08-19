@@ -662,35 +662,63 @@ impl Operations {
         Ok(Some(session_id))
     }
 
-    /// Stop a running agent session: kill its tmux host when present and mark
-    /// the session closed. Background (non-tmux) agent processes cannot be
-    /// signalled — their session record is still closed so the board stops
-    /// treating the task as running. The task keeps its current status and its
-    /// session id (now the last session that worked it); recover or rerun
-    /// decide what happens next.
+    /// Stop a running agent session: mark it closed first so a racing
+    /// `agent-exit` cannot auto-resume, then kill its tmux host when present.
+    /// Background (non-tmux) agent processes cannot be signalled — their
+    /// session record is still closed so the board stops treating the task as
+    /// running. The task keeps its current status and its session id (now the
+    /// last session that worked it); recover or rerun decide what happens next.
     pub fn stop_session(&self, session_id: &str) -> Result<Option<Task>> {
         let session_mgr = self.session_manager();
         let Some(session) = session_mgr.load_session(session_id) else {
             return Ok(None);
         };
+        let was_active = session.status == SessionStatus::Active;
+        if was_active {
+            session_mgr.close_session(session_id)?;
+        }
         let _ = crate::agent::kill_session(session_id);
-        session_mgr.close_session(session_id)?;
         let Some(task) = ({
             let _guard = self.storage.lock()?;
             self.storage.load_task(&session.task_id)?
         }) else {
             return Ok(None);
         };
-        self.thread_manager()?.post(
-            &task.id,
-            MessageRole::System,
-            MessageKind::System,
-            &format!("Session {session_id} was stopped by the user."),
-            None,
-            vec![],
-            Some("kanban".to_string()),
-        )?;
+        if was_active {
+            self.thread_manager()?.post(
+                &task.id,
+                MessageRole::System,
+                MessageKind::System,
+                &format!("Session {session_id} was stopped by the user."),
+                None,
+                vec![],
+                Some("kanban".to_string()),
+            )?;
+        }
         Ok(Some(task))
+    }
+
+    /// Stop the active agent session attached to a task. Missing tasks return
+    /// `Ok(None)`; a task with no active session is an error.
+    pub fn stop_task(&self, task_id: &str) -> Result<Option<Task>> {
+        let task = {
+            let _guard = self.storage.lock()?;
+            self.storage.load_task(task_id)?
+        };
+        let Some(task) = task else {
+            return Ok(None);
+        };
+        let Some(session_id) = task.session.clone() else {
+            return Err(KanbanError::Invalid(format!(
+                "Task {task_id} has no active session"
+            )));
+        };
+        if !self.session_manager().is_session_active(&session_id) {
+            return Err(KanbanError::Invalid(format!(
+                "Task {task_id} has no active session"
+            )));
+        }
+        self.stop_session(&session_id)
     }
 
     pub fn complete_task(
@@ -2141,6 +2169,9 @@ impl Operations {
             return Ok(AgentExitOutcome::Closed);
         };
         if session.task_id != task_id || session.id != session_id {
+            return Ok(AgentExitOutcome::Closed);
+        }
+        if session.status != SessionStatus::Active {
             return Ok(AgentExitOutcome::Closed);
         }
         if exit_status != 0 {

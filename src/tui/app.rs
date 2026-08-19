@@ -171,6 +171,7 @@ pub enum UiAction {
     DeleteTask,
     Run,
     Revoke,
+    Stop,
     AnswerQuestion,
     Recover,
     Approve,
@@ -933,6 +934,7 @@ impl App {
             (KeyCode::Char('t'), _) if action_screen => self.dispatch(UiAction::Attach)?,
             (KeyCode::Char('c'), _) if action_screen => self.dispatch(UiAction::AddContext)?,
             (KeyCode::Char('u'), _) if action_screen => self.dispatch(UiAction::Recover)?,
+            (KeyCode::Char('k'), _) if action_screen => self.dispatch(UiAction::Stop)?,
             (KeyCode::Char('['), _) if self.screen == Screen::Detail => {
                 self.move_thread_selection(-1)
             }
@@ -1296,6 +1298,7 @@ impl App {
             // is the primary action and never asks for confirmation.
             UiAction::Run => self.run_current_task()?,
             UiAction::Revoke => self.revoke_current_task()?,
+            UiAction::Stop => self.open_stop_confirm(),
             UiAction::AnswerQuestion => self.open_answer_dialog()?,
             UiAction::Recover => self.recover_current_task()?,
             UiAction::Approve => self.approve_current_task()?,
@@ -2388,6 +2391,16 @@ impl App {
         }
     }
 
+    /// Live or waiting In Progress sessions can be stopped without replacing them.
+    /// Crashed sessions use recover; a cleanly closed session is already idle.
+    pub(super) fn task_can_stop(&self, task: &Task) -> bool {
+        task.status == TaskStatus::InProgress
+            && matches!(
+                self.board.session_states.get(&task.id),
+                Some(SessionState::Live | SessionState::Waiting)
+            )
+    }
+
     fn current_task_id(&self) -> Option<String> {
         if self.screen == Screen::Detail {
             return self.detail.as_ref().map(|detail| detail.task_id.clone());
@@ -3371,6 +3384,22 @@ impl App {
                 self.modal = Some(ModalState::new(Modal::KillSessionConfirm { session_id }));
             }
             None => self.status = "No session selected".to_string(),
+        }
+    }
+
+    fn open_stop_confirm(&mut self) {
+        let session_id = self.current_task().and_then(|task| {
+            if self.task_can_stop(&task) {
+                task.session.clone()
+            } else {
+                None
+            }
+        });
+        match session_id {
+            Some(session_id) => {
+                self.modal = Some(ModalState::new(Modal::KillSessionConfirm { session_id }));
+            }
+            None => self.status = "No running session to stop".to_string(),
         }
     }
 

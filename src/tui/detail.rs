@@ -459,6 +459,9 @@ fn render_action_bar(
             } else {
                 vec![("▶ Run r".to_string(), UiAction::Run)]
             };
+        if app.task_can_stop(task) {
+            buttons.push(("Stop k".to_string(), UiAction::Stop));
+        }
         if has_questions {
             buttons.push(("Answer w".to_string(), UiAction::AnswerQuestion));
         }

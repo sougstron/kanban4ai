@@ -5,7 +5,9 @@ mod common;
 use common::ops_with_recorder;
 use kanban4ai::core::context::ContextManager;
 use kanban4ai::core::error::KanbanError;
-use kanban4ai::core::models::{MessageKind, MessageRole, MessageStatus, Task, TaskStatus};
+use kanban4ai::core::models::{
+    MessageKind, MessageRole, MessageStatus, SessionStatus, Task, TaskStatus,
+};
 use kanban4ai::core::operations::{
     AgentExitOutcome, AgentLauncher, NoopLauncher, Operations, QuestionRef, TaskPatch, sort_tasks,
 };
@@ -1959,6 +1961,60 @@ fn stop_session_closes_session_and_keeps_it_on_the_task() {
     );
 
     assert!(ops.stop_session("ses-missing").unwrap().is_none());
+}
+
+#[test]
+fn stop_task_requires_an_active_session() {
+    let (_dir, ops, _recorder) = ops_with_recorder(true);
+    let idle = ops.create_task(NewTask::titled("Idle")).unwrap();
+    assert!(matches!(
+        ops.stop_task(&idle.id),
+        Err(KanbanError::Invalid(_))
+    ));
+    assert!(ops.stop_task("TASK-999").unwrap().is_none());
+
+    let running = ops.create_task(NewTask::titled("Running")).unwrap();
+    ops.take_task(&running.id, "ses-stop-task", true)
+        .unwrap()
+        .unwrap();
+    let stopped = ops.stop_task(&running.id).unwrap().unwrap();
+    assert_eq!(stopped.status, TaskStatus::InProgress);
+    assert_eq!(stopped.session.as_deref(), Some("ses-stop-task"));
+    assert!(matches!(
+        ops.stop_task(&running.id),
+        Err(KanbanError::Invalid(_))
+    ));
+}
+
+#[test]
+fn stop_session_then_agent_exit_does_not_resume_or_crash() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Do not resume")).unwrap();
+    ops.take_task(&task.id, "ses-stop-exit", true)
+        .unwrap()
+        .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    ops.stop_session("ses-stop-exit").unwrap();
+    assert_eq!(
+        ops.reconcile_agent_exit(&task.id, "ses-stop-exit", 0)
+            .unwrap(),
+        AgentExitOutcome::Closed
+    );
+    assert_eq!(
+        ops.reconcile_agent_exit(&task.id, "ses-stop-exit", 1)
+            .unwrap(),
+        AgentExitOutcome::Closed
+    );
+    assert!(recorder.calls().is_empty());
+
+    let session = SessionManager::new(dir.path())
+        .load_session("ses-stop-exit")
+        .unwrap();
+    assert_eq!(session.status, SessionStatus::Closed);
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_eq!(stored.session.as_deref(), Some("ses-stop-exit"));
 }
 
 #[test]

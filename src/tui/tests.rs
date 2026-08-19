@@ -2028,7 +2028,9 @@ fn in_progress_detail_shows_revoke_instead_of_run() {
     let rendered = render_at(&mut app, 100, 24);
 
     assert!(rendered.contains("Revoke r"), "{rendered}");
+    assert!(rendered.contains("Stop k"), "{rendered}");
     assert!(rendered.contains("r revoke"), "{rendered}");
+    assert!(rendered.contains("k stop"), "{rendered}");
     assert!(
         app.hitboxes
             .iter()
@@ -2037,8 +2039,57 @@ fn in_progress_detail_shows_revoke_instead_of_run() {
     assert!(
         app.hitboxes
             .iter()
+            .any(|hitbox| hitbox.action == HitAction::Action(UiAction::Stop))
+    );
+    assert!(
+        app.hitboxes
+            .iter()
             .all(|hitbox| hitbox.action != HitAction::Action(UiAction::Run))
     );
+}
+
+#[test]
+fn board_stop_hotkey_closes_session_without_relaunch() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Stop from board"))
+        .expect("create task");
+    app.ops
+        .take_task(&task.id, "ses-board-stop", true)
+        .unwrap()
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.focused_column = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == "in_progress")
+        .expect("in_progress column");
+    app.focused_card = 0;
+
+    app.handle_key(key(KeyCode::Char('k'))).expect("stop");
+    assert!(matches!(
+        app.modal.as_ref().expect("stop confirm").modal,
+        Modal::KillSessionConfirm { .. }
+    ));
+    app.handle_key(key(KeyCode::Char('y')))
+        .expect("confirm stop");
+    assert!(
+        app.status.starts_with("Stopped ses-board-stop"),
+        "{}",
+        app.status
+    );
+
+    let stopped = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stopped.status.as_str(), "in_progress");
+    assert_eq!(stopped.session.as_deref(), Some("ses-board-stop"));
+    assert!(!SessionManager::new(dir.path()).is_session_active("ses-board-stop"));
+    assert_eq!(app.primary_run_action_for(&stopped), UiAction::Run);
+
+    app.handle_key(key(KeyCode::Char('k'))).expect("idle stop");
+    assert!(app.modal.is_none());
+    assert_eq!(app.status, "No running session to stop");
 }
 
 #[test]

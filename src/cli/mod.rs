@@ -288,6 +288,9 @@ enum Command {
     CheckSessions,
     /// Recover a crashed task.
     Recover { task_id: String },
+    /// Stop the running agent session for a task (leaves the task In Progress).
+    Stop { task_id: String },
+
     /// List active sessions.
     Sessions,
     /// Show remaining subscription limits for the agent providers (claude, codex, grok, zai, synthetic).
@@ -900,6 +903,16 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 println!("Task {task_id} recovered and moved to To Do");
             }
             None => eprintln!("Task {task_id} not found"),
+        },
+        Command::Stop { task_id } => match ops.stop_task(&task_id)? {
+            Some(task) => {
+                let session = task.session.as_deref().unwrap_or("unknown");
+                println!("Stopped {task_id} session {session}");
+            }
+            None => {
+                eprintln!("Task {task_id} not found");
+                return Ok(ExitCode::FAILURE);
+            }
         },
         Command::Sessions => {
             let session_mgr = SessionManager::new(ops.data_root());

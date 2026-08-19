@@ -198,6 +198,7 @@ messages:
 - `kanban heartbeat --session <id>` - Update session heartbeat
 - `kanban check-sessions` - Find crashed sessions
 - `kanban recover <id>` - Recover crashed task
+- `kanban stop <id>` - Stop the task's running agent session; the task stays In Progress (idle)
 - `kanban sessions` - List active sessions
 - `kanban archive` - List archived tasks
 - `kanban archive-done` - Move all Done tasks to Archive
@@ -320,6 +321,10 @@ Action hotkeys work on both the board (focused card) and the open detail view.
   fresh one. A cleanly closed session stays idle: `r` is Run again, not
   recover (the board is human-managed and agent-executed; "delegate"
   terminology and its confirmation dialog were removed)
+- `k`: **Stop** — kill a live or waiting agent session on the focused In Progress
+  task (or its detail). The task stays In Progress so `r` can run it again.
+  Confirm first. Distinct from revoke (`r`), which stops and immediately starts
+  a fresh session. Sessions view still uses `x` to kill a selected session.
 - `n`: New task in the focused column
 - `s`: Open Project Settings from Board or Detail: project name, default backend,
   its model/effort/persona defaults, dark/light theme, and task sorting. On the
@@ -436,7 +441,7 @@ dropped in the rewrite — it never worked reliably; `u` now means recover.
 
 The detail view renders the thread (open questions, variants, suggestions,
 resolved entries) plus the task's `chained_to` target, and a bottom action bar
-with clickable, context-sensitive buttons (Run/Answer/Approve/Re-run/Attach/
+with clickable, context-sensitive buttons (Run/Stop/Answer/Approve/Re-run/Attach/
 Edit/Move/+Ctx/Revert/Del). When the task has open questions an inline
 **answer panel** appears between the thread and the review-edits editor:
 `←/→` switch between questions, `↑/↓` pick one of the agent's variants or the
