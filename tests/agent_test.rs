@@ -3,9 +3,10 @@ mod common;
 use std::fs;
 
 use kanban4ai::agent::{
-    build_agent_prompt, build_launch_plan, cached_opencode_catalog, parse_omp_models_json,
-    parse_opencode_agent_list, parse_opencode_models_verbose, parse_pi_models_store, recent_models,
-    record_recent_model, sort_efforts, sort_opencode_models,
+    build_agent_prompt, build_launch_plan, cached_opencode_catalog, load_pi_catalog_from_dir,
+    parse_omp_models_json, parse_opencode_agent_list, parse_opencode_models_verbose,
+    parse_pi_models_json, parse_pi_models_store, recent_models, record_recent_model, sort_efforts,
+    sort_opencode_models,
 };
 use kanban4ai::core::models::{MessageKind, MessageRole, Task};
 use kanban4ai::core::project::Roots;
@@ -612,6 +613,123 @@ fn pi_models_store_yields_provider_slash_id_selectors_and_efforts() {
     );
     // Falls back to a plain `thinking` array when present.
     assert_eq!(catalog.variants_for("xai/grok-4.5"), ["low", "high"]);
+}
+
+#[test]
+fn pi_models_json_yields_custom_provider_selectors() {
+    let text = r#"{
+      "providers": {
+        "Yolo-Auto": {
+          "baseUrl": "https://example.test/v1",
+          "api": "openai-completions",
+          "models": [
+            {"id": "qwen3.8-27b", "name": "qwen3.8-27b", "reasoning": true}
+          ]
+        }
+      }
+    }"#;
+    let catalog = parse_pi_models_json(text);
+    assert!(
+        catalog
+            .models
+            .contains(&"Yolo-Auto/qwen3.8-27b".to_string())
+    );
+    assert!(catalog.variants_for("Yolo-Auto/qwen3.8-27b").is_empty());
+}
+
+#[test]
+fn pi_models_json_ignores_missing_providers_and_invalid_json() {
+    assert!(parse_pi_models_json("{}").models.is_empty());
+    assert!(parse_pi_models_json("not json").models.is_empty());
+}
+
+#[test]
+fn pi_catalog_merges_store_with_custom_models_json() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("models-store.json"),
+        r#"{
+          "xai": {
+            "models": [
+              {"id":"grok-4.5","provider":"xai","thinking":["high","low"]}
+            ]
+          }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("models.json"),
+        r#"{
+          "providers": {
+            "Yolo-Auto": {
+              "models": [{"id": "qwen3.8-27b"}]
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let catalog = load_pi_catalog_from_dir(dir.path());
+    assert!(catalog.models.contains(&"xai/grok-4.5".to_string()));
+    assert!(
+        catalog
+            .models
+            .contains(&"Yolo-Auto/qwen3.8-27b".to_string())
+    );
+    assert_eq!(catalog.variants_for("xai/grok-4.5"), ["low", "high"]);
+}
+
+#[test]
+fn pi_catalog_from_models_json_alone_includes_custom_providers() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("models.json"),
+        r#"{
+          "providers": {
+            "Yolo-Auto": {
+              "models": [{"id": "qwen3.8-27b"}]
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let catalog = load_pi_catalog_from_dir(dir.path());
+    assert_eq!(catalog.models, vec!["Yolo-Auto/qwen3.8-27b".to_string()]);
+}
+
+#[test]
+fn pi_catalog_store_thinking_map_wins_on_duplicate_selector() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("models-store.json"),
+        r#"{
+          "Yolo-Auto": {
+            "models": [
+              {"id":"qwen3.8-27b","thinkingLevelMap":{"low":null,"high":null}}
+            ]
+          }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("models.json"),
+        r#"{
+          "providers": {
+            "Yolo-Auto": {
+              "models": [{"id": "qwen3.8-27b"}]
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let catalog = load_pi_catalog_from_dir(dir.path());
+    assert_eq!(catalog.models, vec!["Yolo-Auto/qwen3.8-27b".to_string()]);
+    assert_eq!(
+        catalog.variants_for("Yolo-Auto/qwen3.8-27b"),
+        ["low", "high"]
+    );
 }
 
 #[test]

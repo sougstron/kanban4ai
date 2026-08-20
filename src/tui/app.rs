@@ -2656,16 +2656,10 @@ impl App {
     }
 
     fn open_new_dialog(&mut self) {
-        let target_status = if self.screen == Screen::Detail {
-            self.current_task()
-                .map(|task| task.status.as_str().to_string())
-        } else {
-            self.board
-                .columns
-                .get(self.focused_column)
-                .map(|column| column.id.clone())
-        };
-        self.open_new_dialog_with_target(target_status);
+        // New tasks always start in To Do, regardless of which column or
+        // task currently has focus, so they're visible to other board users
+        // before an agent or human picks them up.
+        self.open_new_dialog_with_target(Some(TaskStatus::Todo.as_str().to_string()));
     }
 
     fn open_new_dialog_with_target(&mut self, target_status: Option<String>) {

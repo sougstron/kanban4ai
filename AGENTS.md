@@ -294,7 +294,7 @@ Controls how delegating a task spawns a background agent job (shared across all 
 Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. The `agents:` map defines one entry per backend:
 - `command`: executable resolved via PATH (e.g. `opencode`, `claude`)
 - `model`: default model when a task has no `ai_model`
-- `models`: list offered in the TUI create/edit dialog for this backend. For the catalog backends (opencode, omp, pi) this is only a fallback: when the backend's catalog is available the dialog lists the live catalog instead, ordered default model first, then up to three most recently launched models (`.kanban/recent_models`, newest first), then the rest alphabetically. Catalog sources: opencode → `opencode models --verbose`; omp → `omp models --json`; pi (which has no models subcommand) → its on-disk `models-store.json` under `PI_CODING_AGENT_DIR` (default `~/.pi/agent`). Catalogs are warmed in the background at TUI startup and cached per backend+command for the process lifetime
+- `models`: list offered in the TUI create/edit dialog for this backend. For the catalog backends (opencode, omp, pi) this is only a fallback: when the backend's catalog is available the dialog lists the live catalog instead, ordered default model first, then up to three most recently launched models (`.kanban/recent_models`, newest first), then the rest alphabetically. Catalog sources: opencode → `opencode models --verbose`; omp → `omp models --json`; pi → on-disk `models-store.json` (builtin/remote cache) merged with custom providers from `models.json`, under `PI_CODING_AGENT_DIR` (default `~/.pi/agent`). Catalogs are warmed in the background at TUI startup and cached per backend+command for the process lifetime
 - `effort`: default reasoning effort when a task has no `ai_effort`
 - `efforts` (claude, omp, pi): effort levels offered in the TUI dialog as a fallback (defaults `low`/`medium`/`high`/`xhigh`/`max`, matching `claude --effort`; omp/pi also expose `off`). For opencode/omp/pi the dialog instead offers the selected model's variants reported by the live catalog when available (opencode exposes them as `variants`, omp as each model's `thinking` list, pi as each model's `thinkingLevelMap` keys)
 - `agent`: optional default `--agent` persona (overridden per task by `task.agent_name`; opencode only)
@@ -325,7 +325,7 @@ Action hotkeys work on both the board (focused card) and the open detail view.
   task (or its detail). The task stays In Progress so `r` can run it again.
   Confirm first. Distinct from revoke (`r`), which stops and immediately starts
   a fresh session. Sessions view still uses `x` to kill a selected session.
-- `n`: New task in the focused column
+- `n`: New task — always created in To Do, regardless of the focused column
 - `s`: Open Project Settings from Board or Detail: project name, default backend,
   its model/effort/persona defaults, dark/light theme, and task sorting. On the
   Projects screen `s` instead opens Global Settings (see "Global Settings").
@@ -643,9 +643,13 @@ omitted from the row entirely; `401`/`403` becomes `signed out`. Fetches run on
 a background thread started from the event loop (never `App::new`, so no test
 or non-TUI caller polls a provider), and results are cached in memory and in
 `<store>/limits.json` with a `limits_refresh_interval` TTL, because the claude
-usage endpoint rate-limits frequent polling. Claude windows carry their true
-observation time (`observed_at`: the last statusline tick, or the fetch time
-for an HTTP 200), so both the row and the CLI can show their age the way codex
+usage endpoint rate-limits frequent polling. Saving that snapshot never
+replaces a newer claude or codex observation with an older file source — the
+background refresh rereads the statusline bridge and the newest rollout, which
+lag the usage endpoint and the Codex RPC a click just stored. Claude windows
+carry their true observation time (`observed_at`: the last statusline tick, or
+the fetch time for an HTTP 200), so both the row and the CLI can show their
+age the way codex
 rollouts do. A window whose `resets_at` has passed is dropped from the row and
 from `kanban limits` (its percentage describes a period that is over); a
 provider whose windows have all rolled over reads `stale` rather than freezing

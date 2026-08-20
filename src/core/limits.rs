@@ -46,7 +46,10 @@
 //! repeated CLI calls do not re-poll the providers — the claude endpoint is
 //! documented to rate-limit polling callers. A 429 keeps the last good Claude
 //! windows (so the row does not flip to n/a) and doubles the snapshot TTL
-//! before the next background poll, capped at 64×.
+//! before the next background poll, capped at 64×. Saving a snapshot never
+//! replaces a newer claude/codex observation with an older file source: the
+//! background refresh rereads the statusline bridge and the newest rollout,
+//! which lag the usage endpoint and the Codex RPC that a click just stored.
 //!
 //! Clicking a provider segment in the TUI limits row can also refresh that
 //! provider (see [`refresh_provider_async`]): claude force-polls the usage
@@ -1576,21 +1579,69 @@ pub fn force_provider_refresh_in_flight(in_flight: bool) {
 // ---------------------------------------------------------------------------
 // fetch + cache
 // ---------------------------------------------------------------------------
-
 /// Poll every provider. Blocking: callers on a UI path use [`refresh_if_stale`].
 /// `force` marks a refresh the user asked for, which skips the claude usage
 /// endpoint's poll interval.
 pub fn fetch_all(force: bool) -> LimitsSnapshot {
     let previous = cached();
+    let now = now_secs();
     LimitsSnapshot {
-        fetched_at: now_secs(),
-        providers: vec![
-            resolve_claude(previous.as_deref(), force),
-            fetch_codex(),
-            fetch_grok(),
-            fetch_zai(),
-            fetch_synthetic(),
-        ],
+        fetched_at: now,
+        providers: retain_fresher_providers(
+            previous.as_deref(),
+            vec![
+                resolve_claude(previous.as_deref(), force),
+                fetch_codex(),
+                fetch_grok(),
+                fetch_zai(),
+                fetch_synthetic(),
+            ],
+            now,
+        ),
+    }
+}
+
+/// Keep a newer claude/codex observation when a later fetch only has the older
+/// file source. Grok/zai/synthetic always live-fetch, so they take the incoming
+/// row as-is.
+fn retain_fresher_providers(
+    previous: Option<&LimitsSnapshot>,
+    providers: Vec<ProviderLimits>,
+    now: i64,
+) -> Vec<ProviderLimits> {
+    providers
+        .into_iter()
+        .map(|incoming| {
+            let previous = previous.and_then(|snapshot| snapshot.get(&incoming.provider));
+            match incoming.provider.as_str() {
+                "claude" => merge_claude_sources(previous.cloned(), incoming, now),
+                "codex" => prefer_newer_observation(previous, incoming),
+                _ => incoming,
+            }
+        })
+        .collect()
+}
+
+fn observation_time(entry: &ProviderLimits) -> i64 {
+    entry.observed_at.unwrap_or(0)
+}
+
+/// Ready numbers with a later `observed_at` win; a failed fetch never displaces
+/// a ready cache. Equal timestamps take the incoming row (the source just read).
+fn prefer_newer_observation(
+    previous: Option<&ProviderLimits>,
+    incoming: ProviderLimits,
+) -> ProviderLimits {
+    match previous {
+        Some(previous) if previous.is_ready() && !incoming.is_ready() => previous.clone(),
+        Some(previous)
+            if previous.is_ready()
+                && incoming.is_ready()
+                && observation_time(previous) > observation_time(&incoming) =>
+        {
+            previous.clone()
+        }
+        _ => incoming,
     }
 }
 
@@ -1625,25 +1676,39 @@ fn read_cache_file() -> Option<LimitsSnapshot> {
     serde_json::from_str(&text).ok()
 }
 
-fn store(snapshot: Arc<LimitsSnapshot>, persist: bool) {
-    if let Ok(mut value) = cache().lock() {
-        *value = Some(Arc::clone(&snapshot));
-    }
+fn store(snapshot: Arc<LimitsSnapshot>, persist: bool) -> Arc<LimitsSnapshot> {
+    let now = now_secs();
+    let merged = if let Ok(mut value) = cache().lock() {
+        let merged = match value.as_ref() {
+            Some(existing) => Arc::new(LimitsSnapshot {
+                fetched_at: snapshot.fetched_at.max(existing.fetched_at),
+                providers: retain_fresher_providers(
+                    Some(existing.as_ref()),
+                    snapshot.providers.clone(),
+                    now,
+                ),
+            }),
+            None => snapshot,
+        };
+        *value = Some(Arc::clone(&merged));
+        merged
+    } else {
+        snapshot
+    };
     if persist
         && let Some(path) = cache_file()
-        && let Ok(text) = serde_json::to_string(snapshot.as_ref())
+        && let Ok(text) = serde_json::to_string(merged.as_ref())
     {
         let _ = atomic_write_text(&path, &text);
     }
+    merged
 }
 
 /// Fetch now, updating both caches. Used by the CLI, where blocking is fine.
 /// `force` is `kanban limits --refresh`, as opposed to a snapshot that merely
 /// aged out.
 pub fn refresh_blocking(force: bool) -> Arc<LimitsSnapshot> {
-    let snapshot = Arc::new(fetch_all(force));
-    store(Arc::clone(&snapshot), true);
-    snapshot
+    store(Arc::new(fetch_all(force)), true)
 }
 
 /// Start a background refresh when the cached snapshot is older than `ttl`
@@ -2454,5 +2519,147 @@ mod tests {
 
         assert_eq!(stale.data_age(1_600), Some(600));
         assert_eq!(stale.data_age(900), None);
+    }
+
+    #[test]
+    fn a_newer_cached_codex_observation_survives_an_older_rollout() {
+        let now = 1_700_000_000;
+        let cached = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 10.0, Some(now + 3_000))],
+            observed_at: Some(now - 60),
+            ..ProviderLimits::new("codex", ProviderState::Ready)
+        };
+        let rollout = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 80.0, Some(now + 3_000))],
+            observed_at: Some(now - 86_400),
+            ..ProviderLimits::new("codex", ProviderState::Ready)
+        };
+        let previous = LimitsSnapshot {
+            fetched_at: now - 60,
+            providers: vec![cached.clone()],
+        };
+
+        let kept = retain_fresher_providers(Some(&previous), vec![rollout], now);
+
+        assert_eq!(kept[0].windows[0].remaining_percent, 90.0);
+        assert_eq!(kept[0].observed_at, Some(now - 60));
+    }
+
+    #[test]
+    fn a_newer_codex_rollout_replaces_the_cached_observation() {
+        let now = 1_700_000_000;
+        let cached = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 10.0, Some(now + 3_000))],
+            observed_at: Some(now - 86_400),
+            ..ProviderLimits::new("codex", ProviderState::Ready)
+        };
+        let rollout = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 40.0, Some(now + 3_000))],
+            observed_at: Some(now - 30),
+            ..ProviderLimits::new("codex", ProviderState::Ready)
+        };
+        let previous = LimitsSnapshot {
+            fetched_at: now - 86_400,
+            providers: vec![cached],
+        };
+
+        let kept = retain_fresher_providers(Some(&previous), vec![rollout.clone()], now);
+
+        assert_eq!(kept[0], rollout);
+    }
+
+    #[test]
+    fn a_failed_codex_fetch_keeps_the_cached_windows() {
+        let now = 1_700_000_000;
+        let cached = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 10.0, Some(now + 3_000))],
+            observed_at: Some(now - 60),
+            ..ProviderLimits::new("codex", ProviderState::Ready)
+        };
+        let previous = LimitsSnapshot {
+            fetched_at: now - 60,
+            providers: vec![cached.clone()],
+        };
+        let failed = ProviderLimits::new(
+            "codex",
+            ProviderState::Unavailable("no rate limits recorded yet".into()),
+        );
+
+        let kept = retain_fresher_providers(Some(&previous), vec![failed], now);
+
+        assert_eq!(kept[0], cached);
+    }
+
+    #[test]
+    fn a_newer_cached_claude_observation_survives_an_older_bridge() {
+        let now = 1_700_000_000;
+        let cached = ProviderLimits {
+            windows: vec![
+                LimitWindow::new("5h", 17.0, Some(now + 9_000)),
+                LimitWindow::new("7d", 16.0, Some(now + 400_000)),
+            ],
+            observed_at: Some(now - 60),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+        let bridge = ProviderLimits {
+            windows: vec![
+                LimitWindow::new("5h", 99.0, Some(now + 9_000)),
+                LimitWindow::new("7d", 20.0, Some(now + 400_000)),
+            ],
+            observed_at: Some(now - 46_800),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+        let previous = LimitsSnapshot {
+            fetched_at: now - 60,
+            providers: vec![cached.clone()],
+        };
+
+        let kept = retain_fresher_providers(Some(&previous), vec![bridge], now);
+
+        assert_eq!(kept[0].windows[0].remaining_percent, 83.0);
+        assert_eq!(kept[0].windows[1].remaining_percent, 84.0);
+        assert_eq!(kept[0].observed_at, Some(now - 60));
+    }
+
+    #[test]
+    fn a_failed_claude_fetch_keeps_the_cached_windows() {
+        let now = 1_700_000_000;
+        let cached = ProviderLimits {
+            windows: vec![LimitWindow::new("5h", 17.0, Some(now + 9_000))],
+            observed_at: Some(now - 60),
+            ..ProviderLimits::new("claude", ProviderState::Ready)
+        };
+        let previous = LimitsSnapshot {
+            fetched_at: now - 60,
+            providers: vec![cached.clone()],
+        };
+        let failed = ProviderLimits::new("claude", ProviderState::Unavailable("HTTP 500".into()));
+
+        let kept = retain_fresher_providers(Some(&previous), vec![failed], now);
+
+        assert_eq!(kept[0], cached);
+    }
+
+    #[test]
+    fn live_providers_are_not_held_back_by_the_cache() {
+        let now = 1_700_000_000;
+        let cached = ProviderLimits {
+            windows: vec![LimitWindow::new("7d", 10.0, Some(now + 9_000))],
+            observed_at: Some(now - 60),
+            ..ProviderLimits::new("grok", ProviderState::Ready)
+        };
+        let incoming = ProviderLimits {
+            windows: vec![LimitWindow::new("7d", 40.0, Some(now + 9_000))],
+            observed_at: Some(now),
+            ..ProviderLimits::new("grok", ProviderState::Ready)
+        };
+        let previous = LimitsSnapshot {
+            fetched_at: now - 60,
+            providers: vec![cached],
+        };
+
+        let kept = retain_fresher_providers(Some(&previous), vec![incoming.clone()], now);
+
+        assert_eq!(kept[0], incoming);
     }
 }

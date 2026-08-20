@@ -1,25 +1,30 @@
-# kanban4ai 0.4.7
+# kanban4ai 0.4.8
 
 ## Highlights
 
-- `kanban stop <id>` stops the task's running agent session and leaves the
-  task In Progress (idle). The last session id stays on the task so `r` can
-  run it again.
-- TUI Board and Detail: `k` (and a `Stop k` action-bar / status-bar hint when
-  the focused task is live or waiting) opens the existing kill confirmation,
-  then stops without launching a replacement. Distinct from revoke (`r`),
-  which restarts immediately. Sessions view still uses `x`.
-- `Operations::stop_task` looks up the task's active session. `stop_session`
-  now closes the session record before `tmux kill-session`, so a racing
-  wrapper `agent-exit` cannot auto-resume or mark the stopped session crashed.
+- Provider limits: background TTL refreshes no longer clobber a fresher
+  claude/codex observation with older file-source numbers. Click-refresh
+  stores live Claude usage-endpoint and Codex RPC data in `limits.json`;
+  `retain_fresher_providers` now keeps the later `observed_at` for claude
+  (window merge) and codex (ready observation) whether the snapshot comes
+  from `fetch_all` or a background `store`.
+- TUI: pressing `n` always opens the New Task dialog targeting To Do,
+  regardless of the focused column or open task's status, so new tasks are
+  visible to other board users before an agent or human picks them up.
+- Agent backends: the `pi` model catalog now merges custom providers from
+  `models.json` with the builtin/remote `models-store.json` cache, so
+  custom-provider models (e.g. Yolo) show up in the TUI model selector
+  instead of only the builtin catalog.
 
 ## Verification coverage
 
-- CLI: `kanban stop` closes an active session, keeps the task In Progress,
-  and reports no active session when the task is idle.
-- Operations: `stop_task` requires an active session; a closed session is
-  ignored by `reconcile_agent_exit`.
-- TUI: In Progress detail/status show `Stop k`; the board `k` hotkey closes
-  the session without relaunch.
-- Release checks for this version include rustfmt, clippy with warnings denied,
-  locked tests, a release build, and installer packaging smoke tests.
+- `core::limits`: 52 tests covering the fresher-observation merge for claude
+  and codex across `fetch_all` and `store`.
+- TUI: covering test renamed to
+  `phase_three_headers_new_task_always_targets_todo_and_bulk_confirmation_work`,
+  asserting `n` always targets To Do regardless of focus.
+- `agent_test`: `pi_models`/`pi_catalog` cover merging `models.json` custom
+  providers with `models-store.json`, store entries winning on a duplicate
+  selector.
+- Release checks for this version include rustfmt, clippy with warnings
+  denied, locked tests, a release build, and installer packaging smoke tests.

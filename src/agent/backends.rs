@@ -341,8 +341,9 @@ pub fn resolve_opencode_agent(command: &str, requested: &str) -> String {
 
 /// Model catalog reported by an agent backend: every launchable model id plus
 /// the reasoning-effort variants each model accepts. Sourced from the backend
-/// CLI (`opencode models --verbose`, `omp models --json`) or, for pi, its
-/// on-disk `models-store.json`.
+/// CLI (`opencode models --verbose`, `omp models --json`) or, for pi, the
+/// on-disk `models-store.json` builtin/remote cache merged with custom
+/// providers from `models.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackendCatalog {
     pub models: Vec<String>,
@@ -358,8 +359,9 @@ impl BackendCatalog {
     }
 }
 
-/// Backends whose model/effort catalog kanban polls (from the CLI, or from pi's
-/// on-disk store) instead of relying solely on the configured `models` list.
+/// Backends whose model/effort catalog kanban polls (from the CLI, or from
+/// pi's on-disk store + custom providers) instead of relying solely on the
+/// configured `models` list.
 pub fn backend_has_catalog(backend: &str) -> bool {
     matches!(backend, "opencode" | "omp" | "pi")
 }
@@ -405,10 +407,9 @@ fn fetch_backend_catalog(backend: &str, command: &str) -> Option<BackendCatalog>
         "opencode" => run_capture(command, &["models", "--verbose"])
             .map(|t| parse_opencode_models_verbose(&t)),
         "omp" => run_capture(command, &["models", "--json"]).map(|t| parse_omp_models_json(&t)),
-        // pi has no models subcommand; it maintains the catalog on disk.
-        "pi" => fs::read_to_string(pi_models_store_path())
-            .ok()
-            .map(|t| parse_pi_models_store(&t)),
+        // Custom providers live in models.json and are never written into the
+        // builtin/remote models-store.json cache. Merge both.
+        "pi" => Some(load_pi_catalog_from_dir(&pi_agent_dir())),
         _ => None,
     }
 }
@@ -422,17 +423,39 @@ fn run_capture(command: &str, args: &[&str]) -> Option<String> {
         .and_then(|output| String::from_utf8(output.stdout).ok())
 }
 
-/// Path to pi's on-disk model catalog. pi has no models subcommand, so its
-/// catalog is read from the agent config directory (`PI_CODING_AGENT_DIR`,
-/// default `~/.pi/agent`).
-fn pi_models_store_path() -> PathBuf {
-    let dir = std::env::var_os("PI_CODING_AGENT_DIR")
+/// pi's agent config directory (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`).
+fn pi_agent_dir() -> PathBuf {
+    std::env::var_os("PI_CODING_AGENT_DIR")
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi").join("agent"))
         })
-        .unwrap_or_else(|| PathBuf::from(".pi").join("agent"));
-    dir.join("models-store.json")
+        .unwrap_or_else(|| PathBuf::from(".pi").join("agent"))
+}
+
+/// Load pi's catalog from an agent config directory: builtin/remote
+/// `models-store.json` plus custom providers from `models.json`. Store entries
+/// win on a duplicate selector so their `thinkingLevelMap` is kept.
+pub fn load_pi_catalog_from_dir(dir: &Path) -> BackendCatalog {
+    let mut catalog = BackendCatalog::default();
+    if let Ok(text) = fs::read_to_string(dir.join("models-store.json")) {
+        extend_catalog(&mut catalog, parse_pi_models_store(&text));
+    }
+    if let Ok(text) = fs::read_to_string(dir.join("models.json")) {
+        extend_catalog(&mut catalog, parse_pi_models_json(&text));
+    }
+    catalog
+}
+
+fn extend_catalog(into: &mut BackendCatalog, from: BackendCatalog) {
+    for model in from.models {
+        if into.variants.contains_key(&model) {
+            continue;
+        }
+        let efforts = from.variants.get(&model).cloned().unwrap_or_default();
+        into.variants.insert(model.clone(), efforts);
+        into.models.push(model);
+    }
 }
 
 /// Start a best-effort background fetch of a backend's model catalog.
@@ -575,10 +598,27 @@ pub fn parse_omp_models_json(text: &str) -> BackendCatalog {
 /// The launchable selector is `provider/id`; a model's efforts are the
 /// `thinkingLevelMap` keys (or `thinking` array) it accepts.
 pub fn parse_pi_models_store(text: &str) -> BackendCatalog {
-    let mut catalog = BackendCatalog::default();
     let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
-        return catalog;
+        return BackendCatalog::default();
     };
+    parse_pi_provider_map(&root)
+}
+
+/// Parse pi's `models.json`: `{ "providers": { "<name>": { "models": [{ id, ... }] } } }`.
+/// Custom providers are composed at runtime from this file and never written
+/// into `models-store.json`.
+pub fn parse_pi_models_json(text: &str) -> BackendCatalog {
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
+        return BackendCatalog::default();
+    };
+    let Some(providers) = root.get("providers") else {
+        return BackendCatalog::default();
+    };
+    parse_pi_provider_map(providers)
+}
+
+fn parse_pi_provider_map(root: &serde_json::Value) -> BackendCatalog {
+    let mut catalog = BackendCatalog::default();
     let Some(providers) = root.as_object() else {
         return catalog;
     };

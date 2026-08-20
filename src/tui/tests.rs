@@ -2951,7 +2951,7 @@ fn archive_enter_opens_selected_archived_task() {
 }
 
 #[test]
-fn phase_three_headers_targeted_creation_and_bulk_confirmation_work() {
+fn phase_three_headers_new_task_always_targets_todo_and_bulk_confirmation_work() {
     let (_dir, mut app) = app_with_board();
     let in_progress = app
         .board
@@ -2965,7 +2965,7 @@ fn phase_three_headers_targeted_creation_and_bulk_confirmation_work() {
     assert_eq!(
         modal.modal,
         Modal::NewTask {
-            target_status: Some("in_progress".to_string())
+            target_status: Some("todo".to_string())
         }
     );
     modal.title.insert_str("Targeted");
@@ -2974,14 +2974,14 @@ fn phase_three_headers_targeted_creation_and_bulk_confirmation_work() {
         .expect("create targeted task");
     assert_eq!(
         app.ops
-            .list_tasks(Some("in_progress"), None, "created", "asc")
+            .list_tasks(Some("todo"), None, "created", "asc")
             .unwrap()
             .len(),
         1
     );
     let task = app
         .ops
-        .list_tasks(Some("in_progress"), None, "created", "asc")
+        .list_tasks(Some("todo"), None, "created", "asc")
         .unwrap()
         .remove(0);
     app.ops.move_task(&task.id, "review", false).unwrap();
