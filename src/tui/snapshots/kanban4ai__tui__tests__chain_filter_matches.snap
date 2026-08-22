@@ -1,6 +1,6 @@
 ---
 source: src/tui/tests.rs
-expression: output
+expression: "render_at(&mut app, 80, 24)"
 ---
 ┌ To Do (1) ───────┐┌ In Progress (0) ─┐┌ Review (1) ──────┐┌ Done (0) ────────┐
 │┌────────────────┐││No tasks          ││┌────────────────┐││No tasks          │
@@ -8,10 +8,10 @@ expression: output
 ││? Choose a rout…│││                  │││Dropdown work   │││                  │
 ││☑ interact┌ New task ────────────────────────────────────────────┐           │
 │└──────────│┌ Chain to ──────────────────────────────────────────┐│           │
-│           ││/ type to filter                                    ││           │
-│           ││› No chain                                          ││           │
-│           ││  TASK-002 (Implement selectors)                    ││           │
+│           ││/ task-00                                           ││           │
+│           ││› TASK-002 (Implement selectors)                    ││           │
 │           ││  TASK-001 (Question card)                          ││           │
+│           ││                                                    ││           │
 │           │└────────────────────────────────────────────────────┘│           │
 │           │┌ Interactive ───────────────────────────────────────┐│           │
 │           ││☐ interactive (Space toggles, Enter continues)      ││           │
@@ -80,8 +80,8 @@ expression: output
 6:1-12 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:12-14 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:14-16 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-6:16-30 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).italic()
-6:30-66 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+6:16-23 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
+6:23-66 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:66-68 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:68-79 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:79-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

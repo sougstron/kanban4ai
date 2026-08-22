@@ -7,15 +7,27 @@ use ratatui::widgets::{
     ScrollbarState, Wrap,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::core::session::SessionState;
 
 use super::app::App;
+use super::board;
 use super::card::{sanitize_terminal_text, truncate_display};
 
 const SESSIONS_TITLE: &str = " Sessions · Enter open · i info · v log · x kill · o task · q back ";
 const ARCHIVE_TITLE: &str = " Archive · Enter detail · u restore · / filter · q back ";
 
-pub fn render_sessions(frame: &mut Frame<'_>, app: &App, area: Rect) {
+/// Put the project badge at the right end of a list block's top border row,
+/// clearing the screen title that already occupies its left end.
+fn render_badge(frame: &mut Frame<'_>, app: &mut App, area: Rect, title: &str) {
+    let title_width = UnicodeWidthStr::width(title) as u16;
+    if let Some(hitbox) = board::render_project_badge(frame, app, area, title_width) {
+        app.hitboxes.push(hitbox);
+    }
+}
+
+pub fn render_sessions(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let active_sessions = app.filtered_active_sessions();
     if active_sessions.is_empty() {
         let message = if app.search.text().is_empty() {
@@ -28,6 +40,7 @@ pub fn render_sessions(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .block(Block::default().title(SESSIONS_TITLE).borders(Borders::ALL)),
             area,
         );
+        render_badge(frame, app, area, SESSIONS_TITLE);
         return;
     }
     let items = active_sessions
@@ -95,9 +108,10 @@ pub fn render_sessions(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         );
     frame.render_stateful_widget(list, area, &mut state);
+    render_badge(frame, app, area, SESSIONS_TITLE);
 }
 
-pub fn render_archive(frame: &mut Frame<'_>, app: &App, area: Rect) {
+pub fn render_archive(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let tasks = app.filtered_archived_tasks();
     if tasks.is_empty() {
         let message = if app.search.text().is_empty() {
@@ -110,6 +124,7 @@ pub fn render_archive(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .block(Block::default().title(ARCHIVE_TITLE).borders(Borders::ALL)),
             area,
         );
+        render_badge(frame, app, area, ARCHIVE_TITLE);
         return;
     }
     let items = tasks
@@ -142,6 +157,7 @@ pub fn render_archive(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         );
     frame.render_stateful_widget(list, area, &mut state);
+    render_badge(frame, app, area, ARCHIVE_TITLE);
 }
 
 /// Pager over the cached tail of the selected session's log. The scroll is

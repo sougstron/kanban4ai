@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 1578
 expression: render_snapshot(&mut app)
 ---
 ┌ Inputs (provenance) · TASK-001 · ↑/↓ PgUp/PgDn scroll · q back ──────────────────────────────┐

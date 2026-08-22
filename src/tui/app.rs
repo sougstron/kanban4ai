@@ -734,6 +734,27 @@ impl App {
         self.has_board.then_some(self.project_path.as_path())
     }
 
+    /// Whether this app is showing a real board. The projects-list app carries
+    /// a placeholder `project_name`, so anything that labels the open project
+    /// has to check this first.
+    pub fn has_board(&self) -> bool {
+        self.has_board
+    }
+
+    /// Text for the terminal window title. The project comes first because tab
+    /// bars and multiplexer status lines truncate from the right, and a board
+    /// sitting in a background tab is exactly the case the label is for.
+    pub fn window_title(&self) -> String {
+        match self
+            .has_board
+            .then(|| window_title_name(&self.settings.project_name))
+            .flatten()
+        {
+            Some(name) => format!("{name} — kanban4ai"),
+            None => "kanban4ai".to_string(),
+        }
+    }
+
     pub fn take_loop_outcome(&mut self) -> Option<LoopOutcome> {
         if let Some(outcome) = self.pending_switch.take() {
             return Some(outcome);
@@ -3925,6 +3946,9 @@ impl App {
         };
         let backend_selected = modal.backend_selected;
         let model_selected = modal.model_selected;
+        // Enter now advances focus, so the dependent-option refresh below has
+        // to look at the field the key was actually delivered to.
+        let field_before = modal.active_field();
         let command = normalize_command_key(key);
         if modal.discard_confirm {
             match command.code {
@@ -3991,6 +4015,23 @@ impl App {
                 KeyCode::Enter if modal.cancel_on_enter() => {
                     return self.request_modal_close(modal);
                 }
+                // Shift+Enter (Alt+Enter where the terminal cannot report it)
+                // is the only way to break a line inside a text field.
+                KeyCode::Enter
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+                {
+                    modal.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+                // Plain Enter commits the focused field and walks to the next
+                // one, exactly like Tab. A filtered selector with no match
+                // keeps focus and turns red instead.
+                KeyCode::Enter => {
+                    if modal.enter_field() {
+                        modal.next_field();
+                    }
+                }
                 KeyCode::Char('s')
                     if key.modifiers == KeyModifiers::CONTROL && modal.submit_on_ctrl_s() =>
                 {
@@ -4009,13 +4050,9 @@ impl App {
                 _ => modal.input(key),
             }
         }
-        if modal.active_field() == DialogField::Backend
-            && modal.backend_selected != backend_selected
-        {
+        if field_before == DialogField::Backend && modal.backend_selected != backend_selected {
             self.refresh_backend_options(&mut modal);
-        } else if modal.active_field() == DialogField::Model
-            && modal.model_selected != model_selected
-        {
+        } else if field_before == DialogField::Model && modal.model_selected != model_selected {
             self.refresh_effort_options(&mut modal);
         }
         self.modal = Some(modal);
@@ -4996,6 +5033,18 @@ fn retain_source_legacy_auto_launch_keys(
         }
     }
     Ok(())
+}
+
+/// Collapse a project name to one line of printable text short enough for a
+/// tab bar. The result is written to the terminal inside an OSC escape, so a
+/// control character in a project name must never survive this.
+fn window_title_name(name: &str) -> Option<String> {
+    let printable = name
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    let collapsed = printable.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!collapsed.is_empty()).then(|| truncate_display(&collapsed, 64))
 }
 
 fn default_project_settings() -> TuiSettings {

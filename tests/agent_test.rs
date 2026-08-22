@@ -3,9 +3,10 @@ mod common;
 use std::fs;
 
 use kanban4ai::agent::{
-    build_agent_prompt, build_launch_plan, cached_opencode_catalog, load_pi_catalog_from_dir,
-    parse_omp_models_json, parse_opencode_agent_list, parse_opencode_models_verbose,
-    parse_pi_models_json, parse_pi_models_store, recent_models, record_recent_model, sort_efforts,
+    build_agent_prompt, build_launch_plan, cached_opencode_catalog, load_pi_catalog,
+    load_pi_catalog_from_dir, parse_omp_models_json, parse_opencode_agent_list,
+    parse_opencode_models_verbose, parse_pi_builtin_catalog, parse_pi_models_json,
+    parse_pi_models_store, pi_builtin_data_dir, recent_models, record_recent_model, sort_efforts,
     sort_opencode_models,
 };
 use kanban4ai::core::models::{MessageKind, MessageRole, Task};
@@ -729,6 +730,199 @@ fn pi_catalog_store_thinking_map_wins_on_duplicate_selector() {
     assert_eq!(
         catalog.variants_for("Yolo-Auto/qwen3.8-27b"),
         ["low", "high"]
+    );
+}
+
+#[test]
+fn pi_builtin_catalog_yields_grouped_provider_slash_id_selectors() {
+    let text = r#"{
+      "openai-completions": {
+        "anthropic/claude-sonnet-5": {
+          "id": "anthropic/claude-sonnet-5",
+          "provider": "openrouter",
+          "thinkingLevelMap": {"off": null, "xhigh": "xhigh", "max": "max"}
+        },
+        "auto": {
+          "id": "auto",
+          "provider": "openrouter"
+        }
+      }
+    }"#;
+    let catalog = parse_pi_builtin_catalog(text);
+    assert!(
+        catalog
+            .models
+            .contains(&"openrouter/anthropic/claude-sonnet-5".to_string())
+    );
+    assert!(catalog.models.contains(&"openrouter/auto".to_string()));
+    assert_eq!(
+        catalog.variants_for("openrouter/anthropic/claude-sonnet-5"),
+        ["off", "xhigh", "max"]
+    );
+}
+
+#[test]
+fn pi_builtin_catalog_ignores_invalid_json() {
+    assert!(parse_pi_builtin_catalog("not json").models.is_empty());
+    assert!(parse_pi_builtin_catalog("[]").models.is_empty());
+}
+
+#[test]
+fn pi_catalog_merges_authenticated_builtin_openrouter() {
+    let agent = tempfile::tempdir().unwrap();
+    fs::write(
+        agent.path().join("models-store.json"),
+        r#"{"xai":{"models":[{"id":"grok-4.5","provider":"xai"}]}}"#,
+    )
+    .unwrap();
+    fs::write(
+        agent.path().join("auth.json"),
+        r#"{"openrouter":{"type":"api_key","key":"sk-test"},"xai":{"type":"oauth"}}"#,
+    )
+    .unwrap();
+
+    let data = tempfile::tempdir().unwrap();
+    fs::write(
+        data.path().join("openrouter.json"),
+        r#"{
+          "openai-completions": {
+            "moonshotai/kimi-k2.6": {
+              "id": "moonshotai/kimi-k2.6",
+              "provider": "openrouter"
+            }
+          }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        data.path().join("google.json"),
+        r#"{
+          "google-generative-ai": {
+            "gemini-3.1-pro": {"id": "gemini-3.1-pro", "provider": "google"}
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let catalog = load_pi_catalog(agent.path(), Some(data.path()));
+    assert!(catalog.models.contains(&"xai/grok-4.5".to_string()));
+    assert!(
+        catalog
+            .models
+            .contains(&"openrouter/moonshotai/kimi-k2.6".to_string())
+    );
+    assert!(!catalog.models.iter().any(|m| m.starts_with("google/")));
+}
+
+#[test]
+fn pi_catalog_skips_builtin_without_auth() {
+    let agent = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    fs::write(
+        data.path().join("openrouter.json"),
+        r#"{
+          "openai-completions": {
+            "auto": {"id": "auto", "provider": "openrouter"}
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let catalog = load_pi_catalog(agent.path(), Some(data.path()));
+    assert!(catalog.models.is_empty());
+}
+
+#[test]
+fn pi_catalog_store_wins_over_builtin_duplicate() {
+    let agent = tempfile::tempdir().unwrap();
+    fs::write(
+        agent.path().join("models-store.json"),
+        r#"{
+          "openrouter": {
+            "models": [
+              {"id":"auto","provider":"openrouter","thinking":["low","high"]}
+            ]
+          }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        agent.path().join("auth.json"),
+        r#"{"openrouter":{"type":"api_key","key":"sk-test"}}"#,
+    )
+    .unwrap();
+    let data = tempfile::tempdir().unwrap();
+    fs::write(
+        data.path().join("openrouter.json"),
+        r#"{
+          "openai-completions": {
+            "auto": {"id": "auto", "provider": "openrouter"}
+          }
+        }"#,
+    )
+    .unwrap();
+
+    let catalog = load_pi_catalog(agent.path(), Some(data.path()));
+    assert_eq!(catalog.models, vec!["openrouter/auto".to_string()]);
+    assert_eq!(catalog.variants_for("openrouter/auto"), ["low", "high"]);
+}
+
+#[test]
+fn pi_builtin_data_dir_walks_from_pi_command() {
+    let root = tempfile::tempdir().unwrap();
+    let data = root
+        .path()
+        .join("node_modules")
+        .join("@earendil-works")
+        .join("pi-ai")
+        .join("dist")
+        .join("providers")
+        .join("data");
+    fs::create_dir_all(&data).unwrap();
+    let command = root.path().join("dist").join("cli.js");
+    fs::create_dir_all(command.parent().unwrap()).unwrap();
+    fs::write(&command, "#!/usr/bin/env node\n").unwrap();
+
+    let found = pi_builtin_data_dir(command.to_str().unwrap()).expect("catalog dir");
+    assert_eq!(found, data);
+}
+
+#[test]
+fn installed_pi_openrouter_catalog_parses_when_pi_is_on_path() {
+    let Some(data) = pi_builtin_data_dir("pi") else {
+        return;
+    };
+    let path = data.join("openrouter.json");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return;
+    };
+    let parsed = parse_pi_builtin_catalog(&text);
+    assert!(
+        parsed
+            .models
+            .iter()
+            .any(|model| model.starts_with("openrouter/")),
+        "installed {} should yield openrouter selectors",
+        path.display()
+    );
+
+    let agent = tempfile::tempdir().unwrap();
+    fs::write(
+        agent.path().join("auth.json"),
+        r#"{"openrouter":{"type":"api_key","key":"x"}}"#,
+    )
+    .unwrap();
+    let catalog = load_pi_catalog(agent.path(), Some(&data));
+    assert!(
+        catalog.models.len() > 100,
+        "expected a full OpenRouter catalog, got {}",
+        catalog.models.len()
+    );
+    assert!(
+        catalog
+            .models
+            .iter()
+            .any(|model| model == "openrouter/auto" || model.starts_with("openrouter/"))
     );
 }
 

@@ -343,7 +343,8 @@ pub fn resolve_opencode_agent(command: &str, requested: &str) -> String {
 /// the reasoning-effort variants each model accepts. Sourced from the backend
 /// CLI (`opencode models --verbose`, `omp models --json`) or, for pi, the
 /// on-disk `models-store.json` builtin/remote cache merged with custom
-/// providers from `models.json`.
+/// providers from `models.json` and bundled catalogs for providers listed
+/// in `auth.json` (e.g. OpenRouter from the installed `pi-ai` package).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackendCatalog {
     pub models: Vec<String>,
@@ -408,8 +409,13 @@ fn fetch_backend_catalog(backend: &str, command: &str) -> Option<BackendCatalog>
             .map(|t| parse_opencode_models_verbose(&t)),
         "omp" => run_capture(command, &["models", "--json"]).map(|t| parse_omp_models_json(&t)),
         // Custom providers live in models.json and are never written into the
-        // builtin/remote models-store.json cache. Merge both.
-        "pi" => Some(load_pi_catalog_from_dir(&pi_agent_dir())),
+        // builtin/remote models-store.json cache. Authenticated built-ins
+        // such as OpenRouter live in the installed pi-ai package and often
+        // never land in the store. Merge all three.
+        "pi" => Some(load_pi_catalog(
+            &pi_agent_dir(),
+            pi_builtin_data_dir(command).as_deref(),
+        )),
         _ => None,
     }
 }
@@ -436,7 +442,10 @@ fn pi_agent_dir() -> PathBuf {
 /// Load pi's catalog from an agent config directory: builtin/remote
 /// `models-store.json` plus custom providers from `models.json`. Store entries
 /// win on a duplicate selector so their `thinkingLevelMap` is kept.
-pub fn load_pi_catalog_from_dir(dir: &Path) -> BackendCatalog {
+///
+/// Pass `builtin_data_dir` to also merge bundled `pi-ai` catalogs
+/// (`<dir>/<provider>.json`) for every provider listed in `auth.json`.
+pub fn load_pi_catalog(dir: &Path, builtin_data_dir: Option<&Path>) -> BackendCatalog {
     let mut catalog = BackendCatalog::default();
     if let Ok(text) = fs::read_to_string(dir.join("models-store.json")) {
         extend_catalog(&mut catalog, parse_pi_models_store(&text));
@@ -444,7 +453,89 @@ pub fn load_pi_catalog_from_dir(dir: &Path) -> BackendCatalog {
     if let Ok(text) = fs::read_to_string(dir.join("models.json")) {
         extend_catalog(&mut catalog, parse_pi_models_json(&text));
     }
+    if let Some(data_dir) = builtin_data_dir {
+        for provider in authenticated_pi_providers(dir) {
+            let path = data_dir.join(format!("{provider}.json"));
+            if let Ok(text) = fs::read_to_string(path) {
+                extend_catalog(
+                    &mut catalog,
+                    parse_pi_builtin_catalog_with_provider(&text, Some(&provider)),
+                );
+            }
+        }
+    }
     catalog
+}
+
+/// Load pi's catalog from an agent config directory without the installed
+/// `pi-ai` bundled catalogs. Tests that only exercise store/`models.json`
+/// merging use this; production goes through [`load_pi_catalog`].
+pub fn load_pi_catalog_from_dir(dir: &Path) -> BackendCatalog {
+    load_pi_catalog(dir, None)
+}
+
+/// Providers that have credentials in pi's `auth.json`. Keys are provider
+/// ids; secret values are ignored.
+fn authenticated_pi_providers(dir: &Path) -> Vec<String> {
+    let Ok(text) = fs::read_to_string(dir.join("auth.json")) else {
+        return Vec::new();
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    root.as_object()
+        .map(|obj| {
+            obj.keys()
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Locate the installed `pi-ai` bundled provider catalogs next to the `pi`
+/// command (`…/pi-ai/dist/providers/data`).
+pub fn pi_builtin_data_dir(command: &str) -> Option<PathBuf> {
+    let exe = resolve_command_path(command)?;
+    let resolved = fs::canonicalize(exe).ok()?;
+    let mut dir = resolved.parent()?.to_path_buf();
+    loop {
+        let nested = dir
+            .join("node_modules")
+            .join("@earendil-works")
+            .join("pi-ai")
+            .join("dist")
+            .join("providers")
+            .join("data");
+        if nested.is_dir() {
+            return Some(nested);
+        }
+        let sibling = dir
+            .join("pi-ai")
+            .join("dist")
+            .join("providers")
+            .join("data");
+        if sibling.is_dir() {
+            return Some(sibling);
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => return None,
+        }
+    }
+}
+
+fn resolve_command_path(command: &str) -> Option<PathBuf> {
+    let path = Path::new(command);
+    if path.components().count() > 1 || path.is_absolute() {
+        return path.is_file().then(|| path.to_path_buf());
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(command))
+        .find(|candidate| candidate.is_file())
 }
 
 fn extend_catalog(into: &mut BackendCatalog, from: BackendCatalog) {
@@ -627,42 +718,84 @@ fn parse_pi_provider_map(root: &serde_json::Value) -> BackendCatalog {
             continue;
         };
         for model in models {
-            let Some(id) = model
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            else {
-                continue;
-            };
-            let provider = model
-                .get("provider")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .unwrap_or(provider_key.as_str());
-            let selector = format!("{provider}/{id}");
-            let efforts = model
-                .get("thinkingLevelMap")
-                .and_then(serde_json::Value::as_object)
-                .map(|map| map.keys().cloned().collect::<Vec<_>>())
-                .or_else(|| {
-                    model
-                        .get("thinking")
-                        .and_then(serde_json::Value::as_array)
-                        .map(|arr| json_string_array(arr))
-                })
-                .unwrap_or_default();
-            if catalog
-                .variants
-                .insert(selector.clone(), sort_efforts(efforts))
-                .is_none()
-            {
-                catalog.models.push(selector);
-            }
+            push_pi_model(&mut catalog, provider_key, model, None);
         }
     }
     catalog
+}
+
+/// Parse a pi-ai bundled provider catalog (`providers/data/<id>.json`):
+/// `{ "<api>": { "<model-id>": { id, provider, thinkingLevelMap?, thinking? } } }`.
+pub fn parse_pi_builtin_catalog(text: &str) -> BackendCatalog {
+    parse_pi_builtin_catalog_with_provider(text, None)
+}
+
+fn parse_pi_builtin_catalog_with_provider(
+    text: &str,
+    provider_fallback: Option<&str>,
+) -> BackendCatalog {
+    let mut catalog = BackendCatalog::default();
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
+        return catalog;
+    };
+    let Some(groups) = root.as_object() else {
+        return catalog;
+    };
+    let fallback = provider_fallback.unwrap_or("");
+    for group in groups.values() {
+        let Some(models) = group.as_object() else {
+            continue;
+        };
+        for (model_key, model) in models {
+            push_pi_model(&mut catalog, fallback, model, Some(model_key));
+        }
+    }
+    catalog
+}
+
+fn push_pi_model(
+    catalog: &mut BackendCatalog,
+    provider_fallback: &str,
+    model: &serde_json::Value,
+    id_fallback: Option<&str>,
+) {
+    let Some(id) = model
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| id_fallback.map(str::trim).filter(|value| !value.is_empty()))
+    else {
+        return;
+    };
+    let provider = model
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(provider_fallback);
+    if provider.is_empty() {
+        return;
+    }
+    let selector = format!("{provider}/{id}");
+    let efforts = model
+        .get("thinkingLevelMap")
+        .and_then(serde_json::Value::as_object)
+        .map(|map| map.keys().cloned().collect::<Vec<_>>())
+        .or_else(|| {
+            model
+                .get("thinking")
+                .and_then(serde_json::Value::as_array)
+                .map(|arr| json_string_array(arr))
+        })
+        .unwrap_or_default();
+    if catalog
+        .variants
+        .insert(selector.clone(), sort_efforts(efforts))
+        .is_none()
+    {
+        catalog.models.push(selector);
+    }
 }
 
 fn json_string_array(values: &[serde_json::Value]) -> Vec<String> {

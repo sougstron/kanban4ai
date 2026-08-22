@@ -160,6 +160,15 @@ pub struct ModalState {
     pub project_sort: TextArea<'static>,
     pub form_scroll: usize,
     pub error: Option<String>,
+    /// Typed filters for the selectors that can hold long lists. Keyed by the
+    /// field so the same plumbing covers any selector we later opt in.
+    pub backend_filter: String,
+    pub model_filter: String,
+    pub chain_filter: String,
+    /// Selector whose filter matched nothing when Enter was pressed. The
+    /// section renders in the error colour until anything is picked or the
+    /// filter changes.
+    pub filter_error: Option<DialogField>,
     pub discard_confirm: bool,
     pub confirm_yes_selected: bool,
     initial_values: Option<String>,
@@ -213,6 +222,10 @@ impl ModalState {
             project_sort: one_line("name"),
             form_scroll: 0,
             error: None,
+            backend_filter: String::new(),
+            model_filter: String::new(),
+            chain_filter: String::new(),
+            filter_error: None,
             discard_confirm: false,
             confirm_yes_selected: false,
             initial_values: None,
@@ -336,23 +349,40 @@ impl ModalState {
         self.fields()[self.field_index.min(self.fields().len().saturating_sub(1))]
     }
 
+    /// Single entry point for every focus change, so a filter can never
+    /// outlive the visit that typed it. Leaving a selector drops its filter
+    /// text and any error it was showing; coming back always starts from the
+    /// full list instead of a narrowing the user has since forgotten about.
+    fn set_field_index(&mut self, index: usize) {
+        if index != self.field_index {
+            let leaving = self.active_field();
+            if let Some(filter) = self.field_filter_mut(leaving) {
+                filter.clear();
+            }
+            if self.filter_error == Some(leaving) {
+                self.filter_error = None;
+            }
+        }
+        self.field_index = index;
+        self.ensure_active_field_visible();
+    }
+
     pub fn next_field(&mut self) {
         let len = self.fields().len();
         if len > 0 {
-            self.field_index = (self.field_index + 1) % len;
-            self.ensure_active_field_visible();
+            self.set_field_index((self.field_index + 1) % len);
         }
     }
 
     pub fn prev_field(&mut self) {
         let len = self.fields().len();
         if len > 0 {
-            self.field_index = if self.field_index == 0 {
+            let index = if self.field_index == 0 {
                 len - 1
             } else {
                 self.field_index - 1
             };
-            self.ensure_active_field_visible();
+            self.set_field_index(index);
         }
     }
 
@@ -385,8 +415,7 @@ impl ModalState {
             .iter()
             .position(|candidate| *candidate == field)
         {
-            self.field_index = index;
-            self.ensure_active_field_visible();
+            self.set_field_index(index);
         }
     }
 
@@ -401,24 +430,12 @@ impl ModalState {
     }
 
     pub fn select_option(&mut self, field: DialogField, index: usize) {
-        let kind = match field {
-            DialogField::Backend => Some(SelectorKind::Backend),
-            DialogField::Model => Some(SelectorKind::Model),
-            DialogField::Effort => Some(SelectorKind::Effort),
-            DialogField::Agent => Some(SelectorKind::Agent),
-            DialogField::ChainTo => Some(SelectorKind::ChainTo),
-            DialogField::TargetStatus => Some(SelectorKind::TargetStatus),
-            DialogField::MessageKind => Some(SelectorKind::MessageKind),
-            DialogField::Question => Some(SelectorKind::Question),
-            DialogField::Variant => Some(SelectorKind::Variant),
-            DialogField::Theme => Some(SelectorKind::Theme),
-            DialogField::TaskSort => Some(SelectorKind::TaskSort),
-            DialogField::ProjectSort => Some(SelectorKind::ProjectSort),
-            _ => None,
-        };
-        if let Some(kind) = kind {
+        if let Some(kind) = selector_kind(field) {
             let len = self.selection_len(kind);
             if len > 0 {
+                // Picking anything clears the "filter matched nothing" state,
+                // even when the pick lands on the already-selected option.
+                self.filter_error = None;
                 let selected = index.min(len - 1);
                 if self.selection_value(kind) == selected {
                     return;
@@ -428,6 +445,101 @@ impl ModalState {
                 self.error = None;
             }
         }
+    }
+
+    /// Filter text typed into a selector, or `None` when the selector has no
+    /// filter row. Effort, agent, theme and the sort selectors are deliberately
+    /// left out: their lists are short and fixed, so a filter row would cost a
+    /// line of the dialog without ever saving a keystroke.
+    pub fn field_filter(&self, field: DialogField) -> Option<&str> {
+        match field {
+            DialogField::Backend => Some(self.backend_filter.as_str()),
+            DialogField::Model => Some(self.model_filter.as_str()),
+            DialogField::ChainTo => Some(self.chain_filter.as_str()),
+            _ => None,
+        }
+    }
+
+    fn field_filter_mut(&mut self, field: DialogField) -> Option<&mut String> {
+        match field {
+            DialogField::Backend => Some(&mut self.backend_filter),
+            DialogField::Model => Some(&mut self.model_filter),
+            DialogField::ChainTo => Some(&mut self.chain_filter),
+            _ => None,
+        }
+    }
+
+    pub fn options_for(&self, field: DialogField) -> &[SelectOption] {
+        match field {
+            DialogField::Backend => &self.backend_options,
+            DialogField::Model => &self.model_options,
+            DialogField::Effort => &self.effort_options,
+            DialogField::Agent => &self.agent_options,
+            DialogField::ChainTo => &self.chain_options,
+            DialogField::TargetStatus => &self.status_options,
+            DialogField::Theme => &self.theme_options,
+            DialogField::TaskSort => &self.task_sort_options,
+            DialogField::ProjectSort => &self.project_sort_options,
+            _ => &[],
+        }
+    }
+
+    /// Option indices the selector currently shows. Identical to `0..len` for
+    /// selectors without a filter row.
+    pub fn visible_options(&self, field: DialogField) -> Vec<usize> {
+        match self.field_filter(field) {
+            Some(filter) => filtered_indices(self.options_for(field), filter),
+            None => match selector_kind(field) {
+                Some(kind) => (0..self.selection_len(kind)).collect(),
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// Plain Enter inside a form field: commit whatever is focused and report
+    /// whether focus should advance. A filtered selector with no matches keeps
+    /// focus and paints the section red instead.
+    pub fn enter_field(&mut self) -> bool {
+        let field = self.active_field();
+        let Some(kind) = selector_kind(field) else {
+            return true;
+        };
+        if self.field_filter(field).is_some() {
+            let visible = self.visible_options(field);
+            let Some(first) = visible.first().copied() else {
+                // An empty list is only an error when the filter is what
+                // emptied it; a selector with nothing to offer at all just
+                // hands focus on rather than trapping it.
+                if self.options_for(field).is_empty() {
+                    self.filter_error = None;
+                    return true;
+                }
+                self.filter_error = Some(field);
+                return false;
+            };
+            if !visible.contains(&self.selection_value(kind)) {
+                *self.selection_mut(kind) = first;
+                self.apply_selection(kind);
+            }
+        }
+        self.filter_error = None;
+        true
+    }
+
+    /// Re-point the selection after the filter text changed. The selection is
+    /// only moved when it scrolled out of the filtered list, so narrowing down
+    /// to a single match leaves that match selected and ready for Enter.
+    fn sync_filtered_selection(&mut self, kind: SelectorKind, field: DialogField) {
+        self.filter_error = None;
+        let visible = self.visible_options(field);
+        let Some(first) = visible.first().copied() else {
+            return;
+        };
+        if visible.contains(&self.selection_value(kind)) {
+            return;
+        }
+        *self.selection_mut(kind) = first;
+        self.apply_selection(kind);
     }
 
     pub fn input(&mut self, key: ratatui::crossterm::event::KeyEvent) {
@@ -442,24 +554,24 @@ impl ModalState {
             DialogField::Effort => self.input_select(key, SelectorKind::Effort),
             DialogField::Agent => self.input_select(key, SelectorKind::Agent),
             DialogField::ChainTo => self.input_select(key, SelectorKind::ChainTo),
-            DialogField::Interactive => match key.code {
-                ratatui::crossterm::event::KeyCode::Char(' ')
-                | ratatui::crossterm::event::KeyCode::Enter => self.interactive = !self.interactive,
-                _ => {}
-            },
-            DialogField::EscapeToProjects => match key.code {
-                ratatui::crossterm::event::KeyCode::Char(' ')
-                | ratatui::crossterm::event::KeyCode::Enter => {
-                    self.escape_to_projects = !self.escape_to_projects
+            // Checkboxes toggle on Space only; Enter belongs to field
+            // navigation like everywhere else in the form.
+            DialogField::Interactive => {
+                if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
+                    self.interactive = !self.interactive;
                 }
-                _ => {}
-            },
+            }
+            DialogField::EscapeToProjects => {
+                if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
+                    self.escape_to_projects = !self.escape_to_projects;
+                }
+            }
             DialogField::ProjectSort => self.input_select(key, SelectorKind::ProjectSort),
-            DialogField::PurgeData => match key.code {
-                ratatui::crossterm::event::KeyCode::Char(' ')
-                | ratatui::crossterm::event::KeyCode::Enter => self.purge_data = !self.purge_data,
-                _ => {}
-            },
+            DialogField::PurgeData => {
+                if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
+                    self.purge_data = !self.purge_data;
+                }
+            }
             DialogField::TargetStatus => self.input_select(key, SelectorKind::TargetStatus),
             DialogField::MessageKind => self.input_select(key, SelectorKind::MessageKind),
             DialogField::Question => self.input_select(key, SelectorKind::Question),
@@ -534,6 +646,9 @@ impl ModalState {
         self.model_options = options;
         self.model_selected = select_matching(&self.model_options, self.model_text().as_deref());
         self.apply_selection(SelectorKind::Model);
+        // The catalog can warm up while a filter is typed; keep the selection
+        // inside whatever the filter now shows.
+        self.sync_filtered_selection(SelectorKind::Model, DialogField::Model);
     }
 
     pub fn set_effort_options(&mut self, options: Vec<SelectOption>) {
@@ -552,6 +667,7 @@ impl ModalState {
         self.chain_options = options;
         self.chain_selected = select_matching(&self.chain_options, self.chain_text().as_deref());
         self.apply_selection(SelectorKind::ChainTo);
+        self.sync_filtered_selection(SelectorKind::ChainTo, DialogField::ChainTo);
     }
 
     pub fn set_status_options(&mut self, options: Vec<SelectOption>, current: Option<&str>) {
@@ -647,31 +763,67 @@ impl ModalState {
     }
 
     fn input_select(&mut self, key: ratatui::crossterm::event::KeyEvent, kind: SelectorKind) {
-        use ratatui::crossterm::event::KeyCode;
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        let field = self.active_field();
         match key.code {
             KeyCode::Up | KeyCode::Left => self.move_selection(kind, -1),
             KeyCode::Down | KeyCode::Right => self.move_selection(kind, 1),
-            KeyCode::Enter | KeyCode::Char(' ') => {}
+            KeyCode::Char(character)
+                if self.field_filter(field).is_some()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(filter) = self.field_filter_mut(field) {
+                    filter.push(character);
+                }
+                self.sync_filtered_selection(kind, field);
+            }
+            KeyCode::Backspace if self.field_filter(field).is_some() => {
+                if let Some(filter) = self.field_filter_mut(field) {
+                    filter.pop();
+                }
+                self.sync_filtered_selection(kind, field);
+            }
+            KeyCode::Delete if self.field_filter(field).is_some() => {
+                if let Some(filter) = self.field_filter_mut(field) {
+                    filter.clear();
+                }
+                self.sync_filtered_selection(kind, field);
+            }
             _ => {}
         }
     }
 
+    /// Move within the options the selector currently shows, so a filtered
+    /// list never steps onto a hidden entry.
     fn move_selection(&mut self, kind: SelectorKind, delta: isize) {
-        let len = self.selection_len(kind);
-        if len == 0 {
+        let field = self.active_field();
+        let visible = self.visible_options(field);
+        if visible.is_empty() {
             return;
         }
         let selected = self.selection_value(kind);
-        let next = if delta.is_negative() {
-            selected.saturating_sub(delta.unsigned_abs())
-        } else {
-            selected.saturating_add(delta as usize).min(len - 1)
+        let position = visible.iter().position(|index| *index == selected);
+        let next = match position {
+            Some(position) => {
+                let moved = if delta.is_negative() {
+                    position.saturating_sub(delta.unsigned_abs())
+                } else {
+                    position
+                        .saturating_add(delta as usize)
+                        .min(visible.len() - 1)
+                };
+                visible[moved]
+            }
+            // The selection scrolled out of the filtered list; step back onto it.
+            None => visible[0],
         };
         if next == selected {
             return;
         }
         *self.selection_mut(kind) = next;
         self.apply_selection(kind);
+        self.filter_error = None;
     }
 
     fn selection_len(&self, kind: SelectorKind) -> usize {
@@ -863,6 +1015,38 @@ enum SelectorKind {
     Theme,
     TaskSort,
     ProjectSort,
+}
+
+fn selector_kind(field: DialogField) -> Option<SelectorKind> {
+    match field {
+        DialogField::Backend => Some(SelectorKind::Backend),
+        DialogField::Model => Some(SelectorKind::Model),
+        DialogField::Effort => Some(SelectorKind::Effort),
+        DialogField::Agent => Some(SelectorKind::Agent),
+        DialogField::ChainTo => Some(SelectorKind::ChainTo),
+        DialogField::TargetStatus => Some(SelectorKind::TargetStatus),
+        DialogField::MessageKind => Some(SelectorKind::MessageKind),
+        DialogField::Question => Some(SelectorKind::Question),
+        DialogField::Variant => Some(SelectorKind::Variant),
+        DialogField::Theme => Some(SelectorKind::Theme),
+        DialogField::TaskSort => Some(SelectorKind::TaskSort),
+        DialogField::ProjectSort => Some(SelectorKind::ProjectSort),
+        _ => None,
+    }
+}
+
+/// Option indices whose label contains `filter`, case-insensitively. An empty
+/// filter keeps every option, including the leading "Default …" entry.
+pub(super) fn filtered_indices(options: &[SelectOption], filter: &str) -> Vec<usize> {
+    let needle = filter.trim().to_lowercase();
+    options
+        .iter()
+        .enumerate()
+        .filter(|(_, option)| {
+            needle.is_empty() || option.label.to_lowercase().contains(needle.as_str())
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Rect) -> Vec<Hitbox> {
@@ -1218,6 +1402,9 @@ fn task_field_min_height(field: DialogField) -> u16 {
     match field {
         DialogField::Title | DialogField::Interactive | DialogField::EscapeToProjects => 3,
         DialogField::Description => 5,
+        // Filterable selectors spend a row on the filter input, so they need
+        // one more line to still show two options.
+        DialogField::Backend | DialogField::Model | DialogField::ChainTo => 5,
         _ => 4,
     }
 }
@@ -1226,6 +1413,11 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
     if field == DialogField::Description {
         return 10;
     }
+    let chrome = if modal.field_filter(field).is_some() {
+        3
+    } else {
+        2
+    };
     let count = match field {
         DialogField::Backend => modal.backend_options.len(),
         DialogField::Model => modal.model_options.len(),
@@ -1237,7 +1429,8 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         DialogField::ChainTo => modal.chain_options.len(),
         _ => return task_field_min_height(field),
     };
-    task_field_min_height(field).max((count.saturating_add(2)).min(u16::MAX as usize) as u16)
+    task_field_min_height(field)
+        .max((count.saturating_add(chrome as usize)).min(u16::MAX as usize) as u16)
 }
 
 fn render_move(
@@ -1471,7 +1664,7 @@ fn render_selector_field(
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
-        DialogField::Backend => render_select(
+        DialogField::Backend => render_select_filtered(
             frame,
             app,
             "Backend",
@@ -1479,8 +1672,10 @@ fn render_selector_field(
             modal.backend_selected,
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.backend_filter),
+            modal.filter_error == Some(field),
         ),
-        DialogField::Model => render_select(
+        DialogField::Model => render_select_filtered(
             frame,
             app,
             "Model",
@@ -1488,6 +1683,8 @@ fn render_selector_field(
             modal.model_selected,
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.model_filter),
+            modal.filter_error == Some(field),
         ),
         DialogField::Effort => render_select(
             frame,
@@ -1507,7 +1704,7 @@ fn render_selector_field(
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
-        DialogField::ChainTo => render_select(
+        DialogField::ChainTo => render_select_filtered(
             frame,
             app,
             "Chain to",
@@ -1515,6 +1712,8 @@ fn render_selector_field(
             modal.chain_selected,
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.chain_filter),
+            modal.filter_error == Some(field),
         ),
         DialogField::Interactive => render_interactive(frame, app, modal, area),
         DialogField::EscapeToProjects => render_escape_to_projects(frame, app, modal, area),
@@ -1569,7 +1768,58 @@ fn register_task_options(
         DialogField::ChainTo => (modal.chain_options.len(), modal.chain_selected),
         _ => (0, 0),
     };
+    if modal.field_filter(field).is_some() {
+        register_filtered_options(
+            hitboxes,
+            area,
+            field,
+            &modal.visible_options(field),
+            selected,
+        );
+        return;
+    }
     register_options(hitboxes, area, field, count, selected);
+}
+
+/// Hitboxes for a filtered selector. Rows are laid out below the filter line,
+/// and each row carries the option's index in the unfiltered list so clicks
+/// resolve to the same option `select_option` expects.
+fn register_filtered_options(
+    hitboxes: &mut Vec<Hitbox>,
+    area: Rect,
+    field: DialogField,
+    visible: &[usize],
+    selected: usize,
+) {
+    let rows = area.height.saturating_sub(3) as usize;
+    let highlight = visible
+        .iter()
+        .position(|index| *index == selected)
+        .unwrap_or(0);
+    let start = list_viewport_start(highlight, visible.len(), rows);
+    for (offset, option) in visible
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(position, option)| (position - start, *option))
+    {
+        hitboxes.insert(
+            0,
+            Hitbox {
+                area: Rect {
+                    x: area.x.saturating_add(1),
+                    y: area.y.saturating_add(2 + offset as u16),
+                    width: area.width.saturating_sub(2),
+                    height: 1,
+                },
+                action: HitAction::ModalOption {
+                    field,
+                    index: option,
+                },
+            },
+        );
+    }
 }
 
 fn render_select(
@@ -1581,37 +1831,130 @@ fn render_select(
     area: Rect,
     active: bool,
 ) {
+    render_select_filtered(
+        frame, app, title, options, selected, area, active, None, false,
+    );
+}
+
+/// Draw a selector, optionally with a filter row above the options. `filter`
+/// is `Some` only for selectors that opt into filtering; `error` paints the
+/// section in the error colour after Enter found nothing to select.
+#[allow(clippy::too_many_arguments)]
+fn render_select_filtered(
+    frame: &mut Frame<'_>,
+    app: &App,
+    title: &str,
+    options: &[SelectOption],
+    selected: usize,
+    area: Rect,
+    active: bool,
+    filter: Option<&str>,
+    error: bool,
+) {
     let field = select_field_from_title(title);
     let active = field
         .map(|field| active || select_field_hovered(app, field, options.len()))
         .unwrap_or(active);
-    let items = if options.is_empty() {
-        vec![ListItem::new("-")]
-    } else {
-        options
-            .iter()
-            .enumerate()
-            .map(|(index, option)| {
-                let mut item = ListItem::new(sanitize_terminal_text(&option.label));
-                if let Some(field) = field {
-                    item = item.style(option_hover_style(
-                        app,
-                        HitAction::ModalOption { field, index },
-                    ));
-                }
-                item
-            })
-            .collect()
+    let visible = match filter {
+        Some(filter) => filtered_indices(options, filter),
+        None => (0..options.len()).collect::<Vec<_>>(),
     };
-    render_list(
+    let mut items = visible
+        .iter()
+        .map(|index| {
+            let mut item = ListItem::new(sanitize_terminal_text(&options[*index].label));
+            if let Some(field) = field {
+                item = item.style(option_hover_style(
+                    app,
+                    HitAction::ModalOption {
+                        field,
+                        index: *index,
+                    },
+                ));
+            }
+            item
+        })
+        .collect::<Vec<_>>();
+    let matched = !items.is_empty();
+    if !matched {
+        let placeholder = if filter.is_some() && !options.is_empty() {
+            "no matches"
+        } else {
+            "-"
+        };
+        items.push(ListItem::new(placeholder).style(Style::default().fg(app.theme.muted)));
+    }
+    // A selection outside the filtered list highlights the first match, which
+    // is exactly the option Enter would commit.
+    let highlight = visible
+        .iter()
+        .position(|index| *index == selected)
+        .unwrap_or(0);
+    let border = select_border(app, active, error);
+    let block = Block::default()
+        .title(format!(" {title} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border));
+    let Some(filter) = filter else {
+        render_list_in(frame, app, items, highlight, area, Some(block), true);
+        return;
+    };
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    frame.render_widget(filter_line(app, filter, error), Rect { height: 1, ..inner });
+    render_list_in(
         frame,
         app,
-        &format!(" {title} "),
         items,
-        selected,
-        area,
-        active,
+        highlight,
+        Rect {
+            y: inner.y.saturating_add(1),
+            height: inner.height.saturating_sub(1),
+            ..inner
+        },
+        None,
+        matched,
     );
+}
+
+fn select_border(app: &App, active: bool, error: bool) -> ratatui::style::Color {
+    if error {
+        app.theme.err
+    } else if active {
+        app.theme.focus
+    } else {
+        app.theme.border
+    }
+}
+
+fn filter_line(app: &App, filter: &str, error: bool) -> Paragraph<'static> {
+    let prefix = ratatui::text::Span::styled(
+        "/ ",
+        Style::default().fg(if error {
+            app.theme.err
+        } else {
+            app.theme.muted
+        }),
+    );
+    let body = if filter.is_empty() {
+        ratatui::text::Span::styled(
+            "type to filter",
+            Style::default()
+                .fg(app.theme.muted)
+                .add_modifier(Modifier::ITALIC),
+        )
+    } else {
+        ratatui::text::Span::styled(
+            sanitize_terminal_text(filter),
+            Style::default()
+                .fg(if error { app.theme.err } else { app.theme.fg })
+                .add_modifier(Modifier::BOLD),
+        )
+    };
+    Paragraph::new(Line::from(vec![prefix, body]))
 }
 
 fn select_field_hovered(app: &App, field: DialogField, option_count: usize) -> bool {
@@ -1659,27 +2002,42 @@ fn render_list(
     } else {
         app.theme.border
     };
+    let block = Block::default()
+        .title(title.to_string())
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border));
+    render_list_in(frame, app, items, selected, area, Some(block), true);
+}
+
+/// Render list items into `area`. `block` is `None` when the caller already
+/// drew the surrounding border (filterable selectors reserve a row inside it),
+/// and `highlight` is false when there is nothing selectable to point at.
+fn render_list_in(
+    frame: &mut Frame<'_>,
+    app: &App,
+    items: Vec<ListItem<'static>>,
+    selected: usize,
+    area: Rect,
+    block: Option<Block<'static>>,
+    highlight: bool,
+) {
     let mut state = ListState::default();
     let selected = selected.min(items.len().saturating_sub(1));
-    state.select(Some(selected));
+    state.select(highlight.then_some(selected));
+    let chrome = if block.is_some() { 2 } else { 0 };
     *state.offset_mut() = list_viewport_start(
         selected,
         items.len(),
-        area.height.saturating_sub(2) as usize,
+        area.height.saturating_sub(chrome) as usize,
     );
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .title(title)
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border)),
-        )
-        .highlight_symbol("› ")
-        .highlight_style(
-            Style::default()
-                .fg(app.theme.focus)
-                .add_modifier(Modifier::BOLD),
-        );
+    let mut list = List::new(items).highlight_symbol("› ").highlight_style(
+        Style::default()
+            .fg(app.theme.focus)
+            .add_modifier(Modifier::BOLD),
+    );
+    if let Some(block) = block {
+        list = list.block(block);
+    }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -1781,7 +2139,8 @@ fn render_buttons(
     let right_style = button_style(app, right_active);
     let content = if left == "Save" && right == "Cancel" {
         let save_hint = "(Ctrl + S)";
-        let nav_hint = "use Tab or Shift + Tab to navigate";
+        // Enter walks forward like Tab now, so the hint has to name it.
+        let nav_hint = "use Tab, Enter or Shift + Tab to navigate";
         let hint_width = area.width.saturating_sub(2) as usize;
         let hint_gap = hint_width
             .saturating_sub(save_hint.len() + nav_hint.len())
@@ -1909,7 +2268,10 @@ fn render_interactive(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area
     };
     let mark = if modal.interactive { "☑" } else { "☐" };
     frame.render_widget(
-        Paragraph::new(format!("{mark} interactive (Space/Enter to toggle)")).block(
+        Paragraph::new(format!(
+            "{mark} interactive (Space toggles, Enter continues)"
+        ))
+        .block(
             Block::default()
                 .title(" Interactive ")
                 .borders(Borders::ALL)
@@ -1933,7 +2295,10 @@ fn render_escape_to_projects(frame: &mut Frame<'_>, app: &App, modal: &ModalStat
         "☐"
     };
     frame.render_widget(
-        Paragraph::new(format!("{mark} Esc from board opens projects")).block(
+        Paragraph::new(format!(
+            "{mark} Esc from board opens projects (Space toggles)"
+        ))
+        .block(
             Block::default()
                 .title(" Escape ")
                 .borders(Borders::ALL)
@@ -1980,7 +2345,9 @@ fn render_description_textarea(
     };
     modal.description.set_block(
         Block::default()
-            .title(" Description (Ctrl+V image paste) ")
+            // Alt+Enter is named too: terminals without the kitty keyboard
+            // protocol cannot report Shift+Enter apart from plain Enter.
+            .title(" Description (Ctrl+V image paste, Shift/Alt+Enter newline) ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border)),
     );

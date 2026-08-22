@@ -53,8 +53,10 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
     threads: &EventThreads,
 ) -> Result<LoopOutcome> {
     let _watcher = start_watcher(app.watch_root(), threads.tx.clone());
+    let mut window_title = String::new();
 
     refresh_limits(app);
+    sync_window_title(app, &mut window_title);
     terminal.draw(|frame| board::ui(frame, app))?;
     loop {
         if let Some(outcome) = app.take_loop_outcome() {
@@ -84,7 +86,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
             let _input_guard = threads.input_gate.lock().map_err(|_| {
                 crate::core::error::KanbanError::Invalid("terminal input lock poisoned".to_string())
             })?;
-            let ok = super::run_terminal_action(&action)?;
+            let ok = super::run_terminal_action(&action, &window_title)?;
             app.finish_terminal_action(&action, ok);
             terminal.clear()?;
         }
@@ -94,7 +96,19 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
         if let Some(outcome) = app.take_loop_outcome() {
             return Ok(outcome);
         }
+        sync_window_title(app, &mut window_title);
         terminal.draw(|frame| board::ui(frame, app))?;
+    }
+}
+
+/// Keep the terminal's window title in step with the open project. A rename
+/// lands mid-loop, so the title is diffed here rather than re-emitted on every
+/// frame — the escape would otherwise fight the multiplexer once a second.
+fn sync_window_title(app: &App, current: &mut String) {
+    let next = app.window_title();
+    if *current != next {
+        super::set_window_title(&next);
+        *current = next;
     }
 }
 
@@ -113,7 +127,18 @@ fn refresh_limits(app: &mut App) {
 
 fn handle_input(app: &mut App, input: CrosstermEvent) -> Result<()> {
     match input {
-        CrosstermEvent::Key(key) => app.handle_key(key),
+        // The kitty keyboard protocol can report repeats and releases; only
+        // presses drive the UI.
+        CrosstermEvent::Key(key)
+            if matches!(
+                key.kind,
+                ratatui::crossterm::event::KeyEventKind::Press
+                    | ratatui::crossterm::event::KeyEventKind::Repeat
+            ) =>
+        {
+            app.handle_key(key)
+        }
+        CrosstermEvent::Key(_) => Ok(()),
         CrosstermEvent::Mouse(mouse) => app.handle_mouse(mouse),
         CrosstermEvent::Paste(text) => app.handle_paste(&text),
         CrosstermEvent::Resize(_, _) => Ok(()),

@@ -2,7 +2,7 @@
 source: src/tui/tests.rs
 expression: render_snapshot(&mut app)
 ---
-┌ Task ────────────────────────────────────────────────────────────────────────────────────────┐
+┌ Task ────────────────────────────────────────────────────────────────────────────── ▸ Kanban ┐
 │TASK-001 Question card                                                                        │
 │Status: todo │ Session: - │ Interactive: true                                                 │
 │Backend: default │ Model: - │ Effort: - │ Agent: - │ Chain: -                                 │
@@ -32,7 +32,10 @@ expression: render_snapshot(&mut app)
  ? 1 questions  TUI ready │ r run · w answer · y approve · Tab editor · q/Esc back              
 
 --- style runs ---
-0:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:0-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:85-88 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:88-94 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
+0:94-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 1:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 1:1-9 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
 1:9-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

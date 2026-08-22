@@ -1,9 +1,8 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 1826
 expression: output
 ---
-┌ To Do (2 of 4) ──────┐┌ In Progress (0) ─────┐┌ Review (0) ──────────┐┌ Done (0) ────────────┐
+┌ To Do (2 of 4) ──────┐┌ In Progress (0) ─────┐┌ Review (0) ──────────┐┌ Done (0) ── ▸ Kanban ┐
 │┌────────────────────┐││No tasks              ││No tasks              ││No tasks              │
 ││TASK-001 Running    │││                      ││                      ││                      │
 ││▶ running           │││                      ││                      ││                      │
@@ -24,7 +23,10 @@ expression: output
 
 --- style runs ---
 0:0-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-0:24-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:24-85 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:85-88 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:88-94 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
+0:94-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 1:0-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 1:24-25 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 1:25-47 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

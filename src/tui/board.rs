@@ -73,6 +73,10 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints(constraints)
         .split(area);
+    // The project badge goes on the rightmost column, whose top border row is
+    // the only one with a free right corner; it is drawn after the loop so the
+    // block cannot paint over it.
+    let mut badge_slot = None;
     for index in 0..app.board.columns.len() {
         let column = &app.board.columns[index];
         let focused = index == app.focused_column;
@@ -97,6 +101,9 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             format!("({matching})")
         };
         let title = column_title(&column.name, &count, areas[index].width.saturating_sub(2));
+        if index + 1 == app.board.columns.len() {
+            badge_slot = Some((areas[index], UnicodeWidthStr::width(title.as_str()) as u16));
+        }
         let block = Block::default()
             .title(title.clone())
             .borders(Borders::ALL)
@@ -119,7 +126,92 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             action: HitAction::ColumnFocus(index),
         });
     }
+    if let Some((block, title_width)) = badge_slot
+        && let Some(hitbox) = render_project_badge(frame, app, block, title_width)
+    {
+        // The badge lies on the last column's border, so it has to be searched
+        // before that column's own region.
+        hitboxes.insert(0, hitbox);
+    }
     app.hitboxes = hitboxes;
+}
+
+/// Marker in front of the project name, so the badge reads as a label rather
+/// than as one more column title on the same row.
+const BADGE_MARKER: &str = " ▸ ";
+/// Shorter than this a truncated name stops being an orientation cue, so the
+/// badge is dropped and the frame is left clean instead.
+const BADGE_MIN_NAME: usize = 4;
+
+fn badge_chrome() -> usize {
+    // The marker, plus the trailing space that keeps the name off the corner.
+    UnicodeWidthStr::width(BADGE_MARKER) + 1
+}
+
+/// The project name fitted to the room left on a block's top border row, or
+/// `None` when there is not enough of it for a readable label.
+fn badge_name(name: &str, available: u16) -> Option<String> {
+    let name = sanitize_terminal_text(name);
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let room = (available as usize).checked_sub(badge_chrome())?;
+    if room < UnicodeWidthStr::width(name).min(BADGE_MIN_NAME) {
+        return None;
+    }
+    Some(truncate_display(name, room))
+}
+
+/// Draw the open project's name at the right end of `block`'s top border row —
+/// the row that already carries the block's own title, so a permanent "which
+/// board am I looking at" anchor costs no card space. `title_width` is what
+/// that left-aligned title took; one more cell is kept clear so the two never
+/// run together.
+///
+/// Returns the badge's hitbox. It sits inside the block, so callers must
+/// register it ahead of whatever region encloses it.
+pub(super) fn render_project_badge(
+    frame: &mut Frame<'_>,
+    app: &App,
+    block: Rect,
+    title_width: u16,
+) -> Option<Hitbox> {
+    if !app.has_board() || block.width == 0 || block.height == 0 {
+        return None;
+    }
+    // Both corners, the existing title, and the gap after it are spoken for.
+    let available = block
+        .width
+        .saturating_sub(2)
+        .saturating_sub(title_width)
+        .saturating_sub(1);
+    let name = badge_name(&app.settings.project_name, available)?;
+    let width = (UnicodeWidthStr::width(name.as_str()) + badge_chrome()) as u16;
+    let area = Rect {
+        x: block.x + block.width.saturating_sub(width.saturating_add(1)),
+        y: block.y,
+        width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(BADGE_MARKER, Style::default().fg(app.theme.muted)),
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(app.theme.fg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]))
+        .style(Style::default().bg(app.theme.bg)),
+        area,
+    );
+    Some(Hitbox {
+        area,
+        action: HitAction::Action(UiAction::OpenProjects),
+    })
 }
 
 fn column_title(name: &str, count: &str, available: u16) -> String {

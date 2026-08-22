@@ -294,7 +294,7 @@ Controls how delegating a task spawns a background agent job (shared across all 
 Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. The `agents:` map defines one entry per backend:
 - `command`: executable resolved via PATH (e.g. `opencode`, `claude`)
 - `model`: default model when a task has no `ai_model`
-- `models`: list offered in the TUI create/edit dialog for this backend. For the catalog backends (opencode, omp, pi) this is only a fallback: when the backend's catalog is available the dialog lists the live catalog instead, ordered default model first, then up to three most recently launched models (`.kanban/recent_models`, newest first), then the rest alphabetically. Catalog sources: opencode → `opencode models --verbose`; omp → `omp models --json`; pi → on-disk `models-store.json` (builtin/remote cache) merged with custom providers from `models.json`, under `PI_CODING_AGENT_DIR` (default `~/.pi/agent`). Catalogs are warmed in the background at TUI startup and cached per backend+command for the process lifetime
+- `models`: list offered in the TUI create/edit dialog for this backend. For the catalog backends (opencode, omp, pi) this is only a fallback: when the backend's catalog is available the dialog lists the live catalog instead, ordered default model first, then up to three most recently launched models (`.kanban/recent_models`, newest first), then the rest alphabetically. Catalog sources: opencode → `opencode models --verbose`; omp → `omp models --json`; pi → on-disk `models-store.json` (builtin/remote cache) merged with custom providers from `models.json` and, for every provider listed in `auth.json`, the matching bundled catalog from the installed `pi-ai` package (`providers/data/<provider>.json`, e.g. OpenRouter). Agent dir is `PI_CODING_AGENT_DIR` (default `~/.pi/agent`). Catalogs are warmed in the background at TUI startup and cached per backend+command for the process lifetime
 - `effort`: default reasoning effort when a task has no `ai_effort`
 - `efforts` (claude, omp, pi): effort levels offered in the TUI dialog as a fallback (defaults `low`/`medium`/`high`/`xhigh`/`max`, matching `claude --effort`; omp/pi also expose `off`). For opencode/omp/pi the dialog instead offers the selected model's variants reported by the live catalog when available (opencode exposes them as `variants`, omp as each model's `thinking` list, pi as each model's `thinkingLevelMap` keys)
 - `agent`: optional default `--agent` persona (overridden per task by `task.agent_name`; opencode only)
@@ -425,6 +425,23 @@ dialog (unregister by default; Space toggles
 returns to the board this list was opened from, or quits when the list is the
 entry screen.
 
+The open project is named in two places, both free of screen space. On screen,
+a ` ▸ <name> ` badge is right-aligned into the top border row of the rightmost
+block — the row that already carries that block's own title — on Board, Detail,
+Sessions and Archive, so a board opened in one of several terminals identifies
+itself without leaving the screen. It degrades on its own ladder (full name →
+truncated → dropped once fewer than four columns of name would survive) so it
+never collides with the title it shares the row with, it is hit-tested ahead of
+the column underneath it and clicking it opens the Projects list, and it is
+suppressed on the Projects screen, which has no open project to name. Off
+screen, the terminal window title is set to `<name> — kanban4ai` (project first,
+because tab bars truncate from the right) whenever the open project changes,
+including after a child process that renamed the terminal hands it back; the
+name is collapsed to one line of printable text and clipped to 64 columns
+before it goes into the escape. The title found on entry is saved and restored
+with the XTWINOPS title stack (`ESC[22;2t` / `ESC[23;2t`) alongside the
+alternate-screen teardown, on the panic path too.
+
 The status bar is contextual per screen (Board, Detail, Sessions, Archive,
 Projects, log view) and its hotkey segments are clickable; when the terminal is
 narrow the least important segments are dropped instead of clipping. Column headers show
@@ -461,6 +478,36 @@ checkbox and a "Chain to task" selector. The backend selector leads with
 follow `auto_launch.default_agent` from settings; the label shows the agent it
 resolves to, and the detail view shows `default` while no launch has pinned a
 concrete backend.
+
+Dialog fields advance on Enter as well as Tab: Enter commits the focused field
+and moves to the next one, so a form can be filled without reaching for Tab,
+and Enter only submits once focus has reached the Save button (`Ctrl+S` submits
+from anywhere). Because Enter navigates, the fields that used to consume it
+behave differently: the `interactive` and other checkboxes toggle on Space
+only, and the multi-line text areas (Description, Answer) take Shift+Enter for
+a newline — Alt+Enter does the same, since a terminal without the kitty
+keyboard protocol cannot report Shift+Enter apart from plain Enter. The TUI
+requests `DISAMBIGUATE_ESCAPE_CODES` at startup where the terminal supports it
+and pops the flag again for foreground children and on every teardown path.
+
+The Backend, Model and "Chain to" selectors carry a filter row as their first
+line (shown as `/ …`). Typing narrows the list case-insensitively on the option
+label, including the leading "Default …" / "No chain" entry; Backspace edits
+the filter and Delete clears it. Arrow keys step only through visible matches,
+and the selection follows the filter, so narrowing to a single match leaves it
+selected and one Enter both picks it and advances. Enter on a filter that
+matches nothing is an error: the section border and filter row turn the theme's
+error colour and focus stays put, cleared again by any edit to the filter or
+any selection. A selector that has no options at all is not an error — Enter
+walks past it. The remaining selectors (effort, agent, status, theme, sorting)
+have no filter row: their lists are short and fixed, so the row would cost a
+line of the dialog without saving a keystroke.
+
+A filter lasts only as long as the visit that typed it. Every focus change —
+Tab, Enter, Shift+Tab, or a click on another field — clears the filter of the
+field being left along with any error it was showing, so returning to a
+selector always starts from the full list rather than a stale narrowing. The
+option that was picked while filtered stays selected.
 
 ### Integration Model
 Agents call kanban via shell commands. NOT a plugin. An agent must:

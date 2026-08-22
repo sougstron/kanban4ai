@@ -1,9 +1,8 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 558
 expression: render_snapshot(&mut app)
 ---
-┌ To Do (1) ───────────┐┌ In Progress (0) ─────┐┌ Review (1) ──────────┐┌ Done (0) ────────────┐
+┌ To Do (1) ───────────┐┌ In Progress (0) ─────┐┌ Review (1) ──────────┐┌ Done (0) ── ▸ Kanban ┐
 │┌────────────────────┐││No tasks              ││┌────────────────────┐││No tasks              │
 ││TASK-001 Question ca│││                      │││TASK-002 Implement s│││                      │
 ││? Choose a route?   │││                      │││Dropdown work       │││                      │
@@ -24,7 +23,7 @@ expression: render_snapshot(&mut app)
 │             │└────────────────────────────────────────────────────────────────┘│             │
 │             │┌────────────────────────────────────────────────────────────────┐│             │
 │             ││[ Save ]  [ Cancel ]                                            ││             │
-│             ││(Ctrl + S)                    use Tab or Shift + Tab to navigate││             │
+│             ││(Ctrl + S)             use Tab, Enter or Shift + Tab to navigate││             │
 │             │└────────────────────────────────────────────────────────────────┘│             │
 │             └──────────────────────────────────────────────────────────────────┘             │
 │                      ││                      ││                      ││                      │
@@ -34,7 +33,10 @@ expression: render_snapshot(&mut app)
 
 --- style runs ---
 0:0-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-0:24-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:24-85 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:85-88 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:88-94 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
+0:94-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 1:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 1:1-23 Style::new().fg(Color::Rgb(245, 190, 80)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 1:23-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -204,8 +206,8 @@ expression: render_snapshot(&mut app)
 21:14-15 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:15-16 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:16-26 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-21:26-46 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-21:46-80 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+21:26-39 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+21:39-80 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:80-81 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:81-82 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:82-95 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

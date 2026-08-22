@@ -19,7 +19,7 @@ use super::app::{
     App, DetailFocus, HitAction, Screen, UiAction, load_log_tail, normalize_command_key,
 };
 use super::board;
-use super::dialogs::{DialogField, Modal, ModalButton, ModalState};
+use super::dialogs::{DialogField, Modal, ModalButton, ModalState, SelectOption};
 use super::event::LoopOutcome;
 use super::theme::Theme;
 
@@ -114,7 +114,9 @@ fn task_description_soft_wraps_and_preserves_data_cursor_after_resize() {
 fn task_description_height_is_bounded_and_other_editors_remain_unwrapped() {
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
-    let _ = render_at(&mut app, 120, 60);
+    // Tall enough that the description can reach its cap even after the
+    // filterable Model and Chain-to selectors claim their filter rows.
+    let _ = render_at(&mut app, 120, 70);
 
     let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
     assert_eq!(description.height, 10);
@@ -391,6 +393,105 @@ fn renders_empty_and_populated_boards_in_both_themes() {
 
     let (_dir, mut app) = populated_app();
     insta::assert_snapshot!("populated_board", render_snapshot(&mut app));
+}
+
+/// The badge answers "which board am I looking at", and the guessing happens
+/// while reading tasks, so it has to hold on every screen a task can be read
+/// from — not just the board.
+#[test]
+fn project_badge_names_the_open_project_on_every_board_screen() {
+    let (_dir, mut app) = populated_app();
+    app.settings.project_name = "Kanban".to_string();
+
+    let board = rendered_lines(&mut app, 160, 28);
+    assert!(board[0].contains("▸ Kanban"), "{}", board[0]);
+
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    assert_eq!(app.screen, Screen::Detail);
+    let detail = rendered_lines(&mut app, 160, 28);
+    assert!(detail[0].contains("▸ Kanban"), "{}", detail[0]);
+
+    for screen in [Screen::Sessions, Screen::Archive] {
+        app.screen = screen;
+        let lines = rendered_lines(&mut app, 160, 28);
+        assert!(lines[0].contains("▸ Kanban"), "{screen:?}: {}", lines[0]);
+    }
+}
+
+/// The badge shares its row with the last block's own title, so it gives way
+/// rather than colliding: full name, then truncated, then gone.
+#[test]
+fn project_badge_degrades_instead_of_colliding_with_a_column_title() {
+    let (_dir, mut app) = populated_app();
+    app.settings.project_name = "Long Project Name".to_string();
+
+    let wide = rendered_lines(&mut app, 160, 28);
+    assert!(wide[0].contains("▸ Long Project Name"), "{}", wide[0]);
+
+    let medium = rendered_lines(&mut app, 96, 28);
+    assert!(medium[0].contains("▸ Long P…"), "{}", medium[0]);
+    assert!(medium[0].contains("Done (0)"), "{}", medium[0]);
+
+    // Too little room left for a readable label: the frame stays clean.
+    let narrow = rendered_lines(&mut app, 60, 28);
+    assert!(!narrow[0].contains('▸'), "{}", narrow[0]);
+    assert!(narrow[0].contains("Done"), "{}", narrow[0]);
+}
+
+/// The badge sits inside the last column's area, so it has to be hit-tested
+/// ahead of that column or a click on it would only move focus.
+#[test]
+fn project_badge_click_target_wins_over_the_column_underneath() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+
+    let badge = &app.hitboxes[0];
+    assert_eq!(badge.action, HitAction::Action(UiAction::OpenProjects));
+    let last = app.board.columns.len() - 1;
+    let column = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::ColumnFocus(last))
+        .expect("column hitbox");
+    assert!(overlaps(badge.area, column.area));
+}
+
+/// The projects list has no open project; its placeholder name must not be
+/// rendered as if it were one.
+#[test]
+fn projects_list_carries_no_project_badge() {
+    let work = tempfile::tempdir().expect("work");
+    let (_store, mut app) = projects_app(work.path(), None);
+
+    let lines = rendered_lines(&mut app, 120, 24);
+    assert_eq!(app.screen, Screen::Projects);
+    assert!(!lines[0].contains('▸'), "{}", lines[0]);
+}
+
+/// The title is written inside an OSC escape and read in a tab bar, so it is
+/// one line of printable text or nothing.
+#[test]
+fn window_title_names_the_project_without_leaking_control_characters() {
+    let (_dir, mut app) = app_with_board();
+    app.settings.project_name = "Kanban".to_string();
+    assert_eq!(app.window_title(), "Kanban — kanban4ai");
+
+    app.settings.project_name = "bad\u{7}name\nsecond".to_string();
+    let title = app.window_title();
+    assert!(!title.chars().any(char::is_control), "{title}");
+    assert_eq!(title, "bad name second — kanban4ai");
+
+    app.settings.project_name = "   ".to_string();
+    assert_eq!(app.window_title(), "kanban4ai");
+
+    app.settings.project_name = "N".repeat(200);
+    let long = app.window_title();
+    assert!(long.starts_with(&format!("{}…", "N".repeat(63))), "{long}");
+
+    let work = tempfile::tempdir().expect("work");
+    let (_store, projects) = projects_app(work.path(), None);
+    assert!(!projects.has_board());
+    assert_eq!(projects.window_title(), "kanban4ai");
 }
 
 #[cfg(unix)]
@@ -4045,7 +4146,7 @@ fn phase_four_modal_mouse_routes_fields_options_and_add_message_buttons() {
     let output = render_at(&mut app, 96, 28);
     assert!(output.contains("[ Save ]  [ Cancel ]"));
     let save_hint = "(Ctrl + S)";
-    let nav_hint = "use Tab or Shift + Tab to navigate";
+    let nav_hint = "use Tab, Enter or Shift + Tab to navigate";
     let hint_line = output
         .lines()
         .find(|line| line.contains(save_hint))
@@ -5726,4 +5827,373 @@ fn limits_progress_status_does_not_expire_while_refreshing() {
     app.expire_transient_status_at(Instant::now() + Duration::from_secs(4));
     assert_eq!(app.status, "Refreshing grok limits…");
     crate::core::limits::force_provider_refresh_in_flight(false);
+}
+
+/// Tab six times from the Title field lands on Chain to in the task form.
+fn open_new_task_on_chain(app: &mut App) {
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Tab)).expect("tab");
+    }
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::ChainTo
+    );
+}
+
+fn type_text(app: &mut App, text: &str) {
+    for character in text.chars() {
+        app.handle_key(key(KeyCode::Char(character))).expect("type");
+    }
+}
+
+#[test]
+fn chain_filter_narrows_options_and_keeps_selection_on_a_match() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.visible_options(DialogField::ChainTo).len(), 3);
+
+    type_text(&mut app, "question");
+    let modal = app.modal.as_ref().expect("modal");
+    let visible = modal.visible_options(DialogField::ChainTo);
+    assert_eq!(visible.len(), 1, "only the question card matches");
+    assert_eq!(modal.chain_selected, visible[0]);
+    assert_eq!(modal.chain_text().as_deref(), Some("TASK-001"));
+
+    // Backspacing back to nothing keeps every option available again.
+    for _ in 0.."question".len() {
+        app.handle_key(key(KeyCode::Backspace)).expect("backspace");
+    }
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.chain_filter, "");
+    assert_eq!(modal.visible_options(DialogField::ChainTo).len(), 3);
+}
+
+#[test]
+fn chain_filter_matches_the_default_entry_too() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    type_text(&mut app, "no ch");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.visible_options(DialogField::ChainTo), vec![0]);
+    assert_eq!(modal.chain_text(), None, "\"No chain\" carries no value");
+}
+
+#[test]
+fn enter_on_a_single_filter_match_selects_it_and_advances() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    type_text(&mut app, "implement");
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.chain_text().as_deref(), Some("TASK-002"));
+    assert_eq!(
+        modal.active_field(),
+        DialogField::Interactive,
+        "Enter moves on like Tab"
+    );
+    assert_eq!(modal.filter_error, None);
+}
+
+#[test]
+fn enter_without_filter_matches_marks_the_section_and_holds_focus() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    let before = app.modal.as_ref().expect("modal").chain_text();
+    type_text(&mut app, "zzz");
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+
+    let modal = app.modal.as_ref().expect("modal");
+    assert!(modal.visible_options(DialogField::ChainTo).is_empty());
+    assert_eq!(modal.filter_error, Some(DialogField::ChainTo));
+    assert_eq!(
+        modal.active_field(),
+        DialogField::ChainTo,
+        "focus stays put"
+    );
+    assert_eq!(modal.chain_text(), before, "nothing was selected");
+
+    // Editing the filter clears the error colouring again.
+    app.handle_key(key(KeyCode::Backspace)).expect("backspace");
+    assert_eq!(app.modal.as_ref().expect("modal").filter_error, None);
+}
+
+#[test]
+fn enter_walks_past_a_selector_that_has_no_options_at_all() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    // An empty list is not a filter miss, so Enter must not trap focus here.
+    app.modal.as_mut().expect("modal").set_chain_options(vec![]);
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.filter_error, None);
+    assert_ne!(modal.active_field(), DialogField::ChainTo, "focus moved on");
+}
+
+#[test]
+fn selecting_an_option_clears_the_filter_error() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    type_text(&mut app, "zzz");
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").filter_error,
+        Some(DialogField::ChainTo)
+    );
+
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .select_option(DialogField::ChainTo, 1);
+    assert_eq!(app.modal.as_ref().expect("modal").filter_error, None);
+}
+
+#[test]
+fn leaving_a_selector_clears_its_filter() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    type_text(&mut app, "implement");
+    let selected = app.modal.as_ref().expect("modal").chain_selected;
+    assert_eq!(
+        app.modal
+            .as_ref()
+            .expect("modal")
+            .visible_options(DialogField::ChainTo)
+            .len(),
+        1
+    );
+
+    app.handle_key(key(KeyCode::Tab)).expect("tab away");
+    app.handle_key(key(KeyCode::BackTab)).expect("tab back");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.active_field(), DialogField::ChainTo);
+    assert_eq!(
+        modal.chain_filter, "",
+        "the filter does not outlive a visit"
+    );
+    assert_eq!(modal.visible_options(DialogField::ChainTo).len(), 3);
+    assert_eq!(modal.chain_selected, selected, "the pick itself survives");
+}
+
+#[test]
+fn leaving_a_selector_clears_the_filter_error_too() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    type_text(&mut app, "zzz");
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").filter_error,
+        Some(DialogField::ChainTo)
+    );
+
+    app.handle_key(key(KeyCode::Tab)).expect("tab away");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.filter_error, None);
+    assert_eq!(modal.chain_filter, "");
+}
+
+#[test]
+fn backend_filters_like_the_other_long_selectors() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::Backend);
+    let count = app.modal.as_ref().expect("modal").backend_options.len();
+    assert!(count > 1, "fixture backends: {count}");
+
+    type_text(&mut app, "default");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.visible_options(DialogField::Backend), vec![0]);
+
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.backend_selected, 0);
+    assert_eq!(modal.active_field(), DialogField::Model, "Enter moves on");
+    assert_eq!(modal.backend_filter, "");
+}
+
+#[test]
+fn short_selectors_take_typed_characters_as_no_filter() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    for field in [DialogField::Effort, DialogField::Agent] {
+        app.modal.as_mut().expect("modal").focus_field(field);
+        let before = app.modal.as_ref().expect("modal").visible_options(field);
+        type_text(&mut app, "zz");
+        let modal = app.modal.as_ref().expect("modal");
+        assert_eq!(modal.field_filter(field), None, "{field:?} has no filter");
+        assert_eq!(modal.visible_options(field), before);
+    }
+}
+
+#[test]
+fn filtered_selector_click_resolves_to_the_unfiltered_option_index() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    type_text(&mut app, "task-");
+    let _ = render_at(&mut app, 100, 60);
+    let expected = app.modal.as_ref().expect("modal").chain_options[2]
+        .value
+        .clone();
+
+    let hit = modal_hitbox(
+        &app,
+        HitAction::ModalOption {
+            field: DialogField::ChainTo,
+            index: 2,
+        },
+    );
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: hit.x,
+        row: hit.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("click option");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.chain_selected, 2);
+    assert_eq!(modal.chain_text(), expected);
+    assert!(
+        !app.hitboxes.iter().any(|hitbox| hitbox.action
+            == HitAction::ModalOption {
+                field: DialogField::ChainTo,
+                index: 0,
+            }),
+        "the filtered-out \"No chain\" row is not clickable"
+    );
+}
+
+#[test]
+fn plain_enter_walks_the_task_form_and_shift_enter_writes_a_newline() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    type_text(&mut app, "Title text");
+    app.handle_key(key(KeyCode::Enter)).expect("enter on title");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::Description
+    );
+    assert_eq!(
+        app.modal.as_ref().expect("modal").title_text(),
+        "Title text"
+    );
+
+    type_text(&mut app, "first");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+        .expect("shift enter");
+    type_text(&mut app, "second");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").description_text(),
+        "first\nsecond"
+    );
+
+    app.handle_key(key(KeyCode::Enter)).expect("enter on body");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::Backend
+    );
+}
+
+#[test]
+fn interactive_toggles_on_space_only_and_enter_moves_on() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    for _ in 0..7 {
+        app.handle_key(key(KeyCode::Tab)).expect("tab");
+    }
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::Interactive
+    );
+    assert!(!app.modal.as_ref().expect("modal").interactive);
+
+    app.handle_key(key(KeyCode::Char(' '))).expect("space");
+    assert!(app.modal.as_ref().expect("modal").interactive);
+
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    let modal = app.modal.as_ref().expect("modal");
+    assert!(modal.interactive, "Enter must not flip the checkbox");
+    assert_eq!(modal.active_field(), DialogField::Confirm);
+}
+
+#[test]
+fn enter_still_submits_and_cancels_from_the_form_buttons() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    type_text(&mut app, "Enter submits");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    assert!(app.modal.is_none(), "Save button still submits on Enter");
+    assert!(
+        app.board
+            .columns
+            .iter()
+            .flat_map(|column| column.tasks.iter())
+            .any(|task| task.title == "Enter submits")
+    );
+}
+
+#[test]
+fn model_filter_survives_a_catalog_refresh_and_stays_on_a_visible_option() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::Model);
+    let modal = app.modal.as_mut().expect("modal");
+    modal.set_model_options(vec![
+        SelectOption {
+            label: "Default model".to_string(),
+            value: None,
+        },
+        SelectOption {
+            label: "sonnet".to_string(),
+            value: Some("sonnet".to_string()),
+        },
+        SelectOption {
+            label: "opus".to_string(),
+            value: Some("opus".to_string()),
+        },
+    ]);
+    type_text(&mut app, "opus");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.model_text().as_deref(), Some("opus"));
+
+    // A warmed catalog replaces the list; the typed filter must still hold.
+    let modal = app.modal.as_mut().expect("modal");
+    modal.set_model_options(vec![
+        SelectOption {
+            label: "Default model".to_string(),
+            value: None,
+        },
+        SelectOption {
+            label: "opus-4".to_string(),
+            value: Some("opus-4".to_string()),
+        },
+    ]);
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.model_filter, "opus");
+    assert_eq!(modal.visible_options(DialogField::Model), vec![1]);
+    assert_eq!(modal.model_text().as_deref(), Some("opus-4"));
+}
+
+#[test]
+fn chain_filter_renders_matches_and_the_empty_filter_error() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    type_text(&mut app, "task-00");
+    insta::assert_snapshot!("chain_filter_matches", render_at(&mut app, 80, 24));
+
+    type_text(&mut app, "9");
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    insta::assert_snapshot!("chain_filter_no_matches", render_at(&mut app, 80, 24));
 }

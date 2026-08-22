@@ -1,9 +1,8 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 3277
 expression: rendered
 ---
-┌ Sessions · Enter open · i info · v log · x kill · o task · q back ───────────────────────────┐
+┌ Sessions · Enter open · i info · v log · x kill · o task · q back ───────────────── ▸ Kanban ┐
 │▶ ses-live  TASK-001 Live task  tokens: 5                                                     │
 │✖ ses-lost  TASK-002 Crashed task  tokens: unknown                                            │
 │                                                                                              │
@@ -33,7 +32,11 @@ expression: rendered
  TUI ready │ Enter attach · v log · x kill · o task · / filter · q back                         
 
 --- style runs ---
-0:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+0:0-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+0:85-88 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:88-94 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
+0:94-95 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+0:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 1:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 1:1-95 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset).bold()
 1:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)

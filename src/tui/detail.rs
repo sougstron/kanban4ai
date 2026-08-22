@@ -12,8 +12,14 @@ use crate::core::session::SessionState;
 use crate::core::timefmt;
 
 use super::app::{App, DetailFocus, HitAction, Hitbox, UiAction};
+use super::board;
 use super::card::{sanitize_terminal_text, truncate_display};
 use super::theme::Theme;
+
+/// Width of the meta block's own title, which the project badge has to clear
+/// on the same border row.
+const META_TITLE: &str = " Task ";
+const META_TITLE_WIDTH: u16 = META_TITLE.len() as u16;
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let Some(detail) = app.detail.as_ref() else {
@@ -84,6 +90,9 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         session_state,
     };
     render_meta(frame, &theme, &task, &meta_state, chunks[0]);
+    if let Some(hitbox) = board::render_project_badge(frame, app, chunks[0], META_TITLE_WIDTH) {
+        app.hitboxes.push(hitbox);
+    }
 
     // Thread panel with a clamped scroll and a scrollbar. Input-provenance
     // (what the agent actually consumed) is telemetry, not conversation, so it
@@ -244,7 +253,7 @@ fn render_meta(
         Paragraph::new(meta)
             .block(
                 Block::default()
-                    .title(" Task ")
+                    .title(META_TITLE)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.focus)),
             )

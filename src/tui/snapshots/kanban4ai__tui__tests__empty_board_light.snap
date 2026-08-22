@@ -2,7 +2,7 @@
 source: src/tui/tests.rs
 expression: render_snapshot(&mut app)
 ---
-┌ To Do (0) ───────────┐┌ In Progress (0) ─────┐┌ Review (0) ──────────┐┌ Done (0) ────────────┐
+┌ To Do (0) ───────────┐┌ In Progress (0) ─────┐┌ Review (0) ──────────┐┌ Done (0) ── ▸ Kanban ┐
 │press n to create task││No tasks              ││No tasks              ││No tasks              │
 │                      ││                      ││                      ││                      │
 │                      ││                      ││                      ││                      │
@@ -33,7 +33,10 @@ expression: render_snapshot(&mut app)
 
 --- style runs ---
 0:0-24 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
-0:24-96 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
+0:24-85 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
+0:85-88 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
+0:88-94 Style::new().fg(Color::Rgb(28, 31, 38)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset).bold()
+0:94-96 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 1:0-1 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 1:1-23 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 1:23-24 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
