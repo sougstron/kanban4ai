@@ -61,7 +61,7 @@ jobs:
           archive="kanban4ai-${VERSION}-${TARGET}"
           mkdir -p "dist/${archive}"
           cp "target/${TARGET}/release/kanban4ai" "dist/${archive}/"
-          cp README.md LICENSE "dist/${archive}/"
+          cp README.md LICENSE packaging/systemd/kanban4ai.service "dist/${archive}/"
           tar -C dist -czf "dist/${archive}.tar.gz" "${archive}"
           cd dist
           sha256sum "${archive}.tar.gz" > "${archive}.tar.gz.sha256"

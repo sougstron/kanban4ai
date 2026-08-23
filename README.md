@@ -7,7 +7,7 @@ A fast native local-first kanban board CLI and TUI designed for AI coding agents
 - Linux or another Unix-like environment
 - Rust 1.88 or newer when building from source
 - Optional integrations: `tmux`, `notify-send`, `wl-paste` or `xclip`, `curl`
-  (subscription limits for claude, grok, and z.ai)
+  (subscription limits for claude, grok, z.ai, synthetic, and yolo)
 - Optional agent backends: opencode and/or Claude Code
 
 ## Install
@@ -28,8 +28,19 @@ PREFIX="$HOME/.local" sh scripts/install.sh
 
 `PREFIX` defaults to `/usr/local`; packagers can also set `DESTDIR`. The
 installer refuses to overwrite any existing `kanban4ai`, `kanban`, or `kb`
-path. Arch Linux source recipes are provided for `kanban4ai` and
-`kanban4ai-git` under `packaging/aur/`.
+path. Pass `--with-daemon` to copy the systemd user unit to
+`~/.config/systemd/user/kanban4ai.service` (never enabled). Arch Linux
+source recipes are provided for `kanban4ai` and `kanban4ai-git` under
+`packaging/aur/`; they ship the unit under `/usr/lib/systemd/user/` without
+enabling it.
+
+The queue and crash-restart schedule only advance while something pumps them.
+Keep a TUI open, run `kanban daemon` in the foreground, enable the user unit
+(`systemctl --user enable --now kanban4ai.service`), or add a cron line:
+
+```sh
+* * * * * kanban daemon --once
+```
 
 Tags matching `v*` publish Linux x86_64 and aarch64 archives plus SHA-256
 checksum files at <https://github.com/sougstron/kanban4ai/releases>.
@@ -202,17 +213,17 @@ clickable.
 Directly above the status bar, the Board and Projects screens show how much of
 each AI subscription is left — `✳ claude 5h 66% ↻3h30m · 7d 95% ↻6d11h │ ✺ codex
 mon 75% ↻18d │ ✕ grok 7d 93% ↻4d22h │ ◆ zai 5h 85% ↻4h48m · 7d 97% ↻6d23h │ ✦
-synthetic 5h 91% ↻3h59m · 7d 12% ↻3h22m` —
+synthetic 5h 91% ↻3h59m · 7d 12% ↻3h22m │ ◉ yolo 1d 40% ↻8h · conc 100%` —
 with the percentage that **remains** in each window and the time until it
 resets. Providers you are not signed in to are left out. The numbers refresh in
-the background (claude, grok, z.ai, and synthetic over HTTPS via `curl`, codex
+the background (claude, grok, z.ai, synthetic, and yolo over HTTPS via `curl`, codex
 straight from its local session files, so codex values carry the age of your
-last codex run). Clicking the claude, codex, or grok segment refreshes that
-provider on the spot — claude force-polls its usage endpoint, codex is asked
-live over its app-server RPC, and the grok CLI renews its login token; the
-z.ai and synthetic segments reuse keys
-from opencode's credential store. A window whose reset time has passed is
-dropped rather than shown frozen, and a provider with nothing current left
+last codex run). Clicking any provider segment refreshes that provider on the
+spot — claude force-polls its usage endpoint, codex is asked live over its
+app-server RPC, the grok CLI renews its login token, and z.ai / synthetic / yolo
+re-fetch over HTTPS. A window whose reset time has passed is
+dropped rather than shown frozen (synthetic's tick-regenerating quotas keep
+their seat until the next poll), and a provider with nothing current left
 reads `stale`. `kanban4ai limits` prints the same data, and
 `tui.show_limits: false` hides the row.
 

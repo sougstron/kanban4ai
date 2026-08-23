@@ -104,6 +104,27 @@ pub enum DialogField {
     TaskSort,
     EscapeToProjects,
     ProjectSort,
+    QueueEnabled,
+    MaxRunningTotal,
+    MaxRunningDesigner,
+    MaxRunningReviewer,
+    MaxRunningExecutor,
+    MaxRunningPerBackend,
+    MaxRunningPerBackendModel,
+    AutoRestartEnabled,
+    AutoRestartDelays,
+    DesignerEnabled,
+    DesignerBackend,
+    DesignerModel,
+    DesignerEffort,
+    DesignerAgent,
+    ReviewerEnabled,
+    ReviewerBackend,
+    ReviewerModel,
+    ReviewerEffort,
+    ReviewerAgent,
+    ReviewerOnChanges,
+    ReviewerMaxRounds,
     Confirm,
     Cancel,
     PurgeData,
@@ -120,7 +141,7 @@ const TASK_FORM_FIELDS: [DialogField; 8] = [
     DialogField::Interactive,
 ];
 
-const SETTINGS_FORM_FIELDS: [DialogField; 7] = [
+const SETTINGS_FORM_FIELDS: [DialogField; 28] = [
     DialogField::Title,
     DialogField::Backend,
     DialogField::Model,
@@ -128,6 +149,27 @@ const SETTINGS_FORM_FIELDS: [DialogField; 7] = [
     DialogField::Agent,
     DialogField::Theme,
     DialogField::TaskSort,
+    DialogField::QueueEnabled,
+    DialogField::MaxRunningTotal,
+    DialogField::MaxRunningDesigner,
+    DialogField::MaxRunningReviewer,
+    DialogField::MaxRunningExecutor,
+    DialogField::MaxRunningPerBackend,
+    DialogField::MaxRunningPerBackendModel,
+    DialogField::AutoRestartEnabled,
+    DialogField::AutoRestartDelays,
+    DialogField::DesignerEnabled,
+    DialogField::DesignerBackend,
+    DialogField::DesignerModel,
+    DialogField::DesignerEffort,
+    DialogField::DesignerAgent,
+    DialogField::ReviewerEnabled,
+    DialogField::ReviewerBackend,
+    DialogField::ReviewerModel,
+    DialogField::ReviewerEffort,
+    DialogField::ReviewerAgent,
+    DialogField::ReviewerOnChanges,
+    DialogField::ReviewerMaxRounds,
 ];
 
 const GLOBAL_SETTINGS_FORM_FIELDS: [DialogField; 2] =
@@ -139,6 +181,59 @@ pub enum ModalButton {
     Cancel,
     Yes,
     No,
+}
+
+/// Which backend/model/effort/agent selector group a settings or task field
+/// belongs to. The task form and the settings default-agent fields share
+/// [`AgentSlot::Primary`]; designer and reviewer bots have their own catalogs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentSlot {
+    Primary,
+    Designer,
+    Reviewer,
+}
+
+/// Compact one-line-per-entry map editors live in these textareas:
+/// `backend: N` for per-backend caps and `backend/model: N` for the model
+/// cap (`claude/opus: 1`, `opencode/openai/gpt-5.5: 2`). A bare model id is
+/// never stored — save prefixes the selected default backend when the user
+/// omits it, so the census key always matches.
+pub(crate) struct AgentPicker {
+    backend: TextArea<'static>,
+    model: TextArea<'static>,
+    effort: TextArea<'static>,
+    agent: TextArea<'static>,
+    backend_options: Vec<SelectOption>,
+    model_options: Vec<SelectOption>,
+    effort_options: Vec<SelectOption>,
+    agent_options: Vec<SelectOption>,
+    pub(crate) backend_selected: usize,
+    pub(crate) model_selected: usize,
+    pub(crate) effort_selected: usize,
+    pub(crate) agent_selected: usize,
+    backend_filter: String,
+    model_filter: String,
+}
+
+impl AgentPicker {
+    fn new() -> Self {
+        Self {
+            backend: one_line(""),
+            model: one_line(""),
+            effort: one_line(""),
+            agent: one_line(""),
+            backend_options: Vec::new(),
+            model_options: Vec::new(),
+            effort_options: Vec::new(),
+            agent_options: Vec::new(),
+            backend_selected: 0,
+            model_selected: 0,
+            effort_selected: 0,
+            agent_selected: 0,
+            backend_filter: String::new(),
+            model_filter: String::new(),
+        }
+    }
 }
 
 pub struct ModalState {
@@ -194,6 +289,23 @@ pub struct ModalState {
     pub project_sort_options: Vec<SelectOption>,
     pub project_sort_selected: usize,
     pub purge_data: bool,
+    pub queue_enabled: bool,
+    pub max_running_total: TextArea<'static>,
+    pub max_running_designer: TextArea<'static>,
+    pub max_running_reviewer: TextArea<'static>,
+    pub max_running_executor: TextArea<'static>,
+    pub max_running_per_backend: TextArea<'static>,
+    pub max_running_per_backend_model: TextArea<'static>,
+    pub auto_restart_enabled: bool,
+    pub auto_restart_delays: TextArea<'static>,
+    pub designer_enabled: bool,
+    pub(crate) designer: AgentPicker,
+    pub reviewer_enabled: bool,
+    pub(crate) reviewer: AgentPicker,
+    pub reviewer_on_changes: TextArea<'static>,
+    pub reviewer_on_changes_options: Vec<SelectOption>,
+    pub reviewer_on_changes_selected: usize,
+    pub reviewer_max_rounds: TextArea<'static>,
 }
 
 impl ModalState {
@@ -251,6 +363,23 @@ impl ModalState {
             project_sort_options: Vec::new(),
             project_sort_selected: 0,
             purge_data: false,
+            queue_enabled: true,
+            max_running_total: one_line("3"),
+            max_running_designer: one_line("1"),
+            max_running_reviewer: one_line("1"),
+            max_running_executor: one_line("3"),
+            max_running_per_backend: TextArea::default(),
+            max_running_per_backend_model: TextArea::default(),
+            auto_restart_enabled: true,
+            auto_restart_delays: one_line("1, 30, 270"),
+            designer_enabled: false,
+            designer: AgentPicker::new(),
+            reviewer_enabled: false,
+            reviewer: AgentPicker::new(),
+            reviewer_on_changes: one_line("in_progress"),
+            reviewer_on_changes_options: Vec::new(),
+            reviewer_on_changes_selected: 0,
+            reviewer_max_rounds: one_line("3"),
         }
     }
 
@@ -312,6 +441,27 @@ impl ModalState {
                 DialogField::Agent,
                 DialogField::Theme,
                 DialogField::TaskSort,
+                DialogField::QueueEnabled,
+                DialogField::MaxRunningTotal,
+                DialogField::MaxRunningDesigner,
+                DialogField::MaxRunningReviewer,
+                DialogField::MaxRunningExecutor,
+                DialogField::MaxRunningPerBackend,
+                DialogField::MaxRunningPerBackendModel,
+                DialogField::AutoRestartEnabled,
+                DialogField::AutoRestartDelays,
+                DialogField::DesignerEnabled,
+                DialogField::DesignerBackend,
+                DialogField::DesignerModel,
+                DialogField::DesignerEffort,
+                DialogField::DesignerAgent,
+                DialogField::ReviewerEnabled,
+                DialogField::ReviewerBackend,
+                DialogField::ReviewerModel,
+                DialogField::ReviewerEffort,
+                DialogField::ReviewerAgent,
+                DialogField::ReviewerOnChanges,
+                DialogField::ReviewerMaxRounds,
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
@@ -394,6 +544,139 @@ impl ModalState {
         self.active_field() == DialogField::Cancel
     }
 
+    /// Multiline text fields consume Enter as a newline. Many terminals —
+    /// and tmux without `extended-keys` — deliver Shift+Enter as a bare
+    /// Enter, so the only way both Shift+Enter and Alt+Enter can break a
+    /// line is for Enter itself to do so. Tab still walks to the next field.
+    /// Project path/name reuse `Description` as a single line and are excluded.
+    pub fn enter_inserts_newline(&self) -> bool {
+        matches!(
+            (&self.modal, self.active_field()),
+            (
+                Modal::NewTask { .. } | Modal::EditTask { .. } | Modal::AddMessage { .. },
+                DialogField::Description,
+            ) | (Modal::AnswerQuestion { .. }, DialogField::Answer)
+                | (
+                    Modal::Settings,
+                    DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel
+                )
+        )
+    }
+
+    pub fn agent_slot(field: DialogField) -> Option<AgentSlot> {
+        match field {
+            DialogField::Backend
+            | DialogField::Model
+            | DialogField::Effort
+            | DialogField::Agent => Some(AgentSlot::Primary),
+            DialogField::DesignerBackend
+            | DialogField::DesignerModel
+            | DialogField::DesignerEffort
+            | DialogField::DesignerAgent => Some(AgentSlot::Designer),
+            DialogField::ReviewerBackend
+            | DialogField::ReviewerModel
+            | DialogField::ReviewerEffort
+            | DialogField::ReviewerAgent => Some(AgentSlot::Reviewer),
+            _ => None,
+        }
+    }
+
+    fn picker(&self, slot: AgentSlot) -> Option<&AgentPicker> {
+        match slot {
+            AgentSlot::Primary => None,
+            AgentSlot::Designer => Some(&self.designer),
+            AgentSlot::Reviewer => Some(&self.reviewer),
+        }
+    }
+
+    fn picker_mut(&mut self, slot: AgentSlot) -> Option<&mut AgentPicker> {
+        match slot {
+            AgentSlot::Primary => None,
+            AgentSlot::Designer => Some(&mut self.designer),
+            AgentSlot::Reviewer => Some(&mut self.reviewer),
+        }
+    }
+
+    pub fn designer_backend_selected(&self) -> usize {
+        self.designer.backend_selected
+    }
+
+    pub fn designer_model_selected(&self) -> usize {
+        self.designer.model_selected
+    }
+
+    pub fn reviewer_backend_selected(&self) -> usize {
+        self.reviewer.backend_selected
+    }
+
+    pub fn reviewer_model_selected(&self) -> usize {
+        self.reviewer.model_selected
+    }
+
+    pub fn backend_text_for(&self, slot: AgentSlot) -> Option<String> {
+        match slot {
+            AgentSlot::Primary => self.backend_text(),
+            AgentSlot::Designer => non_empty(textarea_text(&self.designer.backend)),
+            AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.backend)),
+        }
+    }
+
+    pub fn model_text_for(&self, slot: AgentSlot) -> Option<String> {
+        match slot {
+            AgentSlot::Primary => self.model_text(),
+            AgentSlot::Designer => non_empty(textarea_text(&self.designer.model)),
+            AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.model)),
+        }
+    }
+
+    pub fn effort_text_for(&self, slot: AgentSlot) -> Option<String> {
+        match slot {
+            AgentSlot::Primary => self.effort_text(),
+            AgentSlot::Designer => non_empty(textarea_text(&self.designer.effort)),
+            AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.effort)),
+        }
+    }
+
+    pub fn agent_text_for(&self, slot: AgentSlot) -> Option<String> {
+        match slot {
+            AgentSlot::Primary => self.agent_text(),
+            AgentSlot::Designer => non_empty(textarea_text(&self.designer.agent)),
+            AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.agent)),
+        }
+    }
+
+    pub fn set_backend_text_for(&mut self, slot: AgentSlot, value: &str) {
+        match slot {
+            AgentSlot::Primary => self.backend = one_line(value),
+            AgentSlot::Designer => self.designer.backend = one_line(value),
+            AgentSlot::Reviewer => self.reviewer.backend = one_line(value),
+        }
+    }
+
+    pub fn set_model_text_for(&mut self, slot: AgentSlot, value: &str) {
+        match slot {
+            AgentSlot::Primary => self.model = one_line(value),
+            AgentSlot::Designer => self.designer.model = one_line(value),
+            AgentSlot::Reviewer => self.reviewer.model = one_line(value),
+        }
+    }
+
+    pub fn set_effort_text_for(&mut self, slot: AgentSlot, value: &str) {
+        match slot {
+            AgentSlot::Primary => self.effort = one_line(value),
+            AgentSlot::Designer => self.designer.effort = one_line(value),
+            AgentSlot::Reviewer => self.reviewer.effort = one_line(value),
+        }
+    }
+
+    pub fn set_agent_text_for(&mut self, slot: AgentSlot, value: &str) {
+        match slot {
+            AgentSlot::Primary => self.agent = one_line(value),
+            AgentSlot::Designer => self.designer.agent = one_line(value),
+            AgentSlot::Reviewer => self.reviewer.agent = one_line(value),
+        }
+    }
+
     /// Ctrl+S submits form-style dialogs from any field; pure confirmation
     /// dialogs are excluded so a save reflex cannot trigger a destructive
     /// action.
@@ -431,17 +714,17 @@ impl ModalState {
 
     pub fn select_option(&mut self, field: DialogField, index: usize) {
         if let Some(kind) = selector_kind(field) {
-            let len = self.selection_len(kind);
+            let len = self.selection_len_for(field, kind);
             if len > 0 {
                 // Picking anything clears the "filter matched nothing" state,
                 // even when the pick lands on the already-selected option.
                 self.filter_error = None;
                 let selected = index.min(len - 1);
-                if self.selection_value(kind) == selected {
+                if self.selection_value_for(field, kind) == selected {
                     return;
                 }
-                *self.selection_mut(kind) = selected;
-                self.apply_selection(kind);
+                *self.selection_mut_for(field, kind) = selected;
+                self.apply_selection_for(field, kind);
                 self.error = None;
             }
         }
@@ -456,6 +739,10 @@ impl ModalState {
             DialogField::Backend => Some(self.backend_filter.as_str()),
             DialogField::Model => Some(self.model_filter.as_str()),
             DialogField::ChainTo => Some(self.chain_filter.as_str()),
+            DialogField::DesignerBackend => Some(self.designer.backend_filter.as_str()),
+            DialogField::DesignerModel => Some(self.designer.model_filter.as_str()),
+            DialogField::ReviewerBackend => Some(self.reviewer.backend_filter.as_str()),
+            DialogField::ReviewerModel => Some(self.reviewer.model_filter.as_str()),
             _ => None,
         }
     }
@@ -465,6 +752,10 @@ impl ModalState {
             DialogField::Backend => Some(&mut self.backend_filter),
             DialogField::Model => Some(&mut self.model_filter),
             DialogField::ChainTo => Some(&mut self.chain_filter),
+            DialogField::DesignerBackend => Some(&mut self.designer.backend_filter),
+            DialogField::DesignerModel => Some(&mut self.designer.model_filter),
+            DialogField::ReviewerBackend => Some(&mut self.reviewer.backend_filter),
+            DialogField::ReviewerModel => Some(&mut self.reviewer.model_filter),
             _ => None,
         }
     }
@@ -480,6 +771,15 @@ impl ModalState {
             DialogField::Theme => &self.theme_options,
             DialogField::TaskSort => &self.task_sort_options,
             DialogField::ProjectSort => &self.project_sort_options,
+            DialogField::DesignerBackend => &self.designer.backend_options,
+            DialogField::DesignerModel => &self.designer.model_options,
+            DialogField::DesignerEffort => &self.designer.effort_options,
+            DialogField::DesignerAgent => &self.designer.agent_options,
+            DialogField::ReviewerBackend => &self.reviewer.backend_options,
+            DialogField::ReviewerModel => &self.reviewer.model_options,
+            DialogField::ReviewerEffort => &self.reviewer.effort_options,
+            DialogField::ReviewerAgent => &self.reviewer.agent_options,
+            DialogField::ReviewerOnChanges => &self.reviewer_on_changes_options,
             _ => &[],
         }
     }
@@ -490,7 +790,7 @@ impl ModalState {
         match self.field_filter(field) {
             Some(filter) => filtered_indices(self.options_for(field), filter),
             None => match selector_kind(field) {
-                Some(kind) => (0..self.selection_len(kind)).collect(),
+                Some(kind) => (0..self.selection_len_for(field, kind)).collect(),
                 None => Vec::new(),
             },
         }
@@ -517,9 +817,9 @@ impl ModalState {
                 self.filter_error = Some(field);
                 return false;
             };
-            if !visible.contains(&self.selection_value(kind)) {
-                *self.selection_mut(kind) = first;
-                self.apply_selection(kind);
+            if !visible.contains(&self.selection_value_for(field, kind)) {
+                *self.selection_mut_for(field, kind) = first;
+                self.apply_selection_for(field, kind);
             }
         }
         self.filter_error = None;
@@ -535,11 +835,11 @@ impl ModalState {
         let Some(first) = visible.first().copied() else {
             return;
         };
-        if visible.contains(&self.selection_value(kind)) {
+        if visible.contains(&self.selection_value_for(field, kind)) {
             return;
         }
-        *self.selection_mut(kind) = first;
-        self.apply_selection(kind);
+        *self.selection_mut_for(field, kind) = first;
+        self.apply_selection_for(field, kind);
     }
 
     pub fn input(&mut self, key: ratatui::crossterm::event::KeyEvent) {
@@ -581,6 +881,40 @@ impl ModalState {
             }
             DialogField::Theme => self.input_select(key, SelectorKind::Theme),
             DialogField::TaskSort => self.input_select(key, SelectorKind::TaskSort),
+            DialogField::QueueEnabled => toggle_on_space(&mut self.queue_enabled, key),
+            DialogField::MaxRunningTotal => input_single_line(&mut self.max_running_total, key),
+            DialogField::MaxRunningDesigner => {
+                input_single_line(&mut self.max_running_designer, key)
+            }
+            DialogField::MaxRunningReviewer => {
+                input_single_line(&mut self.max_running_reviewer, key)
+            }
+            DialogField::MaxRunningExecutor => {
+                input_single_line(&mut self.max_running_executor, key)
+            }
+            DialogField::MaxRunningPerBackend => {
+                self.max_running_per_backend.input(key);
+            }
+            DialogField::MaxRunningPerBackendModel => {
+                self.maybe_prefix_backend_model_cap(&key);
+                self.max_running_per_backend_model.input(key);
+            }
+            DialogField::AutoRestartEnabled => toggle_on_space(&mut self.auto_restart_enabled, key),
+            DialogField::AutoRestartDelays => input_single_line(&mut self.auto_restart_delays, key),
+            DialogField::DesignerEnabled => toggle_on_space(&mut self.designer_enabled, key),
+            DialogField::DesignerBackend => self.input_select(key, SelectorKind::Backend),
+            DialogField::DesignerModel => self.input_select(key, SelectorKind::Model),
+            DialogField::DesignerEffort => self.input_select(key, SelectorKind::Effort),
+            DialogField::DesignerAgent => self.input_select(key, SelectorKind::Agent),
+            DialogField::ReviewerEnabled => toggle_on_space(&mut self.reviewer_enabled, key),
+            DialogField::ReviewerBackend => self.input_select(key, SelectorKind::Backend),
+            DialogField::ReviewerModel => self.input_select(key, SelectorKind::Model),
+            DialogField::ReviewerEffort => self.input_select(key, SelectorKind::Effort),
+            DialogField::ReviewerAgent => self.input_select(key, SelectorKind::Agent),
+            DialogField::ReviewerOnChanges => {
+                self.input_select(key, SelectorKind::ReviewerOnChanges)
+            }
+            DialogField::ReviewerMaxRounds => input_single_line(&mut self.reviewer_max_rounds, key),
             DialogField::Confirm | DialogField::Cancel => {}
         }
         if self.editable_signature() != before {
@@ -605,6 +939,34 @@ impl ModalState {
             }
             DialogField::Answer => {
                 self.answer.insert_str(&text);
+            }
+            DialogField::MaxRunningTotal => {
+                self.max_running_total.insert_str(text.replace('\n', " "));
+            }
+            DialogField::MaxRunningDesigner => {
+                self.max_running_designer
+                    .insert_str(text.replace('\n', " "));
+            }
+            DialogField::MaxRunningReviewer => {
+                self.max_running_reviewer
+                    .insert_str(text.replace('\n', " "));
+            }
+            DialogField::MaxRunningExecutor => {
+                self.max_running_executor
+                    .insert_str(text.replace('\n', " "));
+            }
+            DialogField::MaxRunningPerBackend => {
+                self.max_running_per_backend.insert_str(&text);
+            }
+            DialogField::MaxRunningPerBackendModel => {
+                self.prefix_backend_model_cap_if_empty();
+                self.max_running_per_backend_model.insert_str(&text);
+            }
+            DialogField::AutoRestartDelays => {
+                self.auto_restart_delays.insert_str(text.replace('\n', " "));
+            }
+            DialogField::ReviewerMaxRounds => {
+                self.reviewer_max_rounds.insert_str(text.replace('\n', " "));
             }
             _ => return false,
         }
@@ -631,7 +993,30 @@ impl ModalState {
             DialogField::Answer => &mut self.answer,
             DialogField::Theme => &mut self.theme,
             DialogField::TaskSort => &mut self.task_sort,
-            DialogField::Confirm | DialogField::Cancel | DialogField::PurgeData => &mut self.answer,
+            DialogField::MaxRunningTotal => &mut self.max_running_total,
+            DialogField::MaxRunningDesigner => &mut self.max_running_designer,
+            DialogField::MaxRunningReviewer => &mut self.max_running_reviewer,
+            DialogField::MaxRunningExecutor => &mut self.max_running_executor,
+            DialogField::MaxRunningPerBackend => &mut self.max_running_per_backend,
+            DialogField::MaxRunningPerBackendModel => &mut self.max_running_per_backend_model,
+            DialogField::AutoRestartDelays => &mut self.auto_restart_delays,
+            DialogField::DesignerBackend => &mut self.designer.backend,
+            DialogField::DesignerModel => &mut self.designer.model,
+            DialogField::DesignerEffort => &mut self.designer.effort,
+            DialogField::DesignerAgent => &mut self.designer.agent,
+            DialogField::ReviewerBackend => &mut self.reviewer.backend,
+            DialogField::ReviewerModel => &mut self.reviewer.model,
+            DialogField::ReviewerEffort => &mut self.reviewer.effort,
+            DialogField::ReviewerAgent => &mut self.reviewer.agent,
+            DialogField::ReviewerOnChanges => &mut self.reviewer_on_changes,
+            DialogField::ReviewerMaxRounds => &mut self.reviewer_max_rounds,
+            DialogField::Confirm
+            | DialogField::Cancel
+            | DialogField::PurgeData
+            | DialogField::QueueEnabled
+            | DialogField::AutoRestartEnabled
+            | DialogField::DesignerEnabled
+            | DialogField::ReviewerEnabled => &mut self.answer,
         }
     }
 
@@ -696,6 +1081,124 @@ impl ModalState {
             self.project_sort_text().as_deref(),
         );
         self.apply_selection(SelectorKind::ProjectSort);
+    }
+
+    pub fn set_backend_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
+        match slot {
+            AgentSlot::Primary => self.set_backend_options(options),
+            AgentSlot::Designer | AgentSlot::Reviewer => {
+                let current = self.backend_text_for(slot);
+                let picker = self.picker_mut(slot).expect("role picker");
+                picker.backend_options = options;
+                picker.backend_selected =
+                    select_matching(&picker.backend_options, current.as_deref());
+                let field = match slot {
+                    AgentSlot::Designer => DialogField::DesignerBackend,
+                    AgentSlot::Reviewer => DialogField::ReviewerBackend,
+                    AgentSlot::Primary => unreachable!(),
+                };
+                self.apply_selection_for(field, SelectorKind::Backend);
+                self.sync_filtered_selection(SelectorKind::Backend, field);
+            }
+        }
+    }
+
+    pub fn set_model_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
+        match slot {
+            AgentSlot::Primary => self.set_model_options(options),
+            AgentSlot::Designer | AgentSlot::Reviewer => {
+                let current = self.model_text_for(slot);
+                let picker = self.picker_mut(slot).expect("role picker");
+                picker.model_options = options;
+                picker.model_selected = select_matching(&picker.model_options, current.as_deref());
+                let field = match slot {
+                    AgentSlot::Designer => DialogField::DesignerModel,
+                    AgentSlot::Reviewer => DialogField::ReviewerModel,
+                    AgentSlot::Primary => unreachable!(),
+                };
+                self.apply_selection_for(field, SelectorKind::Model);
+                self.sync_filtered_selection(SelectorKind::Model, field);
+            }
+        }
+    }
+
+    pub fn set_effort_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
+        match slot {
+            AgentSlot::Primary => self.set_effort_options(options),
+            AgentSlot::Designer | AgentSlot::Reviewer => {
+                let current = self.effort_text_for(slot);
+                let picker = self.picker_mut(slot).expect("role picker");
+                picker.effort_options = options;
+                picker.effort_selected =
+                    select_matching(&picker.effort_options, current.as_deref());
+                let field = match slot {
+                    AgentSlot::Designer => DialogField::DesignerEffort,
+                    AgentSlot::Reviewer => DialogField::ReviewerEffort,
+                    AgentSlot::Primary => unreachable!(),
+                };
+                self.apply_selection_for(field, SelectorKind::Effort);
+            }
+        }
+    }
+
+    pub fn set_agent_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
+        match slot {
+            AgentSlot::Primary => self.set_agent_options(options),
+            AgentSlot::Designer | AgentSlot::Reviewer => {
+                let current = self.agent_text_for(slot);
+                let picker = self.picker_mut(slot).expect("role picker");
+                picker.agent_options = options;
+                picker.agent_selected = select_matching(&picker.agent_options, current.as_deref());
+                let field = match slot {
+                    AgentSlot::Designer => DialogField::DesignerAgent,
+                    AgentSlot::Reviewer => DialogField::ReviewerAgent,
+                    AgentSlot::Primary => unreachable!(),
+                };
+                self.apply_selection_for(field, SelectorKind::Agent);
+            }
+        }
+    }
+
+    pub fn set_reviewer_on_changes_options(&mut self, options: Vec<SelectOption>) {
+        self.reviewer_on_changes_options = options;
+        self.reviewer_on_changes_selected = select_matching(
+            &self.reviewer_on_changes_options,
+            non_empty(textarea_text(&self.reviewer_on_changes)).as_deref(),
+        );
+        self.apply_selection_for(
+            DialogField::ReviewerOnChanges,
+            SelectorKind::ReviewerOnChanges,
+        );
+    }
+
+    pub fn reviewer_on_changes_text(&self) -> Option<String> {
+        non_empty(textarea_text(&self.reviewer_on_changes))
+    }
+
+    fn maybe_prefix_backend_model_cap(&mut self, key: &ratatui::crossterm::event::KeyEvent) {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        let KeyCode::Char(_) = key.code else {
+            return;
+        };
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return;
+        }
+        self.prefix_backend_model_cap_if_empty();
+    }
+
+    fn prefix_backend_model_cap_if_empty(&mut self) {
+        if !textarea_text(&self.max_running_per_backend_model).is_empty() {
+            return;
+        }
+        let Some(backend) = self.backend_text() else {
+            return;
+        };
+        self.max_running_per_backend_model = TextArea::new(vec![format!("{backend}/")]);
+        // Place the cursor after the prefix so the next keystroke appends the model id.
+        self.max_running_per_backend_model
+            .move_cursor(ratatui_textarea::CursorMove::End);
     }
 
     pub fn title_text(&self) -> String {
@@ -826,7 +1329,18 @@ impl ModalState {
         self.filter_error = None;
     }
 
-    fn selection_len(&self, kind: SelectorKind) -> usize {
+    fn selection_len_for(&self, field: DialogField, kind: SelectorKind) -> usize {
+        if let Some(slot) = Self::agent_slot(field)
+            && let Some(picker) = self.picker(slot)
+        {
+            return match kind {
+                SelectorKind::Backend => picker.backend_options.len(),
+                SelectorKind::Model => picker.model_options.len(),
+                SelectorKind::Effort => picker.effort_options.len(),
+                SelectorKind::Agent => picker.agent_options.len(),
+                _ => 0,
+            };
+        }
         match kind {
             SelectorKind::Backend => self.backend_options.len(),
             SelectorKind::Model => self.model_options.len(),
@@ -843,10 +1357,27 @@ impl ModalState {
             SelectorKind::Theme => self.theme_options.len(),
             SelectorKind::TaskSort => self.task_sort_options.len(),
             SelectorKind::ProjectSort => self.project_sort_options.len(),
+            SelectorKind::ReviewerOnChanges => self.reviewer_on_changes_options.len(),
         }
     }
 
     fn selection_mut(&mut self, kind: SelectorKind) -> &mut usize {
+        self.selection_mut_for(self.active_field(), kind)
+    }
+
+    fn selection_mut_for(&mut self, field: DialogField, kind: SelectorKind) -> &mut usize {
+        if let Some(slot) = Self::agent_slot(field)
+            && slot != AgentSlot::Primary
+        {
+            let picker = self.picker_mut(slot).expect("role picker");
+            return match kind {
+                SelectorKind::Backend => &mut picker.backend_selected,
+                SelectorKind::Model => &mut picker.model_selected,
+                SelectorKind::Effort => &mut picker.effort_selected,
+                SelectorKind::Agent => &mut picker.agent_selected,
+                _ => &mut picker.backend_selected,
+            };
+        }
         match kind {
             SelectorKind::Backend => &mut self.backend_selected,
             SelectorKind::Model => &mut self.model_selected,
@@ -860,10 +1391,26 @@ impl ModalState {
             SelectorKind::Theme => &mut self.theme_selected,
             SelectorKind::TaskSort => &mut self.task_sort_selected,
             SelectorKind::ProjectSort => &mut self.project_sort_selected,
+            SelectorKind::ReviewerOnChanges => &mut self.reviewer_on_changes_selected,
         }
     }
 
     fn selection_value(&self, kind: SelectorKind) -> usize {
+        self.selection_value_for(self.active_field(), kind)
+    }
+
+    fn selection_value_for(&self, field: DialogField, kind: SelectorKind) -> usize {
+        if let Some(slot) = Self::agent_slot(field)
+            && let Some(picker) = self.picker(slot)
+        {
+            return match kind {
+                SelectorKind::Backend => picker.backend_selected,
+                SelectorKind::Model => picker.model_selected,
+                SelectorKind::Effort => picker.effort_selected,
+                SelectorKind::Agent => picker.agent_selected,
+                _ => 0,
+            };
+        }
         match kind {
             SelectorKind::Backend => self.backend_selected,
             SelectorKind::Model => self.model_selected,
@@ -877,10 +1424,40 @@ impl ModalState {
             SelectorKind::Theme => self.theme_selected,
             SelectorKind::TaskSort => self.task_sort_selected,
             SelectorKind::ProjectSort => self.project_sort_selected,
+            SelectorKind::ReviewerOnChanges => self.reviewer_on_changes_selected,
         }
     }
 
     fn apply_selection(&mut self, kind: SelectorKind) {
+        self.apply_selection_for(self.active_field(), kind);
+    }
+
+    fn apply_selection_for(&mut self, field: DialogField, kind: SelectorKind) {
+        if let Some(slot) = Self::agent_slot(field)
+            && slot != AgentSlot::Primary
+        {
+            let picker = self.picker_mut(slot).expect("role picker");
+            match kind {
+                SelectorKind::Backend => {
+                    let text = selected_value(&picker.backend_options, picker.backend_selected);
+                    picker.backend = one_line(text.as_deref().unwrap_or(""));
+                }
+                SelectorKind::Model => {
+                    let text = selected_value(&picker.model_options, picker.model_selected);
+                    picker.model = one_line(text.as_deref().unwrap_or(""));
+                }
+                SelectorKind::Effort => {
+                    let text = selected_value(&picker.effort_options, picker.effort_selected);
+                    picker.effort = one_line(text.as_deref().unwrap_or(""));
+                }
+                SelectorKind::Agent => {
+                    let text = selected_value(&picker.agent_options, picker.agent_selected);
+                    picker.agent = one_line(text.as_deref().unwrap_or(""));
+                }
+                _ => {}
+            }
+            return;
+        }
         match kind {
             SelectorKind::Backend => {
                 let text = selected_value(&self.backend_options, self.backend_selected);
@@ -930,6 +1507,13 @@ impl ModalState {
             SelectorKind::ProjectSort => {
                 let text = selected_value(&self.project_sort_options, self.project_sort_selected);
                 self.project_sort = one_line(text.as_deref().unwrap_or("name"));
+            }
+            SelectorKind::ReviewerOnChanges => {
+                let text = selected_value(
+                    &self.reviewer_on_changes_options,
+                    self.reviewer_on_changes_selected,
+                );
+                self.reviewer_on_changes = one_line(text.as_deref().unwrap_or("in_progress"));
             }
         }
     }
@@ -996,6 +1580,36 @@ impl ModalState {
             raw_textarea_text(&self.project_sort),
             self.project_sort_selected.to_string(),
             self.purge_data.to_string(),
+            self.queue_enabled.to_string(),
+            raw_textarea_text(&self.max_running_total),
+            raw_textarea_text(&self.max_running_designer),
+            raw_textarea_text(&self.max_running_reviewer),
+            raw_textarea_text(&self.max_running_executor),
+            raw_textarea_text(&self.max_running_per_backend),
+            raw_textarea_text(&self.max_running_per_backend_model),
+            self.auto_restart_enabled.to_string(),
+            raw_textarea_text(&self.auto_restart_delays),
+            self.designer_enabled.to_string(),
+            raw_textarea_text(&self.designer.backend),
+            raw_textarea_text(&self.designer.model),
+            raw_textarea_text(&self.designer.effort),
+            raw_textarea_text(&self.designer.agent),
+            self.designer.backend_selected.to_string(),
+            self.designer.model_selected.to_string(),
+            self.designer.effort_selected.to_string(),
+            self.designer.agent_selected.to_string(),
+            self.reviewer_enabled.to_string(),
+            raw_textarea_text(&self.reviewer.backend),
+            raw_textarea_text(&self.reviewer.model),
+            raw_textarea_text(&self.reviewer.effort),
+            raw_textarea_text(&self.reviewer.agent),
+            self.reviewer.backend_selected.to_string(),
+            self.reviewer.model_selected.to_string(),
+            self.reviewer.effort_selected.to_string(),
+            self.reviewer.agent_selected.to_string(),
+            raw_textarea_text(&self.reviewer_on_changes),
+            self.reviewer_on_changes_selected.to_string(),
+            raw_textarea_text(&self.reviewer_max_rounds),
         ]
         .join("\u{1f}")
     }
@@ -1015,14 +1629,23 @@ enum SelectorKind {
     Theme,
     TaskSort,
     ProjectSort,
+    ReviewerOnChanges,
 }
 
 fn selector_kind(field: DialogField) -> Option<SelectorKind> {
     match field {
-        DialogField::Backend => Some(SelectorKind::Backend),
-        DialogField::Model => Some(SelectorKind::Model),
-        DialogField::Effort => Some(SelectorKind::Effort),
-        DialogField::Agent => Some(SelectorKind::Agent),
+        DialogField::Backend | DialogField::DesignerBackend | DialogField::ReviewerBackend => {
+            Some(SelectorKind::Backend)
+        }
+        DialogField::Model | DialogField::DesignerModel | DialogField::ReviewerModel => {
+            Some(SelectorKind::Model)
+        }
+        DialogField::Effort | DialogField::DesignerEffort | DialogField::ReviewerEffort => {
+            Some(SelectorKind::Effort)
+        }
+        DialogField::Agent | DialogField::DesignerAgent | DialogField::ReviewerAgent => {
+            Some(SelectorKind::Agent)
+        }
         DialogField::ChainTo => Some(SelectorKind::ChainTo),
         DialogField::TargetStatus => Some(SelectorKind::TargetStatus),
         DialogField::MessageKind => Some(SelectorKind::MessageKind),
@@ -1031,6 +1654,7 @@ fn selector_kind(field: DialogField) -> Option<SelectorKind> {
         DialogField::Theme => Some(SelectorKind::Theme),
         DialogField::TaskSort => Some(SelectorKind::TaskSort),
         DialogField::ProjectSort => Some(SelectorKind::ProjectSort),
+        DialogField::ReviewerOnChanges => Some(SelectorKind::ReviewerOnChanges),
         _ => None,
     }
 }
@@ -1400,17 +2024,42 @@ fn selector_form_rows(
 
 fn task_field_min_height(field: DialogField) -> u16 {
     match field {
-        DialogField::Title | DialogField::Interactive | DialogField::EscapeToProjects => 3,
-        DialogField::Description => 5,
+        DialogField::Title
+        | DialogField::Interactive
+        | DialogField::EscapeToProjects
+        | DialogField::QueueEnabled
+        | DialogField::AutoRestartEnabled
+        | DialogField::DesignerEnabled
+        | DialogField::ReviewerEnabled
+        | DialogField::MaxRunningTotal
+        | DialogField::MaxRunningDesigner
+        | DialogField::MaxRunningReviewer
+        | DialogField::MaxRunningExecutor
+        | DialogField::AutoRestartDelays
+        | DialogField::ReviewerMaxRounds => 3,
+        DialogField::Description
+        | DialogField::MaxRunningPerBackend
+        | DialogField::MaxRunningPerBackendModel => 5,
         // Filterable selectors spend a row on the filter input, so they need
         // one more line to still show two options.
-        DialogField::Backend | DialogField::Model | DialogField::ChainTo => 5,
+        DialogField::Backend
+        | DialogField::Model
+        | DialogField::ChainTo
+        | DialogField::DesignerBackend
+        | DialogField::DesignerModel
+        | DialogField::ReviewerBackend
+        | DialogField::ReviewerModel => 5,
         _ => 4,
     }
 }
 
 fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
-    if field == DialogField::Description {
+    if matches!(
+        field,
+        DialogField::Description
+            | DialogField::MaxRunningPerBackend
+            | DialogField::MaxRunningPerBackendModel
+    ) {
         return 10;
     }
     let chrome = if modal.field_filter(field).is_some() {
@@ -1427,6 +2076,15 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         DialogField::TaskSort => modal.task_sort_options.len(),
         DialogField::ProjectSort => modal.project_sort_options.len(),
         DialogField::ChainTo => modal.chain_options.len(),
+        DialogField::DesignerBackend => modal.designer.backend_options.len(),
+        DialogField::DesignerModel => modal.designer.model_options.len(),
+        DialogField::DesignerEffort => modal.designer.effort_options.len(),
+        DialogField::DesignerAgent => modal.designer.agent_options.len(),
+        DialogField::ReviewerBackend => modal.reviewer.backend_options.len(),
+        DialogField::ReviewerModel => modal.reviewer.model_options.len(),
+        DialogField::ReviewerEffort => modal.reviewer.effort_options.len(),
+        DialogField::ReviewerAgent => modal.reviewer.agent_options.len(),
+        DialogField::ReviewerOnChanges => modal.reviewer_on_changes_options.len(),
         _ => return task_field_min_height(field),
     };
     task_field_min_height(field)
@@ -1744,6 +2402,205 @@ fn render_selector_field(
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
+        DialogField::QueueEnabled => render_checkbox(
+            frame,
+            app,
+            area,
+            "Limits",
+            "queue enabled (dispatcher starts queued tasks)",
+            modal.queue_enabled,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::MaxRunningTotal => render_textarea(
+            frame,
+            app,
+            &modal.max_running_total,
+            area,
+            "Limits · Max running total (0 = unlimited)",
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::MaxRunningDesigner => render_textarea(
+            frame,
+            app,
+            &modal.max_running_designer,
+            area,
+            "Limits · Max designer tasks",
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::MaxRunningReviewer => render_textarea(
+            frame,
+            app,
+            &modal.max_running_reviewer,
+            area,
+            "Limits · Max reviewer tasks",
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::MaxRunningExecutor => render_textarea(
+            frame,
+            app,
+            &modal.max_running_executor,
+            area,
+            "Limits · Max executor tasks",
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::MaxRunningPerBackend => render_textarea(
+            frame,
+            app,
+            &modal.max_running_per_backend,
+            area,
+            "Limits · Max tasks per backend (one `backend: N` line)",
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::MaxRunningPerBackendModel => {
+            let hint = modal
+                .backend_text()
+                .map(|backend| {
+                    format!("Limits · Max tasks per backend/model (`{backend}/model: N`)")
+                })
+                .unwrap_or_else(|| {
+                    "Limits · Max tasks per backend/model (`claude/opus: N`)".to_string()
+                });
+            render_textarea(
+                frame,
+                app,
+                &modal.max_running_per_backend_model,
+                area,
+                &hint,
+                modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            );
+        }
+        DialogField::AutoRestartEnabled => render_checkbox(
+            frame,
+            app,
+            area,
+            "Restarts",
+            "auto-restart crashed sessions",
+            modal.auto_restart_enabled,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::AutoRestartDelays => render_textarea(
+            frame,
+            app,
+            &modal.auto_restart_delays,
+            area,
+            "Restarts · Delay minutes (e.g. 1, 30, 270)",
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::DesignerEnabled => render_checkbox(
+            frame,
+            app,
+            area,
+            "Designer",
+            "run a designer bot before the executor",
+            modal.designer_enabled,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::DesignerBackend => render_select_filtered(
+            frame,
+            app,
+            "Designer · Backend",
+            &modal.designer.backend_options,
+            modal.designer.backend_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.designer.backend_filter),
+            modal.filter_error == Some(field),
+        ),
+        DialogField::DesignerModel => render_select_filtered(
+            frame,
+            app,
+            "Designer · Model",
+            &modal.designer.model_options,
+            modal.designer.model_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.designer.model_filter),
+            modal.filter_error == Some(field),
+        ),
+        DialogField::DesignerEffort => render_select(
+            frame,
+            app,
+            "Designer · Effort",
+            &modal.designer.effort_options,
+            modal.designer.effort_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::DesignerAgent => render_select(
+            frame,
+            app,
+            "Designer · Agent",
+            &modal.designer.agent_options,
+            modal.designer.agent_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::ReviewerEnabled => render_checkbox(
+            frame,
+            app,
+            area,
+            "Reviewer",
+            "run a reviewer bot before human Review",
+            modal.reviewer_enabled,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::ReviewerBackend => render_select_filtered(
+            frame,
+            app,
+            "Reviewer · Backend",
+            &modal.reviewer.backend_options,
+            modal.reviewer.backend_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.reviewer.backend_filter),
+            modal.filter_error == Some(field),
+        ),
+        DialogField::ReviewerModel => render_select_filtered(
+            frame,
+            app,
+            "Reviewer · Model",
+            &modal.reviewer.model_options,
+            modal.reviewer.model_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.reviewer.model_filter),
+            modal.filter_error == Some(field),
+        ),
+        DialogField::ReviewerEffort => render_select(
+            frame,
+            app,
+            "Reviewer · Effort",
+            &modal.reviewer.effort_options,
+            modal.reviewer.effort_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::ReviewerAgent => render_select(
+            frame,
+            app,
+            "Reviewer · Agent",
+            &modal.reviewer.agent_options,
+            modal.reviewer.agent_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::ReviewerOnChanges => render_select(
+            frame,
+            app,
+            "Reviewer · On changes requested",
+            &modal.reviewer_on_changes_options,
+            modal.reviewer_on_changes_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::ReviewerMaxRounds => render_textarea(
+            frame,
+            app,
+            &modal.reviewer_max_rounds,
+            area,
+            "Reviewer · Max bounce rounds (0 = unlimited)",
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
         _ => {}
     }
 }
@@ -1766,6 +2623,42 @@ fn register_task_options(
             modal.project_sort_selected,
         ),
         DialogField::ChainTo => (modal.chain_options.len(), modal.chain_selected),
+        DialogField::DesignerBackend => (
+            modal.designer.backend_options.len(),
+            modal.designer.backend_selected,
+        ),
+        DialogField::DesignerModel => (
+            modal.designer.model_options.len(),
+            modal.designer.model_selected,
+        ),
+        DialogField::DesignerEffort => (
+            modal.designer.effort_options.len(),
+            modal.designer.effort_selected,
+        ),
+        DialogField::DesignerAgent => (
+            modal.designer.agent_options.len(),
+            modal.designer.agent_selected,
+        ),
+        DialogField::ReviewerBackend => (
+            modal.reviewer.backend_options.len(),
+            modal.reviewer.backend_selected,
+        ),
+        DialogField::ReviewerModel => (
+            modal.reviewer.model_options.len(),
+            modal.reviewer.model_selected,
+        ),
+        DialogField::ReviewerEffort => (
+            modal.reviewer.effort_options.len(),
+            modal.reviewer.effort_selected,
+        ),
+        DialogField::ReviewerAgent => (
+            modal.reviewer.agent_options.len(),
+            modal.reviewer.agent_selected,
+        ),
+        DialogField::ReviewerOnChanges => (
+            modal.reviewer_on_changes_options.len(),
+            modal.reviewer_on_changes_selected,
+        ),
         _ => (0, 0),
     };
     if modal.field_filter(field).is_some() {
@@ -2258,6 +3151,38 @@ fn register_buttons(hitboxes: &mut Vec<Hitbox>, area: Rect, left: ModalButton, r
         action: HitAction::ModalButton(right),
     });
 }
+fn toggle_on_space(value: &mut bool, key: ratatui::crossterm::event::KeyEvent) {
+    if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
+        *value = !*value;
+    }
+}
+
+fn render_checkbox(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    title: &str,
+    label: &str,
+    checked: bool,
+    active: bool,
+) {
+    let border = if active {
+        app.theme.focus
+    } else {
+        app.theme.border
+    };
+    let mark = if checked { "☑" } else { "☐" };
+    frame.render_widget(
+        Paragraph::new(format!("{mark} {label} (Space toggles)")).block(
+            Block::default()
+                .title(format!(" {title} "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border)),
+        ),
+        area,
+    );
+}
+
 fn render_interactive(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
     let active = modal.active_field() == DialogField::Interactive
         || app.is_hovered(HitAction::ModalField(DialogField::Interactive));
@@ -2345,9 +3270,10 @@ fn render_description_textarea(
     };
     modal.description.set_block(
         Block::default()
-            // Alt+Enter is named too: terminals without the kitty keyboard
-            // protocol cannot report Shift+Enter apart from plain Enter.
-            .title(" Description (Ctrl+V image paste, Shift/Alt+Enter newline) ")
+            // Enter, Shift+Enter, and Alt+Enter all insert a newline. The
+            // title names Enter because that is the key every terminal can
+            // deliver; the modifiers are accepted too.
+            .title(" Description (Ctrl+V image paste, Enter newline) ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border)),
     );

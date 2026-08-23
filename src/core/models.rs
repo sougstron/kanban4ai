@@ -55,6 +55,36 @@ string_enum!(TaskStatus {
     Archive => "archive",
 });
 
+// Sub-state of an In Progress task. The board columns (`TaskStatus`) do not
+// change; this records where a delegated run stands inside In Progress.
+// Absent (`None`) means "In Progress the old way" and is treated as
+// `RunPhase::Execute` wherever a phase is required.
+string_enum!(RunPhase {
+    Queued => "queued",
+    Design => "design",
+    Execute => "execute",
+    Review => "review",
+});
+
+// Which bot a session is running as. Derived from `RunPhase` (`design` →
+// designer, `review` → reviewer, everything else including a missing
+// phase → executor) and handed to the prompt builder and the move gate.
+string_enum!(Role {
+    Executor => "executor",
+    Designer => "designer",
+    Reviewer => "reviewer",
+});
+
+impl Role {
+    pub fn from_phase(phase: Option<RunPhase>) -> Self {
+        match phase {
+            Some(RunPhase::Design) => Role::Designer,
+            Some(RunPhase::Review) => Role::Reviewer,
+            _ => Role::Executor,
+        }
+    }
+}
+
 string_enum!(SessionStatus {
     Active => "active",
     Closed => "closed",
@@ -255,6 +285,39 @@ pub struct Task {
     /// legacy boards round-trip byte-identically.
     #[serde(default, skip_serializing_if = "is_false")]
     pub review_unseen: bool,
+    /// Where the current In Progress run stands (queued / design / execute /
+    /// review). `None` is not serialized — legacy boards keep round-tripping
+    /// byte-identically — and reads as `Execute` wherever a phase is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_phase: Option<RunPhase>,
+    /// Crash auto-restarts consumed for this task. Separate from
+    /// `auto_resumes`: a clean-exit resume and a crash restart are different
+    /// failure modes and must not share a counter. Reset whenever a human
+    /// (re)starts the task. Omitted while zero so legacy boards round-trip
+    /// byte-identically.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub crash_restarts: u32,
+    /// When the crash-restart pump should re-queue an In Progress task after
+    /// a crash (`now + delay[crash_restarts]`). Omitted while unset.
+    #[serde(
+        default,
+        with = "timefmt::serde_naive_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub restart_at: Option<NaiveDateTime>,
+    /// Consecutive bot-review rounds consumed for this task. Capped by
+    /// `orchestration.reviewer.max_rounds`; exhausting it falls through to
+    /// human Review. Reset on a human restart. Omitted while zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub review_rounds: u32,
+    /// A designer pass has already finished for this task and its plan is on
+    /// the thread. Gates the design phase directly instead of inferring it
+    /// from `review_rounds`, so a crash restart mid-execute resumes the
+    /// executor rather than re-planning from scratch. Cleared only when a
+    /// human sends the task back to To Do. Omitted while false so legacy
+    /// boards round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub designed: bool,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -289,7 +352,32 @@ impl Task {
             review_edits: String::new(),
             auto_resumes: 0,
             review_unseen: false,
+            run_phase: None,
+            crash_restarts: 0,
+            restart_at: None,
+            review_rounds: 0,
+            designed: false,
         }
+    }
+
+    /// Clear the automatic-relaunch bookkeeping: the clean-exit resume budget,
+    /// the crash-restart counter and its pending deadline. Used on its own
+    /// where a human nudges a run that is still the *same* run (wake/revoke,
+    /// re-run of a stranded session) — those must not also clear the reviewer
+    /// bounce count, or a task woken mid-review would re-arm `max_rounds`
+    /// from zero and the bounce loop the cap exists to stop could run forever.
+    pub fn reset_auto_restart(&mut self) {
+        self.auto_resumes = 0;
+        self.crash_restarts = 0;
+        self.restart_at = None;
+    }
+
+    /// Clear every automatic-relaunch counter after a human restarts the work
+    /// itself (run, re-run from Review, recover, take, queue). That is a fresh
+    /// attempt, so the bot-review bounce count starts over too.
+    pub fn reset_human_restart(&mut self) {
+        self.reset_auto_restart();
+        self.review_rounds = 0;
     }
 }
 

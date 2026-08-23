@@ -25,4 +25,6 @@ package() {
   ln -s kanban4ai "$pkgdir/usr/bin/kb"
   install -Dm644 "$release_dir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 "$release_dir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 "$release_dir/kanban4ai.service" \
+    "$pkgdir/usr/lib/systemd/user/kanban4ai.service"
 }

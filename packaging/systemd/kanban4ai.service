@@ -1,0 +1,22 @@
+# kanban4ai headless dispatcher.
+#
+# User unit: copy to ~/.config/systemd/user/ (scripts/install.sh --with-daemon)
+# or install under /usr/lib/systemd/user/ (AUR). Never enabled automatically.
+#
+#   systemctl --user enable --now kanban4ai.service
+#   journalctl --user -u kanban4ai
+#
+# Non-systemd fallback (cron / a systemd timer):
+#   * * * * * kanban daemon --once
+
+[Unit]
+Description=kanban4ai headless dispatcher
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/kanban4ai daemon
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

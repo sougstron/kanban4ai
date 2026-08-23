@@ -8,7 +8,7 @@ use std::fs;
 use common::{copy_fixture, fixtures_dir, temp_board};
 use kanban4ai::core::config::Config;
 use kanban4ai::core::models::{
-    MessageKind, MessageRole, MessageStatus, Session, SessionStatus, TaskStatus,
+    MessageKind, MessageRole, MessageStatus, RunPhase, Session, SessionStatus, Task, TaskStatus,
 };
 use kanban4ai::core::storage::Storage;
 use kanban4ai::core::thread::ThreadManager;
@@ -67,6 +67,81 @@ fn task_fixtures_round_trip_losslessly() {
         assert_eq!(original, reloaded, "round-trip mismatch for {path:?}");
         drop(dir);
     }
+}
+
+#[test]
+fn legacy_task_without_run_phase_round_trips_byte_identically() {
+    let (dir, storage) = temp_board();
+    let mut task = Task::new("TASK-090", "Legacy in-progress task");
+    task.status = TaskStatus::InProgress;
+    task.session = Some("ses-opencode-20260823-120000-000001".to_string());
+    task.ai_model = Some("openai/gpt-5.5".to_string());
+    task.interactive = true;
+
+    let path = dir.path().join(".kanban/tasks/in_progress/TASK-090.md");
+    storage.save_task(&task).unwrap();
+    let first = fs::read_to_string(&path).unwrap();
+
+    // The orchestration fields stay out of frontmatter that never carried
+    // them — a board written before TASK-222 is rewritten unchanged.
+    assert!(!first.contains("run_phase"), "{first}");
+    assert!(!first.contains("crash_restarts"), "{first}");
+    assert!(!first.contains("restart_at"), "{first}");
+    assert!(!first.contains("review_rounds"), "{first}");
+
+    let reparsed = storage.parse_task_file(&path).unwrap();
+    assert_eq!(reparsed, task);
+    assert_eq!(reparsed.run_phase, None);
+    assert_eq!(reparsed.crash_restarts, 0);
+    assert_eq!(reparsed.restart_at, None);
+
+    storage.save_task(&reparsed).unwrap();
+    let second = fs::read_to_string(&path).unwrap();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn run_phase_and_crash_restart_fields_round_trip() {
+    let (dir, storage) = temp_board();
+    let mut task = Task::new("TASK-091", "Crashed queued task");
+    task.status = TaskStatus::InProgress;
+    task.run_phase = Some(RunPhase::Queued);
+    task.crash_restarts = 2;
+    task.restart_at = Some(timefmt::parse("2026-08-23T18:30:00").unwrap());
+
+    let path = dir.path().join(".kanban/tasks/in_progress/TASK-091.md");
+    storage.save_task(&task).unwrap();
+    let raw = fs::read_to_string(&path).unwrap();
+    // The restart deadline is quoted like every other naive datetime so the
+    // Python CLI's `datetime.fromisoformat` keeps reading it as a string.
+    assert!(raw.contains("run_phase: queued"), "{raw}");
+    assert!(raw.contains("crash_restarts: 2"), "{raw}");
+    assert!(raw.contains("restart_at: '2026-08-23T18:30:00'"), "{raw}");
+
+    let mut reparsed = storage.parse_task_file(&path).unwrap();
+    assert_eq!(reparsed, task);
+
+    // Zero/None values are omitted again on the way back.
+    reparsed.run_phase = None;
+    reparsed.restart_at = None;
+    reparsed.crash_restarts = 0;
+    storage.save_task(&reparsed).unwrap();
+    let cleared = fs::read_to_string(&path).unwrap();
+    assert!(!cleared.contains("restart_at"), "{cleared}");
+}
+
+#[test]
+fn reset_human_restart_clears_crash_bookkeeping() {
+    let mut task = Task::new("TASK-092", "Restart bookkeeping");
+    task.auto_resumes = 1;
+    task.crash_restarts = 3;
+    task.restart_at = Some(timefmt::now());
+    task.review_rounds = 2;
+    task.reset_human_restart();
+    assert_eq!(task.auto_resumes, 0);
+    assert_eq!(task.crash_restarts, 0);
+    assert_eq!(task.restart_at, None);
+    assert_eq!(task.review_rounds, 0);
 }
 
 #[test]

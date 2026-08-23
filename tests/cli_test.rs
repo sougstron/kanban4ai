@@ -6,6 +6,8 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use kanban4ai::core::daemon;
+use kanban4ai::core::operations::Operations;
 use kanban4ai::core::project::ProjectStore;
 use predicates::prelude::*;
 
@@ -1097,4 +1099,177 @@ fn limits_bridge_install_wraps_and_restores_the_statusline() {
             .with_file_name("settings.json.kanban4ai-bak")
             .exists()
     );
+}
+
+fn project_ops(env: &Env) -> Operations {
+    let project = ProjectStore::at(env.store())
+        .resolve_from_cwd(env.work())
+        .expect("resolve")
+        .expect("registered");
+    Operations::for_project(&project)
+}
+
+fn write_board_config(env: &Env, body: &str) {
+    std::fs::write(env.kanban().join("config.yaml"), body).expect("config");
+}
+
+#[test]
+fn daemon_once_is_quiet_on_an_empty_store() {
+    let env = Env::new();
+    kanban(&env)
+        .args(["daemon", "--once"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+}
+
+#[test]
+fn daemon_refuses_a_second_instance() {
+    let env = board();
+    let store = ProjectStore::at(env.store());
+    let _lock = daemon::try_lock(&store).expect("hold daemon.lock");
+    kanban(&env)
+        .args(["daemon", "--once"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("already running"));
+}
+
+#[test]
+fn daemon_once_releases_the_lock() {
+    let env = board();
+    kanban(&env).args(["daemon", "--once"]).assert().success();
+    kanban(&env).args(["daemon", "--once"]).assert().success();
+}
+
+#[test]
+fn daemon_interval_zero_is_rejected() {
+    let env = Env::new();
+    kanban(&env)
+        .args(["daemon", "--once", "--interval", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--interval must be greater than 0",
+        ));
+}
+
+#[test]
+fn daemon_skips_a_missing_work_folder_with_one_warning() {
+    let env = board();
+    let project = ProjectStore::at(env.store())
+        .resolve_from_cwd(env.work())
+        .unwrap()
+        .unwrap();
+    let work = env.work().to_path_buf();
+    std::fs::remove_dir_all(&work).expect("remove work folder");
+    kanban(&env)
+        .current_dir(env.store())
+        .args(["daemon", "--once"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("work folder is gone")
+                .and(predicate::str::contains(&project.id)),
+        );
+}
+
+#[test]
+fn daemon_skips_a_project_with_queue_disabled() {
+    let env = board();
+    write_board_config(
+        &env,
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: true\norchestration:\n  queue_enabled: false\n",
+    );
+    kanban(&env).args(["create", "Parked"]).assert().success();
+    project_ops(&env).enqueue_task("TASK-001").unwrap();
+    kanban(&env)
+        .args(["daemon", "--once"])
+        .assert()
+        .success()
+        .stdout(predicate::str::is_empty());
+    let task = project_ops(&env).get_task("TASK-001").unwrap().unwrap();
+    assert_eq!(
+        task.run_phase,
+        Some(kanban4ai::core::models::RunPhase::Queued)
+    );
+}
+
+#[test]
+fn daemon_unknown_project_is_an_error() {
+    let env = board();
+    kanban(&env)
+        .args(["daemon", "--once", "--project", "no-such-board"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no such project: no-such-board"));
+}
+
+#[test]
+fn daemon_launches_a_queued_task_without_a_terminal() {
+    let env = board();
+    let sleeper = env.work().join("fake-agent.sh");
+    std::fs::write(&sleeper, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&sleeper).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sleeper, perms).unwrap();
+    }
+    write_board_config(
+        &env,
+        &format!(
+            "notifications:\n  enabled: false\n\
+auto_launch:\n  enabled: true\n  use_tmux: true\n  terminal_fallback: true\n  default_agent: opencode\n\
+agents:\n  opencode:\n    command: {}\n    extra_args: []\n",
+            sleeper.display()
+        ),
+    );
+    kanban(&env)
+        .args(["create", "Daemon launch", "--backend", "opencode"])
+        .assert()
+        .success();
+    project_ops(&env).enqueue_task("TASK-001").unwrap();
+
+    let output = kanban(&env)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .args(["daemon", "--once"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dispatch TASK-001"))
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8_lossy(&output);
+    let log = std::fs::read_to_string(env.store().join("logs/daemon.log")).expect("daemon.log");
+    assert!(log.contains("dispatch TASK-001"), "{log}");
+
+    let task = project_ops(&env).get_task("TASK-001").unwrap().unwrap();
+    let session = task.session.expect("session pinned");
+    assert!(
+        stdout.contains(&session),
+        "dispatch line should name the session: {stdout}"
+    );
+
+    if which("tmux") {
+        let attached = std::process::Command::new("tmux")
+            .args(["has-session", "-t", &format!("={session}")])
+            .status()
+            .expect("tmux has-session")
+            .success();
+        assert!(attached, "tmux session {session} should be attachable");
+    }
+
+    kanban(&env).args(["stop", "TASK-001"]).assert().success();
+}
+
+fn which(command: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let path = dir.join(command);
+            path.is_file()
+        })
+    })
 }

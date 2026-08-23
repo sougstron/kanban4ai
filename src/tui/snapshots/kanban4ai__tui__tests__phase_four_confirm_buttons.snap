@@ -25,7 +25,7 @@ expression: output
 │                  ││                  ││                  ││                  │
 │                  ││                  ││                  ││                  │
 └──────────────────┘└──────────────────┘└──────────────────┘└──────────────────┘
- TUI ready │ n new · e edit · r run · m move · y approve · / filter · ? help    
+ TUI ready │ n new · e edit · r run · Q queue · m move · / filter · ? help      
 
 --- style runs ---
 0:0-20 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

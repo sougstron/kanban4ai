@@ -10,7 +10,7 @@ expression: render_snapshot(&mut app)
 │└────────────│┌ Title ─────────────────────────────────────────────────────────┐│             │
 │             ││Question card                                                   ││             │
 │             │└────────────────────────────────────────────────────────────────┘│             │
-│             │┌ Description (Ctrl+V image paste, Shift/Alt+Enter newline) ─────┐│             │
+│             │┌ Description (Ctrl+V image paste, Enter newline) ───────────────┐│             │
 │             ││Needs an answer                                                 ││             │
 │             ││                                                                ││             │
 │             ││                                                                ││             │
@@ -29,7 +29,7 @@ expression: render_snapshot(&mut app)
 │                      ││                      ││                      ││                      │
 │                      ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
- ? 1 questions  Dialog cancelled │ n new · e edit · r run · m move · / filter · ? help          
+ ? 1 questions  Dialog cancelled │ n new · e edit · r run · Q queue · / filter · ? help         
 
 --- style runs ---
 0:0-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

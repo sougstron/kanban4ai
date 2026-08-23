@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::core::models::Task;
+use crate::core::models::{RunPhase, Task};
 use crate::core::session::SessionState;
 use crate::core::telemetry::SessionProgress;
 
@@ -21,9 +21,10 @@ pub fn render_card(
     dragging: bool,
 ) {
     let session_state = app.board.session_states.get(&task.id).copied();
-    let border = if session_state == Some(SessionState::Crashed) {
+    let retrying = task.restart_at.is_some();
+    let border = if session_state == Some(SessionState::Crashed) && !retrying {
         app.theme.err
-    } else if task.review_unseen || (task.has_questions && !hovered) {
+    } else if retrying || task.review_unseen || (task.has_questions && !hovered) {
         app.theme.warn
     } else if focused || hovered {
         app.theme.focus
@@ -218,8 +219,19 @@ pub fn badges(
     if task.interactive {
         badges.push(("☑ interactive".to_string(), app.theme.ok));
     }
+    // A queued/design/review run phase overrides only the running badge's
+    // label and colour; live/waiting/crashed still derive from SessionState.
+    let phase_badge = match task.run_phase {
+        Some(RunPhase::Queued) => Some(("⏸ queued", app.theme.warn)),
+        Some(RunPhase::Design) => Some(("✎ design", app.theme.focus)),
+        Some(RunPhase::Review) => Some(("⚖ review", app.theme.review)),
+        _ => None,
+    };
     match session_state {
-        Some(SessionState::Live) => badges.push(("▶ running".to_string(), app.theme.ok)),
+        Some(SessionState::Live) => {
+            let (label, color) = phase_badge.unwrap_or(("▶ running", app.theme.ok));
+            badges.push((label.to_string(), color));
+        }
         Some(SessionState::Waiting) => {
             let label = app
                 .board
@@ -229,10 +241,17 @@ pub fn badges(
                 .unwrap_or_else(|| "⏳ wait mode".to_string());
             badges.push((label, app.theme.warn));
         }
-        Some(SessionState::Crashed) => {
-            badges.push(("✖ crashed · u recover".to_string(), app.theme.err))
+        Some(SessionState::Crashed) => match task.restart_at {
+            Some(restart_at) => badges.push((retry_badge(restart_at), app.theme.warn)),
+            None => badges.push(("✖ crashed · u recover".to_string(), app.theme.err)),
+        },
+        None => {
+            if let Some(restart_at) = task.restart_at {
+                badges.push((retry_badge(restart_at), app.theme.warn));
+            } else if let Some((label, color)) = phase_badge {
+                badges.push((label.to_string(), color));
+            }
         }
-        None => {}
     }
     if task.chained_to.is_some() {
         badges.push(("↪ chain".to_string(), app.theme.ok));
@@ -241,6 +260,10 @@ pub fn badges(
         badges.push(("? questions".to_string(), app.theme.warn));
     }
     badges
+}
+
+pub fn retry_badge(restart_at: chrono::NaiveDateTime) -> String {
+    format!("↻ retry {}", restart_at.format("%H:%M"))
 }
 
 /// The two live-telemetry rows for a running agent: a stats line (todo progress
@@ -372,10 +395,20 @@ pub fn sanitize_terminal_text(text: &str) -> String {
 mod tests {
     use ratatui::style::Color;
 
+    use chrono::NaiveDate;
+
     use super::{
-        case_insensitive_match, format_tokens, highlight_title_matches, progress_bar,
+        case_insensitive_match, format_tokens, highlight_title_matches, progress_bar, retry_badge,
         sanitize_terminal_text, truncate_display,
     };
+
+    #[test]
+    fn retry_badge_shows_the_deadline_clock() {
+        let at = NaiveDate::from_ymd_opt(2026, 8, 23)
+            .and_then(|d| d.and_hms_opt(14, 32, 0))
+            .expect("valid fixture timestamp");
+        assert_eq!(retry_badge(at), "↻ retry 14:32");
+    }
 
     #[test]
     fn progress_bar_fills_and_rounds() {

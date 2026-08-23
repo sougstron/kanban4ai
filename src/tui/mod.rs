@@ -45,6 +45,15 @@ type PanicHook = Box<dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static>;
 /// sequences and simply keep the board's title after quitting.
 const PUSH_WINDOW_TITLE: &str = "\x1b[22;2t";
 const POP_WINDOW_TITLE: &str = "\x1b[23;2t";
+/// xterm modifyOtherKeys level 2. Inside tmux this asks the multiplexer to
+/// report modified keys (Shift+Enter among them) to this pane once the server
+/// is configured with `extended-keys on` and `extended-keys-format csi-u`;
+/// tmux consumes the request per pane, so other panes are untouched. It is
+/// never sent to a bare terminal: one that honours it without also speaking
+/// the kitty protocol answers in the `CSI 27;mod;key~` form, which crossterm
+/// cannot parse, and every modified key would turn into a dropped event.
+const SET_MODIFY_OTHER_KEYS: &str = "\x1b[>4;2m";
+const RESET_MODIFY_OTHER_KEYS: &str = "\x1b[>4m";
 
 fn write_escape(stdout: &mut Stdout, escape: &str) -> bool {
     write!(stdout, "{escape}")
@@ -63,6 +72,7 @@ fn set_window_title(title: &str) {
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
     key_disambiguation: bool,
+    key_modify_other_keys: bool,
     window_title: bool,
 }
 
@@ -73,16 +83,16 @@ struct TerminalSetupGuard {
     mouse_capture: bool,
     bracketed_paste: bool,
     key_disambiguation: bool,
+    key_modify_other_keys: bool,
     window_title: bool,
     cursor_hidden: bool,
     armed: bool,
 }
 
 /// Ask the terminal to disambiguate escape codes so modified Enter arrives as
-/// `Enter` + `SHIFT` instead of a bare `Enter`. Dialogs need the distinction to
-/// keep Shift+Enter as "new line" while plain Enter walks to the next field.
-/// Terminals without the kitty keyboard protocol simply ignore the request, so
-/// Alt+Enter stays available as the fallback.
+/// `Enter` + `SHIFT` instead of a bare `Enter`. The detail answer panel still
+/// needs that distinction (plain Enter submits). Terminals without the kitty
+/// keyboard protocol simply ignore the request.
 fn push_key_disambiguation(stdout: &mut Stdout) -> bool {
     if !matches!(
         ratatui::crossterm::terminal::supports_keyboard_enhancement(),
@@ -95,6 +105,49 @@ fn push_key_disambiguation(stdout: &mut Stdout) -> bool {
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
         ))
         .is_ok()
+}
+
+/// Parse `tmux show-options -s` output and tell whether the server reports
+/// extended keys to panes in the CSI-u form crossterm understands. Anything
+/// else — `extended-keys off`, the default `xterm` format, an older tmux
+/// without the format option — must keep the request unissued: tmux would
+/// then re-encode modified keys as `CSI 27;mod;key~`, which crossterm drops,
+/// so even Alt+Enter would stop working.
+fn tmux_reports_csi_u(options: &str) -> bool {
+    let mut enabled = false;
+    let mut csi_u = false;
+    for line in options.lines() {
+        let mut fields = line.split_whitespace();
+        match (fields.next(), fields.next()) {
+            (Some("extended-keys"), Some(value)) => {
+                enabled = matches!(value, "on" | "always");
+            }
+            (Some("extended-keys-format"), Some(value)) => csi_u = value == "csi-u",
+            _ => {}
+        }
+    }
+    enabled && csi_u
+}
+
+/// Ask tmux — when the TUI runs inside it — to report modified keys
+/// distinctly to this pane. Returns true when Shift+Enter will actually
+/// arrive carrying its SHIFT modifier; when the server is not configured
+/// for it, nothing is sent and the caller shows the user which options are
+/// missing instead of failing silently.
+fn push_tmux_key_disambiguation(stdout: &mut Stdout) -> bool {
+    if std::env::var_os("TMUX").is_none() {
+        return false;
+    }
+    let Ok(output) = std::process::Command::new("tmux")
+        .args(["show-options", "-s"])
+        .output()
+    else {
+        return false;
+    };
+    if !tmux_reports_csi_u(&String::from_utf8_lossy(&output.stdout)) {
+        return false;
+    }
+    write_escape(stdout, SET_MODIFY_OTHER_KEYS)
 }
 
 impl TerminalSetupGuard {
@@ -124,6 +177,9 @@ impl Drop for TerminalSetupGuard {
         }
         if self.key_disambiguation {
             let _ = stdout.execute(PopKeyboardEnhancementFlags);
+        }
+        if self.key_modify_other_keys {
+            write_escape(&mut stdout, RESET_MODIFY_OTHER_KEYS);
         }
         if self.bracketed_paste {
             let _ = stdout.execute(DisableBracketedPaste);
@@ -155,6 +211,15 @@ impl TerminalGuard {
         setup.bracketed_paste = true;
         let key_disambiguation = push_key_disambiguation(&mut stdout);
         setup.key_disambiguation = key_disambiguation;
+        // Kitty flags win when the terminal speaks that protocol; only then
+        // is the tmux fallback skipped. The flag tracks the escape we sent
+        // so teardown can reset it.
+        let key_modify_other_keys = if key_disambiguation {
+            false
+        } else {
+            push_tmux_key_disambiguation(&mut stdout)
+        };
+        setup.key_modify_other_keys = key_modify_other_keys;
         stdout.execute(Hide)?;
         setup.cursor_hidden = true;
         let window_title = setup.window_title;
@@ -164,6 +229,7 @@ impl TerminalGuard {
         Ok(Self {
             terminal,
             key_disambiguation,
+            key_modify_other_keys,
             window_title,
         })
     }
@@ -177,6 +243,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
         let key_disambiguation = self.key_disambiguation;
+        let key_modify_other_keys = self.key_modify_other_keys;
         let window_title = self.window_title;
         let backend = self.terminal.backend_mut();
         let _ = backend.execute(Show);
@@ -186,6 +253,10 @@ impl Drop for TerminalGuard {
         }
         if key_disambiguation {
             let _ = backend.execute(PopKeyboardEnhancementFlags);
+        }
+        if key_modify_other_keys {
+            let _ = backend.write_all(RESET_MODIFY_OTHER_KEYS.as_bytes());
+            let _ = backend.flush();
         }
         let _ = backend.execute(DisableBracketedPaste);
         let _ = backend.execute(DisableMouseCapture);
@@ -207,6 +278,7 @@ impl PanicHookGuard {
             let _ = stdout.execute(Show);
             write_escape(&mut stdout, POP_WINDOW_TITLE);
             let _ = stdout.execute(PopKeyboardEnhancementFlags);
+            write_escape(&mut stdout, RESET_MODIFY_OTHER_KEYS);
             let _ = stdout.execute(DisableBracketedPaste);
             let _ = stdout.execute(DisableMouseCapture);
             let _ = stdout.execute(LeaveAlternateScreen);
@@ -236,6 +308,7 @@ fn run_terminal_action(action: &app::TerminalAction, window_title: &str) -> Resu
         stdout.execute(Show)?;
         // The child process gets the terminal back in its default key mode.
         let _ = stdout.execute(PopKeyboardEnhancementFlags);
+        write_escape(&mut stdout, RESET_MODIFY_OTHER_KEYS);
         stdout.execute(DisableBracketedPaste)?;
         stdout.execute(DisableMouseCapture)?;
         stdout.execute(LeaveAlternateScreen)?;
@@ -271,7 +344,7 @@ fn restore_terminal() -> Result<()> {
     stdout.execute(EnterAlternateScreen)?;
     stdout.execute(EnableMouseCapture)?;
     stdout.execute(EnableBracketedPaste)?;
-    push_key_disambiguation(&mut stdout);
+    let _ = push_key_disambiguation(&mut stdout) || push_tmux_key_disambiguation(&mut stdout);
     stdout.execute(Hide)?;
     Ok(())
 }
@@ -304,7 +377,8 @@ pub fn run(start: TuiStart) -> Result<()> {
                 app = next;
             }
             LoopOutcome::ShowProjects { return_to } => {
-                app = app::App::projects_only(return_to)?;
+                let next = app::App::projects_only(return_to)?;
+                app = next;
             }
         }
     }

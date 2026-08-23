@@ -4,7 +4,7 @@ mod common;
 
 use std::fs;
 
-use kanban4ai::core::config::Config;
+use kanban4ai::core::config::{Config, OnChangesRequested, OrchestrationSettings};
 
 fn write_config(dir: &tempfile::TempDir, content: &str) -> Config {
     let kanban = dir.path().join(".kanban");
@@ -258,4 +258,341 @@ fn empty_columns_is_an_error_or_defaulted() {
     let config = write_config(&dir, "");
     let board = config.load().unwrap();
     assert_eq!(board.column_ids().len(), 4);
+}
+
+#[test]
+fn legacy_board_without_orchestration_gets_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\nthresholds:\n  context_warning: 42\n",
+    );
+
+    let orch = config.get_orchestration().unwrap();
+    assert!(orch.queue_enabled);
+    assert_eq!(orch.max_running_total, 3);
+    assert_eq!(orch.max_running_per_backend.get("claude"), Some(&2));
+    assert_eq!(orch.max_running_per_backend.get("opencode"), Some(&2));
+    assert_eq!(orch.max_running_per_backend.get("omp"), Some(&2));
+    assert_eq!(orch.max_running_per_backend.get("pi"), Some(&2));
+    assert!(orch.max_running_per_backend_model.is_empty());
+    assert_eq!(orch.max_running_per_role.get("designer"), Some(&1));
+    assert_eq!(orch.max_running_per_role.get("reviewer"), Some(&1));
+    assert_eq!(orch.max_running_per_role.get("executor"), Some(&3));
+    assert!(orch.auto_restart_enabled);
+    assert_eq!(orch.auto_restart_delays_minutes, vec![1, 30, 270]);
+    assert!(!orch.designer.enabled);
+    assert_eq!(orch.designer.backend.as_deref(), Some("claude"));
+    assert_eq!(orch.designer.model.as_deref(), Some("sonnet"));
+    assert_eq!(orch.designer.effort, None);
+    assert!(!orch.reviewer.enabled);
+    assert_eq!(orch.reviewer.max_rounds, 3);
+}
+
+#[test]
+fn partial_orchestration_gets_sibling_defaults_deep_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+orchestration:
+  queue_enabled: false
+  max_running_per_backend:
+    claude: 5
+  designer:
+    enabled: true
+"#,
+    );
+
+    let orch = config.get_orchestration().unwrap();
+    // user values kept
+    assert!(!orch.queue_enabled);
+    assert_eq!(orch.max_running_per_backend.get("claude"), Some(&5));
+    assert!(orch.designer.enabled);
+    // sibling defaults filled in at every nesting level
+    assert_eq!(orch.max_running_per_backend.get("opencode"), Some(&2));
+    assert_eq!(orch.max_running_total, 3);
+    assert_eq!(orch.designer.model.as_deref(), Some("sonnet"));
+    assert_eq!(orch.designer.backend.as_deref(), Some("claude"));
+    assert!(!orch.reviewer.enabled);
+    assert_eq!(orch.auto_restart_delays_minutes, vec![1, 30, 270]);
+
+    // the merged section survives save/reload with user keys intact
+    let board = config.load().unwrap();
+    config.save(&board).unwrap();
+    let fresh = Config::new(dir.path());
+    let orch = fresh.get_orchestration().unwrap();
+    assert!(!orch.queue_enabled);
+    assert_eq!(orch.max_running_per_backend.get("claude"), Some(&5));
+    assert!(orch.designer.enabled);
+    assert_eq!(orch.designer.model.as_deref(), Some("sonnet"));
+}
+
+#[test]
+fn orchestration_strings_are_coerced() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+orchestration:
+  queue_enabled: "yes"
+  max_running_total: "7"
+  max_running_per_backend:
+    claude: "4"
+  auto_restart:
+    enabled: "no"
+    delays_minutes: ["5", "10"]
+"#,
+    );
+
+    let orch = config.get_orchestration().unwrap();
+    assert!(orch.queue_enabled);
+    assert_eq!(orch.max_running_total, 7);
+    assert_eq!(orch.max_running_per_backend.get("claude"), Some(&4));
+    assert!(!orch.auto_restart_enabled);
+    assert_eq!(orch.auto_restart_delays_minutes, vec![5, 10]);
+}
+
+#[test]
+fn zero_cap_means_unlimited_negative_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  max_running_total: 0\n",
+    );
+    assert_eq!(config.get_orchestration().unwrap().max_running_total, 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  max_running_total: -1\n",
+    );
+    assert!(config.load().is_err());
+}
+
+#[test]
+fn bare_model_id_key_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+orchestration:
+  max_running_per_backend_model:
+    opus: 1
+"#,
+    );
+    let err = format!("{}", config.load().unwrap_err());
+    assert!(
+        err.contains("<backend>/<model>"),
+        "error should explain the key shape: {err}"
+    );
+}
+
+#[test]
+fn backend_model_key_splits_on_first_slash_and_validates_backend() {
+    assert_eq!(
+        OrchestrationSettings::parse_backend_model_key("opencode/openai/gpt-5.5"),
+        Some(("opencode", "openai/gpt-5.5"))
+    );
+    assert_eq!(
+        OrchestrationSettings::backend_model_key("claude", "opus"),
+        "claude/opus"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+orchestration:
+  max_running_per_backend_model:
+    opencode/openai/gpt-5.5: 1
+"#,
+    );
+    let orch = config.get_orchestration().unwrap();
+    assert_eq!(
+        orch.max_running_per_backend_model
+            .get("opencode/openai/gpt-5.5"),
+        Some(&1)
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+orchestration:
+  max_running_per_backend_model:
+    nosuch/model: 1
+"#,
+    );
+    assert!(config.load().is_err());
+}
+
+#[test]
+fn unknown_role_cap_key_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+orchestration:
+  max_running_per_role:
+    reviewers: 1
+"#,
+    );
+    let err = format!("{}", config.load().unwrap_err());
+    assert!(
+        err.contains("is not a role"),
+        "a typo must not silently cap nothing: {err}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+orchestration:
+  max_running_per_role:
+    reviewer: 2
+"#,
+    );
+    assert_eq!(
+        config
+            .get_orchestration()
+            .unwrap()
+            .max_running_per_role
+            .get("reviewer"),
+        Some(&2)
+    );
+}
+
+#[test]
+fn delays_minutes_must_be_positive_ints() {
+    for bad in [
+        "delays_minutes: [0]",
+        "delays_minutes: [-3]",
+        "delays_minutes: 5",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_config(
+            &dir,
+            &format!(
+                "columns:\n- name: To Do\n  id: todo\norchestration:\n  auto_restart:\n    {bad}\n"
+            ),
+        );
+        assert!(config.load().is_err(), "{bad} must be rejected");
+    }
+}
+
+#[test]
+fn reviewer_max_rounds_is_coerced_and_rejects_negatives() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  reviewer:\n    max_rounds: \"2\"\n",
+    );
+    assert_eq!(config.get_orchestration().unwrap().reviewer.max_rounds, 2);
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  reviewer:\n    max_rounds: 0\n",
+    );
+    assert_eq!(config.get_orchestration().unwrap().reviewer.max_rounds, 0);
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  reviewer:\n    max_rounds: -1\n",
+    );
+    assert!(config.load().is_err());
+}
+
+#[test]
+fn on_changes_requested_is_restricted_to_todo_or_in_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  reviewer:\n    on_changes_requested: todo\n",
+    );
+    assert_eq!(
+        config
+            .get_orchestration()
+            .unwrap()
+            .reviewer
+            .on_changes_requested,
+        OnChangesRequested::Todo
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  reviewer:\n    on_changes_requested: archive\n",
+    );
+    assert!(config.load().is_err());
+}
+
+#[test]
+fn unknown_backend_cap_key_warns_but_still_loads() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+orchestration:
+  max_running_per_backend:
+    claude: 2
+    opencodex: 1
+"#,
+    );
+    // Rejecting would make the board unloadable, and `load` runs on every
+    // command — there would be no way back in to fix the typo.
+    config
+        .load()
+        .expect("an ineffective cap must not break the board");
+    let orch = config.get_orchestration().unwrap();
+    assert_eq!(orch.max_running_per_backend.get("claude"), Some(&2));
+
+    let warnings = config.warnings();
+    assert_eq!(warnings.len(), 1, "one warning: {warnings:?}");
+    assert!(
+        warnings[0].contains("opencodex") && warnings[0].contains("caps nothing"),
+        "the user must be told the cap does nothing: {warnings:?}"
+    );
+}
+
+#[test]
+fn a_backend_added_under_agents_is_a_known_cap_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+agents:
+  mybot:
+    command: mybot
+orchestration:
+  max_running_per_backend:
+    mybot: 1
+"#,
+    );
+    config.load().unwrap();
+    assert!(
+        config.warnings().is_empty(),
+        "a configured agent is a real backend: {:?}",
+        config.warnings()
+    );
 }

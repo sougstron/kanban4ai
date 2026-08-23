@@ -8,9 +8,9 @@ use std::thread;
 use serde_yaml_ng::{Mapping, Value};
 
 use crate::agent::prompt::build_agent_prompt;
-use crate::core::config::{BoardConfig, Config};
+use crate::core::config::{BoardConfig, BotSettings, Config, OrchestrationSettings};
 use crate::core::error::{KanbanError, Result};
-use crate::core::models::Task;
+use crate::core::models::{Role, RunPhase, Task};
 use crate::core::project::Roots;
 use crate::core::storage::atomic_write_text;
 
@@ -45,21 +45,93 @@ pub struct LaunchSettings {
     pub agent: Option<String>,
 }
 
+/// Resolve the backend/model/effort/agent this launch will actually use.
+///
+/// A Design-phase task uses `orchestration.designer` (not the task's own
+/// assignment) so the planning bot can differ from the executor. Everything
+/// else — including a queued task that has not been claimed yet — uses the
+/// task fields, falling back to the backend's configured defaults.
 pub fn resolve_launch_settings(config: &BoardConfig, task: &Task) -> Result<LaunchSettings> {
+    let orch = OrchestrationSettings::from_mapping(&config.orchestration);
+    if task.run_phase == Some(RunPhase::Design) && orch.designer.enabled {
+        return resolve_bot_launch_settings(config, &orch.designer);
+    }
+    if task.run_phase == Some(RunPhase::Review) && orch.reviewer.enabled {
+        return resolve_bot_launch_settings(config, &orch.reviewer.bot());
+    }
+    resolve_task_launch_settings(config, task)
+}
+
+/// Settings and phase a new run from the queue (or a first auto-launch) will
+/// use. When the designer is enabled the task leaves `queued` as `design`
+/// and occupies a designer slot; otherwise it starts executing immediately.
+pub fn upcoming_run_plan(config: &BoardConfig, task: &Task) -> Result<(LaunchSettings, RunPhase)> {
+    let orch = OrchestrationSettings::from_mapping(&config.orchestration);
+    // Two ways a run must go straight to the executor. `designed`: the plan is
+    // already on the thread, so a crash restart (or any other re-queue) of an
+    // execute-phase task resumes the work instead of re-planning it — the
+    // counter-free flag is what makes that decidable, since `review_rounds` is
+    // still 0 all through the first execute phase. `review_rounds > 0`: after a
+    // bot-review bounce the dispatcher must restart the task's own bot even if
+    // no designer pass ever ran (the designer may have been switched on
+    // mid-flight), because the requested edits are already folded into the
+    // thread for the executor.
+    if orch.designer.enabled && !task.designed && task.review_rounds == 0 {
+        Ok((
+            resolve_bot_launch_settings(config, &orch.designer)?,
+            RunPhase::Design,
+        ))
+    } else {
+        Ok((
+            resolve_task_launch_settings(config, task)?,
+            RunPhase::Execute,
+        ))
+    }
+}
+
+/// Launch settings from the task's own assignment (the executor bot).
+pub fn resolve_task_launch_settings(config: &BoardConfig, task: &Task) -> Result<LaunchSettings> {
     let backend = resolve_backend_name(config, task);
     let backend_config = backend_config(config, &backend)?;
-    let pick = |task_value: &Option<String>, default: Option<String>| {
-        task_value
-            .clone()
-            .or(default)
-            .filter(|value| !value.trim().is_empty())
-    };
     Ok(LaunchSettings {
-        model: pick(&task.ai_model, backend_config.model),
-        effort: pick(&task.ai_effort, backend_config.effort),
-        agent: pick(&task.agent_name, backend_config.agent),
+        model: pick_setting(&task.ai_model, backend_config.model),
+        effort: pick_setting(&task.ai_effort, backend_config.effort),
+        agent: pick_setting(&task.agent_name, backend_config.agent),
         backend,
     })
+}
+
+/// Launch settings from a role bot (`orchestration.designer` / reviewer).
+/// A missing backend falls back to `auto_launch.default_agent`; missing
+/// model/effort/agent inherit that backend's configured defaults.
+pub fn resolve_bot_launch_settings(
+    config: &BoardConfig,
+    bot: &BotSettings,
+) -> Result<LaunchSettings> {
+    let requested = bot
+        .backend
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| auto_launch_config(config).default_agent);
+    let backend = if config.agents.contains_key(requested.as_str()) {
+        requested
+    } else {
+        "opencode".to_string()
+    };
+    let backend_config = backend_config(config, &backend)?;
+    Ok(LaunchSettings {
+        model: pick_setting(&bot.model, backend_config.model),
+        effort: pick_setting(&bot.effort, backend_config.effort),
+        agent: pick_setting(&bot.agent, backend_config.agent),
+        backend,
+    })
+}
+
+fn pick_setting(value: &Option<String>, default: Option<String>) -> Option<String> {
+    value
+        .clone()
+        .or(default)
+        .filter(|value| !value.trim().is_empty())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,7 +194,13 @@ pub fn build_launch_plan<'a>(
     } else {
         None
     };
-    let prompt = build_agent_prompt(roots, task, session_id, revert)?;
+    let prompt = build_agent_prompt(
+        roots,
+        task,
+        session_id,
+        revert,
+        Role::from_phase(task.run_phase),
+    )?;
     let args = backend_args(
         &backend,
         &backend_config,

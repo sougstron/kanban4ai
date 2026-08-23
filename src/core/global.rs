@@ -28,6 +28,9 @@ pub const PROJECT_SORT_NEWEST: &str = "newest";
 /// then newest first.
 pub const PROJECT_SORT_SMART: &str = "smart";
 
+/// Default `kanban daemon` tick interval when the store config omits one.
+pub const DEFAULT_DAEMON_INTERVAL_SECS: u64 = 60;
+
 /// Map any stored value onto a known ordering; unknown values read as `name`.
 pub fn normalize_project_sort(value: &str) -> &'static str {
     match value {
@@ -41,6 +44,11 @@ pub fn normalize_project_sort(value: &str) -> &'static str {
 pub struct GlobalConfig {
     #[serde(default)]
     pub tui: Mapping,
+    /// Cross-project daemon cadence. Everything else in the orchestration
+    /// plan stays per-project; the daemon spans boards, so its interval
+    /// lives here (`daemon.interval`, seconds, default 60).
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub daemon: Mapping,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
@@ -89,6 +97,26 @@ impl GlobalConfig {
             Value::String(normalize_project_sort(value).to_string()),
         );
     }
+
+    /// Seconds between daemon ticks. Missing, zero, or unparseable values
+    /// read as 60 so a hand-edited file still yields a usable cadence.
+    pub fn daemon_interval(&self) -> u64 {
+        self.daemon
+            .get(Value::String("interval".to_string()))
+            .and_then(positive_u64)
+            .unwrap_or(DEFAULT_DAEMON_INTERVAL_SECS)
+    }
+}
+
+fn positive_u64(value: &Value) -> Option<u64> {
+    let parsed = match value {
+        Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok())),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    parsed.filter(|n| *n > 0)
 }
 
 impl ProjectStore {
@@ -179,5 +207,24 @@ mod tests {
         config.set_project_sort("bogus");
         store.save_global_config(&config).expect("save");
         assert_eq!(store.load_global_config().unwrap().project_sort(), "name");
+    }
+
+    #[test]
+    fn daemon_interval_defaults_and_rejects_zero() {
+        let dir = tempfile::tempdir().expect("store");
+        let store = ProjectStore::at(dir.path());
+        assert_eq!(
+            store.load_global_config().unwrap().daemon_interval(),
+            DEFAULT_DAEMON_INTERVAL_SECS
+        );
+
+        std::fs::write(store.global_config_path(), "daemon:\n  interval: 15\n").expect("seed");
+        assert_eq!(store.load_global_config().unwrap().daemon_interval(), 15);
+
+        std::fs::write(store.global_config_path(), "daemon:\n  interval: 0\n").expect("seed");
+        assert_eq!(
+            store.load_global_config().unwrap().daemon_interval(),
+            DEFAULT_DAEMON_INTERVAL_SECS
+        );
     }
 }

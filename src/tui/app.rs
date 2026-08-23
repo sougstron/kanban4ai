@@ -19,12 +19,12 @@ use crate::agent::{
     backend_has_catalog, cached_backend_catalog, recent_models, sort_opencode_models,
     warm_backend_catalog,
 };
-use crate::core::config::BoardConfig;
+use crate::core::config::{BoardConfig, OnChangesRequested, OrchestrationSettings};
 use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
 use crate::core::limits::LimitsSnapshot;
 use crate::core::models::{
-    Message, MessageKind, MessageStatus, Session, SessionStatus, Task, TaskStatus,
+    Message, MessageKind, MessageStatus, RunPhase, Session, SessionStatus, Task, TaskStatus,
 };
 use crate::core::operations::{Operations, QuestionRef, TaskPatch};
 use crate::core::project::{Project, ProjectStore};
@@ -39,7 +39,8 @@ use super::card::{
     case_insensitive_match, sanitize_paste_text, sanitize_terminal_text, truncate_display,
 };
 use super::dialogs::{
-    BulkAction, DialogField, Modal, ModalButton, ModalState, QuestionChoice, SelectOption,
+    AgentSlot, BulkAction, DialogField, Modal, ModalButton, ModalState, QuestionChoice,
+    SelectOption,
 };
 use super::event::LoopOutcome;
 use super::image;
@@ -56,6 +57,7 @@ const LIMITS_STATUS_WINDOW: Duration = Duration::from_secs(3);
 const STATUS_NOTICE_WINDOW: Duration = Duration::from_secs(3);
 
 const TASK_SORT_NUMBER: &str = "task_number";
+const TASK_SORT_NUMBER_DESC: &str = "task_number_desc";
 const TASK_SORT_UPDATED_ASC: &str = "updated_at_asc";
 const TASK_SORT_UPDATED_DESC: &str = "updated_at_desc";
 const TASK_SORT_LEGACY_COMPLETION: &str = "completion_date";
@@ -171,6 +173,11 @@ pub enum UiAction {
     DeleteTask,
     Run,
     Revoke,
+    /// Queue the current task for the dispatcher (`Q`). No agent launches;
+    /// the task waits In Progress with run phase Queued.
+    Enqueue,
+    /// Take a queued task back out (`Q` again): plain manual `r` territory.
+    Dequeue,
     Stop,
     AnswerQuestion,
     Recover,
@@ -397,6 +404,8 @@ pub struct App {
     ctrl_c_exit_deadline: Option<Instant>,
     /// Last time the tick scanned for expired declared waits to relaunch.
     last_wait_resume: Option<Instant>,
+    /// Last time the tick pumped the orchestration queue.
+    last_queue_dispatch: Option<Instant>,
     /// Backends whose warmed model catalog has already been reflected into an
     /// open modal, so `tick` refreshes options at most once per backend.
     catalog_ready: HashSet<String>,
@@ -567,6 +576,12 @@ impl App {
         }
         let column_offsets = vec![0; board.columns.len()];
         let visible_card_capacities = vec![1; board.columns.len()];
+        // Ineffective config settings have nowhere else to go here: stderr
+        // would be written straight onto the alternate screen.
+        let status = match ops.config.warnings().first() {
+            Some(warning) => warning.clone(),
+            None => DEFAULT_STATUS.to_string(),
+        };
         Ok(Self {
             ops,
             project_path: project_path.to_path_buf(),
@@ -588,7 +603,7 @@ impl App {
             archived_tasks,
             archive_selected: 0,
             should_quit: false,
-            status: DEFAULT_STATUS.to_string(),
+            status,
             hitboxes: Vec::new(),
             hovered: None,
             dragging: None,
@@ -614,6 +629,7 @@ impl App {
             recent_models,
             ctrl_c_exit_deadline: None,
             last_wait_resume: None,
+            last_queue_dispatch: None,
             catalog_ready,
             project: None,
             projects: Vec::new(),
@@ -708,6 +724,7 @@ impl App {
             recent_models: Vec::new(),
             ctrl_c_exit_deadline: None,
             last_wait_resume: None,
+            last_queue_dispatch: None,
             catalog_ready: HashSet::new(),
             project: None,
             projects,
@@ -965,6 +982,14 @@ impl App {
             (KeyCode::Char('x'), _) if self.screen == Screen::Detail => {
                 self.dispatch(UiAction::ToggleReject)?
             }
+            (KeyCode::Char('Q'), _) if action_screen => {
+                if let Some(action) = self
+                    .current_task()
+                    .and_then(|task| self.queue_action_for(&task))
+                {
+                    self.dispatch(action)?
+                }
+            }
             (KeyCode::Char('p'), _) if self.screen == Screen::Detail => {
                 self.dispatch(UiAction::ViewPrompt)?
             }
@@ -1053,6 +1078,13 @@ impl App {
                     self.set_detail_focus(DetailFocus::Thread);
                     return Ok(true);
                 }
+                // Alt+Enter matches the dialogs' newline key here too:
+                // `is_text_input_key` rejects ALT, so route it explicitly
+                // (Shift+Enter already passes through unmodified).
+                if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::ALT) {
+                    self.input_review_edits(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    return Ok(true);
+                }
                 if is_text_input_key(key) || is_word_edit_key(key) {
                     self.input_review_edits(key);
                 }
@@ -1097,6 +1129,20 @@ impl App {
     fn handle_answer_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => self.set_detail_focus(DetailFocus::Thread),
+            // Shift+Enter (Alt+Enter where the terminal cannot report Shift)
+            // breaks a line in the custom answer; plain Enter submits it.
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail
+                        .answer_input
+                        .input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    detail.variant_selected = 0;
+                }
+            }
             KeyCode::Enter => self.submit_detail_answer()?,
             KeyCode::Left => self.switch_detail_question(-1),
             KeyCode::Right => self.switch_detail_question(1),
@@ -1324,6 +1370,8 @@ impl App {
             UiAction::Recover => self.recover_current_task()?,
             UiAction::Approve => self.approve_current_task()?,
             UiAction::Attach => self.attach_current_task()?,
+            UiAction::Enqueue => self.queue_current_task(true)?,
+            UiAction::Dequeue => self.queue_current_task(false)?,
             UiAction::AddContext => self.open_add_message_dialog(),
             UiAction::Rerun => self.rerun_current_task()?,
             UiAction::Revert => self.open_revert_dialog(),
@@ -1528,7 +1576,38 @@ impl App {
     }
 
     fn update_hover(&mut self, x: u16, y: u16) {
-        self.hovered = self.hit_at(x, y);
+        let hit = self.hit_at(x, y);
+        self.hover_select_card(hit);
+        self.hovered = hit;
+    }
+
+    /// Hovering a card *is* selecting it: the mouse and the keyboard drive one
+    /// selection, so `Enter` and every card hotkey act on the card the pointer
+    /// rests on, and the next keyboard navigation moves that selection away
+    /// for good — the card under a stationary pointer is not painted as
+    /// selected again until the pointer moves (see `render_cards`). Skipped
+    /// mid-drag, so a card in flight keeps the selection it was lifted with,
+    /// and while a modal owns the screen, where the pointer crossing the
+    /// dimmed board must not steer the dialog's target.
+    fn hover_select_card(&mut self, hit: Option<HitAction>) {
+        if self.dragging.is_some() || self.modal.is_some() || self.screen != Screen::Board {
+            return;
+        }
+        let (column, card) = match hit {
+            Some(HitAction::FocusCard { column, card })
+            | Some(HitAction::OpenAnswer { column, card }) => (column, card),
+            _ => return,
+        };
+        // Hitboxes describe the last rendered frame; a reload may have
+        // removed the card the pointer still covers.
+        if (self.focused_column == column && self.focused_card == card)
+            || self.visible_tasks_for_column(column).get(card).is_none()
+        {
+            return;
+        }
+        self.focused_column = column;
+        self.focused_card = card;
+        self.ensure_focused_visible();
     }
 
     fn mouse_down(&mut self, x: u16, y: u16) -> Result<()> {
@@ -1721,13 +1800,24 @@ impl App {
                     changed = selector_index(modal, field) != previous;
                 }
                 if changed
-                    && matches!(field, DialogField::Backend | DialogField::Model)
+                    && let Some(slot) = ModalState::agent_slot(field)
                     && let Some(mut modal) = self.modal.take()
                 {
-                    if field == DialogField::Backend {
-                        self.refresh_backend_options(&mut modal);
-                    } else {
-                        self.refresh_effort_options(&mut modal);
+                    if matches!(
+                        field,
+                        DialogField::Backend
+                            | DialogField::DesignerBackend
+                            | DialogField::ReviewerBackend
+                    ) {
+                        self.refresh_backend_options_for(&mut modal, slot);
+                    } else if matches!(
+                        field,
+                        DialogField::Model
+                            | DialogField::DesignerModel
+                            | DialogField::ReviewerModel
+                    ) && let Ok(config) = self.ops.config.load()
+                    {
+                        self.refresh_effort_options_for_slot(&mut modal, &config, slot);
                     }
                     self.modal = Some(modal);
                 }
@@ -1882,6 +1972,7 @@ impl App {
         self.expire_transient_status_at(now);
         self.expire_session_states_at(timefmt::now());
         self.resume_expired_waits_throttled();
+        self.dispatch_queue_throttled();
         // Log writes bypass the fs watcher (it only covers board dirs), so
         // the pager tail refreshes on the tick.
         if self.screen == Screen::LogView {
@@ -2113,6 +2204,38 @@ impl App {
             }
             Ok(_) => {}
             Err(err) => self.status = format!("Wait resume failed: {err}"),
+        }
+    }
+
+    /// Start queued tasks while slots are free. Throttled like wait-resume:
+    /// the census walks every In Progress task, so it runs at most once per
+    /// interval, not on every tick. Errors land in the status line instead of
+    /// killing the TUI. Headless pumps live on `kanban check-sessions` and
+    /// `reconcile_agent_exit`; this is only the interactive one.
+    fn dispatch_queue_throttled(&mut self) {
+        const QUEUE_DISPATCH_INTERVAL: Duration = Duration::from_secs(5);
+        if !self.has_board {
+            return;
+        }
+        if self
+            .last_queue_dispatch
+            .is_some_and(|last| last.elapsed() < QUEUE_DISPATCH_INTERVAL)
+        {
+            return;
+        }
+        self.last_queue_dispatch = Some(Instant::now());
+        match self.ops.dispatch_queue() {
+            Ok(started) if !started.is_empty() => {
+                self.request_full_redraw();
+                let tasks = started
+                    .iter()
+                    .map(|item| item.task_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.status = format!("Queue dispatched: {tasks}");
+            }
+            Ok(_) => {}
+            Err(err) => self.status = format!("Queue dispatch failed: {err}"),
         }
     }
 
@@ -2410,6 +2533,22 @@ impl App {
         } else {
             UiAction::Run
         }
+    }
+
+    /// What `Q` does for this task, or `None` where the queue has no meaning:
+    /// a queued card is taken back out, an idle To Do / In Progress card is
+    /// enqueued, and everything else (Review, Done, Archive, a card whose
+    /// agent is already running) offers nothing. The hint bar and the key
+    /// handler both read this, so the key can never fire an action the hint
+    /// bar does not advertise — pressing `Q` on a Done card used to reach
+    /// `enqueue_task` just to be rejected by it.
+    pub(super) fn queue_action_for(&self, task: &Task) -> Option<UiAction> {
+        if task.run_phase == Some(RunPhase::Queued) {
+            return Some(UiAction::Dequeue);
+        }
+        let queueable = matches!(task.status, TaskStatus::Todo | TaskStatus::InProgress)
+            && !self.task_can_stop(task);
+        queueable.then_some(UiAction::Enqueue)
     }
 
     /// Live or waiting In Progress sessions can be stopped without replacing them.
@@ -2795,6 +2934,60 @@ impl App {
             normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
                 .to_string(),
         ]);
+        let orch = OrchestrationSettings::from_mapping(&config.orchestration);
+        modal.queue_enabled = orch.queue_enabled;
+        modal.max_running_total = TextArea::new(vec![orch.max_running_total.to_string()]);
+        modal.max_running_designer = TextArea::new(vec![role_cap(&orch, "designer").to_string()]);
+        modal.max_running_reviewer = TextArea::new(vec![role_cap(&orch, "reviewer").to_string()]);
+        modal.max_running_executor = TextArea::new(vec![role_cap(&orch, "executor").to_string()]);
+        modal.max_running_per_backend = TextArea::new(lines_or_blank(&format_backend_cap_map(
+            &orch.max_running_per_backend,
+        )));
+        modal.max_running_per_backend_model = TextArea::new(lines_or_blank(
+            &format_sorted_cap_map(&orch.max_running_per_backend_model),
+        ));
+        modal.auto_restart_enabled = orch.auto_restart_enabled;
+        modal.auto_restart_delays =
+            TextArea::new(vec![format_delays(&orch.auto_restart_delays_minutes)]);
+        modal.designer_enabled = orch.designer.enabled;
+        modal.set_backend_text_for(
+            AgentSlot::Designer,
+            orch.designer.backend.as_deref().unwrap_or(""),
+        );
+        modal.set_model_text_for(
+            AgentSlot::Designer,
+            orch.designer.model.as_deref().unwrap_or(""),
+        );
+        modal.set_effort_text_for(
+            AgentSlot::Designer,
+            orch.designer.effort.as_deref().unwrap_or(""),
+        );
+        modal.set_agent_text_for(
+            AgentSlot::Designer,
+            orch.designer.agent.as_deref().unwrap_or(""),
+        );
+        modal.reviewer_enabled = orch.reviewer.enabled;
+        modal.set_backend_text_for(
+            AgentSlot::Reviewer,
+            orch.reviewer.backend.as_deref().unwrap_or(""),
+        );
+        modal.set_model_text_for(
+            AgentSlot::Reviewer,
+            orch.reviewer.model.as_deref().unwrap_or(""),
+        );
+        modal.set_effort_text_for(
+            AgentSlot::Reviewer,
+            orch.reviewer.effort.as_deref().unwrap_or(""),
+        );
+        modal.set_agent_text_for(
+            AgentSlot::Reviewer,
+            orch.reviewer.agent.as_deref().unwrap_or(""),
+        );
+        modal.reviewer_on_changes = TextArea::new(vec![match orch.reviewer.on_changes_requested {
+            OnChangesRequested::InProgress => "in_progress".to_string(),
+            OnChangesRequested::Todo => "todo".to_string(),
+        }]);
+        modal.reviewer_max_rounds = TextArea::new(vec![orch.reviewer.max_rounds.to_string()]);
         self.populate_settings_form_options(&mut modal);
         modal.capture_initial_values();
         self.modal = Some(modal);
@@ -3102,6 +3295,35 @@ impl App {
             })
             .collect::<Vec<_>>();
         modal.set_backend_options(backend_options);
+        let default_agent = mapping_str(Some(&config.auto_launch), "default_agent")
+            .unwrap_or_else(|| "opencode".to_string());
+        let role_backends = std::iter::once(SelectOption {
+            label: format!("Default backend ({default_agent})"),
+            value: None,
+        })
+        .chain(
+            config
+                .agents
+                .keys()
+                .filter_map(Value::as_str)
+                .map(|backend| SelectOption {
+                    label: backend.to_string(),
+                    value: Some(backend.to_string()),
+                }),
+        )
+        .collect::<Vec<_>>();
+        modal.set_backend_options_for(AgentSlot::Designer, role_backends.clone());
+        modal.set_backend_options_for(AgentSlot::Reviewer, role_backends);
+        modal.set_reviewer_on_changes_options(vec![
+            SelectOption {
+                label: "Stay in Progress (re-queue)".to_string(),
+                value: Some("in_progress".to_string()),
+            },
+            SelectOption {
+                label: "Move to To Do".to_string(),
+                value: Some("todo".to_string()),
+            },
+        ]);
         modal.set_theme_options(vec![
             SelectOption {
                 label: "Dark".to_string(),
@@ -3114,8 +3336,12 @@ impl App {
         ]);
         modal.set_task_sort_options(vec![
             SelectOption {
-                label: "Task number".to_string(),
+                label: "Task number up".to_string(),
                 value: Some(TASK_SORT_NUMBER.to_string()),
+            },
+            SelectOption {
+                label: "Task number down".to_string(),
+                value: Some(TASK_SORT_NUMBER_DESC.to_string()),
             },
             SelectOption {
                 label: "Updated (oldest first)".to_string(),
@@ -3177,6 +3403,32 @@ impl App {
             self.close_detail()?;
         }
         Ok(())
+    }
+
+    /// Enqueue (`true`) or dequeue (`false`) the current task. The detail
+    /// view stays open; nothing launches either way.
+    fn queue_current_task(&mut self, enqueue: bool) -> Result<()> {
+        let Some(task_id) = self.current_task_id() else {
+            self.status = "No task selected".to_string();
+            return Ok(());
+        };
+        let result = if enqueue {
+            self.ops.enqueue_task(&task_id)
+        } else {
+            self.ops.dequeue_task(&task_id)
+        };
+        match result {
+            Ok(Some(_)) => {
+                self.status = if enqueue {
+                    format!("Queued {task_id} — the dispatcher starts it when a slot frees")
+                } else {
+                    format!("{task_id} taken out of the queue — r runs it immediately")
+                };
+            }
+            Ok(None) => self.status = format!("Task {task_id} not found"),
+            Err(err) => self.status = err.to_string(),
+        }
+        self.refresh_after_action()
     }
 
     fn revoke_current_task(&mut self) -> Result<()> {
@@ -3789,20 +4041,34 @@ impl App {
         };
     }
 
-    fn refresh_backend_options(&self, modal: &mut ModalState) {
+    fn refresh_backend_options_for(&self, modal: &mut ModalState, slot: AgentSlot) {
         let Ok(config) = self.ops.config.load() else {
             return;
         };
-        self.refresh_backend_options_with_config(modal, &config);
+        self.refresh_slot_options_with_config(modal, &config, slot);
     }
 
     fn refresh_backend_options_with_config(&self, modal: &mut ModalState, config: &BoardConfig) {
-        let backend = selected_backend(&config.auto_launch, modal);
+        self.refresh_slot_options_with_config(modal, config, AgentSlot::Primary);
+        if matches!(modal.modal, Modal::Settings) {
+            self.refresh_slot_options_with_config(modal, config, AgentSlot::Designer);
+            self.refresh_slot_options_with_config(modal, config, AgentSlot::Reviewer);
+        }
+    }
+
+    fn refresh_slot_options_with_config(
+        &self,
+        modal: &mut ModalState,
+        config: &BoardConfig,
+        slot: AgentSlot,
+    ) {
+        let backend = selected_backend_for(&config.auto_launch, modal, slot);
         let backend_settings = config
             .agents
             .get(Value::String(backend.clone()))
             .and_then(Value::as_mapping);
-        if matches!(modal.modal, Modal::Settings) {
+        let settings_primary = matches!(modal.modal, Modal::Settings) && slot == AgentSlot::Primary;
+        if settings_primary {
             modal.model = TextArea::new(vec![
                 mapping_str(backend_settings, "model").unwrap_or_default(),
             ]);
@@ -3813,7 +4079,7 @@ impl App {
                 mapping_str(backend_settings, "agent").unwrap_or_default(),
             ]);
         }
-        let empty_model = if matches!(modal.modal, Modal::Settings) {
+        let empty_model = if settings_primary {
             "No default model"
         } else {
             "Default model"
@@ -3824,10 +4090,10 @@ impl App {
             .collect::<Vec<_>>();
         let mut models = models;
         if matches!(modal.modal, Modal::Settings) {
-            add_missing_option(&mut models, modal.model_text());
+            add_missing_option(&mut models, modal.model_text_for(slot));
         }
-        modal.set_model_options(models);
-        let empty_agent = if matches!(modal.modal, Modal::Settings) {
+        modal.set_model_options_for(slot, models);
+        let empty_agent = if settings_primary {
             "No default agent"
         } else {
             "Default agent"
@@ -3838,10 +4104,10 @@ impl App {
             .collect::<Vec<_>>();
         let mut agents = agents;
         if matches!(modal.modal, Modal::Settings) {
-            add_missing_option(&mut agents, modal.agent_text());
+            add_missing_option(&mut agents, modal.agent_text_for(slot));
         }
-        modal.set_agent_options(agents);
-        self.refresh_effort_options_with_config(modal, config);
+        modal.set_agent_options_for(slot, agents);
+        self.refresh_effort_options_for_slot(modal, config, slot);
     }
 
     /// Model choices for a backend. opencode models come from the live
@@ -3888,15 +4154,13 @@ impl App {
     /// Effort choices depend on the backend and, for opencode, on the model:
     /// claude lists its config `efforts`; opencode offers the variants the
     /// catalog reports for the selected (or default) model.
-    fn refresh_effort_options(&self, modal: &mut ModalState) {
-        let Ok(config) = self.ops.config.load() else {
-            return;
-        };
-        self.refresh_effort_options_with_config(modal, &config);
-    }
-
-    fn refresh_effort_options_with_config(&self, modal: &mut ModalState, config: &BoardConfig) {
-        let backend = selected_backend(&config.auto_launch, modal);
+    fn refresh_effort_options_for_slot(
+        &self,
+        modal: &mut ModalState,
+        config: &BoardConfig,
+        slot: AgentSlot,
+    ) {
+        let backend = selected_backend_for(&config.auto_launch, modal, slot);
         let backend_settings = config
             .agents
             .get(Value::String(backend.clone()))
@@ -3907,7 +4171,7 @@ impl App {
                 cached_backend_catalog(&backend, &backend_command(&backend, backend_settings))
         {
             let model = modal
-                .model_text()
+                .model_text_for(slot)
                 .or_else(|| mapping_str(backend_settings, "model"))
                 .or_else(|| {
                     (backend == "opencode")
@@ -3924,7 +4188,8 @@ impl App {
                 })
                 .collect();
         }
-        let empty_effort = if matches!(modal.modal, Modal::Settings) {
+        let settings_primary = matches!(modal.modal, Modal::Settings) && slot == AgentSlot::Primary;
+        let empty_effort = if settings_primary {
             "No default effort"
         } else {
             "Default effort"
@@ -3935,20 +4200,17 @@ impl App {
             .collect::<Vec<_>>();
         let mut options = options;
         if matches!(modal.modal, Modal::Settings) {
-            add_missing_option(&mut options, modal.effort_text());
+            add_missing_option(&mut options, modal.effort_text_for(slot));
         }
-        modal.set_effort_options(options);
+        modal.set_effort_options_for(slot, options);
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(mut modal) = self.modal.take() else {
             return Ok(false);
         };
-        let backend_selected = modal.backend_selected;
-        let model_selected = modal.model_selected;
-        // Enter now advances focus, so the dependent-option refresh below has
-        // to look at the field the key was actually delivered to.
         let field_before = modal.active_field();
+        let slot_before = slot_selection_snapshot(&modal, field_before);
         let command = normalize_command_key(key);
         if modal.discard_confirm {
             match command.code {
@@ -4015,13 +4277,11 @@ impl App {
                 KeyCode::Enter if modal.cancel_on_enter() => {
                     return self.request_modal_close(modal);
                 }
-                // Shift+Enter (Alt+Enter where the terminal cannot report it)
-                // is the only way to break a line inside a text field.
-                KeyCode::Enter
-                    if key
-                        .modifiers
-                        .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
-                {
+                // Multiline fields insert a newline on any Enter. Shift+Enter
+                // arrives as a bare Enter when the terminal cannot report the
+                // modifier, so this is what makes both Shift+Enter and
+                // Alt+Enter work. Tab still leaves the field.
+                KeyCode::Enter if modal.enter_inserts_newline() => {
                     modal.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                 }
                 // Plain Enter commits the focused field and walks to the next
@@ -4050,10 +4310,17 @@ impl App {
                 _ => modal.input(key),
             }
         }
-        if field_before == DialogField::Backend && modal.backend_selected != backend_selected {
-            self.refresh_backend_options(&mut modal);
-        } else if field_before == DialogField::Model && modal.model_selected != model_selected {
-            self.refresh_effort_options(&mut modal);
+        if let Some(slot) = ModalState::agent_slot(field_before) {
+            let after = slot_selection_snapshot(&modal, field_before);
+            if after.backend != slot_before.backend
+                && let Ok(config) = self.ops.config.load()
+            {
+                self.refresh_slot_options_with_config(&mut modal, &config, slot);
+            } else if after.model != slot_before.model
+                && let Ok(config) = self.ops.config.load()
+            {
+                self.refresh_effort_options_for_slot(&mut modal, &config, slot);
+            }
         }
         self.modal = Some(modal);
         Ok(true)
@@ -4161,6 +4428,15 @@ impl App {
                         .unwrap_or_else(|| TASK_SORT_NUMBER.to_string()),
                 )
                 .to_string();
+                let orch_draft = match parse_orchestration_modal(&modal) {
+                    Ok(draft) => draft,
+                    Err((field, message)) => {
+                        modal.focus_field(field);
+                        modal.error = Some(message);
+                        self.modal = Some(modal);
+                        return Ok(());
+                    }
+                };
                 let save_result = (|| -> Result<()> {
                     ensure_config_write_target_is_safe(&self.ops.config)?;
                     let _lock = self.ops.storage.lock()?;
@@ -4203,6 +4479,7 @@ impl App {
                         &self.ops.config.config_file,
                         &mut config,
                     )?;
+                    apply_orchestration_draft(&mut config.orchestration, &orch_draft);
                     self.ops.config.save(&config)
                 })();
                 if let Err(err) = save_result {
@@ -4563,6 +4840,7 @@ impl BoardSnapshot {
         let (sort_by, order) = match task_sort {
             TASK_SORT_UPDATED_ASC => ("updated", "asc"),
             TASK_SORT_UPDATED_DESC => ("updated", "desc"),
+            TASK_SORT_NUMBER_DESC => ("id", "desc"),
             _ => ("id", "asc"),
         };
         let tasks = ops.list_tasks(None, None, sort_by, order)?;
@@ -4602,6 +4880,7 @@ impl BoardSnapshot {
         // is Run. Painting Closed as Crashed was the Idle Racer lie.
         for task in &tasks {
             if task.status == TaskStatus::InProgress
+                && task.run_phase != Some(RunPhase::Queued)
                 && let Some(session_id) = task.session.as_deref()
                 && !session_states.contains_key(&task.id)
                 && !(task.has_questions && ops.first_open_question(&task.id)?.is_some())
@@ -4943,9 +5222,10 @@ fn catalog_backend_commands(config: &BoardConfig) -> Vec<(String, String)> {
         .collect()
 }
 
-fn selected_backend(auto_launch: &Mapping, modal: &ModalState) -> String {
+fn selected_backend_for(auto_launch: &Mapping, modal: &ModalState, slot: AgentSlot) -> String {
     modal
-        .backend_text()
+        .backend_text_for(slot)
+        .or_else(|| modal.backend_text())
         .or_else(|| {
             auto_launch
                 .get("default_agent")
@@ -4953,6 +5233,28 @@ fn selected_backend(auto_launch: &Mapping, modal: &ModalState) -> String {
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| "opencode".to_string())
+}
+
+struct SlotSelection {
+    backend: usize,
+    model: usize,
+}
+
+fn slot_selection_snapshot(modal: &ModalState, field: DialogField) -> SlotSelection {
+    match ModalState::agent_slot(field).unwrap_or(AgentSlot::Primary) {
+        AgentSlot::Primary => SlotSelection {
+            backend: modal.backend_selected,
+            model: modal.model_selected,
+        },
+        AgentSlot::Designer => SlotSelection {
+            backend: modal.designer_backend_selected(),
+            model: modal.designer_model_selected(),
+        },
+        AgentSlot::Reviewer => SlotSelection {
+            backend: modal.reviewer_backend_selected(),
+            model: modal.reviewer_model_selected(),
+        },
+    }
 }
 
 fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
@@ -4969,6 +5271,15 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::MessageKind => Some(modal.kind_selected),
         DialogField::Question => Some(modal.question_selected),
         DialogField::Variant => modal.variant_selected,
+        DialogField::DesignerBackend => Some(modal.designer_backend_selected()),
+        DialogField::DesignerModel => Some(modal.designer_model_selected()),
+        DialogField::DesignerEffort => Some(modal.designer.effort_selected),
+        DialogField::DesignerAgent => Some(modal.designer.agent_selected),
+        DialogField::ReviewerBackend => Some(modal.reviewer_backend_selected()),
+        DialogField::ReviewerModel => Some(modal.reviewer_model_selected()),
+        DialogField::ReviewerEffort => Some(modal.reviewer.effort_selected),
+        DialogField::ReviewerAgent => Some(modal.reviewer.agent_selected),
+        DialogField::ReviewerOnChanges => Some(modal.reviewer_on_changes_selected),
         DialogField::Title
         | DialogField::Description
         | DialogField::Interactive
@@ -4976,7 +5287,19 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::Answer
         | DialogField::Confirm
         | DialogField::Cancel
-        | DialogField::PurgeData => None,
+        | DialogField::PurgeData
+        | DialogField::QueueEnabled
+        | DialogField::MaxRunningTotal
+        | DialogField::MaxRunningDesigner
+        | DialogField::MaxRunningReviewer
+        | DialogField::MaxRunningExecutor
+        | DialogField::MaxRunningPerBackend
+        | DialogField::MaxRunningPerBackendModel
+        | DialogField::AutoRestartEnabled
+        | DialogField::AutoRestartDelays
+        | DialogField::DesignerEnabled
+        | DialogField::ReviewerEnabled
+        | DialogField::ReviewerMaxRounds => None,
     }
 }
 
@@ -5088,6 +5411,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
 
 pub(super) fn normalize_task_sort(value: &str) -> &'static str {
     match value {
+        TASK_SORT_NUMBER_DESC => TASK_SORT_NUMBER_DESC,
         TASK_SORT_UPDATED_ASC => TASK_SORT_UPDATED_ASC,
         TASK_SORT_UPDATED_DESC | TASK_SORT_LEGACY_COMPLETION => TASK_SORT_UPDATED_DESC,
         _ => TASK_SORT_NUMBER,
@@ -5124,4 +5448,409 @@ fn tui_bool(map: &Mapping, key: &str, default: bool) -> bool {
             _ => None,
         })
         .unwrap_or(default)
+}
+
+fn role_cap(orch: &OrchestrationSettings, role: &str) -> i64 {
+    orch.max_running_per_role.get(role).copied().unwrap_or(0)
+}
+
+const BACKEND_CAP_ORDER: [&str; 4] = ["claude", "opencode", "omp", "pi"];
+
+fn format_backend_cap_map(map: &HashMap<String, i64>) -> String {
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort_by(|left, right| {
+        match (
+            BACKEND_CAP_ORDER.iter().position(|name| name == left),
+            BACKEND_CAP_ORDER.iter().position(|name| name == right),
+        ) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => left.cmp(right),
+        }
+    });
+    keys.into_iter()
+        .map(|key| format!("{key}: {}", map[key]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_sorted_cap_map(map: &HashMap<String, i64>) -> String {
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .map(|key| format!("{key}: {}", map[key]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn format_delays(delays: &[i64]) -> String {
+    delays
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn lines_or_blank(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        vec![String::new()]
+    } else {
+        text.lines().map(str::to_string).collect()
+    }
+}
+
+struct OrchestrationDraft {
+    queue_enabled: bool,
+    max_running_total: i64,
+    max_running_per_role: Vec<(String, i64)>,
+    max_running_per_backend: Vec<(String, i64)>,
+    max_running_per_backend_model: Vec<(String, i64)>,
+    auto_restart_enabled: bool,
+    auto_restart_delays: Vec<i64>,
+    designer_enabled: bool,
+    designer_backend: Option<String>,
+    designer_model: Option<String>,
+    designer_effort: Option<String>,
+    designer_agent: Option<String>,
+    reviewer_enabled: bool,
+    reviewer_backend: Option<String>,
+    reviewer_model: Option<String>,
+    reviewer_effort: Option<String>,
+    reviewer_agent: Option<String>,
+    reviewer_on_changes: String,
+    reviewer_max_rounds: i64,
+}
+
+fn parse_orchestration_modal(
+    modal: &ModalState,
+) -> std::result::Result<OrchestrationDraft, (DialogField, String)> {
+    let max_running_total = parse_cap_field(
+        &modal.max_running_total,
+        DialogField::MaxRunningTotal,
+        "Max running total",
+    )?;
+    let designer_cap = parse_cap_field(
+        &modal.max_running_designer,
+        DialogField::MaxRunningDesigner,
+        "Max designer tasks",
+    )?;
+    let reviewer_cap = parse_cap_field(
+        &modal.max_running_reviewer,
+        DialogField::MaxRunningReviewer,
+        "Max reviewer tasks",
+    )?;
+    let executor_cap = parse_cap_field(
+        &modal.max_running_executor,
+        DialogField::MaxRunningExecutor,
+        "Max executor tasks",
+    )?;
+    let max_running_per_backend = parse_cap_lines(
+        modal,
+        &modal.max_running_per_backend,
+        DialogField::MaxRunningPerBackend,
+        false,
+        None,
+    )?;
+    let default_backend = modal.backend_text();
+    let max_running_per_backend_model = parse_cap_lines(
+        modal,
+        &modal.max_running_per_backend_model,
+        DialogField::MaxRunningPerBackendModel,
+        true,
+        default_backend.as_deref(),
+    )?;
+    let auto_restart_delays = parse_delays(&modal.auto_restart_delays)?;
+    let reviewer_max_rounds = parse_cap_field(
+        &modal.reviewer_max_rounds,
+        DialogField::ReviewerMaxRounds,
+        "Max bounce rounds",
+    )?;
+    let reviewer_on_changes = modal
+        .reviewer_on_changes_text()
+        .unwrap_or_else(|| "in_progress".to_string());
+    if reviewer_on_changes != "in_progress" && reviewer_on_changes != "todo" {
+        return Err((
+            DialogField::ReviewerOnChanges,
+            "On changes requested must be in_progress or todo".to_string(),
+        ));
+    }
+    Ok(OrchestrationDraft {
+        queue_enabled: modal.queue_enabled,
+        max_running_total,
+        max_running_per_role: vec![
+            ("designer".to_string(), designer_cap),
+            ("reviewer".to_string(), reviewer_cap),
+            ("executor".to_string(), executor_cap),
+        ],
+        max_running_per_backend,
+        max_running_per_backend_model,
+        auto_restart_enabled: modal.auto_restart_enabled,
+        auto_restart_delays,
+        designer_enabled: modal.designer_enabled,
+        designer_backend: modal.backend_text_for(AgentSlot::Designer),
+        designer_model: modal.model_text_for(AgentSlot::Designer),
+        designer_effort: modal.effort_text_for(AgentSlot::Designer),
+        designer_agent: modal.agent_text_for(AgentSlot::Designer),
+        reviewer_enabled: modal.reviewer_enabled,
+        reviewer_backend: modal.backend_text_for(AgentSlot::Reviewer),
+        reviewer_model: modal.model_text_for(AgentSlot::Reviewer),
+        reviewer_effort: modal.effort_text_for(AgentSlot::Reviewer),
+        reviewer_agent: modal.agent_text_for(AgentSlot::Reviewer),
+        reviewer_on_changes,
+        reviewer_max_rounds,
+    })
+}
+
+fn parse_cap_field(
+    textarea: &TextArea<'static>,
+    field: DialogField,
+    label: &str,
+) -> std::result::Result<i64, (DialogField, String)> {
+    let text = textarea.lines().join("").trim().to_string();
+    if text.is_empty() {
+        return Err((
+            field,
+            format!("{label} cannot be empty (0 means unlimited)"),
+        ));
+    }
+    let parsed = text.parse::<i64>().map_err(|_| {
+        (
+            field,
+            format!("{label} must be a non-negative integer (0 means unlimited)"),
+        )
+    })?;
+    if parsed < 0 {
+        return Err((
+            field,
+            format!("{label} must not be negative (0 means unlimited)"),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn parse_cap_lines(
+    modal: &ModalState,
+    textarea: &TextArea<'static>,
+    field: DialogField,
+    model_keys: bool,
+    default_backend: Option<&str>,
+) -> std::result::Result<Vec<(String, i64)>, (DialogField, String)> {
+    let mut entries = Vec::new();
+    for raw in textarea.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if model_keys && line.ends_with('/') && !line.contains(':') {
+            return Err((
+                field,
+                format!(
+                    "Max tasks per backend/model needs a model id after the slash (e.g. {}opus: 1)",
+                    default_backend.map(|b| format!("{b}/")).unwrap_or_default()
+                ),
+            ));
+        }
+        let (key, value) = line
+            .rsplit_once(':')
+            .ok_or_else(|| (field, format!("Each line must be `key: N`, got {line:?}")))?;
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            return Err((field, "Cap key cannot be empty".to_string()));
+        }
+        let parsed = value.parse::<i64>().map_err(|_| {
+            (
+                field,
+                format!("Cap for {key} must be a non-negative integer, got {value:?}"),
+            )
+        })?;
+        if parsed < 0 {
+            return Err((
+                field,
+                format!("Cap for {key} must not be negative (0 means unlimited)"),
+            ));
+        }
+        let key = if model_keys {
+            canonicalize_backend_model_key(key, default_backend, field)?
+        } else {
+            key.to_string()
+        };
+        if model_keys {
+            let (backend, _) = OrchestrationSettings::parse_backend_model_key(&key)
+                .expect("canonical key has a slash");
+            if !is_known_settings_backend(modal, backend) {
+                return Err((
+                    field,
+                    format!(
+                        "Unknown backend '{backend}' in `{key}` (use claude/opus or opencode/openai/gpt-5.5)"
+                    ),
+                ));
+            }
+        }
+        entries.push((key, parsed));
+    }
+    Ok(entries)
+}
+
+fn is_known_settings_backend(modal: &ModalState, backend: &str) -> bool {
+    matches!(backend, "opencode" | "claude" | "omp" | "pi")
+        || modal
+            .backend_options
+            .iter()
+            .any(|option| option.value.as_deref() == Some(backend))
+}
+
+fn canonicalize_backend_model_key(
+    key: &str,
+    default_backend: Option<&str>,
+    field: DialogField,
+) -> std::result::Result<String, (DialogField, String)> {
+    if key.ends_with('/') {
+        return Err((
+            field,
+            format!(
+                "Max tasks per backend/model needs a model id after the slash (e.g. {}opus: 1)",
+                default_backend.map(|b| format!("{b}/")).unwrap_or_default()
+            ),
+        ));
+    }
+    let key = if key.contains('/') {
+        key.to_string()
+    } else if let Some(backend) = default_backend {
+        OrchestrationSettings::backend_model_key(backend, key)
+    } else {
+        return Err((
+            field,
+            format!("Use `<backend>/<model>` (e.g. claude/opus), not a bare model id: {key}"),
+        ));
+    };
+    let Some((backend, model)) = OrchestrationSettings::parse_backend_model_key(&key) else {
+        return Err((
+            field,
+            format!("Use `<backend>/<model>` (e.g. claude/opus), not a bare model id: {key}"),
+        ));
+    };
+    if backend.is_empty() || model.is_empty() {
+        return Err((
+            field,
+            format!("Use `<backend>/<model>` (e.g. claude/opus), not a bare model id: {key}"),
+        ));
+    }
+    Ok(key)
+}
+
+fn parse_delays(
+    textarea: &TextArea<'static>,
+) -> std::result::Result<Vec<i64>, (DialogField, String)> {
+    let text = textarea.lines().join(" ");
+    let mut delays = Vec::new();
+    for part in text.split(|c: char| c == ',' || c.is_whitespace()) {
+        if part.is_empty() {
+            continue;
+        }
+        let parsed = part.parse::<i64>().map_err(|_| {
+            (
+                DialogField::AutoRestartDelays,
+                format!("Restart delays must be positive minutes, got {part:?}"),
+            )
+        })?;
+        if parsed <= 0 {
+            return Err((
+                DialogField::AutoRestartDelays,
+                format!("Restart delays must be positive minutes, got {parsed}"),
+            ));
+        }
+        delays.push(parsed);
+    }
+    if delays.is_empty() {
+        return Err((
+            DialogField::AutoRestartDelays,
+            "Enter at least one restart delay in minutes (e.g. 1, 30, 270)".to_string(),
+        ));
+    }
+    Ok(delays)
+}
+
+fn apply_orchestration_draft(orch: &mut Mapping, draft: &OrchestrationDraft) {
+    insert_bool(orch, "queue_enabled", draft.queue_enabled);
+    insert_int(orch, "max_running_total", draft.max_running_total);
+    insert_cap_map(orch, "max_running_per_role", &draft.max_running_per_role);
+    insert_cap_map(
+        orch,
+        "max_running_per_backend",
+        &draft.max_running_per_backend,
+    );
+    insert_cap_map(
+        orch,
+        "max_running_per_backend_model",
+        &draft.max_running_per_backend_model,
+    );
+    let auto_restart = ensure_mapping(orch, "auto_restart");
+    insert_bool(auto_restart, "enabled", draft.auto_restart_enabled);
+    auto_restart.insert(
+        Value::String("delays_minutes".to_string()),
+        Value::Sequence(
+            draft
+                .auto_restart_delays
+                .iter()
+                .copied()
+                .map(|n| Value::Number(n.into()))
+                .collect(),
+        ),
+    );
+    let designer = ensure_mapping(orch, "designer");
+    insert_bool(designer, "enabled", draft.designer_enabled);
+    insert_str_opt(designer, "backend", draft.designer_backend.as_deref());
+    insert_str_opt(designer, "model", draft.designer_model.as_deref());
+    insert_str_opt(designer, "effort", draft.designer_effort.as_deref());
+    insert_str_opt(designer, "agent", draft.designer_agent.as_deref());
+    let reviewer = ensure_mapping(orch, "reviewer");
+    insert_bool(reviewer, "enabled", draft.reviewer_enabled);
+    insert_str_opt(reviewer, "backend", draft.reviewer_backend.as_deref());
+    insert_str_opt(reviewer, "model", draft.reviewer_model.as_deref());
+    insert_str_opt(reviewer, "effort", draft.reviewer_effort.as_deref());
+    insert_str_opt(reviewer, "agent", draft.reviewer_agent.as_deref());
+    insert_str_opt(
+        reviewer,
+        "on_changes_requested",
+        Some(&draft.reviewer_on_changes),
+    );
+    insert_int(reviewer, "max_rounds", draft.reviewer_max_rounds);
+}
+
+fn ensure_mapping<'a>(parent: &'a mut Mapping, key: &str) -> &'a mut Mapping {
+    let yaml_key = Value::String(key.to_string());
+    if !matches!(parent.get(&yaml_key), Some(Value::Mapping(_))) {
+        parent.insert(yaml_key.clone(), Value::Mapping(Mapping::new()));
+    }
+    parent
+        .get_mut(&yaml_key)
+        .and_then(Value::as_mapping_mut)
+        .expect("mapping just inserted")
+}
+
+fn insert_bool(map: &mut Mapping, key: &str, value: bool) {
+    map.insert(Value::String(key.to_string()), Value::Bool(value));
+}
+
+fn insert_int(map: &mut Mapping, key: &str, value: i64) {
+    map.insert(Value::String(key.to_string()), Value::Number(value.into()));
+}
+
+fn insert_str_opt(map: &mut Mapping, key: &str, value: Option<&str>) {
+    map.insert(
+        Value::String(key.to_string()),
+        value
+            .map(|text| Value::String(text.to_string()))
+            .unwrap_or(Value::Null),
+    );
+}
+
+fn insert_cap_map(map: &mut Mapping, key: &str, entries: &[(String, i64)]) {
+    let mut caps = Mapping::new();
+    for (name, value) in entries {
+        caps.insert(Value::String(name.clone()), Value::Number((*value).into()));
+    }
+    map.insert(Value::String(key.to_string()), Value::Mapping(caps));
 }

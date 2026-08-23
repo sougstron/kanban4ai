@@ -8,13 +8,17 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
-use crate::agent::{KanbanLauncher, build_agent_prompt, resolve_launch_settings};
+use crate::agent::{
+    KanbanLauncher, build_agent_prompt, resolve_bot_launch_settings, resolve_launch_settings,
+    resolve_task_launch_settings, upcoming_run_plan,
+};
 use crate::core::ask_form::AskForm;
-use crate::core::config::Config;
+use crate::core::config::{Config, OnChangesRequested};
 use crate::core::context::{ContextManager, role_for_source};
 use crate::core::error::{KanbanError, Result};
 use crate::core::models::{
-    Message, MessageKind, MessageRole, MessageStatus, SessionStatus, Task, TaskStatus,
+    Message, MessageKind, MessageRole, MessageStatus, Role, RunPhase, SessionStatus, Task,
+    TaskStatus,
 };
 use crate::core::notifier::{DesktopNotifier, NotificationConfig};
 use crate::core::project::{Project, Roots};
@@ -22,6 +26,7 @@ use crate::core::provenance::{
     self, ClaudeHarvester, InputManifest, OpencodeHarvester, PiFamilyHarvester, TranscriptHarvester,
 };
 use crate::core::reply;
+use crate::core::scheduler::{Slots, role_for_phase};
 use crate::core::session::SessionManager;
 use crate::core::storage::{NewTask, Storage, atomic_write_text};
 use crate::core::thread::ThreadManager;
@@ -72,6 +77,29 @@ pub struct TaskPatch {
 pub enum QuestionRef {
     Index(usize),
     MsgId(String),
+}
+
+/// The reviewer bot's only legal exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    Approve,
+    Changes(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VerdictRoute {
+    HumanReview { exhausted: bool },
+    Todo,
+    Requeue,
+}
+
+fn apply_human_review(task: &mut Task) {
+    task.status = TaskStatus::Review;
+    task.run_phase = None;
+    task.review_unseen = true;
+    let now = timefmt::now();
+    task.updated_at = now;
+    task.completed_at = Some(now);
 }
 
 /// What [`Operations::reconcile_agent_exit`] decided about an exited agent
@@ -194,7 +222,7 @@ impl Operations {
         ThreadManager::new(self.data_root())
     }
 
-    fn session_manager(&self) -> SessionManager {
+    pub(crate) fn session_manager(&self) -> SessionManager {
         SessionManager::new(self.data_root())
     }
 
@@ -202,7 +230,7 @@ impl Operations {
         ContextManager::new(self.data_root())
     }
 
-    fn notifier(&self) -> Result<DesktopNotifier> {
+    pub(crate) fn notifier(&self) -> Result<DesktopNotifier> {
         let mapping = self.config.get_notifications()?;
         Ok(DesktopNotifier::new(NotificationConfig::from_mapping(
             &mapping,
@@ -389,7 +417,13 @@ impl Operations {
             return Ok(None);
         };
         task.status = TaskStatus::Todo;
-        task.auto_resumes = 0;
+        task.reset_human_restart();
+        // The run phase is a sub-state of In Progress: a recovered task left
+        // that lifecycle, so a stale design/review marker must not decide the
+        // role of whatever runs next.
+        task.run_phase = None;
+        // Back at the top of the pipeline: the next run plans again.
+        task.designed = false;
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         Ok(Some(task))
@@ -439,28 +473,44 @@ impl Operations {
                 )));
             }
 
-            if is_agent && self.config.get_rule("user_only_review_to_done")? {
-                if target_status == TaskStatus::Done.as_str() {
-                    return Err(KanbanError::Permission(
-                        "Agent cannot move tasks to Done".to_string(),
-                    ));
+            if is_agent {
+                match Role::from_phase(task.run_phase) {
+                    Role::Designer => {
+                        return Err(KanbanError::Permission(
+                            "designer cannot move a task; finish the design phase with kanban done"
+                                .to_string(),
+                        ));
+                    }
+                    Role::Reviewer => {
+                        return Err(KanbanError::Permission(
+                            "reviewer cannot move a task; finish with kanban verdict".to_string(),
+                        ));
+                    }
+                    Role::Executor => {}
                 }
-                if task.status == TaskStatus::Review {
-                    return Err(KanbanError::Permission(
-                        "Agent cannot move tasks from Review".to_string(),
-                    ));
+                if self.config.get_rule("user_only_review_to_done")? {
+                    if target_status == TaskStatus::Done.as_str() {
+                        return Err(KanbanError::Permission(
+                            "Agent cannot move tasks to Done".to_string(),
+                        ));
+                    }
+                    if task.status == TaskStatus::Review {
+                        return Err(KanbanError::Permission(
+                            "Agent cannot move tasks from Review".to_string(),
+                        ));
+                    }
                 }
             }
 
             if target_status == TaskStatus::Done.as_str() {
                 let done = self.move_task_to_done(&task)?;
-                (done, false)
+                (self.reset_moved_if_human(done, is_agent)?, false)
             } else {
                 let moved = self.storage.move_task(task_id, target_status, is_agent)?;
                 let entered_review = moved.as_ref().is_some_and(|m| {
                     task.status != TaskStatus::Review && m.status == TaskStatus::Review
                 });
-                (moved, entered_review)
+                (self.reset_moved_if_human(moved, is_agent)?, entered_review)
             }
         };
 
@@ -468,6 +518,27 @@ impl Operations {
             self.trigger_chained_tasks(&moved.id)?;
         }
         Ok(moved)
+    }
+
+    fn reset_moved_if_human(&self, moved: Option<Task>, is_agent: bool) -> Result<Option<Task>> {
+        if is_agent {
+            return Ok(moved);
+        }
+        let Some(mut task) = moved else {
+            return Ok(None);
+        };
+        task.reset_human_restart();
+        // A human move ends whatever run was in flight. Leaving `design` or
+        // `review` on the task would make the next agent launch the wrong bot
+        // and would refuse every later agent move as if a phase bot owned it.
+        task.run_phase = None;
+        // Dragging a task back to To Do restarts the work from the top, so the
+        // next run plans again. Any other human move keeps the existing plan.
+        if task.status == TaskStatus::Todo {
+            task.designed = false;
+        }
+        self.storage.save_task(&task)?;
+        Ok(Some(task))
     }
 
     /// Move every task in `from` to `to` as one locked batch, with human-mode
@@ -579,9 +650,23 @@ impl Operations {
         session_id: &str,
         is_agent: bool,
     ) -> Result<Option<Task>> {
+        self.take_task_inner(task_id, session_id, is_agent, false)
+    }
+
+    /// Queue-aware delegation. With `immediate` (the human `r` Run action)
+    /// the launch always happens and any queued marker is cleared; otherwise
+    /// a task whose concurrency caps are exhausted lands In Progress with run
+    /// phase Queued instead of launching — the dispatcher starts it later.
+    fn take_task_inner(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        is_agent: bool,
+        immediate: bool,
+    ) -> Result<Option<Task>> {
         let session_mgr = self.session_manager();
         SessionManager::validate_session_id(session_id)?;
-        let (task, previous_status) = {
+        let (task, previous_status, queued) = {
             let _guard = self.storage.lock()?;
             let Some(mut task) = self.storage.load_task(task_id)? else {
                 return Ok(None);
@@ -598,18 +683,59 @@ impl Operations {
                 return Ok(None);
             }
 
-            task.session = Some(session_id.to_string());
-            task.auto_resumes = 0;
+            task.reset_human_restart();
             if self.config.get_rule("auto_move_on_assign")? {
                 task.status = TaskStatus::InProgress;
             }
+
+            // Decide launch vs queue before anything is persisted.
+            let mut queued = false;
+            // A task whose plan is already on the thread skips straight to the
+            // executor, however this run was started (see `upcoming_run_plan`).
+            let designer_enabled =
+                self.config.get_orchestration()?.designer.enabled && !task.designed;
+            let will_auto_launch = is_agent
+                && self.config.get_rule("auto_launch_on_delegate")?
+                && self.auto_launch_enabled()?
+                && task.status == TaskStatus::InProgress;
+            if immediate {
+                // A manual start bypasses the queue, but not an enabled
+                // designer: the planning pass still runs first.
+                task.run_phase = if designer_enabled {
+                    Some(RunPhase::Design)
+                } else {
+                    None
+                };
+            } else if will_auto_launch && self.queue_is_full(&task)? {
+                queued = true;
+                task.run_phase = Some(RunPhase::Queued);
+            } else if will_auto_launch && designer_enabled {
+                task.run_phase = Some(RunPhase::Design);
+            } else {
+                // A fresh take starts a fresh run: never inherit the phase a
+                // previous run left behind, or the executor would be launched
+                // (and prompted) as the designer or the reviewer.
+                task.run_phase = None;
+            }
+
+            // A queued task owns no launch, so only record the session when
+            // it already exists (the delegated flow's live caller); a freshly
+            // minted id would otherwise strand an Active record that paints
+            // the card as running for a heartbeat timeout.
+            let known_session = !queued || session_mgr.load_session(session_id).is_some();
+            if known_session {
+                task.session = Some(session_id.to_string());
+            }
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
-            session_mgr.link_named_session(task_id, session_id, &task.title)?;
-            (task, previous_status)
+            if known_session {
+                session_mgr.link_named_session(task_id, session_id, &task.title)?;
+            }
+            (task, previous_status, queued)
         };
 
-        if is_agent
+        if !queued
+            && is_agent
             && self.config.get_rule("auto_launch_on_delegate")?
             && self.auto_launch_enabled()?
         {
@@ -651,15 +777,108 @@ impl Operations {
                     "Task {task_id} is already running (session {session})"
                 )));
             }
-            self.resolve_backend(&task)?
+            upcoming_run_plan(&self.config.load()?, &task)?.0.backend
         };
         let session_id = format!("ses-{}-{}", backend, timefmt::now().format("%Y%m%d-%H%M%S"));
-        if self.take_task(task_id, &session_id, true)?.is_none() {
+        if self
+            .take_task_inner(task_id, &session_id, true, true)?
+            .is_none()
+        {
             return Err(KanbanError::Invalid(format!(
                 "Agent launch failed for {task_id}"
             )));
         }
         Ok(Some(session_id))
+    }
+
+    /// Explicitly queue a task for the dispatcher (the TUI `Q` action). To Do
+    /// moves to In Progress; an idle In Progress task stays put. Either way
+    /// the run phase becomes Queued and no agent launches — the dispatcher
+    /// starts queued tasks once a slot frees up.
+    pub fn enqueue_task(&self, task_id: &str) -> Result<Option<Task>> {
+        let _guard = self.storage.lock()?;
+        let Some(mut task) = self.storage.load_task(task_id)? else {
+            return Ok(None);
+        };
+        match task.status {
+            TaskStatus::Todo => task.status = TaskStatus::InProgress,
+            TaskStatus::InProgress => {}
+            _ => {
+                return Err(KanbanError::Invalid(format!(
+                    "Task {task_id} must be To Do or In Progress to queue"
+                )));
+            }
+        }
+        if task
+            .session
+            .as_deref()
+            .is_some_and(|s| self.session_manager().is_session_active(s))
+        {
+            return Err(KanbanError::Invalid(format!(
+                "Task {task_id} already has a running agent"
+            )));
+        }
+        task.reset_human_restart();
+        task.run_phase = Some(RunPhase::Queued);
+        task.updated_at = timefmt::now();
+        self.storage.save_task(&task)?;
+        self.post_queue_note(&task.id, "⏸ queued — waiting for a free agent slot");
+        Ok(Some(task))
+    }
+
+    /// Take a queued task back out (the TUI `Q` action on a queued card):
+    /// the phase marker clears, the task stays In Progress with no live
+    /// session, and `r` runs it immediately again.
+    pub fn dequeue_task(&self, task_id: &str) -> Result<Option<Task>> {
+        let _guard = self.storage.lock()?;
+        let Some(mut task) = self.storage.load_task(task_id)? else {
+            return Ok(None);
+        };
+        if task.run_phase != Some(RunPhase::Queued) {
+            return Err(KanbanError::Invalid(format!(
+                "Task {task_id} is not queued"
+            )));
+        }
+        task.reset_human_restart();
+        task.run_phase = None;
+        task.updated_at = timefmt::now();
+        self.storage.save_task(&task)?;
+        self.post_queue_note(&task.id, "⏸ taken out of the queue — run it manually");
+        Ok(Some(task))
+    }
+
+    /// Best-effort audit line on the thread for a queue phase change.
+    pub(crate) fn post_queue_note(&self, task_id: &str, body: &str) {
+        let _ = self.thread_manager().and_then(|tm| {
+            tm.post_with_origin(
+                task_id,
+                MessageRole::System,
+                MessageKind::AgentStep,
+                body,
+                None,
+                vec![],
+                Some("kanban".to_string()),
+                Some("kanban".to_string()),
+            )
+        });
+    }
+
+    /// Whether the orchestration queue would hold this task back: queueing
+    /// is enabled and every cap applicable to the task's resolved
+    /// backend/model is already consumed by live sessions.
+    fn queue_is_full(&self, task: &Task) -> Result<bool> {
+        let orch = self.config.get_orchestration()?;
+        if !orch.queue_enabled {
+            return Ok(false);
+        }
+        let config = self.config.load()?;
+        let (settings, phase) = upcoming_run_plan(&config, task)?;
+        Ok(!Slots::measure(self)?.has_room(
+            &orch,
+            &settings.backend,
+            settings.model.as_deref(),
+            role_for_phase(Some(phase)).as_str(),
+        ))
     }
 
     /// Stop a running agent session: mark it closed first so a racing
@@ -733,6 +952,16 @@ impl Operations {
                 return Ok(None);
             };
 
+            if is_agent && task.run_phase == Some(RunPhase::Design) {
+                drop(_guard);
+                return self.complete_design_phase(task_id, session_id);
+            }
+            if is_agent && task.run_phase == Some(RunPhase::Review) {
+                return Err(KanbanError::Invalid(
+                    "bot reviewer must finish with kanban verdict, not done".to_string(),
+                ));
+            }
+
             if is_agent && self.config.get_rule("user_only_review_to_done")? {
                 if task.status == TaskStatus::Review {
                     return Ok(None);
@@ -794,7 +1023,13 @@ impl Operations {
                     });
                 }
 
+                if self.should_start_bot_review(&task)? {
+                    drop(_guard);
+                    return self.start_bot_review(task_id, session_id);
+                }
+
                 task.status = TaskStatus::Review;
+                task.run_phase = None;
                 task.review_unseen = true;
             } else {
                 if is_agent {
@@ -823,6 +1058,291 @@ impl Operations {
         self.notify_completion(&task);
 
         Ok(Some(task))
+    }
+
+    /// Designer `kanban done`: stay In Progress, close the design session,
+    /// flip `run_phase` to Execute, and start the task's assigned bot on the
+    /// same slot. Re-queueing would stall a task whose slot is already paid
+    /// for. A missing plan (no context) is an error so we never hand an
+    /// empty thread to the executor.
+    fn complete_design_phase(&self, task_id: &str, session_id: &str) -> Result<Option<Task>> {
+        {
+            let _guard = self.storage.lock()?;
+            let Some(task) = self.storage.load_task(task_id)? else {
+                return Ok(None);
+            };
+            if task.run_phase != Some(RunPhase::Design) || task.status != TaskStatus::InProgress {
+                return Ok(None);
+            }
+            self.require_current_agent_session(&task, session_id)?;
+            let context = self.context_manager().get_context(task_id, &self.storage)?;
+            if context.trim().is_empty() {
+                return Err(KanbanError::Permission(
+                    "Designer cannot finish without recording a plan via context".to_string(),
+                ));
+            }
+        }
+        self.session_manager().close_session(session_id)?;
+        self.advance_from_design(task_id, session_id)?;
+        self.storage.load_task(task_id)
+    }
+
+    /// Hand the designer's slot to the executor: claim Execute under the
+    /// lock and launch outside it. Caps are not re-checked — the slot is
+    /// already accounted for.
+    fn advance_from_design(&self, task_id: &str, designer_session: &str) -> Result<Option<String>> {
+        let session_mgr = self.session_manager();
+        let new_session_id = {
+            let _guard = self.storage.lock()?;
+            let Some(mut task) = self.storage.load_task(task_id)? else {
+                return Ok(None);
+            };
+            if task.status != TaskStatus::InProgress || task.run_phase != Some(RunPhase::Design) {
+                return Ok(None);
+            }
+            if task.session.as_deref() != Some(designer_session) {
+                return Ok(None);
+            }
+            let settings = resolve_task_launch_settings(&self.config.load()?, &task)?;
+            let new_session_id = self.fresh_session_id(&safe_session_component(&settings.backend));
+            task.run_phase = Some(RunPhase::Execute);
+            // The plan is on the thread now. Record it so a later re-queue of
+            // this task (crash restart, reviewer bounce) starts the executor
+            // instead of paying for a second designer pass.
+            task.designed = true;
+            task.auto_resumes = 0;
+            task.session = Some(new_session_id.clone());
+            task.updated_at = timefmt::now();
+            session_mgr.link_named_session(&task.id, &new_session_id, &task.title)?;
+            if let Err(err) = self.storage.save_task(&task) {
+                session_mgr.unlink_session(&new_session_id);
+                return Err(err);
+            }
+            self.post_queue_note(
+                &task.id,
+                &format!(
+                    "▶ design finished; starting executor session {new_session_id} ({})",
+                    settings.backend
+                ),
+            );
+            new_session_id
+        };
+        match self.finish_launch(
+            &new_session_id,
+            self.launch_agent(task_id, &new_session_id, false),
+        ) {
+            Ok(true) => Ok(Some(new_session_id)),
+            failed => {
+                let _ = self.schedule_crash_restart(task_id);
+                failed?;
+                Ok(Some(new_session_id))
+            }
+        }
+    }
+
+    /// Whether the executor's `done` should launch the reviewer bot instead
+    /// of moving the task to human Review. Exhausted bounce budget falls
+    /// through so a human can take over.
+    fn should_start_bot_review(&self, task: &Task) -> Result<bool> {
+        let orch = self.config.get_orchestration()?;
+        if !orch.reviewer.enabled {
+            return Ok(false);
+        }
+        if matches!(
+            task.run_phase,
+            Some(RunPhase::Design) | Some(RunPhase::Review)
+        ) {
+            return Ok(false);
+        }
+        Ok(!self.review_rounds_exhausted(task, &orch.reviewer))
+    }
+
+    fn review_rounds_exhausted(
+        &self,
+        task: &Task,
+        reviewer: &crate::core::config::ReviewerSettings,
+    ) -> bool {
+        reviewer.max_rounds > 0 && i64::from(task.review_rounds) >= reviewer.max_rounds
+    }
+
+    /// Keep the task In Progress, flip `run_phase` to Review, and launch the
+    /// reviewer bot with `orchestration.reviewer` (not the task assignment).
+    fn start_bot_review(&self, task_id: &str, executor_session: &str) -> Result<Option<Task>> {
+        self.session_manager().close_session(executor_session)?;
+        let orch = self.config.get_orchestration()?;
+        let settings = resolve_bot_launch_settings(&self.config.load()?, &orch.reviewer.bot())?;
+        let session_mgr = self.session_manager();
+        let (task, session_id) = {
+            let _guard = self.storage.lock()?;
+            let Some(mut task) = self.storage.load_task(task_id)? else {
+                return Ok(None);
+            };
+            if task.status != TaskStatus::InProgress {
+                return Ok(None);
+            }
+            let session_id = self.fresh_session_id(&safe_session_component(&settings.backend));
+            task.run_phase = Some(RunPhase::Review);
+            task.review_rounds = task.review_rounds.saturating_add(1);
+            task.session = Some(session_id.clone());
+            task.updated_at = timefmt::now();
+            session_mgr.link_named_session(&task.id, &session_id, &task.title)?;
+            if let Err(err) = self.storage.save_task(&task) {
+                session_mgr.unlink_session(&session_id);
+                return Err(err);
+            }
+            self.post_queue_note(
+                &task.id,
+                &format!(
+                    "⚖ bot review started session {session_id} ({}) — round {}",
+                    settings.backend, task.review_rounds
+                ),
+            );
+            (task, session_id)
+        };
+        if self.auto_launch_enabled()? {
+            match self.finish_launch(&session_id, self.launch_agent(task_id, &session_id, false)) {
+                Ok(true) => {}
+                failed => {
+                    let _ = self.schedule_crash_restart(task_id);
+                    failed?;
+                }
+            }
+        }
+        Ok(self.storage.load_task(task_id)?.or(Some(task)))
+    }
+
+    /// Reviewer-only exit: approve (human Review) or request changes.
+    pub fn submit_verdict(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        is_agent: bool,
+        decision: Verdict,
+    ) -> Result<Option<Task>> {
+        if !is_agent {
+            return Err(KanbanError::Permission(
+                "kanban verdict is the reviewer bot's exit; pass --agent".to_string(),
+            ));
+        }
+        SessionManager::validate_session_id(session_id)?;
+        let orch = self.config.get_orchestration()?;
+        let (task, route) = {
+            let _guard = self.storage.lock()?;
+            let Some(mut task) = self.storage.load_task(task_id)? else {
+                return Ok(None);
+            };
+            if task.run_phase != Some(RunPhase::Review) || task.status != TaskStatus::InProgress {
+                return Err(KanbanError::Invalid(format!(
+                    "Task {task_id} is not in a bot-review phase"
+                )));
+            }
+            self.require_current_agent_session(&task, session_id)?;
+
+            let route = match decision {
+                Verdict::Approve => VerdictRoute::HumanReview { exhausted: false },
+                Verdict::Changes(text) => {
+                    let text = text.trim().to_string();
+                    if text.is_empty() {
+                        return Err(KanbanError::Invalid(
+                            "kanban verdict --changes requires non-empty text".to_string(),
+                        ));
+                    }
+                    task.review_edits = text;
+                    self.fold_review_edits(&mut task)?;
+                    if self.review_rounds_exhausted(&task, &orch.reviewer) {
+                        VerdictRoute::HumanReview { exhausted: true }
+                    } else {
+                        match orch.reviewer.on_changes_requested {
+                            OnChangesRequested::Todo => VerdictRoute::Todo,
+                            OnChangesRequested::InProgress => VerdictRoute::Requeue,
+                        }
+                    }
+                }
+            };
+
+            match route {
+                VerdictRoute::HumanReview { exhausted } => {
+                    apply_human_review(&mut task);
+                    if exhausted {
+                        self.post_queue_note(
+                            &task.id,
+                            "⚖ bot review budget spent — handing to human Review",
+                        );
+                    } else {
+                        self.post_queue_note(
+                            &task.id,
+                            "⚖ reviewer approved — handing to human Review",
+                        );
+                    }
+                }
+                VerdictRoute::Todo => {
+                    task.status = TaskStatus::Todo;
+                    task.run_phase = None;
+                    task.review_unseen = false;
+                    task.updated_at = timefmt::now();
+                    self.post_queue_note(
+                        &task.id,
+                        "⚖ reviewer requested changes — returned to To Do",
+                    );
+                }
+                VerdictRoute::Requeue => {
+                    task.status = TaskStatus::InProgress;
+                    task.run_phase = Some(RunPhase::Queued);
+                    task.review_unseen = false;
+                    task.updated_at = timefmt::now();
+                    self.post_queue_note(
+                        &task.id,
+                        "⚖ reviewer requested changes — queued for the task bot",
+                    );
+                }
+            }
+            self.storage.save_task(&task)?;
+            (task, route)
+        };
+
+        self.session_manager().close_session(session_id)?;
+
+        match route {
+            VerdictRoute::HumanReview { exhausted } => {
+                self.trigger_chained_tasks(&task.id)?;
+                self.notify_completion(&task);
+                if exhausted && let Ok(notifier) = self.notifier() {
+                    notifier.stranded(
+                        &task.id,
+                        &task.title,
+                        "Bot review budget spent; task is in human Review.",
+                    );
+                }
+            }
+            VerdictRoute::Todo => {}
+            VerdictRoute::Requeue => {
+                let _ = self.dispatch_queue()?;
+            }
+        }
+        Ok(self.storage.load_task(task_id)?.or(Some(task)))
+    }
+
+    /// Fold the pending `review_edits` buffer into the thread as a permanent
+    /// `review_edit` message and clear it. Shared by human re-run and the
+    /// reviewer `--changes` path.
+    fn fold_review_edits(&self, task: &mut Task) -> Result<()> {
+        let edits = task.review_edits.trim().to_string();
+        if edits.is_empty() {
+            task.review_edits.clear();
+            return Ok(());
+        }
+        self.thread_manager()?.post_with_origin(
+            &task.id,
+            MessageRole::Human,
+            MessageKind::ReviewEdit,
+            &edits,
+            None,
+            vec![],
+            Some("user".to_string()),
+            Some("human".to_string()),
+        )?;
+        task.review_edits.clear();
+        Ok(())
     }
 
     /// Maximum number of characters from the verification command's combined
@@ -900,7 +1420,7 @@ impl Operations {
             {
                 continue;
             }
-            let backend = self.resolve_backend(&task)?;
+            let backend = upcoming_run_plan(&self.config.load()?, &task)?.0.backend;
             let session_id = format!(
                 "ses-{}-{}",
                 backend,
@@ -1191,7 +1711,9 @@ impl Operations {
             return Err(err);
         }
         task.session = Some(new_session_id.clone());
-        task.auto_resumes = 0;
+        // A wake replaces the session of a run that is still the same run, so
+        // the reviewer bounce count survives it — see `reset_auto_restart`.
+        task.reset_auto_restart();
         task.updated_at = timefmt::now();
         if let Err(err) = self.storage.save_task(&task) {
             session_mgr.unlink_session(&new_session_id);
@@ -1216,7 +1738,7 @@ impl Operations {
 
     /// Allocate under the board lock; suffixing makes wall-clock repetition
     /// harmless and prevents an authority token from being overwritten.
-    fn fresh_session_id(&self, backend: &str) -> String {
+    pub(crate) fn fresh_session_id(&self, backend: &str) -> String {
         let base = format!(
             "ses-{}-{}",
             backend,
@@ -1473,20 +1995,7 @@ impl Operations {
             let Some(mut task) = self.storage.load_task(task_id)? else {
                 return Ok(None);
             };
-            let tm = self.thread_manager()?;
-            let edits = task.review_edits.trim().to_string();
-            if !edits.is_empty() {
-                tm.post_with_origin(
-                    &task.id,
-                    MessageRole::Human,
-                    MessageKind::ReviewEdit,
-                    &edits,
-                    None,
-                    vec![],
-                    Some("user".to_string()),
-                    Some("human".to_string()),
-                )?;
-            }
+            self.fold_review_edits(&mut task)?;
 
             let backend = self.resolve_backend(&task)?;
             let session_id = match session_id {
@@ -1495,7 +2004,7 @@ impl Operations {
             };
             task.review_edits = String::new();
             task.session = Some(session_id.clone());
-            task.auto_resumes = 0;
+            task.reset_human_restart();
             task.review_unseen = false;
             task.status = TaskStatus::InProgress;
             task.updated_at = timefmt::now();
@@ -1584,7 +2093,10 @@ impl Operations {
             )?;
 
             task.session = Some(session_id.clone());
-            task.auto_resumes = 0;
+            // Re-running a stranded In Progress session continues the same
+            // attempt on a fresh session; the reviewer bounce count is not
+            // part of what went wrong, so it is not cleared here.
+            task.reset_auto_restart();
             task.has_questions = tm.has_open_questions(&task.id)?;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
@@ -1602,7 +2114,7 @@ impl Operations {
 
     // --------------------------------------------------------------- launch
 
-    fn auto_launch_enabled(&self) -> Result<bool> {
+    pub(crate) fn auto_launch_enabled(&self) -> Result<bool> {
         Ok(self
             .config
             .load()?
@@ -1615,20 +2127,7 @@ impl Operations {
     /// Backend key for a task: its `agent_backend`, else the configured
     /// default, falling back to `opencode` for unknown backends.
     pub fn resolve_backend(&self, task: &Task) -> Result<String> {
-        let config = self.config.load()?;
-        let backend = task.agent_backend.clone().unwrap_or_else(|| {
-            config
-                .auto_launch
-                .get("default_agent")
-                .and_then(|v| v.as_str())
-                .unwrap_or("opencode")
-                .to_string()
-        });
-        if config.agents.contains_key(backend.as_str()) {
-            Ok(backend)
-        } else {
-            Ok("opencode".to_string())
-        }
+        Ok(resolve_launch_settings(&self.config.load()?, task)?.backend)
     }
 
     /// Configured opencode agent personas selectable per task (opencode-only).
@@ -1649,7 +2148,12 @@ impl Operations {
             .unwrap_or_default())
     }
 
-    fn launch_agent(&self, task_id: &str, session_id: &str, revert: bool) -> Result<bool> {
+    pub(crate) fn launch_agent(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        revert: bool,
+    ) -> Result<bool> {
         let Some(task) = self.storage.load_task(task_id)? else {
             return Err(KanbanError::Invalid(format!(
                 "Task {task_id} not found. Agent not started."
@@ -1687,7 +2191,7 @@ impl Operations {
 
     /// Crash the session when the agent did not start. `Ok(false)` stays a
     /// soft failure; `Err` is the exact spawn error for the TUI status bar.
-    fn finish_launch(&self, session_id: &str, launched: Result<bool>) -> Result<bool> {
+    pub(crate) fn finish_launch(&self, session_id: &str, launched: Result<bool>) -> Result<bool> {
         match launched {
             Ok(true) => Ok(true),
             Ok(false) => {
@@ -1709,7 +2213,13 @@ impl Operations {
             .storage
             .logs_dir
             .join(format!("{session_id}.prompt.txt"));
-        if let Ok(prompt) = build_agent_prompt(self.roots(), task, session_id, revert) {
+        if let Ok(prompt) = build_agent_prompt(
+            self.roots(),
+            task,
+            session_id,
+            revert,
+            Role::from_phase(task.run_phase),
+        ) {
             let _ = atomic_write_text(&prompt_path, &prompt);
         }
 
@@ -1717,12 +2227,25 @@ impl Operations {
             .strip_prefix(self.data_root())
             .unwrap_or(&prompt_path)
             .display();
+        let settings = resolve_launch_settings(&self.config.load().unwrap_or_default(), task).ok();
         let body = format!(
             "▶ launch session={session_id} backend={} model={} effort={} agent={} revert={revert} → prompt: {rel_prompt_path}",
-            task.agent_backend.as_deref().unwrap_or("-"),
-            task.ai_model.as_deref().unwrap_or("-"),
-            task.ai_effort.as_deref().unwrap_or("-"),
-            task.agent_name.as_deref().unwrap_or("-"),
+            settings
+                .as_ref()
+                .map(|s| s.backend.as_str())
+                .unwrap_or(task.agent_backend.as_deref().unwrap_or("-")),
+            settings
+                .as_ref()
+                .and_then(|s| s.model.as_deref())
+                .unwrap_or(task.ai_model.as_deref().unwrap_or("-")),
+            settings
+                .as_ref()
+                .and_then(|s| s.effort.as_deref())
+                .unwrap_or(task.ai_effort.as_deref().unwrap_or("-")),
+            settings
+                .as_ref()
+                .and_then(|s| s.agent.as_deref())
+                .unwrap_or(task.agent_name.as_deref().unwrap_or("-")),
         );
         let _ = self.thread_manager().and_then(|tm| {
             tm.post_with_origin(
@@ -1743,6 +2266,12 @@ impl Operations {
     /// instead of showing nothing when the values came from board config.
     /// Fields the task already sets are left untouched.
     fn record_launch_settings(&self, task: Task) -> Result<Task> {
+        // Designer/reviewer bots must not overwrite the task's assigned
+        // executor backend/model/effort/agent — those fields are what the
+        // next phase launches with.
+        if matches!(task.run_phase, Some(RunPhase::Design | RunPhase::Review)) {
+            return Ok(task);
+        }
         let settings = resolve_launch_settings(&self.config.load()?, &task)?;
         let _guard = self.storage.lock()?;
         let Some(mut current) = self.storage.load_task(&task.id)? else {
@@ -2031,6 +2560,10 @@ impl Operations {
                 manifest.as_ref(),
             );
         }
+        // An exit freed a slot (or re-filled one via the auto-resume); pump
+        // the queue so the launch wrapper starts queued work even with no
+        // TUI open. Best effort — never disturbs the reconciled exit.
+        let _ = self.dispatch_queue();
         Ok(outcome)
     }
 
@@ -2176,6 +2709,7 @@ impl Operations {
         }
         if exit_status != 0 {
             session_mgr.crash_session(session_id)?;
+            let _ = self.schedule_crash_restart(task_id);
             return Ok(AgentExitOutcome::Crashed);
         }
 
@@ -2660,7 +3194,7 @@ impl Operations {
     }
 }
 
-fn safe_session_component(value: &str) -> String {
+pub(crate) fn safe_session_component(value: &str) -> String {
     let safe = value
         .chars()
         .map(|ch| {

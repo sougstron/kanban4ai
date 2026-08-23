@@ -195,7 +195,7 @@ impl Storage {
     fn write_task_file(&self, filepath: &Path, task: &Task) -> Result<()> {
         let frontmatter = timefmt::quote_yaml_timestamp_fields(
             &serde_yaml_ng::to_string(task)?,
-            &["created_at", "updated_at", "completed_at"],
+            &["created_at", "updated_at", "completed_at", "restart_at"],
         );
         let content = format!("---\n{frontmatter}---\n{}\n", task.description);
         atomic_write_text(filepath, &content)

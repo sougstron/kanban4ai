@@ -9,6 +9,7 @@ use ratatui::crossterm::event::{
 use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{TextArea, WrapMode};
 
+use crate::core::models::{RunPhase, TaskStatus};
 use crate::core::operations::Operations;
 use crate::core::project::ProjectStore;
 use crate::core::session::SessionManager;
@@ -215,6 +216,22 @@ fn populated_app() -> (tempfile::TempDir, App) {
         .expect("create second task");
     ops.move_task(&second.id, "review", false)
         .expect("move task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    (dir, app)
+}
+
+/// A board of `count` plain todo cards in one column, for selection tests
+/// that need several unremarkable cards (no questions, no badges).
+fn plain_tasks_app(count: usize) -> (tempfile::TempDir, App) {
+    let (dir, mut app) = app_with_board();
+    let ops = Operations::new(dir.path());
+    for n in 1..=count {
+        ops.create_task(NewTask {
+            title: format!("Plain task {n}"),
+            ..Default::default()
+        })
+        .expect("create plain task");
+    }
     app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
     (dir, app)
 }
@@ -826,6 +843,44 @@ fn task_form_default_backend_inherits_settings_agent() {
     assert_eq!(task.agent_backend, None);
 }
 
+/// Enter, Shift+Enter, and Alt+Enter all break lines inside the description.
+/// Terminals (and tmux without extended-keys) deliver Shift+Enter as a bare
+/// Enter, so the field must treat that the same as the modified chords. Tab
+/// is what leaves the field.
+#[test]
+fn description_enter_shift_and_alt_enter_break_lines() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::Description);
+    app.handle_key(key(KeyCode::Char('l'))).expect("type");
+    app.handle_key(key(KeyCode::Char('i'))).expect("type");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+        .expect("shift newline");
+    app.handle_key(key(KeyCode::Char('2'))).expect("type");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+        .expect("alt newline");
+    app.handle_key(key(KeyCode::Char('3'))).expect("type");
+    app.handle_key(key(KeyCode::Enter)).expect("plain newline");
+    app.handle_key(key(KeyCode::Char('4'))).expect("type");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").description.lines(),
+        ["li", "2", "3", "4"]
+    );
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::Description
+    );
+
+    app.handle_key(key(KeyCode::Tab)).expect("leave field");
+    assert_ne!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::Description
+    );
+}
+
 #[test]
 fn settings_hotkey_navigates_fields_and_reloads_backend_defaults() {
     let (_dir, mut app) = settings_app();
@@ -899,7 +954,12 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
             .iter()
             .filter_map(|option| option.value.as_deref())
             .collect::<Vec<_>>(),
-        vec!["task_number", "updated_at_asc", "updated_at_desc"]
+        vec![
+            "task_number",
+            "task_number_desc",
+            "updated_at_asc",
+            "updated_at_desc"
+        ]
     );
     {
         let modal = app.modal.as_mut().expect("settings modal");
@@ -918,8 +978,11 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     app.handle_key(key(KeyCode::Left)).expect("dark theme");
     app.handle_key(key(KeyCode::Tab)).expect("task sorting");
     app.handle_key(key(KeyCode::Right))
+        .expect("task number down");
+    app.handle_key(key(KeyCode::Right))
         .expect("updated ascending sorting");
-    app.handle_key(key(KeyCode::Tab)).expect("save");
+    let save_field = app.modal.as_ref().unwrap().fields().len() - 2;
+    app.modal.as_mut().unwrap().field_index = save_field;
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
 
     assert!(app.modal.is_none());
@@ -1024,6 +1087,62 @@ fn updated_sort_setting_applies_both_directions_to_every_column() {
         assert_eq!(column.tasks[0].id, *newer);
         assert_eq!(column.tasks[1].id, *older);
     }
+}
+
+#[test]
+fn task_number_sort_applies_both_directions_to_every_column() {
+    let (_dir, mut app) = settings_app();
+    let mut expected_by_column = Vec::new();
+    for status in ["todo", "in_progress", "review", "done"] {
+        // Tasks are created in ascending id order within each column.
+        let older = app
+            .ops
+            .create_task(NewTask::titled(format!("First {status}")))
+            .unwrap();
+        let middle = app
+            .ops
+            .create_task(NewTask::titled(format!("Second {status}")))
+            .unwrap();
+        if status != "todo" {
+            app.ops.move_task(&older.id, status, false).unwrap();
+            app.ops.move_task(&middle.id, status, false).unwrap();
+        }
+        expected_by_column.push((older.id, middle.id));
+    }
+
+    let mut config = app.ops.config.load_fresh().unwrap();
+    config.tui.insert(
+        serde_yaml_ng::Value::String("task_sort".to_string()),
+        serde_yaml_ng::Value::String("task_number_desc".to_string()),
+    );
+    app.ops.config.save(&config).unwrap();
+    assert_eq!(
+        super::app::normalize_task_sort("task_number_desc"),
+        "task_number_desc"
+    );
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    assert_eq!(app.board.columns.len(), expected_by_column.len());
+    for (column, (older, newer)) in app.board.columns.iter().zip(&expected_by_column) {
+        assert_eq!(
+            column.tasks[0].id, *newer,
+            "descending sort puts the highest task number first"
+        );
+        assert_eq!(column.tasks[1].id, *older);
+    }
+}
+
+#[test]
+fn board_renders_with_descending_task_number_sort() {
+    let (dir, mut app) = populated_app();
+    let ops = Operations::new(dir.path());
+    let mut config = ops.config.load_fresh().unwrap();
+    config.tui.insert(
+        serde_yaml_ng::Value::String("task_sort".to_string()),
+        serde_yaml_ng::Value::String("task_number_desc".to_string()),
+    );
+    ops.config.save(&config).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    insta::assert_snapshot!("board_task_sort_desc", render_snapshot(&mut app));
 }
 
 #[test]
@@ -1259,6 +1378,269 @@ fn settings_modal_remains_navigable_at_constrained_height() {
 }
 
 #[test]
+fn settings_dialog_loads_orchestration_defaults() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let modal = app.modal.as_ref().expect("settings modal");
+    assert!(modal.queue_enabled);
+    assert_eq!(modal.max_running_total.lines(), ["3"]);
+    assert_eq!(modal.max_running_designer.lines(), ["1"]);
+    assert_eq!(modal.max_running_reviewer.lines(), ["1"]);
+    assert_eq!(modal.max_running_executor.lines(), ["3"]);
+    let per_backend = modal.max_running_per_backend.lines().join("\n");
+    assert!(per_backend.contains("claude: 2"));
+    assert!(per_backend.contains("opencode: 2"));
+    assert!(modal.auto_restart_enabled);
+    assert_eq!(modal.auto_restart_delays.lines(), ["1, 30, 270"]);
+    assert!(!modal.designer_enabled);
+    assert_eq!(
+        modal
+            .backend_text_for(super::dialogs::AgentSlot::Designer)
+            .as_deref(),
+        Some("claude")
+    );
+    assert_eq!(
+        modal
+            .model_text_for(super::dialogs::AgentSlot::Designer)
+            .as_deref(),
+        Some("sonnet")
+    );
+    assert!(!modal.reviewer_enabled);
+    assert_eq!(
+        modal.reviewer_on_changes_text().as_deref(),
+        Some("in_progress")
+    );
+    assert_eq!(modal.reviewer_max_rounds.lines(), ["3"]);
+    assert!(
+        modal
+            .fields()
+            .contains(&DialogField::MaxRunningPerBackendModel),
+        "model cap field must be on the form"
+    );
+}
+
+#[test]
+fn settings_orchestration_snapshots_are_grouped() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    insta::assert_snapshot!("settings_orchestration_top", render_at(&mut app, 80, 24));
+
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::QueueEnabled);
+    let limits = render_at(&mut app, 80, 24);
+    assert!(limits.contains("queue enabled"));
+    assert!(limits.contains("Max running total"));
+    insta::assert_snapshot!("settings_orchestration_limits", limits);
+
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::MaxRunningPerBackendModel);
+    let model_cap = render_at(&mut app, 80, 24);
+    assert!(
+        model_cap.contains("Max tasks per backend/model"),
+        "{model_cap}"
+    );
+    insta::assert_snapshot!("settings_orchestration_model_cap", model_cap);
+
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::AutoRestartEnabled);
+    insta::assert_snapshot!(
+        "settings_orchestration_restarts",
+        render_at(&mut app, 80, 24)
+    );
+
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::DesignerEnabled);
+    let designer = render_at(&mut app, 80, 24);
+    assert!(designer.contains("Designer"));
+    insta::assert_snapshot!("settings_orchestration_designer", designer);
+
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::ReviewerEnabled);
+    let reviewer = render_at(&mut app, 80, 24);
+    assert!(reviewer.contains("Reviewer"));
+    insta::assert_snapshot!("settings_orchestration_reviewer", reviewer);
+}
+
+#[test]
+fn settings_save_persists_orchestration_and_keeps_unknown_keys() {
+    let (dir, mut app) = settings_app();
+    let config_path = dir.path().join(".kanban/config.yaml");
+    let mut raw = std::fs::read_to_string(&config_path).expect("read config");
+    raw.push_str(
+        "\norchestration:\n  queue_enabled: true\n  extra_user_key: keep-me\n  designer:\n    enabled: false\n    note: leave-this\n",
+    );
+    std::fs::write(&config_path, raw).expect("write orchestration extras");
+
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().expect("settings");
+        modal.queue_enabled = false;
+        modal.max_running_total = TextArea::new(vec!["4".to_string()]);
+        modal.max_running_designer = TextArea::new(vec!["2".to_string()]);
+        modal.max_running_per_backend_model =
+            TextArea::new(vec!["claude/opus: 1".to_string(), "opus: 2".to_string()]);
+        modal.auto_restart_enabled = false;
+        modal.auto_restart_delays = TextArea::new(vec!["5, 15".to_string()]);
+        modal.designer_enabled = true;
+        modal.reviewer_enabled = true;
+        modal.reviewer_on_changes = TextArea::new(vec!["todo".to_string()]);
+        modal.reviewer_max_rounds = TextArea::new(vec!["4".to_string()]);
+        modal.field_index = modal.fields().len() - 2;
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("save");
+    assert!(app.modal.is_none(), "save should close the dialog");
+
+    let saved = app.ops.config.load_fresh().expect("reload");
+    let orch = crate::core::config::OrchestrationSettings::from_mapping(&saved.orchestration);
+    assert!(!orch.queue_enabled);
+    assert_eq!(orch.max_running_total, 4);
+    assert_eq!(orch.max_running_per_role.get("designer").copied(), Some(2));
+    assert_eq!(
+        orch.max_running_per_backend_model
+            .get("claude/opus")
+            .copied(),
+        Some(1)
+    );
+    assert_eq!(
+        orch.max_running_per_backend_model
+            .get("opencode/opus")
+            .copied(),
+        Some(2),
+        "bare opus is prefixed with the selected default backend: {:?}",
+        orch.max_running_per_backend_model
+    );
+    assert!(!orch.auto_restart_enabled);
+    assert_eq!(orch.auto_restart_delays_minutes, vec![5, 15]);
+    assert!(orch.designer.enabled);
+    assert!(orch.reviewer.enabled);
+    assert_eq!(
+        orch.reviewer.on_changes_requested,
+        crate::core::config::OnChangesRequested::Todo
+    );
+    assert_eq!(orch.reviewer.max_rounds, 4);
+    assert_eq!(
+        saved
+            .orchestration
+            .get("extra_user_key")
+            .and_then(|value| value.as_str()),
+        Some("keep-me")
+    );
+    assert_eq!(
+        saved
+            .orchestration
+            .get("designer")
+            .and_then(|value| value.get("note"))
+            .and_then(|value| value.as_str()),
+        Some("leave-this")
+    );
+}
+
+#[test]
+fn settings_model_cap_rejects_unknown_backend_and_empty_model() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().expect("settings");
+        modal.max_running_per_backend_model = TextArea::new(vec!["mystery/model: 1".to_string()]);
+        modal.field_index = modal.fields().len() - 2;
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("save rejected");
+    let modal = app.modal.as_ref().expect("stays open");
+    assert_eq!(modal.active_field(), DialogField::MaxRunningPerBackendModel);
+    assert!(
+        modal
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Unknown backend")),
+        "{:?}",
+        modal.error
+    );
+
+    {
+        let modal = app.modal.as_mut().expect("settings");
+        modal.max_running_per_backend_model = TextArea::new(vec!["claude/".to_string()]);
+        modal.field_index = modal.fields().len() - 2;
+    }
+    app.handle_key(key(KeyCode::Enter))
+        .expect("save rejected empty model");
+    let modal = app.modal.as_ref().expect("stays open");
+    assert!(
+        modal
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("model id")),
+        "{:?}",
+        modal.error
+    );
+}
+
+#[test]
+fn settings_model_cap_prefills_backend_prefix_on_first_edit() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::MaxRunningPerBackendModel);
+    app.modal.as_mut().unwrap().max_running_per_backend_model = TextArea::default();
+    app.handle_key(key(KeyCode::Char('o'))).expect("type model");
+    let text = app
+        .modal
+        .as_ref()
+        .unwrap()
+        .max_running_per_backend_model
+        .lines()
+        .join("");
+    assert_eq!(text, "opencode/o");
+}
+
+#[test]
+fn settings_designer_backend_change_does_not_clobber_default_model() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let primary_model = app
+        .modal
+        .as_ref()
+        .unwrap()
+        .model_text()
+        .expect("primary model");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::DesignerBackend);
+    app.handle_key(key(KeyCode::Down))
+        .expect("change designer backend");
+    assert_eq!(
+        app.modal.as_ref().unwrap().model_text().as_deref(),
+        Some(primary_model.as_str()),
+        "changing the designer backend must not rewrite the project default model"
+    );
+    assert!(
+        app.modal
+            .as_ref()
+            .unwrap()
+            .backend_text_for(super::dialogs::AgentSlot::Designer)
+            .is_some()
+    );
+}
+
+#[test]
 fn wide_board_status_bar_opens_settings_by_mouse() {
     let (_dir, mut app) = settings_app();
     let _ = render_at(&mut app, 240, 28);
@@ -1480,6 +1862,146 @@ fn mouse_move_highlights_board_cards() {
     assert!(app.is_hovered(HitAction::FocusCard { column, card }));
     let style = style_at(&mut app, 96, 28, area.x, area.y);
     assert_eq!(style.fg, Some(app.theme.focus));
+}
+#[test]
+fn hover_selects_the_card_so_enter_opens_it() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    assert_eq!((app.focused_column, app.focused_card), (0, 0));
+    let (column, card, area) = card_hits(&app)[1];
+    let hovered_id = app.visible_tasks_for_column(column)[card].id.clone();
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: area.x + 1,
+        row: area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover card");
+
+    assert_eq!((app.focused_column, app.focused_card), (column, card));
+    app.handle_key(key(KeyCode::Enter))
+        .expect("open hovered card");
+    assert_eq!(app.screen, Screen::Detail);
+    assert_eq!(
+        app.detail.as_ref().expect("detail open").task_id,
+        hovered_id
+    );
+}
+
+#[test]
+fn keyboard_navigation_retires_the_selection_under_the_pointer() {
+    let (_dir, mut app) = plain_tasks_app(3);
+    let _ = render_snapshot(&mut app);
+    let (_, hovered, hover_area) = card_hits(&app)[1];
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: hover_area.x + 1,
+        row: hover_area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover middle card");
+    assert_eq!(app.focused_card, hovered);
+
+    // The pointer never moves, yet the selection does: the card under the
+    // resting pointer must stop reading as selected.
+    app.handle_key(key(KeyCode::Down)).expect("move selection");
+    assert_eq!(app.focused_card, hovered + 1);
+    let retired = style_at(&mut app, 96, 28, hover_area.x, hover_area.y);
+    assert_ne!(retired.fg, Some(app.theme.focus));
+}
+
+#[test]
+fn hovering_a_card_takes_the_selection_from_the_keyboard() {
+    let (_dir, mut app) = plain_tasks_app(3);
+    let _ = render_snapshot(&mut app);
+    app.handle_key(key(KeyCode::Down)).expect("keyboard select");
+    let (_, _, second_area) = card_hits(&app)[1];
+    let (_, _, third_area) = card_hits(&app)[2];
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: third_area.x + 1,
+        row: third_area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover third card");
+
+    assert_eq!(app.focused_card, 2);
+    let dropped = style_at(&mut app, 96, 28, second_area.x, second_area.y);
+    assert_ne!(dropped.fg, Some(app.theme.focus));
+    let selected = style_at(&mut app, 96, 28, third_area.x, third_area.y);
+    assert_eq!(selected.fg, Some(app.theme.focus));
+}
+
+#[test]
+fn a_card_drag_sweeps_the_pointer_without_stealing_the_selection() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let (column, _, source) = card_hits(&app)[0];
+    let (_, _, target) = card_hits(&app)[1];
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: source.x + 2,
+        row: source.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("lift card");
+    assert_eq!((app.focused_column, app.focused_card), (column, 0));
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Drag(MouseButton::Left),
+        column: target.x + 2,
+        row: target.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("drag over another column");
+    assert_eq!((app.focused_column, app.focused_card), (column, 0));
+}
+
+#[test]
+fn hovering_behind_an_open_modal_keeps_the_selection() {
+    let (_dir, mut app) = plain_tasks_app(3);
+    let _ = render_snapshot(&mut app);
+    let (_, _, area) = card_hits(&app)[2];
+    app.handle_key(key(KeyCode::Char('n')))
+        .expect("open dialog");
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: area.x + 1,
+        row: area.y + 1,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover behind modal");
+    assert_eq!((app.focused_column, app.focused_card), (0, 0));
+}
+
+#[test]
+fn hovering_the_question_preview_selects_its_card() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let preview = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| matches!(hitbox.action, HitAction::OpenAnswer { .. }))
+        .copied()
+        .expect("question preview hitbox");
+    let HitAction::OpenAnswer { column, card } = preview.action else {
+        unreachable!("checked above");
+    };
+    app.handle_key(key(KeyCode::Right))
+        .expect("focus in-progress");
+    app.handle_key(key(KeyCode::Right)).expect("focus review");
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: preview.area.x + 1,
+        row: preview.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover preview line");
+    assert_eq!((app.focused_column, app.focused_card), (column, card));
 }
 
 #[test]
@@ -4401,6 +4923,117 @@ fn paste_without_a_text_field_is_ignored() {
     assert!(app.status.contains("Nothing pasted"));
 }
 
+/// The answer panel must not submit on Shift/Alt+Enter — those break a line
+/// in the custom answer box. Plain Enter submits.
+#[test]
+fn answer_panel_shift_enter_breaks_a_line_instead_of_submitting() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Question holder"))
+        .expect("task");
+    app.ops
+        .ask_question(&task.id, "Which one?", "agent", vec![])
+        .expect("ask");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Tab)).expect("focus answer");
+    assert_eq!(
+        app.detail.as_ref().expect("detail state").focus,
+        DetailFocus::Answer
+    );
+
+    app.handle_key(key(KeyCode::Char('o'))).expect("type");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+        .expect("shift newline");
+    app.handle_key(key(KeyCode::Char('k'))).expect("type");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+        .expect("alt newline");
+    app.handle_key(key(KeyCode::Char('9'))).expect("type");
+    let detail = app.detail.as_ref().expect("detail state");
+    assert_eq!(detail.answer_input.lines(), ["o", "k", "9"]);
+    assert!(
+        app.ops.get_task(&task.id).unwrap().unwrap().has_questions,
+        "Shift/Alt+Enter must not submit the answer"
+    );
+
+    // Plain Enter submits the custom answer and clears the question.
+    app.handle_key(key(KeyCode::Enter)).expect("submit");
+    assert!(
+        !app.ops.get_task(&task.id).unwrap().unwrap().has_questions,
+        "plain Enter must submit"
+    );
+}
+
+/// The review editor takes the same newline keys as the dialogs: Shift+Enter
+/// and Alt+Enter both break a line (plain Enter already does).
+#[test]
+fn review_editor_shift_and_alt_enter_break_lines() {
+    let (_dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Edit review")).unwrap();
+    app.ops.set_review_edits(&task.id, "abcdef").unwrap();
+    app.ops.move_task(&task.id, "review", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    app.handle_key(key(KeyCode::Tab)).expect("focus editor");
+    assert_eq!(
+        app.detail.as_ref().expect("detail").focus,
+        DetailFocus::Edits
+    );
+    app.handle_key(key(KeyCode::End)).expect("cursor to end");
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
+        .expect("shift newline");
+    app.handle_key(key(KeyCode::Char('s'))).expect("type");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+        .expect("alt newline");
+    app.handle_key(key(KeyCode::Char('a'))).expect("type");
+    assert_eq!(
+        app.detail
+            .as_ref()
+            .expect("detail")
+            .review_edits
+            .lines()
+            .join("\n"),
+        "abcdef\ns\na"
+    );
+}
+
+/// The description title names Enter as the newline key so a terminal that
+/// cannot report Shift+Enter still documents a working chord.
+#[test]
+fn description_title_names_enter_as_newline() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let full = render_at(&mut app, 120, 30);
+    assert!(full.contains("Enter newline"), "{full}");
+}
+
+/// Only a tmux server that reports extended keys in CSI-u form may be asked
+/// for modifyOtherKeys: the xterm format it would otherwise use is not
+/// parseable here and would swallow every modified key.
+#[test]
+fn tmux_option_scan_requires_csi_u_extended_keys() {
+    assert!(super::tmux_reports_csi_u(
+        "escape-time 10\nextended-keys on\nextended-keys-format csi-u\n"
+    ));
+    assert!(super::tmux_reports_csi_u(
+        "extended-keys always\nextended-keys-format csi-u"
+    ));
+    assert!(!super::tmux_reports_csi_u(
+        "extended-keys off\nextended-keys-format csi-u\n"
+    ));
+    assert!(!super::tmux_reports_csi_u(
+        "extended-keys on\nextended-keys-format xterm\n"
+    ));
+    assert!(
+        !super::tmux_reports_csi_u("escape-time 10\n"),
+        "options missing entirely"
+    );
+}
+
 /// The detail answer box takes pasted text on the current line.
 #[test]
 fn paste_fills_the_detail_answer_box() {
@@ -5492,6 +6125,7 @@ fn limits_fixture() -> std::sync::Arc<crate::core::limits::LimitsSnapshot> {
         label: label.to_string(),
         remaining_percent: remaining,
         resets_at: Some(now + resets_in),
+        rolling: false,
     };
     std::sync::Arc::new(LimitsSnapshot {
         fetched_at: now,
@@ -5590,6 +6224,7 @@ fn limits_row_drops_windows_that_have_already_reset() {
         label: label.to_string(),
         remaining_percent: remaining,
         resets_at: Some(resets_at),
+        rolling: false,
     };
     app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
         fetched_at: now,
@@ -5660,9 +6295,28 @@ fn limits_row_renders_on_the_projects_screen() {
 }
 
 #[test]
-fn limits_row_registers_refresh_hitboxes_on_claude_codex_and_grok() {
+fn limits_row_registers_refresh_hitboxes_on_every_provider() {
+    use crate::core::limits::{LimitWindow, LimitsSnapshot, ProviderLimits, ProviderState};
+
     let (_dir, mut app) = populated_app();
-    app.limits = Some(limits_fixture());
+    let now = chrono::Utc::now().timestamp();
+    let window = |label: &str, remaining: f64| LimitWindow {
+        label: label.to_string(),
+        remaining_percent: remaining,
+        resets_at: Some(now + 86_400),
+        rolling: false,
+    };
+    app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
+        fetched_at: now,
+        providers: crate::core::limits::PROVIDERS
+            .map(|provider| ProviderLimits {
+                provider: provider.to_string(),
+                state: ProviderState::Ready,
+                windows: vec![window("5h", 66.0)],
+                observed_at: None,
+            })
+            .into(),
+    }));
 
     let lines = rendered_lines(&mut app, 120, 28);
     let row_index = lines.len() - 2;
@@ -5675,23 +6329,16 @@ fn limits_row_registers_refresh_hitboxes_on_claude_codex_and_grok() {
                 && hitbox.action == HitAction::Action(UiAction::RefreshLimits(provider))
         })
     };
-    let claude_hit = refresh_hit("claude").expect("claude hitbox");
-    let codex_hit = refresh_hit("codex").expect("codex hitbox");
-    let grok_hit = refresh_hit("grok").expect("grok hitbox");
-    assert!(
-        refresh_hit("zai").is_none() && refresh_hit("synthetic").is_none(),
-        "zai and synthetic stay display-only"
-    );
-
     // Each hitbox covers its provider's own text on the rendered row.
     let covers = |hitbox: &super::app::Hitbox, text: &str| {
         let byte = row_text.find(text).expect("provider text");
         let column = unicode_width::UnicodeWidthStr::width(&row_text[..byte]) as u16;
         hitbox.area.x <= column && column < hitbox.area.x + hitbox.area.width
     };
-    assert!(covers(claude_hit, "claude"), "{claude_hit:?} vs {row_text}");
-    assert!(covers(codex_hit, "codex"), "{codex_hit:?} vs {row_text}");
-    assert!(covers(grok_hit, "grok"), "{grok_hit:?} vs {row_text}");
+    for provider in crate::core::limits::PROVIDERS {
+        let hit = refresh_hit(provider).unwrap_or_else(|| panic!("{provider} hitbox"));
+        assert!(covers(hit, provider), "{hit:?} vs {row_text}");
+    }
 }
 
 fn click_limits_segment(app: &mut App, provider: &'static str) {
@@ -6069,7 +6716,7 @@ fn filtered_selector_click_resolves_to_the_unfiltered_option_index() {
 }
 
 #[test]
-fn plain_enter_walks_the_task_form_and_shift_enter_writes_a_newline() {
+fn title_enter_walks_on_and_description_enter_writes_a_newline() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     type_text(&mut app, "Title text");
@@ -6087,12 +6734,21 @@ fn plain_enter_walks_the_task_form_and_shift_enter_writes_a_newline() {
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))
         .expect("shift enter");
     type_text(&mut app, "second");
+    app.handle_key(key(KeyCode::Enter)).expect("plain enter");
+    type_text(&mut app, "third");
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT))
+        .expect("alt enter");
+    type_text(&mut app, "fourth");
     assert_eq!(
         app.modal.as_ref().expect("modal").description_text(),
-        "first\nsecond"
+        "first\nsecond\nthird\nfourth"
+    );
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::Description
     );
 
-    app.handle_key(key(KeyCode::Enter)).expect("enter on body");
+    app.handle_key(key(KeyCode::Tab)).expect("tab on body");
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
         DialogField::Backend
@@ -6196,4 +6852,158 @@ fn chain_filter_renders_matches_and_the_empty_filter_error() {
     type_text(&mut app, "9");
     app.handle_key(key(KeyCode::Enter)).expect("enter");
     insta::assert_snapshot!("chain_filter_no_matches", render_at(&mut app, 80, 24));
+}
+
+// ------------------------------------------------------- queued run phase
+
+#[test]
+fn queued_design_and_review_phases_render_phase_badges() {
+    let (_dir, mut app) = app_with_board();
+    let mut queued = app.ops.create_task(NewTask::titled("Queued task")).unwrap();
+    queued.run_phase = Some(RunPhase::Queued);
+    app.ops.storage.save_task(&queued).unwrap();
+    let mut design = app.ops.create_task(NewTask::titled("Design task")).unwrap();
+    design.run_phase = Some(RunPhase::Design);
+    app.ops.storage.save_task(&design).unwrap();
+    let mut review = app
+        .ops
+        .create_task(NewTask::titled("Bot review task"))
+        .unwrap();
+    review.run_phase = Some(RunPhase::Review);
+    app.ops.storage.save_task(&review).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let output = render_at(&mut app, 120, 30);
+    assert!(output.contains("⏸ queued"), "queued badge missing");
+    assert!(output.contains("✎ design"), "design badge missing");
+    assert!(output.contains("⚖ review"), "review badge missing");
+    insta::assert_snapshot!("phase_queued_badges", output);
+}
+
+#[test]
+fn live_queued_session_overrides_the_running_label_only() {
+    let (dir, mut app) = app_with_board();
+    let mut running = app
+        .ops
+        .create_task(NewTask::titled("Queued but live"))
+        .unwrap();
+    SessionManager::new(dir.path())
+        .link_session(&running.id, "ses-q-live")
+        .unwrap();
+    running.session = Some("ses-q-live".to_string());
+    running.run_phase = Some(RunPhase::Queued);
+    app.ops.storage.save_task(&running).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let output = render_at(&mut app, 120, 24);
+    assert!(output.contains("⏸ queued"));
+    assert!(
+        !output.contains("▶ running"),
+        "phase must override the run label"
+    );
+    // A queued task with a stale session id is not painted crashed.
+    assert!(!output.contains("✖ crashed"));
+}
+
+#[test]
+fn live_design_session_shows_the_design_badge() {
+    let (dir, mut app) = app_with_board();
+    let mut design = app
+        .ops
+        .create_task(NewTask::titled("Designing now"))
+        .unwrap();
+    SessionManager::new(dir.path())
+        .link_session(&design.id, "ses-design-live")
+        .unwrap();
+    design.session = Some("ses-design-live".to_string());
+    design.status = TaskStatus::InProgress;
+    design.run_phase = Some(RunPhase::Design);
+    app.ops.storage.save_task(&design).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let output = render_at(&mut app, 120, 24);
+    assert!(
+        output.contains("✎ design"),
+        "design badge missing:\n{output}"
+    );
+    assert!(
+        !output.contains("▶ running"),
+        "design phase must override the run label:\n{output}"
+    );
+}
+
+#[test]
+fn detail_meta_shows_the_run_phase() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Detail phase"))
+        .unwrap();
+    app.ops.enqueue_task(&task.id).unwrap().unwrap();
+    let queued = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    // The enqueued card sits in the In Progress column now.
+    assert_eq!(app.board.columns[1].tasks.len(), 1);
+    app.focused_column = 1;
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    assert_eq!(app.screen, Screen::Detail);
+
+    let output = render_at(&mut app, 100, 40);
+    assert!(
+        output.contains("Status: in_progress · queued"),
+        "status line with phase missing"
+    );
+    insta::assert_snapshot!("phase_queued_detail_meta", output);
+}
+
+#[test]
+fn q_toggles_enqueue_and_dequeue() {
+    let (_dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Toggle me")).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    // Enqueue: To Do moves to In Progress queued, nothing launches.
+    app.handle_key(key(KeyCode::Char('Q'))).unwrap();
+    let current = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(current.status, TaskStatus::InProgress);
+    assert_eq!(current.run_phase, Some(RunPhase::Queued));
+    assert_eq!(
+        app.status,
+        "Queued TASK-001 — the dispatcher starts it when a slot frees"
+    );
+
+    // Dequeue: back to a plain idle In Progress task for manual `r`. The
+    // card jumped to the In Progress column, so follow it before pressing Q.
+    assert_eq!(app.board.columns[1].tasks.len(), 1);
+    app.focused_column = 1;
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Char('Q'))).unwrap();
+    let current = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(current.run_phase, None);
+    assert_eq!(current.status, TaskStatus::InProgress);
+}
+
+#[test]
+fn q_does_nothing_where_the_queue_has_no_meaning() {
+    let (_dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Finished")).unwrap();
+    app.ops.move_task(&task.id, "done", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    // Follow the card into the Done column.
+    app.focused_column = 3;
+    app.focused_card = 0;
+    let before = app.status.clone();
+
+    assert_eq!(
+        app.queue_action_for(&app.current_task().unwrap()),
+        None,
+        "the hint bar offers nothing here, so the key must do nothing"
+    );
+    app.handle_key(key(KeyCode::Char('Q'))).unwrap();
+
+    let current = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(current.status, TaskStatus::Done);
+    assert_eq!(current.run_phase, None);
+    assert_eq!(app.status, before, "no error banner from an unbound key");
 }

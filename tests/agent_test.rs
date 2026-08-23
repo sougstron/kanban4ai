@@ -9,7 +9,7 @@ use kanban4ai::agent::{
     parse_pi_models_store, pi_builtin_data_dir, recent_models, record_recent_model, sort_efforts,
     sort_opencode_models,
 };
-use kanban4ai::core::models::{MessageKind, MessageRole, Task};
+use kanban4ai::core::models::{MessageKind, MessageRole, Role, RunPhase, Task};
 use kanban4ai::core::project::Roots;
 use kanban4ai::core::storage::{NewTask, Storage};
 use kanban4ai::core::thread::ThreadManager;
@@ -194,7 +194,7 @@ fn prompt_nudges_suggestions_and_ask_form_for_plain_tasks() {
         })
         .unwrap();
 
-    let prompt = build_agent_prompt(dir.path(), &task, "ses-plain", false).unwrap();
+    let prompt = build_agent_prompt(dir.path(), &task, "ses-plain", false, Role::Executor).unwrap();
 
     assert!(prompt.contains("\"$KANBAN_CMD\" suggest TASK-001 <idea>"));
     // Board paths are absolute: the agent's cwd is the code folder.
@@ -210,6 +210,103 @@ fn prompt_nudges_suggestions_and_ask_form_for_plain_tasks() {
     assert!(prompt.contains(&format!("Write {} then submit it", form_file.display())));
     assert!(prompt.contains("questions:"));
     assert!(prompt.contains("- prompt: <question text>"));
+    assert!(prompt.contains("Role: executor"), "{prompt}");
+    assert!(prompt.contains("Never move a task to Done"));
+    assert!(prompt.contains("lands the task in Review or starts bot review"));
+}
+
+#[test]
+fn designer_prompt_plans_and_forbids_implementation() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let mut task = storage
+        .create_task(NewTask {
+            title: "Add login".into(),
+            description: "Users should sign in with OAuth".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    task.run_phase = Some(RunPhase::Design);
+    storage.save_task(&task).unwrap();
+
+    let prompt =
+        build_agent_prompt(dir.path(), &task, "ses-design", false, Role::Designer).unwrap();
+
+    assert!(prompt.contains("DESIGNER"), "{prompt}");
+    assert!(prompt.contains("Role: designer"), "{prompt}");
+    assert!(prompt.contains("plan, not to implement"), "{prompt}");
+    assert!(prompt.contains("Do not implement the task"));
+    assert!(prompt.contains("Do not move the task between columns"));
+    assert!(prompt.contains("Do not move this task out of In Progress"));
+    assert!(prompt.contains("Finish the design phase only"));
+    assert!(prompt.contains("\"$KANBAN_CMD\" context TASK-001 <text> --source agent"));
+    assert!(prompt.contains("\"$KANBAN_CMD\" done TASK-001 --session ses-design --agent"));
+    assert!(prompt.contains("Users should sign in with OAuth"));
+    assert!(
+        !prompt.contains("Before editing an existing file"),
+        "designer must not be told to edit files:\n{prompt}"
+    );
+}
+
+#[test]
+fn reviewer_prompt_requires_verdict_and_forbids_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let mut task = storage
+        .create_task(NewTask {
+            title: "Add login".into(),
+            description: "Users should sign in with OAuth".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    task.run_phase = Some(RunPhase::Review);
+    storage.save_task(&task).unwrap();
+
+    let prompt =
+        build_agent_prompt(dir.path(), &task, "ses-review", false, Role::Reviewer).unwrap();
+
+    assert!(prompt.contains("REVIEWER"), "{prompt}");
+    assert!(prompt.contains("Role: reviewer"), "{prompt}");
+    assert!(prompt.contains("AGENTS.md"));
+    assert!(prompt.contains("CLAUDE.md"));
+    assert!(prompt.contains("thread"));
+    assert!(
+        prompt.contains("\"$KANBAN_CMD\" verdict TASK-001 --approve --session ses-review --agent")
+    );
+    assert!(prompt.contains("\"$KANBAN_CMD\" verdict TASK-001 --changes"));
+    assert!(prompt.contains("Never call done"));
+    assert!(prompt.contains("Do not implement fixes"));
+    assert!(prompt.contains("Your only exit is kanban verdict"));
+    assert!(prompt.contains("Users should sign in with OAuth"));
+    assert!(
+        !prompt.contains("When implementation and verification are complete"),
+        "reviewer must not be given the executor done contract:\n{prompt}"
+    );
+}
+
+#[test]
+fn prompt_follows_role_not_run_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let task = storage
+        .create_task(NewTask {
+            title: "No phase".into(),
+            description: "Body".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(task.run_phase, None);
+
+    let designer = build_agent_prompt(dir.path(), &task, "ses-r", false, Role::Designer).unwrap();
+    assert!(designer.contains("Role: designer"), "{designer}");
+    assert!(!designer.contains("Role: executor"));
+
+    let reviewer = build_agent_prompt(dir.path(), &task, "ses-r", false, Role::Reviewer).unwrap();
+    assert!(reviewer.contains("Role: reviewer"), "{reviewer}");
+    assert!(reviewer.contains("Your only exit is kanban verdict"));
 }
 
 #[test]
@@ -955,8 +1052,14 @@ fn recent_models_history_moves_latest_first_and_dedupes() {
 #[test]
 fn revert_prompt_is_restrictive() {
     let task = Task::new("TASK-777", "Undo bad edit");
-    let prompt =
-        build_agent_prompt(std::path::Path::new("/repo"), &task, "ses-revert", true).unwrap();
+    let prompt = build_agent_prompt(
+        std::path::Path::new("/repo"),
+        &task,
+        "ses-revert",
+        true,
+        Role::Executor,
+    )
+    .unwrap();
 
     assert!(prompt.contains("revert agent"));
     assert!(prompt.contains("Restore every file from /repo/.kanban/backups/TASK-777/"));

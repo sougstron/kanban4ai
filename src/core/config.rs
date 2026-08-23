@@ -5,14 +5,15 @@
 //! values on read. All thresholds/rules used by business logic must come from
 //! here — never hardcode them.
 
+use serde::{Deserialize, Serialize};
+use serde_yaml_ng::{Mapping, Value};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
-use serde_yaml_ng::{Mapping, Value};
-
 use crate::core::error::{KanbanError, Result};
+use crate::core::models::Role;
 use crate::core::storage::atomic_write_text;
 
 /// Written verbatim by `kanban init`; also the source of per-key fallbacks.
@@ -157,6 +158,39 @@ agents:
     - max
     agent: null
     extra_args: []
+orchestration:
+  queue_enabled: true
+  max_running_total: 3
+  max_running_per_backend:
+    claude: 2
+    opencode: 2
+    omp: 2
+    pi: 2
+  max_running_per_backend_model: {}
+  max_running_per_role:
+    designer: 1
+    reviewer: 1
+    executor: 3
+  auto_restart:
+    enabled: true
+    delays_minutes:
+    - 1
+    - 30
+    - 270
+  designer:
+    enabled: false
+    backend: claude
+    model: sonnet
+    effort: null
+    agent: null
+  reviewer:
+    enabled: false
+    backend: claude
+    model: sonnet
+    effort: null
+    agent: null
+    on_changes_requested: in_progress
+    max_rounds: 3
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,6 +211,8 @@ pub struct BoardConfig {
     pub agents: Mapping,
     #[serde(default)]
     pub verification: Mapping,
+    #[serde(default)]
+    pub orchestration: Mapping,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
@@ -200,6 +236,74 @@ impl BoardConfig {
             .iter()
             .filter_map(|c| c.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect()
+    }
+}
+
+/// Typed view of one role bot's launch settings (`orchestration.designer` /
+/// `orchestration.reviewer`). `None` fields mean "inherit the backend's
+/// configured default at launch time".
+#[derive(Debug, Clone)]
+pub struct BotSettings {
+    pub enabled: bool,
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub agent: Option<String>,
+}
+
+/// What happens to a task after the reviewer bot requests changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnChangesRequested {
+    InProgress,
+    Todo,
+}
+
+/// Typed snapshot of the whole `orchestration:` section. Business logic reads
+/// this — never the raw `Mapping`, and no threshold is hardcoded elsewhere.
+#[derive(Debug, Clone)]
+pub struct OrchestrationSettings {
+    pub queue_enabled: bool,
+    /// Total concurrently running agents. `0` means unlimited.
+    pub max_running_total: i64,
+    /// Per-backend caps keyed by backend name. `0` means unlimited.
+    pub max_running_per_backend: HashMap<String, i64>,
+    /// Per `<backend>/<model>` pair caps (see [`Self::backend_model_key`]).
+    /// `0` means unlimited.
+    pub max_running_per_backend_model: HashMap<String, i64>,
+    /// Per-role caps keyed by `designer` / `reviewer` / `executor`.
+    /// `0` means unlimited.
+    pub max_running_per_role: HashMap<String, i64>,
+    pub auto_restart_enabled: bool,
+    /// Crash-restart backoff schedule in minutes; entry `n` is the delay
+    /// before attempt `n + 1`. Exhausting it leaves the task crashed.
+    pub auto_restart_delays_minutes: Vec<i64>,
+    pub designer: BotSettings,
+    pub reviewer: ReviewerSettings,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewerSettings {
+    pub enabled: bool,
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub agent: Option<String>,
+    pub on_changes_requested: OnChangesRequested,
+    /// Consecutive bot-review bounces before falling through to human Review.
+    /// `0` means unlimited.
+    pub max_rounds: i64,
+}
+
+impl ReviewerSettings {
+    /// Launch settings for the reviewer bot (backend/model/effort/agent).
+    pub fn bot(&self) -> BotSettings {
+        BotSettings {
+            enabled: self.enabled,
+            backend: self.backend.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            agent: self.agent.clone(),
+        }
     }
 }
 
@@ -233,6 +337,26 @@ fn merge_missing(target: &mut Mapping, defaults: &Mapping) {
     }
 }
 
+/// Like [`merge_missing`], but recurses into nested mappings so a
+/// partially-specified section gets its sibling defaults filled in. Used only
+/// for `orchestration`; every other section keeps the exact shallow semantics
+/// it has always had.
+fn merge_missing_deep(target: &mut Mapping, defaults: &Mapping) {
+    for (key, value) in defaults {
+        match target.get_mut(key) {
+            Some(Value::Mapping(existing)) => {
+                if let Value::Mapping(default_value) = value {
+                    merge_missing_deep(existing, default_value);
+                }
+            }
+            Some(_) => {}
+            None => {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
 /// Add new built-in choices to an existing catalog while preserving its order
 /// and any user-defined entries.
 fn merge_missing_sequence_values(target: &mut Mapping, defaults: &Mapping, key: &str) {
@@ -250,11 +374,337 @@ fn merge_missing_sequence_values(target: &mut Mapping, defaults: &Mapping, key: 
     }
 }
 
+fn sub_mapping_mut<'a>(section: &'a mut Mapping, key: &str) -> Option<&'a mut Mapping> {
+    match section.get_mut(Value::String(key.to_owned())) {
+        Some(Value::Mapping(m)) => Some(m),
+        _ => None,
+    }
+}
+
+/// Coerce a boolean config key in place (string spellings accepted, like the
+/// `rules:` section). Present-but-uncoercible is a config error.
+fn coerce_bool_field(map: &mut Mapping, key: &str, path: &str) -> Result<()> {
+    let yaml_key = Value::String(key.to_owned());
+    let Some(value) = map.get(&yaml_key) else {
+        return Ok(());
+    };
+    if matches!(value, Value::Bool(_) | Value::Null) {
+        return Ok(());
+    }
+    match as_bool(value) {
+        Some(coerced) => {
+            map.insert(yaml_key, Value::Bool(coerced));
+            Ok(())
+        }
+        None => Err(KanbanError::Invalid(format!(
+            "Invalid boolean value for {path}.{key}: {value:?}"
+        ))),
+    }
+}
+
+/// Coerce a scalar non-negative int cap in place. `0` means unlimited;
+/// negative or unparseable values are a config error.
+fn coerce_int_cap(map: &mut Mapping, key: &str) -> Result<()> {
+    let yaml_key = Value::String(key.to_owned());
+    let Some(value) = map.get(&yaml_key) else {
+        return Ok(());
+    };
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    let parsed = as_int(value).ok_or_else(|| {
+        KanbanError::Invalid(format!(
+            "Invalid integer value for orchestration.{key}: {value:?}"
+        ))
+    })?;
+    if parsed < 0 {
+        return Err(KanbanError::Invalid(format!(
+            "orchestration.{key} must not be negative (0 means unlimited): {parsed}"
+        )));
+    }
+    map.insert(yaml_key, Value::Number(parsed.into()));
+    Ok(())
+}
+
+/// Validate one cap mapping (`max_running_per_backend`, `..._per_backend_model`,
+/// `..._per_role`): every value is a coerced non-negative int; for
+/// `max_running_per_backend_model` every key must be `<known-backend>/<model>`
+/// — split on the FIRST slash only, because model ids themselves contain
+/// slashes (`opencode/openai/gpt-5.5`). A bare model id would silently never
+/// match any census key, so it is rejected outright. `..._per_role` keys are a
+/// closed set (`executor` / `designer` / `reviewer`) and are checked for the
+/// same reason: a typo would cap nothing and look like it worked.
+///
+/// `max_running_per_backend` keys are checked too, but only as a *warning*:
+/// backends are user-extensible, so a cap left behind for an agent that was
+/// since dropped from `agents:` would otherwise make the whole board
+/// unloadable — and `load` runs on every command, so there would be no way
+/// back in to fix it. The cap still does nothing; the user is told so.
+fn validate_cap_map(
+    section: &mut Mapping,
+    key: &str,
+    known_backends: &[String],
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let yaml_key = Value::String(key.to_owned());
+    let check_keys = key == "max_running_per_backend_model";
+    let check_roles = key == "max_running_per_role";
+    let warn_backends = key == "max_running_per_backend";
+    match section.get_mut(&yaml_key) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Mapping(caps)) => {
+            let snapshot: Vec<(Value, Value)> =
+                caps.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            for (cap_key, value) in snapshot {
+                let Some(key_str) = cap_key.as_str() else {
+                    return Err(KanbanError::Invalid(format!(
+                        "orchestration '{key}' keys must be strings: {cap_key:?}"
+                    )));
+                };
+                if check_keys {
+                    let Some((backend, model)) =
+                        OrchestrationSettings::parse_backend_model_key(key_str)
+                    else {
+                        return Err(KanbanError::Invalid(format!(
+                            "orchestration '{key}' entry '{key_str}' must be '<backend>/<model>' (a bare model id would silently never match)"
+                        )));
+                    };
+                    if model.is_empty() {
+                        return Err(KanbanError::Invalid(format!(
+                            "orchestration '{key}' entry '{key_str}' has an empty model id"
+                        )));
+                    }
+                    if !known_backends.iter().any(|b| b == backend) {
+                        return Err(KanbanError::Invalid(format!(
+                            "orchestration '{key}' entry '{key_str}' names unknown backend '{backend}' (known: {})",
+                            known_backends.join(", ")
+                        )));
+                    }
+                }
+                if warn_backends && !known_backends.iter().any(|b| b == key_str) {
+                    warnings.push(format!(
+                        "orchestration '{key}' entry '{key_str}' names unknown backend '{key_str}' and caps nothing (known: {})",
+                        known_backends.join(", ")
+                    ));
+                }
+                if check_roles && key_str.parse::<Role>().is_err() {
+                    return Err(KanbanError::Invalid(format!(
+                        "orchestration '{key}' entry '{key_str}' is not a role (known: executor, designer, reviewer)"
+                    )));
+                }
+                let parsed = as_int(&value).ok_or_else(|| {
+                    KanbanError::Invalid(format!(
+                        "Invalid integer value for orchestration '{key}' entry '{key_str}': {value:?}"
+                    ))
+                })?;
+                if parsed < 0 {
+                    return Err(KanbanError::Invalid(format!(
+                        "orchestration '{key}' entry '{key_str}' must not be negative (0 means unlimited): {parsed}"
+                    )));
+                }
+                caps.insert(cap_key, Value::Number(parsed.into()));
+            }
+            Ok(())
+        }
+        Some(other) => Err(KanbanError::Invalid(format!(
+            "orchestration '{key}' must be a mapping, got: {other:?}"
+        ))),
+    }
+}
+
+/// `auto_restart.delays_minutes`: a sequence of positive ints (minutes before
+/// each crash-restart attempt). Zero/negative or unparseable entries are a
+/// config error.
+fn validate_delays_minutes(auto_restart: &mut Mapping) -> Result<()> {
+    let yaml_key = Value::String("delays_minutes".to_owned());
+    match auto_restart.get_mut(&yaml_key) {
+        None | Some(Value::Null) => Ok(()),
+        Some(Value::Sequence(items)) => {
+            let mut parsed_values = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                let parsed = as_int(item).ok_or_else(|| {
+                    KanbanError::Invalid(format!(
+                        "Invalid integer value for orchestration.auto_restart.delays_minutes: {item:?}"
+                    ))
+                })?;
+                if parsed <= 0 {
+                    return Err(KanbanError::Invalid(format!(
+                        "orchestration.auto_restart.delays_minutes entries must be positive minutes, got: {parsed}"
+                    )));
+                }
+                parsed_values.push(parsed);
+            }
+            *items = parsed_values
+                .into_iter()
+                .map(|n| Value::Number(n.into()))
+                .collect();
+            Ok(())
+        }
+        Some(other) => Err(KanbanError::Invalid(format!(
+            "orchestration.auto_restart.delays_minutes must be a sequence of positive integers, got: {other:?}"
+        ))),
+    }
+}
+
+impl OrchestrationSettings {
+    /// Canonical census key for a backend/model pair — one spelling shared by
+    /// config keys (`max_running_per_backend_model`), the running-agent
+    /// census, the settings UI and the docs.
+    pub fn backend_model_key(backend: &str, model: &str) -> String {
+        format!("{backend}/{model}")
+    }
+
+    /// Split a `<backend>/<model>` key on the FIRST slash only: model ids
+    /// themselves contain slashes, so `opencode/openai/gpt-5.5` is backend
+    /// `opencode`, model `openai/gpt-5.5`.
+    pub fn parse_backend_model_key(key: &str) -> Option<(&str, &str)> {
+        key.split_once('/')
+    }
+
+    /// Build the typed snapshot from a loaded (defaults-merged) mapping.
+    /// Every key falls back to the built-in default so callers never see a
+    /// missing value.
+    pub(crate) fn from_mapping(mapping: &Mapping) -> Self {
+        let defaults = BoardConfig::default().orchestration;
+        let bool_at = |key: &str| -> bool {
+            mapping
+                .get(key)
+                .and_then(as_bool)
+                .or_else(|| defaults.get(key).and_then(as_bool))
+                .unwrap_or(false)
+        };
+        let int_at = |key: &str| -> i64 {
+            mapping
+                .get(key)
+                .and_then(as_int)
+                .or_else(|| defaults.get(key).and_then(as_int))
+                .unwrap_or(0)
+        };
+        let str_opt_at = |section: &Mapping, key: &str| -> Option<String> {
+            section
+                .get(Value::String(key.to_owned()))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        };
+        let cap_map_at = |key: &str| -> HashMap<String, i64> {
+            match mapping
+                .get(Value::String(key.to_owned()))
+                .or_else(|| defaults.get(key))
+            {
+                Some(Value::Mapping(m)) => m
+                    .iter()
+                    .filter_map(|(k, v)| {
+                        let name = k.as_str()?.to_owned();
+                        as_int(v).map(|n| (name, n))
+                    })
+                    .collect(),
+                _ => HashMap::new(),
+            }
+        };
+        let bot_at = |section: &Mapping| -> BotSettings {
+            BotSettings {
+                enabled: section.get("enabled").and_then(as_bool).unwrap_or(false),
+                backend: str_opt_at(section, "backend"),
+                model: str_opt_at(section, "model"),
+                effort: str_opt_at(section, "effort"),
+                agent: str_opt_at(section, "agent"),
+            }
+        };
+        let default_section =
+            |key: &str| -> Option<&Mapping> { defaults.get(key).and_then(Value::as_mapping) };
+        let designer = mapping
+            .get("designer")
+            .and_then(Value::as_mapping)
+            .or_else(|| default_section("designer"))
+            .expect("built-in defaults contain orchestration.designer");
+        let reviewer = mapping
+            .get("reviewer")
+            .and_then(Value::as_mapping)
+            .or_else(|| default_section("reviewer"))
+            .expect("built-in defaults contain orchestration.reviewer");
+        let on_changes_requested = reviewer
+            .get("on_changes_requested")
+            .and_then(Value::as_str)
+            .and_then(|s| match s {
+                "todo" => Some(OnChangesRequested::Todo),
+                "in_progress" => Some(OnChangesRequested::InProgress),
+                _ => None,
+            })
+            .unwrap_or(OnChangesRequested::InProgress);
+        let max_rounds = reviewer
+            .get("max_rounds")
+            .and_then(as_int)
+            .or_else(|| {
+                default_section("reviewer")
+                    .and_then(|m| m.get("max_rounds"))
+                    .and_then(as_int)
+            })
+            .unwrap_or(3);
+        let delays = mapping
+            .get("auto_restart")
+            .and_then(|v| v.get("delays_minutes"))
+            .and_then(Value::as_sequence);
+        let auto_restart_enabled = mapping
+            .get("auto_restart")
+            .and_then(|v| v.get("enabled"))
+            .and_then(as_bool)
+            .or_else(|| {
+                defaults
+                    .get("auto_restart")
+                    .and_then(|v| v.get("enabled"))
+                    .and_then(as_bool)
+            })
+            .unwrap_or(true);
+        let auto_restart_delays_minutes = delays
+            .map(|items| items.iter().filter_map(as_int).collect::<Vec<i64>>())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| {
+                defaults
+                    .get("auto_restart")
+                    .and_then(|v| v.get("delays_minutes"))
+                    .and_then(Value::as_sequence)
+                    .map(|items| items.iter().filter_map(as_int).collect())
+                    .unwrap_or_default()
+            });
+
+        OrchestrationSettings {
+            queue_enabled: bool_at("queue_enabled"),
+            max_running_total: int_at("max_running_total"),
+            max_running_per_backend: cap_map_at("max_running_per_backend"),
+            max_running_per_backend_model: cap_map_at("max_running_per_backend_model"),
+            max_running_per_role: cap_map_at("max_running_per_role"),
+            auto_restart_enabled,
+            auto_restart_delays_minutes,
+            designer: bot_at(designer),
+            reviewer: ReviewerSettings {
+                enabled: reviewer.get("enabled").and_then(as_bool).unwrap_or(false),
+                backend: str_opt_at(reviewer, "backend"),
+                model: str_opt_at(reviewer, "model"),
+                effort: str_opt_at(reviewer, "effort"),
+                agent: str_opt_at(reviewer, "agent"),
+                on_changes_requested,
+                max_rounds,
+            },
+        }
+    }
+}
+
+impl Default for OrchestrationSettings {
+    fn default() -> Self {
+        Self::from_mapping(&BoardConfig::default().orchestration)
+    }
+}
+
 pub struct Config {
     pub project_path: PathBuf,
     pub kanban_dir: PathBuf,
     pub config_file: PathBuf,
     cache: RefCell<Option<BoardConfig>>,
+    /// Non-fatal problems found while validating the loaded config — a setting
+    /// that is merely ineffective rather than wrong (see [`Self::warnings`]).
+    /// Filled by the load that populated `cache`, so a cache hit keeps them.
+    warnings: RefCell<Vec<String>>,
 }
 
 impl Config {
@@ -267,7 +717,19 @@ impl Config {
             kanban_dir,
             config_file,
             cache: RefCell::new(None),
+            warnings: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Settings that loaded cleanly but will not do what they look like they
+    /// do — currently a concurrency cap keyed by a backend the board does not
+    /// know. These are reported rather than rejected: a cap left behind for an
+    /// agent the user has since removed from `agents:` must not make an
+    /// existing board unloadable, and `load` runs on every command.
+    ///
+    /// Empty until the config has been loaded at least once.
+    pub fn warnings(&self) -> Vec<String> {
+        self.warnings.borrow().clone()
     }
 
     pub fn exists(&self) -> bool {
@@ -296,7 +758,9 @@ impl Config {
         if config.columns.is_empty() {
             config.columns = BoardConfig::default().columns;
         }
-        Self::validate(&mut config)?;
+        let mut warnings = Vec::new();
+        Self::validate(&mut config, &mut warnings)?;
+        *self.warnings.borrow_mut() = warnings;
         *self.cache.borrow_mut() = Some(config.clone());
         Ok(config)
     }
@@ -316,7 +780,7 @@ impl Config {
         Ok(())
     }
 
-    fn validate(config: &mut BoardConfig) -> Result<()> {
+    fn validate(config: &mut BoardConfig, warnings: &mut Vec<String>) -> Result<()> {
         if config.column_ids().is_empty() {
             return Err(KanbanError::Invalid(
                 "Config must have at least one column".into(),
@@ -431,6 +895,85 @@ impl Config {
             }
         }
 
+        Self::validate_orchestration(config, warnings)?;
+
+        Ok(())
+    }
+
+    /// Coercion and validation for the `orchestration:` section. Runs after
+    /// [`Self::ensure_defaults`], so the full default structure is present.
+    fn validate_orchestration(config: &mut BoardConfig, warnings: &mut Vec<String>) -> Result<()> {
+        // Known backends for `<backend>/<model>` key checks: the built-ins
+        // plus anything the user configured under `agents:`.
+        let known_backends: Vec<String> = ["opencode", "claude", "omp", "pi"]
+            .into_iter()
+            .map(str::to_owned)
+            .chain(
+                config
+                    .agents
+                    .keys()
+                    .filter_map(|k| k.as_str().map(str::to_owned)),
+            )
+            .collect();
+        let orch = &mut config.orchestration;
+
+        coerce_bool_field(orch, "queue_enabled", "orchestration")?;
+        coerce_int_cap(orch, "max_running_total")?;
+
+        validate_cap_map(orch, "max_running_per_backend", &known_backends, warnings)?;
+        validate_cap_map(
+            orch,
+            "max_running_per_backend_model",
+            &known_backends,
+            warnings,
+        )?;
+        validate_cap_map(orch, "max_running_per_role", &known_backends, warnings)?;
+
+        if let Some(auto_restart) = sub_mapping_mut(orch, "auto_restart") {
+            coerce_bool_field(auto_restart, "enabled", "orchestration.auto_restart")?;
+            validate_delays_minutes(auto_restart)?;
+        }
+        for role in ["designer", "reviewer"] {
+            let Some(bot) = sub_mapping_mut(orch, role) else {
+                continue;
+            };
+            coerce_bool_field(bot, "enabled", &format!("orchestration.{role}"))?;
+        }
+        if let Some(reviewer) = sub_mapping_mut(orch, "reviewer") {
+            let yaml_key = Value::String("on_changes_requested".into());
+            if let Some(value) = reviewer
+                .get(&yaml_key)
+                .filter(|v| !matches!(v, Value::Null))
+            {
+                match value.as_str() {
+                    Some("in_progress") | Some("todo") => {}
+                    other => {
+                        return Err(KanbanError::Invalid(format!(
+                            "orchestration.reviewer.on_changes_requested must be 'in_progress' or 'todo', got {other:?}"
+                        )));
+                    }
+                }
+            }
+            let max_key = Value::String("max_rounds".into());
+            if let Some(value) = reviewer
+                .get(&max_key)
+                .filter(|v| !matches!(v, Value::Null))
+                .cloned()
+            {
+                let parsed = as_int(&value).ok_or_else(|| {
+                    KanbanError::Invalid(format!(
+                        "Invalid integer value for orchestration.reviewer.max_rounds: {value:?}"
+                    ))
+                })?;
+                if parsed < 0 {
+                    return Err(KanbanError::Invalid(format!(
+                        "orchestration.reviewer.max_rounds must not be negative (0 means unlimited): {parsed}"
+                    )));
+                }
+                reviewer.insert(max_key, Value::Number(parsed.into()));
+            }
+        }
+
         Ok(())
     }
 
@@ -442,6 +985,7 @@ impl Config {
         merge_missing(&mut config.auto_launch, &defaults.auto_launch);
         merge_missing(&mut config.notifications, &defaults.notifications);
         merge_missing(&mut config.verification, &defaults.verification);
+        merge_missing_deep(&mut config.orchestration, &defaults.orchestration);
         for (backend, settings) in &defaults.agents {
             match config.agents.get_mut(backend) {
                 Some(Value::Mapping(existing)) => {
@@ -493,6 +1037,15 @@ impl Config {
 
     pub fn get_notifications(&self) -> Result<Mapping> {
         Ok(self.load()?.notifications)
+    }
+
+    /// Typed snapshot of the `orchestration:` section. Business logic (queue
+    /// dispatcher, crash restarts, role bots) reads this — never the raw
+    /// `Mapping`.
+    pub fn get_orchestration(&self) -> Result<OrchestrationSettings> {
+        Ok(OrchestrationSettings::from_mapping(
+            &self.load()?.orchestration,
+        ))
     }
 
     /// Verification gate command, if configured and non-empty. Empty or unset

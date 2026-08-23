@@ -6,10 +6,11 @@ use common::ops_with_recorder;
 use kanban4ai::core::context::ContextManager;
 use kanban4ai::core::error::KanbanError;
 use kanban4ai::core::models::{
-    MessageKind, MessageRole, MessageStatus, SessionStatus, Task, TaskStatus,
+    MessageKind, MessageRole, MessageStatus, Role, RunPhase, SessionStatus, Task, TaskStatus,
 };
 use kanban4ai::core::operations::{
-    AgentExitOutcome, AgentLauncher, NoopLauncher, Operations, QuestionRef, TaskPatch, sort_tasks,
+    AgentExitOutcome, AgentLauncher, NoopLauncher, Operations, QuestionRef, TaskPatch, Verdict,
+    sort_tasks,
 };
 use kanban4ai::core::project::{ProjectStore, Roots};
 use kanban4ai::core::session::{SessionManager, SessionState};
@@ -356,6 +357,62 @@ fn agent_cannot_move_to_done_or_from_review() {
     // human can do anything
     let done = ops.move_task(&task.id, "done", false).unwrap().unwrap();
     assert_eq!(done.status, TaskStatus::Done);
+}
+
+#[test]
+fn designer_phase_agent_cannot_move() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Plan me")).unwrap();
+    ops.take_task(&task.id, "ses-design", true).unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.run_phase = Some(RunPhase::Design);
+    ops.storage.save_task(&current).unwrap();
+
+    match ops.move_task(&task.id, "review", true) {
+        Err(KanbanError::Permission(msg)) => {
+            assert!(msg.contains("designer"), "{msg}");
+            assert!(msg.contains("kanban done"), "{msg}");
+        }
+        other => panic!("expected designer move refusal, got {other:?}"),
+    }
+    match ops.move_task(&task.id, "todo", true) {
+        Err(KanbanError::Permission(msg)) => assert!(msg.contains("designer"), "{msg}"),
+        other => panic!("expected designer move refusal, got {other:?}"),
+    }
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_eq!(stored.run_phase, Some(RunPhase::Design));
+
+    let human = ops.move_task(&task.id, "todo", false).unwrap().unwrap();
+    assert_eq!(human.status, TaskStatus::Todo);
+}
+
+#[test]
+fn reviewer_phase_agent_cannot_move() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Check me")).unwrap();
+    ops.take_task(&task.id, "ses-review", true).unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.run_phase = Some(RunPhase::Review);
+    ops.storage.save_task(&current).unwrap();
+
+    match ops.move_task(&task.id, "done", true) {
+        Err(KanbanError::Permission(msg)) => {
+            assert!(msg.contains("reviewer"), "{msg}");
+            assert!(msg.contains("kanban verdict"), "{msg}");
+        }
+        other => panic!("expected reviewer move refusal, got {other:?}"),
+    }
+    match ops.move_task(&task.id, "review", true) {
+        Err(KanbanError::Permission(msg)) => assert!(msg.contains("verdict"), "{msg}"),
+        other => panic!("expected reviewer move refusal, got {other:?}"),
+    }
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_eq!(stored.run_phase, Some(RunPhase::Review));
+
+    let human = ops.move_task(&task.id, "review", false).unwrap().unwrap();
+    assert_eq!(human.status, TaskStatus::Review);
 }
 
 #[test]
@@ -2147,8 +2204,14 @@ fn agent_context_records_its_session_origin() {
     assert_eq!(context.origin.as_deref(), Some("agent:ses-context"));
 
     let task = ops.storage.load_task(&task.id).unwrap().unwrap();
-    let prompt =
-        kanban4ai::agent::build_agent_prompt(dir.path(), &task, "ses-context", false).unwrap();
+    let prompt = kanban4ai::agent::build_agent_prompt(
+        dir.path(),
+        &task,
+        "ses-context",
+        false,
+        Role::Executor,
+    )
+    .unwrap();
     assert!(prompt.contains("origin=agent:ses-context"));
 
     ContextManager::new(dir.path())
@@ -2530,8 +2593,14 @@ fn agent_step_messages_are_excluded_from_agent_prompt() {
             .any(|m| m.kind == MessageKind::AgentStep)
     );
 
-    let prompt =
-        kanban4ai::agent::build_agent_prompt(dir.path(), &taken, "ses-prompt", false).unwrap();
+    let prompt = kanban4ai::agent::build_agent_prompt(
+        dir.path(),
+        &taken,
+        "ses-prompt",
+        false,
+        Role::Executor,
+    )
+    .unwrap();
     assert!(!prompt.contains("▶ launch"));
     assert!(!prompt.contains("agent_step"));
 }
@@ -2569,8 +2638,14 @@ fn rejected_context_is_excluded_from_prompt_and_gathered_context() {
     assert!(!context.contains("poisoned note"));
 
     let task = ops.storage.load_task(&task.id).unwrap().unwrap();
-    let prompt =
-        kanban4ai::agent::build_agent_prompt(dir.path(), &task, "ses-reject", false).unwrap();
+    let prompt = kanban4ai::agent::build_agent_prompt(
+        dir.path(),
+        &task,
+        "ses-reject",
+        false,
+        Role::Executor,
+    )
+    .unwrap();
     assert!(prompt.contains("trustworthy note"));
     assert!(!prompt.contains("poisoned note"));
 
@@ -2580,8 +2655,14 @@ fn rejected_context_is_excluded_from_prompt_and_gathered_context() {
 
     let context = ctx.get_context(&task.id, &ops.storage).unwrap();
     assert!(context.contains("poisoned note"));
-    let prompt =
-        kanban4ai::agent::build_agent_prompt(dir.path(), &task, "ses-reject", false).unwrap();
+    let prompt = kanban4ai::agent::build_agent_prompt(
+        dir.path(),
+        &task,
+        "ses-reject",
+        false,
+        Role::Executor,
+    )
+    .unwrap();
     assert!(prompt.contains("poisoned note"));
 }
 
@@ -2799,4 +2880,575 @@ fn rerun_review_task_clears_review_unseen() {
     let rerun = ops.rerun_review_task(&task.id, None).unwrap().unwrap();
     assert_eq!(rerun.status, TaskStatus::InProgress);
     assert!(!rerun.review_unseen, "rerun clears review_unseen");
+}
+
+// ------------------------------------------------------- queued run phase
+
+fn fill_total_slots(ops: &Operations, dir: &Path, count: usize) {
+    let session_mgr = SessionManager::new(dir);
+    // Spread the fillers across backends so only `max_running_total` is
+    // exhausted — every per-backend cap still has room.
+    const BACKENDS: [&str; 4] = ["claude", "opencode", "omp", "pi"];
+    for n in 0..count {
+        let filler = ops
+            .create_task(NewTask::titled(format!("Filler {n}")))
+            .unwrap();
+        let session_id = format!("ses-fill-{n}");
+        session_mgr.link_session(&filler.id, &session_id).unwrap();
+        let mut current = ops.get_task(&filler.id).unwrap().unwrap();
+        current.status = TaskStatus::InProgress;
+        current.session = Some(session_id);
+        current.agent_backend = Some(BACKENDS[n % BACKENDS.len()].to_string());
+        ops.storage.save_task(&current).unwrap();
+    }
+}
+
+#[test]
+fn agent_take_queues_when_the_total_cap_is_exhausted() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    // Default orchestration caps: max_running_total 3.
+    fill_total_slots(&ops, dir.path(), 3);
+
+    let task = ops.create_task(NewTask::titled("Queue me")).unwrap();
+    let taken = ops
+        .take_task(&task.id, "ses-queued", true)
+        .unwrap()
+        .unwrap();
+
+    // The task lands In Progress queued instead of launching, and no phantom
+    // Active session record is minted for the fresh id.
+    assert_eq!(taken.status, TaskStatus::InProgress);
+    assert_eq!(taken.run_phase, Some(RunPhase::Queued));
+    assert!(recorder.calls().is_empty());
+    assert!(
+        SessionManager::new(dir.path())
+            .load_session("ses-queued")
+            .is_none()
+    );
+    assert_eq!(taken.session.as_deref(), None);
+}
+
+#[test]
+fn agent_take_launches_while_slots_remain() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    fill_total_slots(&ops, dir.path(), 2);
+
+    let task = ops.create_task(NewTask::titled("Launch me")).unwrap();
+    let taken = ops.take_task(&task.id, "ses-live", true).unwrap().unwrap();
+    assert_eq!(taken.run_phase, None, "a launched task carries no phase");
+    assert_eq!(
+        recorder.calls(),
+        vec![(task.id.clone(), "ses-live".to_string(), false)]
+    );
+    assert!(
+        SessionManager::new(dir.path())
+            .load_session("ses-live")
+            .is_some()
+    );
+}
+
+#[test]
+fn manual_run_bypasses_the_queue_and_clears_the_marker() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    fill_total_slots(&ops, dir.path(), 3);
+
+    let task = ops.create_task(NewTask::titled("Manual run")).unwrap();
+    let session_id = ops.start_task(&task.id).unwrap().unwrap();
+    assert_eq!(
+        recorder.calls(),
+        vec![(task.id.clone(), session_id.clone(), false)]
+    );
+    let current = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(current.run_phase, None);
+}
+
+#[test]
+fn explicit_enqueue_and_dequeue_round_trip() {
+    let (dir, ops, recorder) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Round trip")).unwrap();
+
+    let queued = ops.enqueue_task(&task.id).unwrap().unwrap();
+    assert_eq!(queued.status, TaskStatus::InProgress);
+    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
+    assert!(recorder.calls().is_empty(), "queueing never launches");
+    // The queue note is on the thread for the audit trail.
+    let thread = ThreadManager::new(dir.path())
+        .expect("thread manager")
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread
+            .messages
+            .iter()
+            .any(|m| m.body.contains("waiting for a free agent slot"))
+    );
+
+    let dequeued = ops.dequeue_task(&task.id).unwrap().unwrap();
+    assert_eq!(dequeued.run_phase, None);
+    assert_eq!(dequeued.status, TaskStatus::InProgress);
+    assert!(matches!(
+        ops.dequeue_task(&task.id),
+        Err(KanbanError::Invalid(_))
+    ));
+
+    // Review tasks cannot be queued.
+    ops.move_task(&task.id, "review", false).unwrap();
+    assert!(matches!(
+        ops.enqueue_task(&task.id),
+        Err(KanbanError::Invalid(_))
+    ));
+}
+
+// ------------------------------------------------------- bot reviewer / verdict
+
+fn write_reviewer_config(project: &Path, extra: &str) {
+    let mut config = fs::read_to_string(project.join(".kanban/config.yaml")).unwrap();
+    config.push_str("orchestration:\n  reviewer:\n    enabled: true\n");
+    config.push_str(extra);
+    fs::write(project.join(".kanban/config.yaml"), config).unwrap();
+}
+
+fn finish_executor(ops: &Operations, dir: &Path, task_id: &str, session: &str) {
+    ContextManager::new(dir)
+        .append_context(task_id, "implemented and tested", "agent", &ops.storage)
+        .unwrap();
+    ops.complete_task(task_id, session, true).unwrap().unwrap();
+}
+
+fn enter_bot_review(
+    ops: &Operations,
+    dir: &Path,
+    title: &str,
+) -> (kanban4ai::core::models::Task, String) {
+    let task = ops
+        .create_task(NewTask {
+            title: title.into(),
+            agent_backend: Some("opencode".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-exec", true).unwrap();
+    finish_executor(ops, dir, &task.id, "ses-exec");
+    let current = ops.get_task(&task.id).unwrap().unwrap();
+    let session = current.session.clone().expect("reviewer session");
+    (current, session)
+}
+
+#[test]
+fn executor_done_launches_reviewer_when_enabled() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    write_reviewer_config(dir.path(), "    backend: claude\n");
+    ops.config.load_fresh().unwrap();
+
+    let (task, session) = enter_bot_review(&ops, dir.path(), "Needs review");
+    assert_eq!(task.status, TaskStatus::InProgress);
+    assert_eq!(task.run_phase, Some(RunPhase::Review));
+    assert_eq!(task.review_rounds, 1);
+    assert_eq!(task.agent_backend.as_deref(), Some("opencode"));
+    assert!(session.starts_with("ses-claude-"), "{session}");
+    assert_eq!(task.completed_at, None);
+    assert_ne!(task.status, TaskStatus::Review);
+
+    let launches: Vec<_> = recorder
+        .calls()
+        .into_iter()
+        .filter(|(id, _, _)| id == &task.id)
+        .collect();
+    assert_eq!(launches.len(), 2, "executor then reviewer: {launches:?}");
+    assert_eq!(launches[0].1, "ses-exec");
+    assert!(
+        launches[1].1.starts_with("ses-claude-"),
+        "{:?}",
+        launches[1]
+    );
+}
+
+#[test]
+fn verdict_approve_moves_to_review_and_fires_chains() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    write_reviewer_config(dir.path(), "    backend: claude\n");
+    ops.config.load_fresh().unwrap();
+
+    let target = ops
+        .create_task(NewTask {
+            title: "Target".into(),
+            agent_backend: Some("opencode".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    let chained = ops
+        .create_task(NewTask {
+            title: "Chained after review".into(),
+            chained_to: Some(target.id.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    ops.take_task(&target.id, "ses-exec", true).unwrap();
+    finish_executor(&ops, dir.path(), &target.id, "ses-exec");
+    let reviewer = ops.get_task(&target.id).unwrap().unwrap();
+    let session = reviewer.session.clone().unwrap();
+
+    let approved = ops
+        .submit_verdict(&target.id, &session, true, Verdict::Approve)
+        .unwrap()
+        .unwrap();
+    assert_eq!(approved.status, TaskStatus::Review);
+    assert_eq!(approved.run_phase, None);
+    assert!(approved.completed_at.is_some());
+    assert!(approved.review_unseen);
+
+    let chained_now = ops.get_task(&chained.id).unwrap().unwrap();
+    assert_eq!(chained_now.status, TaskStatus::InProgress);
+    assert!(
+        recorder.calls().iter().any(|(id, _, _)| id == &chained.id),
+        "approve must fire the existing chained-task path"
+    );
+}
+
+#[test]
+fn verdict_changes_todo_returns_to_todo() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    write_reviewer_config(
+        dir.path(),
+        "    backend: claude\n    on_changes_requested: todo\n",
+    );
+    ops.config.load_fresh().unwrap();
+
+    let (task, session) = enter_bot_review(&ops, dir.path(), "Send back");
+    let launches_before = recorder.calls().len();
+    let returned = ops
+        .submit_verdict(
+            &task.id,
+            &session,
+            true,
+            Verdict::Changes("please add tests".into()),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(returned.status, TaskStatus::Todo);
+    assert_eq!(returned.run_phase, None);
+    assert!(returned.review_edits.is_empty());
+    assert_eq!(
+        recorder.calls().len(),
+        launches_before,
+        "todo route must not auto-launch"
+    );
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread
+            .messages
+            .iter()
+            .any(|m| { m.kind == MessageKind::ReviewEdit && m.body.contains("please add tests") }),
+        "changes must fold into the thread: {:?}",
+        thread.messages
+    );
+}
+
+#[test]
+fn verdict_changes_in_progress_requeues_the_task_bot() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    write_reviewer_config(
+        dir.path(),
+        "    backend: claude\n    on_changes_requested: in_progress\n",
+    );
+    ops.config.load_fresh().unwrap();
+
+    let (task, session) = enter_bot_review(&ops, dir.path(), "Bounce back");
+    let bounced = ops
+        .submit_verdict(
+            &task.id,
+            &session,
+            true,
+            Verdict::Changes("handle the empty list".into()),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(bounced.status, TaskStatus::InProgress);
+    assert_ne!(
+        bounced.run_phase,
+        Some(RunPhase::Review),
+        "bounce must leave the reviewer phase"
+    );
+    assert_eq!(bounced.agent_backend.as_deref(), Some("opencode"));
+    let bounce_session = bounced.session.clone().unwrap();
+    assert!(
+        bounce_session.starts_with("ses-opencode-"),
+        "re-run must use the task bot, not the reviewer: {bounce_session}"
+    );
+    assert_ne!(bounce_session, session);
+
+    let launches: Vec<_> = recorder
+        .calls()
+        .into_iter()
+        .filter(|(id, _, _)| id == &task.id)
+        .map(|(_, sid, _)| sid)
+        .collect();
+    assert_eq!(
+        launches.len(),
+        3,
+        "executor, reviewer, executor: {launches:?}"
+    );
+    assert!(launches[1].starts_with("ses-claude-"), "{:?}", launches[1]);
+    assert!(
+        launches[2].starts_with("ses-opencode-"),
+        "third launch is the task bot: {:?}",
+        launches[2]
+    );
+}
+
+#[test]
+fn verdict_changes_exhausts_max_rounds_to_human_review() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    write_reviewer_config(
+        dir.path(),
+        "    backend: claude\n    max_rounds: 1\n    on_changes_requested: in_progress\n",
+    );
+    ops.config.load_fresh().unwrap();
+
+    let (task, session) = enter_bot_review(&ops, dir.path(), "Last round");
+    let launches_before = recorder.calls().len();
+    let handed = ops
+        .submit_verdict(
+            &task.id,
+            &session,
+            true,
+            Verdict::Changes("still not right".into()),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(handed.status, TaskStatus::Review);
+    assert_eq!(handed.run_phase, None);
+    assert!(handed.completed_at.is_some());
+    assert_eq!(
+        recorder.calls().len(),
+        launches_before,
+        "exhausted budget must not relaunch"
+    );
+}
+
+#[test]
+fn reviewer_done_is_rejected() {
+    let (dir, ops, _rec) = ops_with_recorder(true);
+    write_reviewer_config(dir.path(), "    backend: claude\n");
+    ops.config.load_fresh().unwrap();
+
+    let (task, session) = enter_bot_review(&ops, dir.path(), "No done");
+    let err = ops.complete_task(&task.id, &session, true).unwrap_err();
+    assert!(
+        err.to_string().contains("verdict"),
+        "reviewer done must point at verdict: {err}"
+    );
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_eq!(stored.run_phase, Some(RunPhase::Review));
+}
+
+// -------------------------------------------- run-phase lifecycle regressions
+
+fn park_in_phase(ops: &Operations, title: &str, phase: RunPhase) -> Task {
+    let task = ops.create_task(NewTask::titled(title)).unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.status = TaskStatus::InProgress;
+    current.run_phase = Some(phase);
+    ops.storage.save_task(&current).unwrap();
+    current
+}
+
+#[test]
+fn recover_clears_the_run_phase() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = park_in_phase(&ops, "Recover me", RunPhase::Review);
+    let recovered = ops.recover_task(&task.id).unwrap().unwrap();
+    assert_eq!(recovered.status, TaskStatus::Todo);
+    assert_eq!(recovered.run_phase, None, "recover must clear the phase");
+}
+
+#[test]
+fn human_move_clears_the_run_phase() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = park_in_phase(&ops, "Move me", RunPhase::Design);
+    let moved = ops.move_task(&task.id, "todo", false).unwrap().unwrap();
+    assert_eq!(moved.run_phase, None, "a human move must clear the phase");
+}
+
+#[test]
+fn agent_move_is_not_blocked_by_a_stale_run_phase() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = park_in_phase(&ops, "Stale", RunPhase::Review);
+    ops.move_task(&task.id, "todo", false).unwrap();
+    // An unrelated agent moving this task back should not be told it is the
+    // reviewer of a task that is not even in a review phase any more.
+    let moved = ops.move_task(&task.id, "in_progress", true).unwrap();
+    assert!(
+        moved.is_some(),
+        "agent move must not be blocked by a stale phase"
+    );
+}
+
+#[test]
+fn delegated_take_clears_a_stale_run_phase() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = park_in_phase(&ops, "Take me", RunPhase::Review);
+    let taken = ops
+        .take_task(&task.id, "ses-take-1", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        taken.run_phase, None,
+        "a delegated take must not inherit a stale review phase"
+    );
+}
+
+#[test]
+fn crash_restart_is_not_scheduled_when_the_queue_cannot_start_it() {
+    let (dir, ops, _rec) = ops_with_recorder(true);
+    // Crash restart is implemented through the queue; with the queue off
+    // nothing would ever pick the task back up.
+    let mut config = fs::read_to_string(dir.path().join(".kanban/config.yaml")).unwrap();
+    config.push_str("orchestration:\n  queue_enabled: false\n");
+    fs::write(dir.path().join(".kanban/config.yaml"), config).unwrap();
+    ops.config.load_fresh().unwrap();
+
+    let task = park_in_phase(&ops, "Crashed", RunPhase::Execute);
+    let session = "ses-crash-1";
+    SessionManager::new(dir.path())
+        .link_session(&task.id, session)
+        .unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.session = Some(session.to_string());
+    ops.storage.save_task(&current).unwrap();
+
+    ops.reconcile_agent_exit(&task.id, session, 1).unwrap();
+
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(
+        stored.restart_at, None,
+        "no retry deadline may be promised while the dispatcher is off"
+    );
+    assert_ne!(
+        stored.run_phase,
+        Some(RunPhase::Queued),
+        "the task must stay crashed and recoverable, not park in a dead queue"
+    );
+}
+
+#[test]
+fn recover_clears_the_designed_flag() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = park_in_phase(&ops, "Replan me", RunPhase::Execute);
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.designed = true;
+    ops.storage.save_task(&current).unwrap();
+
+    let recovered = ops.recover_task(&task.id).unwrap().unwrap();
+    assert!(
+        !recovered.designed,
+        "a task sent back to To Do restarts from the top and plans again"
+    );
+}
+
+#[test]
+fn a_human_move_back_to_todo_clears_the_designed_flag() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = park_in_phase(&ops, "Drag me back", RunPhase::Execute);
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.designed = true;
+    ops.storage.save_task(&current).unwrap();
+
+    let moved = ops.move_task(&task.id, "todo", false).unwrap().unwrap();
+    assert!(!moved.designed);
+}
+
+#[test]
+fn a_human_move_that_is_not_to_todo_keeps_the_plan() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = park_in_phase(&ops, "Park in review", RunPhase::Execute);
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.designed = true;
+    ops.storage.save_task(&current).unwrap();
+
+    let moved = ops.move_task(&task.id, "review", false).unwrap().unwrap();
+    assert!(
+        moved.designed,
+        "only a return to To Do discards the existing plan"
+    );
+}
+
+#[test]
+fn waking_a_task_keeps_the_reviewer_bounce_count() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    let task = park_in_phase(&ops, "Wake me", RunPhase::Execute);
+    let session = "ses-wake-1";
+    SessionManager::new(dir.path())
+        .link_session(&task.id, session)
+        .unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.session = Some(session.to_string());
+    current.review_rounds = 2;
+    current.crash_restarts = 1;
+    ops.storage.save_task(&current).unwrap();
+    // A closed session is what `wake` replaces; an active one needs a live
+    // process to revoke.
+    SessionManager::new(dir.path())
+        .close_session(session)
+        .unwrap();
+
+    ops.revoke_in_progress_task(&task.id, Some(session))
+        .unwrap();
+
+    let woken = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(
+        woken.review_rounds, 2,
+        "a wake continues the same run; it must not re-arm the bounce cap"
+    );
+    assert_eq!(
+        woken.crash_restarts, 0,
+        "the crash budget is still reset by a human nudge"
+    );
+}
+
+#[test]
+fn rerunning_a_stranded_session_keeps_the_reviewer_bounce_count() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    let task = park_in_phase(&ops, "Stranded", RunPhase::Execute);
+    let session = "ses-stranded-1";
+    SessionManager::new(dir.path())
+        .link_session(&task.id, session)
+        .unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.session = Some(session.to_string());
+    current.review_rounds = 3;
+    current.auto_resumes = 2;
+    ops.storage.save_task(&current).unwrap();
+    SessionManager::new(dir.path())
+        .close_session(session)
+        .unwrap();
+
+    ops.rerun_in_progress_task(&task.id, None).unwrap().unwrap();
+
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.review_rounds, 3);
+    assert_eq!(stored.auto_resumes, 0);
+}
+
+#[test]
+fn rerunning_from_review_does_reset_the_reviewer_bounce_count() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Fresh attempt")).unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.status = TaskStatus::Review;
+    current.review_rounds = 3;
+    ops.storage.save_task(&current).unwrap();
+
+    ops.rerun_review_task(&task.id, None).unwrap().unwrap();
+
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(
+        stored.review_rounds, 0,
+        "a human restarting the work from Review is a fresh attempt"
+    );
 }

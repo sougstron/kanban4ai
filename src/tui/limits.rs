@@ -10,11 +10,10 @@
 //! The row degrades with width: reset times drop first, then window labels and
 //! provider names, then whole providers from the right.
 //!
-//! The claude, codex, and grok segments are clickable: a click refreshes that
-//! provider (claude force-polls the usage endpoint; codex via the app-server
-//! RPC; grok renews its token via the grok CLI — see
-//! [`crate::core::limits::refresh_provider_async`]). zai and synthetic stay
-//! display-only: their keys are long-lived and the background poll is enough.
+//! Every provider segment is clickable: a click refreshes that provider on
+//! the spot (claude force-polls the usage endpoint; codex via the app-server
+//! RPC; grok renews its token via the grok CLI; zai, synthetic, and yolo
+//! re-fetch over HTTPS — see [`crate::core::limits::refresh_provider_async`]).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -30,9 +29,9 @@ use super::app::{App, HitAction, Hitbox, Screen, UiAction};
 /// Between two providers; matches the status bar's divider.
 const SEPARATOR: &str = "  │  ";
 
-/// Providers whose segment of the row refreshes on click. zai and synthetic
-/// stay display-only: their keys never expire and the background poll is enough.
-const CLICKABLE: [&str; 3] = ["claude", "codex", "grok"];
+/// Providers whose segment of the row refreshes on click: all of them, so a
+/// manual refresh is always one tap away even for the HTTPS-only providers.
+const CLICKABLE: &[&str] = &limits::PROVIDERS;
 
 /// How much of each provider is spelled out. Tried in order until the row fits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +51,7 @@ fn provider_color(app: &App, provider: &str) -> Color {
         "codex" => Color::Rgb(90, 190, 160),
         "zai" => Color::Rgb(112, 145, 219),
         "synthetic" => Color::Rgb(178, 142, 212),
+        "yolo" => Color::Rgb(232, 176, 70),
         _ => app.theme.fg,
     }
 }
@@ -63,6 +63,7 @@ pub fn provider_icon(provider: &str) -> &'static str {
         "grok" => "✕",
         "zai" => "◆",
         "synthetic" => "✦",
+        "yolo" => "◉",
         _ => "•",
     }
 }

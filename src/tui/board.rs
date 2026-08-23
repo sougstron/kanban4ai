@@ -8,6 +8,7 @@ use ratatui::widgets::{
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{App, HitAction, Hitbox, Screen, UiAction};
+
 use super::card::{sanitize_terminal_text, truncate_display};
 use super::{card, detail, dialogs, limits, projects, search, sessions};
 
@@ -293,13 +294,18 @@ fn render_cards(frame: &mut Frame<'_>, app: &App, column_index: usize, area: Rec
     for (task_index, task) in tasks.into_iter().enumerate() {
         let absolute_index = offset + task_index;
         let focused = column_index == app.focused_column && absolute_index == app.focused_card;
-        let hovered = app.is_hovered(HitAction::FocusCard {
-            column: column_index,
-            card: absolute_index,
-        }) || app.is_hovered(HitAction::OpenAnswer {
-            column: column_index,
-            card: absolute_index,
-        });
+        // One selection at a time: the pointer paints a card as hovered only
+        // while that card already is the selection. After keyboard navigation
+        // moves the selection away, the card under a stationary pointer stops
+        // reading as selected until the pointer moves onto a card again.
+        let hovered = focused
+            && (app.is_hovered(HitAction::FocusCard {
+                column: column_index,
+                card: absolute_index,
+            }) || app.is_hovered(HitAction::OpenAnswer {
+                column: column_index,
+                card: absolute_index,
+            }));
         let row = rows[row_index];
         row_index += 1;
         let dragging = app.is_dragging_card(column_index, absolute_index);
@@ -370,6 +376,17 @@ fn seg(label: &'static str, action: Option<UiAction>, priority: u8) -> StatusSeg
     }
 }
 
+/// The `Q` hint for the current task, when it applies: a queued card offers
+/// unqueueing; To Do and idle In Progress cards offer explicit enqueueing.
+fn queue_segment(app: &App) -> Option<StatusSegment> {
+    let task = app.current_task()?;
+    match app.queue_action_for(&task)? {
+        UiAction::Dequeue => Some(seg("Q unqueue", Some(UiAction::Dequeue), 3)),
+        UiAction::Enqueue => Some(seg("Q queue", Some(UiAction::Enqueue), 3)),
+        _ => None,
+    }
+}
+
 fn status_segments(app: &App) -> Vec<StatusSegment> {
     let primary_action = match app.current_task() {
         Some(task) if app.primary_run_action_for(&task) == UiAction::Revoke => {
@@ -397,6 +414,9 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
             {
                 segments.insert(3, seg("k stop", Some(UiAction::Stop), 2));
             }
+            if let Some(queue) = queue_segment(app) {
+                segments.insert(3, queue);
+            }
             segments
         }
         Screen::Detail => {
@@ -414,6 +434,9 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
                 .is_some_and(|task| app.task_can_stop(&task))
             {
                 segments.insert(1, seg("k stop", Some(UiAction::Stop), 2));
+            }
+            if let Some(queue) = queue_segment(app) {
+                segments.insert(1, queue);
             }
             if show_tab {
                 segments.push(seg("Tab editor", None, 4));
@@ -623,6 +646,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  Enter: open task detail"),
         Line::from("  r: run a task; revoke only while a session is live/crashed"),
         Line::from("  k: stop a live or waiting session (task stays In Progress)"),
+        Line::from("  Q: queue for the dispatcher / take a queued task back out"),
         Line::from("  n: new task in focused column · e/m/d: edit, move, delete permanently"),
         Line::from("  w: answer question · y: approve Review → Done"),
         Line::from("  t: attach to the task's agent · c: add context/suggestion"),
@@ -665,6 +689,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  ↑/↓ PgUp/PgDn Home/End: scroll · End re-enables follow · q: back"),
         Line::from(""),
         Line::from("Mouse"),
+        Line::from("  hover a card: select it — Enter and hotkeys act on it; arrows"),
+        Line::from("    move the selection and drop the pointer's card again"),
         Line::from("  click: open a card, press a button, or pick a dialog field"),
         Line::from("  wheel: scrolls the column under the cursor"),
         Line::from("  drag across text: copy it · hold Shift to select interactive text"),
@@ -673,8 +699,10 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  status-bar hints are clickable; column headers show name and count"),
         Line::from(""),
         Line::from("Provider limits (row above the status bar, Board and Projects)"),
-        Line::from("  ✳ claude · ✺ codex · ✕ grok: % of each window left, ↻ time to reset"),
-        Line::from("  click claude, codex, or grok to refresh now · codex shows last-session age"),
+        Line::from("  ✳ claude · ✺ codex · ✕ grok · ◆ zai · ✦ synthetic · ◉ yolo"),
+        Line::from(
+            "  click a provider to refresh now · % left and ↻ reset · codex shows last-session age",
+        ),
         Line::from("  hide the row with tui.show_limits: false · kanban limits prints it"),
         Line::from(""),
         Line::from("?: toggle help · q/Esc: back · Ctrl+C twice: quit"),

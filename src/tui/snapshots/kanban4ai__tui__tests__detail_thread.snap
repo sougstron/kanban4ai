@@ -29,7 +29,7 @@ expression: render_snapshot(&mut app)
 │                                                                                              │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
 [ ▶ Run r ] [ Answer w ] [ Edit e ] [ Move m ] [ +Ctx c ] [ Del d ]                             
- ? 1 questions  TUI ready │ r run · w answer · y approve · Tab editor · q/Esc back              
+ ? 1 questions  TUI ready │ r run · Q queue · w answer · y approve · Tab editor · q/Esc back    
 
 --- style runs ---
 0:0-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

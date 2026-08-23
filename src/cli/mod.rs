@@ -2,6 +2,7 @@
 //! CLI so existing agent prompts and scripts keep working unchanged.
 
 mod bridge;
+mod daemon;
 mod init;
 mod project;
 mod resolve;
@@ -23,7 +24,7 @@ use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
 use crate::core::limits;
 use crate::core::models::Task;
-use crate::core::operations::{AgentExitOutcome, Operations, QuestionRef, TaskPatch};
+use crate::core::operations::{AgentExitOutcome, Operations, QuestionRef, TaskPatch, Verdict};
 use crate::core::session::{SessionManager, estimate_session_tokens};
 use crate::core::storage::NewTask;
 use crate::core::timefmt;
@@ -185,6 +186,25 @@ enum Command {
     Unreject { task_id: String, msg_id: String },
     /// Set the review-edits buffer on a task (folded into the thread on next re-run).
     Edits { task_id: String, text: String },
+    /// Bot-reviewer verdict: approve (human Review) or request changes.
+    Verdict {
+        task_id: String,
+        /// Accept the work and move the task to human Review.
+        #[arg(long, group = "verdict")]
+        approve: bool,
+        /// Request changes (written into the review-edits buffer).
+        #[arg(long, group = "verdict")]
+        changes: Option<String>,
+        /// Read the requested changes from a file instead of (or in addition to) --changes.
+        #[arg(long)]
+        file: Option<String>,
+        /// Session ID of the reviewer bot.
+        #[arg(long)]
+        session: Option<String>,
+        /// Agent mode (required).
+        #[arg(long)]
+        agent: bool,
+    },
     /// Fold pending review edits into the thread and re-run the task's agent.
     Rerun {
         task_id: String,
@@ -286,6 +306,15 @@ enum Command {
     /// Check for crashed sessions.
     #[command(name = "check-sessions")]
     CheckSessions,
+    /// Pump the queue and crash-restart schedule without a TUI.
+    Daemon {
+        /// Seconds between ticks (default: store `daemon.interval`, or 60)
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Run a single tick and exit (cron / systemd timer)
+        #[arg(long)]
+        once: bool,
+    },
     /// Recover a crashed task.
     Recover { task_id: String },
     /// Stop the running agent session for a task (leaves the task In Progress).
@@ -293,7 +322,7 @@ enum Command {
 
     /// List active sessions.
     Sessions,
-    /// Show remaining subscription limits for the agent providers (claude, codex, grok, zai, synthetic).
+    /// Show remaining subscription limits for the agent providers (claude, codex, grok, zai, synthetic, yolo).
     Limits {
         /// Output format
         #[arg(long = "format", value_parser = ["table", "json"], default_value = "table")]
@@ -492,9 +521,19 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Command::Tui => return launch_tui(cli.project.as_deref()),
+        Command::Daemon { interval, once } => {
+            return daemon::run(once, interval, cli.project.as_deref());
+        }
         _ => {}
     }
     let ops = resolve::resolve_project(cli.project.as_deref())?.operations();
+    // Settings that loaded but will not do what they look like they do. On
+    // stderr so it never contaminates a command's parseable stdout.
+    if ops.config.load().is_ok() {
+        for warning in ops.config.warnings() {
+            eprintln!("Warning: {warning}");
+        }
+    }
     match command {
         Command::Create {
             title,
@@ -718,6 +757,43 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Some(_) => println!("Message {msg_id} restored on {task_id}"),
             None => eprintln!("Message {msg_id} not found on {task_id}"),
         },
+        Command::Verdict {
+            task_id,
+            approve,
+            changes,
+            file,
+            session,
+            agent,
+        } => {
+            let session_id = env_session(session);
+            let decision = if approve {
+                Verdict::Approve
+            } else {
+                let mut text = changes.unwrap_or_default();
+                if let Some(path) = file {
+                    let from_file = read_agent_file(&ops, &path)?;
+                    if text.trim().is_empty() {
+                        text = from_file;
+                    } else {
+                        text.push('\n');
+                        text.push_str(&from_file);
+                    }
+                }
+                if text.trim().is_empty() {
+                    return Err(KanbanError::Invalid(
+                        "kanban verdict requires --approve or --changes <text> (or --file)"
+                            .to_string(),
+                    ));
+                }
+                Verdict::Changes(text)
+            };
+            match ops.submit_verdict(&task_id, &session_id, agent, decision)? {
+                Some(task) => {
+                    println!("Task {task_id} verdict recorded ({})", task.status.as_str())
+                }
+                None => eprintln!("Failed to record verdict on {task_id}"),
+            }
+        }
         Command::Edits { task_id, text } => match ops.set_review_edits(&task_id, &text)? {
             Some(_) => println!("Review edits saved on {task_id}"),
             None => eprintln!("Task {task_id} not found"),
@@ -897,6 +973,17 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     println!("  {} (task: {})", session.id, session.task_id);
                 }
             }
+            let restarted = ops.due_restarts()?;
+            for task_id in &restarted {
+                println!("Crash-restart due: {task_id} handed to the queue");
+            }
+            let dispatched = ops.dispatch_queue()?;
+            for item in &dispatched {
+                println!(
+                    "Dispatched {} → {} ({})",
+                    item.task_id, item.session_id, item.backend
+                );
+            }
         }
         Command::Recover { task_id } => match ops.recover_task(&task_id)? {
             Some(_) => {
@@ -944,7 +1031,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 );
             }
         }
-        Command::Tui | Command::Limits { .. } | Command::StatuslineBridge => {
+        Command::Tui
+        | Command::Limits { .. }
+        | Command::StatuslineBridge
+        | Command::Daemon { .. } => {
             unreachable!("handled before resolve")
         }
         Command::Attach { task_id } => {

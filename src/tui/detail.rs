@@ -54,7 +54,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let description_lines = task_description_lines(&task);
     let meta_extra_lines = u16::from(waiting)
         + u16::from(wait_deadline.is_some())
-        + u16::from(session_state == Some(SessionState::Crashed))
+        + u16::from(task.restart_at.is_some() || session_state == Some(SessionState::Crashed))
         + description_lines;
     let meta_height = 6 + meta_extra_lines;
     let answer_height = if show_answer {
@@ -190,8 +190,11 @@ fn render_meta(
             Span::raw(sanitize_terminal_text(&task.title)),
         ]),
         Line::from(format!(
-            "Status: {} │ Session: {} │ Interactive: {}",
+            "Status: {}{} │ Session: {} │ Interactive: {}",
             task.status,
+            task.run_phase
+                .map(|phase| format!(" · {phase}"))
+                .unwrap_or_default(),
             sanitize_terminal_text(task.session.as_deref().unwrap_or("-")),
             task.interactive
         )),
@@ -241,13 +244,21 @@ fn render_meta(
             Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
         )));
     }
-    if meta_state.session_state == Some(SessionState::Crashed)
-        && task.status == TaskStatus::InProgress
-    {
-        meta.push(Line::from(Span::styled(
-            "✖ Session is stuck or crashed — press u / Recover to return it to To Do",
-            Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
-        )));
+    if task.status == TaskStatus::InProgress {
+        if let Some(restart_at) = task.restart_at {
+            meta.push(Line::from(Span::styled(
+                format!(
+                    "↻ Crash retry at {} — waiting for the backoff before the queue picks it up",
+                    restart_at.format("%H:%M")
+                ),
+                Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
+            )));
+        } else if meta_state.session_state == Some(SessionState::Crashed) {
+            meta.push(Line::from(Span::styled(
+                "✖ Session is stuck or crashed — press u / Recover to return it to To Do",
+                Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
+            )));
+        }
     }
     frame.render_widget(
         Paragraph::new(meta)

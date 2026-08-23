@@ -30,7 +30,8 @@ src/
 │   ├── mod.rs           # parser + dispatch; global `--project`
 │   ├── init.rs          # store-backed `kanban init`
 │   ├── project.rs       # `kanban project` list/add/show/rename/set-path/path/remove/open
-│   └── resolve.rs       # `--project` / $KANBAN_PROJECT / cwd / silent adoption
+│   ├── resolve.rs       # `--project` / $KANBAN_PROJECT / cwd / silent adoption
+│   └── daemon.rs        # `kanban daemon` foreground loop
 └── core/
     ├── mod.rs
     ├── error.rs         # KanbanError (Io/Yaml/Invalid/Permission) / Result
@@ -46,7 +47,9 @@ src/
     ├── session.rs       # SessionManager: heartbeats, crash detection, token estimate
     ├── context.rs       # ContextManager: thread-based context + legacy back-compat
     ├── compaction.rs    # Rule-based context compaction (no LLM)
-    ├── limits.rs        # Provider subscription limits (claude/codex/grok/zai/synthetic) + cache
+    ├── scheduler.rs     # Slot census, queue dispatch, crash-restart backoff
+    ├── daemon.rs        # Store-wide tick + single-instance `daemon.lock`
+    ├── limits.rs        # Provider subscription limits (claude/codex/grok/zai/synthetic/yolo) + cache
     └── notifier.rs      # Desktop notifications (notify-send)
 Additional modules:
     agent/               # process manager, tmux wrapper, backends, prompts
@@ -65,7 +68,7 @@ tests/
 ```
 
 ### Data Model
-- **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, ai_model, ai_effort, agent_backend, agent_name, chained_to, review_edits, auto_resumes, completed_at. `description` is the **user-authored task only** — agent work-context lives in the thread (see "Context, questions & review edits"). `interactive: true` enables the thread-based blocking question loop for delegated agents. `chained_to` is an optional target task id: when that target enters Review, this task auto-runs (see "Task Chaining"). `review_edits` is the single editable buffer for the human's review feedback; it is folded into the thread and cleared on the next re-run from Review. `auto_resumes` counts consecutive automatic relaunches after clean exits or expired waits and resets on human starts/recoveries. `completed_at` records the most recent transition that completed work into Review or Done; a rerun keeps the previous value while active and replaces it when the agent completes again. `session` names the **last** session that worked the task, not only a running one: it survives the session's end (done, stop, recover, unarchive, failed launch) so the task keeps a record of who ran it, and is overwritten by the next session. Whether that session is alive is decided by its session record — never by this field being set. `agent_backend`/`ai_model`/`ai_effort`/`agent_name` are likewise a record of the last launch: each launch pins the value it resolved (the task's own field where set, the backend's configured default otherwise) onto the task.
+- **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, ai_model, ai_effort, agent_backend, agent_name, chained_to, review_edits, auto_resumes, completed_at, run_phase, crash_restarts, restart_at, review_rounds, designed. `description` is the **user-authored task only** — agent work-context lives in the thread (see "Context, questions & review edits"). `interactive: true` enables the thread-based blocking question loop for delegated agents. `chained_to` is an optional target task id: when that target enters Review, this task auto-runs (see "Task Chaining"). `review_edits` is the single editable buffer for the human's review feedback; it is folded into the thread and cleared on the next re-run from Review. `auto_resumes` counts consecutive automatic relaunches after clean exits or expired waits and resets on human starts/recoveries. `completed_at` records the most recent transition that completed work into Review or Done; a rerun keeps the previous value while active and replaces it when the agent completes again. `session` names the **last** session that worked the task, not only a running one: it survives the session's end (done, stop, recover, unarchive, failed launch) so the task keeps a record of who ran it, and is overwritten by the next session. Whether that session is alive is decided by its session record — never by this field being set. `agent_backend`/`ai_model`/`ai_effort`/`agent_name` are likewise a record of the last launch: each launch pins the value it resolved (the task's own field where set, the backend's configured default otherwise) onto the task — except for designer/reviewer launches, which must not overwrite the task's assigned executor settings. `run_phase` is the In Progress sub-state (`queued`/`design`/`execute`/`review`, see "Run Phases"); it is `None` on every other column and on legacy boards, where it reads as `execute`. `crash_restarts` counts consumed crash auto-restarts and `restart_at` is the pending backoff deadline (both distinct from `auto_resumes`); `review_rounds` counts consumed bot-review bounces. `designed` records that a designer pass already finished and its plan is on the thread. The relaunch bookkeeping is cleared in two grades: `Task::reset_auto_restart()` clears `auto_resumes`, `crash_restarts` and `restart_at`, and `Task::reset_human_restart()` clears those **and** `review_rounds`. A human restart of the *work* (run, re-run from Review, recover, take, queue) uses the second; a human nudge to a run that is still the same run (wake/revoke, re-run of a stranded session) uses the first, so a task woken mid-review does not re-arm `reviewer.max_rounds` from zero and reopen the bounce loop the cap exists to stop.
 - **Session**: id, task_id, started_at, status (active/closed/crashed), last_seen, wait_until, wait_note, wait_exited. `wait_until`/`wait_note` are set by `kanban waiting`; `wait_exited` means the agent process ended during the declared wait and should be relaunched after the deadline.
 - **MessageRole** / **MessageKind** / **MessageStatus**: enums for thread message author, type, and lifecycle state. `MessageKind` is one of `system`, `task`, `question`, `suggestion`, `context`, or `review_edit`.
 - New tasks initialize their sidecar thread with `system` and `task` messages: `MSG-001` records creation metadata, `MSG-002` stores the initial user-authored task body so the TUI can render the whole conversation from the thread.
@@ -89,6 +92,21 @@ review_edits: ''
 ---
 User-authored task description only — agent context is NOT embedded here.
 ```
+
+The orchestration fields are written only when they carry a value, so a board
+that never used the queue round-trips byte-identically against the golden
+fixtures: `run_phase` and `restart_at` are omitted while `None`,
+`crash_restarts` and `review_rounds` while `0`, `designed` while `false`. A task mid-run looks like this:
+
+```yaml
+status: in_progress
+run_phase: queued
+crash_restarts: 1
+restart_at: '2026-06-01T14:32:00'
+review_rounds: 1
+```
+
+`restart_at` uses the same timestamp dialect as every other datetime field.
 
 Timestamps use the Python `datetime.isoformat()` dialect (naive local time,
 microseconds omitted when zero) — `src/core/timefmt.rs` is the single
@@ -193,30 +211,119 @@ messages:
 - `kanban questions <id>` - List open thread messages
 - `kanban suggest <id> <suggestion>` - Add suggestion
 - `kanban edits <id> <text>` - Set the review-edits buffer
+- `kanban verdict <id> (--approve | --changes <text> [--file <path>]) --session <id> --agent` - The bot reviewer's only exit (see "Run Phases"). `--agent` is required and the session must be the task's current reviewer session on a task that is In Progress with phase `review`. `--approve` clears the phase and moves the task to human Review (chained tasks and the completion notification fire as usual); `--changes` writes the text into the `review_edits` buffer, folds it into the thread, and routes per `orchestration.reviewer.on_changes_requested`. `--file` reads the text from a file for longer write-ups; empty change text is rejected
 - `kanban rerun <id> [--session <id>]` - Fold review edits into the thread and re-run the agent
 - `kanban compact <id>` - Compact context (rule-based, no LLM)
 - `kanban heartbeat --session <id>` - Update session heartbeat
-- `kanban check-sessions` - Find crashed sessions
+- `kanban check-sessions` - The manual headless pump: resume expired waits, reap crashed sessions, hand due crash-restarts back to the queue (`due_restarts`), then `dispatch_queue` and print what each step did
+- `kanban daemon [--interval SECONDS] [--once] [--project <p>]` - Foreground loop (does not fork) that ticks every registered project: resume expired waits, reap crashed sessions, `due_restarts()`, then `dispatch_queue()`. `--once` is one tick for cron or a systemd timer; the plain loop is what the user unit runs. Default interval is 60s from the store `daemon.interval` (`--interval` overrides). `flock`s `<store>/daemon.lock` and refuses a second daemon; a TUI pumping at the same time is fine. Projects with `orchestration.queue_enabled: false` or a missing work folder are skipped (one warning for a gone folder). Logs one line per resume/reap/restart/dispatch to `<store>/logs/daemon.log` and stdout. Cron fallback: `* * * * * kanban daemon --once`. Opt-in user unit: `scripts/install.sh --with-daemon` (never enabled).
 - `kanban recover <id>` - Recover crashed task
 - `kanban stop <id>` - Stop the task's running agent session; the task stays In Progress (idle)
 - `kanban sessions` - List active sessions
 - `kanban archive` - List archived tasks
 - `kanban archive-done` - Move all Done tasks to Archive
-- `kanban limits [--format table|json] [--refresh]` - Remaining subscription capacity per provider (claude, codex, grok, zai, synthetic); serves the cached snapshot unless it aged out or `--refresh` is given
+- `kanban limits [--format table|json] [--refresh]` - Remaining subscription capacity per provider (claude, codex, grok, zai, synthetic, yolo); serves the cached snapshot unless it aged out or `--refresh` is given
 - `kanban limits bridge install` / `kanban limits bridge remove` - Wrap / unwrap Claude Code's statusline command with the bridge feeding the claude segment of the limits row
 - `kanban tui` - Launch the interactive board; with no resolved project, open the projects list
 - `kanban attach <id>` - Attach to the task's running agent tmux session
 
 ### Agent Rules (Enforced with --agent flag)
 1. `one_task_per_instance`: Block an agent from taking multiple tasks
-2. `user_only_review_to_done`: Only user can move Review -> Done
+2. `user_only_review_to_done`: Only the user can move Review -> Done. Agents must never move a task to Done; an executor's `kanban done` lands in Review (or bot review when the reviewer is on)
 3. `auto_move_on_assign`: Move to In Progress on take
 4. `auto_move_on_complete`: Move to Review on agent done
 5. `questions_go_to_review`: If true, questions move task to Review; if false, keep in In Progress
 6. `auto_launch_on_delegate`: On agent `take`, auto-launch the backend for the task (gated by `auto_launch.enabled`)
 7. `auto_launch_chained`: When a task enters Review, auto-launch every To Do task whose `chained_to` points at it (gated by `auto_launch.enabled`)
+8. Designer-phase agents cannot move their task at all; they record a plan and finish the design phase with `kanban done` (that does not complete the work)
+9. Reviewer-phase agents cannot move their task at all; they must not implement fixes; their only exit is `kanban verdict`
 
 When `interactive: true`, delegated agents are instructed to use `kanban ask --wait` for blocking questions and `kanban suggest` for non-blocking ideas.
+
+**Role contracts.** A session's role comes from the task's run phase
+(`Role::from_phase`: `design` → designer, `review` → reviewer, everything else
+including a missing phase → executor). The role picks the prompt
+(`agent/prompt.rs`) *and* the move gate in `operations::move_task`, so the
+contract is enforced, not merely worded:
+
+| role | prompt says | enforced |
+|---|---|---|
+| executor | finish with `kanban done`, which lands the task in Review (or starts bot review); never move a task to Done; do not use `kanban move` to change columns | `user_only_review_to_done`: an agent move to Done, or out of Review, is refused |
+| designer | plan, do not implement, do not move the task out of In Progress; record the plan with `kanban context`; finish the design phase with `kanban done` (that does not complete the work) | any `move` is refused with *"designer cannot move a task; finish the design phase with kanban done"*; `done` without a recorded plan is refused with *"Designer cannot finish without recording a plan via context"* |
+| reviewer | check the result against the task requirements and the project conventions in `AGENTS.md`/`CLAUDE.md`; do not edit project files; do not implement fixes; the only exit is `kanban verdict` | any `move` is refused with *"reviewer cannot move a task; finish with kanban verdict"*; `kanban done` from a review phase is refused with *"bot reviewer must finish with kanban verdict, not done"* |
+
+### Run Phases (In Progress sub-states)
+
+The board columns are unchanged. What is new is a sub-state on In Progress:
+`Task.run_phase`, one of `queued`, `design`, `execute`, `review`. `None` means
+"In Progress the old way" and reads as `execute` everywhere a phase is needed,
+so legacy boards keep working untouched.
+
+```
+To Do            manual start only (unchanged)
+In Progress      queued → [design] → execute → [bot review]
+Review           human review
+Done             human only (unchanged)
+```
+
+| phase | badge | meaning |
+|---|---|---|
+| `queued` | `⏸ queued` | waiting for a free agent slot; the dispatcher starts it. No session runs, so a queued task occupies no slot |
+| `design` | `✎ design` | the designer bot is planning (only when `orchestration.designer.enabled`) |
+| `execute` | `▶ running` | the task's own assigned bot is doing the work |
+| `review` | `⚖ review` | the reviewer bot is checking the result; the task is still In Progress |
+
+The badge still derives live/waiting/crashed from the session record; the phase
+only overrides the *label*, and a pending crash-restart shows `↻ retry HH:MM`
+from `restart_at` instead.
+
+**To Do stays manual-start-only.** The dispatcher never pulls from To Do. A
+task reaches In Progress only through an explicit start (`r` Run, `Q` queue, a
+move, `take --agent`) or the chaining rule. **Done stays human-only** — rule 2
+is unchanged and every role prompt repeats it.
+
+How a task enters each phase:
+
+- **`r` Run** (`start_task` → `take_task_inner(immediate: true)`) — a manual
+  start always launches, bypassing the queue and clearing any queued marker.
+  The one thing it does not bypass is an enabled designer: the planning pass
+  still runs first (phase `design`).
+- **`take --agent`** — queue-aware. When `auto_launch_on_delegate` would launch
+  but every applicable cap is full (`queue_is_full`), the task lands In Progress
+  with phase `queued` instead of launching, and the dispatcher starts it later.
+- **`Q`** — explicit enqueue. A To Do task moves to In Progress, an idle In
+  Progress task stays put; either way the phase becomes `queued`, the
+  human-restart counters reset, and nothing launches. `Q` on an already-queued
+  task unqueues it (phase back to `None`, run it manually). A task with a live
+  session cannot be queued.
+- **`design` → `execute`** — the designer's `kanban done` closes the design
+  session, sets `designed: true`, flips the phase to `execute`, and launches the task's own bot
+  directly on the same slot (re-queueing would stall a task whose slot is
+  already paid for). The plan reaches the executor through the thread.
+- **`execute` → `review`** — when `orchestration.reviewer.enabled`, the point
+  where `auto_move_on_complete` would move the task to Review instead keeps it
+  In Progress, sets phase `review`, increments `review_rounds`, and launches the
+  reviewer bot with the reviewer's own backend/model.
+- **`review` → out** — only `kanban verdict`. `--approve` clears the phase and
+  moves to human Review. `--changes` folds the text into the thread and then
+  routes on `reviewer.on_changes_requested`: `todo` returns the task to To Do
+  with a cleared phase (manual restart), `in_progress` sets phase `queued` so
+  the dispatcher restarts **the task's own bot**, never the reviewer, with the
+  edits already in the thread. Once `review_rounds` reaches
+  `reviewer.max_rounds` the bounce falls through to human Review and notifies.
+
+Every phase change posts a one-line audit note on the task thread
+(`▶ dispatcher started session …`, `↻ crash restart scheduled at …`,
+`⚖ reviewer approved — handing to human Review`, …).
+
+Whether a run starts at `design` or `execute` is decided by the task's
+`designed` flag, never by a counter. A crash restart, a `Q` re-queue or a
+review bounce of a task that already has its plan resumes the **executor**;
+only a task with no plan yet goes to the designer. `designed` is cleared when a
+human sends the task back to To Do (`recover`, or a human move whose target is
+To Do) — that is a fresh attempt, so the next run plans again. A reviewer
+bounce routed by `on_changes_requested: todo` does **not** clear it: the plan
+is still the plan, and the requested edits are already on the thread.
 
 ### Configurable Thresholds (per-project .kanban/config.yaml)
 - `context_embed_max_size`: 5120 (5KB) - inline vs separate file
@@ -242,9 +349,12 @@ When `interactive: true`, delegated agents are instructed to use `kanban ask --w
 - `max_tasks_per_column`: 100 - cap rendered per column
 - `name`: project name shown in Project Settings
 - `theme`: theme name (quick-toggle/persist via `Ctrl+T`, or edit in Project Settings)
-- `task_sort`: `task_number` (default, ascending TASK id), `updated_at_asc`
-  (least recently modified first), or `updated_at_desc` (most recently modified
-  first). Legacy `completion_date` values are read as `updated_at_desc`.
+- `task_sort`: `task_number` (default, ascending TASK id), `task_number_desc`
+  (descending TASK id — highest task number first; doubles as the
+  queue-priority control for the dispatcher), `updated_at_asc` (least recently
+  modified first), or `updated_at_desc` (most recently modified first).
+  Legacy `completion_date` values are read as `updated_at_desc`; unknown
+  values read as `task_number`.
 - `show_limits`: true - draw the provider subscription-limits row above the
   status bar on the Board and Projects screens
 
@@ -263,6 +373,7 @@ they are edited: press `s` on the Projects screen. Saved under the store
   first — unseen Review or open questions — then rows with running agents,
   then newest). Unknown values read as `name`. Edited from Global Settings
   (`s` on the Projects screen).
+- `daemon.interval`: 60 - seconds between `kanban daemon` ticks. `--interval` on the command line overrides. This is the only orchestration cadence that lives in the store config, because the daemon spans projects.
 - `tui.file_manager`: unset - command the Projects screen's `o folder` button
   hands the work folder to (the folder is appended as the last argument;
   the value is split like a shell word list, e.g. `nautilus --new-window`).
@@ -289,6 +400,76 @@ Controls how delegating a task spawns a background agent job (shared across all 
 - `auto_complete_on_exit`: false - whether agent exit auto-completes the task
 - `default_agent`: opencode - backend used when a task has no `agent_backend`
 - `model` / `models` / `agent`: opencode back-compat mirrors of `agents.opencode.*`
+
+### Orchestration Settings (.kanban/config.yaml `orchestration:`)
+
+Per-project — nothing here lives in the global store config. Edited in Project
+Settings (`s`) or in the file. Unlike every other section, `orchestration` is
+merged with `merge_missing_deep`, so a board that sets only
+`orchestration.designer.enabled` still gets all the sibling defaults; the other
+sections keep their long-standing shallow `merge_missing` semantics.
+
+```yaml
+orchestration:
+  queue_enabled: true
+  max_running_total: 3
+  max_running_per_backend: {claude: 2, opencode: 2, omp: 2, pi: 2}
+  max_running_per_backend_model: {}
+  max_running_per_role: {designer: 1, reviewer: 1, executor: 3}
+  auto_restart: {enabled: true, delays_minutes: [1, 30, 270]}
+  designer: {enabled: false, backend: claude, model: sonnet, effort: null, agent: null}
+  reviewer: {enabled: false, backend: claude, model: sonnet, effort: null, agent: null,
+             on_changes_requested: in_progress, max_rounds: 3}
+```
+
+- `queue_enabled`: true - master switch for the dispatcher. Off means nothing
+  is ever queued and `dispatch_queue` returns immediately. `auto_launch.enabled`
+  gates it too: with auto-launch off the dispatcher starts nothing
+- `max_running_total`: 3 - concurrently running agents across the board
+- `max_running_per_backend`: 2 each for claude/opencode/omp/pi - cap per
+  resolved backend. A key naming a backend the board does not know (a typo, or
+  an agent since removed from `agents:`) caps nothing, so `Config::load`
+  reports it as a **warning** rather than rejecting it — a hard error would run
+  on every command and lock the user out of their own board. The warning
+  surfaces on stderr for CLI commands, in the daemon log (once per project per
+  daemon run), and in the TUI status line at startup
+- `max_running_per_backend_model`: `{}` - cap per resolved `<backend>/<model>`
+  pair. **The key must be `<backend>/<model>`, parsed on the first slash only**,
+  because model ids contain slashes themselves: `opencode/openai/gpt-5.5` is
+  backend `opencode`, model `openai/gpt-5.5`. A bare model id (`opus`) is
+  rejected by `Config::validate` rather than silently never matching, as is an
+  empty model id or an unknown backend. Model ids are only unique inside a
+  backend, so this is the one format used by the config key, the census key
+  (`OrchestrationSettings::backend_model_key`), the settings label
+  ("Max tasks per backend/model") and these docs
+- `max_running_per_role`: designer 1, reviewer 1, executor 3 - cap per role.
+  Unlike the backend maps this is a closed set: a key that is not `executor`,
+  `designer` or `reviewer` is rejected by `Config::validate`, since there is no
+  user-extensible role to be wrong about
+- `auto_restart.enabled`: true - master switch for crash auto-restart
+- `auto_restart.delays_minutes`: `[1, 30, 270]` - backoff schedule; entry *n*
+  is the wait before attempt *n+1*, and its length is the attempt budget.
+  Entries must be positive integers
+- `designer.enabled`: false - run a planning pass before execution
+- `designer.backend` / `model` / `effort` / `agent`: `claude` / `sonnet` /
+  unset / unset - the designer bot's own launch settings, used instead of the
+  task's assignment. An unset (or blank) backend falls back to
+  `auto_launch.default_agent`, and a name with no `agents:` entry falls back to
+  `opencode`, matching the task path; unset model/effort/agent inherit that
+  backend's configured defaults
+- `reviewer.enabled`: false - run a bot review before human Review
+- `reviewer.backend` / `model` / `effort` / `agent`: same defaults and same
+  fallback chain as the designer
+- `reviewer.on_changes_requested`: `in_progress` - where `kanban verdict
+  --changes` sends the task: `in_progress` re-queues it for its own bot,
+  `todo` returns it to To Do for a manual restart. Any other value is a config
+  error
+- `reviewer.max_rounds`: 3 - consecutive bot-review bounces before falling
+  through to human Review
+
+Every cap is an integer where **`0` means unlimited**, and so does an absent
+map entry; a negative or unparseable value is a config error. `enabled` flags
+are coerced like the other boolean settings (`true`/`yes`/`1`).
 
 ### Agent Backends (.kanban/config.yaml `agents:`)
 Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. The `agents:` map defines one entry per backend:
@@ -325,9 +506,16 @@ Action hotkeys work on both the board (focused card) and the open detail view.
   task (or its detail). The task stays In Progress so `r` can run it again.
   Confirm first. Distinct from revoke (`r`), which stops and immediately starts
   a fresh session. Sessions view still uses `x` to kill a selected session.
+- `Q`: **Queue / Unqueue** — hand the task to the dispatcher instead of starting
+  it now (To Do moves to In Progress, an idle In Progress task stays put; phase
+  becomes `queued` and nothing launches), or take an already-queued task back
+  out. The status bar hint flips between `Q queue` and `Q unqueue`; a task with
+  a live session cannot be queued
 - `n`: New task — always created in To Do, regardless of the focused column
 - `s`: Open Project Settings from Board or Detail: project name, default backend,
-  its model/effort/persona defaults, dark/light theme, and task sorting. On the
+  its model/effort/persona defaults, dark/light theme, task sorting, and the
+  whole `orchestration:` block (queue switch, the four cap groups, crash-restart
+  schedule, designer and reviewer bots). On the
   Projects screen `s` instead opens Global Settings (see "Global Settings").
   The Board status-bar `s settings` hint is clickable when it fits.
 - `e`: Edit task
@@ -453,6 +641,14 @@ is visible: the card in flight is inverted, the destination column's border
 turns green and bold once the cursor crosses into it, and the status bar shows
 `Moving <task> → <column>` so the pending move is never ambiguous.
 
+Cards have exactly one selection, driven by whichever input moved last.
+Hovering a card *is* selecting it — `Enter` and every card hotkey act on the
+card under the pointer — and the next keyboard navigation moves that selection
+away for good: the card a stationary pointer rests on stops being painted as
+selected until the pointer moves onto a card again. Hover-steering is
+suspended mid-drag (a lifted card keeps the selection) and while a modal is
+open.
+
 Note: the opencode subscription/usage overlay (`u` in the Python version) was
 dropped in the rewrite — it never worked reliably; `u` now means recover.
 
@@ -479,15 +675,14 @@ follow `auto_launch.default_agent` from settings; the label shows the agent it
 resolves to, and the detail view shows `default` while no launch has pinned a
 concrete backend.
 
-Dialog fields advance on Enter as well as Tab: Enter commits the focused field
-and moves to the next one, so a form can be filled without reaching for Tab,
-and Enter only submits once focus has reached the Save button (`Ctrl+S` submits
-from anywhere). Because Enter navigates, the fields that used to consume it
-behave differently: the `interactive` and other checkboxes toggle on Space
-only, and the multi-line text areas (Description, Answer) take Shift+Enter for
-a newline — Alt+Enter does the same, since a terminal without the kitty
-keyboard protocol cannot report Shift+Enter apart from plain Enter. The TUI
-requests `DISAMBIGUATE_ESCAPE_CODES` at startup where the terminal supports it
+Dialog fields advance on Enter as well as Tab, except in multi-line text
+areas (task Description, Add-message body, custom Answer): those insert a
+newline on Enter, Shift+Enter, and Alt+Enter. Many terminals — and tmux
+without `extended-keys` — deliver Shift+Enter as a bare Enter, so the field
+must treat that the same as the modified chords. Tab still leaves the field.
+Enter only submits once focus has reached the Save button (`Ctrl+S` submits
+from anywhere). Checkboxes toggle on Space only. The TUI requests
+`DISAMBIGUATE_ESCAPE_CODES` at startup where the terminal supports it
 and pops the flag again for foreground children and on every teardown path.
 
 The Backend, Model and "Chain to" selectors carry a filter row as their first
@@ -518,18 +713,210 @@ Agents call kanban via shell commands. NOT a plugin. An agent must:
 4. Add context via `kanban context`
 5. Ask questions via `kanban ask`, or `kanban ask --wait --session <id>` when the task is interactive and the question is blocking
 6. For long detached external work, prefer `kanban detach <id> --session <id> --eta SECONDS --note TEXT -- <command>` (starts the command so it survives the session and declares the wait in one step). A plain shell background job dies with the session's process group; when detaching manually (`setsid` + `nohup`, output to a file), declare the wait with `kanban waiting <id> --session <id> --eta SECONDS --note TEXT`. Either way the board relaunches the agent after the deadline to check the result
-7. Mark done via `kanban done`
+7. Finish according to role — never `kanban move` a task to Done:
+   - executor: `kanban done` (Review, or bot review when the reviewer is on)
+   - designer: do not implement and do not move the task; record the plan with `kanban context` and finish the design phase with `kanban done`
+   - reviewer: do not implement fixes and do not move the task; the only exit is `kanban verdict`
 
-Closure invariant for non-interactive agent jobs: after implementation and verification are complete, do not stop at a progress update, green test report, or pending specialist review. Record final context and run `kanban done <id> --session <id> --agent` in the same execution unless a blocking ambiguity requires `kanban ask --agent`, or a long-running detached result requires `kanban waiting --session <id>` or `kanban detach --session <id>`, and an immediate stop.
+Closure invariant for non-interactive **executor** jobs: after implementation and verification are complete, do not stop at a progress update, green test report, or pending specialist review. Record final context and run `kanban done <id> --session <id> --agent` in the same execution unless a blocking ambiguity requires `kanban ask --agent`, or a long-running detached result requires `kanban waiting --session <id>` or `kanban detach --session <id>`, and an immediate stop. A designer finishes its phase with the same `done` command after recording the plan (no implementation). A reviewer finishes only with `kanban verdict`.
 
 ### Agent Auto-Launch
 When a task is handed to an agent (`take --agent`, or the TUI `r` Run action) and auto-launch is enabled, the CLI spawns the agent itself:
 - Builds a non-interactive command per backend (see "Agent Backends"). Model resolves from `task.ai_model`, else the backend default; reasoning effort from `task.ai_effort`, else the backend `effort` default.
 - The assembled prompt is written to `.kanban/logs/<session>.prompt.txt`. The wrapper feeds it as the last argument with `"$(cat -- <file>)"` so the body is never placed on the tmux/`bash -c` argv (ARG_MAX / `ps`).
-- The prompt instructs the agent to: work only on this task, use the provided `KANBAN_SESSION`/`KANBAN_TASK_ID` env vars, back up touched files, record progress via `kanban context`, and finish with `kanban done --agent`. When `interactive: true`, blocking questions go through `kanban ask --wait --session <id>`. Long detached waits go through `kanban detach --session <id> -- <command>` (preferred; survives the session and records output/exit code under `.kanban/detached/`) or a manual `setsid`/`nohup` launch plus `kanban waiting --session <id>` — the prompt warns that plain background jobs die with the session's process group. Clean exits that leave a task In Progress without `done`, `ask`, or `waiting` are automatically resumed up to `max_auto_resumes`. The prompt stays backend-neutral.
+- The prompt is role-scoped (`Role` from the task's run phase): an executor backs up touched files, records progress via `kanban context`, and finishes with `kanban done --agent` (never a move to Done); a designer records a plan and finishes the design phase with `done` without implementing or moving the task; a reviewer checks the result and exits only via `kanban verdict`. When `interactive: true`, blocking questions go through `kanban ask --wait --session <id>`. Long detached waits go through `kanban detach --session <id> -- <command>` (preferred; survives the session and records output/exit code under `.kanban/detached/`) or a manual `setsid`/`nohup` launch plus `kanban waiting --session <id>` — the prompt warns that plain background jobs die with the session's process group. Clean exits that leave a task In Progress without `done`, `ask`, `verdict`, or `waiting` are automatically resumed up to `max_auto_resumes`. The prompt stays backend-neutral.
 - If `use_tmux` and tmux is available → `tmux new-session -d` with stdin/stdout/stderr detached from the TUI TTY (`-x`/`-y` size, `-c` work path; tmux stderr goes to `.kanban/logs/<session>.tmux.err`). A non-zero tmux exit takes the same background fallback as a missing tmux binary; the exact error is posted on the thread and returned to the TUI status bar instead of `eprintln`. Either way agent stdout/stderr is teed to `.kanban/logs/<session>.log`. Session ids are prefixed by backend (`ses-<backend>-...`).
 - While the TUI owns the terminal, `operations` never writes to stderr (`eprintln`). After a TUI-initiated launch (run / revoke / re-run / revert, or an expired-wait relaunch) the event loop `terminal.clear()`s and fully redraws, same as after attach, so a leaked glyph cannot desync ratatui's buffer from the alternate screen.
 - Agent exit is watched to reconcile task/session state.
+
+### Queue Dispatcher (`core/scheduler.rs`)
+
+`Operations::dispatch_queue()` starts queued tasks while the concurrency caps
+have room. It is a plain library call with no TUI or terminal assumptions.
+
+**Occupied slots.** The census (`Slots::measure`) counts every **In Progress**
+task whose session state is `Live` or `Waiting` — a waiting agent still owns a
+process and a subscription budget, so it keeps its slot. Tasks in phase
+`queued` own no session and count for nothing. Each counted task is bucketed by
+its **resolved** launch settings (task override, else the backend default), so
+a task that inherits the backend model is counted under the same
+`<backend>/<model>` key as one that names it explicitly, and by its role
+(`Role::from_phase`). Before counting, dispatch reaps dead sessions exactly as
+`check-sessions` does — otherwise a session whose process died silently would
+hold its slot until the `session_heartbeat_timeout` (30 min) — and runs
+`due_restarts()`.
+
+**Candidate order is the board's own sort.** `tui.task_sort` is mapped onto the
+same `sort_tasks(by, order)` call the board screen uses (`task_number` →
+id/asc, `task_number_desc` → id/desc, `updated_at_asc`/`updated_at_desc` →
+updated/asc|desc, legacy `completion_date` → updated/desc, anything unknown →
+id/asc). Changing the board sort therefore changes the queue priority. Only
+queued tasks with no pending `restart_at` in the future are candidates.
+
+**Caps.** For each candidate the dispatcher resolves the launch settings and
+the phase it would enter (`upcoming_run_plan`: `design` when the designer is
+enabled and no review bounce has happened yet, else `execute`), then asks
+`Slots::blocking_cap` for the first cap that refuses one more agent. Caps are
+checked total → backend → backend/model → role, and a cap of `0` or an absent
+entry is unlimited.
+
+- The **global total** is the only head-of-line-blocking cap: hitting it stops
+  the walk (`DispatchDecision::Stop`).
+- Every other cap only **skips** its own candidate and the walk continues, so a
+  full claude quota never holds back an opencode task.
+
+**Claiming.** Because several pumps can run at once, a start is claimed under
+the board lock: re-read the task, verify it is still In Progress with phase
+`queued`, no live session and no future `restart_at`, re-measure the caps, mint
+the session id, flip the phase and persist — all in one locked
+read-modify-write. The launch itself happens outside the lock. A launch failure
+hands the task to the crash-restart backoff instead of hot-looping.
+
+**Pump points** — `dispatch_queue()` is a library call, not a process of its
+own; something has to call it. Four of the five callers need a human or an
+agent to be present; only (5) runs on a clock:
+
+1. `App::tick` → `dispatch_queue_throttled`, at most once every 5 s (the census
+   walks every In Progress task). Errors land in the status line.
+2. `kanban check-sessions` — the manual headless one-shot.
+3. `reconcile_agent_exit` — an exit frees a slot, so the launch wrapper pumps
+   the queue even with no TUI open.
+4. `kanban verdict --changes` with `on_changes_requested: in_progress`, which
+   re-queues the task and pumps immediately.
+5. `kanban daemon` — the scheduled headless pump. `--once` is one tick; the
+   looping form is what the systemd user unit runs. Without it, a queued task
+   or a due crash-restart sits until something calls (1)–(4).
+
+### Headless Dispatcher Daemon (`core/daemon.rs`, `cli/daemon.rs`)
+
+This is the answer to "nothing starts while the TUI is closed". Pump points
+(1)–(4) all need someone present: a TUI on screen, an agent exiting, or a
+command typed by hand. Queue five tasks, close the TUI and walk away, and
+without the daemon the queue stops at the concurrency cap and a due
+crash-restart never fires. `kanban daemon` is the one pump that runs on a
+clock.
+
+```
+kanban daemon [--interval SECONDS] [--once] [--project <id|name|path>]
+```
+
+It is a **foreground loop and never forks** — daemonizing is the supervisor's
+job (systemd, or `&` in a shell). `core/daemon.rs` holds the store-wide tick
+and the lock and has no terminal assumptions; `cli/daemon.rs` is the loop,
+the sleep and the log append.
+
+**Per-tick order.** For every project in the store registry
+(`ProjectStore::list()`, or only the one named by the global `--project` flag),
+`pump_project` runs four steps in a fixed order:
+
+1. `resume_expired_waits()` — a declared wait whose `wait_until`
+   (`eta × waiting_eta_multiplier`) has passed **and** whose process is gone
+   (`wait_exited`, or silent longer than `session_heartbeat_timeout`) is
+   relaunched to collect the result; a still-heartbeating agent past its own
+   ETA is left alone, and a task out of `max_auto_resumes` is crashed instead.
+2. **Reap** — `SessionManager::check_sessions(session_heartbeat_timeout)` marks
+   dead sessions crashed, and each one is offered to `schedule_crash_restart`
+   (which is itself a no-op when `auto_restart` is off or the backoff schedule
+   is spent — see **Crash Auto-Restart**).
+   Reaping comes **before** scheduling for the same reason it does inside
+   `dispatch_queue`: `check_sessions` only returns sessions it *just* marked
+   crashed, so a later tick would never see them again.
+3. `due_restarts()` — crash-restarts whose `restart_at` has passed go back to
+   phase `queued`.
+4. `dispatch_queue()` — the normal cap-checked dispatch described above.
+
+So a crash detected in tick *N* is scheduled in the same tick, and started in
+whichever later tick its backoff comes due. The daemon adds no new rules: it
+calls the same `Operations` methods the TUI does, and starts land under the
+same locked claim, so a daemon and an open TUI pumping the same board at the
+same time is safe.
+
+**`--once` vs. the loop.** `--once` runs a single tick and exits — the cron /
+systemd-*timer* entry point. Without it the process ticks, sleeps
+`interval`, and repeats forever; that is what the systemd *service* runs.
+
+**Interval.** Seconds between ticks, resolved as `--interval`, else the store
+`daemon.interval`, else 60. `--interval 0` is rejected outright; a `0` or
+unparseable `daemon.interval` in the config silently falls back to 60. This is
+the only orchestration cadence that lives in **Global Settings**
+(`<store>/config.yaml`) rather than a board's `.kanban/config.yaml`, because
+the daemon spans projects — see **Global Settings**.
+
+**Single instance.** Startup `flock`s `<store>/daemon.lock` (exclusive,
+non-blocking). A second daemon exits with
+`kanban daemon is already running (holds …)` rather than blocking or racing.
+The lock is held for the process lifetime and released on exit. It does *not*
+exclude a TUI or a `check-sessions` run — two daemons are merely pointless,
+concurrent pumps are not unsafe.
+
+**One bad project cannot kill the loop.** A project with
+`orchestration.queue_enabled: false` is skipped silently. A project whose work
+folder has disappeared is skipped with **one** warning (remembered in a
+`warned_missing` set, so it is not repeated every tick). Any other per-project
+error is printed as a `warning:` line and the loop continues to the next
+project.
+
+**Logging.** One timestamped line per `resume` / `reap` / `restart` /
+`dispatch` (plus warnings), written to stdout *and* appended to
+`<store>/logs/daemon.log`. Quiet otherwise, so `journalctl --user -u kanban4ai`
+stays readable.
+
+**systemd user unit.** `packaging/systemd/kanban4ai.service` — `Type=simple`,
+`ExecStart=… daemon`, `Restart=on-failure`, `RestartSec=30`, `WantedBy=default.target`.
+It is **never enabled automatically** by any install path:
+
+- `scripts/install.sh --with-daemon` copies it to
+  `${XDG_CONFIG_HOME:-~/.config}/systemd/user/kanban4ai.service`, rewriting
+  `ExecStart` to the prefix that install used. Without the flag no unit is
+  written at all (`scripts/test-packaging.sh` asserts both halves: no unit
+  without the flag, and no `default.target.wants/` symlink with it).
+- The AUR packages install the unit under `/usr/lib/systemd/user/` and stop
+  there.
+
+Enable it yourself:
+
+```sh
+systemctl --user enable --now kanban4ai.service
+journalctl --user -u kanban4ai
+```
+
+**Non-systemd fallback.** A crontab line calling the one-shot form:
+
+```
+* * * * * kanban daemon --once
+```
+
+`kanban check-sessions` remains the manual one-shot equivalent for the current
+project — same steps, no lock, no loop.
+
+### Crash Auto-Restart
+
+Distinct from `max_auto_resumes`, and deliberately on a separate counter —
+these are different failure modes:
+
+| | trigger | budget | field |
+|---|---|---|---|
+| auto-resume | **clean** exit that left the task stranded In Progress, or an expired wait | `thresholds.max_auto_resumes` (3) | `auto_resumes` |
+| crash restart | session **crashed**: non-zero exit or heartbeat timeout | `orchestration.auto_restart.delays_minutes` (`[1, 30, 270]`: 3 attempts, waiting 1 min after the first crash, 30 min after the second, 270 min after the third) | `crash_restarts` + `restart_at` |
+
+On a crash, `schedule_crash_restart` sets
+`restart_at = now + delays_minutes[crash_restarts]`, leaves the task In
+Progress with phase `queued`, and the card shows `↻ retry HH:MM`. When the
+deadline passes, `due_restarts()` — same pump points — increments
+`crash_restarts`, clears `restart_at` and hands the task back to the normal
+queue; the dispatcher starts it, so a retry after a subscription-limit crash is
+gated by exactly the same caps as any other run. Once the schedule is spent the
+task stays crashed and notifies, like an exhausted resume budget. Any human
+action on the task (run, re-run, recover, take, queue, unqueue) resets
+`crash_restarts` and `restart_at` via `Task::reset_human_restart()`. Setting
+`auto_restart.enabled: false` disables the whole mechanism and restores the
+previous behavior (crashed tasks wait for `u` recover).
+
+Because a crash restart runs *through* the queue, `schedule_crash_restart` also
+requires `orchestration.queue_enabled` **and** `auto_launch.enabled` to be on.
+With either off it schedules nothing and the task simply stays crashed and
+recoverable: promising a retry the dispatcher can never honour would leave the
+card wearing a `↻ retry` badge forever.
 
 ### Task Chaining
 A task may carry a `chained_to` target task id. When the **target** task enters Review — via `move` or an agent's `done` — every task whose `chained_to` equals that id and is still in **To Do** is auto-run with a fresh per-task session (its own backend/model/persona/description). Only the To-Do→Review transition fires it (re-entering Review does not). Gated by the `auto_launch_chained` rule and `auto_launch.enabled`.
@@ -607,7 +994,7 @@ are never clipped while columns of plain cards keep the configured
 How much of each AI subscription window is left, drawn as one row directly
 above the status bar on the Board and Projects screens (`✳ claude 5h 66% ↻3h30m
 · 7d 95% ↻6d11h │ ✺ codex mon 75% ↻18d (7d old) │ ✕ grok 7d 93% ↻4d22h │ ◆ zai
-5h 85% ↻4h48m · 7d 97% ↻6d23h │ ✦ synthetic 5h 91% ↻3h59m · 7d 12% ↻3h22m`), and
+5h 85% ↻4h48m · 7d 97% ↻6d23h │ ✦ synthetic 5h 91% ↻3h59m · 7d 12% ↻3h22m │ ◉ yolo 1d 40% ↻8h · conc 100%`), and
 printed by `kanban limits`. Percentages are what remains (100 − used), not what
 is spent.
 
@@ -678,11 +1065,21 @@ Sources, all read-only and best effort:
   at `nextRegenAt`). Both quotas regenerate in small ticks rather than resetting
   on a timer, so the reset time is the next capacity gain. The key never
   expires, so the segment needs no CLI-driven click refresh.
+- **yolo**: `GET https://yolo-auto.com/v1/usage` with `$YOLO_API_KEY` or the
+  custom yolo provider's `apiKey` from opencode (`~/.config/opencode/opencode.json`,
+  `$XDG_CONFIG_HOME` respected), omp (`~/.omp/agent/models.yml`), or pi
+  (`models.json` under `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`). A provider
+  counts as yolo when its id/name contains `yolo` or its `baseURL` points at
+  `yolo-auto.com`. Yields a daily (`1d`) and weekly (`7d`) request window when
+  the plan publishes `limits.requests` (remaining preferred; `project.dailyRequestLimit`
+  is the day fallback) and live concurrency (`conc`, `concurrencySlots` of
+  `maxConcurrency`). The key never expires, so the segment needs no CLI-driven
+  click refresh.
 
 HTTPS goes through `curl -K -`, with the request config (URL and headers) piped
 on stdin: no TLS dependency is linked into the crate, and bearer tokens never
 appear in a command line where `ps` would expose them. `curl` is an optional
-dependency — without it claude, grok, zai, and synthetic degrade to `n/a` and
+dependency — without it claude, grok, zai, synthetic, and yolo degrade to `n/a` and
 codex still works.
 
 A provider with no credentials on the machine reports `not_configured` and is
@@ -698,14 +1095,17 @@ carry their true observation time (`observed_at`: the last statusline tick, or
 the fetch time for an HTTP 200), so both the row and the CLI can show their
 age the way codex
 rollouts do. A window whose `resets_at` has passed is dropped from the row and
-from `kanban limits` (its percentage describes a period that is over); a
-provider whose windows have all rolled over reads `stale` rather than freezing
+from `kanban limits` (its percentage describes a period that is over), unless
+it is a tick-regenerating quota (`LimitWindow.rolling`, synthetic's windows):
+there the reset time is the next capacity gain, not the end of the window, so
+the percentage stays until the next poll refreshes it. A provider whose
+windows have all rolled over reads `stale` rather than freezing
 yesterday's number. The renderer only ever draws
 `App::limits`, the snapshot the event loop last pulled from that cache, and
 degrades with width: reset times drop first, then window labels and provider
 names, then whole providers from the right.
 
-**Click refresh**: the claude, codex, and grok segments of the row are hitboxes
+**Click refresh**: every provider segment of the row is a hitbox
 (`UiAction::RefreshLimits`); a click refreshes that provider on a background
 thread (`refresh_provider_async`, guarded against overlapping runs) and merges
 the result into the same caches, so the row updates on the next tick. A click
@@ -714,16 +1114,19 @@ and the current-bridge short-circuit the background refresh honors) and merges
 the result with whatever the statusline bridge still holds. codex is queried
 live over the app-server JSON-RPC (`initialize` + `account/rateLimits/read`,
 camelCase payload, answers in ~1s, spends no usage, and falls back to the
-rollout files on any failure), and running `grok models` renews the short-lived
+rollout files on any failure), running `grok models` renews the short-lived
 OIDC token in `~/.grok/auth.json` before the billing fetch — that fixes both
 "codex numbers only as fresh as the last run" and "grok reads signed out after
-~6h" without a periodic poller. Both CLIs run in the scratch cwd
-`<store>/limits-refresh-cwd` so stray session state never lands in a project.
-The zai and synthetic segments stay display-only: their keys are long-lived and
-the background poll keeps them fresh. A 429 from the
+~6h" without a periodic poller — and zai / synthetic / yolo re-fetch over HTTPS
+(their keys are long-lived, so no renewal step is needed). Both CLIs run in
+the scratch cwd `<store>/limits-refresh-cwd` so stray session state never
+lands in a project. A 429 from the
 usage endpoint keeps the last good Claude windows (the row does not flip to
-`n/a`) and doubles the snapshot TTL before the next background poll, capped
-at 64×.
+`n/a`) and doubles the claude usage-endpoint poll interval before the next
+poll, capped at 64×; the backoff is claude's own and never delays the other
+providers. A transient fetch failure likewise keeps the cached numbers rather
+than flipping a provider to `n/a`; only a real state change (signed out,
+credentials removed) replaces them.
 
 ### Storage Directories (under `<data_root>/.kanban/`)
 
@@ -748,6 +1151,12 @@ Provider limit snapshots are machine-wide, not per board: they live in
 `claude-rate-limits.json` and the `claude-usage-poll` marker that spaces out
 the OAuth usage polls (see **Projects & Store**).
 
+The dispatcher daemon is machine-wide for the same reason — it ticks every
+registered project — so its two files sit at the store root, not under any
+board's `.kanban/`: `<store>/daemon.lock` (the exclusive single-instance
+`flock`) and `<store>/logs/daemon.log` (one appended line per
+resume/reap/restart/dispatch). See **Headless Dispatcher Daemon**.
+
 ### Projects & Store
 
 Each registered project splits two roles that used to be the same folder:
@@ -765,6 +1174,9 @@ Store root resolution (empty or relative values are ignored):
 ```
 <store>/
 ├── .lock                       # flock, serializes registry mutations
+├── daemon.lock                 # exclusive lock for `kanban daemon`
+├── logs/daemon.log             # one line per daemon resume/reap/restart/dispatch
+├── config.yaml                 # machine-wide settings (`daemon.interval`, TUI)
 └── projects/
     └── <id>/                   # data_root; slug of the folder name, deduped
         ├── project.yaml        # id, name, work_path, timestamps, migrated_from
@@ -788,7 +1200,8 @@ scan of `projects/*/project.yaml`. The `id` is stable (`rename` changes only
    board is left in place and one warning is printed to stderr; the next
    command retries
 5. Nothing resolves: `init` / `project add` create; `tui` / bare `kanban`
-   open the projects list; every other command errors
+   open the projects list; `daemon` ticks every registered project; every
+   other command errors
    (`not inside a kanban project; run kanban init or kanban project add`)
 
 **Migration** (`init`, `project add`, TUI add, silent adoption) is one path:
