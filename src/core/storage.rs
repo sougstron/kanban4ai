@@ -215,6 +215,8 @@ impl Storage {
         task.agent_backend = new_task.agent_backend;
         task.agent_name = new_task.agent_name;
         task.interactive = new_task.interactive;
+        task.use_designer = new_task.use_designer;
+        task.use_reviewer = new_task.use_reviewer;
         task.chained_to = new_task.chained_to;
         task.status = status;
         if matches!(status, TaskStatus::Review | TaskStatus::Done) {
@@ -409,6 +411,8 @@ pub struct NewTask {
     pub agent_backend: Option<String>,
     pub agent_name: Option<String>,
     pub interactive: bool,
+    pub use_designer: bool,
+    pub use_reviewer: bool,
     pub chained_to: Option<String>,
 }
 

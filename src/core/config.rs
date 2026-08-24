@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::core::error::{KanbanError, Result};
-use crate::core::models::Role;
+use crate::core::models::{Role, Task};
 use crate::core::storage::atomic_write_text;
 
 /// Written verbatim by `kanban init`; also the source of per-key fallbacks.
@@ -292,6 +292,16 @@ pub struct ReviewerSettings {
     /// Consecutive bot-review bounces before falling through to human Review.
     /// `0` means unlimited.
     pub max_rounds: i64,
+}
+
+impl OrchestrationSettings {
+    pub fn designer_enabled_for(&self, task: &Task) -> bool {
+        self.designer.enabled || task.use_designer
+    }
+
+    pub fn reviewer_enabled_for(&self, task: &Task) -> bool {
+        self.reviewer.enabled || task.use_reviewer
+    }
 }
 
 impl ReviewerSettings {

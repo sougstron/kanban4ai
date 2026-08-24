@@ -6,13 +6,13 @@ expression: output
 │TASK-001 Detail phase                                                                             │
 │Status: in_progress · queued │ Session: - │ Interactive: false                                    │
 │Backend: default │ Model: - │ Effort: - │ Agent: - │ Chain: -                                     │
-│Created: <timestamp> │ Updated: <timestamp>                         │
+│Created: <timestamp> │ Updated: <timestamp>                                                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Thread ──────────────────────────────────────────────────────────────────────────────────────────┐
 │MSG-001 · system · open                                                                           │
 │Task created: Detail phase                                                                        │
 │Status: todo                                                                                      │
-│Created at: <timestamp>                                                            │
+│Created at: <timestamp>                                                                           │
 │                                                                                                  │
 │MSG-002 · task · open                                                                             │
 │(no description provided)                                                                         │

@@ -68,7 +68,7 @@ tests/
 ```
 
 ### Data Model
-- **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, ai_model, ai_effort, agent_backend, agent_name, chained_to, review_edits, auto_resumes, completed_at, run_phase, crash_restarts, restart_at, review_rounds, designed. `description` is the **user-authored task only** — agent work-context lives in the thread (see "Context, questions & review edits"). `interactive: true` enables the thread-based blocking question loop for delegated agents. `chained_to` is an optional target task id: when that target enters Review, this task auto-runs (see "Task Chaining"). `review_edits` is the single editable buffer for the human's review feedback; it is folded into the thread and cleared on the next re-run from Review. `auto_resumes` counts consecutive automatic relaunches after clean exits or expired waits and resets on human starts/recoveries. `completed_at` records the most recent transition that completed work into Review or Done; a rerun keeps the previous value while active and replaces it when the agent completes again. `session` names the **last** session that worked the task, not only a running one: it survives the session's end (done, stop, recover, unarchive, failed launch) so the task keeps a record of who ran it, and is overwritten by the next session. Whether that session is alive is decided by its session record — never by this field being set. `agent_backend`/`ai_model`/`ai_effort`/`agent_name` are likewise a record of the last launch: each launch pins the value it resolved (the task's own field where set, the backend's configured default otherwise) onto the task — except for designer/reviewer launches, which must not overwrite the task's assigned executor settings. `run_phase` is the In Progress sub-state (`queued`/`design`/`execute`/`review`, see "Run Phases"); it is `None` on every other column and on legacy boards, where it reads as `execute`. `crash_restarts` counts consumed crash auto-restarts and `restart_at` is the pending backoff deadline (both distinct from `auto_resumes`); `review_rounds` counts consumed bot-review bounces. `designed` records that a designer pass already finished and its plan is on the thread. The relaunch bookkeeping is cleared in two grades: `Task::reset_auto_restart()` clears `auto_resumes`, `crash_restarts` and `restart_at`, and `Task::reset_human_restart()` clears those **and** `review_rounds`. A human restart of the *work* (run, re-run from Review, recover, take, queue) uses the second; a human nudge to a run that is still the same run (wake/revoke, re-run of a stranded session) uses the first, so a task woken mid-review does not re-arm `reviewer.max_rounds` from zero and reopen the bounce loop the cap exists to stop.
+- **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, use_designer, use_reviewer, ai_model, ai_effort, agent_backend, agent_name, chained_to, review_edits, auto_resumes, completed_at, run_phase, crash_restarts, restart_at, review_rounds, designed. `description` is the **user-authored task only** — agent work-context lives in the thread (see "Context, questions & review edits"). `interactive: true` enables the thread-based blocking question loop for delegated agents. `use_designer` / `use_reviewer` opt this task into the project designer or reviewer bot even when that bot is off board-wide; models and agents still come from `orchestration.designer` / `orchestration.reviewer`. Either flag ORs with the matching project `enabled` switch. Omitted from frontmatter while false. `chained_to` is an optional target task id: when that target enters Review, this task auto-runs (see "Task Chaining"). `review_edits` is the single editable buffer for the human's review feedback; it is folded into the thread and cleared on the next re-run from Review. `auto_resumes` counts consecutive automatic relaunches after clean exits or expired waits and resets on human starts/recoveries. `completed_at` records the most recent transition that completed work into Review or Done; a rerun keeps the previous value while active and replaces it when the agent completes again. `session` names the **last** session that worked the task, not only a running one: it survives the session's end (done, stop, recover, unarchive, failed launch) so the task keeps a record of who ran it, and is overwritten by the next session. Whether that session is alive is decided by its session record — never by this field being set. `agent_backend`/`ai_model`/`ai_effort`/`agent_name` are likewise a record of the last launch: each launch pins the value it resolved (the task's own field where set, the backend's configured default otherwise) onto the task — except for designer/reviewer launches, which must not overwrite the task's assigned executor settings. `run_phase` is the In Progress sub-state (`queued`/`design`/`execute`/`review`, see "Run Phases"); it is `None` on every other column and on legacy boards, where it reads as `execute`. `crash_restarts` counts consumed crash auto-restarts and `restart_at` is the pending backoff deadline (both distinct from `auto_resumes`); `review_rounds` counts consumed bot-review bounces. `designed` records that a designer pass already finished and its plan is on the thread. The relaunch bookkeeping is cleared in two grades: `Task::reset_auto_restart()` clears `auto_resumes`, `crash_restarts` and `restart_at`, and `Task::reset_human_restart()` clears those **and** `review_rounds`. A human restart of the *work* (run, re-run from Review, recover, take, queue) uses the second; a human nudge to a run that is still the same run (wake/revoke, re-run of a stranded session) uses the first, so a task woken mid-review does not re-arm `reviewer.max_rounds` from zero and reopen the bounce loop the cap exists to stop.
 - **Session**: id, task_id, started_at, status (active/closed/crashed), last_seen, wait_until, wait_note, wait_exited. `wait_until`/`wait_note` are set by `kanban waiting`; `wait_exited` means the agent process ended during the declared wait and should be relaunched after the deadline.
 - **MessageRole** / **MessageKind** / **MessageStatus**: enums for thread message author, type, and lifecycle state. `MessageKind` is one of `system`, `task`, `question`, `suggestion`, `context`, or `review_edit`.
 - New tasks initialize their sidecar thread with `system` and `task` messages: `MSG-001` records creation metadata, `MSG-002` stores the initial user-authored task body so the TUI can render the whole conversation from the thread.
@@ -195,7 +195,7 @@ messages:
 - `kanban project path [id|name|path]` - Print the work path (defaults to the current project)
 - `kanban project remove <id|name> [--purge] [--yes]` - Unregister; `--purge` also deletes board data. Interactive confirm unless `--yes`
 - `kanban project open <id|name|path>` - Open the TUI on that project
-- `kanban create <title> [--backend opencode|claude|omp|pi] [--model M] [--effort E] [--agent-name P] [--interactive] [--chain-to TASK-NNN]` - Create task
+- `kanban create <title> [--backend opencode|claude|omp|pi] [--model M] [--effort E] [--agent-name P] [--interactive] [--designer] [--reviewer] [--chain-to TASK-NNN]` - Create task. `--designer` / `--reviewer` opt this task into the project designer or reviewer bot without turning that bot on for the whole board.
 - `kanban chain <id> [<target_id>] [--clear]` - Show, set, or clear chaining
 - `kanban list` - List tasks
 - `kanban show <id>` - Show task details
@@ -300,7 +300,7 @@ How a task enters each phase:
   session, sets `designed: true`, flips the phase to `execute`, and launches the task's own bot
   directly on the same slot (re-queueing would stall a task whose slot is
   already paid for). The plan reaches the executor through the thread.
-- **`execute` → `review`** — when `orchestration.reviewer.enabled`, the point
+- **`execute` → `review`** — when `orchestration.reviewer.enabled` or this task has `use_reviewer`, the point
   where `auto_move_on_complete` would move the task to Review instead keeps it
   In Progress, sets phase `review`, increments `review_rounds`, and launches the
   reviewer bot with the reviewer's own backend/model.
@@ -319,7 +319,7 @@ Every phase change posts a one-line audit note on the task thread
 Whether a run starts at `design` or `execute` is decided by the task's
 `designed` flag, never by a counter. A crash restart, a `Q` re-queue or a
 review bounce of a task that already has its plan resumes the **executor**;
-only a task with no plan yet goes to the designer. `designed` is cleared when a
+only a task with no plan yet goes to the designer, and only when the designer is on for the project or this task (`use_designer`). `designed` is cleared when a
 human sends the task back to To Do (`recover`, or a human move whose target is
 To Do) — that is a fresh attempt, so the next run plans again. A reviewer
 bounce routed by `on_changes_requested: todo` does **not** clear it: the plan
@@ -450,14 +450,14 @@ orchestration:
 - `auto_restart.delays_minutes`: `[1, 30, 270]` - backoff schedule; entry *n*
   is the wait before attempt *n+1*, and its length is the attempt budget.
   Entries must be positive integers
-- `designer.enabled`: false - run a planning pass before execution
+- `designer.enabled`: false - run a planning pass before execution on every task. A single task can still opt in with `use_designer` / the create-dialog Designer checkbox / `kanban create --designer`
 - `designer.backend` / `model` / `effort` / `agent`: `claude` / `sonnet` /
   unset / unset - the designer bot's own launch settings, used instead of the
   task's assignment. An unset (or blank) backend falls back to
   `auto_launch.default_agent`, and a name with no `agents:` entry falls back to
   `opencode`, matching the task path; unset model/effort/agent inherit that
   backend's configured defaults
-- `reviewer.enabled`: false - run a bot review before human Review
+- `reviewer.enabled`: false - run a bot review before human Review on every task. A single task can still opt in with `use_reviewer` / the create-dialog Reviewer checkbox / `kanban create --reviewer`
 - `reviewer.backend` / `model` / `effort` / `agent`: same defaults and same
   fallback chain as the designer
 - `reviewer.on_changes_requested`: `in_progress` - where `kanban verdict
@@ -669,7 +669,8 @@ painted crashed. The review-edits editor is
 editable only while the task is in Review (read-only or hidden otherwise), and
 saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
 `Ctrl+R` / action-bar button. Create/edit dialogs expose an `interactive`
-checkbox and a "Chain to task" selector. The backend selector leads with
+checkbox, Designer and Reviewer checkboxes under it (per-task opt-in; models
+and agents come from project settings), and a "Chain to task" selector. The backend selector leads with
 "Default backend", which leaves the task's `agent_backend` unset so launches
 follow `auto_launch.default_agent` from settings; the label shows the agent it
 resolves to, and the detail view shows `default` while no launch has pinned a

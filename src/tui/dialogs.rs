@@ -95,6 +95,8 @@ pub enum DialogField {
     Agent,
     ChainTo,
     Interactive,
+    UseDesigner,
+    UseReviewer,
     TargetStatus,
     MessageKind,
     Question,
@@ -130,7 +132,7 @@ pub enum DialogField {
     PurgeData,
 }
 
-const TASK_FORM_FIELDS: [DialogField; 8] = [
+const TASK_FORM_FIELDS: [DialogField; 10] = [
     DialogField::Title,
     DialogField::Description,
     DialogField::Backend,
@@ -139,6 +141,8 @@ const TASK_FORM_FIELDS: [DialogField; 8] = [
     DialogField::Agent,
     DialogField::ChainTo,
     DialogField::Interactive,
+    DialogField::UseDesigner,
+    DialogField::UseReviewer,
 ];
 
 const SETTINGS_FORM_FIELDS: [DialogField; 28] = [
@@ -251,6 +255,8 @@ pub struct ModalState {
     pub theme: TextArea<'static>,
     pub task_sort: TextArea<'static>,
     pub interactive: bool,
+    pub use_designer: bool,
+    pub use_reviewer: bool,
     pub escape_to_projects: bool,
     pub project_sort: TextArea<'static>,
     pub form_scroll: usize,
@@ -330,6 +336,8 @@ impl ModalState {
             theme: one_line("dark"),
             task_sort: one_line("task_number"),
             interactive: false,
+            use_designer: false,
+            use_reviewer: false,
             escape_to_projects: false,
             project_sort: one_line("name"),
             form_scroll: 0,
@@ -393,6 +401,8 @@ impl ModalState {
         state.agent = one_line(task.agent_name.as_deref().unwrap_or(""));
         state.chain_to = one_line(task.chained_to.as_deref().unwrap_or(""));
         state.interactive = task.interactive;
+        state.use_designer = task.use_designer;
+        state.use_reviewer = task.use_reviewer;
         state
     }
 
@@ -407,6 +417,8 @@ impl ModalState {
                 DialogField::Agent,
                 DialogField::ChainTo,
                 DialogField::Interactive,
+                DialogField::UseDesigner,
+                DialogField::UseReviewer,
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
@@ -847,7 +859,9 @@ impl ModalState {
         match self.active_field() {
             DialogField::Title => input_single_line(&mut self.title, key),
             DialogField::Description => {
-                self.description.input(key);
+                if !super::app::apply_word_edit(&mut self.description, key) {
+                    self.description.input(key);
+                }
             }
             DialogField::Backend => self.input_select(key, SelectorKind::Backend),
             DialogField::Model => self.input_select(key, SelectorKind::Model),
@@ -861,6 +875,8 @@ impl ModalState {
                     self.interactive = !self.interactive;
                 }
             }
+            DialogField::UseDesigner => toggle_on_space(&mut self.use_designer, key),
+            DialogField::UseReviewer => toggle_on_space(&mut self.use_reviewer, key),
             DialogField::EscapeToProjects => {
                 if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
                     self.escape_to_projects = !self.escape_to_projects;
@@ -985,7 +1001,10 @@ impl ModalState {
             DialogField::Effort => &mut self.effort,
             DialogField::Agent => &mut self.agent,
             DialogField::ChainTo => &mut self.chain_to,
-            DialogField::Interactive | DialogField::EscapeToProjects => &mut self.answer,
+            DialogField::Interactive
+            | DialogField::UseDesigner
+            | DialogField::UseReviewer
+            | DialogField::EscapeToProjects => &mut self.answer,
             DialogField::ProjectSort => &mut self.project_sort,
             DialogField::TargetStatus => &mut self.target_status,
             DialogField::MessageKind => &mut self.description,
@@ -1562,6 +1581,8 @@ impl ModalState {
             raw_textarea_text(&self.chain_to),
             raw_textarea_text(&self.target_status),
             self.interactive.to_string(),
+            self.use_designer.to_string(),
+            self.use_reviewer.to_string(),
             self.backend_selected.to_string(),
             self.model_selected.to_string(),
             self.effort_selected.to_string(),
@@ -2026,6 +2047,8 @@ fn task_field_min_height(field: DialogField) -> u16 {
     match field {
         DialogField::Title
         | DialogField::Interactive
+        | DialogField::UseDesigner
+        | DialogField::UseReviewer
         | DialogField::EscapeToProjects
         | DialogField::QueueEnabled
         | DialogField::AutoRestartEnabled
@@ -2374,6 +2397,24 @@ fn render_selector_field(
             modal.filter_error == Some(field),
         ),
         DialogField::Interactive => render_interactive(frame, app, modal, area),
+        DialogField::UseDesigner => render_checkbox(
+            frame,
+            app,
+            area,
+            "Designer",
+            "designer for this task",
+            modal.use_designer,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::UseReviewer => render_checkbox(
+            frame,
+            app,
+            area,
+            "Reviewer",
+            "reviewer for this task",
+            modal.use_reviewer,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
         DialogField::EscapeToProjects => render_escape_to_projects(frame, app, modal, area),
         DialogField::Theme => render_select(
             frame,

@@ -117,7 +117,7 @@ fn task_description_height_is_bounded_and_other_editors_remain_unwrapped() {
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     // Tall enough that the description can reach its cap even after the
     // filterable Model and Chain-to selectors claim their filter rows.
-    let _ = render_at(&mut app, 120, 70);
+    let _ = render_at(&mut app, 120, 80);
 
     let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
     assert_eq!(description.height, 10);
@@ -242,6 +242,10 @@ fn key(code: KeyCode) -> KeyEvent {
 
 fn ctrl_key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::CONTROL)
+}
+
+fn alt_key(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::ALT)
 }
 
 #[cfg(unix)]
@@ -375,7 +379,21 @@ fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
 fn normalize_elapsed(line: String) -> String {
     let timestamp = regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?")
         .expect("static timestamp regex");
-    timestamp.replace_all(&line, "<timestamp>").into_owned()
+    if !timestamp.is_match(&line) {
+        return line;
+    }
+    let width = line.chars().count();
+    let replaced = timestamp.replace_all(&line, "<timestamp>").into_owned();
+    let last = replaced.chars().last().unwrap_or(' ');
+    if matches!(last, '│' | '┤' | '┐' | '┘' | '█') {
+        let border_len = last.len_utf8();
+        let without = replaced[..replaced.len() - border_len].trim_end();
+        let pad = width.saturating_sub(without.chars().count() + 1);
+        format!("{without}{}{last}", " ".repeat(pad))
+    } else {
+        let pad = width.saturating_sub(replaced.chars().count());
+        format!("{replaced}{}", " ".repeat(pad))
+    }
 }
 
 fn style_runs(buffer: &Buffer) -> String {
@@ -878,6 +896,57 @@ fn description_enter_shift_and_alt_enter_break_lines() {
     assert_ne!(
         app.modal.as_ref().expect("modal").active_field(),
         DialogField::Description
+    );
+}
+
+#[test]
+fn description_ctrl_delete_and_backspace_remove_words() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let modal = app.modal.as_mut().expect("modal");
+    modal.focus_field(DialogField::Description);
+    modal.description.insert_str("hello world foo");
+
+    app.handle_key(key(KeyCode::End)).expect("end");
+    app.handle_key(ctrl_key(KeyCode::Backspace))
+        .expect("ctrl-backspace");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").description.lines(),
+        ["hello world "]
+    );
+
+    app.handle_key(key(KeyCode::Home)).expect("home");
+    app.handle_key(ctrl_key(KeyCode::Delete))
+        .expect("ctrl-delete");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").description.lines(),
+        [" world "]
+    );
+}
+
+#[test]
+fn description_ctrl_delete_removes_next_word_after_wrap_render() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let modal = app.modal.as_mut().expect("modal");
+    modal.focus_field(DialogField::Description);
+    modal.description.insert_str("hello world foo");
+    let _ = render_at(&mut app, 72, 40);
+
+    app.handle_key(key(KeyCode::Home)).expect("home");
+    app.handle_key(ctrl_key(KeyCode::Delete))
+        .expect("ctrl-delete");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").description.lines(),
+        [" world foo"]
+    );
+
+    app.handle_key(key(KeyCode::Home)).expect("home");
+    app.handle_key(alt_key(KeyCode::Delete))
+        .expect("alt-delete");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").description.lines(),
+        [" foo"]
     );
 }
 
@@ -2220,6 +2289,42 @@ fn review_editor_ctrl_backspace_and_delete_remove_words_when_focused() {
 }
 
 #[test]
+fn review_editor_alt_delete_removes_next_word_like_description() {
+    let (_dir, mut app) = open_focused_review_editor("hello world foo");
+
+    app.handle_key(key(KeyCode::Home)).unwrap();
+    app.handle_key(alt_key(KeyCode::Delete)).unwrap();
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
+        " world foo"
+    );
+}
+
+#[test]
+fn review_editor_ctrl_delete_removes_next_word_after_wrap_render() {
+    let (_dir, mut app) = open_focused_review_editor("hello world foo");
+    let _ = render_at(&mut app, 72, 40);
+
+    app.handle_key(key(KeyCode::Home)).unwrap();
+    app.handle_key(ctrl_key(KeyCode::Delete)).unwrap();
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
+        " world foo"
+    );
+
+    app.handle_key(key(KeyCode::Home)).unwrap();
+    app.handle_key(KeyEvent::new(
+        KeyCode::Delete,
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
+        " foo"
+    );
+}
+
+#[test]
 fn review_editor_ctrl_s_still_saves_after_word_hotkeys() {
     let (_dir, mut app) = open_focused_review_editor("hello world foo");
 
@@ -2455,6 +2560,64 @@ fn open_focused_review_editor(text: &str) -> (tempfile::TempDir, App) {
     app.handle_key(key(KeyCode::Tab)).expect("focus editor");
     assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
     (dir, app)
+}
+
+#[test]
+fn review_edits_soft_wraps_like_task_description() {
+    let prose = "Soft wrapping keeps normal prose readable in a narrow terminal. ";
+    let token = "unbroken".repeat(16);
+    let edits = format!("{prose}{token}");
+    let (_dir, mut app) = open_focused_review_editor(&edits);
+
+    assert_eq!(
+        app.detail
+            .as_ref()
+            .expect("detail")
+            .review_edits
+            .wrap_mode(),
+        WrapMode::WordOrGlyph
+    );
+
+    app.detail
+        .as_mut()
+        .expect("detail")
+        .review_edits
+        .input(key(KeyCode::Home));
+    let prose_view = render_at(&mut app, 72, 40);
+    assert!(prose_view.contains("Soft wrapping"));
+    app.detail
+        .as_mut()
+        .expect("detail")
+        .review_edits
+        .input(key(KeyCode::End));
+
+    let _ = render_at(&mut app, 160, 48);
+    let logical_cursor = app.detail.as_ref().expect("detail").review_edits.cursor();
+    let wide_cursor = app
+        .detail
+        .as_ref()
+        .expect("detail")
+        .review_edits
+        .screen_cursor();
+    let narrow = render_at(&mut app, 72, 40);
+    let detail = app.detail.as_ref().expect("detail");
+    assert_eq!(detail.review_edits.lines(), std::slice::from_ref(&edits));
+    assert_eq!(detail.review_edits.cursor(), logical_cursor);
+    assert!(detail.review_edits.screen_cursor().row > wide_cursor.row);
+    assert!(narrow.contains("unbroken"));
+    assert!(!narrow.contains(&token), "long token must be glyph-wrapped");
+
+    let narrow_cursor = detail.review_edits.screen_cursor();
+    let detail = app.detail.as_mut().expect("detail");
+    detail.review_edits.input(key(KeyCode::Up));
+    assert_eq!(
+        detail.review_edits.screen_cursor().row + 1,
+        narrow_cursor.row,
+        "Up must move by one visual wrapped row"
+    );
+    assert_eq!(detail.review_edits.lines(), std::slice::from_ref(&edits));
+    detail.review_edits.input(key(KeyCode::Down));
+    assert_eq!(detail.review_edits.cursor(), logical_cursor);
 }
 
 #[test]
@@ -4483,7 +4646,7 @@ fn phase_four_forms_scroll_validate_and_protect_dirty_input() {
     app.handle_key(key(KeyCode::Esc)).unwrap();
     app.handle_key(key(KeyCode::Char('n'))).unwrap();
     assert!(!app.modal.as_ref().unwrap().is_dirty());
-    for _ in 0..8 {
+    for _ in 0..10 {
         app.handle_key(key(KeyCode::Tab)).unwrap();
     }
     app.handle_key(key(KeyCode::Enter)).unwrap();
@@ -6774,7 +6937,48 @@ fn interactive_toggles_on_space_only_and_enter_moves_on() {
     app.handle_key(key(KeyCode::Enter)).expect("enter");
     let modal = app.modal.as_ref().expect("modal");
     assert!(modal.interactive, "Enter must not flip the checkbox");
-    assert_eq!(modal.active_field(), DialogField::Confirm);
+    assert_eq!(modal.active_field(), DialogField::UseDesigner);
+}
+
+#[test]
+fn new_task_designer_and_reviewer_toggles_save_on_the_task() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .title
+        .insert_str("Per-task bots");
+    for _ in 0..8 {
+        app.handle_key(key(KeyCode::Tab)).expect("tab");
+    }
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::UseDesigner
+    );
+    app.handle_key(key(KeyCode::Char(' '))).expect("space");
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::UseReviewer
+    );
+    app.handle_key(key(KeyCode::Char(' '))).expect("space");
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::Confirm
+    );
+    app.handle_key(key(KeyCode::Enter)).expect("save");
+
+    let created = app
+        .ops
+        .list_tasks(None, Some("Per-task bots"), "created", "asc")
+        .unwrap()
+        .into_iter()
+        .find(|task| task.title == "Per-task bots")
+        .expect("created task");
+    assert!(created.use_designer);
+    assert!(created.use_reviewer);
 }
 
 #[test]

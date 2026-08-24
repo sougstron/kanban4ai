@@ -440,7 +440,7 @@ fn render_edits_panel(
         area,
         action: HitAction::DetailEdits,
     });
-    let mut review_edits = detail.review_edits.clone();
+    let review_edits = &mut app.detail.as_mut().unwrap().review_edits;
     review_edits.set_block(
         Block::default()
             .title(title)
@@ -453,7 +453,7 @@ fn render_edits_panel(
                 theme.muted
             })),
     );
-    frame.render_widget(&review_edits, area);
+    frame.render_widget(&*review_edits, area);
 }
 
 /// Bottom action bar: contextual buttons that dispatch the same `UiAction`s

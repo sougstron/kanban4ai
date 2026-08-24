@@ -284,6 +284,8 @@ fn rust_written_task_is_parseable_and_stable() {
             agent_backend: Some("claude".into()),
             agent_name: None,
             interactive: true,
+            use_designer: false,
+            use_reviewer: false,
             chained_to: Some("TASK-999".into()),
         })
         .unwrap();

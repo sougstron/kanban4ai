@@ -67,6 +67,53 @@ fn saved_task_quotes_timestamps_for_legacy_python_yaml() {
 }
 
 #[test]
+fn create_task_persists_designer_and_reviewer_flags_and_omits_them_when_false() {
+    let (dir, storage) = temp_board();
+    let plain = storage.create_task(NewTask::titled("Plain")).unwrap();
+    let opted = storage
+        .create_task(NewTask {
+            title: "Opted in".into(),
+            use_designer: true,
+            use_reviewer: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+    assert!(!plain.use_designer);
+    assert!(!plain.use_reviewer);
+    assert!(opted.use_designer);
+    assert!(opted.use_reviewer);
+
+    let plain_raw = fs::read_to_string(
+        dir.path()
+            .join(".kanban/tasks/todo")
+            .join(format!("{}.md", plain.id)),
+    )
+    .unwrap();
+    assert!(
+        !plain_raw.contains("use_designer"),
+        "false flags must stay off the frontmatter: {plain_raw}"
+    );
+    assert!(
+        !plain_raw.contains("use_reviewer"),
+        "false flags must stay off the frontmatter: {plain_raw}"
+    );
+
+    let opted_raw = fs::read_to_string(
+        dir.path()
+            .join(".kanban/tasks/todo")
+            .join(format!("{}.md", opted.id)),
+    )
+    .unwrap();
+    assert!(opted_raw.contains("use_designer: true"), "{opted_raw}");
+    assert!(opted_raw.contains("use_reviewer: true"), "{opted_raw}");
+
+    let reloaded = storage.load_task(&opted.id).unwrap().unwrap();
+    assert!(reloaded.use_designer);
+    assert!(reloaded.use_reviewer);
+}
+
+#[test]
 fn saved_session_quotes_timestamps_for_legacy_python_yaml() {
     let (dir, _storage) = temp_board();
     let manager = SessionManager::new(dir.path());

@@ -268,6 +268,17 @@ pub struct Task {
     pub agent_name: Option<String>,
     #[serde(default)]
     pub interactive: bool,
+    /// Opt this task into the designer bot even when
+    /// `orchestration.designer.enabled` is off. Models and agents still
+    /// come from the project designer settings. Omitted while false so
+    /// legacy boards round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_designer: bool,
+    /// Opt this task into the reviewer bot even when
+    /// `orchestration.reviewer.enabled` is off. Models and agents still
+    /// come from the project reviewer settings. Omitted while false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_reviewer: bool,
     #[serde(default)]
     pub chained_to: Option<String>,
     #[serde(default)]
@@ -348,6 +359,8 @@ impl Task {
             agent_backend: None,
             agent_name: None,
             interactive: false,
+            use_designer: false,
+            use_reviewer: false,
             chained_to: None,
             review_edits: String::new(),
             auto_resumes: 0,

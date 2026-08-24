@@ -69,6 +69,8 @@ pub struct TaskPatch {
     pub agent_backend: Option<Option<String>>,
     pub agent_name: Option<Option<String>>,
     pub interactive: Option<bool>,
+    pub use_designer: Option<bool>,
+    pub use_reviewer: Option<bool>,
     pub chained_to: Option<Option<String>>,
     pub session: Option<Option<String>>,
 }
@@ -311,6 +313,12 @@ impl Operations {
         }
         if let Some(interactive) = patch.interactive {
             task.interactive = interactive;
+        }
+        if let Some(use_designer) = patch.use_designer {
+            task.use_designer = use_designer;
+        }
+        if let Some(use_reviewer) = patch.use_reviewer {
+            task.use_reviewer = use_reviewer;
         }
         if let Some(chained_to) = patch.chained_to {
             task.chained_to = chained_to;
@@ -693,7 +701,7 @@ impl Operations {
             // A task whose plan is already on the thread skips straight to the
             // executor, however this run was started (see `upcoming_run_plan`).
             let designer_enabled =
-                self.config.get_orchestration()?.designer.enabled && !task.designed;
+                self.config.get_orchestration()?.designer_enabled_for(&task) && !task.designed;
             let will_auto_launch = is_agent
                 && self.config.get_rule("auto_launch_on_delegate")?
                 && self.auto_launch_enabled()?
@@ -1145,7 +1153,7 @@ impl Operations {
     /// through so a human can take over.
     fn should_start_bot_review(&self, task: &Task) -> Result<bool> {
         let orch = self.config.get_orchestration()?;
-        if !orch.reviewer.enabled {
+        if !orch.reviewer_enabled_for(task) {
             return Ok(false);
         }
         if matches!(

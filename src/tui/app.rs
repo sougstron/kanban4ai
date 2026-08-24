@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{TextArea, WrapMode};
 use serde_yaml_ng::{Mapping, Value};
 use unicode_width::UnicodeWidthStr;
 
@@ -1085,9 +1085,11 @@ impl App {
                     self.input_review_edits(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                     return Ok(true);
                 }
-                if is_text_input_key(key) || is_word_edit_key(key) {
-                    self.input_review_edits(key);
-                }
+                // Same as the task Description field: leftover keys reach the
+                // textarea. Word-delete chords (Ctrl/Alt+Delete) are handled
+                // inside `input_review_edits` because tui-textarea only maps
+                // Alt+Delete, and a filter here used to swallow the rest.
+                self.input_review_edits(key);
                 Ok(true)
             }
         }
@@ -2733,6 +2735,7 @@ impl App {
             review_edits = editor;
         }
         review_edits.set_cursor_line_style(ratatui::style::Style::default());
+        review_edits.set_wrap_mode(WrapMode::WordOrGlyph);
         let has_prompt = task
             .as_ref()
             .is_some_and(|task| self.ops.task_has_prompt(task));
@@ -3982,18 +3985,7 @@ impl App {
         let Some(detail) = self.detail.as_mut() else {
             return;
         };
-        if is_word_edit_key(key) {
-            match key.code {
-                KeyCode::Backspace => {
-                    detail.review_edits.delete_word();
-                }
-                KeyCode::Delete => {
-                    detail.review_edits.delete_next_word();
-                }
-                _ => {
-                    detail.review_edits.input(key);
-                }
-            }
+        if apply_word_edit(&mut detail.review_edits, key) {
             return;
         }
         detail.review_edits.input(key);
@@ -4522,6 +4514,8 @@ impl App {
                     agent_backend: modal.backend_text(),
                     agent_name: modal.agent_text(),
                     interactive: modal.interactive,
+                    use_designer: modal.use_designer,
+                    use_reviewer: modal.use_reviewer,
                     chained_to: modal.chain_text(),
                 };
                 let target = target_status
@@ -4553,6 +4547,8 @@ impl App {
                         agent_backend: Some(modal.backend_text()),
                         agent_name: Some(modal.agent_text()),
                         interactive: Some(modal.interactive),
+                        use_designer: Some(modal.use_designer),
+                        use_reviewer: Some(modal.use_reviewer),
                         chained_to: Some(modal.chain_text()),
                         ..Default::default()
                     },
@@ -5137,17 +5133,31 @@ fn is_text_input_key(key: KeyEvent) -> bool {
 }
 
 fn is_word_edit_key(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && !key.modifiers.contains(KeyModifiers::ALT)
-        && matches!(
-            key.code,
-            KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::Backspace
-                | KeyCode::Delete
-        )
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Backspace | KeyCode::Delete => ctrl || alt,
+        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => ctrl && !alt,
+        _ => false,
+    }
+}
+
+pub(super) fn apply_word_edit(textarea: &mut TextArea<'static>, key: KeyEvent) -> bool {
+    if !is_word_edit_key(key) {
+        return false;
+    }
+    match key.code {
+        KeyCode::Backspace => {
+            textarea.delete_word();
+        }
+        KeyCode::Delete => {
+            textarea.delete_next_word();
+        }
+        _ => {
+            textarea.input(key);
+        }
+    }
+    true
 }
 
 fn contains(area: Rect, x: u16, y: u16) -> bool {
@@ -5283,6 +5293,8 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::Title
         | DialogField::Description
         | DialogField::Interactive
+        | DialogField::UseDesigner
+        | DialogField::UseReviewer
         | DialogField::EscapeToProjects
         | DialogField::Answer
         | DialogField::Confirm

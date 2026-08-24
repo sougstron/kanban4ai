@@ -6,7 +6,7 @@ expression: render_snapshot(&mut app)
 │TASK-001 Question card                                                                        │
 │Status: todo │ Session: - │ Interactive: true                                                 │
 │Backend: default │ Model: - │ Effort: - │ Agent: - │ Chain: -                                 │
-│Created: <timestamp> │ Updated: <timestamp>                     │
+│Created: <timestamp> │ Updated: <timestamp>                                                   │
 │Description:                                                                                  │
 │Needs an answer                                                                               │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
@@ -14,7 +14,7 @@ expression: render_snapshot(&mut app)
 │MSG-001 · system · open                                                                       █
 │Task created: Question card                                                                   █
 │Status: todo                                                                                  █
-│Created at: <timestamp>                                                        █
+│Created at: <timestamp>                                                                       █
 │                                                                                              █
 │MSG-002 · task · open                                                                         █
 │Needs an answer                                                                               █

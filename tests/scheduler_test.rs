@@ -793,6 +793,57 @@ fn upcoming_run_plan_follows_the_designer_flag() {
     assert_eq!(settings.backend, "opencode");
 }
 
+#[test]
+fn upcoming_run_plan_honors_per_task_designer_when_project_designer_is_off() {
+    let (_dir, ops) = ops_with_config("");
+    let task = ops
+        .create_task(NewTask {
+            title: "Just this one".into(),
+            agent_backend: Some("opencode".into()),
+            use_designer: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let config = ops.config.load().unwrap();
+    assert!(!ops.config.get_orchestration().unwrap().designer.enabled);
+
+    let (settings, phase) = upcoming_run_plan(&config, &task).unwrap();
+    assert_eq!(phase, RunPhase::Design);
+    assert_eq!(settings.backend, "claude");
+    assert_eq!(settings.model.as_deref(), Some("sonnet"));
+
+    let mut designed = task.clone();
+    designed.designed = true;
+    let (settings, phase) = upcoming_run_plan(&config, &designed).unwrap();
+    assert_eq!(phase, RunPhase::Execute);
+    assert_eq!(settings.backend, "opencode");
+}
+
+#[test]
+fn resolve_launch_settings_uses_project_bots_for_a_per_task_phase() {
+    let (_dir, ops) = ops_with_config("");
+    let mut task = ops
+        .create_task(NewTask {
+            title: "Per-task bots".into(),
+            agent_backend: Some("opencode".into()),
+            use_designer: true,
+            use_reviewer: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let config = ops.config.load().unwrap();
+
+    task.run_phase = Some(RunPhase::Design);
+    let settings = resolve_launch_settings(&config, &task).unwrap();
+    assert_eq!(settings.backend, "claude");
+    assert_eq!(settings.model.as_deref(), Some("sonnet"));
+
+    task.run_phase = Some(RunPhase::Review);
+    let settings = resolve_launch_settings(&config, &task).unwrap();
+    assert_eq!(settings.backend, "claude");
+    assert_eq!(settings.model.as_deref(), Some("sonnet"));
+}
+
 // ---------------------------------------------- design-gate and census keys
 
 #[test]

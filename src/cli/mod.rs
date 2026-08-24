@@ -66,6 +66,12 @@ enum Command {
         /// Enable interactive ask/wait guidance for delegated agents
         #[arg(long)]
         interactive: bool,
+        /// Run the project designer bot for this task even if it is off board-wide
+        #[arg(long)]
+        designer: bool,
+        /// Run the project reviewer bot for this task even if it is off board-wide
+        #[arg(long)]
+        reviewer: bool,
         /// Auto-run this task when target task (e.g. TASK-029) reaches Review
         #[arg(long = "chain-to")]
         chained_to: Option<String>,
@@ -543,6 +549,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             agent_backend,
             agent_name,
             interactive,
+            designer,
+            reviewer,
             chained_to,
         } => {
             let task = ops.create_task(NewTask {
@@ -553,6 +561,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 agent_backend,
                 agent_name,
                 interactive,
+                use_designer: designer,
+                use_reviewer: reviewer,
                 chained_to: chained_to.filter(|c| !c.is_empty()),
             })?;
             println!("Created task {}: {}", task.id, task.title);
@@ -1253,6 +1263,8 @@ fn task_to_json(task: &Task) -> serde_json::Value {
         "agent_backend": task.agent_backend,
         "agent_name": task.agent_name,
         "interactive": task.interactive,
+        "use_designer": task.use_designer,
+        "use_reviewer": task.use_reviewer,
         "chained_to": task.chained_to,
         "review_edits": task.review_edits,
     })

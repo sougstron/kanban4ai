@@ -53,10 +53,10 @@ pub struct LaunchSettings {
 /// task fields, falling back to the backend's configured defaults.
 pub fn resolve_launch_settings(config: &BoardConfig, task: &Task) -> Result<LaunchSettings> {
     let orch = OrchestrationSettings::from_mapping(&config.orchestration);
-    if task.run_phase == Some(RunPhase::Design) && orch.designer.enabled {
+    if task.run_phase == Some(RunPhase::Design) && orch.designer_enabled_for(task) {
         return resolve_bot_launch_settings(config, &orch.designer);
     }
-    if task.run_phase == Some(RunPhase::Review) && orch.reviewer.enabled {
+    if task.run_phase == Some(RunPhase::Review) && orch.reviewer_enabled_for(task) {
         return resolve_bot_launch_settings(config, &orch.reviewer.bot());
     }
     resolve_task_launch_settings(config, task)
@@ -76,7 +76,7 @@ pub fn upcoming_run_plan(config: &BoardConfig, task: &Task) -> Result<(LaunchSet
     // no designer pass ever ran (the designer may have been switched on
     // mid-flight), because the requested edits are already folded into the
     // thread for the executor.
-    if orch.designer.enabled && !task.designed && task.review_rounds == 0 {
+    if orch.designer_enabled_for(task) && !task.designed && task.review_rounds == 0 {
         Ok((
             resolve_bot_launch_settings(config, &orch.designer)?,
             RunPhase::Design,

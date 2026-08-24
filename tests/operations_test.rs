@@ -2999,6 +2999,76 @@ fn explicit_enqueue_and_dequeue_round_trip() {
     ));
 }
 
+// ------------------------------------------------------- per-task designer / reviewer
+
+#[test]
+fn start_uses_designer_when_only_the_task_opts_in() {
+    let (_dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask {
+            title: "Plan just me".into(),
+            agent_backend: Some("opencode".into()),
+            use_designer: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let session = ops.start_task(&task.id).unwrap().unwrap();
+    assert!(session.starts_with("ses-claude-"), "{session}");
+    let started = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(started.run_phase, Some(RunPhase::Design));
+    assert_eq!(started.agent_backend.as_deref(), Some("opencode"));
+    assert_eq!(recorder.calls().len(), 1);
+    assert!(recorder.calls()[0].1.starts_with("ses-claude-"));
+}
+
+#[test]
+fn executor_done_launches_reviewer_when_only_the_task_opts_in() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops
+        .create_task(NewTask {
+            title: "Review just me".into(),
+            agent_backend: Some("opencode".into()),
+            use_reviewer: true,
+            ..Default::default()
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-exec", true).unwrap();
+    finish_executor(&ops, dir.path(), &task.id, "ses-exec");
+
+    let current = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(current.status, TaskStatus::InProgress);
+    assert_eq!(current.run_phase, Some(RunPhase::Review));
+    assert_eq!(current.review_rounds, 1);
+    let session = current.session.clone().expect("reviewer session");
+    assert!(session.starts_with("ses-claude-"), "{session}");
+    let launches: Vec<_> = recorder
+        .calls()
+        .into_iter()
+        .filter(|(id, _, _)| id == &task.id)
+        .collect();
+    assert_eq!(launches.len(), 2, "executor then reviewer: {launches:?}");
+}
+
+#[test]
+fn update_task_can_toggle_per_task_bots() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Later")).unwrap();
+    let updated = ops
+        .update_task(
+            &task.id,
+            TaskPatch {
+                use_designer: Some(true),
+                use_reviewer: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert!(updated.use_designer);
+    assert!(updated.use_reviewer);
+}
+
 // ------------------------------------------------------- bot reviewer / verdict
 
 fn write_reviewer_config(project: &Path, extra: &str) {

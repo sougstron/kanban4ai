@@ -111,6 +111,22 @@ fn create_list_show_flow() {
 }
 
 #[test]
+fn create_can_opt_one_task_into_designer_and_reviewer() {
+    let dir = board();
+    kanban(&dir)
+        .args(["create", "Just this task", "--designer", "--reviewer"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created task TASK-001"));
+
+    let ops = Operations::new(dir.data_root());
+    let task = ops.get_task("TASK-001").unwrap().unwrap();
+    assert!(task.use_designer);
+    assert!(task.use_reviewer);
+    assert!(!task.interactive);
+}
+
+#[test]
 fn list_json_is_valid_and_complete() {
     let dir = board();
     kanban(&dir)
