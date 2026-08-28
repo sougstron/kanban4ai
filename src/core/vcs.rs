@@ -476,9 +476,8 @@ impl GitRepo {
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(KanbanError::Invalid(format!(
-                    "landing aborted: {} changed on disk after the snapshot was taken \
-                     (concurrent edit); nothing was written",
-                    names
+                    "landing aborted: {names} changed on disk after the snapshot was taken \
+                     (concurrent edit); nothing was written"
                 )));
             }
         }
