@@ -23,11 +23,14 @@ use crate::core::config::Config;
 use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
 use crate::core::limits;
-use crate::core::models::Task;
-use crate::core::operations::{AgentExitOutcome, Operations, QuestionRef, TaskPatch, Verdict};
+use crate::core::models::{RunMode, Task, TaskStatus};
+use crate::core::operations::{
+    AgentExitOutcome, LandOutcome, Operations, QuestionRef, TaskPatch, Verdict, WaitWake,
+};
 use crate::core::session::{SessionManager, estimate_session_tokens};
 use crate::core::storage::NewTask;
 use crate::core::timefmt;
+use crate::core::update;
 
 #[derive(Parser)]
 #[command(
@@ -217,6 +220,9 @@ enum Command {
         /// Session ID for the relaunched agent
         #[arg(long)]
         session: Option<String>,
+        /// Bypass the queue and launch immediately (debug).
+        #[arg(long)]
+        now: bool,
     },
     /// Launch a revert agent using files saved under the board's backups/<task>.
     Revert {
@@ -323,6 +329,9 @@ enum Command {
     },
     /// Recover a crashed task.
     Recover { task_id: String },
+    /// Land an isolated task branch into the work folder (re-runs the merge
+    /// after a conflict was resolved, or lands a `land: manual` board).
+    Integrate { task_id: String },
     /// Stop the running agent session for a task (leaves the task In Progress).
     Stop { task_id: String },
 
@@ -338,6 +347,15 @@ enum Command {
         refresh: bool,
         #[command(subcommand)]
         bridge: Option<bridge::LimitsBridge>,
+    },
+    /// Check GitHub Releases for a newer kanban4ai; without --check also
+    /// install it: download, verify the published SHA-256, and atomically
+    /// replace the running binary. A pacman-owned binary is never touched —
+    /// its package-manager upgrade command is printed instead.
+    Update {
+        /// Report only: print what the newest release is, download nothing
+        #[arg(long)]
+        check: bool,
     },
     /// Launch the TUI kanban board.
     Tui,
@@ -495,6 +513,85 @@ fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
     Ok(())
 }
 
+/// `kanban update [--check]`: report (or install) the newest GitHub release.
+/// Deliberately project-independent — updating the binary has nothing to do
+/// with any board, so it runs from any directory, with no project at all.
+fn run_update(check_only: bool) -> Result<ExitCode> {
+    // The cache-or-blocking split print_limits uses: a status inside the
+    // check interval answers from the cache, anything else pays one
+    // blocking check. A failed check is a missing answer, not a crash.
+    let now = chrono::Utc::now().timestamp();
+    let fresh = match update::cached() {
+        Some(status)
+            if !update::status_expired(&status, update::configured_interval_hours(), now) =>
+        {
+            Some(status)
+        }
+        _ => None,
+    };
+    let Some(status) = fresh.or_else(|| update::check_latest(false).ok()) else {
+        if check_only {
+            println!("No cached update status yet, and the check could not run just now.");
+            return Ok(ExitCode::SUCCESS);
+        }
+        eprintln!("Error: the update check failed; kanban4ai was not changed");
+        return Ok(ExitCode::FAILURE);
+    };
+    if check_only {
+        print_update_report(&status);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if !update::is_update_available(&status) {
+        print_update_report(&status);
+        return Ok(ExitCode::SUCCESS);
+    }
+    match update::apply_update(&status) {
+        Ok(applied) => {
+            println!(
+                "Updated kanban4ai to {} ({}).",
+                applied.version,
+                applied.binary.display()
+            );
+            println!(
+                "Restart kanban4ai (or open a new terminal) — the running process \
+                 still executes the old version."
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        // The package manager owns the binary, so its upgrade command *is*
+        // the update: pointing at it did what was asked (SUCCESS, not FAILURE).
+        Err(err @ update::ApplyError::PackageManaged { .. }) => {
+            println!("{err}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Err(err) => {
+            eprintln!("Error: {err}");
+            Ok(ExitCode::FAILURE)
+        }
+    }
+}
+
+fn print_update_report(status: &update::UpdateStatus) {
+    let installed = update::installed_version();
+    if update::is_update_available(status) {
+        println!(
+            "Update available: kanban4ai {installed} → {}",
+            status.latest_version
+        );
+        if status.asset_url.is_some() {
+            println!("Run `kanban update` to install it.");
+        }
+    } else {
+        println!(
+            "kanban4ai {installed} is up to date (latest release {}).",
+            status.latest_version
+        );
+    }
+    if !status.notes_url.is_empty() {
+        println!("Release notes: {}", status.notes_url);
+    }
+}
+
 fn dispatch(cli: Cli) -> Result<ExitCode> {
     let command = cli.command.unwrap_or(Command::Tui);
     match command {
@@ -526,6 +623,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             return Ok(ExitCode::SUCCESS);
         }
+        Command::Update { check } => return run_update(check),
         Command::Tui => return launch_tui(cli.project.as_deref()),
         Command::Daemon { interval, once } => {
             return daemon::run(once, interval, cli.project.as_deref());
@@ -730,7 +828,20 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     QuestionRef::MsgId(question_ref)
                 };
             match ops.answer_question(&task_id, question_ref, &answer)? {
-                Some(_) => println!("Answer added to {task_id}"),
+                Some(outcome) => {
+                    println!("Answer added to {task_id}");
+                    if outcome.remaining > 0 {
+                        println!("{} question(s) still open", outcome.remaining);
+                    } else if outcome.queued {
+                        println!("All questions answered; agent queued for a free agent slot");
+                    } else if let Some(session) = outcome.resumed_session {
+                        println!("All questions answered; agent resumed on {session}");
+                    } else if outcome.task.status == TaskStatus::InProgress {
+                        println!(
+                            "All questions answered; agent was not running and auto-resume is off"
+                        );
+                    }
+                }
                 None => eprintln!("Failed to answer question on {task_id}"),
             }
         }
@@ -808,12 +919,24 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Some(_) => println!("Review edits saved on {task_id}"),
             None => eprintln!("Task {task_id} not found"),
         },
-        Command::Rerun { task_id, session } => {
-            match ops.rerun_review_task(&task_id, session.as_deref())? {
-                Some(task) => println!(
+        Command::Rerun {
+            task_id,
+            session,
+            now,
+        } => {
+            // Never park a re-run in a queue nothing can drain: with the
+            // queue or auto-launch off, `rerun` starts the agent directly.
+            let mode = if now || !ops.queue_can_dispatch()? {
+                RunMode::Immediate
+            } else {
+                RunMode::Queued
+            };
+            match ops.rerun_review_task(&task_id, session.as_deref(), mode)? {
+                Some(task) if mode == RunMode::Immediate => println!(
                     "Task {task_id} re-running ({})",
                     task.session.as_deref().unwrap_or("none")
                 ),
+                Some(_) => println!("Task {task_id} queued for re-run"),
                 None => eprintln!("Task {task_id} not found"),
             }
         }
@@ -968,9 +1091,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             );
         }
         Command::CheckSessions => {
-            let resumed = ops.resume_expired_waits()?;
-            for (task_id, session_id) in &resumed {
-                println!("Resumed {task_id} after wait deadline → {session_id}");
+            for wake in ops.wake_expired_waits()? {
+                match wake {
+                    WaitWake::Queued { task_id } => {
+                        println!("Wait deadline passed: {task_id} queued for a free agent slot");
+                    }
+                    WaitWake::Resumed {
+                        task_id,
+                        session_id,
+                    } => {
+                        println!("Resumed {task_id} after wait deadline → {session_id}");
+                    }
+                }
             }
             let timeout =
                 Config::new(ops.data_root()).get_threshold("session_heartbeat_timeout")?;
@@ -994,10 +1126,62 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     item.task_id, item.session_id, item.backend
                 );
             }
+            for overlap in ops.detect_write_overlaps() {
+                println!(
+                    "Provenance overlap: {} ({}) and {} ({}) both wrote {} while running concurrently",
+                    overlap.task_a,
+                    overlap.session_a,
+                    overlap.task_b,
+                    overlap.session_b,
+                    overlap.path
+                );
+            }
+            let availability = crate::core::vcs::availability(ops.work_path());
+            if availability.is_available() {
+                println!("Isolation: available");
+            } else {
+                println!("Isolation: unavailable — {availability}");
+            }
         }
         Command::Recover { task_id } => match ops.recover_task(&task_id)? {
             Some(_) => {
                 println!("Task {task_id} recovered and moved to To Do");
+            }
+            None => eprintln!("Task {task_id} not found"),
+        },
+        Command::Integrate { task_id } => match ops.integrate_task(&task_id)? {
+            Some((task, LandOutcome::Landed { changed })) => {
+                println!(
+                    "Landed {} into {} ({} path(s), unstaged):",
+                    task.branch.as_deref().unwrap_or("branch"),
+                    ops.work_path().display(),
+                    changed.len()
+                );
+                for path in changed {
+                    println!("  {}", path.display());
+                }
+                println!("Commit manually after review; the integration ref has advanced.");
+            }
+            Some((task, LandOutcome::Conflict { paths })) => {
+                println!(
+                    "Merge conflicts landing {} — nothing was written to the work folder:",
+                    task.id
+                );
+                for path in paths {
+                    println!("  {path}");
+                }
+                println!(
+                    "Resolve in the work folder or the worktree, then run \
+                     \"kanban integrate {}\" again.",
+                    task.id
+                );
+            }
+            Some((_, LandOutcome::Deferred(reason))) => {
+                eprintln!("Landing deferred: {reason}");
+            }
+            Some((task, LandOutcome::NotIsolated)) => {
+                eprintln!("Task {} has no isolated branch to integrate", task.id);
+                return Ok(ExitCode::FAILURE);
             }
             None => eprintln!("Task {task_id} not found"),
         },
@@ -1043,6 +1227,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Command::Tui
         | Command::Limits { .. }
+        | Command::Update { .. }
         | Command::StatuslineBridge
         | Command::Daemon { .. } => {
             unreachable!("handled before resolve")
@@ -1154,8 +1339,8 @@ fn wait_resume_monitor(ops: &Operations, task_id: &str, session_id: &str) -> Res
             std::thread::sleep(wait.min(std::time::Duration::from_secs(60)));
             continue;
         }
-        let resumed = ops.resume_expired_waits()?;
-        if !resumed.is_empty() {
+        let woken = ops.wake_expired_waits()?;
+        if !woken.is_empty() {
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_secs(5));

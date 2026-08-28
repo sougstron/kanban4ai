@@ -1,5 +1,6 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 1523
 expression: "render_at(&mut app, 80, 24)"
 ---
 ┌ To Do (0) ───────┐┌ In Progress (0) ─┐┌ Review (0) ──────┐┌ Done (0) ────────┐
@@ -25,7 +26,7 @@ expression: "render_at(&mut app, 80, 24)"
 │                  ││                  ││                  ││                  │
 │                  ││                  ││                  ││                  │
 └──────────────────┘└──────────────────┘└──────────────────┘└──────────────────┘
- TUI ready │ n new · e edit · r run · m move · y approve · / filter · ? help    
+ TUI ready │ n new · e edit · r queue · m move · y approve · / filter · ? help  
 
 --- style runs ---
 0:0-20 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)

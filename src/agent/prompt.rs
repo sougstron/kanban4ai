@@ -103,6 +103,20 @@ questions:\n      - prompt: <question text>\n        options: [<choice A>, <choi
         ));
     }
     prompt.push_str(role_column_block(Role::Executor));
+    if let (Some(branch), Some(worktree)) = (&task.branch, &task.worktree) {
+        let checkout = roots
+            .data_path("worktrees")
+            .join(worktree)
+            .display()
+            .to_string();
+        prompt.push_str(&format!(
+            "\nIsolation: you are working in an isolated git checkout at {checkout} on branch \
+{branch}. It was cut from a live snapshot of the project folder, so it already contains the \
+human's latest work — including uncommitted changes. Commit freely on this branch; it merges \
+back into the project when the task is done. Do not create, switch, or delete branches, and do \
+not touch the project folder's own checkout.\n"
+        ));
+    }
     prompt.push_str("\nUser task:\n");
     if task.description.trim().is_empty() {
         prompt.push_str(&task.title);

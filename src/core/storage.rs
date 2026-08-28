@@ -110,6 +110,10 @@ pub struct Storage {
     pub provenance_dir: PathBuf,
     pub backups_dir: PathBuf,
     pub assets_dir: PathBuf,
+    /// Root of the per-task git worktrees (`.kanban/worktrees/<TASK-ID>`).
+    /// Under the data root, never inside work_path, so a worktree can never
+    /// be swept into the user's own commits or .gitignore.
+    pub worktrees_dir: PathBuf,
 }
 
 impl Storage {
@@ -125,6 +129,7 @@ impl Storage {
             provenance_dir: kanban_dir.join("provenance"),
             backups_dir: kanban_dir.join("backups"),
             assets_dir: kanban_dir.join("assets"),
+            worktrees_dir: kanban_dir.join("worktrees"),
             kanban_dir,
             project_path,
         }
@@ -147,6 +152,7 @@ impl Storage {
         fs::create_dir_all(&self.provenance_dir)?;
         fs::create_dir_all(&self.backups_dir)?;
         fs::create_dir_all(self.assets_dir.join("images"))?;
+        fs::create_dir_all(&self.worktrees_dir)?;
         for status in TaskStatus::ALL {
             fs::create_dir_all(self.tasks_dir.join(status.as_str()))?;
         }

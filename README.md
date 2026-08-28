@@ -45,6 +45,16 @@ Keep a TUI open, run `kanban daemon` in the foreground, enable the user unit
 Tags matching `v*` publish Linux x86_64 and aarch64 archives plus SHA-256
 checksum files at <https://github.com/sougstron/kanban4ai/releases>.
 
+**Updating**: installs owned by pacman (the AUR packages) upgrade through the
+package manager — `kanban4ai update` refuses to overwrite a pacman-owned
+binary and prints the upgrade command instead. Everything else (`cargo
+install`, the installer script, a hand-copied binary) self-updates in place:
+`kanban4ai update` downloads the newest GitHub release, verifies its SHA-256
+checksum, and atomically replaces the binary (restart kanban4ai afterwards).
+`kanban4ai update --check` only reports what is available. The TUI also
+checks in the background at most once a day and mentions a newer release in
+the status line.
+
 ## Development
 
 ```sh
@@ -136,11 +146,13 @@ headless agent reply, the agent can declare a bounded wait instead:
 kanban4ai waiting TASK-002 --session ses-login --eta 900 --note "waiting for CI"
 ```
 
-The board records the wait in the thread, keeps the session alive until the
-deadline (ETA with the configured safety multiplier), and relaunches the agent
-after the deadline to check the result. Answering the task's last open question
-wakes a declared-wait agent immediately; the TUI's `Revoke` action does the same
-manually. The agent may call `waiting` again if it still needs more time. When
+The board records the wait in the thread and keeps the session alive until the
+deadline (ETA with the configured safety multiplier). The pause frees the
+agent slot; at the deadline the task re-enters the queue (or, with the queue
+disabled, the agent is relaunched directly) to check the result. Answering the
+task's last open question wakes a declared-wait agent immediately — through
+the queue; the TUI's `Revoke` action does the same manually. The agent may
+call `waiting` again if it still needs more time. When
 the agent finishes, it runs
 `kanban4ai done TASK-002 --session ses-login --agent`, which moves the task to
 Review. The human reviews the work and completes it with:

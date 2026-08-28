@@ -33,6 +33,7 @@ rules:
   auto_move_on_assign: true
   auto_move_on_complete: true
   questions_go_to_review: false
+  resume_after_last_answer: true
   auto_launch_on_delegate: true
   auto_launch_chained: true
 thresholds:
@@ -191,6 +192,15 @@ orchestration:
     agent: null
     on_changes_requested: in_progress
     max_rounds: 3
+  isolation:
+    mode: auto
+    branch_prefix: kanban/
+    integration_ref: refs/kanban/integration
+    seed: live
+    land: worktree
+    on_conflict: review
+    cleanup: on_land
+    commit_message: "kanban: {task_id} {title}"
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +289,7 @@ pub struct OrchestrationSettings {
     pub auto_restart_delays_minutes: Vec<i64>,
     pub designer: BotSettings,
     pub reviewer: ReviewerSettings,
+    pub isolation: IsolationSettings,
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +303,112 @@ pub struct ReviewerSettings {
     /// Consecutive bot-review bounces before falling through to human Review.
     /// `0` means unlimited.
     pub max_rounds: i64,
+}
+
+/// `orchestration.isolation.mode`: when a task's agent runs in an isolated
+/// git worktree. `auto` isolates when the work path is a git repo new enough
+/// for `merge-tree` (>= 2.38) and the project is registered, else falls back
+/// to the shared-directory behavior; `required` refuses to launch when
+/// isolation is unavailable; `off` is always the shared directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationMode {
+    Auto,
+    Off,
+    Required,
+}
+
+/// `orchestration.isolation.seed`: what a task branch starts from — a
+/// snapshot of the dirty work path (`live`) or committed `HEAD` (`head`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationSeed {
+    Live,
+    Head,
+}
+
+/// `orchestration.isolation.land`: how a finished task branch reaches the
+/// user's working tree — materialized automatically (`worktree`) or left to
+/// the human (`manual`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLand {
+    Worktree,
+    Manual,
+}
+
+/// `orchestration.isolation.on_conflict`: what happens when the merge back
+/// conflicts — hand to human Review (`review`) or merge into the task's own
+/// worktree for the resolver flow (`resolver`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationOnConflict {
+    Review,
+    Resolver,
+}
+
+/// `orchestration.isolation.cleanup`: remove the worktree and branch when the
+/// branch has landed (`on_land`) or keep them (`keep`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationCleanup {
+    OnLand,
+    Keep,
+}
+
+macro_rules! isolation_choice {
+    ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
+        impl $name {
+            pub fn parse(text: &str) -> Option<Self> {
+                match text {
+                    $($value => Some($name::$variant),)+
+                    _ => None,
+                }
+            }
+
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $($name::$variant => $value),+
+                }
+            }
+        }
+    };
+}
+
+isolation_choice!(IsolationMode {
+    Auto => "auto",
+    Off => "off",
+    Required => "required",
+});
+
+isolation_choice!(IsolationSeed {
+    Live => "live",
+    Head => "head",
+});
+
+isolation_choice!(IsolationLand {
+    Worktree => "worktree",
+    Manual => "manual",
+});
+
+isolation_choice!(IsolationOnConflict {
+    Review => "review",
+    Resolver => "resolver",
+});
+
+isolation_choice!(IsolationCleanup {
+    OnLand => "on_land",
+    Keep => "keep",
+});
+
+/// Typed view of `orchestration.isolation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolationSettings {
+    pub mode: IsolationMode,
+    pub branch_prefix: String,
+    pub integration_ref: String,
+    pub seed: IsolationSeed,
+    pub land: IsolationLand,
+    pub on_conflict: IsolationOnConflict,
+    pub cleanup: IsolationCleanup,
+    /// Template for agent commits inside the task worktree; `{task_id}` and
+    /// `{title}` are substituted at launch time.
+    pub commit_message: String,
 }
 
 impl OrchestrationSettings {
@@ -525,6 +642,81 @@ fn validate_cap_map(
 /// `auto_restart.delays_minutes`: a sequence of positive ints (minutes before
 /// each crash-restart attempt). Zero/negative or unparseable entries are a
 /// config error.
+/// One closed-set `orchestration.isolation` key: the value must parse into
+/// the typed choice or be absent/null. An unknown spelling (a typo, or a
+/// value for a mode later tasks do not implement) is rejected rather than
+/// silently falling back to the default.
+fn validate_isolation_choice<T>(
+    iso: &Mapping,
+    key: &str,
+    allowed: &str,
+    parse: impl Fn(&str) -> Option<T>,
+) -> Result<()> {
+    let Some(value) = iso.get(Value::String(key.to_owned())) else {
+        return Ok(());
+    };
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    if value.as_str().and_then(parse).is_some() {
+        return Ok(());
+    }
+    Err(KanbanError::Invalid(format!(
+        "orchestration.isolation.{key} must be one of {allowed}, got: {value:?}"
+    )))
+}
+
+/// One free-form `orchestration.isolation` string key (`branch_prefix`,
+/// `integration_ref`, `commit_message`): must be a string when present. A
+/// non-string would otherwise be silently replaced by the default.
+fn validate_isolation_string(iso: &Mapping, key: &str) -> Result<()> {
+    let Some(value) = iso.get(Value::String(key.to_owned())) else {
+        return Ok(());
+    };
+    if matches!(value, Value::Null | Value::String(_)) {
+        return Ok(());
+    }
+    Err(KanbanError::Invalid(format!(
+        "orchestration.isolation.{key} must be a string, got: {value:?}"
+    )))
+}
+
+/// `orchestration.isolation`: strict validation of the worktree-isolation
+/// block. Unknown values for the closed-set keys and non-string values for
+/// the free-form keys are config errors.
+fn validate_isolation(orch: &Mapping) -> Result<()> {
+    let yaml_key = Value::String("isolation".to_owned());
+    let Some(iso) = orch.get(&yaml_key) else {
+        return Ok(());
+    };
+    if matches!(iso, Value::Null) {
+        return Ok(());
+    }
+    let Some(iso) = iso.as_mapping() else {
+        return Err(KanbanError::Invalid(format!(
+            "orchestration.isolation must be a mapping, got: {iso:?}"
+        )));
+    };
+    validate_isolation_choice(
+        iso,
+        "mode",
+        "'auto', 'off', 'required'",
+        IsolationMode::parse,
+    )?;
+    validate_isolation_choice(iso, "seed", "'live', 'head'", IsolationSeed::parse)?;
+    validate_isolation_choice(iso, "land", "'worktree', 'manual'", IsolationLand::parse)?;
+    validate_isolation_choice(
+        iso,
+        "on_conflict",
+        "'review', 'resolver'",
+        IsolationOnConflict::parse,
+    )?;
+    validate_isolation_choice(iso, "cleanup", "'on_land', 'keep'", IsolationCleanup::parse)?;
+    validate_isolation_string(iso, "branch_prefix")?;
+    validate_isolation_string(iso, "integration_ref")?;
+    validate_isolation_string(iso, "commit_message")
+}
+
 fn validate_delays_minutes(auto_restart: &mut Mapping) -> Result<()> {
     let yaml_key = Value::String("delays_minutes".to_owned());
     match auto_restart.get_mut(&yaml_key) {
@@ -677,6 +869,18 @@ impl OrchestrationSettings {
                     .map(|items| items.iter().filter_map(as_int).collect())
                     .unwrap_or_default()
             });
+        let isolation = mapping
+            .get("isolation")
+            .and_then(Value::as_mapping)
+            .or_else(|| default_section("isolation"))
+            .expect("built-in defaults contain orchestration.isolation");
+        let choice_at = |key: &str, default: &str| -> String {
+            isolation
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| default.to_owned())
+        };
 
         OrchestrationSettings {
             queue_enabled: bool_at("queue_enabled"),
@@ -695,6 +899,36 @@ impl OrchestrationSettings {
                 agent: str_opt_at(reviewer, "agent"),
                 on_changes_requested,
                 max_rounds,
+            },
+            isolation: IsolationSettings {
+                mode: isolation
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .and_then(IsolationMode::parse)
+                    .unwrap_or(IsolationMode::Auto),
+                branch_prefix: choice_at("branch_prefix", "kanban/"),
+                integration_ref: choice_at("integration_ref", "refs/kanban/integration"),
+                seed: isolation
+                    .get("seed")
+                    .and_then(Value::as_str)
+                    .and_then(IsolationSeed::parse)
+                    .unwrap_or(IsolationSeed::Live),
+                land: isolation
+                    .get("land")
+                    .and_then(Value::as_str)
+                    .and_then(IsolationLand::parse)
+                    .unwrap_or(IsolationLand::Worktree),
+                on_conflict: isolation
+                    .get("on_conflict")
+                    .and_then(Value::as_str)
+                    .and_then(IsolationOnConflict::parse)
+                    .unwrap_or(IsolationOnConflict::Review),
+                cleanup: isolation
+                    .get("cleanup")
+                    .and_then(Value::as_str)
+                    .and_then(IsolationCleanup::parse)
+                    .unwrap_or(IsolationCleanup::OnLand),
+                commit_message: choice_at("commit_message", "kanban: {task_id} {title}"),
             },
         }
     }
@@ -983,6 +1217,8 @@ impl Config {
                 reviewer.insert(max_key, Value::Number(parsed.into()));
             }
         }
+
+        validate_isolation(orch)?;
 
         Ok(())
     }

@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::core::models::{RunPhase, Task};
+use crate::core::models::{IntegrationState, RunPhase, Task, TaskStatus};
 use crate::core::session::SessionState;
 use crate::core::telemetry::SessionProgress;
 
@@ -213,14 +213,23 @@ pub fn badges(
     app: &App,
 ) -> Vec<(String, ratatui::style::Color)> {
     let mut badges = Vec::new();
+    // Conflict is the one blocking isolation state (the report sits in
+    // review_edits and a human must resolve it), so it leads the card and
+    // displaces the plain worktree badge it implies.
+    let conflicted = task.integration == IntegrationState::Conflict;
+    if conflicted {
+        badges.push(("⚠ conflict".to_string(), app.theme.err));
+    }
     // Interactive is a persistent task flag, emitted first so a long volatile
     // session-state badge (`✖ crashed · u recover`) can never push it past the
-    // card's right edge in a narrow column.
-    if task.interactive {
+    // card's right edge in a narrow column. It only matters while the task can
+    // still run or is running; on Review/Done/Archive the flag is noise.
+    if task.interactive && matches!(task.status, TaskStatus::Todo | TaskStatus::InProgress) {
         badges.push(("☑ interactive".to_string(), app.theme.ok));
     }
-    // A queued/design/review run phase overrides only the running badge's
-    // label and colour; live/waiting/crashed still derive from SessionState.
+    // Design/review name the live bot. Queued never overlays a live session:
+    // it means waiting for a slot. Live/waiting/crashed still come from
+    // SessionState.
     let phase_badge = match task.run_phase {
         Some(RunPhase::Queued) => Some(("⏸ queued", app.theme.warn)),
         Some(RunPhase::Design) => Some(("✎ design", app.theme.focus)),
@@ -229,7 +238,11 @@ pub fn badges(
     };
     match session_state {
         Some(SessionState::Live) => {
-            let (label, color) = phase_badge.unwrap_or(("▶ running", app.theme.ok));
+            let (label, color) = match task.run_phase {
+                Some(RunPhase::Design) => ("✎ design", app.theme.focus),
+                Some(RunPhase::Review) => ("⚖ review", app.theme.review),
+                _ => ("▶ running", app.theme.ok),
+            };
             badges.push((label.to_string(), color));
         }
         Some(SessionState::Waiting) => {
@@ -253,11 +266,44 @@ pub fn badges(
             }
         }
     }
-    if task.chained_to.is_some() {
-        badges.push(("↪ chain".to_string(), app.theme.ok));
+    // Chaining only matters before the task runs: at In Progress the chain
+    // already fired (or is moot) and past it the badge is noise, so the badge
+    // lives on To Do alone and names the target task number.
+    if task.status == TaskStatus::Todo
+        && let Some(target) = task.chained_to.as_deref()
+    {
+        let number = target.rsplit('-').next().unwrap_or(target);
+        badges.push((format!("↪ chain -> {number}"), app.theme.ok));
+    }
+    // Pending design/review stage marks, shown like the chain badge from the
+    // moment the stage is scheduled (project-wide bot or the task's own
+    // opt-in) until the stage completes: design until the plan is recorded
+    // (`designed`), review until the verdict lands the task in human Review.
+    // An active phase badge above already shows a running stage; it wins and
+    // the pending mark stays off rather than duplicating it.
+    if matches!(task.status, TaskStatus::Todo | TaskStatus::InProgress) {
+        if (app.board.designer_bot || task.use_designer)
+            && !task.designed
+            && !badges.iter().any(|(label, _)| label == "✎ design")
+        {
+            badges.push(("✎ design".to_string(), app.theme.focus));
+        }
+        if (app.board.reviewer_bot || task.use_reviewer)
+            && !badges.iter().any(|(label, _)| label == "⚖ review")
+        {
+            badges.push(("⚖ review".to_string(), app.theme.review));
+        }
     }
     if task.has_questions {
         badges.push(("? questions".to_string(), app.theme.warn));
+    }
+    // Isolation is passive information, so its badge trails the action ones.
+    // The fields only exist while the worktree does (cleared on land-with-
+    // cleanup, Done and abandon; kept on Conflict), except that a Conflict
+    // task keeps its unmerged worktree — there the err-colored conflict badge
+    // above already says what matters.
+    if task.worktree.is_some() && !conflicted {
+        badges.push(("⑂ worktree".to_string(), app.theme.muted));
     }
     badges
 }

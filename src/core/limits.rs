@@ -86,6 +86,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::core::http::{HttpError, http_get_json, http_request_json};
 use crate::core::project::store_root;
 use crate::core::storage::atomic_write_text;
 
@@ -95,8 +96,6 @@ pub const PROVIDERS: [&str; 6] = ["claude", "codex", "grok", "zai", "synthetic",
 /// Fallback refresh interval when no board config is available (the projects
 /// screen has no project, so no `.kanban/config.yaml` to read).
 pub const DEFAULT_REFRESH_INTERVAL: i64 = 120;
-
-const HTTP_TIMEOUT_SECS: u32 = 15;
 
 /// One rate-limit window of one provider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -237,83 +236,6 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-// ---------------------------------------------------------------------------
-// HTTP
-// ---------------------------------------------------------------------------
-
-/// `GET url` through curl. See [`http_request_json`].
-fn http_get_json(url: &str, headers: &[(&str, String)]) -> std::result::Result<Value, HttpError> {
-    http_request_json(url, headers, None)
-}
-
-/// One HTTP request through curl, with headers and any request body passed on
-/// stdin so secrets stay out of the command line (a refresh token in `ps`
-/// output would be as good as the credential file itself). A body makes it a
-/// POST. Returns the parsed JSON body, or the HTTP status when the request
-/// completed with a non-2xx code.
-fn http_request_json(
-    url: &str,
-    headers: &[(&str, String)],
-    body: Option<&str>,
-) -> std::result::Result<Value, HttpError> {
-    let mut config = String::new();
-    config.push_str(&format!("url = {}\n", quote_curl(url)));
-    for (name, value) in headers {
-        config.push_str(&format!(
-            "header = {}\n",
-            quote_curl(&format!("{name}: {value}"))
-        ));
-    }
-    if let Some(body) = body {
-        config.push_str(&format!("data = {}\n", quote_curl(body)));
-    }
-    config.push_str("silent\n");
-    config.push_str("show-error\n");
-    config.push_str("location\n");
-    config.push_str(&format!("max-time = {HTTP_TIMEOUT_SECS}\n"));
-    config.push_str("write-out = \"\\n%{http_code}\"\n");
-
-    let mut child = Command::new("curl")
-        .arg("-K")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| HttpError::Transport(format!("curl unavailable: {err}")))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(config.as_bytes())
-            .map_err(|err| HttpError::Transport(format!("curl input failed: {err}")))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|err| HttpError::Transport(format!("curl failed: {err}")))?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr);
-        return Err(HttpError::Transport(
-            message
-                .lines()
-                .next_back()
-                .unwrap_or("request failed")
-                .trim()
-                .to_string(),
-        ));
-    }
-    let body = String::from_utf8_lossy(&output.stdout).to_string();
-    let (payload, status) = split_status(&body);
-    if !(200..300).contains(&status) {
-        return Err(HttpError::Status(status));
-    }
-    serde_json::from_str(payload).map_err(|err| HttpError::Transport(format!("bad JSON: {err}")))
-}
-
-#[derive(Debug)]
-enum HttpError {
-    Status(u16),
-    Transport(String),
-}
-
 impl HttpError {
     fn into_state(self) -> ProviderState {
         match self {
@@ -321,21 +243,6 @@ impl HttpError {
             HttpError::Status(code) => ProviderState::Unavailable(format!("HTTP {code}")),
             HttpError::Transport(message) => ProviderState::Unavailable(message),
         }
-    }
-}
-
-/// curl's config parser reads double-quoted values with backslash escapes.
-fn quote_curl(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
-}
-
-/// Split a curl body written with a trailing `\n%{http_code}` into the payload
-/// and the status code.
-fn split_status(body: &str) -> (&str, u16) {
-    match body.rsplit_once('\n') {
-        Some((payload, status)) => (payload, status.trim().parse().unwrap_or(0)),
-        None => (body, 0),
     }
 }
 
@@ -2428,13 +2335,6 @@ mod tests {
         assert_eq!(format_span(11_520), "3h12m");
         assert_eq!(format_span(536_400), "6d5h");
         assert_eq!(format_span(2_000_000), "23d");
-    }
-
-    #[test]
-    fn curl_status_and_quoting_survive_odd_payloads() {
-        assert_eq!(split_status("{\"a\":1}\n200"), ("{\"a\":1}", 200));
-        assert_eq!(split_status("no status"), ("no status", 0));
-        assert_eq!(quote_curl("a\"b\\c"), "\"a\\\"b\\\\c\"");
     }
 
     #[test]

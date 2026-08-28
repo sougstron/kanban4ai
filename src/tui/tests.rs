@@ -9,7 +9,7 @@ use ratatui::crossterm::event::{
 use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{TextArea, WrapMode};
 
-use crate::core::models::{RunPhase, TaskStatus};
+use crate::core::models::{IntegrationState, RunPhase, TaskStatus};
 use crate::core::operations::Operations;
 use crate::core::project::ProjectStore;
 use crate::core::session::SessionManager;
@@ -2746,7 +2746,7 @@ fn review_rerun_from_board_focuses_in_progress() {
 }
 
 #[test]
-fn run_hotkey_starts_task_without_confirmation() {
+fn run_hotkey_falls_back_to_direct_start_when_auto_launch_is_off() {
     let (dir, mut app) = app_with_board();
     let task = app
         .ops
@@ -2788,6 +2788,280 @@ fn run_hotkey_starts_task_without_confirmation() {
     let revoked = app.ops.get_task(&task.id).unwrap().unwrap();
     assert_ne!(revoked.session.as_deref(), Some(session_id.as_str()));
     assert!(!SessionManager::new(dir.path()).is_session_active(&session_id));
+}
+
+/// Launch calls recorded by [`QueueLaunchSpy`]: (task_id, session_id).
+#[derive(Default, Clone)]
+struct QueueLaunchSpy(std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>);
+
+impl QueueLaunchSpy {
+    fn calls(&self) -> Vec<(String, String)> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl crate::core::operations::AgentLauncher for QueueLaunchSpy {
+    fn launch(
+        &self,
+        _roots: crate::core::project::Roots<'_>,
+        task: &crate::core::models::Task,
+        session_id: &str,
+        _revert: bool,
+    ) -> crate::core::error::Result<bool> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((task.id.clone(), session_id.to_string()));
+        Ok(true)
+    }
+}
+
+/// Board with the queue on, auto-launch on, a total cap of one agent, and a
+/// spy launcher standing in for the real backend spawn.
+fn queue_run_app() -> (tempfile::TempDir, App, QueueLaunchSpy) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(dir.path()).init_board().expect("init board");
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: true\norchestration:\n  queue_enabled: true\n  max_running_total: 1\n  max_running_per_backend: {}\n  max_running_per_role: {}\nagents:\n  opencode:\n    command: /nonexistent/opencode-disabled-for-tests\n",
+    )
+    .expect("quiet config");
+    let spy = QueueLaunchSpy::default();
+    let mut app = App::new(dir.path()).expect("create app");
+    app.ops = Operations::with_launcher(dir.path(), Box::new(spy.clone()));
+    (dir, app, spy)
+}
+
+/// An In Progress task with a live session that consumes the board's single
+/// agent slot.
+fn occupy_the_only_slot(dir: &std::path::Path, app: &mut App) {
+    let occupier = app
+        .ops
+        .create_task(NewTask::titled("Occupier"))
+        .expect("occupier");
+    let mut current = app.ops.get_task(&occupier.id).unwrap().unwrap();
+    current.status = TaskStatus::InProgress;
+    current.session = Some("ses-occupy".to_string());
+    app.ops.storage.save_task(&current).unwrap();
+    SessionManager::new(dir)
+        .link_named_session(&occupier.id, "ses-occupy", "Occupier")
+        .unwrap();
+}
+
+#[test]
+fn run_hotkey_queues_and_pumps_the_queue() {
+    let (dir, mut app, spy) = queue_run_app();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Run me"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+
+    app.handle_key(key(KeyCode::Char('r'))).expect("run");
+    assert!(
+        app.take_full_redraw(),
+        "run must request a full terminal redraw"
+    );
+    assert!(app.modal.is_none(), "run must not open any dialog");
+    assert!(app.status.starts_with("Started"), "status: {}", app.status);
+
+    // The immediate pump started the queued task on the spot, and the queue
+    // note is on the thread for the audit trail.
+    let started = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(started.status, TaskStatus::InProgress);
+    assert_ne!(started.run_phase, Some(RunPhase::Queued));
+    let session_id = started.session.expect("session assigned");
+    assert!(SessionManager::new(dir.path()).is_session_active(&session_id));
+    let calls = spy.calls();
+    assert_eq!(calls.len(), 1, "the pump must launch the queued task");
+    assert_eq!(calls[0].0, task.id);
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(thread.messages.iter().any(|m| m.body.contains("queued")));
+
+    // On In Progress the same key becomes Revoke and replaces the session.
+    app.focused_column = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == "in_progress")
+        .expect("in_progress column");
+    app.focused_card = 0;
+    SessionManager::new(dir.path())
+        .mark_wait_exited(&session_id)
+        .expect("agent process exited");
+    app.handle_key(key(KeyCode::Char('r'))).expect("revoke");
+    assert!(app.status.contains("Revoked and woke"), "{}", app.status);
+    let revoked = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_ne!(revoked.session.as_deref(), Some(session_id.as_str()));
+}
+
+#[test]
+fn run_hotkey_leaves_task_queued_when_caps_are_full() {
+    let (dir, mut app, spy) = queue_run_app();
+    occupy_the_only_slot(dir.path(), &mut app);
+    let mine = app
+        .ops
+        .create_task(NewTask::titled("Queue me"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+    assert_eq!(
+        app.focused_task().map(|focused| focused.id.clone()),
+        Some(mine.id.clone()),
+        "the only To Do card is the pressed one"
+    );
+
+    app.handle_key(key(KeyCode::Char('r'))).expect("run");
+
+    let stored = app.ops.get_task(&mine.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_eq!(stored.run_phase, Some(RunPhase::Queued));
+    assert_eq!(stored.session, None, "a queued task owns no session");
+    assert!(spy.calls().is_empty(), "a full board must not launch");
+    assert_eq!(app.status, "Queued TASK-002 — starts when a slot frees");
+}
+
+#[test]
+fn run_now_hotkey_bypasses_the_queue() {
+    let (dir, mut app, spy) = queue_run_app();
+    occupy_the_only_slot(dir.path(), &mut app);
+    let mine = app
+        .ops
+        .create_task(NewTask::titled("Run me now"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+
+    app.handle_key(key(KeyCode::Char('F'))).expect("run now");
+
+    let stored = app.ops.get_task(&mine.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_ne!(
+        stored.run_phase,
+        Some(RunPhase::Queued),
+        "F must not park the task in the queue"
+    );
+    let session_id = stored.session.expect("session assigned");
+    assert!(SessionManager::new(dir.path()).is_session_active(&session_id));
+    let calls = spy.calls();
+    assert_eq!(calls.len(), 1, "F launches despite the full board");
+    assert_eq!(calls[0].0, mine.id);
+    assert!(app.status.starts_with("Started"), "status: {}", app.status);
+}
+
+#[test]
+fn run_hotkey_starts_directly_when_the_queue_is_disabled() {
+    let (dir, mut app, spy) = queue_run_app();
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: true\norchestration:\n  queue_enabled: false\nagents:\n  opencode:\n    command: /nonexistent/opencode-disabled-for-tests\n",
+    )
+    .expect("quiet config");
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Run regardless"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+
+    app.handle_key(key(KeyCode::Char('r'))).expect("run");
+
+    assert!(app.status.starts_with("Started"), "status: {}", app.status);
+    assert!(
+        app.status.contains("queue is off"),
+        "the status must say why the run went direct: {}",
+        app.status
+    );
+    let stored = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_ne!(stored.run_phase, Some(RunPhase::Queued));
+    let session_id = stored.session.expect("session assigned");
+    assert!(SessionManager::new(dir.path()).is_session_active(&session_id));
+    assert_eq!(spy.calls().len(), 1);
+}
+
+#[test]
+fn review_rerun_lands_queued_when_the_queue_is_on() {
+    let (dir, mut app, spy) = queue_run_app();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Review queue"))
+        .expect("create task");
+    app.ops
+        .move_task(&task.id, "review", false)
+        .expect("move to review");
+    app.ops.set_review_edits(&task.id, "Queued rework").unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .expect("rerun");
+
+    // Free caps: the pump picked the queued re-run up immediately, the edits
+    // are folded, and the board focus followed the task to In Progress.
+    let stored = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_ne!(stored.run_phase, Some(RunPhase::Queued));
+    assert!(stored.review_edits.is_empty());
+    assert_eq!(spy.calls().len(), 1);
+    assert_eq!(app.screen, Screen::Board);
+    assert_eq!(app.focused_column, in_progress_column(&app));
+    assert_eq!(
+        app.focused_task().map(|focused| focused.id.as_str()),
+        Some(task.id.as_str())
+    );
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread.messages.iter().any(|m| m.body == "Queued rework"),
+        "the folded edits must be on the thread"
+    );
+}
+
+#[test]
+fn review_rerun_parks_queued_when_caps_are_full() {
+    let (dir, mut app, spy) = queue_run_app();
+    occupy_the_only_slot(dir.path(), &mut app);
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Review parked"))
+        .expect("create task");
+    app.ops
+        .move_task(&task.id, "review", false)
+        .expect("move to review");
+    app.ops.set_review_edits(&task.id, "Fold me later").unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .expect("rerun");
+
+    let stored = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_eq!(stored.run_phase, Some(RunPhase::Queued));
+    assert!(stored.session.is_none());
+    assert!(stored.review_edits.is_empty());
+    assert!(spy.calls().is_empty(), "a full board must not launch");
+    assert_eq!(app.status, "Queued TASK-002 for re-run");
+    assert_eq!(app.focused_column, in_progress_column(&app));
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread
+            .messages
+            .iter()
+            .any(|m| m.kind == crate::core::models::MessageKind::ReviewEdit),
+        "the edits fold even when the run parks in the queue"
+    );
 }
 
 #[test]
@@ -4340,7 +4614,7 @@ fn phase_three_closed_session_in_progress_is_idle_not_crashed() {
     let board = render_at(&mut app, 120, 18);
     assert!(!board.contains("✖ crashed"), "{board}");
     assert!(!app.board.session_states.contains_key(&task.id));
-    assert!(board.contains("r run"), "{board}");
+    assert!(board.contains("r queue"), "{board}");
     assert!(!board.contains("r revoke"), "{board}");
 
     app.focused_column = 1;
@@ -4348,7 +4622,7 @@ fn phase_three_closed_session_in_progress_is_idle_not_crashed() {
     let detail = render_at(&mut app, 120, 24);
     assert!(!detail.contains("press u / Recover"), "{detail}");
     assert!(!detail.contains("[ Recover u ]"), "{detail}");
-    assert!(detail.contains("Run r"), "{detail}");
+    assert!(detail.contains("Queue r"), "{detail}");
     assert!(!detail.contains("Revoke r"), "{detail}");
 
     app.handle_key(key(KeyCode::Char('r'))).unwrap();
@@ -4556,7 +4830,7 @@ fn phase_seven_status_bar_is_contextual_and_clickable() {
 
     // A narrow terminal drops low-priority segments instead of clipping.
     let narrow = render_at(&mut app, 48, 18);
-    assert!(narrow.contains("r run"));
+    assert!(narrow.contains("r queue"));
     assert!(!narrow.contains("b review done"));
 }
 
@@ -4922,7 +5196,9 @@ fn prompt_and_inputs_buttons_open_read_only_viewers() {
     assert!(detail.has_prompt, "prompt dump should be detected");
     assert!(detail.has_provenance, "provenance should be detected");
 
-    let rendered = render_snapshot(&mut app);
+    // Wide enough that the action bar fits every button, including the
+    // viewers that a narrower terminal drops first.
+    let rendered = render_at(&mut app, 140, 28);
     assert!(rendered.contains("Prompt p"), "prompt button missing");
     assert!(rendered.contains("Inputs v"), "inputs button missing");
 
@@ -6006,6 +6282,8 @@ fn projects_screen_global_settings_toggle_persists_to_the_store() {
     );
     assert!(rendered.contains("☑"), "{rendered}");
     app.handle_key(key(KeyCode::Tab)).expect("focus sort");
+    app.handle_key(key(KeyCode::Tab))
+        .expect("focus updates checkbox");
     app.handle_key(key(KeyCode::Tab)).expect("save");
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
 
@@ -6232,6 +6510,8 @@ fn projects_screen_global_settings_project_sort_persists_to_the_store() {
         app.modal.as_ref().expect("modal").project_sort_text(),
         Some("smart".to_string())
     );
+    app.handle_key(key(KeyCode::Tab))
+        .expect("focus updates checkbox");
     app.handle_key(key(KeyCode::Tab)).expect("save");
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
 
@@ -7085,7 +7365,37 @@ fn queued_design_and_review_phases_render_phase_badges() {
 }
 
 #[test]
-fn live_queued_session_overrides_the_running_label_only() {
+fn a_woken_pause_renders_the_queued_badge() {
+    let (dir, mut app) = app_with_board();
+    // The state a paused task is left in when its wait ends: the old session
+    // is closed and cleared, and the task parks in the queue.
+    let mut paused = app.ops.create_task(NewTask::titled("Woken pause")).unwrap();
+    SessionManager::new(dir.path())
+        .link_session(&paused.id, "ses-paused-1")
+        .unwrap();
+    paused.status = TaskStatus::InProgress;
+    paused.run_phase = Some(RunPhase::Queued);
+    paused.session = None;
+    app.ops.storage.save_task(&paused).unwrap();
+    SessionManager::new(dir.path())
+        .close_session("ses-paused-1")
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let output = render_at(&mut app, 120, 24);
+    assert!(
+        output.contains("⏸ queued"),
+        "a woken pause must wear the queued badge:\n{output}"
+    );
+    assert!(
+        !output.contains("✖ crashed"),
+        "a parked task owns no session and must not read crashed:\n{output}"
+    );
+    insta::assert_snapshot!("paused_woken_to_queued_card", output);
+}
+
+#[test]
+fn live_session_shows_running_even_if_phase_is_still_queued() {
     let (dir, mut app) = app_with_board();
     let mut running = app
         .ops
@@ -7095,17 +7405,20 @@ fn live_queued_session_overrides_the_running_label_only() {
         .link_session(&running.id, "ses-q-live")
         .unwrap();
     running.session = Some("ses-q-live".to_string());
+    running.status = TaskStatus::InProgress;
     running.run_phase = Some(RunPhase::Queued);
     app.ops.storage.save_task(&running).unwrap();
     app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
 
     let output = render_at(&mut app, 120, 24);
-    assert!(output.contains("⏸ queued"));
     assert!(
-        !output.contains("▶ running"),
-        "phase must override the run label"
+        output.contains("▶ running"),
+        "a live session must not wear the queued badge:\n{output}"
     );
-    // A queued task with a stale session id is not painted crashed.
+    assert!(
+        !output.contains("⏸ queued"),
+        "queued is waiting-for-a-slot, not a live overlay:\n{output}"
+    );
     assert!(!output.contains("✖ crashed"));
 }
 
@@ -7210,4 +7523,463 @@ fn q_does_nothing_where_the_queue_has_no_meaning() {
     assert_eq!(current.status, TaskStatus::Done);
     assert_eq!(current.run_phase, None);
     assert_eq!(app.status, before, "no error banner from an unbound key");
+}
+
+#[test]
+fn chain_and_interactive_badges_follow_the_column() {
+    let (_dir, mut app) = app_with_board();
+    let make = |title: &str| {
+        app.ops
+            .create_task(NewTask {
+                title: title.to_string(),
+                interactive: true,
+                chained_to: Some("TASK-154".to_string()),
+                ..Default::default()
+            })
+            .unwrap()
+    };
+    let todo = make("Chained starter");
+    let running = make("Chained running");
+    app.ops
+        .move_task(&running.id, "in_progress", false)
+        .unwrap();
+    let review = make("Chained review");
+    app.ops.move_task(&review.id, "review", false).unwrap();
+    let done = make("Chained done");
+    app.ops.move_task(&done.id, "done", false).unwrap();
+    let archived = make("Chained archived");
+    app.ops.move_task(&archived.id, "archive", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let badge_labels = |app: &App, id: &str| {
+        let task = app.ops.get_task(id).unwrap().unwrap();
+        super::card::badges(&task, None, app)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>()
+    };
+
+    let todo_badges = badge_labels(&app, &todo.id);
+    assert!(
+        todo_badges.iter().any(|label| label == "☑ interactive"),
+        "interactive badge missing on To Do: {todo_badges:?}"
+    );
+    assert!(
+        todo_badges.iter().any(|label| label == "↪ chain -> 154"),
+        "chain badge must name its target on To Do: {todo_badges:?}"
+    );
+
+    let running_badges = badge_labels(&app, &running.id);
+    assert!(
+        running_badges.iter().any(|label| label == "☑ interactive"),
+        "interactive badge missing on In Progress: {running_badges:?}"
+    );
+    assert!(
+        !running_badges.iter().any(|label| label.contains("chain")),
+        "chain badge must hide on In Progress: {running_badges:?}"
+    );
+
+    for id in [&review.id, &done.id, &archived.id] {
+        let labels = badge_labels(&app, id);
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("interactive") || label.contains("chain")),
+            "chain/interactive badges must hide past In Progress: {labels:?}"
+        );
+    }
+
+    let output = render_at(&mut app, 200, 30);
+    assert!(
+        output.contains("↪ chain -> 154"),
+        "chain target missing on the board:\n{output}"
+    );
+}
+
+#[test]
+fn design_and_review_marks_last_until_the_stage_completes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(dir.path()).init_board().expect("init board");
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: false\nagents:\n  opencode:\n    command: /nonexistent/opencode-disabled-for-tests\norchestration:\n  designer:\n    enabled: true\n  reviewer:\n    enabled: true\n",
+    )
+    .expect("quiet config");
+    let app = App::new(dir.path()).expect("create app");
+
+    let labels = |app: &App, id: &str| {
+        let task = app.ops.get_task(id).unwrap().unwrap();
+        super::card::badges(&task, None, app)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>()
+    };
+
+    // Project-wide bots: a fresh To Do task carries both pending marks.
+    let task = app.ops.create_task(NewTask::titled("Pipelined")).unwrap();
+    let todo = labels(&app, &task.id);
+    assert!(
+        todo.iter().any(|label| label == "✎ design"),
+        "design mark missing on To Do: {todo:?}"
+    );
+    assert!(
+        todo.iter().any(|label| label == "⚖ review"),
+        "review mark missing on To Do: {todo:?}"
+    );
+
+    // The design stage completed (`designed`) → design mark drops, review
+    // stays pending.
+    let mut done_designing = app.ops.get_task(&task.id).unwrap().unwrap();
+    done_designing.designed = true;
+    app.ops.storage.save_task(&done_designing).unwrap();
+    let mid = labels(&app, &task.id);
+    assert!(
+        !mid.iter().any(|label| label == "✎ design"),
+        "design mark must drop once designed: {mid:?}"
+    );
+    assert!(
+        mid.iter().any(|label| label == "⚖ review"),
+        "review mark must stay until bot review completes: {mid:?}"
+    );
+
+    // While a stage's bot actually runs (phase set, no live session yet) the
+    // active phase badge shows it and no duplicate mark is added.
+    let mut designing = app.ops.get_task(&task.id).unwrap().unwrap();
+    designing.designed = false;
+    designing.run_phase = Some(RunPhase::Design);
+    app.ops.storage.save_task(&designing).unwrap();
+    let active = labels(&app, &task.id);
+    assert_eq!(
+        active.iter().filter(|label| **label == "✎ design").count(),
+        1,
+        "active design badge must not be duplicated: {active:?}"
+    );
+
+    // Review landed: past In Progress neither mark survives.
+    app.ops.move_task(&task.id, "review", false).unwrap();
+    let review = labels(&app, &task.id);
+    assert!(
+        !review
+            .iter()
+            .any(|label| label == "✎ design" || label == "⚖ review"),
+        "stage marks must hide past In Progress: {review:?}"
+    );
+}
+
+#[test]
+fn per_task_bot_opt_in_shows_marks_with_bots_off() {
+    let (_dir, app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask {
+            title: "Opted in".to_string(),
+            use_designer: true,
+            use_reviewer: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let labels = |app: &App, id: &str| {
+        let task = app.ops.get_task(id).unwrap().unwrap();
+        super::card::badges(&task, None, app)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>()
+    };
+    let marks = labels(&app, &task.id);
+    assert!(
+        marks.iter().any(|label| label == "✎ design"),
+        "per-task designer opt-in must show the design mark: {marks:?}"
+    );
+    assert!(
+        marks.iter().any(|label| label == "⚖ review"),
+        "per-task reviewer opt-in must show the review mark: {marks:?}"
+    );
+
+    // A plain task on the same board (bots off) carries neither mark.
+    let plain = app.ops.create_task(NewTask::titled("No bots")).unwrap();
+    let plain_marks = labels(&app, &plain.id);
+    assert!(
+        !plain_marks
+            .iter()
+            .any(|label| label == "✎ design" || label == "⚖ review"),
+        "marks must require the bot or the opt-in: {plain_marks:?}"
+    );
+}
+
+/// Hold while seeding, polling, or rendering against the process-wide update
+/// cache, so parallel tests cannot wipe a seeded status or see it mid-test.
+fn update_cache_guard() -> std::sync::MutexGuard<'static, ()> {
+    crate::core::update::CACHE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn force_update_cache(version: Option<&str>) {
+    let status = version.map(|version| {
+        std::sync::Arc::new(crate::core::update::UpdateStatus {
+            checked_at: 1_787_000_000,
+            latest_version: version.to_string(),
+            tag: format!("v{version}"),
+            asset_url: Some("https://example.com/kanban4ai.tar.gz".to_string()),
+            checksum_url: None,
+            notes_url: "https://example.com/notes".to_string(),
+            published_at: Some(chrono::Utc::now().timestamp() - 20 * 24 * 3600),
+            dismissed_version: None,
+        })
+    });
+    crate::core::update::force_cache(status);
+}
+
+fn update_banner(version: &str) -> String {
+    format!("↑ kanban4ai {version} available - open Settings to update")
+}
+
+fn global_settings_app() -> (tempfile::TempDir, App) {
+    let dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(dir.path());
+    let app = App::projects_at(store, None, None).expect("projects app");
+    (dir, app)
+}
+
+fn open_global_settings(app: &mut App) {
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("global settings");
+    assert!(
+        matches!(
+            app.modal.as_ref().map(|modal| &modal.modal),
+            Some(Modal::GlobalSettings)
+        ),
+        "s must open the global settings dialog"
+    );
+}
+
+#[test]
+fn update_banner_shows_once_persists_dismissal_and_reopens_on_newer() {
+    let _cache = update_cache_guard();
+    force_update_cache(Some("9.9.9"));
+    let (_dir, mut app) = app_with_board();
+    app.poll_update_banner();
+    assert_eq!(app.status, update_banner("9.9.9"));
+
+    // Showing persisted the dismissal in the process-wide cache, so a
+    // relaunch (a fresh App here) does not nag again for the same version.
+    let (_dir2, mut relaunched) = app_with_board();
+    relaunched.poll_update_banner();
+    assert_eq!(relaunched.status, "TUI ready");
+
+    // A newer tag reopens the banner.
+    force_update_cache(Some("9.10.0"));
+    relaunched.poll_update_banner();
+    assert_eq!(relaunched.status, update_banner("9.10.0"));
+    force_update_cache(None);
+}
+
+#[test]
+fn update_available_banner_snapshot() {
+    let _cache = update_cache_guard();
+    force_update_cache(Some("9.9.9"));
+    let (_dir, mut app) = app_with_board();
+    app.poll_update_banner();
+    let rendered = render_at(&mut app, 96, 28);
+    assert!(
+        rendered.contains(&update_banner("9.9.9")),
+        "banner missing from the status bar:\n{rendered}"
+    );
+    insta::assert_snapshot!("update_available", rendered);
+    force_update_cache(None);
+}
+
+#[test]
+fn global_settings_updates_rows_snapshot() {
+    let _cache = update_cache_guard();
+    force_update_cache(Some("9.9.9"));
+    let (_dir, mut app) = global_settings_app();
+    open_global_settings(&mut app);
+    let rendered = render_at(&mut app, 96, 28);
+    assert!(
+        rendered.contains("kanban4ai 9.9.9 available (released 20d ago)"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("[ Check now ]"), "{rendered}");
+    assert!(rendered.contains("[ Update now ]"), "{rendered}");
+    assert!(
+        rendered.contains("check for updates when kanban4ai opens"),
+        "{rendered}"
+    );
+    insta::assert_snapshot!("global_settings_updates", rendered);
+    force_update_cache(None);
+}
+
+#[test]
+fn global_settings_up_to_date_row_hides_update_button() {
+    let _cache = update_cache_guard();
+    force_update_cache(Some(crate::core::update::installed_version()));
+    let (_dir, mut app) = global_settings_app();
+    open_global_settings(&mut app);
+    let rendered = render_at(&mut app, 96, 28);
+    assert!(
+        rendered.contains(&format!(
+            "kanban4ai {} - up to date",
+            crate::core::update::installed_version()
+        )),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("[ Update now ]"), "{rendered}");
+    force_update_cache(None);
+}
+
+#[test]
+fn global_settings_check_now_failure_shows_reason_row() {
+    let _cache = update_cache_guard();
+    let (_dir, mut app) = global_settings_app();
+    open_global_settings(&mut app);
+    // cfg(test) makes check_latest fail without a network request, which is
+    // exactly the failure row this test wants to see.
+    app.dispatch(UiAction::CheckUpdates).expect("check now");
+    assert!(
+        app.modal
+            .as_ref()
+            .expect("dialog stays open")
+            .update_check_error
+            .is_some(),
+        "the failure must reach the dialog state"
+    );
+    let rendered = render_at(&mut app, 96, 28);
+    assert!(rendered.contains("Check failed:"), "{rendered}");
+    assert!(!rendered.contains("[ Update now ]"), "{rendered}");
+    force_update_cache(None);
+}
+
+#[test]
+fn global_settings_check_on_open_toggle_persists() {
+    let (dir, mut app) = {
+        let _cache = update_cache_guard();
+        global_settings_app()
+    };
+    open_global_settings(&mut app);
+    {
+        let modal = app.modal.as_mut().expect("dialog");
+        assert!(modal.update_check_on_open, "default is on");
+        modal.focus_field(DialogField::UpdateCheckOnOpen);
+        modal.input(key(KeyCode::Char(' ')));
+        assert!(!modal.update_check_on_open);
+        modal.field_index = modal.fields().len() - 2;
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("save");
+    assert!(app.modal.is_none(), "save closes the dialog");
+    let saved = ProjectStore::at(dir.path())
+        .load_global_config()
+        .expect("reload global config");
+    assert!(!saved.update_check_on_open());
+}
+
+#[test]
+fn isolation_and_conflict_badges_follow_integration_state() {
+    let (_dir, mut app) = app_with_board();
+    let mut isolated = app
+        .ops
+        .create_task(NewTask::titled("Isolated work"))
+        .unwrap();
+    isolated.worktree = Some("TASK-001".to_string());
+    isolated.branch = Some("kanban/TASK-001".to_string());
+    isolated.base_commit = Some("0123456789abcdef".to_string());
+    app.ops.storage.save_task(&isolated).unwrap();
+
+    let mut conflict = app
+        .ops
+        .create_task(NewTask::titled("Conflicted work"))
+        .unwrap();
+    conflict.worktree = Some("TASK-002".to_string());
+    conflict.branch = Some("kanban/TASK-002".to_string());
+    conflict.base_commit = Some("0123456789abcdef".to_string());
+    conflict.integration = IntegrationState::Conflict;
+    app.ops.storage.save_task(&conflict).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let labels = |id: &str| {
+        let task = app.ops.get_task(id).unwrap().unwrap();
+        super::card::badges(&task, None, &app)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>()
+    };
+
+    let isolated_badges = labels(&isolated.id);
+    assert!(
+        isolated_badges.iter().any(|label| label == "⑂ worktree"),
+        "worktree badge missing: {isolated_badges:?}"
+    );
+    assert!(
+        !isolated_badges
+            .iter()
+            .any(|label| label.contains("conflict")),
+        "plain worktree badge must not claim conflict: {isolated_badges:?}"
+    );
+
+    let conflict_badges = labels(&conflict.id);
+    assert!(
+        conflict_badges.iter().any(|label| label == "⚠ conflict"),
+        "conflict badge missing: {conflict_badges:?}"
+    );
+    assert!(
+        !conflict_badges
+            .iter()
+            .any(|label| label.contains("worktree")),
+        "conflict displaces the plain worktree badge: {conflict_badges:?}"
+    );
+
+    let output = render_at(&mut app, 120, 30);
+    assert!(output.contains("⚠ conflict"), "conflict badge not rendered");
+}
+
+#[test]
+fn conflict_detail_shows_worktree_branch_base_and_urgent_rerun() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Landing went sideways"))
+        .unwrap();
+    app.ops.move_task(&task.id, "review", false).unwrap();
+    let mut task = app.ops.get_task(&task.id).unwrap().unwrap();
+    task.worktree = Some("TASK-001".to_string());
+    task.branch = Some("kanban/TASK-001".to_string());
+    task.base_commit = Some("0123456789abcdef".to_string());
+    task.integration = IntegrationState::Conflict;
+    task.review_edits = "conflict in src/main.rs: base abc, ours def, theirs 123".to_string();
+    app.ops.storage.save_task(&task).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.focused_column = 2; // Review
+    app.focused_card = 0;
+
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    let output = render_at(&mut app, 100, 32).replace(&dir.path().display().to_string(), "<board>");
+    assert!(output.contains("Worktree: <board>"), "{output}");
+    assert!(output.contains("Branch: kanban/TASK-001"), "{output}");
+    assert!(output.contains("Base: 0123456"), "{output}");
+    assert!(
+        output.contains("⚠ Integration conflict"),
+        "conflict action line missing: {output}"
+    );
+    assert!(output.contains("[ Re-run ^R ]"), "{output}");
+    insta::assert_snapshot!("isolation_conflict_detail", output);
+}
+
+#[test]
+fn project_settings_shows_isolation_availability() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().expect("settings");
+        modal.focus_field(DialogField::IsolationStatus);
+    }
+    let output = render_at(&mut app, 80, 24);
+    // The test board's work folder is not a git repository, so the probe has
+    // a deterministic answer here.
+    assert!(
+        output.contains("Worktree isolation:"),
+        "isolation row missing: {output}"
+    );
+    assert!(output.contains("unavailable"), "{output}");
+    insta::assert_snapshot!("settings_isolation_status", output);
 }

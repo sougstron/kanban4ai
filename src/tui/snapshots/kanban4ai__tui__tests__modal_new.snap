@@ -1,5 +1,6 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 685
 expression: render_snapshot(&mut app)
 ---
 ┌ To Do (1) ───────────┐┌ In Progress (0) ─────┐┌ Review (1) ──────────┐┌ Done (0) ── ▸ Kanban ┐
@@ -29,7 +30,7 @@ expression: render_snapshot(&mut app)
 │                      ││                      ││                      ││                      │
 │                      ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
- ? 1 questions  TUI ready │ n new · e edit · r run · Q queue · m move · / filter · ? help       
+ ? 1 questions  TUI ready │ n new · e edit · r queue · Q queue · m move · / filter · ? help     
 
 --- style runs ---
 0:0-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

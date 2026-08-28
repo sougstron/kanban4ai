@@ -13,12 +13,15 @@ use crate::agent::{
     resolve_task_launch_settings, upcoming_run_plan,
 };
 use crate::core::ask_form::AskForm;
-use crate::core::config::{Config, OnChangesRequested};
+use crate::core::config::{
+    Config, IsolationCleanup, IsolationLand, IsolationMode, IsolationOnConflict, IsolationSeed,
+    IsolationSettings, OnChangesRequested,
+};
 use crate::core::context::{ContextManager, role_for_source};
 use crate::core::error::{KanbanError, Result};
 use crate::core::models::{
-    Message, MessageKind, MessageRole, MessageStatus, Role, RunPhase, SessionStatus, Task,
-    TaskStatus,
+    IntegrationState, Message, MessageKind, MessageRole, MessageStatus, Role, RunMode, RunPhase,
+    Session, SessionStatus, Task, TaskStatus,
 };
 use crate::core::notifier::{DesktopNotifier, NotificationConfig};
 use crate::core::project::{Project, Roots};
@@ -27,10 +30,11 @@ use crate::core::provenance::{
 };
 use crate::core::reply;
 use crate::core::scheduler::{Slots, role_for_phase};
-use crate::core::session::SessionManager;
+use crate::core::session::{SessionManager, SessionState};
 use crate::core::storage::{NewTask, Storage, atomic_write_text};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
+use crate::core::vcs;
 
 /// Seam for spawning the actual agent process. Tests inject a recording stub;
 /// production uses the configured launcher in [`Operations::new`].
@@ -81,6 +85,20 @@ pub enum QuestionRef {
     MsgId(String),
 }
 
+/// Result of a recorded answer: the answered task plus how many questions are
+/// still open and whether the last answer relaunched the agent.
+#[derive(Debug, Clone)]
+pub struct AnswerOutcome {
+    pub task: Task,
+    /// Open questions still awaiting a human answer after this one.
+    pub remaining: usize,
+    /// Session the agent was relaunched on, when the last answer resumed it.
+    pub resumed_session: Option<String>,
+    /// The paused agent was woken by the answer and parked in the dispatcher
+    /// queue instead of launching (`resumed_session` is then `None`).
+    pub queued: bool,
+}
+
 /// The reviewer bot's only legal exit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -102,6 +120,22 @@ fn apply_human_review(task: &mut Task) {
     let now = timefmt::now();
     task.updated_at = now;
     task.completed_at = Some(now);
+}
+
+/// Result of landing an isolated task branch into the work folder (TASK-248).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LandOutcome {
+    /// The task never ran in an isolated worktree (or it was already cleaned
+    /// up after an earlier landing).
+    NotIsolated,
+    /// Clean merge: the changed paths were written to the work folder as
+    /// ordinary unstaged modifications and the integration ref advanced.
+    Landed { changed: Vec<PathBuf> },
+    /// Conflicting paths; nothing was written anywhere and the worktree is
+    /// kept for resolution.
+    Conflict { paths: Vec<String> },
+    /// The landing did not run; the reason is on the thread.
+    Deferred(String),
 }
 
 /// What [`Operations::reconcile_agent_exit`] decided about an exited agent
@@ -145,6 +179,19 @@ enum RespawnOutcome {
     Spawned(String),
     Noop,
     LaunchFailed(String),
+}
+
+/// What [`Operations::wake_expired_waits`] did about one expired declared
+/// wait: a pause releases its slot, so ending one either re-enters the
+/// dispatcher queue (the normal path) or relaunches directly when the queue
+/// could never drain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitWake {
+    /// The pause ended and the task was parked in the dispatcher queue.
+    Queued { task_id: String },
+    /// The queue cannot dispatch (disabled or auto-launch off); the agent
+    /// was relaunched directly on `session_id`.
+    Resumed { task_id: String, session_id: String },
 }
 
 /// A long-running command started by [`Operations::detach_command`]: fully
@@ -335,12 +382,16 @@ impl Operations {
         self.storage.delete_task(task_id)
     }
 
-    /// Delete a task together with its thread, assets, context, backups, and
-    /// sessions.
+    /// Delete a task together with its worktree, branch, thread, assets,
+    /// context, backups, and sessions.
     pub fn abandon_task(&self, task_id: &str) -> Result<bool> {
-        let Some(task) = self.storage.load_task(task_id)? else {
+        let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(false);
         };
+        // Dropping a task drops its isolated worktree and branch with it.
+        // The branch is typically unmerged here — an abandon is an explicit
+        // human discard, so it goes too (a Conflict worktree never does).
+        self.clear_task_worktree(&mut task, true);
         self.clear_task_assets(&task);
         self.context_manager()
             .clear_context(&task.id, &self.storage)?;
@@ -354,7 +405,10 @@ impl Operations {
         Ok(deleted)
     }
 
-    /// Abandon in-progress tasks whose session died without leaving questions.
+    /// Abandon in-progress tasks whose session died without leaving
+    /// questions, then run the worktree GC pass: the same sweep that
+    /// reclaims stalled tasks reclaims isolation artifacts whose task is
+    /// already gone.
     pub fn abandon_stalled_tasks(&self) -> Result<Vec<Task>> {
         let session_mgr = self.session_manager();
         let tm = self.thread_manager()?;
@@ -378,7 +432,67 @@ impl Operations {
                 abandoned.push(task);
             }
         }
+        self.worktree_gc_pass()?;
         Ok(abandoned)
+    }
+
+    /// The worktree GC pass (TASK-250): reconcile worktree registrations for
+    /// directories deleted by hand, then remove every
+    /// `.kanban/worktrees/<id>` directory and every
+    /// `<branch_prefix><id>` branch whose task no longer exists — the
+    /// leftovers of crashes, kills, and manual deletions. A branch only ever
+    /// existed for a task that once held a worktree, so with the task gone
+    /// the branch is the tail of an interrupted cleanup and would block the
+    /// recycled id's next worktree. Finally, when no task holds a worktree,
+    /// re-baseline the integration ref to a fresh snapshot parented on HEAD:
+    /// the ref is a GC root, and without this every snapshot it ever pointed
+    /// at stays alive forever.
+    fn worktree_gc_pass(&self) -> Result<()> {
+        if self.project_id.is_none() {
+            return Ok(());
+        }
+        let Some(repo) = vcs::detect(self.work_path()) else {
+            return Ok(());
+        };
+        let _guard = self.storage.lock()?;
+        repo.prune_worktrees()?;
+
+        let tasks = self.storage.list_tasks(None)?;
+        let live: std::collections::HashSet<&str> =
+            tasks.iter().map(|task| task.id.as_str()).collect();
+
+        if self.storage.worktrees_dir.is_dir() {
+            for entry in fs::read_dir(&self.storage.worktrees_dir)?.flatten() {
+                let id = entry.file_name().to_string_lossy().into_owned();
+                if live.contains(id.as_str()) || !entry.path().is_dir() {
+                    continue;
+                }
+                if repo.remove_worktree(&entry.path(), true).is_err() {
+                    // Not (or no longer) a registered worktree: the
+                    // directory itself is the leftover.
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+
+        let iso = self.config.get_orchestration()?.isolation;
+        for (branch, id) in repo.branches_with_prefix(&iso.branch_prefix)? {
+            if live.contains(id.as_str()) {
+                continue;
+            }
+            let _ = repo.delete_branch(&branch, true);
+        }
+
+        if repo.read_ref(&iso.integration_ref)?.is_some()
+            && !tasks.iter().any(|task| task.worktree.is_some())
+        {
+            let snap = repo.snapshot(
+                "HEAD",
+                "kanban: re-baseline integration ref — no task holds a worktree",
+            )?;
+            repo.set_ref(&iso.integration_ref, &snap)?;
+        }
+        Ok(())
     }
 
     pub fn get_task(&self, task_id: &str) -> Result<Option<Task>> {
@@ -638,6 +752,22 @@ impl Operations {
         let Some(mut current) = self.storage.load_task(&task.id)? else {
             return Ok(None);
         };
+        // Belt and braces: a task that reached Done without a landing still
+        // drops its isolated worktree and branch here — Done is terminal.
+        let had_isolation = current.worktree.is_some() || current.branch.is_some();
+        let problems = self.clear_task_worktree(&mut current, true);
+        if !problems.is_empty() {
+            self.post_queue_note(
+                &current.id,
+                &format!("⚠ done cleanup failed: {}", problems.join("; ")),
+            );
+        } else if had_isolation && current.worktree.is_none() {
+            self.post_queue_note(
+                &current.id,
+                "🧹 done — isolated worktree and branch removed",
+            );
+        }
+
         let entered_done = current.status != TaskStatus::Done;
         current.status = TaskStatus::Done;
         current.review_unseen = false;
@@ -804,6 +934,17 @@ impl Operations {
     /// the run phase becomes Queued and no agent launches — the dispatcher
     /// starts queued tasks once a slot frees up.
     pub fn enqueue_task(&self, task_id: &str) -> Result<Option<Task>> {
+        self.queue_run(task_id)
+    }
+
+    /// Put a task into the orchestration queue: the queued counterpart of
+    /// [`Self::start_task`]. To Do moves to In Progress, Review folds its
+    /// pending review edits into the thread first, and an idle In Progress
+    /// task stays put. The run phase becomes Queued and no agent launches —
+    /// the dispatcher starts queued tasks once a slot frees up. A queued task
+    /// owns no session (`task.session` is left alone); the dispatcher pins
+    /// one when it actually starts the run.
+    pub fn queue_run(&self, task_id: &str) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(None);
@@ -811,9 +952,15 @@ impl Operations {
         match task.status {
             TaskStatus::Todo => task.status = TaskStatus::InProgress,
             TaskStatus::InProgress => {}
+            TaskStatus::Review => {
+                self.fold_review_edits(&mut task)?;
+                task.review_edits = String::new();
+                task.review_unseen = false;
+                task.status = TaskStatus::InProgress;
+            }
             _ => {
                 return Err(KanbanError::Invalid(format!(
-                    "Task {task_id} must be To Do or In Progress to queue"
+                    "Task {task_id} must be To Do, In Progress, or Review to queue"
                 )));
             }
         }
@@ -954,6 +1101,7 @@ impl Operations {
         session_id: &str,
         is_agent: bool,
     ) -> Result<Option<Task>> {
+        let resolver;
         let task = {
             let _guard = self.storage.lock()?;
             let Some(mut task) = self.storage.load_task(task_id)? else {
@@ -1036,6 +1184,8 @@ impl Operations {
                     return self.start_bot_review(task_id, session_id);
                 }
 
+                resolver = self.land_on_review(&mut task);
+
                 task.status = TaskStatus::Review;
                 task.run_phase = None;
                 task.review_unseen = true;
@@ -1064,6 +1214,12 @@ impl Operations {
         // The task just entered Review: launch any task chained to its completion.
         self.trigger_chained_tasks(&task.id)?;
         self.notify_completion(&task);
+
+        // `on_conflict: resolver`: a conflicted landing re-dispatches the
+        // agent immediately; the conflict report is already in the thread.
+        if resolver {
+            self.dispatch_resolver(&task.id);
+        }
 
         Ok(Some(task))
     }
@@ -1234,7 +1390,7 @@ impl Operations {
         }
         SessionManager::validate_session_id(session_id)?;
         let orch = self.config.get_orchestration()?;
-        let (task, route) = {
+        let (task, route, resolver) = {
             let _guard = self.storage.lock()?;
             let Some(mut task) = self.storage.load_task(task_id)? else {
                 return Ok(None);
@@ -1268,8 +1424,10 @@ impl Operations {
                 }
             };
 
+            let mut resolver = false;
             match route {
                 VerdictRoute::HumanReview { exhausted } => {
+                    resolver = self.land_on_review(&mut task);
                     apply_human_review(&mut task);
                     if exhausted {
                         self.post_queue_note(
@@ -1305,7 +1463,7 @@ impl Operations {
                 }
             }
             self.storage.save_task(&task)?;
-            (task, route)
+            (task, route, resolver)
         };
 
         self.session_manager().close_session(session_id)?;
@@ -1326,6 +1484,9 @@ impl Operations {
             VerdictRoute::Requeue => {
                 let _ = self.dispatch_queue()?;
             }
+        }
+        if resolver {
+            self.dispatch_resolver(task_id);
         }
         Ok(self.storage.load_task(task_id)?.or(Some(task)))
     }
@@ -1357,8 +1518,9 @@ impl Operations {
     /// stdout/stderr that is stored in the gate-failed `AgentStep` message.
     const VERIFICATION_OUTPUT_TAIL: usize = 2000;
 
-    /// Run the configured verification command in the work folder (it builds
-    /// and tests the user's code, not the board) and return its exit code plus
+    /// Run the configured verification command where the task's agent worked
+    /// (its worktree when isolated, else the work folder — it builds and
+    /// tests the code, not the board) and return its exit code plus
     /// a tail of the combined output.
     fn run_verification_command(
         &self,
@@ -1369,7 +1531,7 @@ impl Operations {
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(command)
-            .current_dir(self.work_path())
+            .current_dir(self.task_cwd(task_id))
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()
@@ -1543,7 +1705,7 @@ impl Operations {
         task_id: &str,
         question_ref: QuestionRef,
         answer: &str,
-    ) -> Result<Option<Task>> {
+    ) -> Result<Option<AnswerOutcome>> {
         let (mut task, tm, expected_session) = {
             let _guard = self.storage.lock()?;
             let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
@@ -1561,7 +1723,16 @@ impl Operations {
                 }
             };
 
-            if tm.get_message(&task.id, &msg_id)?.is_none() {
+            // An explicit MSG-id is only answerable when it really is a
+            // question: `answer` stamps `answered` plus the answer body onto
+            // whatever it is handed, so without this a typo'd id silently
+            // marks a task or context message answered while the actual
+            // question stays open — and, with `resume_after_last_answer`,
+            // is weighed for a wake that the human never unblocked.
+            let is_question = tm
+                .get_message(&task.id, &msg_id)?
+                .is_some_and(|message| message.kind == MessageKind::Question);
+            if !is_question {
                 return Ok(None);
             }
 
@@ -1574,25 +1745,51 @@ impl Operations {
             (task, tm, expected_session)
         };
 
-        // Async interactive mode: once every open question is answered,
-        // relaunch the agent with the full dialog so it can continue.
-        if task.interactive
-            && task.status == TaskStatus::InProgress
-            && !tm.has_open_questions(&task.id)?
-            && let Some(resumed) =
-                self.resume_interactive_agent(&task.id, expected_session.as_deref())?
-        {
-            task = resumed;
+        // Once every open question is answered, the human has unblocked the
+        // run: relaunch the agent unless it is still alive and polling for
+        // the answer itself. A failed resume must never fail the answer —
+        // it is already durably recorded — so it becomes a thread note.
+        let remaining = tm
+            .open_messages(&task.id, Some(MessageKind::Question))?
+            .len();
+        let mut resumed_session = None;
+        let mut queued = false;
+        if task.status == TaskStatus::InProgress && remaining == 0 {
+            match self.resume_answered_agent(&task.id, expected_session.as_deref()) {
+                Ok(Some(resumed)) => {
+                    resumed_session = resumed.session.clone();
+                    queued =
+                        resumed.run_phase == Some(RunPhase::Queued) && resumed.session.is_none();
+                    task = resumed;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let _ = tm.post(
+                        &task.id,
+                        MessageRole::System,
+                        MessageKind::System,
+                        &format!("Answer recorded, but the agent could not be relaunched: {err}"),
+                        None,
+                        vec![],
+                        Some("kanban".to_string()),
+                    );
+                }
+            }
         }
-        Ok(Some(task))
+        Ok(Some(AnswerOutcome {
+            task,
+            remaining,
+            resumed_session,
+            queued,
+        }))
     }
 
-    fn resume_interactive_agent(
+    fn resume_answered_agent(
         &self,
         task_id: &str,
         expected_session: Option<&str>,
     ) -> Result<Option<Task>> {
-        if !self.auto_launch_enabled()? {
+        if !self.auto_launch_enabled()? || !self.config.get_rule("resume_after_last_answer")? {
             return Ok(None);
         }
 
@@ -1603,27 +1800,50 @@ impl Operations {
                 return Ok(None);
             };
             let tm = self.thread_manager()?;
-            if !current.interactive
-                || current.status != TaskStatus::InProgress
+            if current.status != TaskStatus::InProgress
                 || tm.has_open_questions(task_id)?
                 || current.session.as_deref() != expected_session
             {
                 return Ok(None);
             }
-            if expected_session.is_some_and(|session| {
-                session_mgr.load_session(session).is_some_and(|record| {
-                    record.task_id == current.id
-                        && record.status == SessionStatus::Active
-                        && record.wait_until.is_none()
-                })
-            }) {
-                // `ask --wait` is still polling the answered message and wakes
-                // itself. Only a declared wait needs a replacement process.
-                return Ok(None);
+            if let Some(session) = expected_session
+                && let Some(record) = session_mgr.load_session(session)
+                && record.task_id == current.id
+            {
+                let state = session_mgr.session_state(
+                    session,
+                    self.config.get_threshold("session_heartbeat_timeout")?,
+                );
+                match state {
+                    // A live session with no declared wait is the `ask --wait`
+                    // poller: it heartbeats every poll iteration and wakes
+                    // itself on the answer.
+                    Some(SessionState::Live) if record.wait_until.is_none() => {
+                        return Ok(None);
+                    }
+                    // A stale heartbeat leaves the record Active long after
+                    // the process died; mark it crashed so the revoke below
+                    // sees "process already gone" and can replace it.
+                    Some(SessionState::Crashed) if record.status == SessionStatus::Active => {
+                        session_mgr.crash_session(session)?;
+                    }
+                    _ => {}
+                }
             }
         }
 
         self.revoke_in_progress_task(task_id, expected_session)
+    }
+
+    /// `queued` means waiting for a slot. Any path that claims a session
+    /// outside the dispatcher must replace it with the phase that run will
+    /// occupy, or the card keeps saying queued while an agent is already live.
+    fn claim_run_phase(&self, task: &mut Task) -> Result<()> {
+        if task.run_phase != Some(RunPhase::Queued) {
+            return Ok(());
+        }
+        task.run_phase = Some(upcoming_run_plan(&self.config.load()?, task)?.1);
+        Ok(())
     }
 
     /// Replace the exact session currently assigned to an In Progress task.
@@ -1646,6 +1866,15 @@ impl Operations {
         if task.status != TaskStatus::InProgress || task.session.as_deref() != expected_session {
             return Ok(None);
         }
+
+        // A paused session has already released its slot, so waking it must
+        // re-acquire one through the queue (below) instead of launching past
+        // the caps.
+        let was_paused = expected_session
+            .and_then(|session| session_mgr.load_session(session))
+            .is_some_and(|record| {
+                record.status == SessionStatus::Active && record.wait_until.is_some()
+            });
 
         if let Some(old_session) = expected_session {
             let mut record = session_mgr.load_session(old_session);
@@ -1682,7 +1911,7 @@ impl Operations {
                         &task.id,
                         MessageRole::System,
                         MessageKind::Context,
-                        "Wake requested while the background agent was still exiting; resume immediately after its process ends.",
+                        "Wake requested while the background agent was still exiting; resume through the queue as soon as its process ends.",
                         None,
                         vec![],
                         Some("kanban".to_string()),
@@ -1697,6 +1926,46 @@ impl Operations {
                 }
                 Err(err) => return Err(err),
             }
+        }
+
+        if was_paused && self.queue_can_dispatch()? {
+            // The pause had already released its slot, so the wake re-enters
+            // the queue instead of launching past the caps; the dispatcher
+            // starts it in board order. `F` run now remains the direct
+            // override, and a live or crashed session still wakes instantly
+            // on the path below.
+            self.thread_manager()?.post_with_origin(
+                &task.id,
+                MessageRole::System,
+                MessageKind::Context,
+                &format!(
+                    "Session {} was revoked while paused. Queued for a free agent slot — wake \
+                     immediately on the fresh session the dispatcher starts and continue from \
+                     the current thread context.",
+                    expected_session.unwrap_or("none")
+                ),
+                None,
+                vec![],
+                Some("kanban".to_string()),
+                Some("kanban".to_string()),
+            )?;
+            // Same run-replacement bookkeeping as the direct wake below.
+            task.reset_auto_restart();
+            task.run_phase = Some(RunPhase::Queued);
+            task.session = None;
+            task.updated_at = timefmt::now();
+            self.storage.save_task(&task)?;
+            if let Some(old_session) = expected_session {
+                // Ownership has already moved and the old process is gone. A
+                // failed archival write must not strand the published successor.
+                let _ = session_mgr.close_session(old_session);
+            }
+            self.post_queue_note(
+                &task.id,
+                "⏸ revoked while paused — queued for a free agent slot",
+            );
+            let _ = self.dispatch_queue();
+            return Ok(Some(task));
         }
 
         let backend = safe_session_component(&self.resolve_backend(&task)?);
@@ -1722,6 +1991,7 @@ impl Operations {
         // A wake replaces the session of a run that is still the same run, so
         // the reviewer bounce count survives it — see `reset_auto_restart`.
         task.reset_auto_restart();
+        self.claim_run_phase(&mut task)?;
         task.updated_at = timefmt::now();
         if let Err(err) = self.storage.save_task(&task) {
             session_mgr.unlink_session(&new_session_id);
@@ -1989,12 +2259,18 @@ impl Operations {
     }
 
     /// Fold the pending review-edits buffer into the thread as a permanent
-    /// `review_edit` message, clear it, and relaunch the agent.
+    /// `review_edit` message, clear it, and relaunch the agent. With
+    /// [`RunMode::Queued`] (the default everywhere) no agent launches: the
+    /// task lands In Progress with run phase Queued for the dispatcher.
     pub fn rerun_review_task(
         &self,
         task_id: &str,
         session_id: Option<&str>,
+        mode: RunMode,
     ) -> Result<Option<Task>> {
+        if mode == RunMode::Queued {
+            return self.queue_run(task_id);
+        }
         if let Some(session_id) = session_id {
             SessionManager::validate_session_id(session_id)?;
         }
@@ -2040,16 +2316,21 @@ impl Operations {
         Ok(Some(task))
     }
 
-    /// Move a stalled or questioned in-progress task to a fresh agent session.
+    /// Move a stalled or questioned in-progress task to a fresh agent
+    /// session. With [`RunMode::Queued`] the old session is still closed but
+    /// no new one launches: the task waits in the queue and the dispatcher
+    /// starts the run.
     pub fn rerun_in_progress_task(
         &self,
         task_id: &str,
         session_id: Option<&str>,
+        mode: RunMode,
     ) -> Result<Option<Task>> {
         if let Some(session_id) = session_id {
             SessionManager::validate_session_id(session_id)?;
         }
         let session_mgr = self.session_manager();
+        let queued = mode == RunMode::Queued;
         let (task, session_id) = {
             let _guard = self.storage.lock()?;
             let Some(mut task) = self.storage.load_task(task_id)? else {
@@ -2072,10 +2353,16 @@ impl Operations {
                 return Ok(None);
             }
 
-            let backend = self.resolve_backend(&task)?;
-            let session_id = match session_id {
-                Some(s) => s.to_string(),
-                None => format!("ses-{}-{}", backend, timefmt::now().format("%Y%m%d-%H%M%S")),
+            let new_session_note = if queued {
+                "queued — the dispatcher starts it".to_string()
+            } else {
+                let backend = self.resolve_backend(&task)?;
+                match session_id {
+                    Some(s) => s.to_string(),
+                    None => {
+                        format!("ses-{}-{}", backend, timefmt::now().format("%Y%m%d-%H%M%S"))
+                    }
+                }
             };
             if let Some(old) = old_session_id.as_deref() {
                 session_mgr.crash_session(old)?;
@@ -2093,24 +2380,39 @@ impl Operations {
                     "Task was re-run from In Progress.\nReason: {}\nPrevious session: {}\nNew session: {}",
                     reason,
                     old_session_id.as_deref().unwrap_or("none"),
-                    session_id
+                    new_session_note
                 ),
                 None,
                 vec![],
                 Some("kanban".to_string()),
             )?;
 
-            task.session = Some(session_id.clone());
             // Re-running a stranded In Progress session continues the same
             // attempt on a fresh session; the reviewer bounce count is not
             // part of what went wrong, so it is not cleared here.
             task.reset_auto_restart();
+            if queued {
+                // A queued run owns no session; the dispatcher mints one
+                // when it starts the task.
+                task.session = None;
+                task.run_phase = Some(RunPhase::Queued);
+            } else {
+                task.session = Some(new_session_note.clone());
+                self.claim_run_phase(&mut task)?;
+            }
             task.has_questions = tm.has_open_questions(&task.id)?;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
-            session_mgr.link_named_session(&task.id, &session_id, &task.title)?;
-            (task, session_id)
+            if !queued {
+                session_mgr.link_named_session(&task.id, &new_session_note, &task.title)?;
+            }
+            (task, new_session_note)
         };
+
+        if queued {
+            self.post_queue_note(&task.id, "⏸ queued — waiting for a free agent slot");
+            return Ok(Some(task));
+        }
 
         if self.auto_launch_enabled()?
             && !self.finish_launch(&session_id, self.launch_agent(&task.id, &session_id, false))?
@@ -2168,17 +2470,492 @@ impl Operations {
             )));
         };
         let task = self.record_launch_settings(task)?;
-        self.log_launch_step(&task, session_id, revert);
-        match self
-            .launcher
-            .launch(self.roots(), &task, session_id, revert)
-        {
+        let task = self.prepare_worktree(task)?;
+        // Owned so `roots` can borrow the worktree path for its lifetime.
+        let worktree = self.task_worktree_path(&task);
+        let roots = match &worktree {
+            Some(path) => Roots::new(self.data_root(), path, self.project_id.as_deref()),
+            None => self.roots(),
+        };
+        self.log_launch_step(&roots, &task, session_id, revert);
+        match self.launcher.launch(roots, &task, session_id, revert) {
             Ok(started) => Ok(started),
             Err(err) => {
                 self.log_launch_failure(&task, session_id, &err.to_string());
                 Err(err)
             }
         }
+    }
+
+    /// The task's isolated checkout, when it exists on disk.
+    fn task_worktree_path(&self, task: &Task) -> Option<PathBuf> {
+        let rel = task.worktree.as_deref()?;
+        let path = self.storage.worktrees_dir.join(rel);
+        path.is_dir().then_some(path)
+    }
+
+    /// Where a task's agent-side processes run: its worktree when isolated,
+    /// else the shared work folder.
+    pub(crate) fn task_cwd(&self, task_id: &str) -> PathBuf {
+        self.storage
+            .load_task(task_id)
+            .ok()
+            .flatten()
+            .and_then(|task| self.task_worktree_path(&task))
+            .unwrap_or_else(|| self.work_path().to_path_buf())
+    }
+
+    /// Create the task's isolated checkout before its agent launches (TASK-236).
+    /// Nothing happens unless `orchestration.isolation` is on, the board is a
+    /// registered project (agent callbacks resolve via `KANBAN_PROJECT`, which
+    /// a worktree outside the repo cannot provide by path), and the work
+    /// folder is a git repo new enough for isolation. When the task already
+    /// carries a worktree it is reused as-is, so re-runs continue the same
+    /// branch. `mode: auto` falls back to the shared folder with an audit
+    /// note when isolation is unavailable; `mode: required` refuses the
+    /// launch.
+    ///
+    /// The integration snapshot chains under the board lock: parent = the
+    /// configured integration ref's current tip, or HEAD on the first task —
+    /// so two tasks starting at once get strictly-descendant bases and their
+    /// merge-base is the shared snapshot, not committed HEAD.
+    fn prepare_worktree(&self, task: Task) -> Result<Task> {
+        let iso = &self.config.get_orchestration()?.isolation;
+        if iso.mode == IsolationMode::Off {
+            return Ok(task);
+        }
+        if task
+            .worktree
+            .as_deref()
+            .is_some_and(|rel| self.storage.worktrees_dir.join(rel).is_dir())
+        {
+            return Ok(task);
+        }
+        match self.create_worktree(&task, iso) {
+            Ok(updated) => Ok(updated),
+            Err(reason) => {
+                if iso.mode == IsolationMode::Required {
+                    return Err(KanbanError::Invalid(format!(
+                        "worktree isolation is required but unavailable: {reason}"
+                    )));
+                }
+                self.post_queue_note(
+                    &task.id,
+                    &format!(
+                        "⚠ worktree isolation unavailable ({reason}) — running in the shared folder"
+                    ),
+                );
+                Ok(task)
+            }
+        }
+    }
+
+    /// The availability gate plus the actual snapshot + `worktree add`. The
+    /// `Err` payload is a human-readable unavailability reason. Everything
+    /// from reading the integration ref to saving the task fields holds the
+    /// board lock, so two tasks starting at once chain their snapshots
+    /// instead of racing sibling ones.
+    fn create_worktree(
+        &self,
+        task: &Task,
+        iso: &IsolationSettings,
+    ) -> std::result::Result<Task, String> {
+        if self.project_id.is_none() {
+            return Err("project not registered".to_string());
+        }
+        let repo =
+            vcs::detect(self.work_path()).ok_or_else(|| "not a git repository".to_string())?;
+        if !repo.has_commits().map_err(|e| e.to_string())? {
+            return Err("unborn HEAD (no commits yet)".to_string());
+        }
+
+        let _guard = self.storage.lock().map_err(|e| e.to_string())?;
+        let base = self
+            .isolation_base_commit(&repo, task, iso)
+            .map_err(|e| e.to_string())?;
+        let branch = format!("{}{}", iso.branch_prefix, task.id);
+        let rel = task.id.clone();
+        let path = self.storage.worktrees_dir.join(&rel);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        repo.add_worktree(&path, &branch, &base)
+            .map_err(|e| format!("git worktree add failed: {e}"))?;
+
+        let Some(mut current) = self
+            .storage
+            .load_task(&task.id)
+            .map_err(|e| e.to_string())?
+        else {
+            return Err(format!("task {} vanished during launch", task.id));
+        };
+        current.worktree = Some(rel);
+        current.branch = Some(branch);
+        current.base_commit = Some(base.as_str().to_string());
+        current.updated_at = timefmt::now();
+        self.storage
+            .save_task(&current)
+            .map_err(|e| e.to_string())?;
+        self.post_queue_note(
+            &task.id,
+            &format!(
+                "⑂ isolated checkout {} on {} (base {})",
+                path.display(),
+                current.branch.as_deref().unwrap_or("-"),
+                base.as_str()
+            ),
+        );
+        Ok(current)
+    }
+
+    /// The commit a task branch starts from. `seed: live` snapshots the dirty
+    /// work folder onto the integration chain (parent = the ref's tip, or
+    /// HEAD the first time) and advances the ref; `seed: head` branches from
+    /// committed HEAD and touches no ref.
+    fn isolation_base_commit(
+        &self,
+        repo: &vcs::GitRepo,
+        task: &Task,
+        iso: &IsolationSettings,
+    ) -> Result<vcs::Oid> {
+        match iso.seed {
+            IsolationSeed::Head => repo.head_oid(),
+            IsolationSeed::Live => {
+                let parent = repo
+                    .read_ref(&iso.integration_ref)?
+                    .map(|oid| oid.as_str().to_string())
+                    .unwrap_or_else(|| "HEAD".to_string());
+                let message = format!("kanban: live snapshot before {}", task.id);
+                let snap = repo.snapshot(&parent, &message)?;
+                repo.set_ref(&iso.integration_ref, &snap)?;
+                Ok(snap)
+            }
+        }
+    }
+
+    /// Landing entry for the move to human Review (TASK-248): merge the
+    /// task's branch into the work folder without ever committing on the
+    /// user's branch or staging anything. Runs under the board lock held by
+    /// the caller, so two tasks landing at once serialize against the same
+    /// integration tip. Every failure is reported on the thread and defers
+    /// the landing; it never blocks the move to Review. Returns true when a
+    /// conflicted landing must auto-dispatch a resolver run (`on_conflict:
+    /// resolver`) — the caller does that after releasing the board lock.
+    fn land_on_review(&self, task: &mut Task) -> bool {
+        if task.branch.is_none() || task.worktree.is_none() {
+            return false;
+        }
+        let iso = match self.config.get_orchestration() {
+            Ok(orch) => orch.isolation.clone(),
+            Err(err) => {
+                self.post_queue_note(
+                    &task.id,
+                    &format!("⚠ landing deferred: config unavailable ({err})"),
+                );
+                return false;
+            }
+        };
+        if iso.land == IsolationLand::Manual {
+            task.integration = IntegrationState::Pending;
+            self.post_queue_note(
+                &task.id,
+                &format!(
+                    "⑂ branch {} ready — land it with \"kanban integrate {}\"",
+                    task.branch.as_deref().unwrap_or("-"),
+                    task.id
+                ),
+            );
+            return false;
+        }
+        match self.land_task_branch(task) {
+            Ok(LandOutcome::Conflict { .. }) => iso.on_conflict == IsolationOnConflict::Resolver,
+            Ok(_) => false,
+            Err(err) => {
+                self.post_queue_note(
+                    &task.id,
+                    &format!(
+                        "⚠ landing deferred: {err} — run \"kanban integrate {}\"",
+                        task.id
+                    ),
+                );
+                false
+            }
+        }
+    }
+
+    /// Auto-dispatch the resolver run for a conflicted landing
+    /// (`on_conflict: resolver`): [`Self::rerun_review_task`] folds the
+    /// conflict report into the thread and relaunches the agent on a fresh
+    /// session. Must be called with no board lock held.
+    fn dispatch_resolver(&self, task_id: &str) {
+        if let Err(err) = self.rerun_review_task(task_id, None, RunMode::Immediate) {
+            self.post_queue_note(
+                task_id,
+                &format!(
+                    "⚠ resolver dispatch failed: {err} — the conflict report is \
+                     in the review edits"
+                ),
+            );
+        }
+    }
+
+    /// The landing sequence (steps 1–5 of TASK-248). The caller holds the
+    /// board lock. Git-level problems come back as [`LandOutcome::Deferred`]
+    /// with the reason already on the thread; board-level errors (config)
+    /// propagate.
+    fn land_task_branch(&self, task: &mut Task) -> Result<LandOutcome> {
+        let (Some(branch), Some(wt_rel)) = (&task.branch, &task.worktree) else {
+            return Ok(LandOutcome::NotIsolated);
+        };
+        let wt_path = self.storage.worktrees_dir.join(wt_rel);
+        if !wt_path.is_dir() {
+            return Ok(self.defer_landing(task, "the isolated worktree directory is gone"));
+        }
+        let Some(repo) = vcs::detect(self.work_path()) else {
+            return Ok(self.defer_landing(task, "the work folder is no longer a git repository"));
+        };
+        let iso = self.config.get_orchestration()?.isolation.clone();
+
+        // 1. Commit everything the agent left uncommitted, so it still lands.
+        let tip = match repo.commit_all(
+            &wt_path,
+            &format!("kanban: {} uncommitted work at landing", task.id),
+        ) {
+            Ok(Some(oid)) => oid,
+            Ok(None) => match repo.read_ref(branch)? {
+                Some(oid) => oid,
+                None => {
+                    return Ok(self.defer_landing(task, &format!("branch {branch} does not exist")));
+                }
+            },
+            Err(err) => return Ok(self.defer_landing(task, &format!("commit failed: {err}"))),
+        };
+
+        // 2. W = the human's work folder right now (dirty files included),
+        //    parented on the integration tip so concurrent lands chain.
+        let parent = repo
+            .read_ref(&iso.integration_ref)?
+            .map(|oid| oid.as_str().to_string())
+            .unwrap_or_else(|| "HEAD".to_string());
+        let w = match repo.snapshot(
+            &parent,
+            &format!("kanban: work folder snapshot before landing {}", task.id),
+        ) {
+            Ok(oid) => oid,
+            Err(err) => return Ok(self.defer_landing(task, &format!("snapshot failed: {err}"))),
+        };
+
+        // 3. Preflight the merge in the object database; nothing is written.
+        let pre = match repo.preflight(&w, branch) {
+            Ok(pre) => pre,
+            Err(err) => {
+                return Ok(self.defer_landing(task, &format!("merge preflight failed: {err}")));
+            }
+        };
+
+        match pre {
+            vcs::Preflight::Clean { tree } => {
+                // 4. Write only the differing paths as unstaged changes
+                //    (race-guarded), then advance the integration ref to a
+                //    commit of the merged tree with parents [integration,
+                //    task branch]. Never on the user's branch.
+                let changed = match repo.materialize(&w, &tree) {
+                    Ok(changed) => changed,
+                    Err(err) => return Ok(self.defer_landing(task, &err.to_string())),
+                };
+                let old = repo.read_ref(&iso.integration_ref)?;
+                let mut parents: Vec<String> = Vec::new();
+                if let Some(old) = old {
+                    parents.push(old.as_str().to_string());
+                }
+                parents.push(tip.as_str().to_string());
+                let parent_refs: Vec<&str> = parents.iter().map(String::as_str).collect();
+                let land = match repo.commit_tree(
+                    &tree,
+                    &parent_refs,
+                    &format!("kanban: land {}", task.id),
+                ) {
+                    Ok(oid) => oid,
+                    Err(err) => {
+                        return Ok(self.defer_landing(
+                            task,
+                            &format!("creating the integration commit failed: {err}"),
+                        ));
+                    }
+                };
+                if let Err(err) = repo.set_ref(&iso.integration_ref, &land) {
+                    return Ok(self.defer_landing(
+                        task,
+                        &format!("advancing the integration ref failed: {err}"),
+                    ));
+                }
+                task.integration = IntegrationState::Landed;
+                let files = changed
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.post_queue_note(
+                    &task.id,
+                    &format!(
+                        "⇩ landed {branch} into the work folder ({} path(s): {files}) — \
+                         unstaged changes only, integration at {land}",
+                        changed.len()
+                    ),
+                );
+                self.cleanup_after_land(task, &iso);
+                Ok(LandOutcome::Landed { changed })
+            }
+            vcs::Preflight::Conflict { paths, stages } => {
+                // 5. Nothing was written anywhere. The human side is merged
+                //    INTO the task's own worktree, so the conflict markers
+                //    appear only in that isolated checkout (work_path stays
+                //    untouched), and the resolution is routed through the
+                //    review-edits buffer (TASK-249): the human edits the text
+                //    and re-dispatches, or — with `on_conflict: resolver` —
+                //    a resolver run is dispatched immediately.
+                task.integration = IntegrationState::Conflict;
+                let merged = repo.merge_into_worktree(&wt_path, w.as_str());
+                task.review_edits = self.conflict_report(task, &wt_path, &stages, &merged);
+                let list = paths.join(", ");
+                let tail = match iso.on_conflict {
+                    IsolationOnConflict::Resolver => "; resolver run dispatched",
+                    IsolationOnConflict::Review => "; conflict report is in the review edits",
+                };
+                self.post_queue_note(
+                    &task.id,
+                    &format!(
+                        "⇩ merge conflict landing {branch}: {list} — work folder untouched{tail}"
+                    ),
+                );
+                Ok(LandOutcome::Conflict { paths })
+            }
+        }
+    }
+
+    /// The structured conflict report routed through the review-edits buffer
+    /// (TASK-249): the conflicting paths with all three versions as blob ids,
+    /// the base commit the task started from, where the isolated checkout
+    /// lives, and the instruction to resolve there and finish with
+    /// `kanban done` — which re-runs the landing.
+    fn conflict_report(
+        &self,
+        task: &Task,
+        wt_path: &Path,
+        stages: &[vcs::Stage],
+        merged: &Result<()>,
+    ) -> String {
+        let mut text = format!(
+            "Merge conflict: landing {} into the work folder conflicts with the \
+             current work-folder state; nothing was written to the work folder.\n\n\
+             Conflicting paths (`git cat-file blob <id>` prints a version):\n",
+            task.branch.as_deref().unwrap_or("-"),
+        );
+        let mut current = String::new();
+        for stage in stages {
+            if stage.path != current {
+                current = stage.path.clone();
+                text.push_str(&format!("- {}\n", stage.path));
+            }
+            let label = match stage.stage {
+                1 => "base   (stage 1)".to_string(),
+                2 => "ours   (stage 2, work folder)".to_string(),
+                _ => "theirs (stage 3, task branch)".to_string(),
+            };
+            text.push_str(&format!("  {label}: {}\n", stage.oid));
+        }
+        text.push_str(&format!(
+            "\nTask base commit: {}\nWorktree: {}\n\n",
+            task.base_commit.as_deref().unwrap_or("unknown"),
+            wt_path.display(),
+        ));
+        match merged {
+            Ok(()) => text.push_str(
+                "The work-folder side is already merged into the worktree, so the \
+                 conflict markers are in that isolated checkout: run `git status` \
+                 there, resolve every conflicted file, and commit.\n",
+            ),
+            Err(err) => text.push_str(&format!(
+                "The automatic merge into the worktree failed ({err}); resolve the \
+                 conflicting paths above in the worktree by hand.\n",
+            )),
+        }
+        text.push_str(&format!(
+            "Then finish with\n\n    kanban done {} --session <session> --agent\n\n\
+             done re-runs the landing; a clean merge writes the resolution into \
+             the work folder and cleans up the worktree.\n",
+            task.id
+        ));
+        text
+    }
+
+    /// Record a landing failure on the thread and return [`LandOutcome::Deferred`].
+    fn defer_landing(&self, task: &Task, reason: &str) -> LandOutcome {
+        self.post_queue_note(
+            &task.id,
+            &format!(
+                "⚠ landing deferred: {reason} — nothing was written; \
+                 run \"kanban integrate {}\" once resolved",
+                task.id
+            ),
+        );
+        LandOutcome::Deferred(reason.to_string())
+    }
+
+    /// Default post-landing cleanup (`cleanup: on_land`): remove the
+    /// isolated checkout and the task branch through the shared
+    /// [`Self::clear_task_worktree`], keeping the landed gate — the branch
+    /// was just merged into the integration ref, so the gate passing is the
+    /// sanity check.
+    fn cleanup_after_land(&self, task: &mut Task, iso: &IsolationSettings) {
+        if iso.cleanup != IsolationCleanup::OnLand {
+            return;
+        }
+        let had_isolation = task.worktree.is_some() || task.branch.is_some();
+        let problems = self.clear_task_worktree(task, false);
+        if !problems.is_empty() {
+            self.post_queue_note(
+                &task.id,
+                &format!("⚠ landing cleanup failed: {}", problems.join("; ")),
+            );
+        } else if had_isolation && task.worktree.is_none() {
+            self.post_queue_note(&task.id, "🧹 landed — isolated worktree and branch removed");
+        }
+    }
+
+    /// `kanban integrate <TASK-ID>`: re-run the landing after a conflict was
+    /// resolved (or for `land: manual` boards). Same sequence, same board
+    /// lock, as the done-time landing. A conflicted re-land on a
+    /// `on_conflict: resolver` board dispatches the resolver run like the
+    /// done-time landing does.
+    pub fn integrate_task(&self, task_id: &str) -> Result<Option<(Task, LandOutcome)>> {
+        let (task, outcome, resolver) = {
+            let _guard = self.storage.lock()?;
+            let Some(mut task) = self.storage.load_task(task_id)? else {
+                return Ok(None);
+            };
+            if task.integration == IntegrationState::Landed {
+                return Err(KanbanError::Invalid(format!(
+                    "Task {task_id} is already landed; run it again to land new work"
+                )));
+            }
+            if task.branch.is_none() || task.worktree.is_none() {
+                return Err(KanbanError::Invalid(format!(
+                    "Task {task_id} has no isolated branch to integrate"
+                )));
+            }
+            let outcome = self.land_task_branch(&mut task)?;
+            task.updated_at = timefmt::now();
+            self.storage.save_task(&task)?;
+            let resolver = matches!(outcome, LandOutcome::Conflict { .. })
+                && self.config.get_orchestration()?.isolation.on_conflict
+                    == IsolationOnConflict::Resolver;
+            (task, outcome, resolver)
+        };
+        if resolver {
+            self.dispatch_resolver(task_id);
+        }
+        Ok(Some((task, outcome)))
     }
 
     fn log_launch_failure(&self, task: &Task, session_id: &str, detail: &str) {
@@ -2216,13 +2993,13 @@ impl Operations {
     /// Dump the assembled prompt to `.kanban/logs/<session>.prompt.txt` and
     /// post an `AgentStep` audit entry recording this launch. Best-effort:
     /// a failure here must never block the actual launch.
-    fn log_launch_step(&self, task: &Task, session_id: &str, revert: bool) {
+    fn log_launch_step(&self, roots: &Roots<'_>, task: &Task, session_id: &str, revert: bool) {
         let prompt_path = self
             .storage
             .logs_dir
             .join(format!("{session_id}.prompt.txt"));
         if let Ok(prompt) = build_agent_prompt(
-            self.roots(),
+            *roots,
             task,
             session_id,
             revert,
@@ -2475,7 +3252,7 @@ impl Operations {
             .args(["-c", &script])
             // The detached job is the agent's own command line: it runs where
             // the agent runs, not where the board lives.
-            .current_dir(self.work_path())
+            .current_dir(self.task_cwd(task_id))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -2556,6 +3333,9 @@ impl Operations {
         let outcome = self.reconcile_agent_exit_inner(task_id, session_id, exit_status)?;
         if session_matched_task {
             let manifest = self.harvest_provenance(task_id, session_id);
+            if manifest.is_some() {
+                self.warn_write_overlaps(task_id, session_id);
+            }
             // The agent's closing answer goes in before the exit audit line so
             // the thread reads in the order it happened: what the agent said,
             // then the session closing.
@@ -2582,7 +3362,10 @@ impl Operations {
     /// opencode emit a parseable transcript, and any failure is a soft warning
     /// that never disturbs the reconciled exit.
     fn harvest_provenance(&self, task_id: &str, session_id: &str) -> Option<InputManifest> {
-        let backend = self.task_backend(task_id)?;
+        let task = self.storage.load_task(task_id).ok().flatten()?;
+        let backend = resolve_launch_settings(&self.config.load().ok()?, &task)
+            .ok()?
+            .backend;
         let transcript = self
             .storage
             .logs_dir
@@ -2603,8 +3386,11 @@ impl Operations {
         });
         let session = session_id.to_string();
         // The harvester's root relativizes the files a run read and wrote:
-        // those are the user's code, so it is the work folder.
-        let repo_root = self.work_path().to_path_buf();
+        // those live where the agent worked — its worktree when isolated, so
+        // paths stay repo-relative and comparable across tasks.
+        let repo_root = self
+            .task_worktree_path(&task)
+            .unwrap_or_else(|| self.work_path().to_path_buf());
         let harvester: Box<dyn TranscriptHarvester> = match backend.as_str() {
             "claude" => Box::new(ClaudeHarvester {
                 session_id: session,
@@ -2642,6 +3428,107 @@ impl Operations {
                 .ok()?
                 .backend,
         )
+    }
+
+    /// Every (pair, path) where two sessions from **different** tasks, whose
+    /// lifetimes overlapped, both wrote the same file. Joins the harvested
+    /// manifests with their session records: a manifest whose session record
+    /// is gone (task completion clears session files) cannot be attributed
+    /// and is skipped. Detection only — callers decide how to report it.
+    pub fn detect_write_overlaps(&self) -> Vec<provenance::WriteOverlap> {
+        let sessions = self.session_manager().list_sessions();
+        let now = timefmt::now();
+        let Ok(entries) = fs::read_dir(&self.storage.provenance_dir) else {
+            return Vec::new();
+        };
+        let mut joined = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(session_id) = name.to_str().and_then(|n| n.strip_suffix(".yaml")) else {
+                continue;
+            };
+            let Some(record) = sessions.iter().find(|s| s.id == session_id) else {
+                continue;
+            };
+            let Some(manifest) =
+                provenance::load_manifest(&self.storage.provenance_dir, session_id)
+            else {
+                continue;
+            };
+            // A still-active session owns its files through the present.
+            let end = if record.status == SessionStatus::Active {
+                now
+            } else {
+                record.ended_at.unwrap_or(record.last_seen)
+            };
+            joined.push((manifest, record.task_id.clone(), (record.started_at, end)));
+        }
+        let views: Vec<provenance::SessionWrites<'_>> = joined
+            .iter()
+            .map(|(manifest, task_id, window)| provenance::SessionWrites {
+                manifest,
+                task_id,
+                window: *window,
+            })
+            .collect();
+        provenance::overlapping_writes(&views)
+    }
+
+    /// Visible warning for a provenance overlap: when the session that just
+    /// exited and a session of another task ran concurrently and both wrote
+    /// the same path, post a `context` message on **both** tasks' threads so
+    /// the human (and the next prompt) sees that the file may have been
+    /// clobbered. Deduped per task: a thread that already carries a message
+    /// naming both session ids is left alone. Best-effort — any failure is
+    /// silently ignored, the exit has already been reconciled.
+    fn warn_write_overlaps(&self, task_id: &str, session_id: &str) {
+        let mut groups: Vec<(String, String, Vec<String>)> = Vec::new();
+        for overlap in self
+            .detect_write_overlaps()
+            .into_iter()
+            .filter(|o| o.session_a == session_id || o.session_b == session_id)
+        {
+            let (peer_session, peer_task) = if overlap.session_a == session_id {
+                (overlap.session_b, overlap.task_b)
+            } else {
+                (overlap.session_a, overlap.task_a)
+            };
+            if let Some(group) = groups.iter_mut().find(|(peer, _, _)| peer == &peer_session) {
+                group.2.push(overlap.path);
+            } else {
+                groups.push((peer_session, peer_task, vec![overlap.path]));
+            }
+        }
+        for (peer_session, peer_task, mut paths) in groups {
+            paths.sort();
+            let body = format!(
+                "⚠ provenance overlap: {task_id} (session {session_id}) and {peer_task} \
+                 (session {peer_session}) ran concurrently and both wrote: {}. The last \
+                 writer's content wins; verify nothing was silently clobbered.",
+                paths.join(", ")
+            );
+            for target in [task_id, peer_task.as_str()] {
+                let already_warned = self
+                    .thread_manager()
+                    .and_then(|tm| tm.messages_of_kind(target, MessageKind::Context))
+                    .map(|messages| {
+                        messages.iter().any(|message| {
+                            message.body.contains(session_id)
+                                && message.body.contains(&peer_session)
+                        })
+                    })
+                    .unwrap_or(false);
+                if !already_warned {
+                    let _ = self.context_manager().append_context_with_session(
+                        target,
+                        &body,
+                        "system",
+                        None,
+                        &self.storage,
+                    );
+                }
+            }
+        }
     }
 
     /// Post the agent's closing answer — the summary it prints as its last
@@ -2699,6 +3586,29 @@ impl Operations {
         );
     }
 
+    /// Post a transcript `type: error` on the thread and decide whether
+    /// crash-restart should still run. No error (or a retryable one) keeps
+    /// the backoff; `isRetryable: false` stays crashed so a credits/auth
+    /// failure is not painted as `↻ retry`.
+    fn crash_should_restart(&self, task_id: &str, session_id: &str) -> bool {
+        let transcript = self
+            .storage
+            .logs_dir
+            .join(format!("{session_id}.transcript.jsonl"));
+        let Some(err) = reply::fatal_error(&transcript) else {
+            return true;
+        };
+        self.post_queue_note(task_id, &format!("✖ agent error: {}", err.message));
+        if err.retryable {
+            return true;
+        }
+        self.post_queue_note(
+            task_id,
+            "↻ crash-restart skipped — backend error is not retryable",
+        );
+        false
+    }
+
     fn reconcile_agent_exit_inner(
         &self,
         task_id: &str,
@@ -2717,7 +3627,9 @@ impl Operations {
         }
         if exit_status != 0 {
             session_mgr.crash_session(session_id)?;
-            let _ = self.schedule_crash_restart(task_id);
+            if self.crash_should_restart(task_id, session_id) {
+                let _ = self.schedule_crash_restart(task_id);
+            }
             return Ok(AgentExitOutcome::Crashed);
         }
 
@@ -2827,11 +3739,15 @@ impl Operations {
         });
     }
 
-    /// Relaunch agents whose declared wait deadline has passed while their
-    /// process is gone — the "ping": the fresh session is told to check the
-    /// awaited result, report, and either finish or declare a new wait.
-    /// Called from the TUI tick and `kanban check-sessions`.
-    pub fn resume_expired_waits(&self) -> Result<Vec<(String, String)>> {
+    /// End every declared wait whose deadline has passed while the agent
+    /// process is gone. A pause releases its slot, so the normal path parks
+    /// the task back into the dispatcher queue ([`Self::dispatch_queue`] is
+    /// pumped right after); only a board where the queue could never drain
+    /// keeps the old direct relaunch — the fresh session is told to check
+    /// the awaited result, report, and either finish or declare a new wait.
+    /// Called from the TUI tick, the daemon, `kanban check-sessions`, and
+    /// the wait-resume monitor.
+    pub fn wake_expired_waits(&self) -> Result<Vec<WaitWake>> {
         let session_mgr = self.session_manager();
         let heartbeat_timeout = self.config.get_threshold("session_heartbeat_timeout")?;
         let now = timefmt::now();
@@ -2876,10 +3792,26 @@ impl Operations {
                 timefmt::format(&wait_until),
                 session.wait_note.as_deref().unwrap_or("(no note)")
             );
+            if self.queue_can_dispatch()? {
+                // The pause held no slot, so waking re-acquires one through
+                // the dispatcher instead of launching past the caps.
+                if self.queue_expired_wait(&session, &note, attempt)? {
+                    resumed.push(WaitWake::Queued {
+                        task_id: session.task_id.clone(),
+                    });
+                } else {
+                    // Fenced out: the task moved on without this session.
+                    session_mgr.close_session(&session.id)?;
+                }
+                continue;
+            }
             match self.respawn_session(&session.task_id, &session.id, &note, Some(attempt))? {
                 RespawnOutcome::Spawned(new_session) => {
                     session_mgr.close_session(&session.id)?;
-                    resumed.push((session.task_id.clone(), new_session));
+                    resumed.push(WaitWake::Resumed {
+                        task_id: session.task_id.clone(),
+                        session_id: new_session,
+                    });
                 }
                 RespawnOutcome::LaunchFailed(new_session) => {
                     session_mgr.close_session(&session.id)?;
@@ -2916,7 +3848,57 @@ impl Operations {
                 }
             }
         }
+        if resumed
+            .iter()
+            .any(|wake| matches!(wake, WaitWake::Queued { .. }))
+        {
+            // A parked task needs a pump to actually start, and this call
+            // is often the only thing awake at the deadline. Best-effort,
+            // like the pump in `reconcile_agent_exit`; `dispatch_queue`
+            // never calls back into this method, so there is no recursion.
+            let _ = self.dispatch_queue();
+        }
         Ok(resumed)
+    }
+
+    /// End one pause by parking the task in the dispatcher queue instead of
+    /// launching past the caps. Fenced exactly like [`Self::respawn_session`]:
+    /// `Ok(false)` when the task is gone or was handed to a different session
+    /// in the meantime — the caller then closes the stale session.
+    fn queue_expired_wait(&self, session: &Session, note: &str, attempt: u32) -> Result<bool> {
+        let session_mgr = self.session_manager();
+        let _guard = self.storage.lock()?;
+        let Some(mut task) = self.storage.load_task(&session.task_id)? else {
+            return Ok(false);
+        };
+        if task.status != TaskStatus::InProgress
+            || task.session.as_deref() != Some(session.id.as_str())
+        {
+            return Ok(false);
+        }
+        // `context` kind so the queued run's prompt still carries the wait
+        // reason, exactly like the direct respawn did.
+        self.thread_manager()?.post_with_origin(
+            &task.id,
+            MessageRole::System,
+            MessageKind::Context,
+            note,
+            None,
+            vec![],
+            Some("kanban".to_string()),
+            Some("kanban".to_string()),
+        )?;
+        task.auto_resumes = attempt;
+        task.run_phase = Some(RunPhase::Queued);
+        task.session = None;
+        task.updated_at = timefmt::now();
+        self.storage.save_task(&task)?;
+        session_mgr.close_session(&session.id)?;
+        self.post_queue_note(
+            &task.id,
+            "⏸ wait deadline passed — queued for a free agent slot",
+        );
+        Ok(true)
     }
 
     /// Relaunch a task's agent on a fresh session after `expected_session`
@@ -2962,6 +3944,7 @@ impl Operations {
                 task.auto_resumes = attempt;
             }
             task.session = Some(new_session_id.clone());
+            self.claim_run_phase(&mut task)?;
             task.updated_at = timefmt::now();
             session_mgr.link_named_session(&task.id, &new_session_id, &task.title)?;
             if let Err(err) = self.storage.save_task(&task) {
@@ -3039,6 +4022,60 @@ impl Operations {
         if backup_dir.is_dir() {
             let _ = fs::remove_dir_all(&backup_dir);
         }
+    }
+
+    /// Remove the task's isolated worktree and its branch — the worktree
+    /// counterpart of [`Self::clear_task_backups`], called when the task's
+    /// lifecycle ends: after a successful landing, on Done, and on abandon.
+    /// `allow_unmerged: false` keeps the landed gate (the landing path,
+    /// where the branch was just merged into the integration ref); the
+    /// terminal human paths pass `true`, because dropping or finishing a
+    /// task discards its branch with it. A `Conflict` task is never touched
+    /// here: its worktree is the one place unmerged agent work lives.
+    /// Returns the git problems hit along the way; the task fields are
+    /// cleared only when everything actually went away.
+    fn clear_task_worktree(&self, task: &mut Task, allow_unmerged: bool) -> Vec<String> {
+        if task.integration == IntegrationState::Conflict {
+            return Vec::new();
+        }
+        let (Some(branch), Some(rel)) = (task.branch.clone(), task.worktree.clone()) else {
+            return Vec::new();
+        };
+        let Some(repo) = vcs::detect(self.work_path()) else {
+            return Vec::new();
+        };
+        let mut problems: Vec<String> = Vec::new();
+        let wt_path = self.storage.worktrees_dir.join(&rel);
+        if wt_path.is_dir() {
+            // The checkout dies with the task; --force keeps modified or
+            // untracked leftovers from wedging the removal.
+            if let Err(err) = repo.remove_worktree(&wt_path, true) {
+                problems.push(format!("worktree: {err}"));
+            } else {
+                // git removes what it knew about; an agent process still
+                // exiting can recreate a stray file (a tool's cache dir)
+                // under the path afterwards. A leftover directory would make
+                // `git worktree add` refuse this task id forever, silently
+                // dropping it back to the shared folder on every later run,
+                // so sweep the residue. The path is always
+                // `.kanban/worktrees/<TASK-ID>` — board data, never the
+                // user's work folder.
+                let _ = fs::remove_dir_all(&wt_path);
+            }
+        } else {
+            // The directory is already gone (deleted by hand): drop the
+            // stale registration so the branch can still be reclaimed.
+            let _ = repo.prune_worktrees();
+        }
+        if let Err(err) = repo.delete_branch(&branch, allow_unmerged) {
+            problems.push(format!("branch: {err}"));
+        }
+        if problems.is_empty() {
+            task.worktree = None;
+            task.branch = None;
+            task.base_commit = None;
+        }
+        problems
     }
 
     fn task_session_ids(&self, task: &Task) -> Vec<String> {

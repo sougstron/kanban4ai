@@ -21,6 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
+use chrono::NaiveDateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -299,6 +300,115 @@ pub fn render_manifests(manifests: &[InputManifest]) -> String {
     lines.join("\n")
 }
 
+/// A harvested manifest joined with its session's task ownership and lifetime
+/// window — the inputs of the concurrent-write comparison.
+pub struct SessionWrites<'a> {
+    pub manifest: &'a InputManifest,
+    pub task_id: &'a str,
+    /// `[started_at, end)` — a still-active session's end is the current time.
+    pub window: (NaiveDateTime, NaiveDateTime),
+}
+
+/// One concurrently-clobbered path: two sessions from **different** tasks,
+/// whose lifetimes overlapped, both recorded the file in their `writes`.
+/// Sessions of the same task are excluded — a task's own re-runs are expected
+/// to touch the same files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteOverlap {
+    pub path: String,
+    pub session_a: String,
+    pub task_a: String,
+    pub session_b: String,
+    pub task_b: String,
+}
+
+/// Compare `writes` across sessions whose lifetimes overlapped. A finding
+/// means the later writer silently clobbered the earlier one (last writer
+/// wins), which until now was invisible. Pure detection: callers decide how
+/// to report it.
+pub fn overlapping_writes(sessions: &[SessionWrites<'_>]) -> Vec<WriteOverlap> {
+    let mut out = Vec::new();
+    for (i, a) in sessions.iter().enumerate() {
+        for b in &sessions[i + 1..] {
+            if a.manifest.session_id == b.manifest.session_id
+                || a.task_id == b.task_id
+                // Half-open windows: one session ending exactly when the
+                // other starts is succession, not concurrency.
+                || !(a.window.0 < b.window.1 && b.window.0 < a.window.1)
+            {
+                continue;
+            }
+            for path in &a.manifest.writes {
+                if b.manifest.writes.contains(path) {
+                    out.push(WriteOverlap {
+                        path: path.clone(),
+                        session_a: a.manifest.session_id.clone(),
+                        task_a: a.task_id.to_string(),
+                        session_b: b.manifest.session_id.clone(),
+                        task_b: b.task_id.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A backend `type: error` event: the message shown in the log / thread, and
+/// whether crash-restart should still fire. `isRetryable: false` (OpenCode
+/// credits/401) is a hard failure — retrying it only disguises the cause as
+/// a queue backoff. Missing flag defaults to retryable, matching unknown
+/// crashes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamError {
+    pub message: String,
+    pub retryable: bool,
+}
+
+/// Parse a backend `type: error` event. `None` for any other event, or an
+/// error with no usable message.
+pub fn stream_error(value: &Value) -> Option<StreamError> {
+    if value.get("type").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    let message = error_event_message(value)?;
+    Some(StreamError {
+        message,
+        retryable: error_event_retryable(value),
+    })
+}
+
+fn error_event_message(value: &Value) -> Option<String> {
+    let error = value.get("error");
+    error
+        .and_then(|err| err.get("data"))
+        .and_then(|data| data.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            error
+                .and_then(|err| err.get("message"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+}
+
+fn error_event_retryable(value: &Value) -> bool {
+    let error = value.get("error");
+    error
+        .and_then(|err| err.get("data"))
+        .and_then(|data| data.get("isRetryable"))
+        .and_then(Value::as_bool)
+        .or_else(|| {
+            error
+                .and_then(|err| err.get("isRetryable"))
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(true)
+}
+
 /// Render one backend stream event (claude or opencode) as human-readable log
 /// text, or `None` for events with nothing worth showing. Callers pass non-JSON
 /// lines through untouched; this only decides recognized JSON events. The two
@@ -348,6 +458,7 @@ pub fn render_stream_event(value: &Value) -> Option<String> {
         "tool_use" => value
             .get("part")
             .map(|part| format!("  → {}", opencode_tool_summary(part))),
+        "error" => stream_error(value).map(|err| format!("error: {}", err.message)),
         // pi family (pi/omp). Each assistant turn is finalized in one `message_end`
         // carrying its text and tool calls; `message_start` (placeholder) and
         // `turn_end` (a duplicate of the last message) are skipped to avoid noise.
@@ -916,6 +1027,35 @@ not json at all
         assert_eq!(render_stream_event(&step), None);
     }
 
+    #[test]
+    fn renders_opencode_error_and_parses_retryable_flag() {
+        let fatal: Value = serde_json::from_str(
+            r#"{"type":"error","error":{"name":"APIError","data":{"message":"Insufficient balance.","statusCode":401,"isRetryable":false}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_stream_event(&fatal).as_deref(),
+            Some("error: Insufficient balance.")
+        );
+        assert_eq!(
+            stream_error(&fatal),
+            Some(StreamError {
+                message: "Insufficient balance.".to_string(),
+                retryable: false,
+            })
+        );
+
+        let retryable: Value =
+            serde_json::from_str(r#"{"type":"error","error":{"message":"rate limited"}}"#).unwrap();
+        assert_eq!(
+            stream_error(&retryable),
+            Some(StreamError {
+                message: "rate limited".to_string(),
+                retryable: true,
+            })
+        );
+    }
+
     // pi family (pi/omp) `--mode json` stream: tool calls live under
     // `arguments`; the backend session id is the `session` event's `id`.
     const PI_FAMILY_TRANSCRIPT: &str = r#"
@@ -1010,5 +1150,94 @@ not json at all
         let manifests = collect_for_thread(dir.path(), &[step, noise, missing]);
         assert_eq!(manifests.len(), 1);
         assert_eq!(manifests[0].session_id, "ses-1");
+    }
+
+    fn overlap_manifest(id: &str, writes: &[&str]) -> InputManifest {
+        InputManifest {
+            session_id: id.to_string(),
+            backend: "claude".to_string(),
+            writes: writes.iter().map(|w| w.to_string()).collect(),
+            generated_at: "t".to_string(),
+            ..InputManifest::default()
+        }
+    }
+
+    fn at(secs: i64) -> NaiveDateTime {
+        chrono::DateTime::from_timestamp(secs, 0)
+            .unwrap()
+            .naive_utc()
+    }
+
+    fn view<'a>(
+        manifest: &'a InputManifest,
+        task_id: &'a str,
+        window: (NaiveDateTime, NaiveDateTime),
+    ) -> SessionWrites<'a> {
+        SessionWrites {
+            manifest,
+            task_id,
+            window,
+        }
+    }
+
+    #[test]
+    fn overlapping_writes_flags_cross_task_concurrent_clobber() {
+        let a = overlap_manifest("ses-a", &["src/lib.rs", "src/a.rs"]);
+        let b = overlap_manifest("ses-b", &["src/lib.rs"]);
+        let c = overlap_manifest("ses-c", &["src/c.rs"]);
+        let views = [
+            view(&a, "TASK-1", (at(0), at(100))),
+            view(&b, "TASK-2", (at(50), at(150))),
+            // Overlaps in time with a, but writes nothing a wrote.
+            view(&c, "TASK-3", (at(10), at(20))),
+        ];
+        let findings = overlapping_writes(&views);
+        assert_eq!(findings.len(), 1);
+        let finding = &findings[0];
+        assert_eq!(finding.path, "src/lib.rs");
+        assert_eq!(finding.task_a, "TASK-1");
+        assert_eq!(finding.session_a, "ses-a");
+        assert_eq!(finding.task_b, "TASK-2");
+        assert_eq!(finding.session_b, "ses-b");
+        // Every shared path of the pair is reported, in the first manifest's
+        // write order.
+        let b2 = overlap_manifest("ses-b2", &["src/a.rs", "src/lib.rs"]);
+        let views = [
+            view(&a, "TASK-1", (at(0), at(100))),
+            view(&b2, "TASK-2", (at(50), at(150))),
+        ];
+        let paths: Vec<String> = overlapping_writes(&views)
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        assert_eq!(paths, vec!["src/lib.rs", "src/a.rs"]);
+    }
+
+    #[test]
+    fn overlapping_writes_ignores_same_task_succession_and_non_writes() {
+        let a = overlap_manifest("ses-a", &["src/lib.rs"]);
+        let same_task = overlap_manifest("ses-b", &["src/lib.rs"]);
+        let later = overlap_manifest("ses-c", &["src/lib.rs"]);
+        let views = [
+            // Same task re-runs are expected to touch the same files.
+            view(&a, "TASK-1", (at(0), at(100))),
+            view(&same_task, "TASK-1", (at(50), at(150))),
+        ];
+        assert!(overlapping_writes(&views).is_empty());
+
+        let views = [
+            // Succession, not concurrency: b starts exactly when a ends.
+            view(&a, "TASK-1", (at(0), at(100))),
+            view(&later, "TASK-2", (at(100), at(200))),
+        ];
+        assert!(overlapping_writes(&views).is_empty());
+
+        let reader = overlap_manifest("ses-e", &[]);
+        let views = [
+            // Overlap on reads only — no write, no finding.
+            view(&a, "TASK-1", (at(0), at(100))),
+            view(&reader, "TASK-2", (at(50), at(150))),
+        ];
+        assert!(overlapping_writes(&views).is_empty());
     }
 }

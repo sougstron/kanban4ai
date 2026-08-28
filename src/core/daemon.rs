@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use fs2::FileExt;
 
 use super::error::{KanbanError, Result};
-use super::operations::Operations;
+use super::operations::{Operations, WaitWake};
 use super::project::{Project, ProjectStore};
 use super::session::SessionManager;
 use super::timefmt;
@@ -136,11 +136,21 @@ fn pump_project(project: &Project, warned_once: &mut HashSet<String>) -> Result<
         return Ok(lines);
     }
 
-    for (task_id, session_id) in ops.resume_expired_waits()? {
-        lines.push(format!(
-            "{ts} {} resume {task_id} → {session_id}",
-            project.id
-        ));
+    for wake in ops.wake_expired_waits()? {
+        match wake {
+            WaitWake::Queued { task_id } => {
+                lines.push(format!("{ts} {} queue {task_id}", project.id));
+            }
+            WaitWake::Resumed {
+                task_id,
+                session_id,
+            } => {
+                lines.push(format!(
+                    "{ts} {} resume {task_id} → {session_id}",
+                    project.id
+                ));
+            }
+        }
     }
 
     // Reap then schedule, matching `dispatch_queue`: `check_sessions` only

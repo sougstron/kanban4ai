@@ -41,6 +41,16 @@ pub fn final_reply(backend: &str, transcript: &Path) -> Option<String> {
     (!reply.is_empty()).then(|| reply.to_string())
 }
 
+/// Last `type: error` event in a transcript, if any. Used on a non-zero exit
+/// so the thread can show why the agent died and crash-restart can skip
+/// errors the backend marked `isRetryable: false`.
+pub fn fatal_error(transcript: &Path) -> Option<crate::core::provenance::StreamError> {
+    let raw = std::fs::read_to_string(transcript).ok()?;
+    json_lines(&raw)
+        .filter_map(|value| crate::core::provenance::stream_error(&value))
+        .last()
+}
+
 /// Clamp a reply to `max_chars`, flagging the cut. A whole agent monologue can
 /// be arbitrarily long and every thread entry is replayed into the next
 /// prompt, so the budget is a board threshold rather than a hardcoded limit.
@@ -291,5 +301,21 @@ mod tests {
         let cut = truncate_reply(&long, 10);
         assert!(cut.starts_with(&"я".repeat(10)));
         assert!(cut.ends_with("(agent reply truncated)"));
+    }
+
+    #[test]
+    fn fatal_error_takes_the_last_error_event() {
+        let (_dir, path) = transcript(concat!(
+            r#"{"type":"text","part":{"text":"hi"}}"#,
+            "\n",
+            r#"{"type":"error","error":{"data":{"message":"first","isRetryable":true}}}"#,
+            "\n",
+            r#"{"type":"error","error":{"data":{"message":"Insufficient balance.","isRetryable":false}}}"#,
+            "\n",
+        ));
+        let err = fatal_error(&path).expect("error event");
+        assert_eq!(err.message, "Insufficient balance.");
+        assert!(!err.retryable);
+        assert_eq!(fatal_error(Path::new("/nope/missing.jsonl")), None);
     }
 }

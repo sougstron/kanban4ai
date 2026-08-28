@@ -8,7 +8,8 @@ use std::fs;
 use common::{copy_fixture, fixtures_dir, temp_board};
 use kanban4ai::core::config::Config;
 use kanban4ai::core::models::{
-    MessageKind, MessageRole, MessageStatus, RunPhase, Session, SessionStatus, Task, TaskStatus,
+    IntegrationState, MessageKind, MessageRole, MessageStatus, RunPhase, Session, SessionStatus,
+    Task, TaskStatus,
 };
 use kanban4ai::core::storage::Storage;
 use kanban4ai::core::thread::ThreadManager;
@@ -142,6 +143,46 @@ fn reset_human_restart_clears_crash_bookkeeping() {
     assert_eq!(task.crash_restarts, 0);
     assert_eq!(task.restart_at, None);
     assert_eq!(task.review_rounds, 0);
+}
+
+#[test]
+fn worktree_isolation_fields_stay_absent_by_default_and_round_trip_when_set() {
+    let (dir, storage) = temp_board();
+    let mut task = Task::new("TASK-093", "Isolated task");
+    task.status = TaskStatus::InProgress;
+
+    // A task that never ran isolated writes no isolation keys at all —
+    // boards from before TASK-246 are rewritten byte-identically.
+    let path = dir.path().join(".kanban/tasks/in_progress/TASK-093.md");
+    storage.save_task(&task).unwrap();
+    let plain = fs::read_to_string(&path).unwrap();
+    assert!(!plain.contains("worktree"), "{plain}");
+    assert!(!plain.contains("branch"), "{plain}");
+    assert!(!plain.contains("base_commit"), "{plain}");
+    assert!(!plain.contains("integration"), "{plain}");
+
+    task.worktree = Some("TASK-093".to_string());
+    task.branch = Some("kanban/TASK-093".to_string());
+    task.base_commit = Some("a".repeat(40));
+    task.integration = IntegrationState::Pending;
+    storage.save_task(&task).unwrap();
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("worktree: TASK-093"), "{raw}");
+    assert!(raw.contains("branch: kanban/TASK-093"), "{raw}");
+    assert!(raw.contains("base_commit:"), "{raw}");
+    assert!(raw.contains("integration: pending"), "{raw}");
+
+    let reparsed = storage.parse_task_file(&path).unwrap();
+    assert_eq!(reparsed, task);
+
+    // Back to defaults: the keys are dropped again, not written as nulls.
+    task.worktree = None;
+    task.branch = None;
+    task.base_commit = None;
+    task.integration = IntegrationState::None;
+    storage.save_task(&task).unwrap();
+    let cleared = fs::read_to_string(&path).unwrap();
+    assert_eq!(cleared, plain);
 }
 
 #[test]

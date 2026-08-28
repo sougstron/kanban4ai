@@ -392,7 +392,7 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
         Some(task) if app.primary_run_action_for(&task) == UiAction::Revoke => {
             ("r revoke", UiAction::Revoke)
         }
-        _ => ("r run", UiAction::Run),
+        _ => ("r queue", UiAction::Run),
     };
     match app.screen {
         Screen::Board => {
@@ -400,6 +400,7 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
                 seg("n new", Some(UiAction::NewTask), 2),
                 seg("e edit", Some(UiAction::EditTask), 4),
                 seg(primary_action.0, Some(primary_action.1), 1),
+                seg("F run now", Some(UiAction::RunNow), 7),
                 seg("m move", Some(UiAction::MoveTask), 4),
                 seg("y approve", Some(UiAction::Approve), 5),
                 seg("A archive done", Some(UiAction::ArchiveAllDone), 6),
@@ -425,6 +426,7 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
             });
             let mut segments = vec![
                 seg(primary_action.0, Some(primary_action.1), 1),
+                seg("F run now", Some(UiAction::RunNow), 7),
                 seg("w answer", Some(UiAction::AnswerQuestion), 3),
                 seg("y approve", Some(UiAction::Approve), 3),
                 seg("x reject", Some(UiAction::ToggleReject), 5),
@@ -644,13 +646,16 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  ←/→ or Tab/Shift+Tab: switch columns"),
         Line::from("  ↑/↓ PgUp/PgDn Home/End: navigate cards"),
         Line::from("  Enter: open task detail"),
-        Line::from("  r: run a task; revoke only while a session is live/crashed"),
+        Line::from(
+            "  r: queue a task for the dispatcher; revoke while a session is live/crashed/paused",
+        ),
+        Line::from("  F: run now, bypassing the queue (debug)"),
         Line::from("  k: stop a live or waiting session (task stays In Progress)"),
-        Line::from("  Q: queue for the dispatcher / take a queued task back out"),
+        Line::from("  Q: same as r for idle cards · take a queued task back out"),
         Line::from("  n: new task in focused column · e/m/d: edit, move, delete permanently"),
         Line::from("  w: answer question · y: approve Review → Done"),
         Line::from("  t: attach to the task's agent · c: add context/suggestion"),
-        Line::from("  u: recover a crashed task · Ctrl+R: fold edits and re-run"),
+        Line::from("  u: recover a crashed task · Ctrl+R: fold edits and re-queue"),
         Line::from("  A: archive all Done · b: mark all Review tasks Done (R also works)"),
         Line::from("  a/l: archive and sessions views"),
         Line::from("  /: search · Esc clears an active filter"),
@@ -660,9 +665,9 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Detail"),
         Line::from("  Tab: cycle thread/answer/editor panels when present"),
-        Line::from("  Enter: run To Do tasks only · r/buttons: run or revoke while live"),
+        Line::from("  Enter: queue To Do tasks · r/buttons: run now (F) or revoke live/paused"),
         Line::from("  k: stop a live or waiting session without starting a new one"),
-        Line::from("  Ctrl+S: save review edits (no re-run) · Ctrl+R: re-run"),
+        Line::from("  Ctrl+S: save review edits (no re-run) · Ctrl+R: re-queue"),
         Line::from("  s: project settings · Ctrl+T: cycle and persist theme"),
         Line::from("  Home/End: start/end of thread · q/Esc: back · Esc leaves text panels first"),
         Line::from("  [/]: select a thread message · x: toggle reject (quarantine) on it"),

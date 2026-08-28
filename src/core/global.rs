@@ -31,6 +31,9 @@ pub const PROJECT_SORT_SMART: &str = "smart";
 /// Default `kanban daemon` tick interval when the store config omits one.
 pub const DEFAULT_DAEMON_INTERVAL_SECS: u64 = 60;
 
+/// Default hours between automatic update checks (`updates.check_interval_hours`).
+pub const DEFAULT_CHECK_INTERVAL_HOURS: u64 = 24;
+
 /// Map any stored value onto a known ordering; unknown values read as `name`.
 pub fn normalize_project_sort(value: &str) -> &'static str {
     match value {
@@ -49,6 +52,11 @@ pub struct GlobalConfig {
     /// lives here (`daemon.interval`, seconds, default 60).
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
     pub daemon: Mapping,
+    /// Update-check settings (`updates.check_on_open`, `check_interval_hours`,
+    /// `notify`). Machine-wide like everything else in this file: the update
+    /// state is per install, not per board.
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub updates: Mapping,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
@@ -105,6 +113,54 @@ impl GlobalConfig {
             .get(Value::String("interval".to_string()))
             .and_then(positive_u64)
             .unwrap_or(DEFAULT_DAEMON_INTERVAL_SECS)
+    }
+
+    /// Whether the TUI kicks off an update check on open
+    /// (`updates.check_on_open`, default true).
+    pub fn update_check_on_open(&self) -> bool {
+        self.updates
+            .get(Value::String("check_on_open".to_string()))
+            .and_then(as_bool)
+            .unwrap_or(true)
+    }
+
+    pub fn set_update_check_on_open(&mut self, enabled: bool) {
+        self.updates.insert(
+            Value::String("check_on_open".to_string()),
+            Value::Bool(enabled),
+        );
+    }
+
+    /// Hours a cached update check stays fresh
+    /// (`updates.check_interval_hours`). Missing, zero, or unparseable
+    /// values read as the default, so a hand-edited file still yields a
+    /// usable cadence.
+    pub fn update_check_interval_hours(&self) -> u64 {
+        self.updates
+            .get(Value::String("check_interval_hours".to_string()))
+            .and_then(positive_u64)
+            .unwrap_or(DEFAULT_CHECK_INTERVAL_HOURS)
+    }
+
+    pub fn set_update_check_interval_hours(&mut self, hours: u64) {
+        self.updates.insert(
+            Value::String("check_interval_hours".to_string()),
+            Value::Number(hours.into()),
+        );
+    }
+
+    /// Whether a newly seen version also fires a desktop notification
+    /// (`updates.notify`, default false — the status-line banner covers it).
+    pub fn update_notify(&self) -> bool {
+        self.updates
+            .get(Value::String("notify".to_string()))
+            .and_then(as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn set_update_notify(&mut self, enabled: bool) {
+        self.updates
+            .insert(Value::String("notify".to_string()), Value::Bool(enabled));
     }
 }
 
@@ -225,6 +281,57 @@ mod tests {
         assert_eq!(
             store.load_global_config().unwrap().daemon_interval(),
             DEFAULT_DAEMON_INTERVAL_SECS
+        );
+    }
+
+    #[test]
+    fn updates_section_defaults_overrides_and_legacy_files() {
+        let dir = tempfile::tempdir().expect("store");
+        let store = ProjectStore::at(dir.path());
+
+        // A missing file — and therefore a legacy config without the section —
+        // loads with the defaults.
+        let config = store.load_global_config().unwrap();
+        assert!(config.update_check_on_open());
+        assert_eq!(
+            config.update_check_interval_hours(),
+            DEFAULT_CHECK_INTERVAL_HOURS
+        );
+        assert!(!config.update_notify());
+
+        std::fs::write(
+            store.global_config_path(),
+            "updates:\n  check_on_open: false\n  check_interval_hours: 12\n  notify: true\n",
+        )
+        .expect("seed updates");
+        let config = store.load_global_config().unwrap();
+        assert!(!config.update_check_on_open());
+        assert_eq!(config.update_check_interval_hours(), 12);
+        assert!(config.update_notify());
+
+        // Setters round-trip through the file.
+        let mut config = store.load_global_config().unwrap();
+        config.set_update_check_on_open(true);
+        config.set_update_check_interval_hours(48);
+        config.set_update_notify(false);
+        store.save_global_config(&config).expect("save");
+        let config = store.load_global_config().unwrap();
+        assert!(config.update_check_on_open());
+        assert_eq!(config.update_check_interval_hours(), 48);
+        assert!(!config.update_notify());
+
+        // Zero is not a usable interval: read as the default.
+        std::fs::write(
+            store.global_config_path(),
+            "updates:\n  check_interval_hours: 0\n",
+        )
+        .expect("seed zero");
+        assert_eq!(
+            store
+                .load_global_config()
+                .unwrap()
+                .update_check_interval_hours(),
+            DEFAULT_CHECK_INTERVAL_HOURS
         );
     }
 }

@@ -278,6 +278,41 @@ fn question_pipeline_via_cli() {
 }
 
 #[test]
+fn answer_reports_remaining_questions_and_resume_state() {
+    let dir = board();
+    kanban(&dir).args(["create", "Two asks"]).assert().success();
+    kanban(&dir)
+        .args(["move", "TASK-001", "in_progress"])
+        .assert()
+        .success();
+    kanban(&dir)
+        .args(["ask", "TASK-001", "First?"])
+        .assert()
+        .success();
+    kanban(&dir)
+        .args(["ask", "TASK-001", "Second?"])
+        .assert()
+        .success();
+
+    kanban(&dir)
+        .args(["answer", "TASK-001", "0", "One"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Answer added to TASK-001"))
+        .stdout(predicate::str::contains("1 question(s) still open"));
+
+    // auto_launch is disabled on the quiet board, so the last answer reports
+    // the skipped resume instead of a relaunched session.
+    kanban(&dir)
+        .args(["answer", "TASK-001", "0", "Two"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "All questions answered; agent was not running and auto-resume is off",
+        ));
+}
+
+#[test]
 fn ask_form_posts_questions_from_yaml_file() {
     let dir = board();
     kanban(&dir).args(["create", "Form me"]).assert().success();
@@ -484,6 +519,75 @@ fn edits_and_rerun() {
 }
 
 #[test]
+fn rerun_queues_by_default_and_now_launches() {
+    let dir = board();
+    let sleeper = dir.work().join("fake-agent.sh");
+    std::fs::write(&sleeper, "#!/bin/sh\nexec sleep 30\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&sleeper).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&sleeper, perms).unwrap();
+    }
+    write_board_config(
+        &dir,
+        &format!(
+            "notifications:\n  enabled: false\n\
+auto_launch:\n  enabled: true\n  use_tmux: true\n  terminal_fallback: true\n  default_agent: opencode\n\
+agents:\n  opencode:\n    command: {}\n    extra_args: []\n",
+            sleeper.display()
+        ),
+    );
+    kanban(&dir)
+        .args(["create", "Reviewable"])
+        .assert()
+        .success();
+    kanban(&dir)
+        .args(["move", "TASK-001", "review"])
+        .assert()
+        .success();
+    kanban(&dir)
+        .args(["edits", "TASK-001", "Fold these edits"])
+        .assert()
+        .success();
+
+    // Default: with the queue able to dispatch, the re-run parks in the
+    // queue; the CLI does not pump it, so the next tick starts the run.
+    kanban(&dir)
+        .args(["rerun", "TASK-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Task TASK-001 queued for re-run"));
+    let task = project_ops(&dir).get_task("TASK-001").unwrap().unwrap();
+    assert_eq!(
+        task.run_phase,
+        Some(kanban4ai::core::models::RunPhase::Queued)
+    );
+    assert_eq!(task.session, None);
+
+    // --now bypasses the queue and launches immediately.
+    kanban(&dir)
+        .args(["move", "TASK-001", "review"])
+        .assert()
+        .success();
+    kanban(&dir)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .args(["rerun", "TASK-001", "--now"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Task TASK-001 re-running (ses-"));
+    let task = project_ops(&dir).get_task("TASK-001").unwrap().unwrap();
+    assert_ne!(
+        task.run_phase,
+        Some(kanban4ai::core::models::RunPhase::Queued)
+    );
+    assert!(task.session.is_some());
+    kanban(&dir).args(["stop", "TASK-001"]).assert().success();
+}
+
+#[test]
 fn archive_flow() {
     let dir = board();
     kanban(&dir).args(["create", "Old work"]).assert().success();
@@ -603,7 +707,11 @@ fn sessions_heartbeat_check_recover() {
         .arg("check-sessions")
         .assert()
         .success()
-        .stdout(predicate::str::contains("No crashed sessions found."));
+        .stdout(predicate::str::contains("No crashed sessions found."))
+        // not a git repository is the deterministic answer in the test board
+        .stdout(predicate::str::contains(
+            "Isolation: unavailable — not a git repository",
+        ));
 
     kanban(&dir)
         .args(["recover", "TASK-001"])
@@ -611,6 +719,46 @@ fn sessions_heartbeat_check_recover() {
         .success()
         .stdout(predicate::str::contains(
             "Task TASK-001 recovered and moved to To Do",
+        ));
+}
+
+/// check-sessions surfaces provenance overlaps: two tasks whose sessions ran
+/// concurrently and both wrote the same file get one report line.
+#[test]
+fn check_sessions_reports_provenance_overlaps() {
+    let dir = board();
+    kanban(&dir).args(["create", "Writer A"]).assert().success();
+    kanban(&dir).args(["create", "Writer B"]).assert().success();
+    kanban(&dir)
+        .args(["take", "TASK-001", "--session", "ses-ovl-a", "--agent"])
+        .assert()
+        .success();
+    kanban(&dir)
+        .args(["take", "TASK-002", "--session", "ses-ovl-b", "--agent"])
+        .assert()
+        .success();
+
+    // Both sessions are still active, so their lifetimes overlap; seed the
+    // manifests their exits would have left behind.
+    let provenance_dir = dir.kanban().join("provenance");
+    std::fs::create_dir_all(&provenance_dir).unwrap();
+    for session in ["ses-ovl-a", "ses-ovl-b"] {
+        std::fs::write(
+            provenance_dir.join(format!("{session}.yaml")),
+            format!("session_id: {session}\nbackend: claude\nwrites:\n- src/lib.rs\ngenerated_at: '2026-08-27T20:00:00'\n"),
+        )
+        .unwrap();
+    }
+
+    kanban(&dir)
+        .arg("check-sessions")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Provenance overlap:"))
+        .stdout(predicate::str::contains("TASK-001 (ses-ovl-a)"))
+        .stdout(predicate::str::contains("TASK-002 (ses-ovl-b)"))
+        .stdout(predicate::str::contains(
+            "both wrote src/lib.rs while running concurrently",
         ));
 }
 
@@ -1288,4 +1436,85 @@ fn which(command: &str) -> bool {
             path.is_file()
         })
     })
+}
+
+/// Seed `<store>/update-status.json` as if a check had just answered, so the
+/// CLI's cache path answers without any network.
+fn seed_update_status(store: &Path, latest_version: &str, tag: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let status = serde_json::json!({
+        "checked_at": now,
+        "latest_version": latest_version,
+        "tag": tag,
+        "asset_url": null,
+        "checksum_url": null,
+        "notes_url": "https://example.com/release",
+    });
+    std::fs::write(store.join("update-status.json"), status.to_string()).unwrap();
+}
+
+#[test]
+fn update_check_is_offline_and_project_independent() {
+    // The work folder is registered nowhere: `update` is matched before any
+    // project resolution, so the command must not care.
+    let dir = Env::new();
+    // No curl on PATH → the blocking check fails fast instead of dialing
+    // out or hanging; the suite stays network-free like the limits tests.
+    kanban(&dir)
+        .args(["update", "--check"])
+        .env("PATH", "/nonexistent")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No cached update status yet"));
+    assert!(
+        !dir.store().join("update-status.json").exists(),
+        "--check must not write a status the check never produced"
+    );
+}
+
+#[test]
+fn update_check_reports_a_cached_status() {
+    let dir = Env::new();
+    std::fs::create_dir_all(dir.store()).unwrap();
+    seed_update_status(dir.store(), "9.9.9", "v9.9.9");
+
+    kanban(&dir)
+        .args(["update", "--check"])
+        .env("PATH", "/nonexistent")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Update available"))
+        .stdout(predicate::str::contains("9.9.9"));
+
+    seed_update_status(dir.store(), "0.0.1", "v0.0.1");
+    kanban(&dir)
+        .args(["update", "--check"])
+        .env("PATH", "/nonexistent")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("is up to date"));
+}
+
+#[test]
+fn integrate_reports_tasks_without_an_isolated_branch() {
+    let dir = board();
+    kanban(&dir)
+        .args(["create", "Not isolated"])
+        .assert()
+        .success();
+
+    kanban(&dir)
+        .args(["integrate", "TASK-001"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no isolated branch"));
+
+    kanban(&dir)
+        .args(["integrate", "TASK-999"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("not found"));
 }

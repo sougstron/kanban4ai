@@ -1,5 +1,6 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 4921
 expression: output
 ---
 ┌ To Do (1) ───────┐┌ In Progress (0) ─┐┌ Review (1) ──────┐┌ Done (0) ────────┐
@@ -25,7 +26,7 @@ expression: output
 │                  ││                  ││                  ││                  │
 │                  ││                  ││                  ││                  │
 └──────────────────┘└──────────────────┘└──────────────────┘└──────────────────┘
- ? 1 questions  TUI ready │ n new · r run · Q queue · / filter · ? help         
+ ? 1 questions  TUI ready │ n new · r queue · Q queue · / filter · ? help       
 
 --- style runs ---
 0:0-20 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

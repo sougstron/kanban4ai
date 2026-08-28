@@ -1,14 +1,16 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui_textarea::{TextArea, WrapMode};
 
 use crate::core::models::Task;
 use crate::core::operations::QuestionRef;
+use crate::core::update;
+use crate::core::vcs::Availability;
 
-use super::app::{App, HitAction, Hitbox};
+use super::app::{App, HitAction, Hitbox, UiAction};
 use super::card::{sanitize_paste_text, sanitize_terminal_text};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +108,7 @@ pub enum DialogField {
     TaskSort,
     EscapeToProjects,
     ProjectSort,
+    UpdateCheckOnOpen,
     QueueEnabled,
     MaxRunningTotal,
     MaxRunningDesigner,
@@ -127,6 +130,7 @@ pub enum DialogField {
     ReviewerAgent,
     ReviewerOnChanges,
     ReviewerMaxRounds,
+    IsolationStatus,
     Confirm,
     Cancel,
     PurgeData,
@@ -145,7 +149,7 @@ const TASK_FORM_FIELDS: [DialogField; 10] = [
     DialogField::UseReviewer,
 ];
 
-const SETTINGS_FORM_FIELDS: [DialogField; 28] = [
+const SETTINGS_FORM_FIELDS: [DialogField; 29] = [
     DialogField::Title,
     DialogField::Backend,
     DialogField::Model,
@@ -174,10 +178,14 @@ const SETTINGS_FORM_FIELDS: [DialogField; 28] = [
     DialogField::ReviewerAgent,
     DialogField::ReviewerOnChanges,
     DialogField::ReviewerMaxRounds,
+    DialogField::IsolationStatus,
 ];
 
-const GLOBAL_SETTINGS_FORM_FIELDS: [DialogField; 2] =
-    [DialogField::EscapeToProjects, DialogField::ProjectSort];
+const GLOBAL_SETTINGS_FORM_FIELDS: [DialogField; 3] = [
+    DialogField::EscapeToProjects,
+    DialogField::ProjectSort,
+    DialogField::UpdateCheckOnOpen,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalButton {
@@ -258,6 +266,13 @@ pub struct ModalState {
     pub use_designer: bool,
     pub use_reviewer: bool,
     pub escape_to_projects: bool,
+    pub update_check_on_open: bool,
+    /// Why the last deliberate "Check now" failed, shown on the Updates row.
+    pub update_check_error: Option<String>,
+    /// Package-manager upgrade command for a package-managed install. `Some`
+    /// replaces the "Update now" button with the guidance text, `None` means
+    /// self-update may replace the binary.
+    pub update_upgrade_command: Option<String>,
     pub project_sort: TextArea<'static>,
     pub form_scroll: usize,
     pub error: Option<String>,
@@ -312,6 +327,9 @@ pub struct ModalState {
     pub reviewer_on_changes_options: Vec<SelectOption>,
     pub reviewer_on_changes_selected: usize,
     pub reviewer_max_rounds: TextArea<'static>,
+    /// Availability probe for the current project, taken once when the
+    /// settings dialog opens (the probe runs git subprocesses).
+    pub isolation_status: Option<Availability>,
 }
 
 impl ModalState {
@@ -339,6 +357,9 @@ impl ModalState {
             use_designer: false,
             use_reviewer: false,
             escape_to_projects: false,
+            update_check_on_open: true,
+            update_check_error: None,
+            update_upgrade_command: None,
             project_sort: one_line("name"),
             form_scroll: 0,
             error: None,
@@ -388,6 +409,7 @@ impl ModalState {
             reviewer_on_changes_options: Vec::new(),
             reviewer_on_changes_selected: 0,
             reviewer_max_rounds: one_line("3"),
+            isolation_status: None,
         }
     }
 
@@ -474,12 +496,14 @@ impl ModalState {
                 DialogField::ReviewerAgent,
                 DialogField::ReviewerOnChanges,
                 DialogField::ReviewerMaxRounds,
+                DialogField::IsolationStatus,
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
             Modal::GlobalSettings => &[
                 DialogField::EscapeToProjects,
                 DialogField::ProjectSort,
+                DialogField::UpdateCheckOnOpen,
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
@@ -882,6 +906,11 @@ impl ModalState {
                     self.escape_to_projects = !self.escape_to_projects;
                 }
             }
+            DialogField::UpdateCheckOnOpen => {
+                if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
+                    self.update_check_on_open = !self.update_check_on_open;
+                }
+            }
             DialogField::ProjectSort => self.input_select(key, SelectorKind::ProjectSort),
             DialogField::PurgeData => {
                 if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
@@ -931,6 +960,7 @@ impl ModalState {
                 self.input_select(key, SelectorKind::ReviewerOnChanges)
             }
             DialogField::ReviewerMaxRounds => input_single_line(&mut self.reviewer_max_rounds, key),
+            DialogField::IsolationStatus => {}
             DialogField::Confirm | DialogField::Cancel => {}
         }
         if self.editable_signature() != before {
@@ -1004,7 +1034,8 @@ impl ModalState {
             DialogField::Interactive
             | DialogField::UseDesigner
             | DialogField::UseReviewer
-            | DialogField::EscapeToProjects => &mut self.answer,
+            | DialogField::EscapeToProjects
+            | DialogField::UpdateCheckOnOpen => &mut self.answer,
             DialogField::ProjectSort => &mut self.project_sort,
             DialogField::TargetStatus => &mut self.target_status,
             DialogField::MessageKind => &mut self.description,
@@ -1035,7 +1066,8 @@ impl ModalState {
             | DialogField::QueueEnabled
             | DialogField::AutoRestartEnabled
             | DialogField::DesignerEnabled
-            | DialogField::ReviewerEnabled => &mut self.answer,
+            | DialogField::ReviewerEnabled
+            | DialogField::IsolationStatus => &mut self.answer,
         }
     }
 
@@ -1598,6 +1630,7 @@ impl ModalState {
             raw_textarea_text(&self.task_sort),
             self.task_sort_selected.to_string(),
             self.escape_to_projects.to_string(),
+            self.update_check_on_open.to_string(),
             raw_textarea_text(&self.project_sort),
             self.project_sort_selected.to_string(),
             self.purge_data.to_string(),
@@ -1824,14 +1857,143 @@ fn render_global_settings_form(
     area: Rect,
     hitboxes: &mut Vec<Hitbox>,
 ) {
+    // The Updates section (status + action buttons) sits above the standard
+    // form; update state is machine-wide, so it lives only in this dialog.
+    let updates_height = 4u16;
+    let (updates_area, form_area) = if area.height > updates_height {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(updates_height), Constraint::Min(0)])
+            .split(area);
+        (rows[0], rows[1])
+    } else {
+        (Rect::default(), area)
+    };
+    render_updates_section(frame, app, modal, updates_area, hitboxes);
     render_selector_form(
         frame,
         app,
         modal,
-        area,
+        form_area,
         hitboxes,
         &GLOBAL_SETTINGS_FORM_FIELDS,
     );
+}
+
+fn render_updates_section(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &ModalState,
+    area: Rect,
+    hitboxes: &mut Vec<Hitbox>,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let block = Block::default()
+        .title(" Updates ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(update_status_line(modal)),
+        Rect { height: 1, ..inner },
+    );
+    let action_area = Rect {
+        y: inner.y.saturating_add(1),
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let update_available = modal.update_check_error.is_none()
+        && update::cached()
+            .as_deref()
+            .map(update::is_update_available)
+            .unwrap_or(false);
+    if let (Some(command), true) = (&modal.update_upgrade_command, update_available) {
+        frame.render_widget(
+            Paragraph::new(format!("update with: {command}"))
+                .style(Style::default().fg(app.theme.muted)),
+            action_area,
+        );
+        return;
+    }
+    let check_w = "[ Check now ]".len() as u16;
+    let update_w = "[ Update now ]".len() as u16;
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(check_w),
+            Constraint::Length(if update_available {
+                update_w.saturating_add(2)
+            } else {
+                0
+            }),
+            Constraint::Min(0),
+        ])
+        .split(action_area);
+    let check_active = app.is_hovered(HitAction::Action(UiAction::CheckUpdates));
+    frame.render_widget(
+        Paragraph::new("[ Check now ]").style(button_style(app, check_active)),
+        columns[0],
+    );
+    hitboxes.push(Hitbox {
+        area: columns[0],
+        action: HitAction::Action(UiAction::CheckUpdates),
+    });
+    if update_available {
+        let update_active = app.is_hovered(HitAction::Action(UiAction::ApplyUpdate));
+        frame.render_widget(
+            Paragraph::new("[ Update now ]").style(button_style(app, update_active)),
+            columns[1],
+        );
+        hitboxes.push(Hitbox {
+            area: columns[1],
+            action: HitAction::Action(UiAction::ApplyUpdate),
+        });
+    }
+}
+
+/// The read-only status line on the Updates row, backed by
+/// `update::cached()`: up to date, available (with release age), the failure
+/// reason of a failed "Check now", or "never checked".
+fn update_status_line(modal: &ModalState) -> String {
+    if let Some(reason) = &modal.update_check_error {
+        return format!("Check failed: {reason}");
+    }
+    match update::cached() {
+        None => format!(
+            "kanban4ai {} - no update checked yet",
+            update::installed_version()
+        ),
+        Some(status) => {
+            if update::is_update_available(&status) {
+                format!(
+                    "kanban4ai {} available{}",
+                    status.latest_version,
+                    released_suffix(&status)
+                )
+            } else {
+                format!("kanban4ai {} - up to date", update::installed_version())
+            }
+        }
+    }
+}
+
+fn released_suffix(status: &update::UpdateStatus) -> String {
+    match status.published_at {
+        Some(published_at) => {
+            let age = chrono::Utc::now()
+                .timestamp()
+                .saturating_sub(published_at)
+                .max(0);
+            format!(" (released {} ago)", crate::core::limits::format_span(age))
+        }
+        None => String::new(),
+    }
 }
 
 fn render_simple_confirm(
@@ -2050,6 +2212,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::UseDesigner
         | DialogField::UseReviewer
         | DialogField::EscapeToProjects
+        | DialogField::UpdateCheckOnOpen
         | DialogField::QueueEnabled
         | DialogField::AutoRestartEnabled
         | DialogField::DesignerEnabled
@@ -2059,7 +2222,8 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::MaxRunningReviewer
         | DialogField::MaxRunningExecutor
         | DialogField::AutoRestartDelays
-        | DialogField::ReviewerMaxRounds => 3,
+        | DialogField::ReviewerMaxRounds
+        | DialogField::IsolationStatus => 3,
         DialogField::Description
         | DialogField::MaxRunningPerBackend
         | DialogField::MaxRunningPerBackendModel => 5,
@@ -2416,6 +2580,15 @@ fn render_selector_field(
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::EscapeToProjects => render_escape_to_projects(frame, app, modal, area),
+        DialogField::UpdateCheckOnOpen => render_checkbox(
+            frame,
+            app,
+            area,
+            "Updates",
+            "check for updates when kanban4ai opens",
+            modal.update_check_on_open,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
         DialogField::Theme => render_select(
             frame,
             app,
@@ -2642,8 +2815,36 @@ fn render_selector_field(
             "Reviewer · Max bounce rounds (0 = unlimited)",
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
+        DialogField::IsolationStatus => render_isolation_status(frame, app, modal, area),
         _ => {}
     }
+}
+
+/// Read-only row: whether worktree isolation can run in this project. The
+/// probe was taken once when the dialog opened (`modal.isolation_status`);
+/// changes to git or the repository show after closing and reopening.
+fn render_isolation_status(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
+    let Some(availability) = &modal.isolation_status else {
+        return;
+    };
+    let (value, color) = if availability.is_available() {
+        (availability.to_string(), app.theme.ok)
+    } else {
+        (format!("unavailable — {availability}"), app.theme.err)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::raw("Worktree isolation: "),
+            Span::styled(value, Style::default().fg(color)),
+        ]))
+        .block(
+            Block::default()
+                .title(" Isolation ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(app.theme.border)),
+        ),
+        area,
+    );
 }
 
 fn register_task_options(

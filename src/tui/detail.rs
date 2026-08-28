@@ -7,13 +7,16 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::core::models::{Message, MessageKind, MessageStatus, Task, TaskStatus};
+use crate::core::models::{
+    IntegrationState, Message, MessageKind, MessageStatus, Task, TaskStatus,
+};
 use crate::core::session::SessionState;
 use crate::core::timefmt;
 
 use super::app::{App, DetailFocus, HitAction, Hitbox, UiAction};
 use super::board;
 use super::card::{sanitize_terminal_text, truncate_display};
+use super::projects::shorten_path;
 use super::theme::Theme;
 
 /// Width of the meta block's own title, which the project badge has to clear
@@ -52,9 +55,13 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let task = task.clone();
 
     let description_lines = task_description_lines(&task);
+    let isolated = task.worktree.is_some();
+    let conflicted = task.integration == IntegrationState::Conflict;
     let meta_extra_lines = u16::from(waiting)
         + u16::from(wait_deadline.is_some())
         + u16::from(task.restart_at.is_some() || session_state == Some(SessionState::Crashed))
+        + u16::from(isolated)
+        + u16::from(conflicted)
         + description_lines;
     let meta_height = 6 + meta_extra_lines;
     let answer_height = if show_answer {
@@ -88,6 +95,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         wait_deadline,
         wait_note: wait_note.as_deref(),
         session_state,
+        worktree_path: task
+            .worktree
+            .as_deref()
+            .map(|rel| shorten_path(&app.ops.storage.worktrees_dir.join(rel))),
     };
     render_meta(frame, &theme, &task, &meta_state, chunks[0]);
     if let Some(hitbox) = board::render_project_badge(frame, app, chunks[0], META_TITLE_WIDTH) {
@@ -169,6 +180,7 @@ struct MetaState<'a> {
     wait_deadline: Option<chrono::NaiveDateTime>,
     wait_note: Option<&'a str>,
     session_state: Option<SessionState>,
+    worktree_path: Option<String>,
 }
 
 fn render_meta(
@@ -212,6 +224,21 @@ fn render_meta(
             timefmt::format(&task.updated_at)
         )),
     ];
+    if let Some(worktree) = &meta_state.worktree_path {
+        let mut line = format!(
+            "Worktree: {} │ Branch: {} │ Base: {}",
+            sanitize_terminal_text(worktree),
+            sanitize_terminal_text(task.branch.as_deref().unwrap_or("-")),
+            task.base_commit
+                .as_deref()
+                .map(|commit| commit.chars().take(7).collect::<String>())
+                .unwrap_or_else(|| "-".to_string())
+        );
+        if task.integration != IntegrationState::None {
+            line.push_str(&format!(" │ Integration: {}", task.integration));
+        }
+        meta.push(Line::from(line));
+    }
     if !task.description.trim().is_empty() {
         meta.push(Line::from(Span::styled(
             "Description:",
@@ -259,6 +286,12 @@ fn render_meta(
                 Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
             )));
         }
+    }
+    if task.integration == IntegrationState::Conflict {
+        meta.push(Line::from(Span::styled(
+            "⚠ Integration conflict — resolve in the worktree, then Re-run (Ctrl+R)",
+            Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
+        )));
     }
     frame.render_widget(
         Paragraph::new(meta)
@@ -427,14 +460,20 @@ fn render_edits_panel(
     let detail = app.detail.as_ref().unwrap();
     let focused = detail.focus == DetailFocus::Edits;
     let hovered = app.is_hovered(HitAction::DetailEdits);
+    let conflicted = detail
+        .task
+        .as_ref()
+        .is_some_and(|task| task.integration == IntegrationState::Conflict);
     let title = if !editable {
-        " Review edits (read-only outside Review) "
+        " Review edits (read-only outside Review) ".to_string()
+    } else if conflicted {
+        " Review edits — conflict report · resolve in the worktree · Ctrl+R re-run ".to_string()
     } else if focused {
-        " Review edits [focused] · Ctrl+S save · Ctrl+R re-run · Esc thread "
+        " Review edits [focused] · Ctrl+S save · Ctrl+R re-run · Esc thread ".to_string()
     } else if hovered {
-        " Review edits [click to focus] · Ctrl+S save · Ctrl+R re-run "
+        " Review edits [click to focus] · Ctrl+S save · Ctrl+R re-run ".to_string()
     } else {
-        " Review edits · Tab to edit · Ctrl+S save · Ctrl+R re-run "
+        " Review edits · Tab to edit · Ctrl+S save · Ctrl+R re-run ".to_string()
     };
     app.hitboxes.push(Hitbox {
         area,
@@ -445,7 +484,9 @@ fn render_edits_panel(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(if focused || hovered {
+            .border_style(Style::default().fg(if conflicted && editable {
+                theme.err
+            } else if focused || hovered {
                 theme.focus
             } else if editable {
                 theme.review
@@ -477,7 +518,10 @@ fn render_action_bar(
             if app.primary_run_action_for(task) == UiAction::Revoke {
                 vec![("↻ Revoke r".to_string(), UiAction::Revoke)]
             } else {
-                vec![("▶ Run r".to_string(), UiAction::Run)]
+                vec![
+                    ("▶ Queue r".to_string(), UiAction::Run),
+                    ("⚡ Now F".to_string(), UiAction::RunNow),
+                ]
             };
         if app.task_can_stop(task) {
             buttons.push(("Stop k".to_string(), UiAction::Stop));
@@ -487,6 +531,8 @@ fn render_action_bar(
         }
         if task.status == TaskStatus::Review {
             buttons.push(("Approve y".to_string(), UiAction::Approve));
+            // Re-dispatch is how a conflict report gets acted on, so the
+            // button is painted in the alarm color below.
             buttons.push(("Re-run ^R".to_string(), UiAction::Rerun));
         }
         if task.session.is_some() {
@@ -519,6 +565,8 @@ fn render_action_bar(
 
     let mut spans = Vec::new();
     let mut x = area.x;
+    let rerun_urgent =
+        task.integration == IntegrationState::Conflict && task.status == TaskStatus::Review;
     for (label, action) in buttons {
         let text = format!("[ {label} ]");
         let width = text.chars().count() as u16;
@@ -534,9 +582,15 @@ fn render_action_bar(
             },
             action: HitAction::Action(action),
         });
+        let urgent = rerun_urgent && action == UiAction::Rerun;
         let style = if app.is_hovered(HitAction::Action(action)) {
             Style::default()
                 .fg(theme.focus)
+                .bg(theme.border)
+                .add_modifier(Modifier::BOLD)
+        } else if urgent {
+            Style::default()
+                .fg(theme.err)
                 .bg(theme.border)
                 .add_modifier(Modifier::BOLD)
         } else {

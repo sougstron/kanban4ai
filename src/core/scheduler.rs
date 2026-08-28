@@ -1,11 +1,12 @@
 //! Slot accounting and queue dispatch for the orchestration queue.
 //!
-//! The census counts every In Progress task whose session is `Live` or
-//! `Waiting` — a waiting agent still owns a process and a subscription
-//! budget, so it keeps its slot. Buckets follow the *resolved* launch
-//! settings (task override, else the backend's configured default), so a task
-//! that inherits the backend default is counted under the same key as one
-//! that names the model explicitly.
+//! The census counts every In Progress task whose session is `Live`. A
+//! declared wait is a pause: the agent process is normally already gone, so
+//! the pause releases its slot, and the task re-enters the queue when the
+//! wait ends. Buckets follow the *resolved* launch settings (task override,
+//! else the backend's configured default), so a task that inherits the
+//! backend default is counted under the same key as one that names the model
+//! explicitly.
 
 use std::collections::HashMap;
 
@@ -87,7 +88,7 @@ impl Slots {
             let Some(state) = states.get(session_id) else {
                 continue;
             };
-            if !matches!(state, SessionState::Live | SessionState::Waiting) {
+            if !matches!(state, SessionState::Live) {
                 continue;
             }
             let settings = resolve_launch_settings(&config, &task)?;
@@ -336,10 +337,13 @@ impl Operations {
         Ok(Some(new_session_id))
     }
 
-    /// Whether the dispatcher could actually start a re-queued task: the
-    /// queue and auto-launch both have to be on, since [`Self::dispatch_queue`]
-    /// is what turns a crash restart back into a running agent.
-    fn restart_queue_can_start(&self) -> Result<bool> {
+    /// Whether the dispatcher could actually start a queued task: the queue
+    /// and auto-launch both have to be on, since [`Self::dispatch_queue`] is
+    /// what turns a queue entry back into a running agent. The crash-restart
+    /// path uses this to avoid scheduling retries nothing would ever drain,
+    /// and the TUI uses it to decide between queueing a run and launching
+    /// directly (the fallback for boards where the queue is switched off).
+    pub fn queue_can_dispatch(&self) -> Result<bool> {
         Ok(self.config.get_orchestration()?.queue_enabled && self.auto_launch_enabled()?)
     }
 
@@ -349,7 +353,7 @@ impl Operations {
     /// subscription-limit crash is gated by the same caps as any other run.
     pub fn due_restarts(&self) -> Result<Vec<String>> {
         let orch = self.config.get_orchestration()?;
-        if !orch.auto_restart_enabled || !self.restart_queue_can_start()? {
+        if !orch.auto_restart_enabled || !self.queue_can_dispatch()? {
             // Keep the deadline on the task instead of parking it in a queue
             // nothing drains; it restarts when the dispatcher is back on.
             return Ok(Vec::new());
@@ -390,7 +394,7 @@ impl Operations {
         // dispatcher can never honour would strand the task with a "↻ retry"
         // badge forever. With the queue (or auto-launch) off the task stays
         // crashed and recoverable, exactly as it did before this feature.
-        if !orch.auto_restart_enabled || !self.restart_queue_can_start()? {
+        if !orch.auto_restart_enabled || !self.queue_can_dispatch()? {
             return Ok(false);
         }
         let _guard = self.storage.lock()?;
@@ -400,7 +404,12 @@ impl Operations {
         if task.status != TaskStatus::InProgress {
             return Ok(false);
         }
-        if task.restart_at.is_some() || task.run_phase == Some(RunPhase::Queued) {
+        // Only skip when a backoff is already pending. A leftover `queued`
+        // phase (session claimed outside the dispatcher, or a previous
+        // restart already handed back to the queue) must still get a
+        // deadline — otherwise `dispatch_queue` immediately relaunches and
+        // a lone queued task hot-loops into retry.
+        if task.restart_at.is_some() {
             return Ok(false);
         }
         let delays = &orch.auto_restart_delays_minutes;
@@ -477,6 +486,7 @@ mod tests {
                 on_changes_requested: OnChangesRequested::InProgress,
                 max_rounds: 3,
             },
+            isolation: OrchestrationSettings::default().isolation,
         }
     }
 

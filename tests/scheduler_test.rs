@@ -8,11 +8,12 @@ use std::thread;
 use kanban4ai::agent::{resolve_launch_settings, upcoming_run_plan};
 use kanban4ai::core::config::Config;
 use kanban4ai::core::context::ContextManager;
-use kanban4ai::core::models::{RunPhase, SessionStatus, TaskStatus};
-use kanban4ai::core::operations::{AgentExitOutcome, Operations};
+use kanban4ai::core::models::{MessageKind, RunPhase, SessionStatus, TaskStatus};
+use kanban4ai::core::operations::{AgentExitOutcome, Operations, WaitWake};
 use kanban4ai::core::scheduler::Slots;
 use kanban4ai::core::session::SessionManager;
 use kanban4ai::core::storage::NewTask;
+use kanban4ai::core::thread::ThreadManager;
 use kanban4ai::core::timefmt;
 
 use common::{RecordingLauncher, ops_with_recorder};
@@ -110,7 +111,7 @@ fn census_counts_live_sessions_by_backend_and_model() {
 }
 
 #[test]
-fn waiting_session_still_occupies_a_slot() {
+fn waiting_session_holds_no_slot() {
     let (_dir, ops) = ops_with_config("");
     let session_id = live_task(&ops, "Waiter", "claude", Some("opus"));
     let session_mgr = SessionManager::new(&ops.storage.project_path);
@@ -123,8 +124,12 @@ fn waiting_session_still_occupies_a_slot() {
         .unwrap();
 
     let slots = Slots::measure(&ops).unwrap();
-    assert_eq!(slots.total, 1, "a waiting agent still holds its slot");
-    assert_eq!(slots.per_backend.get("claude"), Some(&1));
+    assert_eq!(
+        slots.total, 0,
+        "a declared wait is a pause and releases its slot"
+    );
+    assert!(!slots.per_backend.contains_key("claude"));
+    assert!(!slots.per_role.contains_key("executor"));
 }
 
 #[test]
@@ -394,6 +399,142 @@ fn restart_board(
     ))
 }
 
+/// An In Progress task whose agent declared a wait whose deadline is already
+/// over and whose process has exited (`wait_exited`).
+fn expired_wait_task(ops: &Operations, title: &str, backend: &str) -> (String, String) {
+    let session_mgr = SessionManager::new(&ops.storage.project_path);
+    let task = ops.create_task(NewTask::titled(title)).unwrap();
+    let session_id = format!("ses-{}", title.replace(' ', "-").to_lowercase());
+    session_mgr.link_session(&task.id, &session_id).unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.status = TaskStatus::InProgress;
+    current.session = Some(session_id.clone());
+    current.agent_backend = Some(backend.to_string());
+    ops.storage.save_task(&current).unwrap();
+    let mut session = session_mgr.load_session(&session_id).unwrap();
+    session.wait_until = Some(timefmt::now() - chrono::Duration::seconds(1));
+    session.wait_exited = true;
+    session_mgr.save_session(&session).unwrap();
+    (task.id, session_id)
+}
+
+fn close_session(ops: &Operations, session_id: &str) {
+    let mgr = SessionManager::new(&ops.storage.project_path);
+    let mut session = mgr.load_session(session_id).unwrap();
+    session.status = SessionStatus::Closed;
+    mgr.save_session(&session).unwrap();
+}
+
+#[test]
+fn an_expired_wait_re_enters_the_queue_instead_of_launching() {
+    let (_dir, ops, recorder) = dispatch_board(
+        "  queue_enabled: true\n  max_running_total: 1\n  max_running_per_backend: {}\n  max_running_per_role: {}\n",
+    );
+    live_task(&ops, "Occupant", "claude", None);
+    let (paused, paused_session) = expired_wait_task(&ops, "Paused", "opencode");
+    recorder.calls.lock().unwrap().clear();
+
+    let woken = ops.wake_expired_waits().unwrap();
+
+    assert_eq!(
+        woken,
+        vec![WaitWake::Queued {
+            task_id: paused.clone()
+        }]
+    );
+    assert!(
+        recorder.calls().is_empty(),
+        "the wake must not launch past the total cap"
+    );
+    assert!(!SessionManager::new(&ops.storage.project_path).is_session_active(&paused_session));
+    let parked = ops.get_task(&paused).unwrap().unwrap();
+    assert_eq!(parked.run_phase, Some(RunPhase::Queued));
+    assert_eq!(parked.session, None);
+
+    // The occupant's slot frees up; the dispatcher starts the re-queued run.
+    close_session(&ops, "ses-occupant");
+    let started = ops.dispatch_queue().unwrap();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].task_id, paused);
+    assert_eq!(recorder.calls().len(), 1);
+}
+
+#[test]
+fn an_expired_wait_launches_directly_when_the_queue_is_off() {
+    let (_dir, ops, recorder) = dispatch_board("  queue_enabled: false\n");
+    let (paused, paused_session) = expired_wait_task(&ops, "Direct", "opencode");
+
+    let woken = ops.wake_expired_waits().unwrap();
+
+    match woken.as_slice() {
+        [
+            WaitWake::Resumed {
+                task_id,
+                session_id,
+            },
+        ] => {
+            assert_eq!(task_id, &paused);
+            assert_ne!(session_id, &paused_session);
+            assert_eq!(
+                recorder.calls(),
+                vec![(paused.clone(), session_id.clone(), false)]
+            );
+        }
+        other => panic!("expected a direct resume, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_revoked_pause_queues_instead_of_launching() {
+    let (_dir, ops, recorder) = dispatch_board(
+        "  queue_enabled: true\n  max_running_total: 1\n  max_running_per_backend: {}\n  max_running_per_role: {}\n",
+    );
+    live_task(&ops, "Occupant", "claude", None);
+    let (paused, paused_session) = expired_wait_task(&ops, "Revoked Pause", "opencode");
+    recorder.calls.lock().unwrap().clear();
+
+    let revoked = ops
+        .revoke_in_progress_task(&paused, Some(&paused_session))
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(
+        revoked.run_phase,
+        Some(RunPhase::Queued),
+        "revoking a paused task parks it in the queue"
+    );
+    assert_eq!(revoked.session, None);
+    assert!(
+        recorder.calls().is_empty(),
+        "the occupant still holds the only slot"
+    );
+    assert!(!SessionManager::new(&ops.storage.project_path).is_session_active(&paused_session));
+
+    close_session(&ops, "ses-occupant");
+    let started = ops.dispatch_queue().unwrap();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].task_id, paused);
+}
+
+#[test]
+fn a_revoked_pause_launches_directly_when_the_queue_is_off() {
+    let (_dir, ops, recorder) = dispatch_board("  queue_enabled: false\n");
+    let (paused, paused_session) = expired_wait_task(&ops, "Direct Revoke", "opencode");
+
+    let revoked = ops
+        .revoke_in_progress_task(&paused, Some(&paused_session))
+        .unwrap()
+        .unwrap();
+
+    let new_session = revoked.session.expect("direct wake installs a successor");
+    assert_ne!(new_session, paused_session);
+    assert_ne!(revoked.run_phase, Some(RunPhase::Queued));
+    assert_eq!(
+        recorder.calls(),
+        vec![(paused.clone(), new_session.clone(), false)]
+    );
+}
+
 fn take_running(ops: &Operations, title: &str, session_id: &str) -> String {
     let task = ops.create_task(NewTask::titled(title)).unwrap();
     ops.take_task(&task.id, session_id, true).unwrap().unwrap();
@@ -429,6 +570,71 @@ fn crash_schedules_restart_at_configured_minutes() {
     assert!(
         restart_at >= expected - slack && restart_at <= expected + slack,
         "restart_at {restart_at} should be ~1 minute after {before}"
+    );
+}
+
+#[test]
+fn crash_of_already_queued_task_still_backs_off() {
+    let (_dir, ops, recorder) = restart_board("[1, 30, 270]", true);
+    let id = take_running(&ops, "Queued leftover", "ses-queued-crash");
+    let mut task = ops.get_task(&id).unwrap().unwrap();
+    task.run_phase = Some(RunPhase::Queued);
+    ops.storage.save_task(&task).unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let outcome = ops
+        .reconcile_agent_exit(&id, "ses-queued-crash", 1)
+        .unwrap();
+
+    assert_eq!(outcome, AgentExitOutcome::Crashed);
+    let stored = ops.get_task(&id).unwrap().unwrap();
+    assert!(
+        stored.restart_at.is_some(),
+        "queued leftover must still get a backoff, not an immediate re-dispatch"
+    );
+    assert!(
+        recorder.calls().is_empty(),
+        "dispatch_queue after a queued crash must not hot-loop a new launch"
+    );
+}
+
+#[test]
+fn non_retryable_backend_error_skips_crash_restart() {
+    let (dir, ops, recorder) = restart_board("[1, 30, 270]", true);
+    let id = take_running(&ops, "Credits", "ses-credits");
+    fs::write(
+        dir.path()
+            .join(".kanban/logs/ses-credits.transcript.jsonl"),
+        r#"{"type":"error","error":{"name":"APIError","data":{"message":"Insufficient balance. Manage your billing here: https://opencode.ai/workspace/billing","statusCode":401,"isRetryable":false}}}"#,
+    )
+    .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let outcome = ops.reconcile_agent_exit(&id, "ses-credits", 1).unwrap();
+
+    assert_eq!(outcome, AgentExitOutcome::Crashed);
+    let stored = ops.get_task(&id).unwrap().unwrap();
+    assert_eq!(
+        stored.restart_at, None,
+        "non-retryable error must not retry"
+    );
+    assert_ne!(
+        stored.run_phase,
+        Some(RunPhase::Queued),
+        "must stay crashed, not park in the queue as ↻ retry"
+    );
+    assert!(recorder.calls().is_empty());
+    let thread = ThreadManager::new(dir.path()).unwrap().load(&id).unwrap();
+    assert!(
+        thread.messages.iter().any(|m| {
+            m.kind == MessageKind::AgentStep && m.body.contains("Insufficient balance")
+        }),
+        "thread must surface the backend error"
+    );
+    assert!(
+        thread.messages.iter().any(|m| {
+            m.kind == MessageKind::AgentStep && m.body.contains("crash-restart skipped")
+        })
     );
 }
 

@@ -6,11 +6,12 @@ use common::ops_with_recorder;
 use kanban4ai::core::context::ContextManager;
 use kanban4ai::core::error::KanbanError;
 use kanban4ai::core::models::{
-    MessageKind, MessageRole, MessageStatus, Role, RunPhase, SessionStatus, Task, TaskStatus,
+    MessageKind, MessageRole, MessageStatus, Role, RunMode, RunPhase, SessionStatus, Task,
+    TaskStatus,
 };
 use kanban4ai::core::operations::{
     AgentExitOutcome, AgentLauncher, NoopLauncher, Operations, QuestionRef, TaskPatch, Verdict,
-    sort_tasks,
+    WaitWake, sort_tasks,
 };
 use kanban4ai::core::project::{ProjectStore, Roots};
 use kanban4ai::core::session::{SessionManager, SessionState};
@@ -201,7 +202,11 @@ fn failed_review_rerun_rolls_back_to_review_without_live_session() {
     ops.set_review_edits(&task.id, "Fix the failed edge case")
         .unwrap();
 
-    assert!(ops.rerun_review_task(&task.id, None).unwrap().is_none());
+    assert!(
+        ops.rerun_review_task(&task.id, None, RunMode::Immediate)
+            .unwrap()
+            .is_none()
+    );
 
     let stored = ops.get_task(&task.id).unwrap().unwrap();
     assert_eq!(stored.status, TaskStatus::Review);
@@ -270,7 +275,7 @@ fn review_rerun_rejects_unsafe_session_id_before_mutation() {
         .unwrap();
 
     assert!(matches!(
-        ops.rerun_review_task(&task.id, Some("../escape")),
+        ops.rerun_review_task(&task.id, Some("../escape"), RunMode::Immediate),
         Err(KanbanError::Invalid(_))
     ));
 
@@ -302,7 +307,7 @@ fn in_progress_rerun_rejects_unsafe_session_id_before_mutation() {
         .unwrap();
 
     assert!(matches!(
-        ops.rerun_in_progress_task(&task.id, Some("../escape")),
+        ops.rerun_in_progress_task(&task.id, Some("../escape"), RunMode::Immediate),
         Err(KanbanError::Invalid(_))
     ));
 
@@ -666,7 +671,7 @@ fn rerun_completion_replaces_the_previous_completion_timestamp() {
     assert!(first_completion.completed_at.is_some());
 
     let rerun = ops
-        .rerun_review_task(&task.id, Some("ses-rerun"))
+        .rerun_review_task(&task.id, Some("ses-rerun"), RunMode::Immediate)
         .unwrap()
         .unwrap();
     assert_eq!(rerun.completed_at, first_completion.completed_at);
@@ -735,7 +740,7 @@ fn ask_question_flags_task_and_answer_clears_it() {
         .answer_question(&task.id, QuestionRef::Index(0), "JWT")
         .unwrap()
         .unwrap();
-    assert!(!answered.has_questions);
+    assert!(!answered.task.has_questions);
     assert!(ops.list_open_messages(&task.id).unwrap().is_empty());
 }
 
@@ -803,6 +808,30 @@ fn answer_by_msg_id_and_bad_index() {
 }
 
 #[test]
+fn answer_refuses_a_msg_id_that_is_not_a_question() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Refs")).unwrap();
+    ops.ask_question(&task.id, "Which one?", "agent", vec![])
+        .unwrap();
+
+    // MSG-002 is the task body message; answering it would stamp an answer
+    // onto a non-question and leave the real question open.
+    assert!(
+        ops.answer_question(&task.id, QuestionRef::MsgId("MSG-002".into()), "bogus")
+            .unwrap()
+            .is_none()
+    );
+    let open = ops.list_open_messages(&task.id).unwrap();
+    assert!(
+        open.iter()
+            .any(|message| message.kind == MessageKind::Question),
+        "the real question stays open"
+    );
+    let task = ops.storage.load_task(&task.id).unwrap().unwrap();
+    assert!(task.has_questions, "the task still has an open question");
+}
+
+#[test]
 fn answering_last_question_resumes_interactive_agent() {
     let (_dir, ops, recorder) = ops_with_recorder(true);
     let task = ops
@@ -830,11 +859,16 @@ fn answering_last_question_resumes_interactive_agent() {
         .unwrap()
         .unwrap();
 
+    assert_eq!(answered.remaining, 0);
     let calls = recorder.calls();
     assert_eq!(calls.len(), 1, "agent must be relaunched");
     assert_eq!(calls[0].0, task.id);
     assert!(calls[0].1.starts_with("ses-opencode-"));
-    assert!(answered.session.is_some());
+    assert!(answered.task.session.is_some());
+    assert_eq!(
+        answered.resumed_session.as_deref(),
+        Some(calls[0].1.as_str())
+    );
     assert_eq!(
         SessionManager::new(_dir.path())
             .load_session(&calls[0].1)
@@ -842,6 +876,136 @@ fn answering_last_question_resumes_interactive_agent() {
             .name,
         Some(task.title)
     );
+}
+
+#[test]
+fn answering_last_question_resumes_plain_task() {
+    let (_dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Plain asker")).unwrap();
+    // put it in progress with no live session (agent exited after asking)
+    ops.update_task(
+        &task.id,
+        TaskPatch {
+            status: Some("in_progress".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    ops.ask_question(&task.id, "Blocking question?", "agent", vec![])
+        .unwrap();
+    assert!(recorder.calls().is_empty());
+
+    let outcome = ops
+        .answer_question(&task.id, QuestionRef::Index(0), "Go ahead")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.remaining, 0);
+    let calls = recorder.calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "a plain task must resume after its last answer"
+    );
+    assert_eq!(calls[0].0, task.id);
+    assert_eq!(
+        outcome.resumed_session.as_deref(),
+        Some(calls[0].1.as_str())
+    );
+    assert_eq!(outcome.task.session.as_deref(), Some(calls[0].1.as_str()));
+}
+
+#[test]
+fn answering_a_question_with_others_open_does_not_resume() {
+    let (_dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Two questions")).unwrap();
+    ops.update_task(
+        &task.id,
+        TaskPatch {
+            status: Some("in_progress".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    ops.ask_question(&task.id, "First?", "agent", vec![])
+        .unwrap();
+    ops.ask_question(&task.id, "Second?", "agent", vec![])
+        .unwrap();
+
+    let first = ops
+        .answer_question(&task.id, QuestionRef::Index(0), "One")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.remaining, 1);
+    assert!(first.resumed_session.is_none());
+    assert!(recorder.calls().is_empty());
+
+    let last = ops
+        .answer_question(&task.id, QuestionRef::Index(0), "Two")
+        .unwrap()
+        .unwrap();
+    assert_eq!(last.remaining, 0);
+    let calls = recorder.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(last.resumed_session.as_deref(), Some(calls[0].1.as_str()));
+}
+
+#[test]
+fn stale_session_is_replaced_after_the_last_answer() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = ops.create_task(NewTask::titled("Stale asker")).unwrap();
+    ops.take_task(&task.id, "ses-answer-stale", true)
+        .unwrap()
+        .unwrap();
+    ops.ask_question(&task.id, "Anyone there?", "agent", vec![])
+        .unwrap();
+    let sessions = SessionManager::new(dir.path());
+    let mut record = sessions.load_session("ses-answer-stale").unwrap();
+    record.last_seen = timefmt::now() - chrono::Duration::seconds(3600);
+    sessions.save_session(&record).unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let outcome = ops
+        .answer_question(&task.id, QuestionRef::Index(0), "Here")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.remaining, 0);
+    assert_eq!(
+        recorder.calls().len(),
+        1,
+        "a stale session must not block the resume"
+    );
+    assert_ne!(outcome.task.session.as_deref(), Some("ses-answer-stale"));
+    assert!(!sessions.is_session_active("ses-answer-stale"));
+}
+
+#[test]
+fn resume_after_answer_can_be_disabled() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let config = "columns:\n- name: To Do\n  id: todo\n- name: In Progress\n  id: in_progress\n- name: Review\n  id: review\n- name: Done\n  id: done\nnotifications:\n  enabled: false\nauto_launch:\n  enabled: true\nrules:\n  resume_after_last_answer: false\n";
+    fs::write(dir.path().join(".kanban/config.yaml"), config).unwrap();
+    let task = ops.create_task(NewTask::titled("Manual resume")).unwrap();
+    ops.update_task(
+        &task.id,
+        TaskPatch {
+            status: Some("in_progress".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    ops.ask_question(&task.id, "Anyone?", "agent", vec![])
+        .unwrap();
+
+    let outcome = ops
+        .answer_question(&task.id, QuestionRef::Index(0), "Yes")
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.remaining, 0);
+    assert!(outcome.resumed_session.is_none());
+    assert!(recorder.calls().is_empty());
+    assert_eq!(outcome.task.status, TaskStatus::InProgress);
 }
 
 #[test]
@@ -873,12 +1037,23 @@ fn answering_last_question_revokes_future_declared_wait() {
         .unwrap()
         .unwrap();
 
-    let new_session = answered.session.expect("replacement session");
-    assert_ne!(new_session, "ses-answer-wait");
-    assert_eq!(recorder.calls().len(), 1);
+    assert!(
+        answered.queued,
+        "answering a paused task must queue the wake, not launch past the caps"
+    );
+    assert!(answered.resumed_session.is_none());
+    assert_eq!(answered.task.run_phase, Some(RunPhase::Queued));
     let sessions = SessionManager::new(dir.path());
     assert!(!sessions.is_session_active("ses-answer-wait"));
-    assert!(sessions.is_session_active(&new_session));
+    // The wake pumps the queue, and an idle board starts the run on the spot.
+    assert_eq!(recorder.calls().len(), 1);
+    assert_eq!(recorder.calls()[0].0, task.id);
+    let started = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(
+        started.session.as_deref(),
+        Some(recorder.calls()[0].1.as_str())
+    );
+    assert!(sessions.is_session_active(recorder.calls()[0].1.as_str()));
 }
 
 #[test]
@@ -910,7 +1085,7 @@ fn answering_last_question_expires_wait_while_background_wrapper_exits() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(answered.session.as_deref(), Some("ses-answer-exiting"));
+    assert_eq!(answered.task.session.as_deref(), Some("ses-answer-exiting"));
     let manager = SessionManager::new(dir.path());
     assert!(
         manager
@@ -950,7 +1125,8 @@ fn answering_question_leaves_live_polling_session_in_place() {
         .unwrap()
         .unwrap();
 
-    assert_eq!(answered.session.as_deref(), Some("ses-answer-live"));
+    assert_eq!(answered.task.session.as_deref(), Some("ses-answer-live"));
+    assert_eq!(answered.remaining, 0);
     assert!(recorder.calls().is_empty());
 }
 
@@ -1111,7 +1287,10 @@ fn review_edits_fold_into_thread_on_rerun() {
     let stored = ops.get_task(&task.id).unwrap().unwrap();
     assert_eq!(stored.review_edits, "Please handle expired tokens too");
 
-    let rerun = ops.rerun_review_task(&task.id, None).unwrap().unwrap();
+    let rerun = ops
+        .rerun_review_task(&task.id, None, RunMode::Immediate)
+        .unwrap()
+        .unwrap();
     assert_eq!(rerun.status, TaskStatus::InProgress);
     assert_eq!(rerun.review_edits, "");
     assert!(rerun.session.is_some());
@@ -1143,7 +1322,10 @@ fn rerun_in_progress_restarts_stalled_session() {
         .unwrap();
     recorder.calls.lock().unwrap().clear();
 
-    let rerun = ops.rerun_in_progress_task(&task.id, None).unwrap().unwrap();
+    let rerun = ops
+        .rerun_in_progress_task(&task.id, None, RunMode::Immediate)
+        .unwrap()
+        .unwrap();
     assert_ne!(rerun.session.as_deref(), Some("ses-dead"));
     assert_eq!(
         SessionManager::new(dir.path())
@@ -1172,7 +1354,7 @@ fn rerun_in_progress_refuses_healthy_session() {
     recorder.calls.lock().unwrap().clear();
 
     assert!(
-        ops.rerun_in_progress_task(&task.id, None)
+        ops.rerun_in_progress_task(&task.id, None, RunMode::Immediate)
             .unwrap()
             .is_none()
     );
@@ -1196,13 +1378,23 @@ fn revoke_in_progress_replaces_exited_wait_and_fences_stale_request() {
         .revoke_in_progress_task(&task.id, Some("ses-revoke-old"))
         .unwrap()
         .unwrap();
-    let new_session = revoked.session.expect("replacement session");
+    assert_eq!(
+        revoked.run_phase,
+        Some(RunPhase::Queued),
+        "revoking a paused task parks it in the queue"
+    );
+    assert_eq!(revoked.session, None);
 
-    assert_ne!(new_session, "ses-revoke-old");
+    // The revoke pumps the queue, so the idle board starts a fresh session.
     assert_eq!(recorder.calls().len(), 1);
+    let new_session = recorder.calls()[0].1.clone();
     let sessions = SessionManager::new(dir.path());
     assert!(!sessions.is_session_active("ses-revoke-old"));
     assert!(sessions.is_session_active(&new_session));
+    assert_eq!(
+        ops.get_task(&task.id).unwrap().unwrap().session.as_deref(),
+        Some(new_session.as_str())
+    );
     assert!(
         ops.revoke_in_progress_task(&task.id, Some("ses-revoke-old"))
             .unwrap()
@@ -1616,8 +1808,13 @@ fn detach_command_requires_owning_active_session_and_a_command() {
 }
 
 #[test]
-fn expired_declared_wait_relaunches_agent_to_check_result() {
+fn expired_declared_wait_queues_agent_to_check_result() {
     let (dir, ops, recorder) = ops_with_recorder(true);
+    fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: true\norchestration:\n  max_running_total: 1\n",
+    )
+    .unwrap();
     let task = ops.create_task(NewTask::titled("Check later")).unwrap();
     ops.take_task(&task.id, "ses-wait-old", true)
         .unwrap()
@@ -1626,27 +1823,32 @@ fn expired_declared_wait_relaunches_agent_to_check_result() {
         .unwrap();
     ops.reconcile_agent_exit(&task.id, "ses-wait-old", 0)
         .unwrap();
+    let occupant = ops.create_task(NewTask::titled("Occupant")).unwrap();
+    ops.take_task(&occupant.id, "ses-occupant", true)
+        .unwrap()
+        .unwrap();
     recorder.calls.lock().unwrap().clear();
     let session_mgr = SessionManager::new(dir.path());
     let mut session = session_mgr.load_session("ses-wait-old").unwrap();
     session.wait_until = Some(timefmt::now() - chrono::Duration::seconds(1));
     session_mgr.save_session(&session).unwrap();
 
-    let resumed = ops.resume_expired_waits().unwrap();
+    let woken = ops.wake_expired_waits().unwrap();
 
-    assert_eq!(resumed.len(), 1);
-    assert_eq!(resumed[0].0, task.id);
-    let new_session = resumed[0].1.clone();
     assert_eq!(
-        recorder.calls(),
-        vec![(task.id.clone(), new_session.clone(), false)]
+        woken,
+        vec![WaitWake::Queued {
+            task_id: task.id.clone()
+        }]
+    );
+    assert!(
+        recorder.calls().is_empty(),
+        "the wake itself must not launch past the caps"
     );
     assert!(!session_mgr.is_session_active("ses-wait-old"));
-    assert!(session_mgr.is_session_active(&new_session));
-    assert_eq!(
-        ops.get_task(&task.id).unwrap().unwrap().session.as_deref(),
-        Some(new_session.as_str())
-    );
+    let parked = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(parked.run_phase, Some(RunPhase::Queued));
+    assert_eq!(parked.session, None);
     let contexts = ThreadManager::new(dir.path())
         .unwrap()
         .messages_of_kind(&task.id, MessageKind::Context)
@@ -1656,6 +1858,18 @@ fn expired_declared_wait_relaunches_agent_to_check_result() {
             && message.body.contains("batch export")
             && message.body.contains("declare waiting again")
     }));
+
+    // The dispatcher starts the re-queued task once a slot is free.
+    let mut occupant_session = session_mgr.load_session("ses-occupant").unwrap();
+    occupant_session.status = SessionStatus::Closed;
+    session_mgr.save_session(&occupant_session).unwrap();
+    let started = ops.dispatch_queue().unwrap();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].task_id, task.id);
+    assert_eq!(
+        recorder.calls(),
+        vec![(task.id.clone(), started[0].session_id.clone(), false)]
+    );
 }
 
 #[test]
@@ -1680,16 +1894,32 @@ fn expired_declared_wait_launch_failure_crashes_new_session() {
     session_mgr.save_session(&session).unwrap();
     let ops = Operations::with_launcher(dir.path(), Box::new(FailingLauncher));
 
-    let resumed = ops.resume_expired_waits().unwrap();
+    let woken = ops.wake_expired_waits().unwrap();
 
-    assert!(resumed.is_empty());
+    // The wake parks the task in the queue; the dispatcher's own pump then
+    // claims it, and the failing launch routes to the crash-restart backoff.
+    assert_eq!(
+        woken,
+        vec![WaitWake::Queued {
+            task_id: task.id.clone()
+        }]
+    );
     assert!(!session_mgr.is_session_active("ses-wait-fail"));
     let stored = ops.get_task(&task.id).unwrap().unwrap();
-    let new_session = stored.session.expect("failed relaunch session persisted");
+    let new_session = stored.session.expect("claimed session persisted");
     assert_ne!(new_session, "ses-wait-fail");
     assert_eq!(
         session_mgr.session_state(&new_session, 300),
         Some(SessionState::Crashed)
+    );
+    assert_eq!(
+        stored.run_phase,
+        Some(RunPhase::Queued),
+        "the failed dispatch hands the task back to the queue"
+    );
+    assert!(
+        stored.restart_at.is_some(),
+        "the failed launch must enter the crash-restart backoff"
     );
 }
 
@@ -1717,7 +1947,7 @@ fn expired_declared_wait_without_auto_launch_crashes_old_session() {
     session.wait_until = Some(timefmt::now() - chrono::Duration::seconds(1));
     session_mgr.save_session(&session).unwrap();
 
-    let resumed = ops.resume_expired_waits().unwrap();
+    let resumed = ops.wake_expired_waits().unwrap();
 
     assert!(resumed.is_empty());
     assert!(recorder.calls().is_empty());
@@ -1751,7 +1981,7 @@ fn expired_declared_wait_respects_auto_resume_budget() {
     stored.auto_resumes = 3;
     ops.storage.save_task(&stored).unwrap();
 
-    let resumed = ops.resume_expired_waits().unwrap();
+    let resumed = ops.wake_expired_waits().unwrap();
 
     assert!(resumed.is_empty());
     assert!(recorder.calls().is_empty());
@@ -2401,6 +2631,104 @@ fn agent_exit_harvests_opencode_transcript_into_provenance_manifest() {
     assert!(step.body.contains("reads=1 writes=0 urls=1"));
 }
 
+/// Two tasks whose sessions ran concurrently and both wrote the same file:
+/// the later exit detects the overlap against the earlier session's manifest
+/// and warns on both threads. A re-harvest of the same session must not
+/// double-post (dedup by session-id pair on the thread).
+#[test]
+fn concurrent_provenance_overlap_warns_both_task_threads() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    let claude_task = |title: &str| NewTask {
+        agent_backend: Some("claude".to_string()),
+        ..NewTask::titled(title)
+    };
+    let task_a = ops.create_task(claude_task("Writer A")).unwrap();
+    let task_b = ops.create_task(claude_task("Writer B")).unwrap();
+    ops.take_task(&task_a.id, "ses-ovl-a", true)
+        .unwrap()
+        .unwrap();
+    ops.take_task(&task_b.id, "ses-ovl-b", true)
+        .unwrap()
+        .unwrap();
+
+    // Both runs edit the same file; the wrapper teed each transcript to logs.
+    let transcript = |session: &str| {
+        let path = dir
+            .path()
+            .join(".kanban/logs")
+            .join(format!("{session}.transcript.jsonl"));
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/lib.rs"}}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+    };
+    transcript("ses-ovl-a");
+
+    // The overlapping run was heartbeating right up to its exit, so its
+    // lifetime reaches into the peer's window.
+    let sessions = SessionManager::new(dir.path());
+    let mut record = sessions.load_session("ses-ovl-a").unwrap();
+    record.last_seen = timefmt::now();
+    sessions.save_session(&record).unwrap();
+
+    // First exit: the peer has no manifest yet, so nothing is posted.
+    ops.reconcile_agent_exit(&task_a.id, "ses-ovl-a", 1)
+        .unwrap();
+    let thread_a = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task_a.id)
+        .unwrap();
+    assert!(
+        !thread_a
+            .messages
+            .iter()
+            .any(|m| m.body.contains("provenance overlap"))
+    );
+
+    // Second exit: ses-ovl-a's manifest exists, the lifetimes overlapped,
+    // and both wrote src/lib.rs — both threads warn.
+    transcript("ses-ovl-b");
+    ops.reconcile_agent_exit(&task_b.id, "ses-ovl-b", 1)
+        .unwrap();
+
+    for task_id in [&task_a.id, &task_b.id] {
+        let thread = ThreadManager::new(dir.path())
+            .unwrap()
+            .load(task_id)
+            .unwrap();
+        let warnings: Vec<_> = thread
+            .messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::Context && m.body.contains("provenance overlap"))
+            .collect();
+        assert_eq!(warnings.len(), 1, "one overlap warning on {task_id}");
+        let body = &warnings[0].body;
+        assert!(body.contains("ses-ovl-a") && body.contains("ses-ovl-b"));
+        assert!(body.contains(&task_a.id) && body.contains(&task_b.id));
+        assert!(body.contains("src/lib.rs"));
+    }
+
+    // A stale-callback re-harvest of the same session must not double-post.
+    ops.reconcile_agent_exit(&task_b.id, "ses-ovl-b", 0)
+        .unwrap();
+    let thread_a = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task_a.id)
+        .unwrap();
+    assert_eq!(
+        thread_a
+            .messages
+            .iter()
+            .filter(|m| m.kind == MessageKind::Context && m.body.contains("provenance overlap"))
+            .count(),
+        1
+    );
+}
+
 /// The agent's closing answer must reach the thread, not just the log file:
 /// claude reports it in the `result` event, and it is posted as a `context`
 /// message ahead of the exit audit line.
@@ -2877,7 +3205,10 @@ fn rerun_review_task_clears_review_unseen() {
         .unwrap();
     assert!(reviewed.review_unseen);
 
-    let rerun = ops.rerun_review_task(&task.id, None).unwrap().unwrap();
+    let rerun = ops
+        .rerun_review_task(&task.id, None, RunMode::Immediate)
+        .unwrap()
+        .unwrap();
     assert_eq!(rerun.status, TaskStatus::InProgress);
     assert!(!rerun.review_unseen, "rerun clears review_unseen");
 }
@@ -2991,12 +3322,14 @@ fn explicit_enqueue_and_dequeue_round_trip() {
         Err(KanbanError::Invalid(_))
     ));
 
-    // Review tasks cannot be queued.
+    // Review tasks queue too: the edits fold and the dispatcher re-runs it.
     ops.move_task(&task.id, "review", false).unwrap();
-    assert!(matches!(
-        ops.enqueue_task(&task.id),
-        Err(KanbanError::Invalid(_))
-    ));
+    ops.set_review_edits(&task.id, "Fold on enqueue").unwrap();
+    let from_review = ops.enqueue_task(&task.id).unwrap().unwrap();
+    assert_eq!(from_review.status, TaskStatus::InProgress);
+    assert_eq!(from_review.run_phase, Some(RunPhase::Queued));
+    assert_eq!(from_review.review_edits, "");
+    assert!(recorder.calls().is_empty(), "queueing never launches");
 }
 
 // ------------------------------------------------------- per-task designer / reviewer
@@ -3449,6 +3782,86 @@ fn a_human_move_that_is_not_to_todo_keeps_the_plan() {
 }
 
 #[test]
+fn waking_a_crash_queued_task_does_not_keep_the_queued_phase() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = park_in_phase(&ops, "Dropped then restarted", RunPhase::Queued);
+    let session = "ses-dropped";
+    SessionManager::new(dir.path())
+        .link_session(&task.id, session)
+        .unwrap();
+    SessionManager::new(dir.path())
+        .crash_session(session)
+        .unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.session = Some(session.to_string());
+    ops.storage.save_task(&current).unwrap();
+
+    let woken = ops
+        .revoke_in_progress_task(&task.id, Some(session))
+        .unwrap()
+        .unwrap();
+
+    assert_ne!(
+        woken.run_phase,
+        Some(RunPhase::Queued),
+        "a live restart must leave the queue; queued on a running task is the badge bug"
+    );
+    assert_eq!(woken.run_phase, Some(RunPhase::Execute));
+    assert_eq!(recorder.calls().len(), 1);
+    assert!(woken.session.is_some_and(|id| id != session));
+}
+
+#[test]
+fn auto_resume_of_a_queued_task_does_not_keep_the_queued_phase() {
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let task = park_in_phase(&ops, "Stranded queued", RunPhase::Queued);
+    let session = "ses-queued-exit";
+    SessionManager::new(dir.path())
+        .link_session(&task.id, session)
+        .unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.session = Some(session.to_string());
+    ops.storage.save_task(&current).unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let outcome = ops.reconcile_agent_exit(&task.id, session, 0).unwrap();
+    assert!(
+        matches!(outcome, AgentExitOutcome::Resumed(_)),
+        "clean stranded exit should auto-resume, got {outcome:?}"
+    );
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_ne!(
+        stored.run_phase,
+        Some(RunPhase::Queued),
+        "auto-resume must not keep queued on the live successor"
+    );
+    assert_eq!(stored.run_phase, Some(RunPhase::Execute));
+}
+
+#[test]
+fn rerunning_a_stranded_queued_task_does_not_keep_the_queued_phase() {
+    let (dir, ops, _rec) = ops_with_recorder(true);
+    let task = park_in_phase(&ops, "Rerun queued", RunPhase::Queued);
+    let session = "ses-rerun-queued";
+    SessionManager::new(dir.path())
+        .link_session(&task.id, session)
+        .unwrap();
+    let mut current = ops.get_task(&task.id).unwrap().unwrap();
+    current.session = Some(session.to_string());
+    ops.storage.save_task(&current).unwrap();
+    SessionManager::new(dir.path())
+        .close_session(session)
+        .unwrap();
+
+    let rerun = ops
+        .rerun_in_progress_task(&task.id, None, RunMode::Immediate)
+        .unwrap()
+        .unwrap();
+    assert_ne!(rerun.run_phase, Some(RunPhase::Queued));
+    assert_eq!(rerun.run_phase, Some(RunPhase::Execute));
+}
+
+#[test]
 fn waking_a_task_keeps_the_reviewer_bounce_count() {
     let (dir, ops, _rec) = ops_with_recorder(false);
     let task = park_in_phase(&ops, "Wake me", RunPhase::Execute);
@@ -3498,7 +3911,9 @@ fn rerunning_a_stranded_session_keeps_the_reviewer_bounce_count() {
         .close_session(session)
         .unwrap();
 
-    ops.rerun_in_progress_task(&task.id, None).unwrap().unwrap();
+    ops.rerun_in_progress_task(&task.id, None, RunMode::Immediate)
+        .unwrap()
+        .unwrap();
 
     let stored = ops.get_task(&task.id).unwrap().unwrap();
     assert_eq!(stored.review_rounds, 3);
@@ -3514,11 +3929,201 @@ fn rerunning_from_review_does_reset_the_reviewer_bounce_count() {
     current.review_rounds = 3;
     ops.storage.save_task(&current).unwrap();
 
-    ops.rerun_review_task(&task.id, None).unwrap().unwrap();
+    ops.rerun_review_task(&task.id, None, RunMode::Immediate)
+        .unwrap()
+        .unwrap();
 
     let stored = ops.get_task(&task.id).unwrap().unwrap();
     assert_eq!(
         stored.review_rounds, 0,
         "a human restarting the work from Review is a fresh attempt"
+    );
+}
+
+// ------------------------------------------------------------------ queue_run
+
+/// Quiet board with auto-launch on, a recording launcher, and the given
+/// orchestration body (the contents of the `orchestration:` mapping).
+fn queue_board(
+    orchestration_yaml: &str,
+) -> (tempfile::TempDir, Operations, common::RecordingLauncher) {
+    let (dir, _storage) = common::quiet_board(false);
+    fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        format!(
+            "notifications:\n  enabled: false\nauto_launch:\n  enabled: true\norchestration:\n{orchestration_yaml}"
+        ),
+    )
+    .unwrap();
+    let recorder = common::RecordingLauncher::new();
+    let ops = Operations::with_launcher(dir.path(), Box::new(recorder.clone()));
+    (dir, ops, recorder)
+}
+
+#[test]
+fn queue_run_moves_todo_to_queued_without_launching() {
+    let (dir, ops, recorder) = queue_board("");
+    let task = ops.create_task(NewTask::titled("Queue me")).unwrap();
+
+    let queued = ops.queue_run(&task.id).unwrap().unwrap();
+    assert_eq!(queued.status, TaskStatus::InProgress);
+    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
+    assert_eq!(queued.session, None, "a queued task owns no session");
+    assert!(recorder.calls().is_empty(), "queue_run must never launch");
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread.messages.iter().any(|m| m.body.contains("queued")),
+        "the queue note must land on the thread"
+    );
+}
+
+#[test]
+fn queue_run_from_review_folds_review_edits_into_the_thread() {
+    let (dir, ops, recorder) = queue_board("");
+    let task = ops.create_task(NewTask::titled("Rework")).unwrap();
+    ops.move_task(&task.id, "review", false).unwrap();
+    ops.set_review_edits(&task.id, "Tighten validation")
+        .unwrap();
+
+    let queued = ops.queue_run(&task.id).unwrap().unwrap();
+    assert_eq!(queued.status, TaskStatus::InProgress);
+    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
+    assert_eq!(queued.review_edits, "");
+    assert!(!queued.review_unseen);
+    assert!(queued.session.is_none());
+    assert!(recorder.calls().is_empty());
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread
+            .messages
+            .iter()
+            .any(|m| m.kind == MessageKind::ReviewEdit && m.body == "Tighten validation"),
+        "the folded review edits must survive on the thread"
+    );
+}
+
+#[test]
+fn queue_run_rejects_done_tasks() {
+    let (_dir, ops, recorder) = queue_board("");
+    let task = ops.create_task(NewTask::titled("Finished")).unwrap();
+    ops.move_task(&task.id, "done", false).unwrap();
+
+    assert!(matches!(
+        ops.queue_run(&task.id),
+        Err(KanbanError::Invalid(_))
+    ));
+    assert!(recorder.calls().is_empty());
+}
+
+#[test]
+fn queue_run_rejects_a_task_with_a_live_session() {
+    let (_dir, ops, recorder) = queue_board("");
+    let task = ops.create_task(NewTask::titled("Busy")).unwrap();
+    ops.take_task(&task.id, "ses-live", true).unwrap().unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    assert!(matches!(
+        ops.queue_run(&task.id),
+        Err(KanbanError::Invalid(_))
+    ));
+    assert!(recorder.calls().is_empty());
+}
+
+#[test]
+fn queue_can_dispatch_tracks_the_queue_and_auto_launch_switches() {
+    let (_dir, ops, _recorder) = queue_board("");
+    assert!(ops.queue_can_dispatch().unwrap());
+
+    let (_dir, queue_off, _recorder) = queue_board("  queue_enabled: false\n");
+    assert!(
+        !queue_off.queue_can_dispatch().unwrap(),
+        "queue_enabled: false must route runs to the direct launch"
+    );
+
+    let (dir, _storage) = common::quiet_board(false);
+    let ops = Operations::new(dir.path());
+    assert!(
+        !ops.queue_can_dispatch().unwrap(),
+        "auto-launch off leaves nothing to drain the queue"
+    );
+}
+
+#[test]
+fn rerun_review_task_in_queued_mode_does_not_launch() {
+    let (dir, ops, recorder) = queue_board("");
+    let task = ops.create_task(NewTask::titled("Queue rerun")).unwrap();
+    ops.move_task(&task.id, "review", false).unwrap();
+    ops.set_review_edits(&task.id, "Fold me").unwrap();
+
+    let queued = ops
+        .rerun_review_task(&task.id, None, RunMode::Queued)
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued.status, TaskStatus::InProgress);
+    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
+    assert!(queued.session.is_none());
+    assert_eq!(queued.review_edits, "");
+    assert!(recorder.calls().is_empty());
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread
+            .messages
+            .iter()
+            .any(|m| m.kind == MessageKind::ReviewEdit && m.body == "Fold me"),
+        "queued re-run folds the edits exactly like the immediate one"
+    );
+}
+
+#[test]
+fn rerun_in_progress_task_in_queued_mode_parks_the_task_without_a_session() {
+    let (dir, ops, recorder) = queue_board("");
+    let task = ops.create_task(NewTask::titled("Stalled queue")).unwrap();
+    ops.take_task(&task.id, "ses-dead", true).unwrap();
+    recorder.calls.lock().unwrap().clear();
+    SessionManager::new(dir.path())
+        .crash_session("ses-dead")
+        .unwrap();
+
+    let queued = ops
+        .rerun_in_progress_task(&task.id, None, RunMode::Queued)
+        .unwrap()
+        .unwrap();
+    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
+    assert_eq!(queued.session, None, "the queued run owns no session yet");
+    assert!(
+        !SessionManager::new(dir.path()).is_session_active("ses-dead"),
+        "the old session must still be closed"
+    );
+    assert!(recorder.calls().is_empty());
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread
+            .messages
+            .iter()
+            .any(|m| m.body.contains("re-run from In Progress")),
+        "the re-run audit note must survive queued mode"
+    );
+    assert!(
+        thread
+            .messages
+            .iter()
+            .any(|m| m.body.contains("queued — the dispatcher starts it")),
+        "the thread must say the new run waits in the queue"
     );
 }

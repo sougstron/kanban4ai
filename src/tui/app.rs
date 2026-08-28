@@ -24,9 +24,10 @@ use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
 use crate::core::limits::LimitsSnapshot;
 use crate::core::models::{
-    Message, MessageKind, MessageStatus, RunPhase, Session, SessionStatus, Task, TaskStatus,
+    Message, MessageKind, MessageStatus, RunMode, RunPhase, Session, SessionStatus, Task,
+    TaskStatus,
 };
-use crate::core::operations::{Operations, QuestionRef, TaskPatch};
+use crate::core::operations::{Operations, QuestionRef, TaskPatch, WaitWake};
 use crate::core::project::{Project, ProjectStore};
 use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
@@ -34,6 +35,7 @@ use crate::core::storage::NewTask;
 use crate::core::telemetry::{self, SessionProgress};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
+use crate::core::update;
 
 use super::card::{
     case_insensitive_match, sanitize_paste_text, sanitize_terminal_text, truncate_display,
@@ -117,6 +119,12 @@ pub struct BoardSnapshot {
     pub session_deadlines: HashMap<String, chrono::NaiveDateTime>,
     pub session_wait_deadlines: HashMap<String, chrono::NaiveDateTime>,
     pub session_wait_notes: HashMap<String, String>,
+    /// Project-wide designer bot on; drives the pending `✎ design` card mark
+    /// (a task's own `use_designer` ORs in).
+    pub designer_bot: bool,
+    /// Project-wide reviewer bot on; drives the pending `⚖ review` card mark
+    /// (a task's own `use_reviewer` ORs in).
+    pub reviewer_bot: bool,
     pub fingerprint: (u64, u128),
 }
 
@@ -171,7 +179,13 @@ pub enum UiAction {
     EditTask,
     MoveTask,
     DeleteTask,
+    /// Queue the focused task for the dispatcher (`r`, `Enter` on a To Do
+    /// detail): no agent launches now; the dispatcher starts the run when a
+    /// slot frees. The queue is pumped once immediately, so on an idle board
+    /// the task still starts right away.
     Run,
+    /// Launch immediately, bypassing the queue (`F`) — the debug/direct path.
+    RunNow,
     Revoke,
     /// Queue the current task for the dispatcher (`Q`). No agent launches;
     /// the task waits In Progress with run phase Queued.
@@ -213,6 +227,11 @@ pub enum UiAction {
     DeleteProject,
     CreateCwdProject,
     RefreshLimits(&'static str),
+    /// Global Settings "Check now": one deliberate blocking check, refreshing
+    /// the dialog's Updates row in place.
+    CheckUpdates,
+    /// Global Settings "Update now": run the same apply path the CLI uses.
+    ApplyUpdate,
 }
 
 /// Which detail panel receives keyboard input. `Thread` is the neutral state
@@ -574,6 +593,11 @@ impl App {
                 warm_backend_catalog(backend.clone(), command.clone());
             }
         }
+        // On-open update check, the same shape as the catalog warm-up: a
+        // background thread that must never block startup or spawn a modal.
+        // `warm_check` no-ops inside the check TTL, when
+        // `updates.check_on_open` is off, and under cfg(test).
+        update::warm_check();
         let column_offsets = vec![0; board.columns.len()];
         let visible_card_capacities = vec![1; board.columns.len()];
         // Ineffective config settings have nowhere else to go here: stderr
@@ -743,6 +767,9 @@ impl App {
             app.settings.escape_to_projects = config.escape_to_projects();
             app.settings.project_sort = config.project_sort().to_string();
         }
+        // The projects list is an entry screen too (bare `kanban4ai` with no
+        // resolvable project), so its open runs the same on-open check.
+        update::warm_check();
         app.theme = Theme::named(&app.settings.theme_name);
         Ok(app)
     }
@@ -967,6 +994,7 @@ impl App {
                     .unwrap_or(UiAction::Run);
                 self.dispatch(action)?
             }
+            (KeyCode::Char('F'), _) if action_screen => self.dispatch(UiAction::RunNow)?,
             (KeyCode::Char('w'), _) if action_screen => self.dispatch(UiAction::AnswerQuestion)?,
             (KeyCode::Char('y'), _) if action_screen => self.dispatch(UiAction::Approve)?,
             (KeyCode::Char('t'), _) if action_screen => self.dispatch(UiAction::Attach)?,
@@ -1229,17 +1257,26 @@ impl App {
             return Ok(());
         }
         let msg_id = question.id.clone();
-        self.ops
-            .answer_question(&task_id, QuestionRef::MsgId(msg_id), &answer)?;
+        let Some(outcome) =
+            self.ops
+                .answer_question(&task_id, QuestionRef::MsgId(msg_id), &answer)?
+        else {
+            self.status = "Question no longer exists".to_string();
+            return Ok(());
+        };
         self.refresh_after_action()?;
-        let remaining = self
-            .detail
-            .as_ref()
-            .map(|detail| detail.open_questions().len())
-            .unwrap_or(0);
-        if remaining > 0 {
+        if outcome.remaining > 0 {
             self.set_detail_focus(DetailFocus::Answer);
-            self.status = format!("Answered; {remaining} question(s) left on {task_id}");
+            self.status = format!(
+                "Answered; {} question(s) left on {task_id}",
+                outcome.remaining
+            );
+        } else if outcome.queued {
+            self.set_detail_focus(DetailFocus::Thread);
+            self.status = "Answered; agent queued for a free agent slot".to_string();
+        } else if let Some(session) = outcome.resumed_session {
+            self.set_detail_focus(DetailFocus::Thread);
+            self.status = format!("Answered; agent resumed on {session}");
         } else {
             self.set_detail_focus(DetailFocus::Thread);
             self.status = format!("Answered question on {task_id}");
@@ -1364,8 +1401,10 @@ impl App {
             UiAction::MoveTask => self.open_move_dialog(),
             UiAction::DeleteTask => self.open_delete_dialog(),
             // The board is human-managed and agent-executed: running a task
-            // is the primary action and never asks for confirmation.
+            // is the primary action and never asks for confirmation. `Run`
+            // queues; `RunNow` (`F`) is the direct-launch debug path.
             UiAction::Run => self.run_current_task()?,
+            UiAction::RunNow => self.run_current_task_now()?,
             UiAction::Revoke => self.revoke_current_task()?,
             UiAction::Stop => self.open_stop_confirm(),
             UiAction::AnswerQuestion => self.open_answer_dialog()?,
@@ -1403,6 +1442,62 @@ impl App {
             UiAction::DeleteProject => self.open_delete_project_dialog(),
             UiAction::CreateCwdProject => self.create_cwd_project()?,
             UiAction::RefreshLimits(provider) => self.refresh_provider_limits(provider),
+            UiAction::CheckUpdates => self.check_updates_now(),
+            UiAction::ApplyUpdate => self.apply_update_now()?,
+        }
+        Ok(())
+    }
+
+    /// Global Settings "Check now": a deliberate user action, so one blocking
+    /// check is acceptable here (unlike the startup path). The dialog's
+    /// Updates row reads `update::cached()` on the next frame.
+    fn check_updates_now(&mut self) {
+        match update::check_latest(true) {
+            Ok(status) => {
+                if let Some(modal) = self.modal.as_mut() {
+                    modal.update_check_error = None;
+                }
+                self.status = if update::is_update_available(&status) {
+                    format!("Checked: kanban4ai {} available", status.latest_version)
+                } else {
+                    format!(
+                        "Checked: kanban4ai {} is up to date",
+                        update::installed_version()
+                    )
+                };
+            }
+            Err(err) => {
+                let reason = match err {
+                    update::UpdateError::Network(reason) | update::UpdateError::Parse(reason) => {
+                        reason
+                    }
+                };
+                if let Some(modal) = self.modal.as_mut() {
+                    modal.update_check_error = Some(reason.clone());
+                }
+                self.status = format!("Update check failed: {reason}");
+            }
+        }
+    }
+
+    /// Global Settings "Update now": the same apply path the CLI's
+    /// `kanban update` uses. The button only renders on unmanaged installs,
+    /// so a package-managed refusal here is a stale-dialog race, not a
+    /// routing bug — its guidance text is still the right answer.
+    fn apply_update_now(&mut self) -> Result<()> {
+        let Some(status) = update::cached().filter(|status| update::is_update_available(status))
+        else {
+            self.status = "No update to install - use Check now first".to_string();
+            return Ok(());
+        };
+        match update::apply_update(&status) {
+            Ok(applied) => {
+                self.status = format!(
+                    "kanban4ai {} installed - restart kanban4ai to load it",
+                    applied.version
+                );
+            }
+            Err(err) => self.status = err.to_string(),
         }
         Ok(())
     }
@@ -1825,6 +1920,14 @@ impl App {
                 }
             }
             Some(HitAction::ModalButton(button)) => self.activate_modal_button(button)?,
+            // Only the dialog's own buttons dispatch inside a modal; other
+            // Action regions (status-bar hints under the dimmed backdrop)
+            // stay inert, exactly as before.
+            Some(HitAction::Action(action))
+                if matches!(action, UiAction::CheckUpdates | UiAction::ApplyUpdate) =>
+            {
+                self.dispatch(action)?
+            }
             _ => {}
         }
         Ok(())
@@ -1982,6 +2085,30 @@ impl App {
         }
         self.refresh_session_progress();
         Ok(())
+    }
+
+    /// Surface a newly available update as a one-time status-line banner. The
+    /// render loop only reads `update::cached()`, so the background check's
+    /// result shows up here within a frame. Showing persists the dismissal,
+    /// so the banner fires once per newly seen version and never nags again
+    /// for it — a newer tag reopens it.
+    ///
+    /// Called from the event loop, not from [`App::tick`], for the same
+    /// reason the limits pull lives there: nothing outside a real terminal
+    /// session should ever touch the process-wide update state.
+    pub(crate) fn poll_update_banner(&mut self) {
+        if self.is_transient_status() {
+            return;
+        }
+        let Some(status) = update::cached() else {
+            return;
+        };
+        if !update::banner_due(&status) {
+            return;
+        }
+        let version = status.latest_version.clone();
+        self.status = format!("↑ kanban4ai {version} available - open Settings to update");
+        update::dismiss(&version);
     }
 
     /// Refresh live agent telemetry for tasks with a running agent. Transcripts
@@ -2181,10 +2308,11 @@ impl App {
         }
     }
 
-    /// Relaunch agents whose declared wait deadline expired ("ping" them to
-    /// report status). Throttled: the scan reads every session file, so it
-    /// runs at most once per interval, not on every tick. Errors land in the
-    /// status line instead of killing the TUI.
+    /// End agents' declared waits whose deadline expired: the task parks in
+    /// the queue (or, with the queue off, relaunches directly). Throttled:
+    /// the scan reads every session file, so it runs at most once per
+    /// interval, not on every tick. Errors land in the status line instead
+    /// of killing the TUI.
     fn resume_expired_waits_throttled(&mut self) {
         const WAIT_RESUME_INTERVAL: Duration = Duration::from_secs(10);
         if self
@@ -2194,15 +2322,18 @@ impl App {
             return;
         }
         self.last_wait_resume = Some(Instant::now());
-        match self.ops.resume_expired_waits() {
-            Ok(resumed) if !resumed.is_empty() => {
+        match self.ops.wake_expired_waits() {
+            Ok(woken) if !woken.is_empty() => {
                 self.request_full_redraw();
-                let tasks = resumed
+                let tasks = woken
                     .iter()
-                    .map(|(task_id, _)| task_id.as_str())
+                    .map(|wake| match wake {
+                        WaitWake::Queued { task_id } => format!("{task_id} (queued)"),
+                        WaitWake::Resumed { task_id, .. } => task_id.clone(),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
-                self.status = format!("Wait deadline passed — relaunched: {tasks}");
+                self.status = format!("Wait deadline passed — woken: {tasks}");
             }
             Ok(_) => {}
             Err(err) => self.status = format!("Wait resume failed: {err}"),
@@ -2921,6 +3052,7 @@ impl App {
             }
         };
         let mut modal = ModalState::new(Modal::Settings);
+        modal.isolation_status = Some(crate::core::vcs::availability(self.ops.work_path()));
         modal.title = TextArea::new(vec![sanitize_terminal_text(&tui_string(
             &config.tui,
             "name",
@@ -3011,6 +3143,15 @@ impl App {
         let mut modal = ModalState::new(Modal::GlobalSettings);
         modal.escape_to_projects = config.escape_to_projects();
         modal.project_sort = super::dialogs::one_line(config.project_sort());
+        modal.update_check_on_open = config.update_check_on_open();
+        // One probe per dialog open, never per frame: the probe shells out to
+        // pacman. `Some` means the package manager owns the binary and the
+        // dialog shows its upgrade command instead of an "Update now" button.
+        modal.update_upgrade_command = update::package_upgrade_command();
+        modal.update_check_error = None;
+        // Fill the status row in the background if no fresh check exists;
+        // the row only ever reads `update::cached()`.
+        update::warm_check();
         modal.set_project_sort_options(vec![
             SelectOption {
                 label: "By name".to_string(),
@@ -3380,7 +3521,42 @@ impl App {
         Ok(())
     }
 
+    /// The human "Run" action: queue the task for the dispatcher and pump the
+    /// queue once immediately, so an idle board still starts the task on the
+    /// spot while a full board parks it with the `⏸ queued` badge. When the
+    /// queue could never drain (queue or auto-launch disabled) fall back to
+    /// the direct launch instead of stranding the task forever.
     fn run_current_task(&mut self) -> Result<()> {
+        let Some(task_id) = self.current_task_id() else {
+            self.status = "No task selected".to_string();
+            return Ok(());
+        };
+        if !self.ops.queue_can_dispatch()? {
+            return self.run_current_task_now_with_suffix(" (queue is off — started directly)");
+        }
+        let should_close_detail = self.screen == Screen::Detail;
+        self.request_full_redraw();
+        if let Err(err) = self.ops.queue_run(&task_id) {
+            self.status = err.to_string();
+            return Ok(());
+        }
+        self.last_queue_dispatch = None;
+        self.dispatch_queue_throttled();
+        self.refresh_after_action()?;
+        self.status = self.post_queue_run_status(&task_id);
+        if self.task_started_after_queue_run(&task_id) && should_close_detail {
+            self.close_detail()?;
+        }
+        Ok(())
+    }
+
+    /// The direct-launch path behind `F` (and the queue-disabled fallback):
+    /// the old `r` behavior of starting an agent right away.
+    fn run_current_task_now(&mut self) -> Result<()> {
+        self.run_current_task_now_with_suffix("")
+    }
+
+    fn run_current_task_now_with_suffix(&mut self, suffix: &str) -> Result<()> {
         let Some(task_id) = self.current_task_id() else {
             self.status = "No task selected".to_string();
             return Ok(());
@@ -3389,7 +3565,7 @@ impl App {
         self.request_full_redraw();
         let started = match self.ops.start_task(&task_id) {
             Ok(Some(session_id)) => {
-                self.status = format!("Started {task_id} → {session_id}");
+                self.status = format!("Started {task_id} → {session_id}{suffix}");
                 true
             }
             Ok(None) => {
@@ -3406,6 +3582,30 @@ impl App {
             self.close_detail()?;
         }
         Ok(())
+    }
+
+    /// Status line after a queued run + immediate pump: report what actually
+    /// happened to the pressed task — an older queued task may have taken the
+    /// freed slot first, so "Started" is never unconditional.
+    fn post_queue_run_status(&self, task_id: &str) -> String {
+        match self.ops.get_task(task_id) {
+            Ok(Some(task)) if task.run_phase == Some(RunPhase::Queued) => {
+                format!("Queued {task_id} — starts when a slot frees")
+            }
+            Ok(Some(task)) => match task.session {
+                Some(session) => format!("Started {task_id} → {session}"),
+                None => format!("Queued {task_id} — starts when a slot frees"),
+            },
+            _ => format!("Queued {task_id} — starts when a slot frees"),
+        }
+    }
+
+    fn task_started_after_queue_run(&self, task_id: &str) -> bool {
+        self.ops
+            .get_task(task_id)
+            .ok()
+            .flatten()
+            .is_some_and(|task| task.run_phase != Some(RunPhase::Queued) && task.session.is_some())
     }
 
     /// Enqueue (`true`) or dequeue (`false`) the current task. The detail
@@ -3446,12 +3646,12 @@ impl App {
         let task_id = task.id.clone();
         let expected_session = task.session.clone();
         self.request_full_redraw();
-        let relaunched = match self
+        let revoked = match self
             .ops
             .revoke_in_progress_task(&task_id, expected_session.as_deref())
         {
-            Ok(Some(_)) => true,
-            Ok(None) => false,
+            Ok(Some(task)) => Some(task),
+            Ok(None) => None,
             Err(err) => {
                 self.refresh_after_action()?;
                 self.status = err.to_string();
@@ -3459,10 +3659,12 @@ impl App {
             }
         };
         self.refresh_after_action()?;
-        self.status = if relaunched {
-            format!("Revoked and woke {task_id}")
-        } else {
-            format!("Revoke of {task_id} was not started")
+        self.status = match revoked {
+            Some(task) if task.run_phase == Some(RunPhase::Queued) && task.session.is_none() => {
+                format!("Revoked and queued {task_id}")
+            }
+            Some(_) => format!("Revoked and woke {task_id}"),
+            None => format!("Revoke of {task_id} was not started"),
         };
         Ok(())
     }
@@ -3560,19 +3762,35 @@ impl App {
         };
         let from_review = task.status == TaskStatus::Review;
         self.request_full_redraw();
-        let relaunched = match task.status {
+        // Same hard fallback as `r`: never park a re-run in a queue nothing
+        // can drain (queue or auto-launch switched off) — start it directly.
+        let mode = if self.ops.queue_can_dispatch()? {
+            RunMode::Queued
+        } else {
+            RunMode::Immediate
+        };
+        let reran = match task.status {
             TaskStatus::Review => {
                 self.save_visible_review_edits_before_rerun(&task)?;
-                self.ops.rerun_review_task(&task.id, None)?.is_some()
+                self.ops.rerun_review_task(&task.id, None, mode)?.is_some()
             }
-            TaskStatus::InProgress => self.ops.rerun_in_progress_task(&task.id, None)?.is_some(),
+            TaskStatus::InProgress => self
+                .ops
+                .rerun_in_progress_task(&task.id, None, mode)?
+                .is_some(),
             _ => {
                 self.status = format!("{} can be re-run only from Review or In Progress", task.id);
                 return Ok(());
             }
         };
+        // Same pump as `r`: with free caps the re-run starts on the spot;
+        // otherwise the task waits in the queue with the edits folded in.
+        if reran && mode == RunMode::Queued {
+            self.last_queue_dispatch = None;
+            self.dispatch_queue_throttled();
+        }
         self.refresh_after_action()?;
-        if relaunched && from_review {
+        if reran && from_review {
             // Leave the Review column/detail and show the task where it now
             // lives — In Progress — so the rework send is visible immediately.
             if self.screen == Screen::Detail {
@@ -3580,8 +3798,16 @@ impl App {
             }
             let _ = self.focus_task(&task.id);
         }
-        self.status = if relaunched {
-            format!("Re-ran {}", task.id)
+        self.status = if reran {
+            if mode == RunMode::Queued {
+                if self.task_started_after_queue_run(&task.id) {
+                    self.post_queue_run_status(&task.id)
+                } else {
+                    format!("Queued {} for re-run", task.id)
+                }
+            } else {
+                format!("Re-ran {}", task.id)
+            }
         } else {
             format!("Re-run of {} was not started", task.id)
         };
@@ -4375,6 +4601,7 @@ impl App {
                     let _lock = store.lock()?;
                     let mut config = store.load_global_config()?;
                     config.set_escape_to_projects(modal.escape_to_projects);
+                    config.set_update_check_on_open(modal.update_check_on_open);
                     config.set_project_sort(
                         &modal
                             .project_sort_text()
@@ -4667,9 +4894,24 @@ impl App {
                 let question_ref = modal.selected_question_ref().ok_or_else(|| {
                     crate::core::error::KanbanError::Invalid("No question selected".to_string())
                 })?;
-                self.ops.answer_question(&task_id, question_ref, &answer)?;
+                let Some(outcome) = self.ops.answer_question(&task_id, question_ref, &answer)?
+                else {
+                    self.status = "Question no longer exists".to_string();
+                    return Ok(());
+                };
                 self.refresh_after_action()?;
-                self.status = format!("Answered question on {task_id}");
+                if outcome.remaining > 0 {
+                    self.status = format!(
+                        "Answered; {} question(s) left on {task_id}",
+                        outcome.remaining
+                    );
+                } else if outcome.queued {
+                    self.status = "Answered; agent queued for a free agent slot".to_string();
+                } else if let Some(session) = outcome.resumed_session {
+                    self.status = format!("Answered; agent resumed on {session}");
+                } else {
+                    self.status = format!("Answered question on {task_id}");
+                }
             }
             Modal::NewProject => {
                 let path = modal.description_text();
@@ -4819,12 +5061,15 @@ impl BoardSnapshot {
             session_deadlines: HashMap::new(),
             session_wait_deadlines: HashMap::new(),
             session_wait_notes: HashMap::new(),
+            designer_bot: false,
+            reviewer_bot: false,
             fingerprint: (0, 0),
         }
     }
 
     pub fn load(ops: &Operations) -> Result<Self> {
         let config = ops.config.load()?;
+        let orch = OrchestrationSettings::from_mapping(&config.orchestration);
         let ids = config.column_ids();
         let names = config.column_names();
         let mut grouped = ids
@@ -4941,6 +5186,8 @@ impl BoardSnapshot {
             session_deadlines,
             session_wait_deadlines,
             session_wait_notes,
+            designer_bot: orch.designer.enabled,
+            reviewer_bot: orch.reviewer.enabled,
             fingerprint: ops.storage.tui_fingerprint(),
         })
     }
@@ -5311,7 +5558,9 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::AutoRestartDelays
         | DialogField::DesignerEnabled
         | DialogField::ReviewerEnabled
-        | DialogField::ReviewerMaxRounds => None,
+        | DialogField::ReviewerMaxRounds
+        | DialogField::IsolationStatus
+        | DialogField::UpdateCheckOnOpen => None,
     }
 }
 

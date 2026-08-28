@@ -4,7 +4,10 @@ mod common;
 
 use std::fs;
 
-use kanban4ai::core::config::{Config, OnChangesRequested, OrchestrationSettings};
+use kanban4ai::core::config::{
+    Config, IsolationCleanup, IsolationLand, IsolationMode, IsolationOnConflict, IsolationSeed,
+    OnChangesRequested, OrchestrationSettings,
+};
 
 fn write_config(dir: &tempfile::TempDir, content: &str) -> Config {
     let kanban = dir.path().join(".kanban");
@@ -595,4 +598,125 @@ orchestration:
         "a configured agent is a real backend: {:?}",
         config.warnings()
     );
+}
+
+#[test]
+fn isolation_defaults_parse_without_the_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(&dir, "columns:\n- name: To Do\n  id: todo\n");
+
+    let iso = config.get_orchestration().unwrap().isolation;
+    assert_eq!(iso.mode, IsolationMode::Auto);
+    assert_eq!(iso.branch_prefix, "kanban/");
+    assert_eq!(iso.integration_ref, "refs/kanban/integration");
+    assert_eq!(iso.seed, IsolationSeed::Live);
+    assert_eq!(iso.land, IsolationLand::Worktree);
+    assert_eq!(iso.on_conflict, IsolationOnConflict::Review);
+    assert_eq!(iso.cleanup, IsolationCleanup::OnLand);
+    assert_eq!(iso.commit_message, "kanban: {task_id} {title}");
+}
+
+#[test]
+fn partial_isolation_gets_sibling_defaults_deep_merged() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+orchestration:
+  isolation:
+    mode: required
+    branch_prefix: wip/
+"#,
+    );
+
+    let iso = config.get_orchestration().unwrap().isolation;
+    // user values kept
+    assert_eq!(iso.mode, IsolationMode::Required);
+    assert_eq!(iso.branch_prefix, "wip/");
+    // sibling defaults filled in
+    assert_eq!(iso.seed, IsolationSeed::Live);
+    assert_eq!(iso.integration_ref, "refs/kanban/integration");
+    assert_eq!(iso.commit_message, "kanban: {task_id} {title}");
+
+    // the merged block survives save/reload
+    let board = config.load().unwrap();
+    config.save(&board).unwrap();
+    let fresh = Config::new(dir.path());
+    let iso = fresh.get_orchestration().unwrap().isolation;
+    assert_eq!(iso.mode, IsolationMode::Required);
+    assert_eq!(iso.branch_prefix, "wip/");
+    assert_eq!(iso.cleanup, IsolationCleanup::OnLand);
+}
+
+#[test]
+fn every_known_isolation_value_parses_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        r#"columns:
+- name: To Do
+  id: todo
+orchestration:
+  isolation:
+    mode: off
+    seed: head
+    land: manual
+    on_conflict: resolver
+    cleanup: keep
+    commit_message: "task {task_id}: {title}"
+"#,
+    );
+
+    let iso = config.get_orchestration().unwrap().isolation;
+    assert_eq!(iso.mode, IsolationMode::Off);
+    assert_eq!(iso.seed, IsolationSeed::Head);
+    assert_eq!(iso.land, IsolationLand::Manual);
+    assert_eq!(iso.on_conflict, IsolationOnConflict::Resolver);
+    assert_eq!(iso.cleanup, IsolationCleanup::Keep);
+    assert_eq!(iso.commit_message, "task {task_id}: {title}");
+}
+
+#[test]
+fn unknown_isolation_values_are_rejected() {
+    for bad in [
+        "mode: sometimes",
+        "seed: dirty",
+        "land: auto",
+        "on_conflict: force",
+        "cleanup: never",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_config(
+            &dir,
+            &format!(
+                "columns:\n- name: To Do\n  id: todo\norchestration:\n  isolation:\n    {bad}\n"
+            ),
+        );
+        let err = format!("{}", config.load().unwrap_err());
+        assert!(
+            err.contains("orchestration.isolation."),
+            "{bad} must be rejected with a pointer at the key: {err}"
+        );
+    }
+}
+
+#[test]
+fn isolation_must_be_a_mapping_with_string_free_form_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  isolation: 5\n",
+    );
+    let err = format!("{}", config.load().unwrap_err());
+    assert!(err.contains("must be a mapping"), "{err}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  isolation:\n    branch_prefix: [wip]\n",
+    );
+    let err = format!("{}", config.load().unwrap_err());
+    assert!(err.contains("branch_prefix must be a string"), "{err}");
 }

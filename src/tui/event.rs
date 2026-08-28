@@ -56,6 +56,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
     let mut window_title = String::new();
 
     refresh_limits(app);
+    app.poll_update_banner();
     sync_window_title(app, &mut window_title);
     terminal.draw(|frame| board::ui(frame, app))?;
     loop {
@@ -76,6 +77,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
             AppEvent::FsDebounced(generation) => app.reload_debounced_change(generation)?,
             AppEvent::Tick => {
                 refresh_limits(app);
+                app.poll_update_banner();
                 app.tick()?;
             }
         }

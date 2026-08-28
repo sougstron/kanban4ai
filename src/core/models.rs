@@ -66,6 +66,37 @@ string_enum!(RunPhase {
     Review => "review",
 });
 
+// How a worktree-isolated task's branch stands relative to the project's
+// integration ref. `None` (the default, omitted from frontmatter) means the
+// task never ran isolated. There is deliberately no Blocked state — the
+// human's live edits participate in the merge as a side, so that case is an
+// ordinary `Conflict`. (A doc comment cannot sit on a `string_enum!`
+// invocation: rustdoc does not document macro invocations.)
+string_enum!(IntegrationState {
+    None => "none",
+    Pending => "pending",
+    Landed => "landed",
+    Conflict => "conflict",
+});
+
+// `#[derive(Default)]` would need a `#[default]` variant attribute inside
+// the shared `string_enum!` macro (a change to every string enum), so the
+// impl is written out — clippy's derivable_impls is expected here.
+#[allow(clippy::derivable_impls)]
+impl Default for IntegrationState {
+    fn default() -> Self {
+        IntegrationState::None
+    }
+}
+
+/// How a re-run starts its agent: through the orchestration queue (the
+/// default everywhere) or immediately, bypassing it (debug).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunMode {
+    Queued,
+    Immediate,
+}
+
 // Which bot a session is running as. Derived from `RunPhase` (`design` →
 // designer, `review` → reviewer, everything else including a missing
 // phase → executor) and handed to the prompt builder and the move gate.
@@ -329,10 +360,33 @@ pub struct Task {
     /// boards round-trip byte-identically.
     #[serde(default, skip_serializing_if = "is_false")]
     pub designed: bool,
+    /// Worktree isolation (TASK-236): relative path of the task's checkout
+    /// under `.kanban/worktrees`. Omitted while unset so legacy boards
+    /// round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// Git branch the isolated checkout runs on (e.g. `kanban/TASK-236`).
+    /// Omitted while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Object id of the snapshot the task branched from — the exact
+    /// working-tree state the agent started from, so a later conflict is
+    /// explainable after the fact. Omitted while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// Where the task's branch stands relative to the integration ref.
+    /// Omitted while [`IntegrationState::None`] so legacy boards round-trip
+    /// byte-identically.
+    #[serde(default, skip_serializing_if = "is_integration_default")]
+    pub integration: IntegrationState,
 }
 
 fn is_zero(value: &u32) -> bool {
     *value == 0
+}
+
+fn is_integration_default(value: &IntegrationState) -> bool {
+    *value == IntegrationState::None
 }
 
 fn default_task_status() -> TaskStatus {
@@ -370,6 +424,10 @@ impl Task {
             restart_at: None,
             review_rounds: 0,
             designed: false,
+            worktree: None,
+            branch: None,
+            base_commit: None,
+            integration: IntegrationState::None,
         }
     }
 
