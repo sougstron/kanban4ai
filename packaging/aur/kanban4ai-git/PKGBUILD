@@ -1,7 +1,7 @@
 # Maintainer: sougstron
 pkgname=kanban4ai-git
 pkgver=0.1.0.r2.gbb5d055
-pkgrel=1
+pkgrel=2
 pkgdesc='Native kanban board CLI and TUI driven by AI coding agents (Git version)'
 arch=('x86_64' 'aarch64')
 url='https://github.com/sougstron/kanban4ai'
@@ -10,7 +10,7 @@ depends=('gcc-libs')
 makedepends=('cargo' 'git')
 optdepends=(
   'tmux: attachable background agent sessions'
-  'curl: subscription limits row for claude, grok, zai, synthetic, and yolo'
+  'curl: subscription limits row for claude, grok, zai, synthetic, and yolo; update checks and self-update'
   'libnotify: desktop notifications through notify-send'
   'wl-clipboard: paste images under Wayland'
   'xclip: paste images under X11'

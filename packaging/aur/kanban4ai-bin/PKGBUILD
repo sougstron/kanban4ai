@@ -1,19 +1,26 @@
 # Maintainer: sougstron
 pkgname=kanban4ai-bin
-pkgver=0.5.1
+pkgver=0.5.2
 pkgrel=1
 pkgdesc='Native kanban board CLI and TUI driven by AI coding agents (prebuilt binary)'
 arch=('x86_64' 'aarch64')
 url='https://github.com/sougstron/kanban4ai'
 license=('MIT')
 depends=('glibc' 'gcc-libs')
+optdepends=(
+  'tmux: attachable background agent sessions'
+  'curl: subscription limits row for claude, grok, zai, synthetic, and yolo; update checks and self-update'
+  'libnotify: desktop notifications through notify-send'
+  'wl-clipboard: paste images under Wayland'
+  'xclip: paste images under X11'
+)
 provides=("kanban4ai=$pkgver")
 conflicts=('kanban4ai')
 options=('!strip')
 
 source_x86_64=("$pkgname-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/kanban4ai-v$pkgver-x86_64-unknown-linux-gnu.tar.gz")
-sha256sums_x86_64=('bfdd7e0cc7b0fec28137b3523155dea0afd94a769bf86d4100ed5d5c7f415a07')
-sha256sums_aarch64=('1b545247fe246b647c3ea2a72de472135cb874d14318a725274c159cc64a28dd')
+sha256sums_x86_64=('e1c9dd91463dd61f82c38e9aa7737c1746cff9bc5377708ee9ea05cf25be487b')
+sha256sums_aarch64=('0d7529c566269d27a000d22fac7dc5175f6a505ef5ff06d6e1730b8649f60cdd')
 
 source_aarch64=("$pkgname-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/kanban4ai-v$pkgver-aarch64-unknown-linux-gnu.tar.gz")
 
