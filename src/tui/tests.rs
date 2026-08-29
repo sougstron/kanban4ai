@@ -430,6 +430,39 @@ fn renders_empty_and_populated_boards_in_both_themes() {
     insta::assert_snapshot!("populated_board", render_snapshot(&mut app));
 }
 
+#[test]
+fn seen_review_cards_keep_the_yellow_completed_highlight() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Agent finished this"))
+        .unwrap();
+    app.ops.move_task(&task.id, "review", true).unwrap();
+    assert!(
+        app.ops.get_task(&task.id).unwrap().unwrap().review_unseen,
+        "agent completion marks the card unseen"
+    );
+    app.ops.mark_review_seen(&task.id).unwrap();
+    assert!(
+        !app.ops.get_task(&task.id).unwrap().unwrap().review_unseen,
+        "opening detail clears the unseen marker"
+    );
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.focused_column = 0;
+    app.focused_card = 0;
+    let _ = render_at(&mut app, 96, 28);
+    let (_, _, area) = card_hits(&app)
+        .into_iter()
+        .find(|(column, _, _)| *column == 2)
+        .expect("review card");
+    let style = style_at(&mut app, 96, 28, area.x, area.y);
+    assert_eq!(
+        style.fg,
+        Some(app.theme.warn),
+        "a seen Review card should keep the yellow completed-task highlight"
+    );
+}
+
 /// The badge answers "which board am I looking at", and the guessing happens
 /// while reading tasks, so it has to hold on every screen a task can be read
 /// from — not just the board.
