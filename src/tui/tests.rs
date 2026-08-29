@@ -430,36 +430,96 @@ fn renders_empty_and_populated_boards_in_both_themes() {
     insta::assert_snapshot!("populated_board", render_snapshot(&mut app));
 }
 
-#[test]
-fn seen_review_cards_keep_the_yellow_completed_highlight() {
-    let (_dir, mut app) = app_with_board();
-    let task = app
-        .ops
-        .create_task(NewTask::titled("Agent finished this"))
-        .unwrap();
+fn review_card_border(app: &mut App) -> Style {
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
+    let _ = render_at(app, 96, 28);
+    let (_, _, area) = card_hits(app)
+        .into_iter()
+        .find(|(column, _, _)| *column == 2)
+        .expect("review card");
+    style_at(app, 96, 28, area.x, area.y)
+}
+
+fn agent_review_task(app: &App, title: &str) -> String {
+    let task = app.ops.create_task(NewTask::titled(title)).unwrap();
     app.ops.move_task(&task.id, "review", true).unwrap();
     assert!(
         app.ops.get_task(&task.id).unwrap().unwrap().review_unseen,
         "agent completion marks the card unseen"
     );
-    app.ops.mark_review_seen(&task.id).unwrap();
-    assert!(
-        !app.ops.get_task(&task.id).unwrap().unwrap().review_unseen,
-        "opening detail clears the unseen marker"
-    );
-    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    task.id
+}
+
+#[test]
+fn unseen_review_cards_use_the_yellow_notifier_border() {
+    let (_dir, mut app) = app_with_board();
+    agent_review_task(&app, "Agent finished this");
     app.focused_column = 0;
     app.focused_card = 0;
-    let _ = render_at(&mut app, 96, 28);
-    let (_, _, area) = card_hits(&app)
-        .into_iter()
-        .find(|(column, _, _)| *column == 2)
-        .expect("review card");
-    let style = style_at(&mut app, 96, 28, area.x, area.y);
+    let style = review_card_border(&mut app);
     assert_eq!(
         style.fg,
         Some(app.theme.warn),
-        "a seen Review card should keep the yellow completed-task highlight"
+        "an unread Review card should use the yellow notifier border"
+    );
+}
+
+#[test]
+fn seen_review_cards_drop_the_yellow_notifier_border() {
+    let (_dir, mut app) = app_with_board();
+    let task_id = agent_review_task(&app, "Agent finished this");
+    app.ops.mark_review_seen(&task_id).unwrap();
+    assert!(
+        !app.ops.get_task(&task_id).unwrap().unwrap().review_unseen,
+        "opening detail clears the unseen marker"
+    );
+    app.focused_column = 0;
+    app.focused_card = 0;
+    let style = review_card_border(&mut app);
+    assert_eq!(
+        style.fg,
+        Some(app.theme.border),
+        "a read Review card should drop the yellow notifier"
+    );
+}
+
+#[test]
+fn focused_unseen_review_card_stays_yellow() {
+    let (_dir, mut app) = app_with_board();
+    agent_review_task(&app, "Still unread");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
+    app.focused_column = 2;
+    app.focused_card = 0;
+    let style = review_card_border(&mut app);
+    assert_eq!(
+        style.fg,
+        Some(app.theme.warn),
+        "keyboard/hover focus must not hide the unread Review notifier"
+    );
+}
+
+#[test]
+fn opening_review_detail_clears_the_unseen_notifier() {
+    let (_dir, mut app) = app_with_board();
+    let task_id = agent_review_task(&app, "Open me");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
+    app.focused_column = 2;
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    assert_eq!(app.screen, Screen::Detail);
+    assert!(
+        !app.ops.get_task(&task_id).unwrap().unwrap().review_unseen,
+        "opening detail is the human-read signal"
+    );
+    app.handle_key(key(KeyCode::Char('q')))
+        .expect("close detail");
+    app.focused_column = 0;
+    app.focused_card = 0;
+    let style = review_card_border(&mut app);
+    assert_eq!(
+        style.fg,
+        Some(app.theme.border),
+        "after the human reads the card, the yellow notifier goes out"
     );
 }
 

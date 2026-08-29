@@ -24,12 +24,10 @@ pub fn render_card(
     let retrying = task.restart_at.is_some();
     let border = if session_state == Some(SessionState::Crashed) && !retrying {
         app.theme.err
-    } else if retrying || (task.has_questions && !hovered) {
+    } else if retrying || task.review_unseen || (task.has_questions && !hovered) {
         app.theme.warn
     } else if focused || hovered {
         app.theme.focus
-    } else if task.review_unseen || task.status == TaskStatus::Review {
-        app.theme.warn
     } else {
         app.theme.border
     };

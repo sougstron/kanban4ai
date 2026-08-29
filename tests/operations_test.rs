@@ -3196,6 +3196,42 @@ fn mark_review_seen_clears_the_flag() {
 }
 
 #[test]
+fn appending_agent_reply_context_keeps_review_unseen() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Keep unseen")).unwrap();
+    ops.take_task(&task.id, "ses-reply", true).unwrap();
+    ContextManager::new(dir.path())
+        .append_context(&task.id, "implemented and tested", "agent", &ops.storage)
+        .unwrap();
+    let reviewed = ops
+        .complete_task(&task.id, "ses-reply", true)
+        .unwrap()
+        .unwrap();
+    assert!(reviewed.review_unseen);
+    assert!(
+        ops.get_task(&task.id).unwrap().unwrap().review_unseen,
+        "agent done persists review_unseen on disk"
+    );
+
+    ContextManager::new(dir.path())
+        .append_context_with_session(
+            &task.id,
+            "whole session answer that is not a duplicate of earlier context",
+            "agent-reply",
+            Some("ses-reply"),
+            &ops.storage,
+        )
+        .unwrap();
+
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Review);
+    assert!(
+        stored.review_unseen,
+        "agent-reply context must not clear the unseen-review notifier"
+    );
+}
+
+#[test]
 fn rerun_review_task_clears_review_unseen() {
     let (dir, ops, _rec) = ops_with_recorder(true);
     let task = ops.create_task(NewTask::titled("Rerun unseen")).unwrap();
