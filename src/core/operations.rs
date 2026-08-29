@@ -3552,13 +3552,13 @@ impl Operations {
         }
     }
 
-    /// Post the agent's closing answer — the summary it prints as its last
-    /// words — to the task thread as a `context` message authored by
-    /// `agent-reply`. Without this the thread holds only the audit trail
-    /// (launch, agent-written context, exit) while the answer itself stays
-    /// buried in `.kanban/logs/<session>.log`. It is taken from the backend's
-    /// own machine transcript, so it is what the agent actually said rather
-    /// than prose it chose to re-type through `kanban context`.
+    /// Post the agent's whole session answer — every assistant text it printed
+    /// during the run, in order — to the task thread as a `context` message
+    /// authored by `agent-reply`. Without this the thread holds only the audit
+    /// trail (launch, agent-written context, exit) while the answer itself
+    /// stays buried in `.kanban/logs/<session>.log`. It is taken from the
+    /// backend's own machine transcript, so it is what the agent actually said
+    /// rather than prose it chose to re-type through `kanban context`.
     ///
     /// Best-effort: any failure is a soft warning — the exit has already been
     /// reconciled by the time this runs. Setting the `agent_reply_max_chars`
@@ -3579,7 +3579,7 @@ impl Operations {
             .storage
             .logs_dir
             .join(format!("{session_id}.transcript.jsonl"));
-        let Some(text) = reply::final_reply(&backend, &transcript) else {
+        let Some(text) = reply::session_reply(&backend, &transcript) else {
             return;
         };
         let body = reply::truncate_reply(&text, max_chars as usize);

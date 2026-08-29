@@ -1,24 +1,33 @@
-//! The agent's own closing answer, harvested from a backend transcript.
+//! The agent's whole session answer, harvested from a backend transcript.
 //!
-//! An agent's last words — the summary it prints when it finishes — used to
-//! land only in `.kanban/logs/<session>.log`, so the task thread showed the
-//! audit trail (launch, context notes, exit) but never what the agent actually
-//! said. Every backend with a machine transcript already streams that text
-//! through stdout, so it is extracted here at exit and posted to the thread as
-//! a `context` message.
+//! What the agent said during a run used to land only in
+//! `.kanban/logs/<session>.log`, so the task thread showed the audit trail
+//! (launch, context notes, exit) but never what the agent actually said.
+//! Every backend with a machine transcript already streams that text through
+//! stdout, so it is extracted here at exit and posted to the thread as a
+//! `context` message.
+//!
+//! The capture is the run's **entire assistant text**, not just the last
+//! message: delegated agents finish with `kanban` tool calls, so their final
+//! message is a short wrap-up ("Task done, moved to Review") while the
+//! substantive answer is the text printed earlier in the session. Keeping
+//! only the last message demonstrably posted just that wrap-up and lost the
+//! actual answer, so every backend's gatherings include all assistant text in
+//! order, exactly as the session rendered it.
 //!
 //! Unlike [`crate::core::provenance`] (telemetry, deliberately kept out of the
 //! thread) this *is* thread content: it is the agent's own prose, and the next
 //! prompt is built from it like any other context entry.
 //!
-//! Each backend marks the final assistant message differently:
-//! * claude (`--output-format stream-json`) closes with a `result` event whose
-//!   `result` is the final text; the last `assistant` message's `text` blocks
-//!   are the fallback when the run ends without one.
+//! Each backend delivers assistant text differently:
+//! * claude (`--output-format stream-json`) streams `assistant` events whose
+//!   message `id` groups the blocks of one message; a `result` event closes
+//!   the run repeating the last message, so it only serves as a fallback when
+//!   the run recorded no assistant text at all.
 //! * opencode (`run --format json`) emits `text` events tagged with the
-//!   `messageID` they belong to, so the final message is the last group.
+//!   `messageID` they belong to.
 //! * the pi family (pi/omp, `--mode json`) finalizes each assistant turn in one
-//!   `message_end`, so the last one carrying text wins.
+//!   `message_end`.
 
 use std::path::Path;
 
@@ -27,14 +36,15 @@ use serde_json::Value;
 /// Marker appended when a reply is cut down to the configured budget.
 const TRUNCATION_MARKER: &str = "\n... (agent reply truncated)";
 
-/// The final assistant text of a run, or `None` when the backend has no
-/// parseable transcript, the file is unreadable, or the run said nothing.
-pub fn final_reply(backend: &str, transcript: &Path) -> Option<String> {
+/// Every assistant text of a run, in order — the whole answer exactly as the
+/// session rendered it — or `None` when the backend has no parseable
+/// transcript, the file is unreadable, or the run said nothing.
+pub fn session_reply(backend: &str, transcript: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(transcript).ok()?;
     let reply = match backend {
-        "claude" => claude_final_reply(&raw),
-        "opencode" => opencode_final_reply(&raw),
-        "pi" | "omp" => pi_family_final_reply(&raw),
+        "claude" => claude_session_reply(&raw),
+        "opencode" => opencode_session_reply(&raw),
+        "pi" | "omp" => pi_family_session_reply(&raw),
         _ => None,
     }?;
     let reply = reply.trim();
@@ -51,9 +61,10 @@ pub fn fatal_error(transcript: &Path) -> Option<crate::core::provenance::StreamE
         .last()
 }
 
-/// Clamp a reply to `max_chars`, flagging the cut. A whole agent monologue can
-/// be arbitrarily long and every thread entry is replayed into the next
-/// prompt, so the budget is a board threshold rather than a hardcoded limit.
+/// Clamp a reply to `max_chars`, flagging the cut. A whole session's worth of
+/// agent prose can be arbitrarily long and every thread entry is replayed into
+/// the next prompt, so the budget is a board threshold rather than a hardcoded
+/// limit.
 pub fn truncate_reply(reply: &str, max_chars: usize) -> String {
     if reply.chars().count() <= max_chars {
         return reply.to_string();
@@ -84,14 +95,15 @@ fn text_blocks(content: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// claude: the `result` event's `result` is the finished answer. Without one
-/// (interrupted run, older CLI) fall back to the last assistant message that
-/// carried text — its blocks arrive as separate events sharing one `message.id`,
-/// so they are grouped by that id and the previous turn is dropped.
-fn claude_final_reply(raw: &str) -> Option<String> {
+/// claude: every assistant message that carried text, kept in the order the
+/// run printed it. One message's blocks arrive as separate events sharing a
+/// message `id`, so they are grouped under that id. The closing `result`
+/// event repeats the last message's text, so it only serves as a fallback
+/// for runs that recorded no assistant events at all.
+fn claude_session_reply(raw: &str) -> Option<String> {
     let mut result: Option<String> = None;
-    let mut current_id = String::new();
-    let mut parts: Vec<String> = Vec::new();
+    let mut order: Vec<String> = Vec::new();
+    let mut texts_by_id: Vec<Vec<String>> = Vec::new();
     for (index, value) in json_lines(raw).enumerate() {
         match value.get("type").and_then(Value::as_str) {
             Some("result") => {
@@ -117,23 +129,31 @@ fn claude_final_reply(raw: &str) -> Option<String> {
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| format!("#{index}"));
-                if id != current_id {
-                    parts.clear();
-                    current_id = id;
+                match order.iter().position(|known| *known == id) {
+                    Some(position) => texts_by_id[position].extend(texts),
+                    None => {
+                        order.push(id);
+                        texts_by_id.push(texts);
+                    }
                 }
-                parts.extend(texts);
             }
             _ => {}
         }
     }
-    result.or_else(|| (!parts.is_empty()).then(|| parts.join("\n\n")))
+    let messages: Vec<String> = texts_by_id
+        .into_iter()
+        .map(|texts| texts.join("\n\n"))
+        .collect();
+    (!messages.is_empty())
+        .then(|| messages.join("\n\n"))
+        .or(result)
 }
 
-/// opencode: `text` events carry `part.messageID`, so the final message is the
-/// last group of text parts sharing one id.
-fn opencode_final_reply(raw: &str) -> Option<String> {
-    let mut current_id = String::new();
-    let mut parts: Vec<String> = Vec::new();
+/// opencode: `text` events carry `part.messageID`; every message's text is
+/// kept, grouped by that id and in the order the run printed it.
+fn opencode_session_reply(raw: &str) -> Option<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut texts_by_id: Vec<Vec<String>> = Vec::new();
     for (index, value) in json_lines(raw).enumerate() {
         if value.get("type").and_then(Value::as_str) != Some("text") {
             continue;
@@ -154,20 +174,26 @@ fn opencode_final_reply(raw: &str) -> Option<String> {
             .and_then(Value::as_str)
             .map(str::to_string)
             .unwrap_or_else(|| format!("#{index}"));
-        if id != current_id {
-            parts.clear();
-            current_id = id;
+        match order.iter().position(|known| *known == id) {
+            Some(position) => texts_by_id[position].push(text.to_string()),
+            None => {
+                order.push(id);
+                texts_by_id.push(vec![text.to_string()]);
+            }
         }
-        parts.push(text.to_string());
     }
-    (!parts.is_empty()).then(|| parts.join("\n\n"))
+    let messages: Vec<String> = texts_by_id
+        .into_iter()
+        .map(|texts| texts.join("\n\n"))
+        .collect();
+    (!messages.is_empty()).then(|| messages.join("\n\n"))
 }
 
 /// pi family (pi/omp): each assistant turn is finalized in one `message_end`,
-/// so the last one carrying text is the closing answer. `turn_end` duplicates
-/// that message and is ignored, exactly as in the log renderer.
-fn pi_family_final_reply(raw: &str) -> Option<String> {
-    let mut last: Option<String> = None;
+/// so every `message_end` carrying text is kept in order. `turn_end`
+/// duplicates that message and is ignored, exactly as in the log renderer.
+fn pi_family_session_reply(raw: &str) -> Option<String> {
+    let mut messages: Vec<String> = Vec::new();
     for value in json_lines(raw) {
         if value.get("type").and_then(Value::as_str) != Some("message_end") {
             continue;
@@ -180,10 +206,10 @@ fn pi_family_final_reply(raw: &str) -> Option<String> {
         }
         let texts = message.get("content").map(text_blocks).unwrap_or_default();
         if !texts.is_empty() {
-            last = Some(texts.join("\n\n"));
+            messages.push(texts.join("\n\n"));
         }
     }
-    last
+    (!messages.is_empty()).then(|| messages.join("\n\n"))
 }
 
 #[cfg(test)]
@@ -198,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_prefers_the_result_event() {
+    fn claude_gathers_every_assistant_message_and_ignores_result() {
         let (_dir, path) = transcript(concat!(
             r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"Planning."}]}}"#,
             "\n",
@@ -208,15 +234,16 @@ mod tests {
             "\n",
         ));
         assert_eq!(
-            final_reply("claude", &path).as_deref(),
-            Some("Summary line.\n\n- one\n- two")
+            session_reply("claude", &path).as_deref(),
+            Some("Planning.\n\nSummary line.")
         );
     }
 
-    /// Without a `result` event only the last assistant message counts, and its
-    /// separately streamed text blocks (same `message.id`) are joined.
+    /// Without any assistant text the closing `result` event is the fallback,
+    /// and the separately streamed blocks of one message (same `message.id`)
+    /// are joined.
     #[test]
-    fn claude_falls_back_to_the_last_assistant_message() {
+    fn claude_groups_message_blocks_and_falls_back_to_result() {
         let (_dir, path) = transcript(concat!(
             r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"Early note."}]}}"#,
             "\n",
@@ -228,13 +255,21 @@ mod tests {
             "\n",
         ));
         assert_eq!(
-            final_reply("claude", &path).as_deref(),
-            Some("Done.\n\nChecks pass.")
+            session_reply("claude", &path).as_deref(),
+            Some("Early note.\n\nDone.\n\nChecks pass.")
+        );
+        let (_dir, path) = transcript(concat!(
+            r#"{"type":"result","subtype":"success","result":"Only the result text."}"#,
+            "\n",
+        ));
+        assert_eq!(
+            session_reply("claude", &path).as_deref(),
+            Some("Only the result text.")
         );
     }
 
     #[test]
-    fn opencode_takes_the_last_message_group() {
+    fn opencode_gathers_every_message_in_order() {
         let (_dir, path) = transcript(concat!(
             r#"{"type":"text","part":{"type":"text","messageID":"msg_a","text":"Reading files."}}"#,
             "\n",
@@ -248,13 +283,13 @@ mod tests {
             "\n",
         ));
         assert_eq!(
-            final_reply("opencode", &path).as_deref(),
-            Some("Основные разделы:\n\n- src/ — код")
+            session_reply("opencode", &path).as_deref(),
+            Some("Reading files.\n\nОсновные разделы:\n\n- src/ — код")
         );
     }
 
     #[test]
-    fn pi_family_takes_the_last_assistant_message_end() {
+    fn pi_family_gathers_every_assistant_message_end() {
         let (_dir, path) = transcript(concat!(
             r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Working."}]}}"#,
             "\n",
@@ -264,12 +299,12 @@ mod tests {
             "\n",
         ));
         assert_eq!(
-            final_reply("omp", &path).as_deref(),
-            Some("All checks green.")
+            session_reply("omp", &path).as_deref(),
+            Some("Working.\n\nAll checks green.")
         );
         assert_eq!(
-            final_reply("pi", &path).as_deref(),
-            Some("All checks green.")
+            session_reply("pi", &path).as_deref(),
+            Some("Working.\n\nAll checks green.")
         );
     }
 
@@ -284,10 +319,10 @@ mod tests {
             r#"{"type":"result","subtype":"success","result":"   "}"#,
             "\n",
         ));
-        assert_eq!(final_reply("claude", &path), None);
-        assert_eq!(final_reply("aider", &path), None);
+        assert_eq!(session_reply("claude", &path), None);
+        assert_eq!(session_reply("aider", &path), None);
         assert_eq!(
-            final_reply("claude", Path::new("/nope/missing.jsonl")),
+            session_reply("claude", Path::new("/nope/missing.jsonl")),
             None
         );
     }

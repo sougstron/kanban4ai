@@ -51,7 +51,7 @@ thresholds:
   waiting_default_eta: 900
   waiting_eta_multiplier: 2
   waiting_note_max_chars: 1000
-  agent_reply_max_chars: 4000
+  agent_reply_max_chars: 32768
   limits_refresh_interval: 120
 verification:
   command: null
