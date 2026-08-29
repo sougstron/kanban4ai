@@ -125,7 +125,7 @@ pub struct BoardSnapshot {
     /// Project-wide reviewer bot on; drives the pending `⚖ review` card mark
     /// (a task's own `use_reviewer` ORs in).
     pub reviewer_bot: bool,
-    pub fingerprint: (u64, u128),
+    pub fingerprint: crate::core::storage::Fingerprint,
 }
 
 /// A clickable region registered by the renderers on every frame. Searched
@@ -5063,7 +5063,7 @@ impl BoardSnapshot {
             session_wait_notes: HashMap::new(),
             designer_bot: false,
             reviewer_bot: false,
-            fingerprint: (0, 0),
+            fingerprint: (0, 0, 0),
         }
     }
 

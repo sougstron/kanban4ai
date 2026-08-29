@@ -99,6 +99,9 @@ pub fn lock_file_reentrant(lock_path: &Path) -> Result<BoardGuard> {
         .map_err(KanbanError::Io)
 }
 
+/// Change-detection signature: `(file_count, max_mtime_ns, total_bytes)`.
+pub type Fingerprint = (u64, u128, u64);
+
 pub struct Storage {
     pub project_path: PathBuf,
     pub kanban_dir: PathBuf,
@@ -361,33 +364,43 @@ impl Storage {
         Ok(Some(task))
     }
 
-    /// Cheap change-detection signature `(file_count, max_mtime_ns)` over every
-    /// `TASK-*.md`, without parsing YAML. Status dir mtimes are included so a
-    /// task moved between columns (rename, count unchanged) is still detected.
-    pub fn tasks_fingerprint(&self) -> (u64, u128) {
+    /// Cheap change-detection signature `(file_count, max_mtime_ns, total_bytes)`
+    /// over every `TASK-*.md`, without parsing YAML. Status dir mtimes are
+    /// included so a task moved between columns (rename, count unchanged) is
+    /// still detected.
+    ///
+    /// The total size is part of the signature because mtime alone is not
+    /// reliable enough: filesystems differ in timestamp granularity (some
+    /// carry only whole seconds), so a write landing inside the same tick as
+    /// the previous read would leave the signature unchanged and the TUI
+    /// would sit on a stale board. Sizes come from the `stat` already being
+    /// made for the mtime, so this costs nothing extra.
+    pub fn tasks_fingerprint(&self) -> Fingerprint {
         let mut count: u64 = 0;
         let mut max_mtime: u128 = 0;
+        let mut total_size: u64 = 0;
         for status_dir in self.status_dirs() {
-            if let Some(mtime) = mtime_ns(&status_dir) {
+            if let Some((mtime, _)) = stat_ns(&status_dir) {
                 max_mtime = max_mtime.max(mtime);
             }
             for path in task_files_in(&status_dir) {
                 count += 1;
-                if let Some(mtime) = mtime_ns(&path) {
+                if let Some((mtime, size)) = stat_ns(&path) {
                     max_mtime = max_mtime.max(mtime);
+                    total_size = total_size.saturating_add(size);
                 }
             }
         }
-        (count, max_mtime)
+        (count, max_mtime, total_size)
     }
 
     /// Cheap signature for every file source rendered by the TUI. In addition
     /// to tasks, detail and sessions views depend on sidecar thread/session
     /// files, so task-only change detection is not sufficient.
-    pub fn tui_fingerprint(&self) -> (u64, u128) {
-        let (mut count, mut max_mtime) = self.tasks_fingerprint();
+    pub fn tui_fingerprint(&self) -> Fingerprint {
+        let (mut count, mut max_mtime, mut total_size) = self.tasks_fingerprint();
         for directory in [&self.threads_dir, &self.sessions_dir] {
-            if let Some(mtime) = mtime_ns(directory) {
+            if let Some((mtime, _)) = stat_ns(directory) {
                 max_mtime = max_mtime.max(mtime);
             }
             let Ok(entries) = fs::read_dir(directory) else {
@@ -398,12 +411,13 @@ impl Storage {
                     continue;
                 }
                 count += 1;
-                if let Some(mtime) = mtime_ns(&path) {
+                if let Some((mtime, size)) = stat_ns(&path) {
                     max_mtime = max_mtime.max(mtime);
+                    total_size = total_size.saturating_add(size);
                 }
             }
         }
-        (count, max_mtime)
+        (count, max_mtime, total_size)
     }
 }
 
@@ -459,10 +473,13 @@ fn task_number(path: &Path) -> Option<u64> {
     digits.parse().ok()
 }
 
-fn mtime_ns(path: &Path) -> Option<u128> {
-    let modified = fs::metadata(path).ok()?.modified().ok()?;
-    modified
+fn stat_ns(path: &Path) -> Option<(u128, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()?
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_nanos())
+        .ok()?
+        .as_nanos();
+    Some((mtime, metadata.len()))
 }

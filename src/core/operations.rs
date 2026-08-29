@@ -2816,6 +2816,27 @@ impl Operations {
                 //    a resolver run is dispatched immediately.
                 task.integration = IntegrationState::Conflict;
                 let merged = repo.merge_into_worktree(&wt_path, w.as_str());
+                // Advance the integration ref to W, so the next landing
+                // snapshots on top of it. Without this the next snapshot is
+                // parented on the pre-conflict integration tip again, the
+                // merge base never reaches W, and the human's work-folder
+                // edit keeps conflicting with the resolution — the
+                // resolve-in-the-worktree-then-`done` loop the conflict
+                // report describes could never converge. W is a
+                // fast-forward of the ref (it was snapshotted on it) and
+                // carries only the work folder's own state, so no task's
+                // landed work is touched and no unlanded branch becomes an
+                // ancestor of the ref.
+                if let Err(err) = repo.set_ref(&iso.integration_ref, &w) {
+                    self.post_queue_note(
+                        &task.id,
+                        &format!(
+                            "⚠ could not record the conflict snapshot on {} ({err}) — \
+                             resolve in the worktree and re-run \"kanban integrate {}\"",
+                            iso.integration_ref, task.id
+                        ),
+                    );
+                }
                 task.review_edits = self.conflict_report(task, &wt_path, &stages, &merged);
                 let list = paths.join(", ");
                 let tail = match iso.on_conflict {

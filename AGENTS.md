@@ -1078,6 +1078,21 @@ refuses to conclude a merge that still has unmerged index entries, so
 unresolved markers keep the landing re-conflicting instead of slipping the
 markered tree into the work folder.
 
+A conflicted landing also **advances the integration ref to its own snapshot
+W** — the one it merged into the worktree — even though nothing landed. That
+is what lets the loop terminate: the next landing snapshots the work folder
+on top of W, so once the resolution commit has absorbed W the merge base of
+`(new snapshot, task branch)` *is* W, the human's still-uncommitted edit
+reads as unchanged against it, and the resolution merges cleanly. Without it
+every snapshot is parented on the pre-conflict tip, the merge base never
+reaches W, and resolving in the worktree re-reports the same conflict for
+ever. The advance is safe by construction: W was snapshotted on the ref, so
+it is a fast-forward, and it carries only the work folder's own state — no
+task's landed work moves, and no unlanded branch becomes an ancestor of the
+ref (a branch could only do so by already being an ancestor of the previous
+tip). Resolving in the worktree without ever touching the work folder is
+therefore the supported path, exactly as the conflict report instructs.
+
 **Cleanup and GC.** `cleanup: on_land` (default) removes the worktree and
 deletes the branch once the branch has landed. Done and abandon always clear
 them regardless of `cleanup` — Done is terminal, and an abandon is an

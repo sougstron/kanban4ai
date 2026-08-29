@@ -288,6 +288,53 @@ fn tui_fingerprint_tracks_thread_and_session_sidecars() {
 }
 
 #[test]
+fn tui_fingerprint_notices_a_write_that_did_not_move_the_mtime() {
+    // Filesystems differ in timestamp granularity (some carry whole seconds
+    // only), so a write can land inside the same tick as the previous read.
+    // Pinning the mtime back simulates that everywhere: the signature must
+    // still change, or the TUI sits on a stale board.
+    let (dir, storage) = temp_board();
+    let task = storage
+        .create_task(NewTask::titled("Coarse clock"))
+        .unwrap();
+    let thread_file = dir
+        .path()
+        .join(".kanban/threads")
+        .join(format!("{}.yaml", task.id));
+    let original_mtime = fs::metadata(&thread_file).unwrap().modified().unwrap();
+    let pinned = fs::FileTimes::new()
+        .set_accessed(original_mtime)
+        .set_modified(original_mtime);
+    let initial = storage.tui_fingerprint();
+
+    ThreadManager::new(dir.path())
+        .unwrap()
+        .post(
+            &task.id,
+            kanban4ai::core::models::MessageRole::Agent,
+            kanban4ai::core::models::MessageKind::Context,
+            "background context update",
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&thread_file)
+        .unwrap()
+        .set_times(pinned)
+        .unwrap();
+
+    assert_eq!(
+        fs::metadata(&thread_file).unwrap().modified().unwrap(),
+        original_mtime,
+        "the mtime really is pinned back"
+    );
+    assert_ne!(storage.tui_fingerprint(), initial);
+}
+
+#[test]
 fn next_id_scans_all_status_dirs() {
     let (_dir, storage) = temp_board();
     storage.create_task(NewTask::titled("One")).unwrap();

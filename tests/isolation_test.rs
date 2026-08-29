@@ -636,6 +636,76 @@ fn conflicting_lands_report_conflict_and_integrate_lands_after_resolution() {
     assert!(err.to_string().contains("already landed"), "{err}");
 }
 
+/// The resolution path the conflict report actually prescribes: resolve
+/// *only* inside the isolated checkout and re-run the landing. The human
+/// never touches the work folder, so their conflicting edit is still live
+/// there — the landing must still converge and write the resolution out.
+///
+/// Regression: the landing used to parent every snapshot on the integration
+/// ref, which a conflicted land left untouched. The merge base therefore
+/// never reached the snapshot the resolution was built on, and the same
+/// conflict was reported for ever.
+#[test]
+fn a_conflict_resolved_only_in_the_worktree_lands_on_the_next_integrate() {
+    let (_store, _work, work_path, ops, _recorder) =
+        git_project_ops("  isolation:\n    mode: auto\n");
+    fs::write(work_path.join("hero.txt"), "armor = 10\n").unwrap();
+    git(&work_path, &["add", "-A"]);
+    git(&work_path, &["commit", "-q", "-m", "add hero"]);
+    let head_before = git(&work_path, &["rev-parse", "HEAD"]);
+
+    let task = ops.create_task(NewTask::titled("Armor")).unwrap();
+    take_and_context(&ops, &task.id, "ses-armor");
+    let wt = worktree_dir(ops.data_root(), &task.id);
+    fs::write(wt.join("hero.txt"), "armor = 99\n").unwrap();
+    // The human edits the same line and leaves it uncommitted.
+    fs::write(work_path.join("hero.txt"), "armor = 20\n").unwrap();
+
+    let conflicted = ops
+        .complete_task(&task.id, "ses-armor", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(conflicted.integration, IntegrationState::Conflict);
+
+    // Resolve where the report says to — in the isolated checkout only. The
+    // work folder keeps the human's conflicting value.
+    fs::write(wt.join("hero.txt"), "armor = 50\n").unwrap();
+    git(&wt, &["add", "-A"]);
+    git(&wt, &["commit", "-q", "-m", "resolve landing"]);
+    // …and the human carries on elsewhere in the folder, so the next
+    // landing really does take a *new* snapshot. (Without this the second
+    // snapshot can come out byte-identical to the first — same tree, same
+    // parent, same second — and hash to the very commit the branch already
+    // merged, hiding the bug behind a timing accident.)
+    fs::write(work_path.join("notes.md"), "still working\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(work_path.join("hero.txt")).unwrap(),
+        "armor = 20\n",
+        "the human never touched the conflicting file"
+    );
+
+    let (landed, outcome) = ops.integrate_task(&task.id).unwrap().unwrap();
+    assert!(
+        matches!(outcome, LandOutcome::Landed { .. }),
+        "resolving in the worktree must converge, got {outcome:?}"
+    );
+    assert_eq!(landed.integration, IntegrationState::Landed);
+    assert_eq!(
+        fs::read_to_string(work_path.join("hero.txt")).unwrap(),
+        "armor = 50\n",
+        "the resolution is written into the work folder"
+    );
+    assert_eq!(
+        fs::read_to_string(work_path.join("notes.md")).unwrap(),
+        "still working\n",
+        "the human's unrelated work is left alone"
+    );
+    // Still no commit and nothing staged on the user's branch.
+    assert_eq!(git(&work_path, &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(git(&work_path, &["diff", "--cached", "--name-only"]), "");
+    assert!(!wt.exists(), "the resolved land cleans the worktree up");
+}
+
 /// The full resolver round trip (TASK-249, `on_conflict: resolver`): a
 /// conflicted land merges the human side into the task's own worktree,
 /// dispatches a resolver run immediately, and a resolution followed by
