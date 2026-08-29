@@ -2729,11 +2729,12 @@ fn concurrent_provenance_overlap_warns_both_task_threads() {
     );
 }
 
-/// The agent's closing answer must reach the thread, not just the log file:
-/// claude reports it in the `result` event, and it is posted as a `context`
-/// message ahead of the exit audit line.
+/// The agent's whole session answer must reach the thread, not just the log
+/// file: claude prints the substantive answer and then a closing wrap-up
+/// (repeated in the `result` event), and both texts are posted together as a
+/// `context` message ahead of the exit audit line.
 #[test]
-fn agent_exit_appends_claude_final_reply_to_thread() {
+fn agent_exit_appends_claude_session_reply_to_thread() {
     let (dir, ops, _recorder) = ops_with_recorder(true);
     let task = ops
         .create_task(NewTask {
@@ -2747,11 +2748,13 @@ fn agent_exit_appends_claude_final_reply_to_thread() {
     fs::write(
         &transcript,
         concat!(
-            r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"Planning the work."}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_1","content":[{"type":"text","text":"Основные разделы:\n\n- src/ — Rust code"}]}}"#,
             "\n",
-            r#"{"type":"assistant","message":{"id":"msg_2","content":[{"type":"tool_use","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#,
+            r#"{"type":"assistant","message":{"id":"msg_2","content":[{"type":"tool_use","name":"Bash","input":{"command":"kanban done"}}]}}"#,
             "\n",
-            r#"{"type":"result","subtype":"success","result":"Основные разделы:\n\n- src/ — Rust code"}"#,
+            r#"{"type":"assistant","message":{"id":"msg_3","content":[{"type":"text","text":"Task done, moved to Review."}]}}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","result":"Task done, moved to Review."}"#,
             "\n",
         ),
     )
@@ -2767,13 +2770,14 @@ fn agent_exit_appends_claude_final_reply_to_thread() {
         .messages
         .iter()
         .position(|m| m.kind == MessageKind::Context && m.body.contains("Основные разделы"))
-        .expect("final reply posted to the thread");
+        .expect("session reply posted to the thread");
     let reply = &thread.messages[reply_index];
     assert_eq!(reply.role, MessageRole::Agent);
     assert_eq!(reply.author.as_deref(), Some("agent-reply"));
-    assert_eq!(reply.body, "Основные разделы:\n\n- src/ — Rust code");
-    // Only the closing message counts, never the earlier chatter.
-    assert!(!reply.body.contains("Planning the work"));
+    assert_eq!(
+        reply.body,
+        "Основные разделы:\n\n- src/ — Rust code\n\nTask done, moved to Review."
+    );
     // The reply reads before the exit audit line it belongs to.
     let exit_index = thread
         .messages
@@ -2785,11 +2789,11 @@ fn agent_exit_appends_claude_final_reply_to_thread() {
     assert!(ops.get_task(&task.id).unwrap().unwrap().context_size > 0);
 }
 
-/// Same contract for opencode, whose final message arrives as `text` events
-/// tagged with a `messageID`; a reply the agent already recorded through
-/// `kanban context` is not duplicated.
+/// Same contract for opencode, whose answer arrives as `text` events tagged
+/// with a `messageID`; a reply already posted on an earlier (stale or
+/// duplicated) exit callback is not duplicated.
 #[test]
-fn agent_exit_appends_opencode_final_reply_without_duplicating_context() {
+fn agent_exit_appends_opencode_session_reply_without_duplicating_context() {
     let (dir, ops, _recorder) = ops_with_recorder(true);
     let task = ops
         .create_task(NewTask {
@@ -2833,12 +2837,12 @@ fn agent_exit_appends_opencode_final_reply_without_duplicating_context() {
     assert_eq!(replies.len(), 1);
     assert_eq!(
         replies[0].body,
-        "Structure confirmed.\n\n- src/ holds the code"
+        "Reading files.\n\nStructure confirmed.\n\n- src/ holds the code"
     );
 }
 
-/// `agent_reply_max_chars` caps how much of a long reply enters the thread,
-/// since every entry is replayed into the next prompt.
+/// `agent_reply_max_chars` caps how much of a long session answer enters the
+/// thread, since every entry is replayed into the next prompt.
 #[test]
 fn agent_reply_is_truncated_to_the_configured_budget() {
     let (dir, ops, _recorder) = ops_with_recorder(true);

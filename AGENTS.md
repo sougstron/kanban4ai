@@ -364,7 +364,7 @@ is still the plan, and the requested edits are already on the thread.
 - `waiting_default_eta`: 900 (sec) - default expected wait for `kanban waiting`
 - `waiting_eta_multiplier`: 2 - safety multiplier applied to the ETA before relaunch
 - `waiting_note_max_chars`: 1000 - maximum stored wait note length
-- `agent_reply_max_chars`: 4000 - maximum length of the agent's closing reply recorded on the thread at exit (`0` disables recording it)
+- `agent_reply_max_chars`: 32768 - maximum length of the agent's session answer (every assistant text of the run, in order) recorded on the thread at exit (`0` disables recording it)
 - `limits_refresh_interval`: 120 (sec) - how long a provider-limits snapshot stays fresh before the TUI refreshes it in the background
 
 ### TUI Settings (.kanban/config.yaml `tui:`)
@@ -1165,20 +1165,27 @@ gitignored files, so ignored build outputs are never carried into a worktree.
 Paste an image from the clipboard (`wl-paste`/`xclip`, or a file path in clipboard text), sniff the type by magic bytes (png/jpg/gif/webp), write it atomically under `.kanban/assets/images/`, and embed Markdown (`![pasted image](...)`) in the task description.
 
 ### Agent Reply Capture (`core/reply.rs`)
-An agent's closing answer used to reach only `.kanban/logs/<session>.log`, so
-the task thread showed the audit trail (launch, agent-written context, exit)
-but never what the agent actually said. At exit `reconcile_agent_exit` extracts
-the final assistant message from the backend's machine transcript and posts it
-as a `context` message (role `agent`, author `agent-reply`) just before the
-`■ exit` audit line, so it is thread content like any other context entry and
-feeds the next prompt.
+An agent's answer used to reach only `.kanban/logs/<session>.log`, so the task
+thread showed the audit trail (launch, agent-written context, exit) but never
+what the agent actually said. At exit `reconcile_agent_exit` extracts the
+run's **entire assistant text** from the backend's machine transcript and
+posts it as a `context` message (role `agent`, author `agent-reply`) just
+before the `■ exit` audit line, so it is thread content like any other
+context entry and feeds the next prompt.
 
-- claude: the `result` event's `result` is the finished answer; without one
-  (interrupted run) the last `assistant` message's `text` blocks are used,
-  grouped by `message.id` so earlier turns are dropped.
-- opencode: `text` events carry `part.messageID`, so the final message is the
-  last group of text parts sharing one id.
-- pi / omp: the last assistant `message_end` carrying text (`turn_end`
+The capture is deliberately the whole session, not the closing message:
+delegated agents finish with `kanban` tool calls (`done`, `context`, …), so
+their final message is a short wrap-up ("Task done, moved to Review") while
+the substantive answer is the text printed earlier in the run. Extracting
+only the last message demonstrably posted just that wrap-up and lost the
+answer. Every backend therefore gathers all assistant text in order, exactly
+as the session rendered it:
+
+- claude: every `assistant` event's `text` blocks, grouped by message `id`;
+  the closing `result` event repeats the last message and is only a fallback
+  for runs with no recorded assistant text at all.
+- opencode: every `text` event, grouped by `part.messageID`.
+- pi / omp: every assistant `message_end` carrying text (`turn_end`
   duplicates it and is skipped).
 - Backends with no parseable transcript, and runs that ended without printing
   text, record nothing. Text identical to an existing `context` message is not

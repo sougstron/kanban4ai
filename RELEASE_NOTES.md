@@ -1,52 +1,44 @@
-# kanban4ai 0.5.3
+# kanban4ai 0.5.4
 
-A correctness release for worktree isolation. It also carries everything
-from 0.5.2, which reached GitHub but never reached the AUR packages — AUR
-users upgrading from 0.5.1 get both.
+The task thread now receives the agent's **whole session answer**, verbatim —
+no summary, no shortening.
 
 ## Fixed
 
-- **A merge conflict could never be resolved.** The conflict report tells you
-  to resolve the markers in the task's own isolated checkout and finish with
-  `kanban done` (or `kanban integrate`). That never worked: a conflicted
-  landing left the integration ref where it was, so every later landing
-  snapshotted the work folder onto the *pre-conflict* tip. The merge base
-  never reached the snapshot your resolution had absorbed, your still-
-  uncommitted edit was re-diffed against the original base every time, and
-  the same conflict came back for ever — the only way out was copying the
-  resolution into the work folder by hand.
+- **The thread only ever saw the agent's closing wrap-up, never its answer.**
+  Agent-reply capture (`core/reply.rs`) kept only the *final* assistant
+  message of the run. But a delegated agent finishes with `kanban` tool calls
+  (`done`, `context`), and after tool calls its last message is always a
+  30–200 char wrap-up ("Task done, moved to Review") while the substantive
+  answer was printed earlier in the session. So the thread silently lost the
+  answer and kept the wrap-up. Reproduced live on all three backend families
+  with the same sentinel payload: claude/haiku (4230-char payload → 124-char
+  wrap-up on the thread), opencode/mimo-free (4232 → 37), pi/minimax-free
+  (4231 → 198).
 
-  A conflicted landing now advances the integration ref to the snapshot it
-  merged into the worktree. The next landing snapshots on top of that, so
-  once the resolution commit has absorbed it the merge base *is* that
-  snapshot, your edit reads as unchanged against it, and the resolution
-  merges cleanly. The advance is a fast-forward carrying only the work
-  folder's own state: no task's landed work moves, and no unlanded branch
-  becomes an ancestor of the ref. Every landing invariant is unchanged —
-  nothing is silently overwritten, and landing still never commits or stages
-  on your branch.
+  The capture now gathers **every assistant text of the run, in order** —
+  byte-equal to what the session rendered: claude `assistant` events grouped
+  by message id (the `result` event demoted to a fallback for runs with no
+  recorded assistant text at all), opencode `text` events grouped by
+  `part.messageID`, pi/omp every assistant `message_end` carrying text.
+  Re-verified live after the change: the thread's agent-reply message is
+  exactly the whole session text on every backend family.
 
-- **The TUI could sit on a stale board.** Change detection keyed on file
-  count and newest mtime. Filesystems differ in timestamp granularity and
-  some carry whole seconds only, so a write landing inside the same tick as
-  the previous read left the signature unchanged and the board did not
-  refresh until something else moved. The signature now includes the total
-  size of the files it already stats, so those writes are caught.
+- **`agent_reply_max_chars` default raised 4000 → 32768.** 4000 was smaller
+  than a typical full answer, so even a correct capture would have been
+  truncated. The cap and its truncation marker remain; `0` still disables
+  recording the reply entirely.
 
 ## Verification coverage
 
-- 820 tests green, including two new regression tests: a conflict resolved
-  *only* in the isolated checkout must land on the next integrate (verified
-  failing before the fix), and a fingerprint change for a write whose mtime
-  was pinned back to simulate a coarse clock.
+- 820 tests green, including the updated unit tests in `core/reply.rs` and
+  the two integration tests in `tests/operations_test.rs` asserting the
+  whole-answer contract for every backend family.
 - `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test --locked`, `cargo build --release --locked`,
   `sh -n scripts/install.sh scripts/test-packaging.sh` and
   `sh scripts/test-packaging.sh` all clean.
-- Live end-to-end run of the release binary on a scratch board and a real
-  git repo: the full conflict loop — agent and human editing the same line,
-  a conflicted `done` that leaves the work folder untouched, a resolution
-  committed only in the worktree, and an `integrate` that lands it with HEAD
-  unmoved, nothing staged, unrelated human work intact, and the worktree and
-  branch cleaned up. TUI board, live refresh from an external change, detail
-  view and Project Settings verified in a real terminal.
+- Live end-to-end runs of the rebuilt binary on three backends — claude
+  haiku, opencode `mimo-v2.5-free`, pi `openrouter/minimax/minimax-m2.7:free`
+  — the thread's agent-reply message is byte-equal to the session's whole
+  assistant text (4351 / 4283 / 4263 chars), no truncation marker.
