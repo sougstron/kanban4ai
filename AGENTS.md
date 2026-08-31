@@ -49,7 +49,7 @@ src/
     ├── compaction.rs    # Rule-based context compaction (no LLM)
     ├── scheduler.rs     # Slot census, queue dispatch, crash-restart backoff
     ├── daemon.rs        # Store-wide tick + single-instance `daemon.lock`
-    ├── limits.rs        # Provider subscription limits (claude/codex/grok/zai/synthetic/yolo) + cache
+    ├── limits.rs        # Provider subscription limits (claude/grok/zai/synthetic; codex parked) + cache
     ├── notifier.rs      # Desktop notifications (notify-send)
     └── vcs.rs           # Worktree isolation: git probe, live snapshots, merge-tree landing
 Additional modules:
@@ -233,7 +233,7 @@ messages:
 - `kanban sessions` - List active sessions
 - `kanban archive` - List archived tasks
 - `kanban archive-done` - Move all Done tasks to Archive
-- `kanban limits [--format table|json] [--refresh]` - Remaining subscription capacity per provider (claude, codex, grok, zai, synthetic, yolo); serves the cached snapshot unless it aged out or `--refresh` is given
+- `kanban limits [--format table|json] [--refresh]` - Remaining subscription capacity per provider (claude, grok, zai, synthetic); serves the cached snapshot unless it aged out or `--refresh` is given
 - `kanban limits bridge install` / `kanban limits bridge remove` - Wrap / unwrap Claude Code's statusline command with the bridge feeding the claude segment of the limits row
 - `kanban update [--check]` - Report (or install) the newest GitHub release; see "Updater". Project-independent: runs from any directory with no board. A status cached within `updates.check_interval_hours` answers from the cache, otherwise one blocking check runs; `--check` only prints the report. Without `--check` a newer release is downloaded, verified, and installed — refused with the upgrade command when pacman owns the binary
 - `kanban tui` - Launch the interactive board; with no resolved project, open the projects list
@@ -1235,8 +1235,8 @@ are never clipped while columns of plain cards keep the configured
 
 How much of each AI subscription window is left, drawn as one row directly
 above the status bar on the Board and Projects screens (`✳ claude 5h 66% ↻3h30m
-· 7d 95% ↻6d11h │ ✺ codex mon 75% ↻18d (7d old) │ ✕ grok 7d 93% ↻4d22h │ ◆ zai
-5h 85% ↻4h48m · 7d 97% ↻6d23h │ ✦ synthetic 5h 91% ↻3h59m · 7d 12% ↻3h22m │ ◉ yolo 1d 40% ↻8h · conc 100%`), and
+· 7d 95% ↻6d11h │ ✕ grok 7d 93% ↻4d22h │ ◆ zai
+5h 85% ↻4h48m · 7d 97% ↻6d23h │ ✦ synthetic 5h 91% ↻3h59m · 7d 12% ↻3h22m`), and
 printed by `kanban limits`. Percentages are what remains (100 − used), not what
 is spent.
 
@@ -1280,11 +1280,15 @@ Sources, all read-only and best effort:
   Note the bridge only fires for interactive Claude Code sessions (`--print`
   runs do not invoke the statusline), which is also when the subscription
   windows actually move; the endpoint is what covers the hours in between.
-- **codex**: no network. The newest `rollout-*.jsonl` under
-  `$CODEX_HOME/sessions/YYYY/MM/DD/` (default `~/.codex`) is streamed for its
-  last `rate_limits` payload (`primary`/`secondary` with `used_percent`,
-  `window_minutes`, epoch `resets_at`). The numbers are only as fresh as the
-  last codex run, so the row appends their age (`(7d old)`).
+- **codex** (parked — not fetched, not shown): no network. The newest
+  `rollout-*.jsonl` under `$CODEX_HOME/sessions/YYYY/MM/DD/` (default
+  `~/.codex`) is streamed for its last `rate_limits` payload (`primary`/
+  `secondary` with `used_percent`, `window_minutes`, epoch `resets_at`). The
+  numbers are only as fresh as the last codex run, so the row appends their
+  age (`(7d old)`). The subscription is paused, so `PROVIDERS` omits codex and
+  `fetch_all` skips it; the readers and the app-server RPC client stay
+  compiled and tested, and returning codex is adding it back to `PROVIDERS`
+  and `fetch_codex()` to `fetch_all`.
 - **grok**: `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`
   with the key and user id from `~/.grok/auth.json` plus
   `X-XAI-Token-Auth: xai-grok-cli`. Yields one window for the current billing
@@ -1307,22 +1311,11 @@ Sources, all read-only and best effort:
   at `nextRegenAt`). Both quotas regenerate in small ticks rather than resetting
   on a timer, so the reset time is the next capacity gain. The key never
   expires, so the segment needs no CLI-driven click refresh.
-- **yolo**: `GET https://yolo-auto.com/v1/usage` with `$YOLO_API_KEY` or the
-  custom yolo provider's `apiKey` from opencode (`~/.config/opencode/opencode.json`,
-  `$XDG_CONFIG_HOME` respected), omp (`~/.omp/agent/models.yml`), or pi
-  (`models.json` under `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`). A provider
-  counts as yolo when its id/name contains `yolo` or its `baseURL` points at
-  `yolo-auto.com`. Yields a daily (`1d`) and weekly (`7d`) request window when
-  the plan publishes `limits.requests` (remaining preferred; `project.dailyRequestLimit`
-  is the day fallback) and live concurrency (`conc`, `concurrencySlots` of
-  `maxConcurrency`). The key never expires, so the segment needs no CLI-driven
-  click refresh.
 
 HTTPS goes through `curl -K -`, with the request config (URL and headers) piped
 on stdin: no TLS dependency is linked into the crate, and bearer tokens never
 appear in a command line where `ps` would expose them. `curl` is an optional
-dependency — without it claude, grok, zai, synthetic, and yolo degrade to `n/a` and
-codex still works.
+dependency — without it claude, grok, zai, and synthetic degrade to `n/a`.
 
 A provider with no credentials on the machine reports `not_configured` and is
 omitted from the row entirely; `401`/`403` becomes `signed out`. Fetches run on
@@ -1330,13 +1323,13 @@ a background thread started from the event loop (never `App::new`, so no test
 or non-TUI caller polls a provider), and results are cached in memory and in
 `<store>/limits.json` with a `limits_refresh_interval` TTL, because the claude
 usage endpoint rate-limits frequent polling. Saving that snapshot never
-replaces a newer claude or codex observation with an older file source — the
-background refresh rereads the statusline bridge and the newest rollout, which
-lag the usage endpoint and the Codex RPC a click just stored. Claude windows
+replaces a newer claude observation with an older file source — the
+background refresh rereads the statusline bridge, which
+lags the usage endpoint a click just stored. Claude windows
 carry their true observation time (`observed_at`: the last statusline tick, or
 the fetch time for an HTTP 200), so both the row and the CLI can show their
 age the way codex
-rollouts do. A window whose `resets_at` has passed is dropped from the row and
+rollouts did. A window whose `resets_at` has passed is dropped from the row and
 from `kanban limits` (its percentage describes a period that is over), unless
 it is a tick-regenerating quota (`LimitWindow.rolling`, synthetic's windows):
 there the reset time is the next capacity gain, not the end of the window, so
@@ -1353,14 +1346,12 @@ thread (`refresh_provider_async`, guarded against overlapping runs) and merges
 the result into the same caches, so the row updates on the next tick. A click
 on claude force-polls `GET /api/oauth/usage` (skipping the 15-minute interval
 and the current-bridge short-circuit the background refresh honors) and merges
-the result with whatever the statusline bridge still holds. codex is queried
-live over the app-server JSON-RPC (`initialize` + `account/rateLimits/read`,
-camelCase payload, answers in ~1s, spends no usage, and falls back to the
-rollout files on any failure), running `grok models` renews the short-lived
-OIDC token in `~/.grok/auth.json` before the billing fetch — that fixes both
-"codex numbers only as fresh as the last run" and "grok reads signed out after
-~6h" without a periodic poller — and zai / synthetic / yolo re-fetch over HTTPS
-(their keys are long-lived, so no renewal step is needed). Both CLIs run in
+the result with whatever the statusline bridge still holds, and running
+`grok models` renews the short-lived
+OIDC token in `~/.grok/auth.json` before the billing fetch — that fixes
+"grok reads signed out after
+~6h" without a periodic poller — while zai / synthetic re-fetch over HTTPS
+(their keys are long-lived, so no renewal step is needed). The CLIs run in
 the scratch cwd `<store>/limits-refresh-cwd` so stray session state never
 lands in a project. A 429 from the
 usage endpoint keeps the last good Claude windows (the row does not flip to

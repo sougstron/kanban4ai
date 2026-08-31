@@ -6714,7 +6714,9 @@ fn limits_row_sits_above_the_status_bar_and_lists_every_provider() {
         row.contains("✳ claude 5h 66% ↻3h30m · 7d 95% ↻6d11h"),
         "{row}"
     );
-    assert!(row.contains("✺ codex mon 75% ↻18d (7d old)"), "{row}");
+    // codex is parked: its cached entry stays in the snapshot but the row
+    // must not draw it.
+    assert!(!row.contains("codex"), "{row}");
     assert!(row.contains("✕ grok signed out"), "{row}");
     // The status bar keeps the last line, and the board keeps its columns.
     assert!(status.contains("n new"), "{status}");
@@ -6730,9 +6732,12 @@ fn limits_row_drops_reset_times_then_names_as_the_terminal_narrows() {
     let (_dir, mut app) = populated_app();
     app.limits = Some(limits_fixture());
 
-    let medium = rendered_lines(&mut app, 70, 20);
+    // codex is parked, so the row is shorter than when these widths were
+    // picked: Full needs 61 columns, NoReset 47, Percent-with-grok 22 —
+    // 55 keeps the NoReset rung and 18 keeps the drop-from-the-right rung.
+    let medium = rendered_lines(&mut app, 55, 20);
     let medium_row = medium[medium.len() - 2].clone();
-    let narrow = rendered_lines(&mut app, 30, 20);
+    let narrow = rendered_lines(&mut app, 18, 20);
     let narrow_row = narrow[narrow.len() - 2].clone();
 
     assert!(
@@ -6788,7 +6793,8 @@ fn limits_row_drops_windows_that_have_already_reset() {
 
     assert!(row.contains("✳ claude 7d 95% ↻6d"), "{row}");
     assert!(!row.contains("1%"), "{row}");
-    assert!(row.contains("✺ codex stale"), "{row}");
+    // codex is parked: even its all-windows-reset entry never draws.
+    assert!(!row.contains("codex"), "{row}");
 }
 
 #[test]
@@ -6894,21 +6900,6 @@ fn click_limits_segment(app: &mut App, provider: &'static str) {
 }
 
 #[test]
-fn clicking_codex_limits_segment_reports_a_refresh_in_the_status() {
-    let (_dir, mut app) = populated_app();
-    app.limits = Some(limits_fixture());
-    let _ = render_at(&mut app, 120, 28);
-
-    click_limits_segment(&mut app, "codex");
-
-    assert!(
-        app.status.contains("Refreshing codex limits"),
-        "{}",
-        app.status
-    );
-}
-
-#[test]
 fn clicking_claude_limits_segment_reports_a_refresh_in_the_status() {
     let (_dir, mut app) = populated_app();
     app.limits = Some(limits_fixture());
@@ -6943,15 +6934,6 @@ fn limits_refresh_status_returns_to_ready_after_update() {
 
     app.expire_limits_status_at(Instant::now() + Duration::from_secs(4));
     assert_eq!(app.status, "TUI ready");
-
-    click_limits_segment(&mut app, "codex");
-    assert!(
-        app.status.contains("Refreshing codex limits"),
-        "{}",
-        app.status
-    );
-    app.tick().expect("tick when already complete");
-    assert_eq!(app.status, "codex limits updated");
 }
 
 #[test]

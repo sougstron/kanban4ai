@@ -21,7 +21,9 @@
 //! - **codex**: no network at all. The newest `rollout-*.jsonl` under
 //!   `~/.codex/sessions/` carries the `rate_limits` payload the server last
 //!   sent, so the numbers are exactly as fresh as the last codex run — the age
-//!   is surfaced with the value.
+//!   is surfaced with the value. Currently parked (see [`PROVIDERS`]): the
+//!   subscription is paused, so it is neither fetched nor displayed, and all
+//!   the readers below stay compiled and tested for its return.
 //! - **grok**: `GET /v1/billing` on the grok CLI proxy with the OIDC key from
 //!   `~/.grok/auth.json`. Reports credit usage for the current billing period.
 //! - **zai**: `GET /api/monitor/usage/quota/limit` on `api.z.ai` with the API
@@ -37,13 +39,6 @@
 //!   `subscription.renewsAt`) and the weekly credit window
 //!   (`weeklyTokenLimit.percentRemaining`); both regenerate in small ticks, so
 //!   the reset time is the next capacity gain, not a hard rollover.
-//! - **yolo**: `GET /v1/usage` on yolo-auto.com. The key is `$YOLO_API_KEY` or
-//!   the custom yolo provider's `apiKey` in opencode (`opencode.json`), omp
-//!   (`~/.omp/agent/models.yml`), or pi (`models.json`). Reports a daily and
-//!   weekly request window when the plan publishes `limits.requests`, falling
-//!   back to `project.dailyRequestLimit`, plus live concurrency slots
-//!   (`concurrencySlots` / `maxConcurrency`). The key never expires, so the
-//!   segment needs no CLI-driven click refresh.
 //!
 //! HTTPS is done by piping a config file into `curl -K -` rather than by
 //! linking a TLS stack: it keeps the dependency set unchanged, and it keeps
@@ -57,20 +52,20 @@
 //! claude's own and never delays the other providers. A transient fetch
 //! failure likewise keeps the cached numbers instead of flipping a provider
 //! to n/a; only a real state change (signed out, credentials removed)
-//! replaces them. Saving a snapshot never replaces a newer claude/codex
+//! replaces them. Saving a snapshot never replaces a newer claude
 //! observation with an older file source: the background refresh rereads the
-//! statusline bridge and the newest rollout, which lag the usage endpoint and
-//! the Codex RPC that a click just stored.
+//! statusline bridge, which lags the usage endpoint a click just stored.
 //!
 //! Clicking any provider segment in the TUI limits row also refreshes that
 //! provider (see [`refresh_provider_async`]): claude force-polls the usage
 //! endpoint (skipping the current-bridge short-circuit and the 15-minute
-//! interval the background refresh honors), codex is asked for fresh rate
-//! limits over its app-server JSON-RPC, running the grok CLI renews the
+//! interval the background refresh honors), running the grok CLI renews the
 //! short-lived token in `~/.grok/auth.json` that the billing fetch uses, and
-//! zai / synthetic / yolo simply re-fetch over HTTPS (their keys are long-lived,
+//! zai / synthetic simply re-fetch over HTTPS (their keys are long-lived,
 //! so no renewal step is needed). Each runs on a background thread and merges
-//! into the same cache, so the row updates on the next tick.
+//! into the same cache, so the row updates on the next tick. The parked codex
+//! keeps its app-server JSON-RPC client (see `refresh_provider_now`) for the
+//! day it returns.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -90,8 +85,15 @@ use crate::core::http::{HttpError, http_get_json, http_request_json};
 use crate::core::project::store_root;
 use crate::core::storage::atomic_write_text;
 
-/// Providers rendered on the board, in display order.
-pub const PROVIDERS: [&str; 6] = ["claude", "codex", "grok", "zai", "synthetic", "yolo"];
+/// Providers rendered on the board and listed by `kanban limits`, in display
+/// order.
+///
+/// codex is parked: its subscription is paused, so `fetch_all` skips it and
+/// the row hides it. All its readers stay compiled and tested (see the codex
+/// section and `refresh_provider_now`) — to bring it back, add `"codex"` here
+/// and `fetch_codex()` to `fetch_all`. The yolo provider was removed outright
+/// when its subscription was cancelled.
+pub const PROVIDERS: [&str; 4] = ["claude", "grok", "zai", "synthetic"];
 
 /// Fallback refresh interval when no board config is available (the projects
 /// screen has no project, so no `.kanban/config.yaml` to read).
@@ -801,7 +803,8 @@ fn parse_rfc3339(text: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// codex
+// codex — parked: not fetched (`fetch_all`) and not displayed (`PROVIDERS`),
+// kept compiled and tested for its return.
 // ---------------------------------------------------------------------------
 
 fn codex_sessions_dir() -> Option<PathBuf> {
@@ -1277,245 +1280,6 @@ pub fn parse_synthetic_quotas(value: &Value) -> Vec<LimitWindow> {
 }
 
 // ---------------------------------------------------------------------------
-// yolo
-// ---------------------------------------------------------------------------
-
-const YOLO_USAGE_URL: &str = "https://yolo-auto.com/v1/usage";
-
-fn opencode_config_path() -> Option<PathBuf> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
-        .or_else(|| home_dir().map(|home| home.join(".config")))?;
-    Some(config.join("opencode").join("opencode.json"))
-}
-
-fn omp_models_path() -> Option<PathBuf> {
-    Some(home_dir()?.join(".omp").join("agent").join("models.yml"))
-}
-
-fn pi_models_path() -> Option<PathBuf> {
-    let dir = std::env::var_os("PI_CODING_AGENT_DIR")
-        .map(PathBuf::from)
-        .or_else(|| home_dir().map(|home| home.join(".pi").join("agent")))?;
-    Some(dir.join("models.json"))
-}
-
-/// Pull a yolo API key out of an opencode / omp / pi provider config.
-/// Looks under `provider` (opencode) or `providers` (pi, omp) for an entry
-/// named like yolo or pointing at `yolo-auto.com`.
-fn yolo_key_from_store(path: &Path) -> Option<String> {
-    let text = fs::read_to_string(path).ok()?;
-    yolo_key_from_config_text(&text)
-}
-
-fn yolo_key_from_config_text(text: &str) -> Option<String> {
-    if let Ok(value) = serde_json::from_str::<Value>(text)
-        && let Some(key) = yolo_key_from_value(&value)
-    {
-        return Some(key);
-    }
-    let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(text).ok()?;
-    yolo_key_from_value(&serde_json::to_value(yaml).ok()?)
-}
-
-fn yolo_key_from_value(value: &Value) -> Option<String> {
-    for key in ["provider", "providers"] {
-        if let Some(found) = value.get(key).and_then(yolo_key_from_providers) {
-            return Some(found);
-        }
-    }
-    yolo_key_from_providers(value)
-}
-
-fn yolo_key_from_providers(providers: &Value) -> Option<String> {
-    providers
-        .as_object()
-        .into_iter()
-        .flatten()
-        .find_map(|(name, entry)| {
-            is_yolo_provider(name, entry)
-                .then(|| yolo_api_key(entry))
-                .flatten()
-        })
-}
-
-fn is_yolo_provider(name: &str, entry: &Value) -> bool {
-    if name.to_ascii_lowercase().contains("yolo") {
-        return true;
-    }
-    yolo_base_url(entry).is_some_and(|url| url.to_ascii_lowercase().contains("yolo-auto.com"))
-}
-
-fn yolo_base_url(entry: &Value) -> Option<&str> {
-    ["baseURL", "baseUrl", "base_url"]
-        .into_iter()
-        .find_map(|key| entry.get(key).and_then(Value::as_str))
-        .or_else(|| entry.get("options").and_then(yolo_base_url))
-}
-
-fn yolo_api_key(entry: &Value) -> Option<String> {
-    ["apiKey", "api_key", "key"]
-        .into_iter()
-        .find_map(|key| {
-            entry
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| entry.get("options").and_then(yolo_api_key))
-}
-
-fn find_yolo_key() -> Option<String> {
-    std::env::var_os("YOLO_API_KEY")
-        .filter(|key| !key.is_empty())
-        .map(|key| key.to_string_lossy().into_owned())
-        .or_else(|| {
-            [opencode_config_path(), omp_models_path(), pi_models_path()]
-                .into_iter()
-                .flatten()
-                .filter(|path| path.exists())
-                .find_map(|path| yolo_key_from_store(&path))
-        })
-}
-
-fn fetch_yolo() -> ProviderLimits {
-    let Some(key) = find_yolo_key() else {
-        return ProviderLimits::new("yolo", ProviderState::NotConfigured);
-    };
-    let headers = [
-        ("Authorization", format!("Bearer {key}")),
-        ("Accept", "application/json".to_string()),
-    ];
-    match http_get_json(YOLO_USAGE_URL, &headers) {
-        Ok(value) => {
-            let windows = parse_yolo_usage(&value);
-            if windows.is_empty() {
-                ProviderLimits::new("yolo", ProviderState::Unavailable("no quota".to_string()))
-            } else {
-                ProviderLimits {
-                    windows,
-                    ..ProviderLimits::new("yolo", ProviderState::Ready)
-                }
-            }
-        }
-        Err(err) => ProviderLimits::new("yolo", err.into_state()),
-    }
-}
-
-/// Read the yolo usage response: a `1d` / `7d` request window when the plan
-/// publishes a positive `limits.requests` (remaining preferred, else the
-/// period's `requests` count), `project.dailyRequestLimit` as the day
-/// fallback, and live concurrency as `conc` (`concurrencySlots` left of
-/// `maxConcurrency`). Reset times come from each period's `endsAt`.
-pub fn parse_yolo_usage(value: &Value) -> Vec<LimitWindow> {
-    let mut windows = Vec::new();
-    let usage = value.get("usage");
-    if let Some(day) = usage.and_then(|usage| usage.get("day"))
-        && let Some(window) = yolo_period_window("1d", day)
-    {
-        windows.push(window);
-    } else if let Some(window) = yolo_daily_project_window(value) {
-        windows.push(window);
-    }
-    if let Some(week) = usage.and_then(|usage| usage.get("week"))
-        && let Some(window) = yolo_period_window("7d", week)
-    {
-        windows.push(window);
-    }
-    if let Some(window) = yolo_concurrency_window(value.get("project")) {
-        windows.push(window);
-    }
-    windows
-}
-
-fn yolo_daily_project_window(value: &Value) -> Option<LimitWindow> {
-    let project = value.get("project")?;
-    let limit = project
-        .get("dailyRequestLimit")
-        .and_then(Value::as_f64)
-        .filter(|limit| *limit > 0.0)?;
-    let remaining = project
-        .get("dailyRequestsRemaining")
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            value
-                .get("usage")
-                .and_then(|usage| usage.get("day"))
-                .and_then(|day| day.get("requests"))
-                .and_then(Value::as_f64)
-                .map(|used| (limit - used).max(0.0))
-        })?;
-    let resets_at = value
-        .get("usage")
-        .and_then(|usage| usage.get("day"))
-        .and_then(|day| day.get("endsAt"))
-        .and_then(Value::as_str)
-        .and_then(parse_rfc3339);
-    Some(LimitWindow::new(
-        "1d",
-        (limit - remaining).max(0.0) / limit * 100.0,
-        resets_at,
-    ))
-}
-
-fn yolo_period_window(label: &str, period: &Value) -> Option<LimitWindow> {
-    let (limit, remaining) =
-        [None, Some("project"), Some("key")]
-            .into_iter()
-            .find_map(|scope| {
-                let node = match scope {
-                    None => period,
-                    Some(key) => period.get(key)?,
-                };
-                yolo_request_quota(node)
-            })?;
-    let resets_at = period
-        .get("endsAt")
-        .and_then(Value::as_str)
-        .and_then(parse_rfc3339);
-    Some(LimitWindow::new(
-        label,
-        (limit - remaining).max(0.0) / limit * 100.0,
-        resets_at,
-    ))
-}
-
-fn yolo_request_quota(node: &Value) -> Option<(f64, f64)> {
-    let limit = node
-        .get("limits")
-        .and_then(|limits| limits.get("requests"))
-        .and_then(Value::as_f64)
-        .filter(|limit| *limit > 0.0)?;
-    let remaining = node
-        .get("remaining")
-        .and_then(|remaining| remaining.get("requests"))
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            node.get("requests")
-                .and_then(Value::as_f64)
-                .map(|used| (limit - used).max(0.0))
-        })?;
-    Some((limit, remaining))
-}
-
-fn yolo_concurrency_window(project: Option<&Value>) -> Option<LimitWindow> {
-    let project = project?;
-    let max = project
-        .get("maxConcurrency")
-        .and_then(Value::as_f64)
-        .filter(|max| *max > 0.0)?;
-    let slots = project.get("concurrencySlots").and_then(Value::as_f64)?;
-    Some(LimitWindow::new(
-        "conc",
-        (max - slots).max(0.0) / max * 100.0,
-        None,
-    ))
-}
-
-// ---------------------------------------------------------------------------
 // CLI-driven refresh (TUI limits-row click)
 // ---------------------------------------------------------------------------
 
@@ -1700,6 +1464,8 @@ fn refresh_grok_cli() -> std::result::Result<(), String> {
 /// [`refresh_provider_async`].
 pub fn refresh_provider_now(provider: &str) {
     let fresh = match provider {
+        // Parked provider: unreachable from the row while hidden, kept so the
+        // RPC client stays exercised the day codex returns.
         "codex" => fetch_codex_rpc().unwrap_or_else(|_| fetch_codex()),
         "grok" => {
             let _ = refresh_grok_cli();
@@ -1708,7 +1474,6 @@ pub fn refresh_provider_now(provider: &str) {
         "claude" => resolve_claude(cached().as_deref(), true),
         "zai" => fetch_zai(),
         "synthetic" => fetch_synthetic(),
-        "yolo" => fetch_yolo(),
         _ => return,
     };
     let mut providers = cached()
@@ -1770,15 +1535,14 @@ pub fn fetch_all(force: bool) -> LimitsSnapshot {
     let now = now_secs();
     LimitsSnapshot {
         fetched_at: now,
+        // codex is parked (see PROVIDERS); its readers stay for the return.
         providers: retain_fresher_providers(
             previous.as_deref(),
             vec![
                 resolve_claude(previous.as_deref(), force),
-                fetch_codex(),
                 fetch_grok(),
                 fetch_zai(),
                 fetch_synthetic(),
-                fetch_yolo(),
             ],
             now,
         ),
@@ -2192,123 +1956,6 @@ mod tests {
         fs::write(&path, r#"{"openai":{"type":"oauth"}}"#).unwrap();
         assert_eq!(synthetic_key_from_store(&path), None);
         assert!(synthetic_key_from_store(&dir.path().join("nope.json")).is_none());
-    }
-
-    #[test]
-    fn yolo_usage_maps_request_windows_and_concurrency() {
-        let value: Value = serde_json::from_str(
-            r#"{"project":{"dailyRequestLimit":null,"maxConcurrency":6,"concurrencySlots":4},
-                "usage":{
-                  "day":{"endsAt":"2026-08-24T00:00:00.000Z","requests":80,
-                    "limits":{"requests":200},"remaining":{"requests":120}},
-                  "week":{"endsAt":"2026-08-24T00:00:00.000Z","requests":400,
-                    "project":{"limits":{"requests":1000},"remaining":{"requests":600}}}
-                }}"#,
-        )
-        .unwrap();
-
-        let windows = parse_yolo_usage(&value);
-
-        assert_eq!(windows.len(), 3);
-        assert_eq!(windows[0].label, "1d");
-        assert_eq!(windows[0].remaining_percent, 60.0);
-        assert_eq!(windows[0].resets_at, Some(1_787_529_600));
-        assert_eq!(windows[1].label, "7d");
-        assert_eq!(windows[1].remaining_percent, 60.0);
-        assert_eq!(windows[1].resets_at, Some(1_787_529_600));
-        assert_eq!(windows[2].label, "conc");
-        assert!((windows[2].remaining_percent - 66.666).abs() < 0.01);
-        assert_eq!(windows[2].resets_at, None);
-    }
-
-    #[test]
-    fn yolo_usage_falls_back_to_project_daily_limit_and_request_counts() {
-        let value: Value = serde_json::from_str(
-            r#"{"project":{"dailyRequestLimit":100,"dailyRequestsRemaining":25,
-                  "maxConcurrency":0},
-                "usage":{"day":{"endsAt":"2026-08-24T00:00:00.000Z","requests":75,
-                    "limits":{"requests":null}},
-                  "week":{"endsAt":"2026-08-31T00:00:00.000Z","requests":40,
-                    "limits":{"requests":200}}}}"#,
-        )
-        .unwrap();
-
-        let windows = parse_yolo_usage(&value);
-
-        assert_eq!(windows.len(), 2);
-        assert_eq!(windows[0].label, "1d");
-        assert_eq!(windows[0].remaining_percent, 25.0);
-        assert_eq!(windows[0].resets_at, Some(1_787_529_600));
-        assert_eq!(windows[1].label, "7d");
-        assert_eq!(windows[1].remaining_percent, 80.0);
-    }
-
-    #[test]
-    fn yolo_usage_without_request_limits_keeps_concurrency() {
-        let value: Value = serde_json::from_str(
-            r#"{"project":{"planId":"pro","dailyRequestLimit":null,
-                  "maxConcurrency":6,"concurrencySlots":6},
-                "usage":{"day":{"requests":571,"limits":{"requests":null},
-                    "remaining":{"requests":null}}}}"#,
-        )
-        .unwrap();
-
-        let windows = parse_yolo_usage(&value);
-
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].label, "conc");
-        assert_eq!(windows[0].remaining_percent, 100.0);
-    }
-
-    #[test]
-    fn yolo_usage_without_usable_windows_is_empty() {
-        let empty: Value = serde_json::from_str(r#"{}"#).unwrap();
-        assert!(parse_yolo_usage(&empty).is_empty());
-
-        let unlimited: Value = serde_json::from_str(
-            r#"{"project":{"dailyRequestLimit":null,"maxConcurrency":0},
-                "usage":{"day":{"limits":{"requests":null}}}}"#,
-        )
-        .unwrap();
-        assert!(parse_yolo_usage(&unlimited).is_empty());
-    }
-
-    #[test]
-    fn yolo_key_is_read_from_opencode_omp_and_pi_provider_configs() {
-        let dir = tempfile::tempdir().unwrap();
-        let opencode = dir.path().join("opencode.json");
-        fs::write(
-            &opencode,
-            r#"{"provider":{"yolo-auto":{"options":{
-                "baseURL":"https://yolo-auto.com/v1","apiKey":"yolo_from_opencode"}}}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            yolo_key_from_store(&opencode),
-            Some("yolo_from_opencode".to_string())
-        );
-
-        let omp = dir.path().join("models.yml");
-        fs::write(
-            &omp,
-            "providers:\n  Yolo-Auto:\n    baseUrl: https://yolo-auto.com/v1\n    apiKey: yolo_from_omp\n",
-        )
-        .unwrap();
-        assert_eq!(yolo_key_from_store(&omp), Some("yolo_from_omp".to_string()));
-
-        let pi = dir.path().join("models.json");
-        fs::write(
-            &pi,
-            r#"{"providers":{"custom":{"baseUrl":"https://yolo-auto.com/v1","apiKey":"yolo_from_pi"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(yolo_key_from_store(&pi), Some("yolo_from_pi".to_string()));
-
-        fs::write(&pi, r#"{"providers":{"Yolo-Auto":{"apiKey":""}}}"#).unwrap();
-        assert_eq!(yolo_key_from_store(&pi), None);
-        fs::write(&pi, r#"{"providers":{"openrouter":{"apiKey":"sk-or"}}}"#).unwrap();
-        assert_eq!(yolo_key_from_store(&pi), None);
-        assert!(yolo_key_from_store(&dir.path().join("nope.json")).is_none());
     }
 
     #[test]
