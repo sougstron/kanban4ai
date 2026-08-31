@@ -704,10 +704,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  status-bar hints are clickable; column headers show name and count"),
         Line::from(""),
         Line::from("Provider limits (row above the status bar, Board and Projects)"),
-        Line::from("  ✳ claude · ✺ codex · ✕ grok · ◆ zai · ✦ synthetic · ◉ yolo"),
-        Line::from(
-            "  click a provider to refresh now · % left and ↻ reset · codex shows last-session age",
-        ),
+        Line::from("  ✳ claude · ✕ grok · ◆ zai · ✦ synthetic"),
+        Line::from("  click a provider to refresh now · % left and ↻ reset"),
         Line::from("  hide the row with tui.show_limits: false · kanban limits prints it"),
         Line::from(""),
         Line::from("?: toggle help · q/Esc: back · Ctrl+C twice: quit"),
