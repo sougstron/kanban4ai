@@ -21,7 +21,7 @@
 
 use std::path::{Path, PathBuf};
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -354,15 +354,21 @@ pub fn overlapping_writes(sessions: &[SessionWrites<'_>]) -> Vec<WriteOverlap> {
     out
 }
 
-/// A backend `type: error` event: the message shown in the log / thread, and
-/// whether crash-restart should still fire. `isRetryable: false` (OpenCode
-/// credits/401) is a hard failure — retrying it only disguises the cause as
-/// a queue backoff. Missing flag defaults to retryable, matching unknown
-/// crashes.
+/// A backend `type: error` event: the message shown in the log / thread,
+/// whether crash-restart should still fire, and when a spent subscription
+/// quota comes back. `isRetryable: false` (OpenCode credits/401) is a hard
+/// failure — retrying it only disguises the cause as a queue backoff. Missing
+/// flag defaults to retryable, matching unknown crashes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamError {
     pub message: String,
     pub retryable: bool,
+    /// Unix time the provider's exhausted usage window rolls over, when the
+    /// error says so (HTTP 429 `usage_limit_reached`, as OpenAI answers an
+    /// `openai/*` opencode run on a spent ChatGPT plan). Retrying before then
+    /// can only fail again, so the restart waits for it instead of walking the
+    /// blind backoff ladder.
+    pub retry_at: Option<i64>,
 }
 
 /// Parse a backend `type: error` event. `None` for any other event, or an
@@ -375,7 +381,70 @@ pub fn stream_error(value: &Value) -> Option<StreamError> {
     Some(StreamError {
         message,
         retryable: error_event_retryable(value),
+        retry_at: error_event_retry_at(value),
     })
+}
+
+/// Error payload as the provider sent it (`error.data` on an opencode event),
+/// which is where the HTTP status, the response body, and the response headers
+/// live. Callers read provider-specific detail off it — the codex usage
+/// headers, for one.
+pub fn stream_error_data(value: &Value) -> Option<&Value> {
+    value.get("error").and_then(|err| err.get("data"))
+}
+
+/// When the exhausted quota resets, from whichever field the provider used:
+/// the `usage_limit_reached` body (`resets_at`, `resets_in_seconds`), the
+/// codex usage headers, or a plain `retry-after`. Only a 429 answers — a
+/// reset time on any other failure says nothing about when to retry.
+fn error_event_retry_at(value: &Value) -> Option<i64> {
+    let data = stream_error_data(value)?;
+    let status = data
+        .get("statusCode")
+        .and_then(Value::as_i64)
+        .or_else(|| data.get("status").and_then(Value::as_i64));
+    if status != Some(429) {
+        return None;
+    }
+    let now = Utc::now().timestamp();
+    let body = data
+        .get("responseBody")
+        .and_then(Value::as_str)
+        .and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let body_error = body.as_ref().and_then(|body| body.get("error"));
+    let from_body = body_error.and_then(|error| {
+        error.get("resets_at").and_then(Value::as_i64).or_else(|| {
+            error
+                .get("resets_in_seconds")
+                .and_then(Value::as_i64)
+                .map(|after| now + after)
+        })
+    });
+    let headers = data.get("responseHeaders");
+    from_body
+        .or_else(|| {
+            headers.and_then(|headers| {
+                header_number(headers, "x-codex-primary-reset-at").or_else(|| {
+                    header_number(headers, "x-codex-primary-reset-after-seconds")
+                        .map(|after| now + after)
+                })
+            })
+        })
+        .or_else(|| {
+            headers
+                .and_then(|headers| header_number(headers, "retry-after"))
+                .map(|after| now + after)
+        })
+        .filter(|at| *at > now)
+}
+
+/// A header value as a number. Headers arrive as strings; a backend that
+/// pre-parsed them is accepted too.
+fn header_number(headers: &Value, name: &str) -> Option<i64> {
+    let value = headers.get(name)?;
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
 }
 
 fn error_event_message(value: &Value) -> Option<String> {
@@ -1042,6 +1111,7 @@ not json at all
             Some(StreamError {
                 message: "Insufficient balance.".to_string(),
                 retryable: false,
+                retry_at: None,
             })
         );
 
@@ -1052,8 +1122,69 @@ not json at all
             Some(StreamError {
                 message: "rate limited".to_string(),
                 retryable: true,
+                retry_at: None,
             })
         );
+    }
+
+    /// A 429 from an `openai/*` opencode run: the body names when the spent
+    /// ChatGPT window rolls over, and the run must wait for exactly that.
+    #[test]
+    fn usage_limit_error_carries_the_quota_reset_time() {
+        let resets_at = Utc::now().timestamp() + 7_335;
+        let event: Value = serde_json::from_str(&format!(
+            r#"{{"type":"error","error":{{"name":"APIError","data":{{"message":"The usage limit has been reached","statusCode":429,"isRetryable":true,"responseBody":"{{\"error\":{{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\",\"resets_at\":{resets_at},\"resets_in_seconds\":7335}}}}"}}}}}}"#
+        ))
+        .unwrap();
+
+        let err = stream_error(&event).expect("error event");
+        assert!(err.retryable);
+        assert_eq!(err.retry_at, Some(resets_at));
+    }
+
+    /// No body: the codex usage headers carry the same reset, and a bare
+    /// `retry-after` is the last fallback.
+    #[test]
+    fn usage_limit_reset_falls_back_to_the_response_headers() {
+        let resets_at = Utc::now().timestamp() + 6_751;
+        let from_headers: Value = serde_json::from_str(&format!(
+            r#"{{"type":"error","error":{{"data":{{"message":"The usage limit has been reached","statusCode":429,"responseHeaders":{{"x-codex-primary-reset-at":"{resets_at}","x-codex-primary-used-percent":"100"}}}}}}}}"#
+        ))
+        .unwrap();
+        assert_eq!(
+            stream_error(&from_headers).and_then(|err| err.retry_at),
+            Some(resets_at)
+        );
+
+        let retry_after: Value = serde_json::from_str(
+            r#"{"type":"error","error":{"data":{"message":"slow down","statusCode":429,"responseHeaders":{"retry-after":"600"}}}}"#,
+        )
+        .unwrap();
+        let at = stream_error(&retry_after)
+            .and_then(|err| err.retry_at)
+            .expect("retry-after");
+        assert!((at - Utc::now().timestamp() - 600).abs() <= 2, "{at}");
+    }
+
+    /// Only a 429 names a retry moment. A reset time on any other failure
+    /// says nothing about when the failure clears, so the normal backoff runs.
+    #[test]
+    fn non_rate_limit_errors_have_no_retry_time() {
+        let server_error: Value = serde_json::from_str(
+            r#"{"type":"error","error":{"data":{"message":"boom","statusCode":500,"responseHeaders":{"x-codex-primary-reset-at":"9999999999"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stream_error(&server_error).and_then(|err| err.retry_at),
+            None
+        );
+
+        // A reset already in the past is a clock disagreement, not a retry.
+        let stale: Value = serde_json::from_str(
+            r#"{"type":"error","error":{"data":{"message":"limit","statusCode":429,"responseHeaders":{"x-codex-primary-reset-at":"1000"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(stream_error(&stale).and_then(|err| err.retry_at), None);
     }
 
     // pi family (pi/omp) `--mode json` stream: tool calls live under

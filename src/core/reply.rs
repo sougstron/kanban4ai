@@ -65,9 +65,15 @@ pub fn session_messages(backend: &str, transcript: &Path) -> Option<Vec<String>>
 /// so the thread can show why the agent died and crash-restart can skip
 /// errors the backend marked `isRetryable: false`.
 pub fn fatal_error(transcript: &Path) -> Option<crate::core::provenance::StreamError> {
+    crate::core::provenance::stream_error(&fatal_error_event(transcript)?)
+}
+
+/// The raw event [`fatal_error`] parses. Callers that need provider detail the
+/// parsed form drops — the codex usage headers on a 429 — read it off this.
+pub fn fatal_error_event(transcript: &Path) -> Option<serde_json::Value> {
     let raw = std::fs::read_to_string(transcript).ok()?;
     json_lines(&raw)
-        .filter_map(|value| crate::core::provenance::stream_error(&value))
+        .filter(|value| crate::core::provenance::stream_error(value).is_some())
         .last()
 }
 

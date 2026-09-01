@@ -18,12 +18,18 @@
 //!   token comes from `~/.claude/.credentials.json`; when it has expired the
 //!   stored refresh token is traded for a new one and the rotated pair is
 //!   written back, so the board keeps working while Claude Code is idle.
-//! - **codex**: no network at all. The newest `rollout-*.jsonl` under
-//!   `~/.codex/sessions/` carries the `rate_limits` payload the server last
-//!   sent, so the numbers are exactly as fresh as the last codex run — the age
-//!   is surfaced with the value. Codex is collected into the cached snapshot
-//!   but remains hidden from the visible provider row while its subscription is
-//!   paused.
+//! - **codex**: the OpenAI subscription, which backs both the codex CLI and
+//!   opencode's `openai/*` models. Three sources, newest observation wins.
+//!   The codex app-server JSON-RPC (`account/rateLimits/read`) answers with
+//!   live server-side numbers and costs no usage, so it is polled on its own
+//!   interval ([`CODEX_RPC_MIN_INTERVAL_SECS`]) rather than the board's. When
+//!   codex is not installed the newest `rollout-*.jsonl` under
+//!   `~/.codex/sessions/` still carries the `rate_limits` payload the server
+//!   last sent, so the numbers are as fresh as the last codex run — the age is
+//!   surfaced with the value. Finally, an agent run that dies on a 429
+//!   `usage_limit_reached` hands its `x-codex-*` response headers to
+//!   [`record_codex_usage`], which is how a machine that only ever drives
+//!   OpenAI through opencode gets numbers at all.
 //! - **grok**: `GET /v1/billing` on the grok CLI proxy with the OIDC key from
 //!   `~/.grok/auth.json`. Reports credit usage for the current billing period.
 //! - **zai**: `GET /api/monitor/usage/quota/limit` on `api.z.ai` with the API
@@ -70,9 +76,9 @@
 //! short-lived token in `~/.grok/auth.json` that the billing fetch uses, and
 //! zai / synthetic / yolo simply re-fetch over HTTPS (their keys are long-lived,
 //! so no renewal step is needed). Each runs on a background thread and merges
-//! into the same cache, so the row updates on the next tick. Codex keeps its
-//! app-server JSON-RPC client (see `refresh_provider_now`) for the
-//! refreshes while its visible row remains hidden.
+//! into the same cache, so the row updates on the next tick. Codex re-asks its
+//! app-server for the live numbers (see `refresh_provider_now`), skipping the
+//! poll interval the background refresh honors.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -93,9 +99,9 @@ use crate::core::project::store_root;
 use crate::core::storage::atomic_write_text;
 
 /// Providers rendered on the board and listed by `kanban limits`, in display
-/// order. Codex is intentionally absent: it is collected into snapshots but
-/// hidden while its subscription is paused.
-pub const PROVIDERS: [&str; 5] = ["claude", "grok", "zai", "synthetic", "yolo"];
+/// order. `codex` is the OpenAI subscription: it covers the codex CLI and
+/// opencode's `openai/*` models alike, since both spend the same quota.
+pub const PROVIDERS: [&str; 6] = ["claude", "codex", "grok", "zai", "synthetic", "yolo"];
 
 /// Fallback refresh interval when no board config is available (the projects
 /// screen has no project, so no `.kanban/config.yaml` to read).
@@ -805,8 +811,122 @@ fn parse_rfc3339(text: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// codex — collected into snapshots but hidden from the visible provider list.
+// codex — the OpenAI subscription behind the codex CLI *and* opencode's
+// `openai/*` models: app-server RPC first, rollout files as the offline
+// fallback, plus whatever a 429'd agent run last observed.
 // ---------------------------------------------------------------------------
+
+/// How often the codex app-server may be started for a background refresh.
+/// The exchange costs no subscription usage but does spawn a process and take
+/// a second or two, and the shortest window codex reports is five hours, so a
+/// few minutes of lag costs nothing visible on the row.
+pub const CODEX_RPC_MIN_INTERVAL_SECS: i64 = 300;
+
+/// When the app-server was last asked. In memory and on disk, because a run of
+/// `kanban` calls is a run of fresh processes (see `claude_usage_polled_at`).
+static CODEX_RPC_POLLED_AT: AtomicI64 = AtomicI64::new(0);
+
+fn codex_rpc_poll_path() -> Option<PathBuf> {
+    store_root().ok().map(|root| root.join("codex-rpc-poll"))
+}
+
+fn codex_rpc_polled_at() -> i64 {
+    let cached = CODEX_RPC_POLLED_AT.load(Ordering::SeqCst);
+    if cached > 0 {
+        return cached;
+    }
+    let stored = codex_rpc_poll_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    CODEX_RPC_POLLED_AT.store(stored, Ordering::SeqCst);
+    stored
+}
+
+fn record_codex_rpc_poll(now: i64) {
+    CODEX_RPC_POLLED_AT.store(now, Ordering::SeqCst);
+    if let Some(path) = codex_rpc_poll_path() {
+        let _ = fs::create_dir_all(path.parent().unwrap_or(Path::new("/")));
+        let _ = atomic_write_text(&path, &now.to_string());
+    }
+}
+
+/// Codex windows for a board refresh: the live app-server numbers when its
+/// poll interval is due (or the user forced a refresh), the rollout files
+/// otherwise. Whichever source answers, an observation the cache already holds
+/// that is *newer* keeps the row — a 429'd run may have recorded the current
+/// numbers seconds ago (see [`record_codex_usage`]).
+fn resolve_codex(previous: Option<&LimitsSnapshot>, force: bool) -> ProviderLimits {
+    let previous_entry = previous.and_then(|snapshot| snapshot.get("codex"));
+    let now = now_secs();
+    // Unit tests must never spawn the codex CLI.
+    let rpc_due = !cfg!(test)
+        && (force || now.saturating_sub(codex_rpc_polled_at()) >= CODEX_RPC_MIN_INTERVAL_SECS);
+    if rpc_due {
+        record_codex_rpc_poll(now);
+        if let Ok(fresh) = fetch_codex_rpc() {
+            return prefer_newer_observation(previous_entry, fresh);
+        }
+    }
+    prefer_newer_observation(previous_entry, fetch_codex())
+}
+
+/// Merge a codex reading observed elsewhere — the `x-codex-*` headers on the
+/// 429 that killed an agent run — into the cached snapshot, so the row reports
+/// the exhausted quota immediately instead of at the next poll. A machine that
+/// drives OpenAI only through opencode has no other live source.
+pub fn record_codex_usage(windows: Vec<LimitWindow>, observed_at: i64) {
+    if windows.is_empty() {
+        return;
+    }
+    let fresh = ProviderLimits {
+        windows,
+        observed_at: Some(observed_at),
+        ..ProviderLimits::new("codex", ProviderState::Ready)
+    };
+    let mut providers = cached()
+        .map(|snapshot| snapshot.providers.clone())
+        .unwrap_or_default();
+    match providers.iter_mut().find(|entry| entry.provider == "codex") {
+        Some(entry) => *entry = prefer_newer_observation(Some(entry), fresh),
+        None => providers.push(fresh),
+    }
+    store(
+        Arc::new(LimitsSnapshot {
+            fetched_at: now_secs(),
+            providers,
+        }),
+        true,
+    );
+}
+
+/// Read codex rate-limit windows off the `x-codex-*` response headers OpenAI
+/// sends with every `/v1/responses` call. opencode records them verbatim in
+/// the transcript's error event, which is the only place a run driven through
+/// opencode ever sees them. Header values are strings; both windows are
+/// optional.
+pub fn parse_codex_usage_headers(headers: &Value) -> Vec<LimitWindow> {
+    let number = |key: &str| -> Option<f64> {
+        let value = headers.get(key)?;
+        value
+            .as_f64()
+            .or_else(|| value.as_str()?.trim().parse::<f64>().ok())
+    };
+    ["primary", "secondary"]
+        .into_iter()
+        .filter_map(|window| {
+            let used = number(&format!("x-codex-{window}-used-percent"))?;
+            let minutes = number(&format!("x-codex-{window}-window-minutes")).unwrap_or(0.0) as i64;
+            let resets_at = number(&format!("x-codex-{window}-reset-at"))
+                .map(|at| at as i64)
+                .or_else(|| {
+                    number(&format!("x-codex-{window}-reset-after-seconds"))
+                        .map(|after| now_secs() + after as i64)
+                });
+            Some(LimitWindow::new(window_label(minutes), used, resets_at))
+        })
+        .collect()
+}
 
 fn codex_sessions_dir() -> Option<PathBuf> {
     let home = std::env::var_os("CODEX_HOME")
@@ -1666,9 +1786,12 @@ fn refresh_grok_cli() -> std::result::Result<(), String> {
 /// [`refresh_provider_async`].
 pub fn refresh_provider_now(provider: &str) {
     let fresh = match provider {
-        // Codex is unreachable from the row while hidden, but remains
-        // available for an explicit provider refresh.
-        "codex" => fetch_codex_rpc().unwrap_or_else(|_| fetch_codex()),
+        // A tap skips the app-server poll interval: the user is asking for
+        // the numbers now.
+        "codex" => {
+            record_codex_rpc_poll(now_secs());
+            fetch_codex_rpc().unwrap_or_else(|_| fetch_codex())
+        }
         "grok" => {
             let _ = refresh_grok_cli();
             fetch_grok()
@@ -1742,7 +1865,7 @@ pub fn fetch_all(force: bool) -> LimitsSnapshot {
             previous.as_deref(),
             vec![
                 resolve_claude(previous.as_deref(), force),
-                fetch_codex(),
+                resolve_codex(previous.as_deref(), force),
                 fetch_grok(),
                 fetch_zai(),
                 fetch_synthetic(),
@@ -1942,6 +2065,53 @@ mod tests {
         assert_eq!(windows[0].remaining_percent, 92.5);
         assert_eq!(windows[0].resets_at, None);
         assert!(parse_codex_rate_limits("not json").is_empty());
+    }
+
+    /// The headers OpenAI attaches to an opencode `openai/*` run — the only
+    /// live source of these numbers on a machine that never runs the codex
+    /// CLI. String values, both windows, absolute reset times.
+    #[test]
+    fn codex_usage_headers_read_both_windows() {
+        let headers: Value = serde_json::from_str(
+            r#"{"x-codex-plan-type":"plus","x-codex-primary-used-percent":"100",
+                "x-codex-primary-window-minutes":"300","x-codex-primary-reset-at":"1788294397",
+                "x-codex-secondary-used-percent":"16","x-codex-secondary-window-minutes":"10080",
+                "x-codex-secondary-reset-at":"1788881197"}"#,
+        )
+        .unwrap();
+
+        let windows = parse_codex_usage_headers(&headers);
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].remaining_percent, 0.0);
+        assert_eq!(windows[0].resets_at, Some(1788294397));
+        assert_eq!(windows[1].label, "7d");
+        assert_eq!(windows[1].remaining_percent, 84.0);
+        assert_eq!(windows[1].resets_at, Some(1788881197));
+    }
+
+    /// Only a relative reset (and only one window): the absolute time is
+    /// derived, and a header set with no usage at all yields nothing.
+    #[test]
+    fn codex_usage_headers_derive_a_relative_reset() {
+        let headers: Value = serde_json::from_str(
+            r#"{"x-codex-primary-used-percent":"42","x-codex-primary-window-minutes":"300",
+                "x-codex-primary-reset-after-seconds":"7336"}"#,
+        )
+        .unwrap();
+
+        let windows = parse_codex_usage_headers(&headers);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].remaining_percent, 58.0);
+        let expected = now_secs() + 7336;
+        let resets_at = windows[0].resets_at.expect("derived reset");
+        assert!((resets_at - expected).abs() <= 2, "{resets_at}");
+
+        let unrelated: Value =
+            serde_json::from_str(r#"{"content-type":"application/json"}"#).unwrap();
+        assert!(parse_codex_usage_headers(&unrelated).is_empty());
     }
 
     #[test]

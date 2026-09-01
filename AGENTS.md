@@ -49,7 +49,7 @@ src/
     ├── compaction.rs    # Rule-based context compaction (no LLM)
     ├── scheduler.rs     # Slot census, queue dispatch, crash-restart backoff
     ├── daemon.rs        # Store-wide tick + single-instance `daemon.lock`
-    ├── limits.rs        # Provider subscription limits (claude/grok/zai/synthetic/yolo; codex parked) + cache
+    ├── limits.rs        # Provider subscription limits (claude/codex/grok/zai/synthetic/yolo) + cache
     ├── notifier.rs      # Desktop notifications (notify-send)
     └── vcs.rs           # Worktree isolation: git probe, live snapshots, merge-tree landing
 Additional modules:
@@ -996,6 +996,20 @@ auth failure is not disguised as `↻ retry`. `format-stream` also renders
 `queued` but has no `restart_at` still gets a backoff — otherwise the
 dispatcher immediately relaunches and a lone queued task hot-loops.
 
+A retryable HTTP 429 that names when the exhausted window rolls over — an
+`openai/*` opencode run on a spent ChatGPT plan answers
+`usage_limit_reached` with `resets_at` / `resets_in_seconds`, and the
+`x-codex-*` response headers carry the same instant — is scheduled *for that
+moment* instead of the next ladder step, since every earlier attempt can only
+429 again (a 1-minute backoff against a two-hour reset burns the whole budget
+in three minutes). The deadline is floored a minute out (a reset already past
+is clock skew) and ignored beyond `MAX_CRASH_RESTART_DELAY_HOURS` (24h); it
+still consumes one budget step, so a backend that keeps failing cannot retry
+forever, and the thread note reads `↻ crash restart scheduled at … (provider
+quota resets then, attempt n/N)`. The usage headers on that error are also fed
+to `limits::record_codex_usage`, so the limits row shows the spent quota
+immediately rather than at its next poll.
+
 Because a crash restart runs *through* the queue, `schedule_crash_restart` also
 requires `orchestration.queue_enabled` **and** `auto_launch.enabled` to be on.
 With either off it schedules nothing and the task simply stays crashed and
@@ -1299,15 +1313,22 @@ Sources, all read-only and best effort:
   Note the bridge only fires for interactive Claude Code sessions (`--print`
   runs do not invoke the statusline), which is also when the subscription
   windows actually move; the endpoint is what covers the hours in between.
-- **codex** (parked — not fetched, not shown): no network. The newest
-  `rollout-*.jsonl` under `$CODEX_HOME/sessions/YYYY/MM/DD/` (default
-  `~/.codex`) is streamed for its last `rate_limits` payload (`primary`/
-  `secondary` with `used_percent`, `window_minutes`, epoch `resets_at`). The
-  numbers are only as fresh as the last codex run, so the row appends their
-  age (`(7d old)`). The subscription is paused, so `PROVIDERS` omits codex and
-  `fetch_all` skips it; the readers and the app-server RPC client stay
-  compiled and tested, and returning codex is adding it back to `PROVIDERS`
-  and `fetch_codex()` to `fetch_all`.
+- **codex**: the OpenAI subscription, which backs the codex CLI *and*
+  opencode's `openai/*` models — both spend the same quota, so the row covers
+  both. Three sources, newest `observed_at` winning. (1) The codex app-server
+  JSON-RPC (`codex -s read-only -a untrusted app-server`, `initialize` then
+  `account/rateLimits/read`) answers with live server-side numbers and costs no
+  usage; `fetch_all` uses it on its own `CODEX_RPC_MIN_INTERVAL_SECS` (300s)
+  poll interval — persisted in `<store>/codex-rpc-poll` so a run of CLI
+  processes shares it — and a click on the segment skips that interval.
+  (2) Without codex installed, the newest `rollout-*.jsonl` under
+  `$CODEX_HOME/sessions/YYYY/MM/DD/` (default `~/.codex`) is streamed for its
+  last `rate_limits` payload (`primary`/`secondary` with `used_percent`,
+  `window_minutes`, epoch `resets_at`); those numbers are only as fresh as the
+  last codex run, so the row appends their age (`(7d old)`). (3) An agent run
+  that dies on a 429 hands the `x-codex-*` response headers to
+  `record_codex_usage`, which is the only live source on a machine that drives
+  OpenAI exclusively through opencode.
 - **grok**: `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`
   with the key and user id from `~/.grok/auth.json` plus
   `X-XAI-Token-Auth: xai-grok-cli`. Yields one window for the current billing

@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use chrono::NaiveDateTime;
+
 use crate::agent::{resolve_launch_settings, upcoming_run_plan};
 use crate::core::config::{BoardConfig, OrchestrationSettings};
 use crate::core::error::Result;
@@ -185,6 +187,19 @@ fn task_sort_args(config: &BoardConfig) -> (&'static str, &'static str) {
         Some("task_number_desc") => ("id", "desc"),
         _ => ("id", "asc"),
     }
+}
+
+/// Longest a crash may defer its own restart. Past this a provider's reported
+/// reset time is more likely a bad clock or a bad payload than a real wait, so
+/// the normal backoff ladder takes over.
+const MAX_CRASH_RESTART_DELAY_HOURS: i64 = 24;
+
+/// A crash-supplied restart deadline as an actual deadline: never sooner than
+/// a minute out, never further than [`MAX_CRASH_RESTART_DELAY_HOURS`].
+fn usable_deadline(deadline: NaiveDateTime, now: NaiveDateTime) -> Option<NaiveDateTime> {
+    let floor = now.checked_add_signed(chrono::Duration::minutes(1))?;
+    let ceiling = now.checked_add_signed(chrono::Duration::hours(MAX_CRASH_RESTART_DELAY_HOURS))?;
+    (deadline <= ceiling).then(|| deadline.max(floor))
 }
 
 impl Operations {
@@ -389,6 +404,23 @@ impl Operations {
     /// (`restart_at = now + delays[crash_restarts]`, phase `queued`) or leave
     /// the task crashed and notify when that schedule is spent.
     pub(crate) fn schedule_crash_restart(&self, task_id: &str) -> Result<bool> {
+        self.schedule_crash_restart_at(task_id, None)
+    }
+
+    /// [`Self::schedule_crash_restart`] with an explicit deadline: the moment
+    /// the crash itself named, which is the provider's usage window rolling
+    /// over. A blind backoff step would only 429 again before then, and one
+    /// far shorter than the window would burn the whole retry budget doing it.
+    /// The deadline still costs a budget step, so a backend that keeps failing
+    /// cannot retry forever. It is floored at a minute out (a reset already
+    /// past is clock skew, not an instant retry) and ignored beyond
+    /// [`MAX_CRASH_RESTART_DELAY_HOURS`], where a nonsense timestamp would
+    /// otherwise park the task for days.
+    pub(crate) fn schedule_crash_restart_at(
+        &self,
+        task_id: &str,
+        deadline: Option<NaiveDateTime>,
+    ) -> Result<bool> {
         let orch = self.config.get_orchestration()?;
         // Crash restart runs *through* the queue, so promising a retry the
         // dispatcher can never honour would strand the task with a "↻ retry"
@@ -429,10 +461,13 @@ impl Operations {
             return Ok(false);
         }
         let minutes = delays[idx];
-        let Some(restart_at) =
-            timefmt::now().checked_add_signed(chrono::Duration::minutes(minutes))
-        else {
+        let now = timefmt::now();
+        let Some(backoff_at) = now.checked_add_signed(chrono::Duration::minutes(minutes)) else {
             return Ok(false);
+        };
+        let (restart_at, reason) = match deadline.and_then(|at| usable_deadline(at, now)) {
+            Some(at) => (at, "provider quota resets then".to_string()),
+            None => (backoff_at, format!("backoff {minutes} min")),
         };
         task.restart_at = Some(restart_at);
         task.run_phase = Some(RunPhase::Queued);
@@ -441,7 +476,7 @@ impl Operations {
         self.post_queue_note(
             &task.id,
             &format!(
-                "↻ crash restart scheduled at {} (backoff {minutes} min, attempt {}/{})",
+                "↻ crash restart scheduled at {} ({reason}, attempt {}/{})",
                 timefmt::format(&restart_at),
                 idx + 1,
                 delays.len()
@@ -455,6 +490,25 @@ impl Operations {
 mod tests {
     use super::*;
     use crate::core::config::{BotSettings, OnChangesRequested, ReviewerSettings};
+
+    /// A crash-supplied deadline is used as-is inside the sane range, floored
+    /// to a minute out, and refused (falling back to the ladder) when it is so
+    /// far out that only a bad clock or a bad payload could have produced it.
+    #[test]
+    fn crash_deadlines_are_floored_and_capped() {
+        let now = timefmt::now();
+        let reset = now + chrono::Duration::hours(2);
+        assert_eq!(usable_deadline(reset, now), Some(reset));
+
+        let past = now - chrono::Duration::minutes(5);
+        assert_eq!(
+            usable_deadline(past, now),
+            Some(now + chrono::Duration::minutes(1))
+        );
+
+        let far = now + chrono::Duration::hours(MAX_CRASH_RESTART_DELAY_HOURS + 1);
+        assert_eq!(usable_deadline(far, now), None);
+    }
 
     fn orch(
         total: i64,

@@ -6,7 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Local, NaiveDateTime};
 use regex::Regex;
+use serde_json::Value;
 
 use crate::agent::{
     KanbanLauncher, build_agent_prompt, resolve_bot_launch_settings, resolve_launch_settings,
@@ -19,6 +21,7 @@ use crate::core::config::{
 };
 use crate::core::context::{ContextManager, role_for_source};
 use crate::core::error::{KanbanError, Result};
+use crate::core::limits;
 use crate::core::models::{
     IntegrationState, Message, MessageKind, MessageRole, MessageStatus, Role, RunMode, RunPhase,
     Session, SessionStatus, Task, TaskStatus,
@@ -173,6 +176,19 @@ impl AgentExitOutcome {
             AgentExitOutcome::LaunchFailed(session) => format!("LaunchFailed({session})"),
         }
     }
+}
+
+/// How a crashed run should be retried, read off the transcript's last error
+/// event by [`Operations::crash_restart_plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CrashRestart {
+    /// The normal `auto_restart.delays_minutes` ladder.
+    Backoff,
+    /// Stay crashed: the backend called the failure non-retryable.
+    Skip,
+    /// Wait for a named moment — the provider's usage window rolling over —
+    /// instead of a blind backoff step.
+    After(NaiveDateTime),
 }
 
 enum RespawnOutcome {
@@ -3621,27 +3637,56 @@ impl Operations {
         );
     }
 
-    /// Post a transcript `type: error` on the thread and decide whether
-    /// crash-restart should still run. No error (or a retryable one) keeps
-    /// the backoff; `isRetryable: false` stays crashed so a credits/auth
-    /// failure is not painted as `↻ retry`.
-    fn crash_should_restart(&self, task_id: &str, session_id: &str) -> bool {
+    /// Post a transcript `type: error` on the thread and decide how
+    /// crash-restart should run. No error (or a plain retryable one) keeps the
+    /// backoff ladder; `isRetryable: false` stays crashed so a credits/auth
+    /// failure is not painted as `↻ retry`; a spent subscription quota waits
+    /// for the window it named, since every earlier attempt can only 429 again.
+    fn crash_restart_plan(&self, task_id: &str, session_id: &str) -> CrashRestart {
         let transcript = self
             .storage
             .logs_dir
             .join(format!("{session_id}.transcript.jsonl"));
-        let Some(err) = reply::fatal_error(&transcript) else {
-            return true;
+        let Some(event) = reply::fatal_error_event(&transcript) else {
+            return CrashRestart::Backoff;
+        };
+        let Some(err) = provenance::stream_error(&event) else {
+            return CrashRestart::Backoff;
         };
         self.post_queue_note(task_id, &format!("✖ agent error: {}", err.message));
-        if err.retryable {
-            return true;
+        if !err.retryable {
+            self.post_queue_note(
+                task_id,
+                "↻ crash-restart skipped — backend error is not retryable",
+            );
+            return CrashRestart::Skip;
         }
-        self.post_queue_note(
-            task_id,
-            "↻ crash-restart skipped — backend error is not retryable",
+        let Some(retry_at) = err.retry_at else {
+            return CrashRestart::Backoff;
+        };
+        // The 429 carries the provider's own usage numbers; record them so the
+        // board's limits row shows the spent quota now rather than at its next
+        // poll. Only OpenAI (codex) sends them, and only through opencode.
+        self.record_provider_usage(&event);
+        let Some(at) = DateTime::from_timestamp(retry_at, 0) else {
+            return CrashRestart::Backoff;
+        };
+        CrashRestart::After(at.with_timezone(&Local).naive_local())
+    }
+
+    /// Feed the usage headers on a rate-limit error into the limits cache.
+    /// Best effort: a provider that sends none simply leaves the row alone.
+    fn record_provider_usage(&self, event: &Value) {
+        let Some(headers) = provenance::stream_error_data(event).and_then(|data| {
+            data.get("responseHeaders")
+                .filter(|headers| headers.is_object())
+        }) else {
+            return;
+        };
+        limits::record_codex_usage(
+            limits::parse_codex_usage_headers(headers),
+            chrono::Utc::now().timestamp(),
         );
-        false
     }
 
     fn reconcile_agent_exit_inner(
@@ -3662,8 +3707,14 @@ impl Operations {
         }
         if exit_status != 0 {
             session_mgr.crash_session(session_id)?;
-            if self.crash_should_restart(task_id, session_id) {
-                let _ = self.schedule_crash_restart(task_id);
+            match self.crash_restart_plan(task_id, session_id) {
+                CrashRestart::Skip => {}
+                CrashRestart::Backoff => {
+                    let _ = self.schedule_crash_restart(task_id);
+                }
+                CrashRestart::After(at) => {
+                    let _ = self.schedule_crash_restart_at(task_id, Some(at));
+                }
             }
             return Ok(AgentExitOutcome::Crashed);
         }
