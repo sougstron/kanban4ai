@@ -1,3 +1,39 @@
+# kanban4ai 0.5.9
+
+opencode's `openai/*` models spend the same ChatGPT subscription as the codex
+CLI, but the board had no visibility into that quota and no way to react to it
+being spent. This release makes codex a visible provider again and teaches
+crash-restart to wait for the quota window instead of retrying blind.
+
+## Added
+
+- **codex is a visible provider again** (`core/limits.rs`). It reports the
+  OpenAI subscription behind both the codex CLI and opencode's `openai/*`
+  models, since they spend the same quota. Live numbers come from the codex
+  app-server JSON-RPC (`account/rateLimits/read`), polled on its own 300s
+  interval since the exchange costs no usage; the newest `rollout-*.jsonl`
+  under `~/.codex/sessions/` is the offline fallback. A run that 429s with a
+  `usage_limit_reached` error hands its `x-codex-*` response headers to the
+  cache directly, so a machine that only ever drives OpenAI through opencode
+  still gets numbers on the row.
+
+## Changed
+
+- **Crash-restart waits for a spent quota instead of retrying blind**
+  (`core/operations.rs`, `core/scheduler.rs`). A crash whose transcript names
+  a `retry_at` — decoded from the 429 body, codex reset headers, or
+  `retry-after` — is rescheduled for that moment (floored a minute out, capped
+  at 24h) instead of stepping through the usual backoff ladder, so an openai
+  task no longer relaunches every minute into the same exhausted window.
+
+## Verification coverage
+
+- `codex_usage_headers_read_both_windows` and related `parse_codex_usage_headers`
+  cases (both windows, string-typed header values, absolute vs. relative reset)
+- `crash_restart_plan` returning `Backoff`/`Skip`/`After` for the corresponding
+  transcript error shapes
+- `schedule_crash_restart_at` honoring a named retry time, floor, and 24h cap
+
 # kanban4ai 0.5.8
 
 The yolo subscription is back on the limits row, a captured agent reply keeps
