@@ -179,6 +179,7 @@ pub enum UiAction {
     Search,
     OpenDetail,
     NewTask,
+    CopyTask,
     EditTask,
     MoveTask,
     DeleteTask,
@@ -895,6 +896,12 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         if is_ctrl_c(key) {
+            if self.modal.is_none()
+                && matches!(self.screen, Screen::Board | Screen::Detail)
+                && self.current_task_id().is_some()
+            {
+                return self.dispatch(UiAction::CopyTask);
+            }
             self.handle_ctrl_c_exit();
             return Ok(());
         }
@@ -953,7 +960,8 @@ impl App {
                     self.screen = Screen::Board;
                     self.detail = None;
                 } else {
-                    self.status = "Press ctrl + C twice to close".to_string();
+                    self.status =
+                        "Press ctrl + C twice to close when no task is selected".to_string();
                 }
             }
             (KeyCode::Esc, _) if matches!(self.screen, Screen::Archive | Screen::Help) => {
@@ -1401,6 +1409,7 @@ impl App {
             UiAction::Search => self.search.active = true,
             UiAction::OpenDetail => self.open_focused_detail()?,
             UiAction::NewTask => self.open_new_dialog(),
+            UiAction::CopyTask => self.copy_current_task()?,
             UiAction::EditTask => self.open_edit_dialog(),
             UiAction::MoveTask => self.open_move_dialog(),
             UiAction::DeleteTask => self.open_delete_dialog(),
@@ -3037,6 +3046,36 @@ impl App {
         self.focused_card = card;
         self.ensure_focused_visible();
         true
+    }
+
+    fn copy_current_task(&mut self) -> Result<()> {
+        let Some(source_id) = self.current_task_id() else {
+            return Ok(());
+        };
+        let Some(copied) = self.ops.copy_task(&source_id)? else {
+            self.status = format!("Task {source_id} no longer exists");
+            return Ok(());
+        };
+        self.detail = None;
+        self.screen = if copied.status == TaskStatus::Archive {
+            Screen::Archive
+        } else {
+            Screen::Board
+        };
+        self.refresh_after_action()?;
+        if self.screen == Screen::Archive {
+            if let Some(index) = self
+                .archived_tasks
+                .iter()
+                .position(|task| task.id == copied.id)
+            {
+                self.archive_selected = index;
+            }
+        } else {
+            let _ = self.focus_task(&copied.id);
+        }
+        self.status = format!("Copied {source_id} → {}", copied.id);
+        Ok(())
     }
 
     fn focus_first_question(&mut self) {

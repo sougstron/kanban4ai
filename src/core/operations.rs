@@ -325,6 +325,55 @@ impl Operations {
         Ok(task)
     }
 
+    /// Copy a task's user-facing state and thread into a fresh task identity.
+    ///
+    /// Run/session and worktree state belongs to the original task lifecycle,
+    /// so a copy never inherits a live agent, restart bookkeeping, or isolation.
+    pub fn copy_task(&self, task_id: &str) -> Result<Option<Task>> {
+        let _guard = self.storage.lock()?;
+        let Some(source) = self.storage.load_task(task_id)? else {
+            return Ok(None);
+        };
+        let source_thread = self.thread_manager()?.load(task_id)?;
+        let created = self
+            .storage
+            .create_task_in_status(NewTask::titled(source.title.clone()), source.status)?;
+        let now = timefmt::now();
+        let mut copied = source;
+        copied.id = created.id;
+        copied.session = None;
+        copied.created_at = now;
+        copied.updated_at = now;
+        copied.completed_at = created.completed_at;
+        copied.context_file = None;
+        copied.context_size = 0;
+        copied.auto_resumes = 0;
+        copied.review_unseen = false;
+        copied.run_phase = None;
+        copied.crash_restarts = 0;
+        copied.restart_at = None;
+        copied.review_rounds = 0;
+        copied.designed = false;
+        copied.worktree = None;
+        copied.branch = None;
+        copied.base_commit = None;
+        copied.integration = IntegrationState::None;
+        self.storage.save_task(&copied)?;
+
+        if !source_thread.messages.is_empty() {
+            let threads = self.thread_manager()?;
+            threads.discard_thread(&copied.id)?;
+            let mut copied_thread = source_thread;
+            copied_thread.task_id = copied.id.clone();
+            copied_thread.rev = 0;
+            copied_thread.base_rev = 0;
+            copied_thread.base_messages.clear();
+            threads.save(&copied.id, &mut copied_thread)?;
+        }
+
+        Ok(Some(copied))
+    }
+
     pub fn update_task(&self, task_id: &str, patch: TaskPatch) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
         let Some(mut task) = self.storage.load_task(task_id)? else {

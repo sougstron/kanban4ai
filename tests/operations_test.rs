@@ -44,6 +44,77 @@ fn targeted_creation_writes_directly_to_requested_status() {
 }
 
 #[test]
+fn copy_task_creates_an_independent_task_and_thread() {
+    let (dir, ops, _recorder) = ops_with_recorder(false);
+    let mut source = ops
+        .create_task_in_status(
+            NewTask {
+                title: "Copy me".to_string(),
+                description: "Preserve this description".to_string(),
+                ai_model: Some("model-a".to_string()),
+                interactive: true,
+                ..NewTask::default()
+            },
+            TaskStatus::Review,
+        )
+        .unwrap();
+    source.designed = true;
+    ops.storage.save_task(&source).unwrap();
+    let threads = ThreadManager::new(dir.path()).unwrap();
+    threads
+        .post(
+            &source.id,
+            MessageRole::Human,
+            MessageKind::Context,
+            "Preserve this context",
+            None,
+            Vec::new(),
+            Some("user".to_string()),
+        )
+        .unwrap();
+
+    let copied = ops.copy_task(&source.id).unwrap().unwrap();
+
+    assert_ne!(copied.id, source.id);
+    assert_eq!(copied.title, source.title);
+    assert_eq!(copied.description, source.description);
+    assert_eq!(copied.ai_model, source.ai_model);
+    assert_eq!(copied.interactive, source.interactive);
+    assert_eq!(copied.status, TaskStatus::Review);
+    assert!(copied.completed_at.is_some());
+    assert!(!copied.designed);
+    assert!(copied.session.is_none());
+    assert!(copied.worktree.is_none());
+    assert_eq!(
+        threads
+            .messages_of_kind(&copied.id, MessageKind::Context)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.body)
+            .collect::<Vec<_>>(),
+        vec!["Preserve this context"]
+    );
+    threads
+        .post(
+            &copied.id,
+            MessageRole::Human,
+            MessageKind::Context,
+            "Only on the copy",
+            None,
+            Vec::new(),
+            Some("user".to_string()),
+        )
+        .unwrap();
+    assert_eq!(
+        threads
+            .messages_of_kind(&source.id, MessageKind::Context)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn exact_bulk_move_refuses_a_changed_source_set() {
     let (_dir, ops, _recorder) = ops_with_recorder(false);
     let first = ops.create_task(NewTask::titled("First")).unwrap();

@@ -195,8 +195,9 @@ to edit, `m` to move, `w` to answer a question, `y` to approve Review → Done,
 `t` to attach to the task's agent,
 `c` to add context or a suggestion, `u` to recover a crashed task, `a` to view
 archived tasks, `l` to view running sessions, `P` to open the projects list,
-`/` to search, `?` for help, and
-press `Ctrl+C` twice within 3 seconds to quit. Press `s` on the board or task
+`/` to search, `?` for help, and `Ctrl+C` to copy the selected task with a
+fresh ID. `Ctrl+C` twice within 3 seconds still quits when no task is selected.
+Press `s` on the board or task
 detail to open Project Settings, where you can edit the project name, default
 backend, that backend's default model/effort/persona, theme, and task sorting
 (task number or modification date, oldest or newest first); the Board
