@@ -39,6 +39,26 @@ fn init_writes_defaults_and_load_reads_them() {
 }
 
 #[test]
+fn default_opencode_agent_options_exclude_obsolete_hephaestus() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config::new(dir.path());
+
+    config.init().unwrap();
+    let board = config.load().unwrap();
+    let options = board
+        .agents
+        .get("opencode")
+        .and_then(|value| value.get("agent_options"))
+        .and_then(|value| value.as_sequence())
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(options, ["sisyphus", "prometheus", "atlas"]);
+}
+
+#[test]
 fn load_creates_config_when_missing() {
     let dir = tempfile::tempdir().unwrap();
     let config = Config::new(dir.path());
