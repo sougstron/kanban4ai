@@ -1996,6 +1996,25 @@ fn drag_selects_card_text_without_moving_or_opening_it() {
 }
 
 #[test]
+fn ctrl_c_copies_the_focused_task_without_quitting() {
+    let (_dir, mut app) = app_with_board();
+    let source = app
+        .ops
+        .create_task(NewTask::titled("Copy this task"))
+        .expect("create source task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .expect("copy focused task");
+
+    let copied = app.focused_task().expect("focus copied task");
+    assert_ne!(copied.id, source.id);
+    assert_eq!(copied.title, source.title);
+    assert!(!app.should_quit);
+    assert_eq!(app.status, format!("Copied {} → {}", source.id, copied.id));
+}
+
+#[test]
 fn copied_notice_restores_previous_status_after_three_seconds() {
     let (_dir, mut app) = app_with_board();
     app.status = "previous status".to_string();
@@ -3911,13 +3930,22 @@ fn phase_five_search_popup_escape_clears_and_enter_preserves_filter() {
         .expect("ignore board escape");
     assert!(!app.should_quit);
 
+    let task_count = app
+        .ops
+        .list_tasks(None, None, "created", "asc")
+        .expect("count source tasks")
+        .len();
     app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-        .expect("first ctrl-c prompts");
+        .expect("ctrl-c copies focused task");
     assert!(!app.should_quit);
-    assert_eq!(app.status, "Press ctrl + C again to close");
-    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-        .expect("second ctrl-c exits");
-    assert!(app.should_quit);
+    assert_eq!(
+        app.ops
+            .list_tasks(None, None, "created", "asc")
+            .expect("count copied tasks")
+            .len(),
+        task_count + 1
+    );
+    assert!(app.status.starts_with("Copied "));
 
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('/')))
@@ -3932,7 +3960,10 @@ fn phase_five_search_popup_escape_clears_and_enter_preserves_filter() {
     app.handle_key(key(KeyCode::Char('q')))
         .expect("q does not quit from board");
     assert!(!app.should_quit);
-    assert_eq!(app.status, "Press ctrl + C twice to close");
+    assert_eq!(
+        app.status,
+        "Press ctrl + C twice to close when no task is selected"
+    );
     assert_eq!(app.search.text(), "kept", "q must not clear the filter");
 }
 

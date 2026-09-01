@@ -708,7 +708,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  click a provider to refresh now · % left and ↻ reset"),
         Line::from("  hide the row with tui.show_limits: false · kanban limits prints it"),
         Line::from(""),
-        Line::from("?: toggle help · q/Esc: back · Ctrl+C twice: quit"),
+        Line::from("?: toggle help · q/Esc: back · Ctrl+C: copy task"),
     ]
 }
 
