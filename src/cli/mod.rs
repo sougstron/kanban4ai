@@ -337,7 +337,7 @@ enum Command {
 
     /// List active sessions.
     Sessions,
-    /// Show remaining subscription limits for the agent providers (claude, grok, zai, synthetic).
+    /// Show remaining subscription limits for the agent providers (claude, grok, zai, synthetic, yolo).
     Limits {
         /// Output format
         #[arg(long = "format", value_parser = ["table", "json"], default_value = "table")]

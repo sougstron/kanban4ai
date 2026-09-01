@@ -49,7 +49,7 @@ src/
     ├── compaction.rs    # Rule-based context compaction (no LLM)
     ├── scheduler.rs     # Slot census, queue dispatch, crash-restart backoff
     ├── daemon.rs        # Store-wide tick + single-instance `daemon.lock`
-    ├── limits.rs        # Provider subscription limits (claude/grok/zai/synthetic; codex parked) + cache
+    ├── limits.rs        # Provider subscription limits (claude/grok/zai/synthetic/yolo; codex parked) + cache
     ├── notifier.rs      # Desktop notifications (notify-send)
     └── vcs.rs           # Worktree isolation: git probe, live snapshots, merge-tree landing
 Additional modules:
@@ -233,7 +233,7 @@ messages:
 - `kanban sessions` - List active sessions
 - `kanban archive` - List archived tasks
 - `kanban archive-done` - Move all Done tasks to Archive
-- `kanban limits [--format table|json] [--refresh]` - Remaining subscription capacity per provider (claude, grok, zai, synthetic); serves the cached snapshot unless it aged out or `--refresh` is given
+- `kanban limits [--format table|json] [--refresh]` - Remaining subscription capacity per provider (claude, grok, zai, synthetic, yolo); serves the cached snapshot unless it aged out or `--refresh` is given
 - `kanban limits bridge install` / `kanban limits bridge remove` - Wrap / unwrap Claude Code's statusline command with the bridge feeding the claude segment of the limits row
 - `kanban update [--check]` - Report (or install) the newest GitHub release; see "Updater". Project-independent: runs from any directory with no board. A status cached within `updates.check_interval_hours` answers from the cache, otherwise one blocking check runs; `--check` only prints the report. Without `--check` a newer release is downloaded, verified, and installed — refused with the upgrade command when pacman owns the binary
 - `kanban tui` - Launch the interactive board; with no resolved project, open the projects list
@@ -1241,7 +1241,8 @@ are never clipped while columns of plain cards keep the configured
 How much of each AI subscription window is left, drawn as one row directly
 above the status bar on the Board and Projects screens (`✳ claude 5h 66% ↻3h30m
 · 7d 95% ↻6d11h │ ✕ grok 7d 93% ↻4d22h │ ◆ zai
-5h 85% ↻4h48m · 7d 97% ↻6d23h │ ✦ synthetic 5h 91% ↻3h59m · 7d 12% ↻3h22m`), and
+5h 85% ↻4h48m · 7d 97% ↻6d23h │ ✦ synthetic 5h 91% ↻3h59m · 7d 12% ↻3h22m │ ◉ yolo
+24h 95%`), and
 printed by `kanban limits`. Percentages are what remains (100 − used), not what
 is spent.
 
@@ -1316,11 +1317,32 @@ Sources, all read-only and best effort:
   at `nextRegenAt`). Both quotas regenerate in small ticks rather than resetting
   on a timer, so the reset time is the next capacity gain. The key never
   expires, so the segment needs no CLI-driven click refresh.
+- **yolo**: `GET https://yolo-auto.com/v1/usage` with `$YOLO_API_KEY` /
+  `$YOLO_AUTO_API_KEY` or the custom yolo provider's `apiKey` from opencode
+  (`~/.config/opencode/opencode.json`, `$XDG_CONFIG_HOME` respected), omp
+  (`~/.omp/agent/models.yml`), or pi (`models.json` under
+  `$PI_CODING_AGENT_DIR`, default `~/.pi/agent`). A provider counts as yolo
+  when its id/name contains `yolo` or its `baseURL` points at `yolo-auto.com`.
+  The endpoint publishes counters but no quota — `limits.requests` and
+  `remaining.requests` are `null` on the current plans, which is why the older
+  request-window parse showed nothing — so the ceiling comes from the plan
+  itself: `YOLO_DAILY_TOKEN_LIMIT`, the 40,000,000-token rolling day of
+  Standard pressure. Only that window (`24h`) is drawn; the plan's
+  8,000,000-token hour is deliberately left out because the response carries no
+  per-hour counter. Spend is the larger of `usage.byModel[].past24h.totalTokens`
+  (truly rolling, but only this key) and `usage.day.project.totalTokens`
+  (every key of the project, but a UTC calendar bucket that drops to zero at
+  midnight): each is a lower bound on the real rolling day, and the row must
+  never promise capacity that is already gone. The window is `rolling` with no
+  reset time — a rolling budget frees capacity token by token, so there is no
+  rollover instant to count down to. The key never expires, so the segment
+  needs no CLI-driven click refresh; the plan's own guidance is to honor
+  `Retry-After` on HTTP 429 and retry with jitter rather than to poll harder.
 
 HTTPS goes through `curl -K -`, with the request config (URL and headers) piped
 on stdin: no TLS dependency is linked into the crate, and bearer tokens never
 appear in a command line where `ps` would expose them. `curl` is an optional
-dependency — without it claude, grok, zai, and synthetic degrade to `n/a`.
+dependency — without it claude, grok, zai, synthetic, and yolo degrade to `n/a`.
 
 A provider with no credentials on the machine reports `not_configured` and is
 omitted from the row entirely; `401`/`403` becomes `signed out`. Fetches run on
@@ -1336,7 +1358,8 @@ the fetch time for an HTTP 200), so both the row and the CLI can show their
 age the way codex
 rollouts did. A window whose `resets_at` has passed is dropped from the row and
 from `kanban limits` (its percentage describes a period that is over), unless
-it is a tick-regenerating quota (`LimitWindow.rolling`, synthetic's windows):
+it is a tick-regenerating quota (`LimitWindow.rolling`, synthetic's windows
+and yolo's rolling day):
 there the reset time is the next capacity gain, not the end of the window, so
 the percentage stays until the next poll refreshes it. A provider whose
 windows have all rolled over reads `stale` rather than freezing
@@ -1355,7 +1378,7 @@ the result with whatever the statusline bridge still holds, and running
 `grok models` renews the short-lived
 OIDC token in `~/.grok/auth.json` before the billing fetch — that fixes
 "grok reads signed out after
-~6h" without a periodic poller — while zai / synthetic re-fetch over HTTPS
+~6h" without a periodic poller — while zai / synthetic / yolo re-fetch over HTTPS
 (their keys are long-lived, so no renewal step is needed). The CLIs run in
 the scratch cwd `<store>/limits-refresh-cwd` so stray session state never
 lands in a project. A 429 from the

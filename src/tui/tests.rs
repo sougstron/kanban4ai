@@ -7037,6 +7037,34 @@ fn limits_row_sits_above_the_status_bar_and_lists_every_provider() {
 }
 
 #[test]
+fn limits_row_draws_the_yolo_rolling_day_without_a_reset_time() {
+    use crate::core::limits::{LimitWindow, LimitsSnapshot, ProviderLimits, ProviderState};
+
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
+        fetched_at: chrono::Utc::now().timestamp(),
+        providers: vec![ProviderLimits {
+            provider: "yolo".to_string(),
+            state: ProviderState::Ready,
+            windows: vec![LimitWindow {
+                label: "24h".to_string(),
+                remaining_percent: 94.0,
+                resets_at: None,
+                rolling: true,
+            }],
+            observed_at: None,
+        }],
+    }));
+
+    let lines = rendered_lines(&mut app, 120, 28);
+    let row = &lines[lines.len() - 2];
+
+    // A rolling budget has no rollover instant, so the segment is percent-only.
+    assert!(row.contains("◉ yolo 24h 94%"), "{row}");
+    assert!(!row.contains('↻'), "{row}");
+}
+
+#[test]
 fn limits_row_drops_reset_times_then_names_as_the_terminal_narrows() {
     let (_dir, mut app) = populated_app();
     app.limits = Some(limits_fixture());
