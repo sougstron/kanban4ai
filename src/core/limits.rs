@@ -21,9 +21,9 @@
 //! - **codex**: no network at all. The newest `rollout-*.jsonl` under
 //!   `~/.codex/sessions/` carries the `rate_limits` payload the server last
 //!   sent, so the numbers are exactly as fresh as the last codex run — the age
-//!   is surfaced with the value. Currently parked (see [`PROVIDERS`]): the
-//!   subscription is paused, so it is neither fetched nor displayed, and all
-//!   the readers below stay compiled and tested for its return.
+//!   is surfaced with the value. Codex is collected into the cached snapshot
+//!   but remains hidden from the visible provider row while its subscription is
+//!   paused.
 //! - **grok**: `GET /v1/billing` on the grok CLI proxy with the OIDC key from
 //!   `~/.grok/auth.json`. Reports credit usage for the current billing period.
 //! - **zai**: `GET /api/monitor/usage/quota/limit` on `api.z.ai` with the API
@@ -70,9 +70,9 @@
 //! short-lived token in `~/.grok/auth.json` that the billing fetch uses, and
 //! zai / synthetic / yolo simply re-fetch over HTTPS (their keys are long-lived,
 //! so no renewal step is needed). Each runs on a background thread and merges
-//! into the same cache, so the row updates on the next tick. The parked codex
-//! keeps its app-server JSON-RPC client (see `refresh_provider_now`) for the
-//! day it returns.
+//! into the same cache, so the row updates on the next tick. Codex keeps its
+//! app-server JSON-RPC client (see `refresh_provider_now`) for the
+//! refreshes while its visible row remains hidden.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -93,12 +93,8 @@ use crate::core::project::store_root;
 use crate::core::storage::atomic_write_text;
 
 /// Providers rendered on the board and listed by `kanban limits`, in display
-/// order.
-///
-/// codex is parked: its subscription is paused, so `fetch_all` skips it and
-/// the row hides it. All its readers stay compiled and tested (see the codex
-/// section and `refresh_provider_now`) — to bring it back, add `"codex"` here
-/// and `fetch_codex()` to `fetch_all`.
+/// order. Codex is intentionally absent: it is collected into snapshots but
+/// hidden while its subscription is paused.
 pub const PROVIDERS: [&str; 5] = ["claude", "grok", "zai", "synthetic", "yolo"];
 
 /// Fallback refresh interval when no board config is available (the projects
@@ -809,8 +805,7 @@ fn parse_rfc3339(text: &str) -> Option<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// codex — parked: not fetched (`fetch_all`) and not displayed (`PROVIDERS`),
-// kept compiled and tested for its return.
+// codex — collected into snapshots but hidden from the visible provider list.
 // ---------------------------------------------------------------------------
 
 fn codex_sessions_dir() -> Option<PathBuf> {
@@ -1671,8 +1666,8 @@ fn refresh_grok_cli() -> std::result::Result<(), String> {
 /// [`refresh_provider_async`].
 pub fn refresh_provider_now(provider: &str) {
     let fresh = match provider {
-        // Parked provider: unreachable from the row while hidden, kept so the
-        // RPC client stays exercised the day codex returns.
+        // Codex is unreachable from the row while hidden, but remains
+        // available for an explicit provider refresh.
         "codex" => fetch_codex_rpc().unwrap_or_else(|_| fetch_codex()),
         "grok" => {
             let _ = refresh_grok_cli();
@@ -1743,11 +1738,11 @@ pub fn fetch_all(force: bool) -> LimitsSnapshot {
     let now = now_secs();
     LimitsSnapshot {
         fetched_at: now,
-        // codex is parked (see PROVIDERS); its readers stay for the return.
         providers: retain_fresher_providers(
             previous.as_deref(),
             vec![
                 resolve_claude(previous.as_deref(), force),
+                fetch_codex(),
                 fetch_grok(),
                 fetch_zai(),
                 fetch_synthetic(),
