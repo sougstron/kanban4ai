@@ -1,3 +1,49 @@
+# kanban4ai 0.5.8
+
+The yolo subscription is back on the limits row, a captured agent reply keeps
+its conclusion instead of its opening, and the thread no longer pre-highlights
+its last message.
+
+## Added
+
+- **yolo returns to the limits row** (`core/limits.rs`). The endpoint publishes
+  counters but no quota — `limits.requests` and `remaining.requests` are `null`
+  on the current plans — so the ceiling comes from the plan itself: the
+  40,000,000-token rolling day of Standard pressure (`YOLO_DAILY_TOKEN_LIMIT`).
+  Only that single `24h` window is drawn; spend is the larger of the key's own
+  rolling-24h total and the project's UTC-day total, each a lower bound on the
+  real rolling day, so the row never promises capacity that is already gone.
+  The window is `rolling` with no reset countdown, and the key never expires,
+  so the segment needs no click refresh.
+
+## Changed
+
+- **Agent replies keep their ending.** The thread budget for a run's captured
+  answer is now spent from the *last* message backwards instead of clamping the
+  head: a long run loses its opening planning chatter rather than the answer it
+  finished on. Earlier messages are additionally capped by the new
+  `agent_reply_message_max_chars` threshold (default 8192) so one mid-run wall
+  of text cannot crowd out the rest, cuts land on a line boundary where there is
+  one, and both truncation markers name `.kanban/logs/<session>.log` where the
+  full text still lives.
+- **The thread no longer pre-highlights its last message.** Opening a task still
+  pins the first line of the last visible message as high as possible without
+  blank rows under the thread, but that message is no longer painted in the
+  selection colour, so the conversation reads as history instead of a fresh
+  selection.
+
+## Verification coverage
+
+- `parse_yolo_usage`, `find_yolo_key`, `is_yolo_provider` (yolo limits row)
+- `budget_is_spent_from_the_last_message_backwards`,
+  `agent_reply_budget_keeps_the_last_message_and_drops_early_chatter`
+- TUI detail test asserting `thread_selected.is_none()` on open
+- `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test --locked`, `cargo build --release --locked`, and
+  `sh scripts/test-packaging.sh`
+
+---
+
 # kanban4ai 0.5.7
 
 A quieter status line and a cleaner thread: codex/yolo leave the limits row,
