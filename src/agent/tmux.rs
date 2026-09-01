@@ -317,20 +317,19 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
         "export KANBAN_DATA_DIR={}; ",
         shell_quote(&roots.kanban_dir().display().to_string())
     );
+    // Always the absolute log dir under data_root. A relative `.kanban/logs`
+    // fallback would mkdir in the work folder after `cd` below.
+    let mkdir_logs = plan
+        .log_file
+        .parent()
+        .map(|parent| format!("mkdir -p {}; ", shell_quote(&parent.display().to_string())))
+        .unwrap_or_default();
     format!(
-        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; {project_export}{data_dir_export}mkdir -p {}; {}{}{run_pipeline}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",
+        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; {project_export}{data_dir_export}{mkdir_logs}{}{}{run_pipeline}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",
         shell_quote(&roots.work_path.display().to_string()),
         shell_quote(&plan.session_id),
         shell_quote(&plan.task_id),
         kanban_cmd,
-        shell_quote(
-            &plan
-                .log_file
-                .parent()
-                .unwrap_or_else(|| Path::new(".kanban/logs"))
-                .display()
-                .to_string()
-        ),
         heartbeat_loop,
         resolve_agent,
         auto_segment,

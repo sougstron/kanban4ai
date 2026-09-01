@@ -367,3 +367,13 @@ fn missing_thread_loads_empty() {
     assert_eq!(thread.rev, 0);
     assert!(thread.messages.is_empty());
 }
+
+#[test]
+fn new_does_not_create_kanban_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    ThreadManager::new(dir.path()).unwrap();
+    assert!(
+        !dir.path().join(".kanban").exists(),
+        "constructing ThreadManager must not mkdir .kanban"
+    );
+}
