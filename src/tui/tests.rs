@@ -2600,6 +2600,8 @@ fn mouse_wheel_scrolls_detail_thread_under_cursor() {
         .map(|hitbox| hitbox.area)
         .expect("thread hitbox");
     assert!(app.detail.as_ref().unwrap().max_scroll > 0);
+    app.handle_key(key(KeyCode::Home)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().scroll, 0);
 
     let scroll_down = MouseEvent {
         kind: MouseEventKind::ScrollDown,
@@ -2616,6 +2618,313 @@ fn mouse_wheel_scrolls_detail_thread_under_cursor() {
     };
     app.handle_mouse(scroll_up).unwrap();
     assert_eq!(app.detail.as_ref().unwrap().scroll, 0);
+}
+
+#[test]
+fn hide_kanban_messages_filters_thread_but_keeps_sidecar() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Filter kanban lines"))
+        .unwrap();
+    let thread_manager = ThreadManager::new(dir.path()).unwrap();
+    thread_manager
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::System,
+            crate::core::models::MessageKind::System,
+            "KANBAN-AUDIT-NOTE",
+            None,
+            Vec::new(),
+            Some("kanban".to_string()),
+        )
+        .unwrap();
+    thread_manager
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            "AGENT-REPLY-BODY",
+            None,
+            Vec::new(),
+            Some("agent-reply".to_string()),
+        )
+        .unwrap();
+    app.settings.hide_kanban_messages = true;
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    let rendered = render_snapshot(&mut app);
+    assert!(
+        rendered.contains("AGENT-REPLY-BODY"),
+        "non-kanban messages must stay visible:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("KANBAN-AUDIT-NOTE"),
+        "kanban messages must be hidden:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("Task created:"),
+        "initial kanban system message must be hidden:\n{rendered}"
+    );
+
+    let stored = thread_manager.load(&task.id).unwrap();
+    assert!(
+        stored
+            .messages
+            .iter()
+            .any(|message| message.body.contains("KANBAN-AUDIT-NOTE")),
+        "filter must not delete sidecar messages"
+    );
+}
+
+#[test]
+fn settings_save_persists_hide_kanban_messages() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().expect("settings");
+        modal.focus_field(DialogField::HideKanbanMessages);
+        assert!(!modal.hide_kanban_messages);
+    }
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("toggle hide");
+    assert!(app.modal.as_ref().expect("settings").hide_kanban_messages);
+    let save_field = app.modal.as_ref().unwrap().fields().len() - 2;
+    app.modal.as_mut().unwrap().field_index = save_field;
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+
+    assert!(app.settings.hide_kanban_messages);
+    let config = app.ops.config.load().expect("saved config");
+    assert_eq!(
+        config
+            .tui
+            .get("hide_kanban_messages")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+}
+
+#[test]
+fn opening_short_thread_does_not_scroll() {
+    let (_dir, mut app) = app_with_board();
+    app.ops
+        .create_task(NewTask::titled("Short thread"))
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    let rendered = render_at(&mut app, 96, 28);
+    assert_eq!(app.detail.as_ref().unwrap().scroll, 0);
+    assert_eq!(app.detail.as_ref().unwrap().max_scroll, 0);
+    assert!(
+        rendered.contains("Task created:"),
+        "short thread stays at the top:\n{rendered}"
+    );
+}
+
+#[test]
+fn opening_long_thread_pins_last_message_without_blank_tail() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Long thread pin"))
+        .unwrap();
+    let thread_manager = ThreadManager::new(dir.path()).unwrap();
+    thread_manager
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            "FIRST-MARKER",
+            None,
+            Vec::new(),
+            Some("agent".to_string()),
+        )
+        .unwrap();
+    for index in 0..24 {
+        thread_manager
+            .post(
+                &task.id,
+                crate::core::models::MessageRole::Agent,
+                crate::core::models::MessageKind::Context,
+                &format!("Context line {index}"),
+                None,
+                Vec::new(),
+                Some("agent".to_string()),
+            )
+            .unwrap();
+    }
+    thread_manager
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            "LAST-MARKER",
+            None,
+            Vec::new(),
+            Some("agent".to_string()),
+        )
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    let rendered = render_at(&mut app, 96, 20);
+    let detail = app.detail.as_ref().unwrap();
+    assert!(detail.max_scroll > 0);
+    assert_eq!(detail.scroll, detail.max_scroll);
+    assert!(
+        rendered.contains("LAST-MARKER"),
+        "last message must be in view:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("FIRST-MARKER"),
+        "first extra message must be scrolled away:\n{rendered}"
+    );
+}
+
+#[test]
+fn opening_with_filter_pins_last_visible_message() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Filtered pin"))
+        .unwrap();
+    let thread_manager = ThreadManager::new(dir.path()).unwrap();
+    for index in 0..20 {
+        thread_manager
+            .post(
+                &task.id,
+                crate::core::models::MessageRole::Agent,
+                crate::core::models::MessageKind::Context,
+                &format!("VISIBLE-LINE-{index}"),
+                None,
+                Vec::new(),
+                Some("agent".to_string()),
+            )
+            .unwrap();
+        thread_manager
+            .post(
+                &task.id,
+                crate::core::models::MessageRole::System,
+                crate::core::models::MessageKind::System,
+                &format!("HIDDEN-LINE-{index}"),
+                None,
+                Vec::new(),
+                Some("kanban".to_string()),
+            )
+            .unwrap();
+    }
+    thread_manager
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            "VISIBLE-LAST",
+            None,
+            Vec::new(),
+            Some("agent".to_string()),
+        )
+        .unwrap();
+    thread_manager
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::System,
+            crate::core::models::MessageKind::System,
+            "HIDDEN-LAST",
+            None,
+            Vec::new(),
+            Some("kanban".to_string()),
+        )
+        .unwrap();
+    app.settings.hide_kanban_messages = true;
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    let rendered = render_at(&mut app, 96, 20);
+    assert!(
+        rendered.contains("VISIBLE-LAST"),
+        "last visible message must be in view:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("HIDDEN-LAST"),
+        "filtered kanban tail must stay hidden:\n{rendered}"
+    );
+    let detail = app.detail.as_ref().unwrap();
+    let last = detail.messages.get(detail.thread_selected).unwrap();
+    assert_eq!(last.body, "VISIBLE-LAST");
+}
+
+#[test]
+fn opening_tall_last_message_puts_header_at_top() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Tall last message"))
+        .unwrap();
+    let thread_manager = ThreadManager::new(dir.path()).unwrap();
+    thread_manager
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            "FIRST-MARKER",
+            None,
+            Vec::new(),
+            Some("agent".to_string()),
+        )
+        .unwrap();
+    for index in 0..8 {
+        thread_manager
+            .post(
+                &task.id,
+                crate::core::models::MessageRole::Agent,
+                crate::core::models::MessageKind::Context,
+                &format!("Context line {index}"),
+                None,
+                Vec::new(),
+                Some("agent".to_string()),
+            )
+            .unwrap();
+    }
+    let last_body = (0..40)
+        .map(|index| format!("LAST-BODY-{index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    thread_manager
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            &last_body,
+            None,
+            Vec::new(),
+            Some("agent".to_string()),
+        )
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    let rendered = render_at(&mut app, 96, 20);
+    let detail = app.detail.as_ref().unwrap();
+    assert!(detail.max_scroll > 0);
+    assert!(
+        detail.scroll < detail.max_scroll,
+        "tall last message should pin its header, not the thread tail"
+    );
+    assert!(
+        rendered.contains("LAST-BODY-0"),
+        "first line of last message must be in view:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("FIRST-MARKER"),
+        "earlier messages must be scrolled away:\n{rendered}"
+    );
 }
 
 fn review_column(app: &App) -> usize {

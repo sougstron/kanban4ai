@@ -106,6 +106,7 @@ pub enum DialogField {
     Answer,
     Theme,
     TaskSort,
+    HideKanbanMessages,
     EscapeToProjects,
     ProjectSort,
     UpdateCheckOnOpen,
@@ -149,7 +150,7 @@ const TASK_FORM_FIELDS: [DialogField; 10] = [
     DialogField::UseReviewer,
 ];
 
-const SETTINGS_FORM_FIELDS: [DialogField; 29] = [
+const SETTINGS_FORM_FIELDS: [DialogField; 30] = [
     DialogField::Title,
     DialogField::Backend,
     DialogField::Model,
@@ -157,6 +158,7 @@ const SETTINGS_FORM_FIELDS: [DialogField; 29] = [
     DialogField::Agent,
     DialogField::Theme,
     DialogField::TaskSort,
+    DialogField::HideKanbanMessages,
     DialogField::QueueEnabled,
     DialogField::MaxRunningTotal,
     DialogField::MaxRunningDesigner,
@@ -307,6 +309,7 @@ pub struct ModalState {
     pub theme_selected: usize,
     pub task_sort_options: Vec<SelectOption>,
     pub task_sort_selected: usize,
+    pub hide_kanban_messages: bool,
     pub project_sort_options: Vec<SelectOption>,
     pub project_sort_selected: usize,
     pub purge_data: bool,
@@ -389,6 +392,7 @@ impl ModalState {
             theme_selected: 0,
             task_sort_options: Vec::new(),
             task_sort_selected: 0,
+            hide_kanban_messages: false,
             project_sort_options: Vec::new(),
             project_sort_selected: 0,
             purge_data: false,
@@ -475,6 +479,7 @@ impl ModalState {
                 DialogField::Agent,
                 DialogField::Theme,
                 DialogField::TaskSort,
+                DialogField::HideKanbanMessages,
                 DialogField::QueueEnabled,
                 DialogField::MaxRunningTotal,
                 DialogField::MaxRunningDesigner,
@@ -926,6 +931,7 @@ impl ModalState {
             }
             DialogField::Theme => self.input_select(key, SelectorKind::Theme),
             DialogField::TaskSort => self.input_select(key, SelectorKind::TaskSort),
+            DialogField::HideKanbanMessages => toggle_on_space(&mut self.hide_kanban_messages, key),
             DialogField::QueueEnabled => toggle_on_space(&mut self.queue_enabled, key),
             DialogField::MaxRunningTotal => input_single_line(&mut self.max_running_total, key),
             DialogField::MaxRunningDesigner => {
@@ -1043,6 +1049,7 @@ impl ModalState {
             DialogField::Answer => &mut self.answer,
             DialogField::Theme => &mut self.theme,
             DialogField::TaskSort => &mut self.task_sort,
+            DialogField::HideKanbanMessages => &mut self.answer,
             DialogField::MaxRunningTotal => &mut self.max_running_total,
             DialogField::MaxRunningDesigner => &mut self.max_running_designer,
             DialogField::MaxRunningReviewer => &mut self.max_running_reviewer,
@@ -1629,6 +1636,7 @@ impl ModalState {
             self.theme_selected.to_string(),
             raw_textarea_text(&self.task_sort),
             self.task_sort_selected.to_string(),
+            self.hide_kanban_messages.to_string(),
             self.escape_to_projects.to_string(),
             self.update_check_on_open.to_string(),
             raw_textarea_text(&self.project_sort),
@@ -2214,6 +2222,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::EscapeToProjects
         | DialogField::UpdateCheckOnOpen
         | DialogField::QueueEnabled
+        | DialogField::HideKanbanMessages
         | DialogField::AutoRestartEnabled
         | DialogField::DesignerEnabled
         | DialogField::ReviewerEnabled
@@ -2605,6 +2614,15 @@ fn render_selector_field(
             &modal.task_sort_options,
             modal.task_sort_selected,
             area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::HideKanbanMessages => render_checkbox(
+            frame,
+            app,
+            area,
+            "Thread",
+            "hide messages by kanban",
+            modal.hide_kanban_messages,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::ProjectSort => render_select(

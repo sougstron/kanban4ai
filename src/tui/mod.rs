@@ -12,6 +12,7 @@ mod projects;
 mod search;
 mod sessions;
 mod theme;
+mod thread_view;
 
 #[cfg(test)]
 mod tests;
