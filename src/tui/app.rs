@@ -49,7 +49,7 @@ use super::image;
 use super::projects::{self, ProjectListItem, ProjectRow};
 use super::search::SearchState;
 use super::theme::Theme;
-use super::thread_view::{is_kanban_authored, last_visible_index};
+use super::thread_view::is_kanban_authored;
 
 const CTRL_C_EXIT_PROMPT: &str = "Press ctrl + C again to close";
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(3);
@@ -252,7 +252,9 @@ pub struct DetailState {
     pub task: Option<Task>,
     pub messages: Vec<Message>,
     /// Index into `messages` of the message `x` will toggle-reject.
-    pub thread_selected: usize,
+    /// `None` until the user picks one with `[`/`]` — opening a task no
+    /// longer pre-highlights the last message.
+    pub thread_selected: Option<usize>,
     pub scroll: u16,
     /// Upper scroll bound, set by the renderer from the thread content height.
     pub max_scroll: u16,
@@ -2848,8 +2850,9 @@ impl App {
         });
         let preserved_selected_msg_id = self.detail.as_ref().and_then(|detail| {
             (detail.task_id == task_id)
-                .then(|| detail.messages.get(detail.thread_selected))
+                .then_some(detail.thread_selected)
                 .flatten()
+                .and_then(|index| detail.messages.get(index))
                 .map(|message| message.id.clone())
         });
         let preserved_scroll = self.detail.as_ref().and_then(|detail| {
@@ -2862,9 +2865,7 @@ impl App {
             .messages;
         let thread_selected = preserved_selected_msg_id
             .and_then(|msg_id| messages.iter().position(|message| message.id == msg_id))
-            .filter(|&index| !hide_kanban || !is_kanban_authored(&messages[index]))
-            .or_else(|| last_visible_index(&messages, hide_kanban))
-            .unwrap_or(0);
+            .filter(|&index| !hide_kanban || !is_kanban_authored(&messages[index]));
         let mut review_edits = TextArea::from(
             task.as_ref()
                 .map(|task| lines_or_empty(&task.review_edits))
@@ -2934,12 +2935,19 @@ impl App {
         if visible.is_empty() {
             return;
         }
-        let current = visible
-            .iter()
-            .position(|index| *index == detail.thread_selected)
-            .unwrap_or(0);
-        let next = (current as i32 + delta).rem_euclid(visible.len() as i32);
-        detail.thread_selected = visible[next as usize];
+        let next = match detail.thread_selected {
+            Some(selected) => {
+                let current = visible
+                    .iter()
+                    .position(|index| *index == selected)
+                    .unwrap_or(0);
+                visible[(current as i32 + delta).rem_euclid(visible.len() as i32) as usize]
+            }
+            // No highlight yet: `]` starts at the first message, `[` at the last.
+            None if delta > 0 => visible[0],
+            None => *visible.last().expect("visible checked non-empty"),
+        };
+        detail.thread_selected = Some(next);
     }
 
     /// Toggle `rejected` on the message selected in the thread panel (`[`/`]`
@@ -2949,7 +2957,10 @@ impl App {
         let Some(detail) = self.detail.as_ref() else {
             return Ok(());
         };
-        let Some(message) = detail.messages.get(detail.thread_selected) else {
+        let Some(message) = detail
+            .thread_selected
+            .and_then(|index| detail.messages.get(index))
+        else {
             return Ok(());
         };
         let task_id = detail.task_id.clone();

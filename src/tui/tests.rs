@@ -2855,8 +2855,10 @@ fn opening_with_filter_pins_last_visible_message() {
         "filtered kanban tail must stay hidden:\n{rendered}"
     );
     let detail = app.detail.as_ref().unwrap();
-    let last = detail.messages.get(detail.thread_selected).unwrap();
-    assert_eq!(last.body, "VISIBLE-LAST");
+    assert!(
+        detail.thread_selected.is_none(),
+        "opening a task must not pre-highlight a message"
+    );
 }
 
 #[test]
