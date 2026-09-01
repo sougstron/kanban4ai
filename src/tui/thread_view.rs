@@ -24,12 +24,6 @@ pub(super) fn visible_thread_messages(messages: &[Message], hide_kanban: bool) -
     }
 }
 
-pub(super) fn last_visible_index(messages: &[Message], hide_kanban: bool) -> Option<usize> {
-    messages
-        .iter()
-        .rposition(|message| !hide_kanban || !is_kanban_authored(message))
-}
-
 /// Scroll so `last_start` (first wrapped row of the last visible message) sits
 /// as high as possible without leaving empty rows under the thread.
 pub(super) fn pin_last_message_scroll(
@@ -42,9 +36,7 @@ pub(super) fn pin_last_message_scroll(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_kanban_authored, last_visible_index, pin_last_message_scroll, visible_thread_messages,
-    };
+    use super::{is_kanban_authored, pin_last_message_scroll, visible_thread_messages};
     use crate::core::models::{Message, MessageKind, MessageRole};
 
     fn message(id: &str, author: Option<&str>) -> Message {
@@ -74,7 +66,6 @@ mod tests {
         ];
         let visible = visible_thread_messages(&messages, false);
         assert_eq!(visible.len(), 3);
-        assert_eq!(last_visible_index(&messages, false), Some(2));
     }
 
     #[test]
@@ -93,14 +84,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["MSG-002", "MSG-004"]
         );
-        assert_eq!(last_visible_index(&messages, true), Some(3));
     }
 
     #[test]
-    fn last_visible_index_is_none_when_filter_hides_everything() {
+    fn visible_thread_messages_is_empty_when_filter_hides_everything() {
         let messages = [message("MSG-001", Some("kanban"))];
         assert!(visible_thread_messages(&messages, true).is_empty());
-        assert_eq!(last_visible_index(&messages, true), None);
     }
 
     #[test]

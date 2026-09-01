@@ -115,8 +115,8 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let detail_ref = app.detail.as_ref().unwrap();
         let visible = visible_thread_messages(&detail_ref.messages, hide_kanban);
         let selected_id = detail_ref
-            .messages
-            .get(detail_ref.thread_selected)
+            .thread_selected
+            .and_then(|index| detail_ref.messages.get(index))
             .map(|message| message.id.clone());
         let panel_lines = thread_lines(&visible, selected_id.as_deref(), &theme);
         let last_start = if visible.len() <= 1 {
