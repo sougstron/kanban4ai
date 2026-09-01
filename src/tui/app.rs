@@ -49,6 +49,7 @@ use super::image;
 use super::projects::{self, ProjectListItem, ProjectRow};
 use super::search::SearchState;
 use super::theme::Theme;
+use super::thread_view::{is_kanban_authored, last_visible_index};
 
 const CTRL_C_EXIT_PROMPT: &str = "Press ctrl + C again to close";
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(3);
@@ -91,6 +92,8 @@ pub struct TuiSettings {
     pub project_sort: String,
     /// Draw the provider subscription-limits row above the status bar.
     pub show_limits: bool,
+    /// Hide thread messages authored by kanban (audit notes). Display filter only.
+    pub hide_kanban_messages: bool,
     /// Seconds a limits snapshot stays fresh before a background refresh.
     pub limits_refresh_interval: i64,
 }
@@ -253,6 +256,8 @@ pub struct DetailState {
     pub scroll: u16,
     /// Upper scroll bound, set by the renderer from the thread content height.
     pub max_scroll: u16,
+    /// On the next thread paint, pin the first row of the last visible message.
+    pub pin_last_message: bool,
     pub review_edits: TextArea<'static>,
     pub focus: DetailFocus,
     pub answer_input: TextArea<'static>,
@@ -2850,13 +2855,19 @@ impl App {
                 .flatten()
                 .map(|message| message.id.clone())
         });
+        let preserved_scroll = self.detail.as_ref().and_then(|detail| {
+            (detail.task_id == task_id).then_some((detail.scroll, detail.pin_last_message))
+        });
+        let hide_kanban = self.settings.hide_kanban_messages;
         let task = self.ops.get_task(task_id)?;
         let messages = ThreadManager::new(&self.project_path)?
             .load(task_id)?
             .messages;
         let thread_selected = preserved_selected_msg_id
             .and_then(|msg_id| messages.iter().position(|message| message.id == msg_id))
-            .unwrap_or_else(|| messages.len().saturating_sub(1));
+            .filter(|&index| !hide_kanban || !is_kanban_authored(&messages[index]))
+            .or_else(|| last_visible_index(&messages, hide_kanban))
+            .unwrap_or(0);
         let mut review_edits = TextArea::from(
             task.as_ref()
                 .map(|task| lines_or_empty(&task.review_edits))
@@ -2878,10 +2889,11 @@ impl App {
             task,
             messages,
             thread_selected,
-            scroll: 0,
+            scroll: preserved_scroll.map(|(scroll, _)| scroll).unwrap_or(0),
             // The real bound is known only at render time; start unbounded so
             // a preserved scroll position survives until the next frame.
             max_scroll: u16::MAX,
+            pin_last_message: preserved_scroll.map(|(_, pin)| pin).unwrap_or(true),
             review_edits,
             focus: DetailFocus::Thread,
             answer_input: {
@@ -2911,15 +2923,26 @@ impl App {
     }
 
     fn move_thread_selection(&mut self, delta: i32) {
+        let hide_kanban = self.settings.hide_kanban_messages;
         let Some(detail) = self.detail.as_mut() else {
             return;
         };
-        if detail.messages.is_empty() {
+        let visible: Vec<usize> = detail
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| !hide_kanban || !is_kanban_authored(message))
+            .map(|(index, _)| index)
+            .collect();
+        if visible.is_empty() {
             return;
         }
-        let len = detail.messages.len() as i32;
-        let next = (detail.thread_selected as i32 + delta).rem_euclid(len);
-        detail.thread_selected = next as usize;
+        let current = visible
+            .iter()
+            .position(|index| *index == detail.thread_selected)
+            .unwrap_or(0);
+        let next = (current as i32 + delta).rem_euclid(visible.len() as i32);
+        detail.thread_selected = visible[next as usize];
     }
 
     /// Toggle `rejected` on the message selected in the thread panel (`[`/`]`
@@ -3069,6 +3092,7 @@ impl App {
             normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
                 .to_string(),
         ]);
+        modal.hide_kanban_messages = tui_bool(&config.tui, "hide_kanban_messages", false);
         let orch = OrchestrationSettings::from_mapping(&config.orchestration);
         modal.queue_enabled = orch.queue_enabled;
         modal.max_running_total = TextArea::new(vec![orch.max_running_total.to_string()]);
@@ -4680,6 +4704,10 @@ impl App {
                         Value::String("task_sort".to_string()),
                         Value::String(task_sort.clone()),
                     );
+                    config.tui.insert(
+                        Value::String("hide_kanban_messages".to_string()),
+                        Value::Bool(modal.hide_kanban_messages),
+                    );
                     config.auto_launch.insert(
                         Value::String("default_agent".to_string()),
                         Value::String(backend.clone()),
@@ -4721,6 +4749,7 @@ impl App {
                 self.settings.project_name = project_name;
                 self.settings.theme_name = theme_name.clone();
                 self.settings.task_sort = task_sort;
+                self.settings.hide_kanban_messages = modal.hide_kanban_messages;
                 self.theme = Theme::named(&theme_name);
                 self.refresh_after_action()?;
                 self.status = "Project settings saved".to_string();
@@ -5522,6 +5551,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::Agent => Some(modal.agent_selected),
         DialogField::Theme => Some(modal.theme_selected),
         DialogField::TaskSort => Some(modal.task_sort_selected),
+        DialogField::HideKanbanMessages => None,
         DialogField::ProjectSort => Some(modal.project_sort_selected),
         DialogField::ChainTo => Some(modal.chain_selected),
         DialogField::TargetStatus => Some(modal.status_selected),
@@ -5642,6 +5672,7 @@ fn default_project_settings() -> TuiSettings {
         escape_to_projects: false,
         project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
         show_limits: true,
+        hide_kanban_messages: false,
         limits_refresh_interval: crate::core::limits::DEFAULT_REFRESH_INTERVAL,
     }
 }
@@ -5662,6 +5693,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
         escape_to_projects: false,
         project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
         show_limits: tui_bool(&config.tui, "show_limits", true),
+        hide_kanban_messages: tui_bool(&config.tui, "hide_kanban_messages", false),
         limits_refresh_interval: ops
             .config
             .get_threshold("limits_refresh_interval")

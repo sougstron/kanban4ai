@@ -381,6 +381,11 @@ is still the plan, and the requested edits are already on the thread.
   values read as `task_number`.
 - `show_limits`: true - draw the provider subscription-limits row above the
   status bar on the Board and Projects screens
+- `hide_kanban_messages`: false - when true, the task-detail thread hides
+  messages authored by kanban (audit notes). They stay on the sidecar; this
+  is a display filter only. Opening a task pins the first line of the last
+  visible message as high as possible without blank rows under the thread;
+  a thread that already fits is left at scroll 0.
 
 ### Global Settings (<store>/config.yaml)
 Machine-wide settings shared by every board, stored at the store root (the

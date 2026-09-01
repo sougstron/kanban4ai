@@ -64,6 +64,7 @@ tui:
   theme: textual-dark
   task_sort: task_number
   show_limits: true
+  hide_kanban_messages: false
 auto_launch:
   enabled: true
   use_tmux: true

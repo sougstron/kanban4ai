@@ -18,6 +18,7 @@ use super::board;
 use super::card::{sanitize_terminal_text, truncate_display};
 use super::projects::shorten_path;
 use super::theme::Theme;
+use super::thread_view::{pin_last_message_scroll, visible_thread_messages};
 
 /// Width of the meta block's own title, which the project badge has to clear
 /// on the same border row.
@@ -108,8 +109,26 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // Thread panel with a clamped scroll and a scrollbar. Input-provenance
     // (what the agent actually consumed) is telemetry, not conversation, so it
     // is kept out of the thread entirely and shown only in the `v` popup.
-    let detail_ref = app.detail.as_ref().unwrap();
-    let panel_lines = thread_lines(&detail_ref.messages, detail_ref.thread_selected, &theme);
+    let inner_width = chunks[1].width.saturating_sub(2);
+    let hide_kanban = app.settings.hide_kanban_messages;
+    let (panel_lines, last_start) = {
+        let detail_ref = app.detail.as_ref().unwrap();
+        let visible = visible_thread_messages(&detail_ref.messages, hide_kanban);
+        let selected_id = detail_ref
+            .messages
+            .get(detail_ref.thread_selected)
+            .map(|message| message.id.clone());
+        let panel_lines = thread_lines(&visible, selected_id.as_deref(), &theme);
+        let last_start = if visible.len() <= 1 {
+            0
+        } else {
+            wrapped_row_count(
+                &thread_lines(&visible[..visible.len() - 1], None, &theme),
+                inner_width,
+            )
+        };
+        (panel_lines, last_start)
+    };
     let thread = Paragraph::new(panel_lines)
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .wrap(Wrap { trim: false });
@@ -117,14 +136,18 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // spans several rows in a narrow terminal, and counting logical lines would
     // stop the scroll short of the thread's last row. The block is attached
     // after measuring so `line_count` sees the inner width only.
-    let inner_width = chunks[1].width.saturating_sub(2);
     let content_height = u16::try_from(thread.line_count(inner_width)).unwrap_or(u16::MAX);
     let visible_height = chunks[1].height.saturating_sub(2);
     let max_scroll = content_height.saturating_sub(visible_height);
     let scroll = {
         let detail = app.detail.as_mut().unwrap();
         detail.max_scroll = max_scroll;
-        detail.scroll = detail.scroll.min(max_scroll);
+        if detail.pin_last_message {
+            detail.scroll = pin_last_message_scroll(last_start, content_height, visible_height);
+            detail.pin_last_message = false;
+        } else {
+            detail.scroll = detail.scroll.min(max_scroll);
+        }
         detail.scroll
     };
     app.hitboxes.push(Hitbox {
@@ -606,12 +629,29 @@ fn render_action_bar(
     );
 }
 
-fn thread_lines(messages: &[Message], selected: usize, theme: &Theme) -> Vec<Line<'static>> {
+fn wrapped_row_count(lines: &[Line<'static>], width: u16) -> u16 {
+    if lines.is_empty() || width == 0 {
+        return 0;
+    }
+    u16::try_from(
+        Paragraph::new(lines.to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(width),
+    )
+    .unwrap_or(u16::MAX)
+}
+
+fn thread_lines(
+    messages: &[&Message],
+    selected_id: Option<&str>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     if messages.is_empty() {
         return vec![Line::from("No thread messages")];
     }
     let mut lines = Vec::new();
-    for (index, message) in messages.iter().enumerate() {
+    for message in messages {
+        let selected = selected_id == Some(message.id.as_str());
         let rejected = message.status == MessageStatus::Rejected;
         let mut style = match message.kind {
             MessageKind::Question => Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
@@ -627,7 +667,7 @@ fn thread_lines(messages: &[Message], selected: usize, theme: &Theme) -> Vec<Lin
                 .fg(theme.muted)
                 .add_modifier(Modifier::DIM | Modifier::CROSSED_OUT);
         }
-        if index == selected {
+        if selected {
             style = style.add_modifier(Modifier::REVERSED);
         }
         let status = match message.status {
@@ -636,7 +676,7 @@ fn thread_lines(messages: &[Message], selected: usize, theme: &Theme) -> Vec<Lin
             MessageStatus::Resolved => "resolved",
             MessageStatus::Rejected => "rejected",
         };
-        let marker = if index == selected { "» " } else { "" };
+        let marker = if selected { "» " } else { "" };
         let mut header = format!("{marker}{} · {} · {}", message.id, message.kind, status);
         if let Some(origin) = message
             .origin
@@ -659,7 +699,7 @@ fn thread_lines(messages: &[Message], selected: usize, theme: &Theme) -> Vec<Lin
         if rejected {
             body_style = body_style.add_modifier(Modifier::DIM | Modifier::CROSSED_OUT);
         }
-        if index == selected {
+        if selected {
             body_style = body_style.add_modifier(Modifier::REVERSED);
         }
         let sanitized_body = sanitize_terminal_text(&message.body);
