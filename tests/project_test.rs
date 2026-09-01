@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 use kanban4ai::core::error::KanbanError;
 use kanban4ai::core::migrate::{board_display_name, relocate_board, set_board_display_name};
 use kanban4ai::core::models::{Session, SessionStatus};
+use kanban4ai::core::operations::Operations;
 use kanban4ai::core::project::{AddOptions, Project, ProjectStore, normalize_path, slugify};
 use kanban4ai::core::session::SessionManager;
-use kanban4ai::core::storage::Storage;
+use kanban4ai::core::storage::{NewTask, Storage};
+use kanban4ai::core::thread::ThreadManager;
 use kanban4ai::core::timefmt;
 
 /// Store plus a folder to hold work directories, both inside one tempdir.
@@ -58,6 +60,34 @@ fn add_registers_a_project_and_writes_project_yaml() {
 
     // Nothing is written into the work folder — the point of the feature.
     assert_eq!(fs::read_dir(&work).unwrap().count(), 0);
+}
+
+#[test]
+fn for_project_ops_do_not_create_a_local_kanban() {
+    let (dir, store) = temp_store();
+    let work = work_dir(dir.path(), "repo");
+    let project = add(&store, &work);
+    Storage::new(&project.data_root)
+        .init_board()
+        .expect("init board in the store");
+
+    let ops = Operations::for_project(&project);
+    ops.create_task(NewTask {
+        title: "Keep work clean".into(),
+        ..Default::default()
+    })
+    .expect("create task");
+    ThreadManager::new(&project.data_root)
+        .expect("open store threads")
+        .load("TASK-001")
+        .expect("load thread");
+    ThreadManager::new(&work).expect("mistaken work-path constructor");
+
+    assert_eq!(
+        fs::read_dir(&work).unwrap().count(),
+        0,
+        "a registered project's work folder must stay free of .kanban"
+    );
 }
 
 #[test]

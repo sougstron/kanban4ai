@@ -23,7 +23,6 @@ impl ThreadManager {
     pub fn new(project_path: impl AsRef<Path>) -> Result<Self> {
         let project_path = project_path.as_ref().to_path_buf();
         let threads_dir = project_path.join(".kanban").join("threads");
-        fs::create_dir_all(&threads_dir)?;
         Ok(ThreadManager {
             project_path,
             threads_dir,
@@ -63,6 +62,7 @@ impl ThreadManager {
         };
         merged.task_id = task_id.to_string();
         merged.rev = current.rev + 1;
+        fs::create_dir_all(&self.threads_dir)?;
         atomic_write_text(&self.thread_file(task_id), &serialize_thread(&merged)?)?;
         *thread = merged;
         thread.snapshot_base();

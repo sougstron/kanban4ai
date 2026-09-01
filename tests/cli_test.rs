@@ -910,6 +910,27 @@ fn init_is_a_noop_when_already_registered() {
 }
 
 #[test]
+fn create_context_and_heartbeat_do_not_create_local_kanban() {
+    let dir = board();
+    kanban(&dir)
+        .args(["create", "Keep work clean"])
+        .assert()
+        .success();
+    kanban(&dir)
+        .args(["context", "TASK-001", "note"])
+        .assert()
+        .success();
+    kanban(&dir)
+        .args(["heartbeat", "--session", "ses-missing"])
+        .assert()
+        .success();
+    assert!(
+        !dir.work().join(".kanban").exists(),
+        "board commands must not recreate .kanban in the work folder"
+    );
+}
+
+#[test]
 fn init_migrates_a_legacy_local_board() {
     let dir = Env::new();
     std::fs::create_dir_all(dir.work().join(".kanban/tasks/todo")).unwrap();

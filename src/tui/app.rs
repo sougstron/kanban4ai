@@ -31,7 +31,7 @@ use crate::core::operations::{Operations, QuestionRef, TaskPatch, WaitWake};
 use crate::core::project::{Project, ProjectStore};
 use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
-use crate::core::storage::NewTask;
+use crate::core::storage::{NewTask, Storage};
 use crate::core::telemetry::{self, SessionProgress};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
@@ -366,7 +366,6 @@ pub struct TextViewState {
 
 pub struct App {
     pub ops: Operations,
-    pub project_path: PathBuf,
     pub screen: Screen,
     pub board: BoardSnapshot,
     pub settings: TuiSettings,
@@ -613,7 +612,6 @@ impl App {
         };
         Ok(Self {
             ops,
-            project_path: project_path.to_path_buf(),
             screen: Screen::Board,
             board,
             settings,
@@ -708,7 +706,6 @@ impl App {
         let dummy = store.root().join(".no-board");
         let mut app = Self {
             ops: Operations::new(&dummy),
-            project_path: dummy,
             screen: Screen::Projects,
             board: BoardSnapshot::empty(),
             settings: default_project_settings(),
@@ -780,7 +777,7 @@ impl App {
     }
 
     pub fn watch_root(&self) -> Option<&Path> {
-        self.has_board.then_some(self.project_path.as_path())
+        self.has_board.then_some(self.ops.data_root())
     }
 
     /// Whether this app is showing a real board. The projects-list app carries
@@ -2135,7 +2132,7 @@ impl App {
                 }
                 let backend = task.agent_backend.as_deref().unwrap_or("claude");
                 let found =
-                    telemetry::read_session_progress(&self.project_path, session_id, backend);
+                    telemetry::read_session_progress(self.ops.data_root(), session_id, backend);
                 if found.has_data() {
                     progress.insert(task.id.clone(), found);
                 }
@@ -2860,7 +2857,7 @@ impl App {
         });
         let hide_kanban = self.settings.hide_kanban_messages;
         let task = self.ops.get_task(task_id)?;
-        let messages = ThreadManager::new(&self.project_path)?
+        let messages = ThreadManager::new(self.ops.data_root())?
             .load(task_id)?
             .messages;
         let thread_selected = preserved_selected_msg_id
@@ -3350,6 +3347,10 @@ impl App {
         };
         match store.add(path, name) {
             Ok(added) => {
+                if let Err(err) = Storage::new(&added.project.data_root).init_board() {
+                    self.status = format!("Could not initialize board: {err}");
+                    return Ok(());
+                }
                 self.pending_switch = Some(LoopOutcome::OpenProject(added.project));
             }
             Err(err) => self.status = format!("Could not add project: {err}"),
@@ -3737,7 +3738,7 @@ impl App {
         }
         let heartbeat_timeout = self.ops.config.get_threshold("session_heartbeat_timeout")?;
         let state =
-            SessionManager::new(&self.project_path).session_state(session_id, heartbeat_timeout);
+            SessionManager::new(self.ops.data_root()).session_state(session_id, heartbeat_timeout);
         if matches!(state, Some(SessionState::Live | SessionState::Waiting)) {
             self.open_log_view_for(session_id.to_string());
             self.status =
@@ -3935,7 +3936,7 @@ impl App {
     /// unified open action for background agents that have no tmux host).
     fn open_log_view_for(&mut self, session_id: String) {
         self.log_view = Some(LogViewState {
-            lines: load_log_tail(&self.project_path, &session_id),
+            lines: load_log_tail(self.ops.data_root(), &session_id),
             session_id: session_id.clone(),
             scroll: 0,
             // The real bound is known only at render time; follow mode pins
@@ -3949,7 +3950,7 @@ impl App {
 
     fn refresh_log_view(&mut self) {
         if let Some(log) = self.log_view.as_mut() {
-            log.lines = load_log_tail(&self.project_path, &log.session_id);
+            log.lines = load_log_tail(self.ops.data_root(), &log.session_id);
         }
     }
 
@@ -4139,7 +4140,7 @@ impl App {
 
     fn refresh_active_sessions(&mut self) -> Result<()> {
         let heartbeat_timeout = self.ops.config.get_threshold("session_heartbeat_timeout")?;
-        self.active_sessions = SessionManager::new(&self.project_path)
+        self.active_sessions = SessionManager::new(self.ops.data_root())
             .list_sessions_with_state(heartbeat_timeout)
             .into_iter()
             .map(|(session, state)| {
@@ -4159,7 +4160,7 @@ impl App {
                     .and_then(|task| task.agent_backend.as_deref())
                     .unwrap_or("claude");
                 let progress =
-                    telemetry::read_session_progress(&self.project_path, &session.id, backend);
+                    telemetry::read_session_progress(self.ops.data_root(), &session.id, backend);
                 let token_display = progress
                     .tokens
                     .map(|value| value.to_string())
@@ -4541,7 +4542,7 @@ impl App {
                 }
                 KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL => {
                     if modal.active_field() == DialogField::Description {
-                        match image::paste_image_markdown(&self.project_path) {
+                        match image::paste_image_markdown(self.ops.data_root()) {
                             Ok(markdown) => {
                                 modal.active_textarea_mut().insert_str(&markdown);
                             }
@@ -4899,7 +4900,7 @@ impl App {
                     return Ok(());
                 }
                 if modal.kind_selected == 0 {
-                    ContextManager::new(&self.project_path).append_context(
+                    ContextManager::new(self.ops.data_root()).append_context(
                         &task_id,
                         &body,
                         "user",
