@@ -598,6 +598,57 @@ fn crash_of_already_queued_task_still_backs_off() {
     );
 }
 
+/// An `openai/*` opencode run on a spent ChatGPT plan dies instantly on a
+/// retryable 429 that names when the quota returns. The backoff ladder would
+/// burn every attempt inside that window (1 min, then 30, against a two-hour
+/// reset), so the restart is scheduled for the reset itself.
+///
+/// The transcript here carries the reset in the response body only: the
+/// `x-codex-*` header path additionally records the numbers into the machine's
+/// limits cache, which a test must not write to.
+#[test]
+fn usage_limit_error_waits_for_the_quota_reset() {
+    let (dir, ops, recorder) = restart_board("[1, 30, 270]", true);
+    let id = take_running(&ops, "Usage limit", "ses-usage-limit");
+    let resets_at = chrono::Utc::now().timestamp() + 7_335;
+    fs::write(
+        dir.path()
+            .join(".kanban/logs/ses-usage-limit.transcript.jsonl"),
+        format!(
+            r#"{{"type":"error","error":{{"name":"APIError","data":{{"message":"The usage limit has been reached","statusCode":429,"isRetryable":true,"responseBody":"{{\"error\":{{\"type\":\"usage_limit_reached\",\"message\":\"The usage limit has been reached\",\"resets_at\":{resets_at}}}}}"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    recorder.calls.lock().unwrap().clear();
+
+    let outcome = ops.reconcile_agent_exit(&id, "ses-usage-limit", 1).unwrap();
+
+    assert_eq!(outcome, AgentExitOutcome::Crashed);
+    let stored = ops.get_task(&id).unwrap().unwrap();
+    assert_eq!(stored.run_phase, Some(RunPhase::Queued));
+    let restart_at = stored.restart_at.expect("restart must be scheduled");
+    let expected = chrono::DateTime::from_timestamp(resets_at, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .naive_local();
+    assert!(
+        (restart_at - expected).num_seconds().abs() <= 2,
+        "restart_at {restart_at} should be the quota reset {expected}"
+    );
+    assert!(
+        recorder.calls().is_empty(),
+        "a spent quota must not be retried before it resets"
+    );
+    let thread = ThreadManager::new(dir.path()).unwrap().load(&id).unwrap();
+    assert!(
+        thread.messages.iter().any(|m| {
+            m.kind == MessageKind::AgentStep && m.body.contains("provider quota resets then")
+        }),
+        "thread must say why the restart waits: {:?}",
+        thread.messages
+    );
+}
+
 #[test]
 fn non_retryable_backend_error_skips_crash_restart() {
     let (dir, ops, recorder) = restart_board("[1, 30, 270]", true);

@@ -7025,9 +7025,9 @@ fn limits_row_sits_above_the_status_bar_and_lists_every_provider() {
         row.contains("✳ claude 5h 66% ↻3h30m · 7d 95% ↻6d11h"),
         "{row}"
     );
-    // codex is parked: its cached entry stays in the snapshot but the row
-    // must not draw it.
-    assert!(!row.contains("codex"), "{row}");
+    // codex reports whatever its last observation said, so the row carries
+    // that reading's age alongside the window.
+    assert!(row.contains("✺ codex mon 75% ↻18d (7d old)"), "{row}");
     assert!(row.contains("✕ grok signed out"), "{row}");
     // The status bar keeps the last line, and the board keeps its columns.
     assert!(status.contains("n new"), "{status}");
@@ -7071,10 +7071,10 @@ fn limits_row_drops_reset_times_then_names_as_the_terminal_narrows() {
     let (_dir, mut app) = populated_app();
     app.limits = Some(limits_fixture());
 
-    // codex is parked, so the row is shorter than when these widths were
-    // picked: Full needs 61 columns, NoReset 47, Percent-with-grok 22 —
-    // 55 keeps the NoReset rung and 18 keeps the drop-from-the-right rung.
-    let medium = rendered_lines(&mut app, 55, 20);
+    // Full needs 95 columns, NoReset 67, Percent 32 (22 without grok, 12 for
+    // claude alone) — 70 keeps the NoReset rung and 18 forces the row to drop
+    // providers from the right.
+    let medium = rendered_lines(&mut app, 70, 20);
     let medium_row = medium[medium.len() - 2].clone();
     let narrow = rendered_lines(&mut app, 18, 20);
     let narrow_row = narrow[narrow.len() - 2].clone();
@@ -7088,6 +7088,7 @@ fn limits_row_drops_reset_times_then_names_as_the_terminal_narrows() {
     // that no longer fit are dropped from the right.
     assert!(narrow_row.contains("✳ 66% · 95%"), "{narrow_row}");
     assert!(!narrow_row.contains("claude"), "{narrow_row}");
+    assert!(!narrow_row.contains('✺'), "{narrow_row}");
     assert!(!narrow_row.contains('✕'), "{narrow_row}");
 }
 
@@ -7132,8 +7133,10 @@ fn limits_row_drops_windows_that_have_already_reset() {
 
     assert!(row.contains("✳ claude 7d 95% ↻6d"), "{row}");
     assert!(!row.contains("1%"), "{row}");
-    // codex is parked: even its all-windows-reset entry never draws.
-    assert!(!row.contains("codex"), "{row}");
+    // Every codex window has rolled over, so the segment says so instead of
+    // showing a percentage for a period that is finished.
+    assert!(row.contains("✺ codex stale"), "{row}");
+    assert!(!row.contains("40%"), "{row}");
 }
 
 #[test]
