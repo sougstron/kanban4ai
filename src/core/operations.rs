@@ -3564,7 +3564,10 @@ impl Operations {
     /// reconciled by the time this runs. Setting the `agent_reply_max_chars`
     /// threshold to 0 turns the whole behavior off; otherwise it caps how much
     /// of a long reply is kept, since every thread entry is replayed into the
-    /// next prompt.
+    /// next prompt. The budget is spent from the run's last message backwards
+    /// (see [`reply::compose_reply`]) so the answer the agent finished on is
+    /// never the part that gets cut, and `agent_reply_message_max_chars` keeps
+    /// one long mid-run message from crowding out the rest.
     fn record_agent_reply(&self, task_id: &str, session_id: &str) {
         let Ok(max_chars) = self.config.get_threshold("agent_reply_max_chars") else {
             return;
@@ -3572,6 +3575,11 @@ impl Operations {
         if max_chars <= 0 {
             return;
         }
+        let message_max_chars = self
+            .config
+            .get_threshold("agent_reply_message_max_chars")
+            .unwrap_or(0)
+            .max(0) as usize;
         let Some(backend) = self.task_backend(task_id) else {
             return;
         };
@@ -3579,10 +3587,16 @@ impl Operations {
             .storage
             .logs_dir
             .join(format!("{session_id}.transcript.jsonl"));
-        let Some(text) = reply::session_reply(&backend, &transcript) else {
+        let Some(messages) = reply::session_messages(&backend, &transcript) else {
             return;
         };
-        let body = reply::truncate_reply(&text, max_chars as usize);
+        let log_path = self.storage.logs_dir.join(format!("{session_id}.log"));
+        let body = reply::compose_reply(
+            &messages,
+            max_chars as usize,
+            message_max_chars,
+            &log_path.display().to_string(),
+        );
         // Agents commonly repeat their summary through `kanban context` before
         // finishing; posting identical text twice would only duplicate it in
         // the next prompt.

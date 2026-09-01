@@ -364,7 +364,8 @@ is still the plan, and the requested edits are already on the thread.
 - `waiting_default_eta`: 900 (sec) - default expected wait for `kanban waiting`
 - `waiting_eta_multiplier`: 2 - safety multiplier applied to the ETA before relaunch
 - `waiting_note_max_chars`: 1000 - maximum stored wait note length
-- `agent_reply_max_chars`: 32768 - maximum length of the agent's session answer (every assistant text of the run, in order) recorded on the thread at exit (`0` disables recording it)
+- `agent_reply_max_chars`: 32768 - maximum length of the agent's session answer (every assistant text of the run, in order) recorded on the thread at exit (`0` disables recording it); the budget is spent from the last message backwards
+- `agent_reply_message_max_chars`: 8192 - maximum length kept from any single *earlier* message of that answer, so one long mid-run message cannot eat the whole budget (`0` disables the per-message cap)
 - `limits_refresh_interval`: 120 (sec) - how long a provider-limits snapshot stays fresh before the TUI refreshes it in the background
 
 ### TUI Settings (.kanban/config.yaml `tui:`)
@@ -1194,11 +1195,23 @@ as the session rendered it:
   duplicates it and is skipped).
 - Backends with no parseable transcript, and runs that ended without printing
   text, record nothing. Text identical to an existing `context` message is not
-  posted again (agents commonly repeat their summary through `kanban context`),
-  and the body is clamped to `agent_reply_max_chars` with a
-  `... (agent reply truncated)` marker; `0` disables the capture entirely.
+  posted again (agents commonly repeat their summary through `kanban context`).
 - Unlike `core/provenance.rs` (telemetry, deliberately kept out of the thread)
   this is the agent's own prose and belongs in the thread.
+
+The messages are kept as a list and assembled by `compose_reply` within
+`agent_reply_max_chars` (`0` disables the capture entirely). The budget is
+spent **from the tail**, not the head: the run's last message is laid down
+first and earlier ones are prepended while they still fit, so a long run loses
+its opening planning chatter rather than the answer it finished on — the
+head-first clamp used to cut the conclusion off mid-sentence. Every earlier
+message is additionally clamped to `agent_reply_message_max_chars` so one
+mid-run wall of text cannot crowd out the rest. Cuts land on a line boundary
+where there is one (agent answers are markdown; slicing a table row mid-cell
+reads as corruption), and both markers —
+`... (agent reply truncated, full text in <log>)` and
+`... (N earlier agent messages omitted, full text in <log>)` — name
+`.kanban/logs/<session>.log` so the dropped text can still be read in full.
 
 ### Live Agent Telemetry (`core/telemetry.rs`)
 `read_session_progress` answers *how a run is going right now* by re-reading the

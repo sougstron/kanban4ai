@@ -2879,8 +2879,84 @@ fn agent_reply_is_truncated_to_the_configured_budget() {
         .find(|m| m.body.starts_with("xxxx"))
         .expect("truncated reply posted");
     assert!(reply.body.starts_with(&"x".repeat(20)));
-    assert!(reply.body.ends_with("(agent reply truncated)"));
+    // The marker points at the run log so the cut text can still be read.
+    assert!(reply.body.ends_with(&format!(
+        "... (agent reply truncated, full text in {})",
+        dir.path().join(".kanban/logs/ses-long.log").display()
+    )));
     assert!(reply.body.len() < long.len());
+}
+
+/// The budget is spent from the run's last message backwards, so a long run
+/// keeps the answer it finished on and drops its opening chatter instead.
+#[test]
+fn agent_reply_budget_keeps_the_last_message_and_drops_early_chatter() {
+    let (dir, ops, _recorder) = ops_with_recorder(true);
+    // Room for the final message plus exactly one capped earlier message,
+    // marker included — the temp path inside it makes its length vary.
+    let marker = format!(
+        "\n... (agent reply truncated, full text in {})",
+        dir.path().join(".kanban/logs/ses-tail.log").display()
+    );
+    let budget = "Итог: всё зелёное.".chars().count() + 2 + 40 + marker.chars().count() + 5;
+    fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        format!(
+            "columns:\n- name: To Do\n  id: todo\n- name: In Progress\n  id: in_progress\n\
+             - name: Review\n  id: review\n- name: Done\n  id: done\n\
+             notifications:\n  enabled: false\nauto_launch:\n  enabled: true\n\
+             thresholds:\n  agent_reply_max_chars: {budget}\n  \
+             agent_reply_message_max_chars: 40\n"
+        ),
+    )
+    .unwrap();
+    let task = ops
+        .create_task(NewTask {
+            agent_backend: Some("claude".to_string()),
+            ..NewTask::titled("Long run")
+        })
+        .unwrap();
+    ops.take_task(&task.id, "ses-tail", true).unwrap().unwrap();
+
+    let plan = "p".repeat(300);
+    let middle = "m".repeat(300);
+    fs::write(
+        dir.path().join(".kanban/logs/ses-tail.transcript.jsonl"),
+        format!(
+            concat!(
+                r#"{{"type":"assistant","message":{{"id":"msg_1","content":[{{"type":"text","text":"{plan}"}}]}}}}"#,
+                "\n",
+                r#"{{"type":"assistant","message":{{"id":"msg_2","content":[{{"type":"text","text":"{middle}"}}]}}}}"#,
+                "\n",
+                r#"{{"type":"assistant","message":{{"id":"msg_3","content":[{{"type":"text","text":"Итог: всё зелёное."}}]}}}}"#,
+                "\n",
+            ),
+            plan = plan,
+            middle = middle,
+        ),
+    )
+    .unwrap();
+
+    ops.reconcile_agent_exit(&task.id, "ses-tail", 0).unwrap();
+
+    let reply = ThreadManager::new(dir.path())
+        .unwrap()
+        .messages_of_kind(&task.id, MessageKind::Context)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.body.contains("Итог"))
+        .expect("session reply posted");
+    // The final message survives whole, the middle one only up to its own cap.
+    assert!(reply.body.ends_with("Итог: всё зелёное."));
+    assert!(reply.body.contains(&"m".repeat(40)));
+    assert!(!reply.body.contains(&"m".repeat(41)));
+    // The opening plan no longer fits and is announced as dropped.
+    assert!(!reply.body.contains("ppp"));
+    assert!(
+        reply
+            .body
+            .starts_with("... (1 earlier agent message omitted")
+    );
 }
 
 #[test]
