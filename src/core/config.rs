@@ -106,7 +106,6 @@ agents:
     agent_options:
     - sisyphus
     - prometheus
-    - hephaestus
     - atlas
     extra_args: []
   claude:
