@@ -39,6 +39,13 @@
 //!   `subscription.renewsAt`) and the weekly credit window
 //!   (`weeklyTokenLimit.percentRemaining`); both regenerate in small ticks, so
 //!   the reset time is the next capacity gain, not a hard rollover.
+//! - **yolo**: `GET /v1/usage` on yolo-auto.com. The key is `$YOLO_API_KEY` /
+//!   `$YOLO_AUTO_API_KEY` or the custom yolo provider's `apiKey` in opencode
+//!   (`opencode.json`), omp (`models.yml`), or pi (`models.json`). The plan's
+//!   quota is not published by the endpoint (`limits.requests` is `null`), so
+//!   the single window is the plan's own rolling 24-hour token budget
+//!   ([`YOLO_DAILY_TOKEN_LIMIT`]) measured against the tokens the response
+//!   reports as spent.
 //!
 //! HTTPS is done by piping a config file into `curl -K -` rather than by
 //! linking a TLS stack: it keeps the dependency set unchanged, and it keeps
@@ -61,7 +68,7 @@
 //! endpoint (skipping the current-bridge short-circuit and the 15-minute
 //! interval the background refresh honors), running the grok CLI renews the
 //! short-lived token in `~/.grok/auth.json` that the billing fetch uses, and
-//! zai / synthetic simply re-fetch over HTTPS (their keys are long-lived,
+//! zai / synthetic / yolo simply re-fetch over HTTPS (their keys are long-lived,
 //! so no renewal step is needed). Each runs on a background thread and merges
 //! into the same cache, so the row updates on the next tick. The parked codex
 //! keeps its app-server JSON-RPC client (see `refresh_provider_now`) for the
@@ -91,9 +98,8 @@ use crate::core::storage::atomic_write_text;
 /// codex is parked: its subscription is paused, so `fetch_all` skips it and
 /// the row hides it. All its readers stay compiled and tested (see the codex
 /// section and `refresh_provider_now`) — to bring it back, add `"codex"` here
-/// and `fetch_codex()` to `fetch_all`. The yolo provider was removed outright
-/// when its subscription was cancelled.
-pub const PROVIDERS: [&str; 4] = ["claude", "grok", "zai", "synthetic"];
+/// and `fetch_codex()` to `fetch_all`.
+pub const PROVIDERS: [&str; 5] = ["claude", "grok", "zai", "synthetic", "yolo"];
 
 /// Fallback refresh interval when no board config is available (the projects
 /// screen has no project, so no `.kanban/config.yaml` to read).
@@ -1280,6 +1286,207 @@ pub fn parse_synthetic_quotas(value: &Value) -> Vec<LimitWindow> {
 }
 
 // ---------------------------------------------------------------------------
+// yolo
+// ---------------------------------------------------------------------------
+
+const YOLO_USAGE_URL: &str = "https://yolo-auto.com/v1/usage";
+
+/// The plan's rolling 24-hour token budget, in tokens.
+///
+/// The usage endpoint publishes counters but no quota — `limits.requests` and
+/// `remaining.requests` are `null` on the current plans — so the ceiling has
+/// to come from the plan itself (Standard pressure: 8,000,000 per hour and
+/// 40,000,000 per 24 hours). Only the 24-hour budget is shown: it is the one
+/// that actually paces a day of agent work, and the hourly one would need a
+/// per-hour counter the endpoint does not report.
+pub const YOLO_DAILY_TOKEN_LIMIT: f64 = 40_000_000.0;
+
+fn opencode_config_path() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| home_dir().map(|home| home.join(".config")))?;
+    Some(config.join("opencode").join("opencode.json"))
+}
+
+fn omp_models_path() -> Option<PathBuf> {
+    Some(home_dir()?.join(".omp").join("agent").join("models.yml"))
+}
+
+fn pi_models_path() -> Option<PathBuf> {
+    let dir = std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".pi").join("agent")))?;
+    Some(dir.join("models.json"))
+}
+
+/// Pull a yolo API key out of an opencode / omp / pi provider config.
+/// Looks under `provider` (opencode) or `providers` (pi, omp) for an entry
+/// named like yolo or pointing at `yolo-auto.com`.
+fn yolo_key_from_store(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    yolo_key_from_config_text(&text)
+}
+
+fn yolo_key_from_config_text(text: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(text)
+        && let Some(key) = yolo_key_from_value(&value)
+    {
+        return Some(key);
+    }
+    let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(text).ok()?;
+    yolo_key_from_value(&serde_json::to_value(yaml).ok()?)
+}
+
+fn yolo_key_from_value(value: &Value) -> Option<String> {
+    for key in ["provider", "providers"] {
+        if let Some(found) = value.get(key).and_then(yolo_key_from_providers) {
+            return Some(found);
+        }
+    }
+    yolo_key_from_providers(value)
+}
+
+fn yolo_key_from_providers(providers: &Value) -> Option<String> {
+    providers
+        .as_object()
+        .into_iter()
+        .flatten()
+        .find_map(|(name, entry)| {
+            is_yolo_provider(name, entry)
+                .then(|| yolo_api_key(entry))
+                .flatten()
+        })
+}
+
+fn is_yolo_provider(name: &str, entry: &Value) -> bool {
+    if name.to_ascii_lowercase().contains("yolo") {
+        return true;
+    }
+    yolo_base_url(entry).is_some_and(|url| url.to_ascii_lowercase().contains("yolo-auto.com"))
+}
+
+fn yolo_base_url(entry: &Value) -> Option<&str> {
+    ["baseURL", "baseUrl", "base_url"]
+        .into_iter()
+        .find_map(|key| entry.get(key).and_then(Value::as_str))
+        .or_else(|| entry.get("options").and_then(yolo_base_url))
+}
+
+fn yolo_api_key(entry: &Value) -> Option<String> {
+    ["apiKey", "api_key", "key"]
+        .into_iter()
+        .find_map(|key| {
+            entry
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| entry.get("options").and_then(yolo_api_key))
+}
+
+fn find_yolo_key() -> Option<String> {
+    ["YOLO_API_KEY", "YOLO_AUTO_API_KEY"]
+        .into_iter()
+        .find_map(|name| {
+            std::env::var_os(name)
+                .filter(|key| !key.is_empty())
+                .map(|key| key.to_string_lossy().into_owned())
+        })
+        .or_else(|| {
+            [opencode_config_path(), omp_models_path(), pi_models_path()]
+                .into_iter()
+                .flatten()
+                .filter(|path| path.exists())
+                .find_map(|path| yolo_key_from_store(&path))
+        })
+}
+
+fn fetch_yolo() -> ProviderLimits {
+    let Some(key) = find_yolo_key() else {
+        return ProviderLimits::new("yolo", ProviderState::NotConfigured);
+    };
+    let headers = [
+        ("Authorization", format!("Bearer {key}")),
+        ("Accept", "application/json".to_string()),
+    ];
+    match http_get_json(YOLO_USAGE_URL, &headers) {
+        Ok(value) => {
+            let windows = parse_yolo_usage(&value);
+            if windows.is_empty() {
+                ProviderLimits::new("yolo", ProviderState::Unavailable("no quota".to_string()))
+            } else {
+                ProviderLimits {
+                    windows,
+                    ..ProviderLimits::new("yolo", ProviderState::Ready)
+                }
+            }
+        }
+        Err(err) => ProviderLimits::new("yolo", err.into_state()),
+    }
+}
+
+/// Read the yolo usage response as one `24h` token window against
+/// [`YOLO_DAILY_TOKEN_LIMIT`].
+///
+/// The endpoint reports the same spend two ways and neither alone covers the
+/// plan's rolling day, so the window takes whichever is larger — each is a
+/// lower bound on what the last 24 hours actually cost, and the row must not
+/// promise capacity that is gone:
+///
+/// - `usage.byModel[].past24h.totalTokens` is genuinely rolling but counts
+///   only the authenticated key.
+/// - `usage.day.totalTokens` (project scope preferred) covers every key of the
+///   project but is a calendar-day bucket, so it drops to zero at UTC midnight
+///   while the rolling window still holds most of the night's spend.
+///
+/// The window is marked [`LimitWindow::rolling`] and carries no reset time: a
+/// rolling budget frees capacity token by token as spend ages out, so there is
+/// no rollover instant to count down to (`usage.day.endsAt` is the calendar
+/// bucket's, not the budget's).
+pub fn parse_yolo_usage(value: &Value) -> Vec<LimitWindow> {
+    let usage = value.get("usage");
+    let rolling = yolo_rolling_day_tokens(usage);
+    let bucket = yolo_day_bucket_tokens(usage);
+    let used = match (rolling, bucket) {
+        (Some(rolling), Some(bucket)) => rolling.max(bucket),
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => return Vec::new(),
+    };
+    vec![LimitWindow::new("24h", used / YOLO_DAILY_TOKEN_LIMIT * 100.0, None).rolling()]
+}
+
+/// Tokens the authenticated key spent in the true rolling 24 hours, summed
+/// over the models it used.
+fn yolo_rolling_day_tokens(usage: Option<&Value>) -> Option<f64> {
+    let models = usage?.get("byModel")?.as_array()?;
+    let mut total = None;
+    for model in models {
+        if let Some(tokens) = model
+            .get("past24h")
+            .and_then(|past| past.get("totalTokens"))
+            .and_then(Value::as_f64)
+        {
+            total = Some(total.unwrap_or(0.0) + tokens.max(0.0));
+        }
+    }
+    total
+}
+
+/// Tokens the whole project spent in the current calendar-day bucket, falling
+/// back to the response's own day total when the project scope is absent.
+fn yolo_day_bucket_tokens(usage: Option<&Value>) -> Option<f64> {
+    let day = usage?.get("day")?;
+    day.get("project")
+        .and_then(|project| project.get("totalTokens"))
+        .and_then(Value::as_f64)
+        .or_else(|| day.get("totalTokens").and_then(Value::as_f64))
+        .map(|tokens| tokens.max(0.0))
+}
+
+// ---------------------------------------------------------------------------
 // CLI-driven refresh (TUI limits-row click)
 // ---------------------------------------------------------------------------
 
@@ -1474,6 +1681,7 @@ pub fn refresh_provider_now(provider: &str) {
         "claude" => resolve_claude(cached().as_deref(), true),
         "zai" => fetch_zai(),
         "synthetic" => fetch_synthetic(),
+        "yolo" => fetch_yolo(),
         _ => return,
     };
     let mut providers = cached()
@@ -1543,6 +1751,7 @@ pub fn fetch_all(force: bool) -> LimitsSnapshot {
                 fetch_grok(),
                 fetch_zai(),
                 fetch_synthetic(),
+                fetch_yolo(),
             ],
             now,
         ),
@@ -1956,6 +2165,117 @@ mod tests {
         fs::write(&path, r#"{"openai":{"type":"oauth"}}"#).unwrap();
         assert_eq!(synthetic_key_from_store(&path), None);
         assert!(synthetic_key_from_store(&dir.path().join("nope.json")).is_none());
+    }
+
+    #[test]
+    fn yolo_usage_maps_the_rolling_day_against_the_plan_token_budget() {
+        // 10,000,000 of 40,000,000 tokens spent in the rolling day.
+        let value: Value = serde_json::from_str(
+            r#"{"project":{"maxConcurrency":6,"concurrencySlots":6,"dailyRequestLimit":null},
+                "usage":{"day":{"endsAt":"2026-09-02T00:00:00.000Z","totalTokens":4000000,
+                                "limits":{"requests":null},
+                                "project":{"totalTokens":4000000}},
+                         "byModel":[{"model":"qwen3.8-27b",
+                                     "past24h":{"totalTokens":6000000}},
+                                    {"model":"qwen3.8-27b-vision",
+                                     "past24h":{"totalTokens":4000000}}]}}"#,
+        )
+        .unwrap();
+
+        let windows = parse_yolo_usage(&value);
+
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "24h");
+        assert_eq!(windows[0].remaining_percent, 75.0);
+        // A rolling budget frees capacity token by token: no rollover instant.
+        assert_eq!(windows[0].resets_at, None);
+        assert!(windows[0].rolling);
+    }
+
+    #[test]
+    fn yolo_usage_prefers_the_larger_of_the_rolling_and_calendar_day_spend() {
+        // Just past UTC midnight: the calendar bucket has reset but the
+        // rolling window still holds the night's spend.
+        let after_midnight: Value = serde_json::from_str(
+            r#"{"usage":{"day":{"totalTokens":200000,"project":{"totalTokens":200000}},
+                         "byModel":[{"past24h":{"totalTokens":20000000}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_yolo_usage(&after_midnight)[0].remaining_percent, 50.0);
+
+        // A second key spent through the project's budget today: the
+        // project-wide bucket outruns this key's rolling total.
+        let sibling_key: Value = serde_json::from_str(
+            r#"{"usage":{"day":{"totalTokens":30000000,"project":{"totalTokens":30000000}},
+                         "byModel":[{"past24h":{"totalTokens":10000000}}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_yolo_usage(&sibling_key)[0].remaining_percent, 25.0);
+    }
+
+    #[test]
+    fn yolo_usage_reads_either_source_alone_and_clamps_an_exhausted_budget() {
+        let bucket_only: Value =
+            serde_json::from_str(r#"{"usage":{"day":{"totalTokens":10000000}}}"#).unwrap();
+        assert_eq!(parse_yolo_usage(&bucket_only)[0].remaining_percent, 75.0);
+
+        let rolling_only: Value =
+            serde_json::from_str(r#"{"usage":{"byModel":[{"past24h":{"totalTokens":48000000}}]}}"#)
+                .unwrap();
+        assert_eq!(parse_yolo_usage(&rolling_only)[0].remaining_percent, 0.0);
+    }
+
+    #[test]
+    fn yolo_usage_without_token_counters_is_empty() {
+        let empty: Value = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(parse_yolo_usage(&empty).is_empty());
+
+        // Counters the plan never publishes must not fabricate a window.
+        let no_tokens: Value = serde_json::from_str(
+            r#"{"project":{"dailyRequestLimit":null},
+                "usage":{"day":{"requests":137,"limits":{"requests":null}},"byModel":[]}}"#,
+        )
+        .unwrap();
+        assert!(parse_yolo_usage(&no_tokens).is_empty());
+    }
+
+    #[test]
+    fn yolo_key_is_read_from_opencode_omp_and_pi_provider_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let opencode = dir.path().join("opencode.json");
+        fs::write(
+            &opencode,
+            r#"{"provider":{"yolo-auto":{"options":{
+                "baseURL":"https://yolo-auto.com/v1","apiKey":"yolo_from_opencode"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            yolo_key_from_store(&opencode),
+            Some("yolo_from_opencode".to_string())
+        );
+
+        let omp = dir.path().join("models.yml");
+        fs::write(
+            &omp,
+            "providers:\n  Yolo-Auto:\n    baseUrl: https://yolo-auto.com/v1\n    apiKey: yolo_from_omp\n",
+        )
+        .unwrap();
+        assert_eq!(yolo_key_from_store(&omp), Some("yolo_from_omp".to_string()));
+
+        // Named anything, but pointing at yolo-auto.com.
+        let pi = dir.path().join("models.json");
+        fs::write(
+            &pi,
+            r#"{"providers":{"custom":{"baseUrl":"https://yolo-auto.com/v1","apiKey":"yolo_from_pi"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(yolo_key_from_store(&pi), Some("yolo_from_pi".to_string()));
+
+        fs::write(&pi, r#"{"providers":{"Yolo-Auto":{"apiKey":""}}}"#).unwrap();
+        assert_eq!(yolo_key_from_store(&pi), None);
+        fs::write(&pi, r#"{"providers":{"openai":{"apiKey":"sk-1"}}}"#).unwrap();
+        assert_eq!(yolo_key_from_store(&pi), None);
+        assert!(yolo_key_from_store(&dir.path().join("nope.json")).is_none());
     }
 
     #[test]
