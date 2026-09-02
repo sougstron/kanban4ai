@@ -50,7 +50,7 @@ Session contract:\n\
 - Record important progress with: \"$KANBAN_CMD\" context {} <text> --source agent\n\
 - Keep the session alive with: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
 - When implementation and verification are complete, run: \"$KANBAN_CMD\" done {} --session {session_id} --agent\n\
-- If blocked, ask with: \"$KANBAN_CMD\" ask {} <question> --agent\n\
+- Ask whenever clarification is needed with: \"$KANBAN_CMD\" ask {} <question> --agent\n\
 - This session is non-interactive and terminates the moment you end your reply; background tasks, \
 monitors, and \"notifications\" die with it, so nothing you launch can re-invoke you later.\n\
 - Long-running foreground commands are safe: the board heartbeats for you while your process runs, \
@@ -161,7 +161,7 @@ Session contract:\n\
   then starts the assigned implementation bot. Do not treat done as \"the work is finished\".\n\
 - Do not implement the task. Do not edit source files. Do not call commands that change the repo.\n\
 - Do not move the task between columns (no take/move to Review/Done).\n\
-- If blocked, ask with: \"$KANBAN_CMD\" ask {} <question> --agent\n\
+- Ask whenever clarification is needed with: \"$KANBAN_CMD\" ask {} <question> --agent\n\
 - This session is non-interactive and terminates the moment you end your reply; background tasks, \
 monitors, and \"notifications\" die with it, so nothing you launch can re-invoke you later.\n\
 - Long-running foreground commands are safe: the board heartbeats for you while your process runs, \
@@ -248,7 +248,7 @@ Session contract:\n\
   Approve: \"$KANBAN_CMD\" verdict {} --approve --session {session_id} --agent\n\
   Request changes: \"$KANBAN_CMD\" verdict {} --changes <what to fix> --session {session_id} --agent\n\
   For a longer write-up, put the text in a file and pass --file <path> with --changes.\n\
-- If blocked, ask with: \"$KANBAN_CMD\" ask {} <question> --agent\n\
+- Ask whenever clarification is needed with: \"$KANBAN_CMD\" ask {} <question> --agent\n\
 - This session is non-interactive and terminates the moment you end your reply; background tasks, \
 monitors, and \"notifications\" die with it, so nothing you launch can re-invoke you later.\n\
 - The final command of your reply must be one of the verdict commands above, or the ask command if you are blocked.\n\
@@ -273,6 +273,12 @@ each question renders with selectable options. Write {form_file} then submit it:
 \"$KANBAN_CMD\" ask-form {} --file {form_file} --agent --session {session_id}\n",
         task.id
     ));
+    if task.interactive {
+        prompt.push_str(&format!(
+            "- This task is interactive: for blocking questions use \"$KANBAN_CMD\" ask {} <question> --agent --wait --session {}; for non-blocking ideas use \"$KANBAN_CMD\" suggest.\n",
+            task.id, session_id
+        ));
+    }
     prompt.push_str(role_column_block(Role::Reviewer));
     prompt.push_str("\nUser task:\n");
     if task.description.trim().is_empty() {

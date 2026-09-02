@@ -20,7 +20,7 @@ use super::app::{
     App, DetailFocus, HitAction, Screen, UiAction, load_log_tail, normalize_command_key,
 };
 use super::board;
-use super::dialogs::{DialogField, Modal, ModalButton, ModalState, SelectOption};
+use super::dialogs::{AgentSlot, DialogField, Modal, ModalButton, ModalState, SelectOption};
 use super::event::LoopOutcome;
 use super::theme::Theme;
 
@@ -817,7 +817,8 @@ fn task_form_move_and_answer_selectors_follow_keyboard_contract() {
             .any(|option| option.value.as_deref() == Some("openai/gpt-5.5"))
     );
     app.handle_key(key(KeyCode::Tab)).expect("description");
-    app.handle_key(key(KeyCode::Tab)).expect("backend");
+    app.handle_key(key(KeyCode::Tab)).expect("agent settings");
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
     app.handle_key(key(KeyCode::Down)).expect("select backend");
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.active_field(), DialogField::Backend);
@@ -857,6 +858,8 @@ fn task_form_move_and_answer_selectors_follow_keyboard_contract() {
             .iter()
             .all(|option| option.value.is_none())
     );
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("stage popup");
     app.handle_key(key(KeyCode::BackTab)).expect("backtab");
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
@@ -889,6 +892,304 @@ fn task_form_move_and_answer_selectors_follow_keyboard_contract() {
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.answer_text(), "Fast path");
 }
+
+#[test]
+fn task_parent_form_opens_nested_agent_settings_without_interactive_field() {
+    // Given a new-task parent form.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(
+        modal.fields(),
+        [
+            DialogField::Title,
+            DialogField::Description,
+            DialogField::AgentSettings,
+            DialogField::ChainTo,
+            DialogField::UseDesigner,
+            DialogField::UseReviewer,
+            DialogField::Confirm,
+            DialogField::Cancel,
+        ]
+    );
+
+    // When the launcher is activated.
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+
+    // Then the primary picker owns focus while the parent remains open.
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.agent_popup_slot(), Some(AgentSlot::Primary));
+    assert_eq!(modal.active_field(), DialogField::Backend);
+}
+
+#[test]
+fn agent_settings_cancel_restores_values_selection_and_parent_view() {
+    // Given a task form with its launcher focused at a known parent scroll.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        modal.focus_field(DialogField::AgentSettings);
+        modal.form_scroll = 2;
+    }
+    let before = {
+        let modal = app.modal.as_ref().expect("modal");
+        (
+            modal.backend_text(),
+            modal.model_text(),
+            modal.effort_text(),
+            modal.agent_text(),
+            modal.backend_selected,
+            modal.model_selected,
+            modal.effort_selected,
+            modal.agent_selected,
+        )
+    };
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+    app.handle_key(key(KeyCode::Down)).expect("change backend");
+
+    // When Esc cancels the popup.
+    app.handle_key(key(KeyCode::Esc)).expect("cancel popup");
+
+    // Then the exact picker state and parent viewport are restored.
+    let modal = app.modal.as_ref().expect("parent remains open");
+    assert_eq!(modal.agent_popup_slot(), None);
+    assert_eq!(modal.active_field(), DialogField::AgentSettings);
+    assert_eq!(modal.form_scroll, 2);
+    assert_eq!(
+        (
+            modal.backend_text(),
+            modal.model_text(),
+            modal.effort_text(),
+            modal.agent_text(),
+            modal.backend_selected,
+            modal.model_selected,
+            modal.effort_selected,
+            modal.agent_selected,
+        ),
+        before
+    );
+}
+
+#[test]
+fn agent_settings_save_stages_changes_and_returns_to_parent() {
+    // Given an open primary-agent popup on a new task.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+    app.handle_key(key(KeyCode::Down)).expect("choose backend");
+    let staged_backend = app.modal.as_ref().expect("modal").backend_text();
+
+    // When the popup is saved with Ctrl+S.
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("save popup");
+
+    // Then only the popup closes and its values remain staged in the parent.
+    let modal = app.modal.as_ref().expect("parent remains open");
+    assert_eq!(modal.agent_popup_slot(), None);
+    assert_eq!(modal.active_field(), DialogField::AgentSettings);
+    assert_eq!(modal.backend_text(), staged_backend);
+    assert!(
+        app.board
+            .columns
+            .iter()
+            .flat_map(|column| column.tasks.iter())
+            .all(|task| !task.title.is_empty())
+    );
+}
+
+#[test]
+fn settings_agent_cancel_restores_staged_values_after_backend_change() {
+    // Given staged primary settings that differ from the persisted defaults.
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    app.modal
+        .as_mut()
+        .expect("settings")
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+    app.modal.as_mut().expect("popup").model = TextArea::new(vec!["staged/model".into()]);
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("stage popup");
+    app.handle_key(key(KeyCode::Enter)).expect("reopen popup");
+    app.handle_key(key(KeyCode::Down)).expect("change backend");
+
+    // When Esc cancels the second visit.
+    app.handle_key(key(KeyCode::Esc)).expect("cancel popup");
+
+    // Then the staged value from the opening snapshot survives.
+    assert_eq!(
+        app.modal
+            .as_ref()
+            .expect("settings")
+            .model_text()
+            .as_deref(),
+        Some("staged/model")
+    );
+}
+
+#[test]
+fn agent_settings_save_clears_visit_filter() {
+    // Given a popup with a backend filter typed during this visit.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+    app.handle_key(key(KeyCode::Char('o'))).expect("filter");
+    assert_eq!(app.modal.as_ref().expect("popup").backend_filter, "o");
+
+    // When the popup is saved and opened again.
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("save popup");
+    app.handle_key(key(KeyCode::Enter)).expect("reopen popup");
+
+    // Then the visit-local filter is gone.
+    assert!(app.modal.as_ref().expect("popup").backend_filter.is_empty());
+}
+
+#[test]
+fn role_agent_options_show_hover_feedback() {
+    // Given the designer popup rendered with clickable options.
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    app.modal
+        .as_mut()
+        .expect("settings")
+        .focus_field(DialogField::DesignerAgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+    let _ = render_at(&mut app, 120, 40);
+    let option = modal_hitbox(
+        &app,
+        HitAction::ModalOption {
+            field: DialogField::DesignerBackend,
+            index: 0,
+        },
+    );
+
+    // When the pointer moves over that option.
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Moved,
+        column: option.x,
+        row: option.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("hover option");
+
+    // Then the option receives the same bold focus treatment as primary options.
+    let hovered = style_at(&mut app, 120, 40, option.x, option.y);
+    assert!(hovered.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(hovered.fg, Some(app.theme.focus));
+}
+
+#[test]
+fn agent_launcher_summary_sanitizes_terminal_controls() {
+    // Given a stored backend value containing a terminal escape.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal.as_mut().expect("modal").backend = TextArea::new(vec!["bad\u{001b}name".into()]);
+
+    // When the parent form renders its launcher summary.
+    let rendered = render_at(&mut app, 100, 32);
+
+    // Then the escape is replaced before reaching the terminal buffer.
+    assert!(!rendered.contains('\u{001b}'));
+    assert!(rendered.contains("bad�name"));
+}
+
+#[test]
+fn agent_popup_render_exposes_only_popup_hitboxes() {
+    // Given a rendered parent form and then its nested popup.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+
+    // When the frame registers hitboxes.
+    let rendered = render_at(&mut app, 100, 40);
+
+    // Then popup controls are clickable and the dimmed parent is not.
+    assert!(rendered.contains("Primary agent settings"), "{rendered}");
+    insta::assert_snapshot!("agent_popup_primary", rendered);
+    assert!(
+        app.hitboxes
+            .iter()
+            .any(|hitbox| { hitbox.action == HitAction::ModalField(DialogField::Backend) })
+    );
+    assert!(
+        !app.hitboxes
+            .iter()
+            .any(|hitbox| { hitbox.action == HitAction::ModalField(DialogField::AgentSettings) })
+    );
+}
+
+#[test]
+fn project_settings_has_separate_role_agent_launchers() {
+    // Given project settings.
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+
+    // Then all three launcher fields are present and flat role fields are not.
+    let modal = app.modal.as_ref().expect("settings");
+    for field in [
+        DialogField::AgentSettings,
+        DialogField::DesignerAgentSettings,
+        DialogField::ReviewerAgentSettings,
+    ] {
+        assert!(modal.fields().contains(&field), "missing {field:?}");
+    }
+    assert!(!modal.fields().contains(&DialogField::DesignerBackend));
+    assert!(!modal.fields().contains(&DialogField::ReviewerBackend));
+}
+
+#[test]
+fn editing_task_does_not_overwrite_persisted_interactive_state() {
+    // Given an edit dialog opened before another writer enables interactive.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('e'))).expect("edit task");
+    let mut task = app
+        .ops
+        .get_task("TASK-001")
+        .expect("load task")
+        .expect("task");
+    task.interactive = true;
+    app.ops
+        .storage
+        .save_task(&task)
+        .expect("persist concurrent flag");
+
+    // When the TUI edits and saves another field.
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .title
+        .insert_str(" updated");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save edit");
+
+    // Then the hidden compatibility field is preserved.
+    let saved = app.ops.get_task("TASK-001").expect("reload").expect("task");
+    assert!(saved.interactive);
+}
 #[test]
 fn task_form_default_backend_inherits_settings_agent() {
     let (_dir, mut app) = populated_app();
@@ -912,6 +1213,7 @@ fn task_form_default_backend_inherits_settings_agent() {
         .expect("load task")
         .expect("task present");
     assert_eq!(task.agent_backend, None);
+    assert!(!task.interactive, "new TUI tasks stay non-interactive");
 
     // Editing an unset task keeps Default selected and saving keeps it unset.
     app.focused_column = 0;
@@ -943,10 +1245,13 @@ fn task_form_default_backend_inherits_settings_agent() {
     let modal = app.modal.as_ref().expect("edit modal");
     assert_eq!(modal.backend_text().as_deref(), Some("claude"));
     app.handle_key(key(KeyCode::Tab)).expect("description");
-    app.handle_key(key(KeyCode::Tab)).expect("backend");
+    app.handle_key(key(KeyCode::Tab)).expect("agent settings");
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
     app.handle_key(key(KeyCode::Up)).expect("to opencode");
     app.handle_key(key(KeyCode::Up)).expect("to default");
     assert_eq!(app.modal.as_ref().expect("modal").backend_text(), None);
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("stage popup");
     let modal = app.modal.as_mut().expect("edit modal");
     modal.field_index = modal.fields().len() - 2;
     app.handle_key(key(KeyCode::Enter)).expect("save edit");
@@ -1056,7 +1361,9 @@ fn settings_hotkey_navigates_fields_and_reloads_backend_defaults() {
     assert_eq!(modal.title_text(), "Existing project");
     assert_eq!(modal.backend_text().as_deref(), Some("opencode"));
 
-    app.handle_key(key(KeyCode::Tab)).expect("backend field");
+    app.handle_key(key(KeyCode::Tab)).expect("agent settings");
+    app.handle_key(key(KeyCode::Enter))
+        .expect("open agent settings");
     app.handle_key(key(KeyCode::Down)).expect("choose claude");
     let modal = app.modal.as_ref().expect("settings modal");
     assert_eq!(modal.active_field(), DialogField::Backend);
@@ -1077,6 +1384,8 @@ fn settings_hotkey_navigates_fields_and_reloads_backend_defaults() {
         "No default effort"
     );
 
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("stage agent settings");
     app.handle_key(key(KeyCode::Esc))
         .expect("discard confirmation");
     assert!(app.modal.as_ref().unwrap().discard_confirm);
@@ -1127,7 +1436,9 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
         let modal = app.modal.as_mut().expect("settings modal");
         modal.title = TextArea::new(vec!["Renamed project".to_string()]);
     }
-    app.handle_key(key(KeyCode::Tab)).expect("backend");
+    app.handle_key(key(KeyCode::Tab)).expect("agent settings");
+    app.handle_key(key(KeyCode::Enter))
+        .expect("open agent settings");
     app.handle_key(key(KeyCode::Down)).expect("claude");
     app.handle_key(key(KeyCode::Tab)).expect("model");
     app.handle_key(key(KeyCode::Left)).expect("clear model");
@@ -1136,6 +1447,8 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     app.handle_key(key(KeyCode::Left)).expect("clear effort");
     app.handle_key(key(KeyCode::Left)).expect("clear effort");
     app.handle_key(key(KeyCode::Tab)).expect("agent");
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("stage agent settings");
     app.handle_key(key(KeyCode::Tab)).expect("theme");
     app.handle_key(key(KeyCode::Left)).expect("dark theme");
     app.handle_key(key(KeyCode::Tab)).expect("task sorting");
@@ -1497,6 +1810,12 @@ fn clicking_selected_settings_backend_preserves_staged_values() {
     let (_dir, mut app) = settings_app();
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open settings");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter))
+        .expect("open agent settings");
     let backend_index = app.modal.as_ref().unwrap().backend_selected;
     app.modal.as_mut().unwrap().model = TextArea::new(vec!["staged/model".to_string()]);
     let _ = render_at(&mut app, 120, 32);
@@ -1528,7 +1847,7 @@ fn settings_modal_remains_navigable_at_constrained_height() {
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open settings");
     assert!(render_at(&mut app, 80, 16).contains("Project settings"));
-    for _ in 0..5 {
+    for _ in 0..2 {
         app.handle_key(key(KeyCode::Tab))
             .expect("next settings field");
     }
@@ -1785,7 +2104,9 @@ fn settings_designer_backend_change_does_not_clobber_default_model() {
     app.modal
         .as_mut()
         .unwrap()
-        .focus_field(DialogField::DesignerBackend);
+        .focus_field(DialogField::DesignerAgentSettings);
+    app.handle_key(key(KeyCode::Enter))
+        .expect("open designer settings");
     app.handle_key(key(KeyCode::Down))
         .expect("change designer backend");
     assert_eq!(
@@ -1800,6 +2121,74 @@ fn settings_designer_backend_change_does_not_clobber_default_model() {
             .backend_text_for(super::dialogs::AgentSlot::Designer)
             .is_some()
     );
+}
+
+#[test]
+fn mouse_backend_selection_refreshes_each_role_popup() {
+    // Given each Project Settings agent launcher in turn.
+    for (launcher, slot, backend_field) in [
+        (
+            DialogField::AgentSettings,
+            AgentSlot::Primary,
+            DialogField::Backend,
+        ),
+        (
+            DialogField::DesignerAgentSettings,
+            AgentSlot::Designer,
+            DialogField::DesignerBackend,
+        ),
+        (
+            DialogField::ReviewerAgentSettings,
+            AgentSlot::Reviewer,
+            DialogField::ReviewerBackend,
+        ),
+    ] {
+        let (_dir, mut app) = settings_app();
+        app.handle_key(key(KeyCode::Char('s')))
+            .expect("open settings");
+        app.modal.as_mut().expect("settings").focus_field(launcher);
+        app.handle_key(key(KeyCode::Enter)).expect("open popup");
+        let current = app.modal.as_ref().expect("popup").backend_text_for(slot);
+        let target = app
+            .modal
+            .as_ref()
+            .expect("popup")
+            .options_for(backend_field)
+            .iter()
+            .enumerate()
+            .find(|(_, option)| option.value.is_some() && option.value != current)
+            .map(|(index, option)| (index, option.value.clone()))
+            .expect("alternate backend");
+        let _ = render_at(&mut app, 120, 40);
+        let hit = modal_hitbox(
+            &app,
+            HitAction::ModalOption {
+                field: backend_field,
+                index: target.0,
+            },
+        );
+
+        // When the backend option is clicked.
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.x,
+            row: hit.y,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("select backend");
+
+        // Then the role keeps its popup and receives refreshed dependent options.
+        let modal = app.modal.as_ref().expect("popup remains");
+        assert_eq!(modal.agent_popup_slot(), Some(slot));
+        assert_eq!(modal.backend_text_for(slot), target.1);
+        assert!(!modal.options_for(backend_field).is_empty());
+        let model_field = match slot {
+            AgentSlot::Primary => DialogField::Model,
+            AgentSlot::Designer => DialogField::DesignerModel,
+            AgentSlot::Reviewer => DialogField::ReviewerModel,
+        };
+        assert!(modal.options_for(model_field).len() > 1);
+    }
 }
 
 #[test]
@@ -2236,6 +2625,11 @@ fn mouse_move_highlights_modal_fields_options_and_buttons() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
 
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
     let _ = render_at(&mut app, 120, 32);
     let backend_hit = app
         .hitboxes
@@ -5345,9 +5739,10 @@ fn phase_four_confirm_buttons_support_one_key_and_mouse() {
 fn phase_four_forms_scroll_validate_and_protect_dirty_input() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).unwrap();
-    for _ in 0..6 {
-        app.handle_key(key(KeyCode::Tab)).unwrap();
-    }
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::ChainTo);
     let output = render_at(&mut app, 80, 24);
     assert!(output.contains("Chain to"));
     insta::assert_snapshot!("phase_four_form_scrolled_80x24", output);
@@ -5355,9 +5750,10 @@ fn phase_four_forms_scroll_validate_and_protect_dirty_input() {
     app.handle_key(key(KeyCode::Esc)).unwrap();
     app.handle_key(key(KeyCode::Char('n'))).unwrap();
     assert!(!app.modal.as_ref().unwrap().is_dirty());
-    for _ in 0..10 {
-        app.handle_key(key(KeyCode::Tab)).unwrap();
-    }
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
     app.handle_key(key(KeyCode::Enter)).unwrap();
     assert_eq!(
         app.modal.as_ref().unwrap().error.as_deref(),
@@ -5400,9 +5796,10 @@ fn phase_four_scrolled_selector_click_uses_visible_option_index() {
     }
     app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
     app.handle_key(key(KeyCode::Char('n'))).unwrap();
-    for _ in 0..6 {
-        app.handle_key(key(KeyCode::Tab)).unwrap();
-    }
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::ChainTo);
     for _ in 0..4 {
         app.handle_key(key(KeyCode::Down)).unwrap();
     }
@@ -5444,9 +5841,10 @@ fn phase_four_tall_form_expands_visible_task_selector_options() {
     }
     app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
     app.handle_key(key(KeyCode::Char('n'))).unwrap();
-    for _ in 0..6 {
-        app.handle_key(key(KeyCode::Tab)).unwrap();
-    }
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::ChainTo);
     let _ = render_at(&mut app, 100, 60);
     let visible_options = app
         .hitboxes
@@ -5509,6 +5907,20 @@ fn phase_four_modal_mouse_routes_fields_options_and_add_message_buttons() {
     let original_focus = (app.focused_column, app.focused_card);
     app.handle_key(key(KeyCode::Char('n'))).unwrap();
     let _ = render_at(&mut app, 96, 28);
+    let launcher = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::ModalField(DialogField::AgentSettings))
+        .copied()
+        .unwrap();
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: launcher.area.x,
+        row: launcher.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .unwrap();
+    let _ = render_at(&mut app, 96, 28);
     let option = app
         .hitboxes
         .iter()
@@ -5534,7 +5946,7 @@ fn phase_four_modal_mouse_routes_fields_options_and_add_message_buttons() {
     );
     assert_eq!((app.focused_column, app.focused_card), original_focus);
     app.handle_key(key(KeyCode::Esc)).unwrap();
-    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
 
     app.handle_key(key(KeyCode::Char('c'))).unwrap();
     let output = render_at(&mut app, 96, 28);
@@ -7370,7 +7782,7 @@ fn limits_progress_status_does_not_expire_while_refreshing() {
 /// Tab six times from the Title field lands on Chain to in the task form.
 fn open_new_task_on_chain(app: &mut App) {
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
-    for _ in 0..6 {
+    for _ in 0..3 {
         app.handle_key(key(KeyCode::Tab)).expect("tab");
     }
     assert_eq!(
@@ -7429,7 +7841,7 @@ fn enter_on_a_single_filter_match_selects_it_and_advances() {
     assert_eq!(modal.chain_text().as_deref(), Some("TASK-002"));
     assert_eq!(
         modal.active_field(),
-        DialogField::Interactive,
+        DialogField::UseDesigner,
         "Enter moves on like Tab"
     );
     assert_eq!(modal.filter_error, None);
@@ -7540,7 +7952,8 @@ fn backend_filters_like_the_other_long_selectors() {
     app.modal
         .as_mut()
         .expect("modal")
-        .focus_field(DialogField::Backend);
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
     let count = app.modal.as_ref().expect("modal").backend_options.len();
     assert!(count > 1, "fixture backends: {count}");
 
@@ -7559,6 +7972,11 @@ fn backend_filters_like_the_other_long_selectors() {
 fn short_selectors_take_typed_characters_as_no_filter() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
     for field in [DialogField::Effort, DialogField::Agent] {
         app.modal.as_mut().expect("modal").focus_field(field);
         let before = app.modal.as_ref().expect("modal").visible_options(field);
@@ -7642,30 +8060,8 @@ fn title_enter_walks_on_and_description_enter_writes_a_newline() {
     app.handle_key(key(KeyCode::Tab)).expect("tab on body");
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
-        DialogField::Backend
+        DialogField::AgentSettings
     );
-}
-
-#[test]
-fn interactive_toggles_on_space_only_and_enter_moves_on() {
-    let (_dir, mut app) = populated_app();
-    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
-    for _ in 0..7 {
-        app.handle_key(key(KeyCode::Tab)).expect("tab");
-    }
-    assert_eq!(
-        app.modal.as_ref().expect("modal").active_field(),
-        DialogField::Interactive
-    );
-    assert!(!app.modal.as_ref().expect("modal").interactive);
-
-    app.handle_key(key(KeyCode::Char(' '))).expect("space");
-    assert!(app.modal.as_ref().expect("modal").interactive);
-
-    app.handle_key(key(KeyCode::Enter)).expect("enter");
-    let modal = app.modal.as_ref().expect("modal");
-    assert!(modal.interactive, "Enter must not flip the checkbox");
-    assert_eq!(modal.active_field(), DialogField::UseDesigner);
 }
 
 #[test]
@@ -7677,7 +8073,7 @@ fn new_task_designer_and_reviewer_toggles_save_on_the_task() {
         .expect("modal")
         .title
         .insert_str("Per-task bots");
-    for _ in 0..8 {
+    for _ in 0..4 {
         app.handle_key(key(KeyCode::Tab)).expect("tab");
     }
     assert_eq!(
@@ -7733,6 +8129,11 @@ fn enter_still_submits_and_cancels_from_the_form_buttons() {
 fn model_filter_survives_a_catalog_refresh_and_stays_on_a_visible_option() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
     app.modal
         .as_mut()
         .expect("modal")

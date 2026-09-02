@@ -11,7 +11,7 @@ use crate::core::update;
 use crate::core::vcs::Availability;
 
 use super::app::{App, HitAction, Hitbox, UiAction};
-use super::card::{sanitize_paste_text, sanitize_terminal_text};
+use super::card::{sanitize_paste_text, sanitize_terminal_text, truncate_display};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
@@ -91,12 +91,14 @@ pub struct QuestionChoice {
 pub enum DialogField {
     Title,
     Description,
+    AgentSettings,
+    DesignerAgentSettings,
+    ReviewerAgentSettings,
     Backend,
     Model,
     Effort,
     Agent,
     ChainTo,
-    Interactive,
     UseDesigner,
     UseReviewer,
     TargetStatus,
@@ -137,25 +139,18 @@ pub enum DialogField {
     PurgeData,
 }
 
-const TASK_FORM_FIELDS: [DialogField; 10] = [
+const TASK_FORM_FIELDS: [DialogField; 6] = [
     DialogField::Title,
     DialogField::Description,
-    DialogField::Backend,
-    DialogField::Model,
-    DialogField::Effort,
-    DialogField::Agent,
+    DialogField::AgentSettings,
     DialogField::ChainTo,
-    DialogField::Interactive,
     DialogField::UseDesigner,
     DialogField::UseReviewer,
 ];
 
-const SETTINGS_FORM_FIELDS: [DialogField; 30] = [
+const SETTINGS_FORM_FIELDS: [DialogField; 21] = [
     DialogField::Title,
-    DialogField::Backend,
-    DialogField::Model,
-    DialogField::Effort,
-    DialogField::Agent,
+    DialogField::AgentSettings,
     DialogField::Theme,
     DialogField::TaskSort,
     DialogField::HideKanbanMessages,
@@ -169,18 +164,39 @@ const SETTINGS_FORM_FIELDS: [DialogField; 30] = [
     DialogField::AutoRestartEnabled,
     DialogField::AutoRestartDelays,
     DialogField::DesignerEnabled,
+    DialogField::DesignerAgentSettings,
+    DialogField::ReviewerEnabled,
+    DialogField::ReviewerAgentSettings,
+    DialogField::ReviewerOnChanges,
+    DialogField::ReviewerMaxRounds,
+    DialogField::IsolationStatus,
+];
+
+const PRIMARY_AGENT_FIELDS: [DialogField; 6] = [
+    DialogField::Backend,
+    DialogField::Model,
+    DialogField::Effort,
+    DialogField::Agent,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
+const DESIGNER_AGENT_FIELDS: [DialogField; 6] = [
     DialogField::DesignerBackend,
     DialogField::DesignerModel,
     DialogField::DesignerEffort,
     DialogField::DesignerAgent,
-    DialogField::ReviewerEnabled,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
+const REVIEWER_AGENT_FIELDS: [DialogField; 6] = [
     DialogField::ReviewerBackend,
     DialogField::ReviewerModel,
     DialogField::ReviewerEffort,
     DialogField::ReviewerAgent,
-    DialogField::ReviewerOnChanges,
-    DialogField::ReviewerMaxRounds,
-    DialogField::IsolationStatus,
+    DialogField::Confirm,
+    DialogField::Cancel,
 ];
 
 const GLOBAL_SETTINGS_FORM_FIELDS: [DialogField; 3] = [
@@ -212,6 +228,7 @@ pub enum AgentSlot {
 /// cap (`claude/opus: 1`, `opencode/openai/gpt-5.5: 2`). A bare model id is
 /// never stored — save prefixes the selected default backend when the user
 /// omits it, so the census key always matches.
+#[derive(Clone)]
 pub(crate) struct AgentPicker {
     backend: TextArea<'static>,
     model: TextArea<'static>,
@@ -227,6 +244,15 @@ pub(crate) struct AgentPicker {
     pub(crate) agent_selected: usize,
     backend_filter: String,
     model_filter: String,
+}
+
+struct AgentPopupState {
+    slot: AgentSlot,
+    parent_field_index: usize,
+    parent_form_scroll: usize,
+    field_index: usize,
+    form_scroll: usize,
+    original: AgentPicker,
 }
 
 impl AgentPicker {
@@ -333,6 +359,7 @@ pub struct ModalState {
     /// Availability probe for the current project, taken once when the
     /// settings dialog opens (the probe runs git subprocesses).
     pub isolation_status: Option<Availability>,
+    agent_popup: Option<AgentPopupState>,
 }
 
 impl ModalState {
@@ -414,6 +441,7 @@ impl ModalState {
             reviewer_on_changes_selected: 0,
             reviewer_max_rounds: one_line("3"),
             isolation_status: None,
+            agent_popup: None,
         }
     }
 
@@ -433,16 +461,19 @@ impl ModalState {
     }
 
     pub fn fields(&self) -> &'static [DialogField] {
+        if let Some(popup) = &self.agent_popup {
+            return agent_fields(popup.slot);
+        }
+        self.parent_fields()
+    }
+
+    fn parent_fields(&self) -> &'static [DialogField] {
         match self.modal {
             Modal::NewTask { .. } | Modal::EditTask { .. } => &[
                 DialogField::Title,
                 DialogField::Description,
-                DialogField::Backend,
-                DialogField::Model,
-                DialogField::Effort,
-                DialogField::Agent,
+                DialogField::AgentSettings,
                 DialogField::ChainTo,
-                DialogField::Interactive,
                 DialogField::UseDesigner,
                 DialogField::UseReviewer,
                 DialogField::Confirm,
@@ -473,10 +504,7 @@ impl ModalState {
             ],
             Modal::Settings => &[
                 DialogField::Title,
-                DialogField::Backend,
-                DialogField::Model,
-                DialogField::Effort,
-                DialogField::Agent,
+                DialogField::AgentSettings,
                 DialogField::Theme,
                 DialogField::TaskSort,
                 DialogField::HideKanbanMessages,
@@ -490,15 +518,9 @@ impl ModalState {
                 DialogField::AutoRestartEnabled,
                 DialogField::AutoRestartDelays,
                 DialogField::DesignerEnabled,
-                DialogField::DesignerBackend,
-                DialogField::DesignerModel,
-                DialogField::DesignerEffort,
-                DialogField::DesignerAgent,
+                DialogField::DesignerAgentSettings,
                 DialogField::ReviewerEnabled,
-                DialogField::ReviewerBackend,
-                DialogField::ReviewerModel,
-                DialogField::ReviewerEffort,
-                DialogField::ReviewerAgent,
+                DialogField::ReviewerAgentSettings,
                 DialogField::ReviewerOnChanges,
                 DialogField::ReviewerMaxRounds,
                 DialogField::IsolationStatus,
@@ -537,7 +559,13 @@ impl ModalState {
     }
 
     pub fn active_field(&self) -> DialogField {
-        self.fields()[self.field_index.min(self.fields().len().saturating_sub(1))]
+        let fields = self.fields();
+        let index = self
+            .agent_popup
+            .as_ref()
+            .map(|popup| popup.field_index)
+            .unwrap_or(self.field_index);
+        fields[index.min(fields.len().saturating_sub(1))]
     }
 
     /// Single entry point for every focus change, so a filter can never
@@ -545,7 +573,12 @@ impl ModalState {
     /// text and any error it was showing; coming back always starts from the
     /// full list instead of a narrowing the user has since forgotten about.
     fn set_field_index(&mut self, index: usize) {
-        if index != self.field_index {
+        let current = self
+            .agent_popup
+            .as_ref()
+            .map(|popup| popup.field_index)
+            .unwrap_or(self.field_index);
+        if index != current {
             let leaving = self.active_field();
             if let Some(filter) = self.field_filter_mut(leaving) {
                 filter.clear();
@@ -554,25 +587,35 @@ impl ModalState {
                 self.filter_error = None;
             }
         }
-        self.field_index = index;
+        if let Some(popup) = self.agent_popup.as_mut() {
+            popup.field_index = index;
+        } else {
+            self.field_index = index;
+        }
         self.ensure_active_field_visible();
     }
 
     pub fn next_field(&mut self) {
         let len = self.fields().len();
         if len > 0 {
-            self.set_field_index((self.field_index + 1) % len);
+            let current = self
+                .agent_popup
+                .as_ref()
+                .map(|popup| popup.field_index)
+                .unwrap_or(self.field_index);
+            self.set_field_index((current + 1) % len);
         }
     }
 
     pub fn prev_field(&mut self) {
         let len = self.fields().len();
         if len > 0 {
-            let index = if self.field_index == 0 {
-                len - 1
-            } else {
-                self.field_index - 1
-            };
+            let current = self
+                .agent_popup
+                .as_ref()
+                .map(|popup| popup.field_index)
+                .unwrap_or(self.field_index);
+            let index = if current == 0 { len - 1 } else { current - 1 };
             self.set_field_index(index);
         }
     }
@@ -619,6 +662,106 @@ impl ModalState {
             | DialogField::ReviewerEffort
             | DialogField::ReviewerAgent => Some(AgentSlot::Reviewer),
             _ => None,
+        }
+    }
+
+    pub fn launcher_slot(field: DialogField) -> Option<AgentSlot> {
+        match field {
+            DialogField::AgentSettings => Some(AgentSlot::Primary),
+            DialogField::DesignerAgentSettings => Some(AgentSlot::Designer),
+            DialogField::ReviewerAgentSettings => Some(AgentSlot::Reviewer),
+            _ => None,
+        }
+    }
+
+    pub fn agent_popup_slot(&self) -> Option<AgentSlot> {
+        self.agent_popup.as_ref().map(|popup| popup.slot)
+    }
+
+    pub fn open_agent_settings(&mut self, slot: AgentSlot) {
+        if self.agent_popup.is_some() {
+            return;
+        }
+        let original = self.picker_snapshot(slot);
+        self.agent_popup = Some(AgentPopupState {
+            slot,
+            parent_field_index: self.field_index,
+            parent_form_scroll: self.form_scroll,
+            field_index: 0,
+            form_scroll: 0,
+            original,
+        });
+        self.filter_error = None;
+    }
+
+    pub fn save_agent_settings(&mut self) {
+        let field = self.active_field();
+        if let Some(filter) = self.field_filter_mut(field) {
+            filter.clear();
+        }
+        self.filter_error = None;
+        self.close_agent_settings(false);
+    }
+
+    pub fn cancel_agent_settings(&mut self) {
+        self.close_agent_settings(true);
+    }
+
+    fn close_agent_settings(&mut self, restore: bool) {
+        let Some(popup) = self.agent_popup.take() else {
+            return;
+        };
+        if restore {
+            self.restore_picker(popup.slot, popup.original);
+        }
+        self.field_index = popup.parent_field_index;
+        self.form_scroll = popup.parent_form_scroll;
+        self.filter_error = None;
+    }
+
+    fn picker_snapshot(&self, slot: AgentSlot) -> AgentPicker {
+        match slot {
+            AgentSlot::Primary => AgentPicker {
+                backend: self.backend.clone(),
+                model: self.model.clone(),
+                effort: self.effort.clone(),
+                agent: self.agent.clone(),
+                backend_options: self.backend_options.clone(),
+                model_options: self.model_options.clone(),
+                effort_options: self.effort_options.clone(),
+                agent_options: self.agent_options.clone(),
+                backend_selected: self.backend_selected,
+                model_selected: self.model_selected,
+                effort_selected: self.effort_selected,
+                agent_selected: self.agent_selected,
+                backend_filter: self.backend_filter.clone(),
+                model_filter: self.model_filter.clone(),
+            },
+            AgentSlot::Designer => self.designer.clone(),
+            AgentSlot::Reviewer => self.reviewer.clone(),
+        }
+    }
+
+    fn restore_picker(&mut self, slot: AgentSlot, picker: AgentPicker) {
+        match slot {
+            AgentSlot::Primary => {
+                self.backend = picker.backend;
+                self.model = picker.model;
+                self.effort = picker.effort;
+                self.agent = picker.agent;
+                self.backend_options = picker.backend_options;
+                self.model_options = picker.model_options;
+                self.effort_options = picker.effort_options;
+                self.agent_options = picker.agent_options;
+                self.backend_selected = picker.backend_selected;
+                self.model_selected = picker.model_selected;
+                self.effort_selected = picker.effort_selected;
+                self.agent_selected = picker.agent_selected;
+                self.backend_filter = picker.backend_filter;
+                self.model_filter = picker.model_filter;
+            }
+            AgentSlot::Designer => self.designer = picker,
+            AgentSlot::Reviewer => self.reviewer = picker,
         }
     }
 
@@ -897,13 +1040,9 @@ impl ModalState {
             DialogField::Effort => self.input_select(key, SelectorKind::Effort),
             DialogField::Agent => self.input_select(key, SelectorKind::Agent),
             DialogField::ChainTo => self.input_select(key, SelectorKind::ChainTo),
-            // Checkboxes toggle on Space only; Enter belongs to field
-            // navigation like everywhere else in the form.
-            DialogField::Interactive => {
-                if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
-                    self.interactive = !self.interactive;
-                }
-            }
+            DialogField::AgentSettings
+            | DialogField::DesignerAgentSettings
+            | DialogField::ReviewerAgentSettings => {}
             DialogField::UseDesigner => toggle_on_space(&mut self.use_designer, key),
             DialogField::UseReviewer => toggle_on_space(&mut self.use_reviewer, key),
             DialogField::EscapeToProjects => {
@@ -1037,7 +1176,9 @@ impl ModalState {
             DialogField::Effort => &mut self.effort,
             DialogField::Agent => &mut self.agent,
             DialogField::ChainTo => &mut self.chain_to,
-            DialogField::Interactive
+            DialogField::AgentSettings
+            | DialogField::DesignerAgentSettings
+            | DialogField::ReviewerAgentSettings
             | DialogField::UseDesigner
             | DialogField::UseReviewer
             | DialogField::EscapeToProjects
@@ -1598,6 +1739,10 @@ impl ModalState {
     }
 
     fn ensure_active_field_visible(&mut self) {
+        if let Some(popup) = self.agent_popup.as_mut() {
+            popup.form_scroll = popup.field_index.min(3);
+            return;
+        }
         let fields = match self.modal {
             Modal::NewTask { .. } | Modal::EditTask { .. } => Some(&TASK_FORM_FIELDS[..]),
             Modal::Settings => Some(&SETTINGS_FORM_FIELDS[..]),
@@ -1674,6 +1819,14 @@ impl ModalState {
             raw_textarea_text(&self.reviewer_max_rounds),
         ]
         .join("\u{1f}")
+    }
+}
+
+fn agent_fields(slot: AgentSlot) -> &'static [DialogField] {
+    match slot {
+        AgentSlot::Primary => &PRIMARY_AGENT_FIELDS,
+        AgentSlot::Designer => &DESIGNER_AGENT_FIELDS,
+        AgentSlot::Reviewer => &REVIEWER_AGENT_FIELDS,
     }
 }
 
@@ -1845,7 +1998,89 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
             name, task_count, ..
         } => render_delete_project(frame, app, modal, inner, name, *task_count, &mut hitboxes),
     }
+    if modal.agent_popup.is_some() {
+        hitboxes.clear();
+        render_agent_popup(frame, app, modal, area, &mut hitboxes);
+    }
     hitboxes
+}
+
+fn render_agent_popup(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &mut ModalState,
+    parent_area: Rect,
+    hitboxes: &mut Vec<Hitbox>,
+) {
+    let Some(popup) = modal.agent_popup.as_ref() else {
+        return;
+    };
+    let slot = popup.slot;
+    let scroll = popup.form_scroll;
+    let area = centered_percent(88, 90, parent_area);
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .title(format!(" {} agent settings ", agent_slot_name(slot)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.focus))
+        .style(Style::default().bg(app.theme.bg).fg(app.theme.fg));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let button_height = 4;
+    let content_height = inner.height.saturating_sub(button_height);
+    let content = Rect {
+        height: content_height,
+        ..inner
+    };
+    let button_area = Rect {
+        y: inner.y.saturating_add(content_height),
+        height: button_height.min(inner.height.saturating_sub(content_height)),
+        ..inner
+    };
+    let fields = &agent_fields(slot)[..4];
+    let rows = selector_form_rows_from_scroll(modal, content.height, fields, scroll);
+    let mut y = content.y;
+    for (field, height) in rows {
+        let row = Rect {
+            x: content.x,
+            y,
+            width: content.width,
+            height,
+        };
+        render_selector_field(frame, app, modal, field, row);
+        register_field(hitboxes, row, field);
+        register_task_options(hitboxes, modal, field, row);
+        y = y.saturating_add(height);
+    }
+    render_form_buttons(frame, app, modal, button_area, hitboxes);
+}
+
+fn agent_slot_name(slot: AgentSlot) -> &'static str {
+    match slot {
+        AgentSlot::Primary => "Primary",
+        AgentSlot::Designer => "Designer",
+        AgentSlot::Reviewer => "Reviewer",
+    }
+}
+
+fn centered_percent(width: u16, height: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height) / 2),
+            Constraint::Percentage(height),
+            Constraint::Percentage((100 - height) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - width) / 2),
+            Constraint::Percentage(width),
+            Constraint::Percentage((100 - width) / 2),
+        ])
+        .split(vertical[1])[1]
 }
 
 fn render_settings_form(
@@ -2169,13 +2404,18 @@ fn selector_form_rows(
     content_height: u16,
     fields: &[DialogField],
 ) -> Vec<(DialogField, u16)> {
+    selector_form_rows_from_scroll(modal, content_height, fields, modal.form_scroll)
+}
+
+fn selector_form_rows_from_scroll(
+    modal: &ModalState,
+    content_height: u16,
+    fields: &[DialogField],
+    scroll: usize,
+) -> Vec<(DialogField, u16)> {
     let mut rows = Vec::new();
     let mut used: u16 = 0;
-    for field in fields
-        .iter()
-        .copied()
-        .skip(modal.form_scroll.min(fields.len() - 1))
-    {
+    for field in fields.iter().copied().skip(scroll.min(fields.len() - 1)) {
         let height = task_field_min_height(field);
         if used.saturating_add(height) > content_height {
             break;
@@ -2216,7 +2456,9 @@ fn selector_form_rows(
 fn task_field_min_height(field: DialogField) -> u16 {
     match field {
         DialogField::Title
-        | DialogField::Interactive
+        | DialogField::AgentSettings
+        | DialogField::DesignerAgentSettings
+        | DialogField::ReviewerAgentSettings
         | DialogField::UseDesigner
         | DialogField::UseReviewer
         | DialogField::EscapeToProjects
@@ -2518,6 +2760,30 @@ fn render_selector_field(
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
+        DialogField::AgentSettings => render_agent_launcher(
+            frame,
+            app,
+            modal,
+            AgentSlot::Primary,
+            area,
+            "Agent settings",
+        ),
+        DialogField::DesignerAgentSettings => render_agent_launcher(
+            frame,
+            app,
+            modal,
+            AgentSlot::Designer,
+            area,
+            "Designer agent settings",
+        ),
+        DialogField::ReviewerAgentSettings => render_agent_launcher(
+            frame,
+            app,
+            modal,
+            AgentSlot::Reviewer,
+            area,
+            "Reviewer agent settings",
+        ),
         DialogField::Backend => render_select_filtered(
             frame,
             app,
@@ -2569,7 +2835,6 @@ fn render_selector_field(
             Some(&modal.chain_filter),
             modal.filter_error == Some(field),
         ),
-        DialogField::Interactive => render_interactive(frame, app, modal, area),
         DialogField::UseDesigner => render_checkbox(
             frame,
             app,
@@ -2836,6 +3101,57 @@ fn render_selector_field(
         DialogField::IsolationStatus => render_isolation_status(frame, app, modal, area),
         _ => {}
     }
+}
+
+fn render_agent_launcher(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &ModalState,
+    slot: AgentSlot,
+    area: Rect,
+    title: &str,
+) {
+    let field = match slot {
+        AgentSlot::Primary => DialogField::AgentSettings,
+        AgentSlot::Designer => DialogField::DesignerAgentSettings,
+        AgentSlot::Reviewer => DialogField::ReviewerAgentSettings,
+    };
+    let active = modal.active_field() == field || app.is_hovered(HitAction::ModalField(field));
+    let border = if active {
+        app.theme.focus
+    } else {
+        app.theme.border
+    };
+    let values = [
+        modal.backend_text_for(slot),
+        modal.model_text_for(slot),
+        modal.effort_text_for(slot),
+        modal.agent_text_for(slot),
+    ];
+    let summary = values
+        .into_iter()
+        .flatten()
+        .map(|value| sanitize_terminal_text(&value))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let summary = if summary.is_empty() {
+        "defaults".to_string()
+    } else {
+        summary
+    };
+    let suffix = "  › Enter to configure";
+    let summary_width =
+        usize::from(area.width.saturating_sub(2)).saturating_sub(suffix.chars().count());
+    let label = format!("{}{}", truncate_display(&summary, summary_width), suffix);
+    frame.render_widget(
+        Paragraph::new(label).block(
+            Block::default()
+                .title(format!(" {title} "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border)),
+        ),
+        area,
+    );
 }
 
 /// Read-only row: whether worktree isolation can run in this project. The
@@ -3123,6 +3439,14 @@ fn select_field_from_title(title: &str) -> Option<DialogField> {
         "Model" => Some(DialogField::Model),
         "Effort" => Some(DialogField::Effort),
         "Agent" => Some(DialogField::Agent),
+        "Designer · Backend" => Some(DialogField::DesignerBackend),
+        "Designer · Model" => Some(DialogField::DesignerModel),
+        "Designer · Effort" => Some(DialogField::DesignerEffort),
+        "Designer · Agent" => Some(DialogField::DesignerAgent),
+        "Reviewer · Backend" => Some(DialogField::ReviewerBackend),
+        "Reviewer · Model" => Some(DialogField::ReviewerModel),
+        "Reviewer · Effort" => Some(DialogField::ReviewerEffort),
+        "Reviewer · Agent" => Some(DialogField::ReviewerAgent),
         "Chain to" => Some(DialogField::ChainTo),
         "Theme" => Some(DialogField::Theme),
         "Task sorting" => Some(DialogField::TaskSort),
@@ -3436,29 +3760,6 @@ fn render_checkbox(
         Paragraph::new(format!("{mark} {label} (Space toggles)")).block(
             Block::default()
                 .title(format!(" {title} "))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border)),
-        ),
-        area,
-    );
-}
-
-fn render_interactive(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
-    let active = modal.active_field() == DialogField::Interactive
-        || app.is_hovered(HitAction::ModalField(DialogField::Interactive));
-    let border = if active {
-        app.theme.focus
-    } else {
-        app.theme.border
-    };
-    let mark = if modal.interactive { "☑" } else { "☐" };
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{mark} interactive (Space toggles, Enter continues)"
-        ))
-        .block(
-            Block::default()
-                .title(" Interactive ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border)),
         ),

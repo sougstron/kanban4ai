@@ -287,6 +287,38 @@ fn reviewer_prompt_requires_verdict_and_forbids_done() {
 }
 
 #[test]
+fn every_role_can_ask_for_clarification_and_interactive_tasks_can_wait() {
+    // Given an interactive task launched under every role contract.
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let task = storage
+        .create_task(NewTask {
+            title: "Clarify requirements".into(),
+            interactive: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+    // When each role prompt is built.
+    for role in [Role::Executor, Role::Designer, Role::Reviewer] {
+        let prompt = build_agent_prompt(dir.path(), &task, "ses-questions", false, role).unwrap();
+
+        // Then both structured questions and blocking interactive waits are available.
+        assert!(
+            prompt.contains("\"$KANBAN_CMD\" ask-form TASK-001"),
+            "missing ask-form for {role:?}"
+        );
+        assert!(
+            prompt.contains(
+                "\"$KANBAN_CMD\" ask TASK-001 <question> --agent --wait --session ses-questions"
+            ),
+            "missing interactive wait for {role:?}"
+        );
+    }
+}
+
+#[test]
 fn prompt_follows_role_not_run_phase() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::new(dir.path());
