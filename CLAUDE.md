@@ -6,8 +6,9 @@ Guidance for Claude Code when working in this repository.
 
 `kanban4ai` is a completed native Rust CLI and ratatui application for local
 kanban boards driven by AI coding agents. It preserves the original CLI and
-on-disk board formats. `AGENTS.md` is the exhaustive behavior, architecture,
-change-log, and version-release reference.
+on-disk board formats. `AGENTS.md` holds the project shape and the rules that
+apply to all work; the exhaustive reference is split across `docs/` and listed
+in the reference map there — read only the file a task actually touches.
 
 The canonical repository is <https://github.com/sougstron/kanban4ai>. The crate
 builds one binary named `kanban4ai`; installation packages create relative
@@ -22,6 +23,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release --locked
 sh -n scripts/install.sh scripts/test-packaging.sh
 sh scripts/test-packaging.sh
+sh scripts/token-budget.sh
 ```
 
 TUI changes also require ratatui snapshot tests and visual terminal
@@ -42,6 +44,10 @@ optional `src/agent/` process launchers.
 - Never regenerate or delete `tests/fixtures/`; they verify compatibility with
   boards created by the earlier implementation.
 - Keep Cargo's single canonical binary and all package aliases as symlinks.
-- Follow the change-log and version-update workflow in `AGENTS.md`: ordinary
-  work remains uncommitted, and commit/tag/push/deploy operations are allowed
-  only for an explicit update to a specific version.
+- Follow the change-log and version-update workflow (summarised in `AGENTS.md`,
+  in full in `docs/releasing.md`): ordinary work remains uncommitted, and
+  commit/tag/push/deploy operations are allowed only for an explicit update to
+  a specific version.
+- `AGENTS.md` and `CLAUDE.md` are auto-loaded into every agent session, so keep
+  them small and put long-form material in `docs/`; `scripts/token-budget.sh`
+  fails the build when they grow past budget.

@@ -142,8 +142,9 @@ task touches that subsystem.
 Trimming 29,050 → 6,000 saves, per session: **11.2k (omp), 13.0k (pi),
 15.7k (opencode), 0 (claude)**.
 
-Caveat: `ask-form --help` currently says "see AGENTS.md for the schema". If
-the schema leaves `AGENTS.md`, inline it into that help text.
+Implemented after this baseline: `AGENTS.md` is now below 3k tokens, reference
+sections live in `docs/*.md`, and `scripts/token-budget.sh` enforces a 6k ceiling.
+The ask-form schema was moved into `ask-form --help` before leaving the core doc.
 
 ### B. Pick the backend for its floor
 
@@ -179,13 +180,30 @@ session ids), resuming and sending only the delta would drop nearly all of it.
 This is the largest structural saving after (A), and unlike (A) it also cuts
 the thread replay, which is the part that grows with task age.
 
+This is feasible here, but it is a backend integration change rather than a
+prompt-only edit. kanban4ai must persist each backend's native conversation id
+next to the board session, teach that backend's resume command to reopen it,
+and fall back to today's fresh launch if the id is absent or rejected. A resume
+prompt should contain only the wake reason and messages added since the saved
+thread cursor. Claude and opencode should be implemented independently because
+their resume interfaces and failure modes differ; omp/pi need capability checks
+before promising the same saving. Tests must cover fresh launch, successful
+resume, stale-id fallback, and no duplicate thread messages.
+
 ### E. Cap the thread replay
 
-`append_thread_context` (`src/agent/prompt.rs:327`) replays every non-system,
+`append_thread_context` (`src/agent/prompt.rs`) replays every non-system,
 non-rejected message with no budget. Median 419 tokens is fine; the p90 of
-1,900 and max of 4,163 are not. A token budget that keeps the most recent
-messages whole and summarises the older ones would bound it — the same
-treatment `core/reply.rs` already applies to captured agent replies.
+1,900 and max of 4,163 are not. Budgeting means setting a configurable maximum
+for this section (for example 2k tokens), walking newest-to-oldest, keeping
+recent messages whole, and replacing the omitted prefix with a deterministic
+notice or rule-based summary. Questions still awaiting answers and the latest
+human answer must be pinned so truncation cannot hide the task's blocking
+state. Use the existing cheap token estimator rather than adding an LLM call;
+the same clamp pattern in `core/reply.rs` is the model. Store the full thread
+unchanged—the budget applies only when rendering a launch prompt. With native
+resume this becomes a fallback for fresh launches and stale-session recovery,
+not something paid on every wake.
 
 ## 7. Automation
 

@@ -208,8 +208,8 @@ fn prompt_nudges_suggestions_and_ask_form_for_plain_tasks() {
         form_file.display()
     )));
     assert!(prompt.contains(&format!("Write {} then submit it", form_file.display())));
-    assert!(prompt.contains("questions:"));
-    assert!(prompt.contains("- prompt: <question text>"));
+    assert!(prompt.contains("Schema and examples: \"$KANBAN_CMD\" ask-form --help."));
+    assert!(!prompt.contains("- prompt: <question text>"));
     assert!(prompt.contains("Role: executor"), "{prompt}");
     assert!(prompt.contains("Never move a task to Done"));
     assert!(prompt.contains("lands the task in Review or starts bot review"));
