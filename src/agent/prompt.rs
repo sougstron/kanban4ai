@@ -121,6 +121,43 @@ not touch the project folder's own checkout.\n"
     Ok(prompt)
 }
 
+/// Small follow-up sent when pi/omp reopen their native conversation. The
+/// backend already has the original task, rules, tool history, and its own
+/// replies, so only the new board session identity and thread delta belong in
+/// this turn.
+pub fn build_resume_prompt<'a>(
+    roots: impl Into<Roots<'a>>,
+    task: &Task,
+    session_id: &str,
+    previous_session_id: &str,
+    role: Role,
+) -> Result<String> {
+    let roots = roots.into();
+    let finish = match role {
+        Role::Executor => format!(
+            "Finish with: \"$KANBAN_CMD\" done {} --session {session_id} --agent",
+            task.id
+        ),
+        Role::Designer => format!(
+            "Record the plan, then finish with: \"$KANBAN_CMD\" done {} --session {session_id} --agent",
+            task.id
+        ),
+        Role::Reviewer => format!(
+            "Finish only with: \"$KANBAN_CMD\" verdict {} --approve|--changes <text> --session {session_id} --agent",
+            task.id
+        ),
+    };
+    let mut prompt = format!(
+        "Resume kanban4ai task {}. This is the same backend conversation, but the board session changed; all earlier session-id instructions are superseded.\n\
+KANBAN_SESSION={session_id}; KANBAN_TASK_ID={}; use \"$KANBAN_CMD\" for callbacks.\n\
+Heartbeat: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
+{finish}. Continue from the latest state; do not repeat work already completed.",
+        task.id, task.id
+    );
+    append_thread_delta(roots, task, previous_session_id, &mut prompt)?;
+    Ok(prompt)
+}
+
 /// Planning-pass prompt: the designer records a plan on the thread and must
 /// not implement or move the task. A later executor reads that plan through
 /// [`append_thread_context`]. Finishing with `kanban done` completes the
@@ -314,15 +351,28 @@ Column ownership:
 
 fn append_thread_context(roots: Roots<'_>, task: &Task, prompt: &mut String) -> Result<()> {
     let thread = ThreadManager::new(roots.data_root)?.load(&task.id)?;
+    let origins_with_agent_context: std::collections::HashSet<_> = thread
+        .messages
+        .iter()
+        .filter(|message| {
+            message.kind == MessageKind::Context && message.author.as_deref() == Some("agent")
+        })
+        .filter_map(|message| message.origin.clone())
+        .collect();
     let messages: Vec<_> = thread
         .messages
         .into_iter()
         .filter(|message| {
-            !matches!(
+            !(matches!(
                 message.kind,
                 MessageKind::System | MessageKind::Task | MessageKind::AgentStep
-            ) && message.status != MessageStatus::Rejected
-                && !message.body.trim().is_empty()
+            ) || message.status == MessageStatus::Rejected
+                || message.body.trim().is_empty()
+                // The captured whole-session reply frequently repeats context
+                // explicitly posted by that same run. Keep the explicit,
+                // concise progress record and do not replay the run twice.
+                || (message.author.as_deref() == Some("agent-reply")
+                    && message.origin.as_ref().is_some_and(|origin| origins_with_agent_context.contains(origin))))
         })
         .collect();
     if messages.is_empty() {
@@ -332,6 +382,40 @@ fn append_thread_context(roots: Roots<'_>, task: &Task, prompt: &mut String) -> 
     prompt.push_str("\n\nThread context and review feedback:\n");
     for message in messages {
         append_message(prompt, &message);
+    }
+    Ok(())
+}
+
+fn append_thread_delta(
+    roots: Roots<'_>,
+    task: &Task,
+    previous_session_id: &str,
+    prompt: &mut String,
+) -> Result<()> {
+    let thread = ThreadManager::new(roots.data_root)?.load(&task.id)?;
+    let previous_origin = format!("agent:{previous_session_id}");
+    let start = thread
+        .messages
+        .iter()
+        .rposition(|message| message.origin.as_deref() == Some(previous_origin.as_str()))
+        .map_or(0, |index| index + 1);
+    let messages: Vec<_> = thread
+        .messages
+        .into_iter()
+        .skip(start)
+        .filter(|message| {
+            !matches!(
+                message.kind,
+                MessageKind::System | MessageKind::Task | MessageKind::AgentStep
+            ) && message.status != MessageStatus::Rejected
+                && !message.body.trim().is_empty()
+        })
+        .collect();
+    if !messages.is_empty() {
+        prompt.push_str("\n\nNew thread context since the previous run:\n");
+        for message in messages {
+            append_message(prompt, &message);
+        }
     }
     Ok(())
 }
