@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 1542
 expression: reviewer
 ---
 ┌ To Do (0) ───────┐┌ In Progress (0) ─┐┌ Review (0) ──────┐┌ Done (0) ────────┐
@@ -11,12 +10,12 @@ expression: reviewer
 │           │┌ Reviewer ──────────────────────────────────────────┐│           │
 │           ││☐ run a reviewer bot before human Review (Space togg││           │
 │           │└────────────────────────────────────────────────────┘│           │
-│           │┌ Reviewer · Backend ────────────────────────────────┐│           │
-│           ││/ type to filter                                    ││           │
-│           ││  Default backend (opencode)                        ││           │
-│           ││  opencode                                          ││           │
-│           ││› claude                                            ││           │
-│           ││  omp                                               ││           │
+│           │┌ Reviewer agent settings ───────────────────────────┐│           │
+│           ││claude · sonnet  › Enter to configure               ││           │
+│           │└────────────────────────────────────────────────────┘│           │
+│           │┌ Reviewer · On changes requested ───────────────────┐│           │
+│           ││› Stay in Progress (re-queue)                       ││           │
+│           ││  Move to To Do                                     ││           │
 │           │└────────────────────────────────────────────────────┘│           │
 │           │┌────────────────────────────────────────────────────┐│           │
 │           ││[ Save ]  [ Cancel ]                                ││           │
@@ -94,9 +93,7 @@ expression: reviewer
 9:1-12 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 9:12-13 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 9:13-14 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
-9:14-16 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
-9:16-30 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset).italic()
-9:30-66 Style::new().fg(Color::Rgb(28, 31, 38)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
+9:14-66 Style::new().fg(Color::Rgb(28, 31, 38)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 9:66-67 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 9:67-68 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 9:68-79 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
@@ -104,18 +101,14 @@ expression: reviewer
 10:0-1 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 10:1-12 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 10:12-13 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
-10:13-14 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
-10:14-66 Style::new().fg(Color::Rgb(28, 31, 38)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
-10:66-67 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
+10:13-67 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 10:67-68 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 10:68-79 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 10:79-80 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 11:0-1 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 11:1-12 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 11:12-13 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
-11:13-14 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
-11:14-66 Style::new().fg(Color::Rgb(28, 31, 38)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
-11:66-67 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
+11:13-67 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 11:67-68 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 11:68-79 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 11:79-80 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)

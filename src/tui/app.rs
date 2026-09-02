@@ -1899,6 +1899,9 @@ impl App {
             Some(HitAction::ModalField(field)) => {
                 if let Some(modal) = self.modal.as_mut() {
                     modal.focus_field(field);
+                    if let Some(slot) = ModalState::launcher_slot(field) {
+                        modal.open_agent_settings(slot);
+                    }
                 }
             }
             Some(HitAction::ModalOption { field, index }) => {
@@ -4549,6 +4552,11 @@ impl App {
             }
         } else {
             match key.code {
+                KeyCode::Esc if modal.agent_popup_slot().is_some() => {
+                    modal.cancel_agent_settings();
+                    self.modal = Some(modal);
+                    return Ok(true);
+                }
                 KeyCode::Esc => return self.request_modal_close(modal),
                 KeyCode::Tab => modal.next_field(),
                 KeyCode::BackTab => modal.prev_field(),
@@ -4564,6 +4572,12 @@ impl App {
                         modal.focus_field(DialogField::Confirm);
                     }
                 }
+                KeyCode::Enter if modal.submit_on_enter() && modal.agent_popup_slot().is_some() => {
+                    modal.save_agent_settings();
+                }
+                KeyCode::Enter if modal.cancel_on_enter() && modal.agent_popup_slot().is_some() => {
+                    modal.cancel_agent_settings();
+                }
                 KeyCode::Enter if modal.submit_on_enter() => {
                     return self.submit_modal(modal).map(|_| true);
                 }
@@ -4577,6 +4591,11 @@ impl App {
                 KeyCode::Enter if modal.enter_inserts_newline() => {
                     modal.input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                 }
+                KeyCode::Enter if ModalState::launcher_slot(modal.active_field()).is_some() => {
+                    let slot = ModalState::launcher_slot(modal.active_field())
+                        .unwrap_or(AgentSlot::Primary);
+                    modal.open_agent_settings(slot);
+                }
                 // Plain Enter commits the focused field and walks to the next
                 // one, exactly like Tab. A filtered selector with no match
                 // keeps focus and turns red instead.
@@ -4584,6 +4603,12 @@ impl App {
                     if modal.enter_field() {
                         modal.next_field();
                     }
+                }
+                KeyCode::Char('s')
+                    if key.modifiers == KeyModifiers::CONTROL
+                        && modal.agent_popup_slot().is_some() =>
+                {
+                    modal.save_agent_settings();
                 }
                 KeyCode::Char('s')
                     if key.modifiers == KeyModifiers::CONTROL && modal.submit_on_ctrl_s() =>
@@ -4636,6 +4661,14 @@ impl App {
                     Ok(())
                 }
             };
+        }
+        if modal.agent_popup_slot().is_some() {
+            match button {
+                ModalButton::Save | ModalButton::Yes => modal.save_agent_settings(),
+                ModalButton::Cancel | ModalButton::No => modal.cancel_agent_settings(),
+            }
+            self.modal = Some(modal);
+            return Ok(());
         }
         match button {
             ModalButton::Yes => self.submit_modal(modal),
@@ -4703,7 +4736,7 @@ impl App {
             Modal::Settings => {
                 let project_name = modal.title_text();
                 let Some(backend) = modal.backend_text() else {
-                    modal.focus_field(DialogField::Backend);
+                    modal.focus_field(DialogField::AgentSettings);
                     modal.error = Some("Default backend must be selected".to_string());
                     self.modal = Some(modal);
                     return Ok(());
@@ -4820,7 +4853,7 @@ impl App {
                     ai_effort: modal.effort_text(),
                     agent_backend: modal.backend_text(),
                     agent_name: modal.agent_text(),
-                    interactive: modal.interactive,
+                    interactive: false,
                     use_designer: modal.use_designer,
                     use_reviewer: modal.use_reviewer,
                     chained_to: modal.chain_text(),
@@ -4853,7 +4886,7 @@ impl App {
                         ai_effort: Some(modal.effort_text()),
                         agent_backend: Some(modal.backend_text()),
                         agent_name: Some(modal.agent_text()),
-                        interactive: Some(modal.interactive),
+                        interactive: None,
                         use_designer: Some(modal.use_designer),
                         use_reviewer: Some(modal.use_reviewer),
                         chained_to: Some(modal.chain_text()),
@@ -5620,7 +5653,9 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::ReviewerOnChanges => Some(modal.reviewer_on_changes_selected),
         DialogField::Title
         | DialogField::Description
-        | DialogField::Interactive
+        | DialogField::AgentSettings
+        | DialogField::DesignerAgentSettings
+        | DialogField::ReviewerAgentSettings
         | DialogField::UseDesigner
         | DialogField::UseReviewer
         | DialogField::EscapeToProjects

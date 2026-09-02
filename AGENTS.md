@@ -569,10 +569,11 @@ Action hotkeys work on both the board (focused card) and the open detail view.
   out. The status bar hint flips between `Q queue` and `Q unqueue`; a task with
   a live session cannot be queued
 - `n`: New task — always created in To Do, regardless of the focused column
-- `s`: Open Project Settings from Board or Detail: project name, default backend,
-  its model/effort/persona defaults, dark/light theme, task sorting, and the
-  whole `orchestration:` block (queue switch, the four cap groups, crash-restart
-  schedule, designer and reviewer bots), plus a read-only Worktree isolation row
+- `s`: Open Project Settings from Board or Detail: project name, default agent
+  settings (backend/model/effort/persona) through a nested launcher, dark/light
+  theme, task sorting, and the whole `orchestration:` block (queue switch, the
+  four cap groups, crash-restart schedule, designer and reviewer bots, each with
+  its own nested agent-settings launcher), plus a read-only Worktree isolation row
   (`available`, or `unavailable — <reason>`; probed once when the dialog opens,
   since the probe runs git). On the
   Projects screen `s` instead opens Global Settings (see "Global Settings").
@@ -735,9 +736,14 @@ closed session on In Progress is idle — `r` runs a fresh agent; it is not
 painted crashed. The review-edits editor is
 editable only while the task is in Review (read-only or hidden otherwise), and
 saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
-`Ctrl+R` / action-bar button. Create/edit dialogs expose an `interactive`
-checkbox, Designer and Reviewer checkboxes under it (per-task opt-in; models
-and agents come from project settings), and a "Chain to task" selector. The backend selector leads with
+`Ctrl+R` / action-bar button. Create/edit dialogs expose one `Agent settings`
+row that opens a nested popup for backend, model, effort, and persona; popup
+Save stages those values in the task form and popup Cancel restores the exact
+opening state. They also expose Designer and Reviewer checkboxes (per-task
+opt-in; models and agents come from project settings), and a "Chain to task"
+selector. The TUI no longer exposes the legacy `interactive` switch:
+TUI-created tasks use `interactive: false`, and TUI edits leave an existing
+value untouched; CLI/YAML compatibility remains. The backend selector leads with
 "Default backend", which leaves the task's `agent_backend` unset so launches
 follow `auto_launch.default_agent` from settings; the label shows the agent it
 resolves to, and the detail view shows `default` while no launch has pinned a

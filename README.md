@@ -199,12 +199,18 @@ archived tasks, `l` to view running sessions, `P` to open the projects list,
 fresh ID. `Ctrl+C` twice within 3 seconds still quits when no task is selected.
 Press `s` on the board or task
 detail to open Project Settings, where you can edit the project name, default
-backend, that backend's default model/effort/persona, theme, and task sorting
+agent settings through a nested backend/model/effort/persona popup, theme, and task sorting
 (task number or modification date, oldest or newest first); the Board
 status-bar hint is clickable when
 it fits. `Ctrl+T` remains the quick theme toggle. All action keys work from
 the board and from the detail view, which also offers clickable action buttons
 and an inline panel for answering agent questions.
+
+Task create/edit dialogs use the same nested `Agent settings` popup and keep
+Designer, Reviewer, and Chain-to controls on the parent form. Interactive mode
+is intentionally not exposed in the TUI: new TUI tasks are non-interactive and
+editing does not change an existing value. The CLI `--interactive` option and
+stored YAML field remain supported.
 
 The sessions view marks each session `▶` live, `⏳` in a declared wait, or `✖`
 crashed; there `Enter` attaches, `v` opens a scrollable pager over the session
