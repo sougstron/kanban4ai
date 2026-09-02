@@ -163,9 +163,17 @@ enum Command {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Post one or more questions from a strict YAML form file (see AGENTS.md
-    /// for the schema). Each entry becomes a question whose `options` are the
-    /// selectable answer variants.
+    /// Post one or more questions from a strict YAML form file.
+    ///
+    /// Each entry becomes a question whose `options` are the selectable answer
+    /// variants. `prompt` is required, `options` is optional, and the file may
+    /// hold as many questions as needed:
+    ///
+    /// questions:
+    ///   - prompt: <question text>
+    ///     options: [<choice A>, <choice B>]
+    ///   - prompt: <another question>
+    #[command(verbatim_doc_comment)]
     AskForm {
         task_id: String,
         /// Path to the YAML form file

@@ -56,18 +56,14 @@ monitors, and \"notifications\" die with it, so nothing you launch can re-invoke
 - Long-running foreground commands are safe: the board heartbeats for you while your process runs, \
 with no time limit. Prefer blocking in the foreground and collecting every result before you \
 continue; never end a reply while anything you launched is still running or unread.\n\
-- If a result will take too long to block on (a heavy query, an external job), never start it as \
-a plain shell background job: this session's whole process group is killed when your reply ends, \
-so backgrounded work silently dies even after you declare a wait. Instead run: \
+- If a result will take too long to block on, never start it as a plain shell background job: \
+this session's whole process group dies with your reply. Instead run: \
 \"$KANBAN_CMD\" detach {} --session {session_id} --eta <expected-seconds> --note <what you wait for> -- <command> [args...]\n\
-  It starts the command fully detached (it survives this session), appends its output to \
-{detached_log}, writes the exit code to the matching .status file, and \
-declares the wait for you. If you must detach manually instead, launch with setsid and nohup, \
-redirect stdin/stdout/stderr away from the terminal to a result file, and then declare the wait \
-yourself before ending your reply: \
+  It survives this session, logs to {detached_log} plus a .status file, and declares the wait. \
+To wait on something you did not detach, use \
 \"$KANBAN_CMD\" waiting {} --session {session_id} --eta <expected-seconds> --note <what you wait for>\n\
-  Either way the board relaunches you after the deadline (eta plus a safety buffer) to check the \
-recorded result; declare waiting again from the new session if it needs more time.\n\
+  Either way the board relaunches you after the deadline to check the result. \
+Details: \"$KANBAN_CMD\" detach --help, \"$KANBAN_CMD\" waiting --help.\n\
 - The final command of your reply must be the done command above, the ask command if you are \
 blocked, or the waiting/detach command if you are waiting on a declared long-running result. \
 Ending a reply without one of those strands the task and forces an automatic resume.\n",
@@ -91,9 +87,7 @@ Ending a reply without one of those strands the task and forces an automatic res
         "- To ask the human one or more questions, prefer a strict YAML form over free text so \
 each question renders with selectable options. Write {form_file} then submit it:\n  \
 \"$KANBAN_CMD\" ask-form {} --file {form_file} --agent --session {session_id}\n  \
-Schema (options are optional; prompt is required; add as many questions as you need):\n    \
-questions:\n      - prompt: <question text>\n        options: [<choice A>, <choice B>]\n      \
-- prompt: <another question>\n",
+Schema and examples: \"$KANBAN_CMD\" ask-form --help.\n",
         task.id
     ));
     if task.interactive {
@@ -167,18 +161,14 @@ monitors, and \"notifications\" die with it, so nothing you launch can re-invoke
 - Long-running foreground commands are safe: the board heartbeats for you while your process runs, \
 with no time limit. Prefer blocking in the foreground and collecting every result before you \
 continue; never end a reply while anything you launched is still running or unread.\n\
-- If a result will take too long to block on (a heavy query, an external job), never start it as \
-a plain shell background job: this session's whole process group is killed when your reply ends, \
-so backgrounded work silently dies even after you declare a wait. Instead run: \
+- If a result will take too long to block on, never start it as a plain shell background job: \
+this session's whole process group dies with your reply. Instead run: \
 \"$KANBAN_CMD\" detach {} --session {session_id} --eta <expected-seconds> --note <what you wait for> -- <command> [args...]\n\
-  It starts the command fully detached (it survives this session), appends its output to \
-{detached_log}, writes the exit code to the matching .status file, and \
-declares the wait for you. If you must detach manually instead, launch with setsid and nohup, \
-redirect stdin/stdout/stderr away from the terminal to a result file, and then declare the wait \
-yourself before ending your reply: \
+  It survives this session, logs to {detached_log} plus a .status file, and declares the wait. \
+To wait on something you did not detach, use \
 \"$KANBAN_CMD\" waiting {} --session {session_id} --eta <expected-seconds> --note <what you wait for>\n\
-  Either way the board relaunches you after the deadline (eta plus a safety buffer) to check the \
-recorded result; declare waiting again from the new session if it needs more time.\n\
+  Either way the board relaunches you after the deadline to check the result. \
+Details: \"$KANBAN_CMD\" detach --help, \"$KANBAN_CMD\" waiting --help.\n\
 - The final command of your reply must be the done command above, the ask command if you are \
 blocked, or the waiting/detach command if you are waiting on a declared long-running result. \
 Ending a reply without one of those strands the design phase and forces an automatic resume.\n",
@@ -202,9 +192,7 @@ Ending a reply without one of those strands the design phase and forces an autom
         "- To ask the human one or more questions, prefer a strict YAML form over free text so \
 each question renders with selectable options. Write {form_file} then submit it:\n  \
 \"$KANBAN_CMD\" ask-form {} --file {form_file} --agent --session {session_id}\n  \
-Schema (options are optional; prompt is required; add as many questions as you need):\n    \
-questions:\n      - prompt: <question text>\n        options: [<choice A>, <choice B>]\n      \
-- prompt: <another question>\n",
+Schema and examples: \"$KANBAN_CMD\" ask-form --help.\n",
         task.id
     ));
     if task.interactive {

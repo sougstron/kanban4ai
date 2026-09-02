@@ -272,5 +272,7 @@ Board data lives under `$XDG_DATA_HOME/kanban4ai/projects/<id>/.kanban/`
 `<folder>/.kanban` is moved into the store the next time a command runs there.
 The board is file-based and has no database.
 
-See `AGENTS.md` for the complete command, configuration, data-model, and TUI
-reference. kanban4ai is licensed under the MIT License.
+See `AGENTS.md` for the project shape and rules, and `docs/` for the complete
+command (`docs/cli.md`), configuration (`docs/config.md`), data-model
+(`docs/data-model.md`), and TUI (`docs/tui.md`) reference. kanban4ai is
+licensed under the MIT License.
