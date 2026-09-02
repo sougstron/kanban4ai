@@ -11,6 +11,8 @@ use kanban4ai::agent::{
 };
 use kanban4ai::core::models::{MessageKind, MessageRole, Role, RunPhase, Task};
 use kanban4ai::core::project::Roots;
+use kanban4ai::core::provenance::{self, InputManifest};
+use kanban4ai::core::session::SessionManager;
 use kanban4ai::core::storage::{NewTask, Storage};
 use kanban4ai::core::thread::ThreadManager;
 
@@ -532,6 +534,105 @@ agents:
     assert!(has_arg_pair(&plan.args, "--mode", "json"));
     assert!(plan.transcript_file.is_some());
     assert!(plan.resolve_agent.is_none());
+}
+
+#[test]
+fn pi_family_auto_relaunch_resumes_native_conversation_with_delta_prompt() {
+    for backend in ["pi", "omp"] {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path());
+        storage.init_board().unwrap();
+        write_agent_config(
+            dir.path(),
+            &format!(
+                "auto_launch:\n  enabled: true\n  default_agent: {backend}\nnotifications:\n  enabled: false\nagents:\n  {backend}:\n    command: {backend}\n"
+            ),
+        );
+        let mut task = storage.create_task(NewTask::titled("Resume me")).unwrap();
+        task.agent_backend = Some(backend.to_string());
+        task.auto_resumes = 1;
+        storage.save_task(&task).unwrap();
+
+        let sessions = SessionManager::new(dir.path());
+        let mut previous = sessions
+            .link_named_session(&task.id, "ses-previous", "old")
+            .unwrap();
+        previous.status = kanban4ai::core::models::SessionStatus::Closed;
+        previous.ended_at = Some(previous.last_seen);
+        sessions.save_session(&previous).unwrap();
+        provenance::write_manifest(
+            &storage.provenance_dir,
+            &InputManifest {
+                session_id: previous.id.clone(),
+                backend: backend.to_string(),
+                backend_session_id: Some("native-conversation-id".to_string()),
+                ..InputManifest::default()
+            },
+        )
+        .unwrap();
+        post_with_test_origin(
+            dir.path(),
+            &task.id,
+            "agent",
+            "already known by native history",
+            "agent:ses-previous",
+        );
+        ThreadManager::new(dir.path())
+            .unwrap()
+            .post(
+                &task.id,
+                MessageRole::Human,
+                MessageKind::ReviewEdit,
+                "new human feedback",
+                None,
+                vec![],
+                Some("user".to_string()),
+            )
+            .unwrap();
+
+        let plan = build_launch_plan(dir.path(), &task, "ses-current", false).unwrap();
+        let resume_flag = if backend == "pi" {
+            "--session"
+        } else {
+            "--resume"
+        };
+        assert!(has_arg_pair(
+            &plan.args,
+            resume_flag,
+            "native-conversation-id"
+        ));
+        assert_eq!(
+            plan.resumed_backend_session.as_deref(),
+            Some("native-conversation-id")
+        );
+        assert!(
+            plan.prompt.contains("new human feedback"),
+            "{}",
+            plan.prompt
+        );
+        assert!(!plan.prompt.contains("already known by native history"));
+        assert!(!plan.prompt.contains("Before editing an existing file"));
+        assert!(plan.prompt.contains("KANBAN_SESSION=ses-current"));
+    }
+}
+
+#[test]
+fn full_prompt_does_not_replay_agent_reply_when_same_run_posted_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let task = storage
+        .create_task(NewTask::titled("No duplicate"))
+        .unwrap();
+    for (author, body) in [
+        ("agent", "concise progress"),
+        ("agent-reply", "whole noisy run"),
+    ] {
+        post_with_test_origin(dir.path(), &task.id, author, body, "agent:ses-old");
+    }
+    let prompt = build_agent_prompt(dir.path(), &task, "ses-new", false, Role::Executor).unwrap();
+    assert!(prompt.contains("concise progress"));
+    assert!(!prompt.contains("whole noisy run"));
 }
 
 #[test]
@@ -1130,6 +1231,35 @@ fn write_agent_config(project: &std::path::Path, body: &str) {
         "columns:\n- name: To Do\n  id: todo\n- name: In Progress\n  id: in_progress\n- name: Review\n  id: review\n- name: Done\n  id: done\nrules:\n  one_task_per_instance: true\n  user_only_review_to_done: true\n  auto_move_on_assign: true\n  auto_move_on_complete: true\n  questions_go_to_review: false\n  auto_launch_on_delegate: true\n  auto_launch_chained: true\nthresholds:\n  context_embed_max_size: 5120\n  context_warning: 51200\n  context_auto_compact: 102400\n  context_summary_max_length: 5000\n  session_heartbeat_timeout: 300\n  question_poll_interval: 0\n  question_wait_timeout: 0\n{body}"
     );
     fs::write(project.join(".kanban/config.yaml"), config).unwrap();
+}
+
+fn post_with_test_origin(
+    root: &std::path::Path,
+    task_id: &str,
+    author: &str,
+    body: &str,
+    origin: &str,
+) {
+    let manager = ThreadManager::new(root).unwrap();
+    let posted = manager
+        .post(
+            task_id,
+            MessageRole::Agent,
+            MessageKind::Context,
+            body,
+            None,
+            vec![],
+            Some(author.to_string()),
+        )
+        .unwrap();
+    let mut thread = manager.load(task_id).unwrap();
+    thread
+        .messages
+        .iter_mut()
+        .find(|message| message.id == posted.id)
+        .unwrap()
+        .origin = Some(origin.to_string());
+    manager.save(task_id, &mut thread).unwrap();
 }
 
 fn has_arg_pair(args: &[String], key: &str, value: &str) -> bool {

@@ -180,21 +180,31 @@ session ids), resuming and sending only the delta would drop nearly all of it.
 This is the largest structural saving after (A), and unlike (A) it also cuts
 the thread replay, which is the part that grows with task age.
 
-This is feasible here, but it is a backend integration change rather than a
-prompt-only edit. kanban4ai must persist each backend's native conversation id
-next to the board session, teach that backend's resume command to reopen it,
-and fall back to today's fresh launch if the id is absent or rejected. A resume
-prompt should contain only the wake reason and messages added since the saved
-thread cursor. Claude and opencode should be implemented independently because
-their resume interfaces and failure modes differ; omp/pi need capability checks
-before promising the same saving. Tests must cover fresh launch, successful
-resume, stale-id fallback, and no duplicate thread messages.
+The first implementation now covers automatic pi/omp relaunches. Their native
+conversation id is already captured in each provenance manifest, so no task
+format change was needed. The launcher selects the newest completed manifest
+for the same task/backend and uses `pi --session <id>` or
+`omp --resume <id>`. (Despite pi's help wording, `pi --resume` is an interactive
+picker; `--session` is the exact non-interactive form.) The new turn contains
+only the replacement board session identity and messages added after the prior
+run. Missing manifests, backend changes, first launches, human restarts, and
+reverts automatically retain the old full-prompt path. Claude and opencode
+remain separate follow-ups because their resume interfaces and failure modes
+differ.
 
 ### E. Cap the thread replay
 
 `append_thread_context` (`src/agent/prompt.rs`) replays every non-system,
-non-rejected message with no budget. Median 419 tokens is fine; the p90 of
-1,900 and max of 4,163 are not. Budgeting means setting a configurable maximum
+non-rejected message with no budget. These are not tokens spent by the Rust
+app itself: kanban renders stored thread messages into the next agent's input,
+so the provider counts them against that agent's context and limits. Median
+419 tokens is fine; the p90 of 1,900 and max of 4,163 are not. A common source
+of accidental duplication is now removed: if a run explicitly posted an
+agent `context`, its captured whole-session `agent-reply` is not rendered again
+for a fresh launch. Native resume goes further and renders only messages after
+the previous run, since that conversation already contains its own output.
+
+Further budgeting means setting a configurable maximum
 for this section (for example 2k tokens), walking newest-to-oldest, keeping
 recent messages whole, and replacing the omitted prefix with a deterministic
 notice or rule-based summary. Questions still awaiting answers and the latest
@@ -202,8 +212,8 @@ human answer must be pinned so truncation cannot hide the task's blocking
 state. Use the existing cheap token estimator rather than adding an LLM call;
 the same clamp pattern in `core/reply.rs` is the model. Store the full thread
 unchanged—the budget applies only when rendering a launch prompt. With native
-resume this becomes a fallback for fresh launches and stale-session recovery,
-not something paid on every wake.
+resume this becomes primarily a fallback for fresh launches, not something
+paid on every wake.
 
 ## 7. Automation
 

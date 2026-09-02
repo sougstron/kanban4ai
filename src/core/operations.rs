@@ -3416,16 +3416,21 @@ impl Operations {
             .session_manager()
             .load_session(session_id)
             .is_some_and(|session| session.task_id == task_id && session.id == session_id);
-        let outcome = self.reconcile_agent_exit_inner(task_id, session_id, exit_status)?;
+        // Harvest before reconciliation: a clean stranded exit may launch its
+        // successor inside `reconcile_agent_exit_inner`, and pi/omp need the
+        // just-finished backend conversation id to reopen it. Capture the
+        // reply first as well, so a fresh-launch fallback sees all prior work.
+        let manifest = session_matched_task
+            .then(|| self.harvest_provenance(task_id, session_id))
+            .flatten();
         if session_matched_task {
-            let manifest = self.harvest_provenance(task_id, session_id);
             if manifest.is_some() {
                 self.warn_write_overlaps(task_id, session_id);
             }
-            // The agent's closing answer goes in before the exit audit line so
-            // the thread reads in the order it happened: what the agent said,
-            // then the session closing.
             self.record_agent_reply(task_id, session_id);
+        }
+        let outcome = self.reconcile_agent_exit_inner(task_id, session_id, exit_status)?;
+        if session_matched_task {
             self.log_exit_step(
                 task_id,
                 session_id,

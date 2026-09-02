@@ -7,11 +7,13 @@ use std::thread;
 
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::agent::prompt::build_agent_prompt;
+use crate::agent::prompt::{build_agent_prompt, build_resume_prompt};
 use crate::core::config::{BoardConfig, BotSettings, Config, OrchestrationSettings};
 use crate::core::error::{KanbanError, Result};
-use crate::core::models::{Role, RunPhase, Task};
+use crate::core::models::{Role, RunPhase, SessionStatus, Task};
 use crate::core::project::Roots;
+use crate::core::provenance;
+use crate::core::session::SessionManager;
 use crate::core::storage::atomic_write_text;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +167,9 @@ pub struct LaunchPlan {
     /// the spawned session. `args` carries the requested name as the
     /// `--agent` value; the wrapper substitutes the resolved one.
     pub resolve_agent: Option<String>,
+    /// Native pi/omp conversation reopened for this board relaunch. `None`
+    /// means a fresh backend session and the full prompt.
+    pub resumed_backend_session: Option<String>,
 }
 
 /// Build the plan for one agent run. Board files (config, prompt, log,
@@ -194,19 +199,22 @@ pub fn build_launch_plan<'a>(
     } else {
         None
     };
-    let prompt = build_agent_prompt(
-        roots,
-        task,
-        session_id,
-        revert,
-        Role::from_phase(task.run_phase),
-    )?;
+    let role = Role::from_phase(task.run_phase);
+    let resume = (!revert && matches!(backend.as_str(), "pi" | "omp"))
+        .then(|| native_resume_candidate(roots.data_root, task, session_id, &backend))
+        .flatten();
+    let prompt = if let Some((previous_session, _)) = &resume {
+        build_resume_prompt(roots, task, session_id, previous_session, role)?
+    } else {
+        build_agent_prompt(roots, task, session_id, revert, role)?
+    };
     let args = backend_args(
         &backend,
         &backend_config,
         model.as_deref(),
         effort.as_deref(),
         agent.as_deref(),
+        resume.as_ref().map(|(_, backend_id)| backend_id.as_str()),
         &prompt,
     );
 
@@ -234,6 +242,37 @@ pub fn build_launch_plan<'a>(
         auto_complete_on_exit: auto_launch.auto_complete_on_exit,
         heartbeat_interval_secs,
         resolve_agent,
+        resumed_backend_session: resume.map(|(_, backend_id)| backend_id),
+    })
+}
+
+/// Find the most recent completed kanban session for this task whose pi-family
+/// transcript exposed a native conversation id. Human starts reset both
+/// counters, so only automatic relaunches are eligible.
+fn native_resume_candidate(
+    data_root: &Path,
+    task: &Task,
+    current_session_id: &str,
+    backend: &str,
+) -> Option<(String, String)> {
+    if task.auto_resumes == 0 && task.crash_restarts == 0 {
+        return None;
+    }
+    let provenance_dir = data_root.join(".kanban").join("provenance");
+    let mut sessions = SessionManager::new(data_root).list_sessions();
+    sessions.sort_by_key(|session| session.started_at);
+    sessions.into_iter().rev().find_map(|session| {
+        if session.id == current_session_id
+            || session.task_id != task.id
+            || session.status == SessionStatus::Active
+        {
+            return None;
+        }
+        let manifest = provenance::load_manifest(&provenance_dir, &session.id)?;
+        if manifest.backend != backend {
+            return None;
+        }
+        Some((session.id, manifest.backend_session_id?))
     })
 }
 
@@ -285,6 +324,7 @@ fn backend_args(
     model: Option<&str>,
     effort: Option<&str>,
     agent: Option<&str>,
+    resume_session: Option<&str>,
     prompt: &str,
 ) -> Vec<String> {
     let mut args = match backend {
@@ -315,6 +355,17 @@ fn backend_args(
         "omp" | "pi" => vec!["-p".to_string(), "--mode".to_string(), "json".to_string()],
         _ => vec!["run".to_string()],
     };
+    if let Some(session) = resume_session {
+        // pi's `--resume` opens an interactive picker even with a following
+        // value; exact non-interactive lookup is `--session <id>`. OMP exposes
+        // the id-taking form directly as `--resume <id>`.
+        args.push(if backend == "pi" {
+            "--session".to_string()
+        } else {
+            "--resume".to_string()
+        });
+        args.push(session.to_string());
+    }
     args.extend(config.extra_args.clone());
     if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
         args.push("--model".to_string());

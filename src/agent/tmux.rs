@@ -419,6 +419,7 @@ mod tests {
             auto_complete_on_exit: auto_complete,
             heartbeat_interval_secs: 100,
             resolve_agent: None,
+            resumed_backend_session: None,
         }
     }
 
