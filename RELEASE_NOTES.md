@@ -1,3 +1,50 @@
+# kanban4ai 0.6.0
+
+Three board-workflow features: duplicate a task with a keystroke, reach
+backend/model/effort/persona settings through one nested popup, and a tighter
+default persona list.
+
+## Added
+
+- **Copy task** (`core/operations.rs`, `tui/app.rs`). `Ctrl+C` on a selected
+  board or detail task duplicates it under a fresh ID in the same column —
+  title, description, assignment, and the sidecar thread come along; run
+  bookkeeping does not (`session`, run phase, restart counters, and
+  worktree/branch/integration state are cleared, so a copy never inherits a
+  live agent or an isolated checkout). `Ctrl+C` twice within 3 seconds still
+  quits when no task is selected, and the help overlay says which of the two
+  the key does.
+
+## Changed
+
+- **Nested `Agent settings` popup** (`tui/dialogs.rs`). The flat
+  Backend/Model/Effort/Agent rows in the task create/edit dialogs and Project
+  Settings became one launcher row that opens a nested popup (per slot: the
+  task's own executor settings, the designer bot, the reviewer bot). The popup
+  opens on Enter or a click on the row, saves or restores the exact opening
+  state, and the parent form keeps Designer, Reviewer, and Chain-to controls.
+  The legacy `Interactive` checkbox left the TUI dialogs — TUI-created tasks
+  are non-interactive and edits leave an existing value untouched; the CLI
+  `--interactive` option and the stored YAML field remain supported.
+- **Agent prompts ask sooner** (`agent/prompt.rs`). Delegated agents are now
+  told to ask whenever clarification is needed instead of only "if blocked",
+  and an `interactive` task's prompt states the `kanban ask --wait` guidance
+  explicitly.
+
+## Removed
+
+- **`hephaestus` persona** (`core/config.rs`): dropped from the default
+  opencode `agent_options`.
+
+## Verification coverage
+
+- `copy_task` round-trip, run-state stripping, and thread copy
+  (`tests/operations_test.rs`)
+- agent-popup open/save/cancel, launcher click, snapshot updates for the
+  create/edit/settings dialogs (`src/tui/tests.rs` and snapshots)
+- interactive prompt paragraph in `tests/agent_test.rs`
+- full `cargo test --locked` and `cargo clippy --all-targets -- -D warnings`
+
 # kanban4ai 0.5.9
 
 opencode's `openai/*` models spend the same ChatGPT subscription as the codex

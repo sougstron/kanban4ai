@@ -1113,28 +1113,28 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut status = sample_status();
-        status.latest_version = "0.6.0".to_string();
-        status.tag = "v0.6.0".to_string();
+        status.latest_version = "9.9.9".to_string();
+        status.tag = "v9.9.9".to_string();
         force_cache(Some(Arc::new(status)));
 
         assert!(
             cached().as_deref().map(banner_due).unwrap_or(false),
             "undismissed update is due"
         );
-        dismiss("0.6.0");
+        dismiss("9.9.9");
         let marked = cached().expect("status after dismiss");
-        assert_eq!(marked.dismissed_version.as_deref(), Some("0.6.0"));
+        assert_eq!(marked.dismissed_version.as_deref(), Some("9.9.9"));
         assert!(!banner_due(&marked), "dismissed version is not due");
 
         // A newer release than the dismissed one reopens the banner.
         let mut newer = (*cached().unwrap()).clone();
-        newer.latest_version = "0.7.0".to_string();
-        newer.tag = "v0.7.0".to_string();
+        newer.latest_version = "9.9.10".to_string();
+        newer.tag = "v9.9.10".to_string();
         force_cache(Some(Arc::new(newer)));
         assert!(banner_due(cached().as_deref().unwrap()));
 
         force_cache(None);
-        dismiss("0.7.0");
+        dismiss("9.9.10");
         assert!(cached().is_none());
 
         force_cache(None);
