@@ -1,3 +1,62 @@
+# kanban4ai 0.6.1
+
+Relaunches stop paying twice: automatic relaunches of pi/omp agents now reopen
+the backend's own conversation instead of re-briefing a fresh one, and the
+fixed prompt text that every delegated session carries got smaller.
+
+## Added
+
+- **Native conversation resume for pi/omp relaunches** (`agent/backends.rs`,
+  `agent/prompt.rs`, `core/operations.rs`). Crash restarts, queue resumes, and
+  wake-after-answer relaunches look up the task's most recent completed
+  session with a recorded backend conversation id (provenance manifest, same
+  backend) and reopen it — pi via `--session <id>`, omp via `--resume <id>`
+  — instead of starting a fresh conversation. The relaunch sends a small
+  follow-up prompt (`build_resume_prompt`) that carries only the new board
+  session identity, the finish command for the role, and the thread delta
+  since the previous session; the backend already holds the original task,
+  rules, and tool history. Provenance is harvested before exit
+  reconciliation, so the just-finished conversation id is available when the
+  successor launch is built. Human-started resets are never resumed.
+- **`kanban ask-form --help` documents the schema**
+  (`cli/mod.rs`). The strict YAML form schema moved into the command's help
+  text, so agents are pointed at it instead of carrying the example in every
+  prompt.
+
+## Changed
+
+- **Slimmer delegated-agent prompts** (`agent/prompt.rs`). The detach/waiting
+  guidance and the ask-form example were condensed to a couple of lines that
+  reference `--help`; every session prompt (executor, designer, reviewer)
+  shrinks accordingly.
+- **No double replay of a run's reply** (`agent/prompt.rs`). When a captured
+  whole-session reply repeats context that the same run already posted
+  explicitly, the reply is skipped and only the concise context record is
+  replayed into the next prompt.
+
+## Docs and tooling
+
+- **`AGENTS.md` cut from ~1.6k lines to a project shape**
+  (`AGENTS.md`, `docs/*`, `scripts/token-budget.sh`). Long-form reference
+  moved into `docs/` (data model, CLI, config, orchestration, worktrees, TUI,
+  limits, agent I/O, releasing, token profile), loaded on demand; the
+  auto-loaded file keeps only architecture, rules, and a doc map.
+  `scripts/token-budget.sh` keeps the auto-loaded files small.
+- **Token profiler** (`scripts/profile-tokens.py`,
+  `docs/token-profile.md`). Measures what the board and `AGENTS.md` actually
+  cost an agent from the run history in `.kanban/logs/`, per stage and
+  cross-project.
+
+## Verification coverage
+
+- relaunch reopens the native conversation with the delta prompt
+  (`tests/agent_test.rs`: `pi_family_auto_relaunch_resumes_native_conversation_with_delta_prompt`)
+- captured reply not replayed when the run posted explicit context
+  (`tests/agent_test.rs`: `full_prompt_does_not_replay_agent_reply_when_same_run_posted_context`)
+- full `cargo test --locked`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build --release --locked`, `sh scripts/test-packaging.sh`,
+  `sh scripts/token-budget.sh`
+
 # kanban4ai 0.6.0
 
 Three board-workflow features: duplicate a task with a keystroke, reach
