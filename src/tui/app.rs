@@ -3236,6 +3236,10 @@ impl App {
                 label: "Smart (unread → running → newest)".to_string(),
                 value: Some(crate::core::global::PROJECT_SORT_SMART.to_string()),
             },
+            SelectOption {
+                label: "Smart (unread → running → name)".to_string(),
+                value: Some(crate::core::global::PROJECT_SORT_SMART_NAME.to_string()),
+            },
         ]);
         modal.capture_initial_values();
         self.modal = Some(modal);

@@ -6358,6 +6358,30 @@ fn set_project_created_at(data_root: &std::path::Path, stamp: &str) {
     std::fs::write(&file, format!("{updated}\n")).expect("rewrite project.yaml");
 }
 
+/// Stamp a project's `last_opened_at` so the smart sort's recency stage is
+/// deterministic (it mirrors the visible "Last opened" column). A project
+/// never opened has no `last_opened_at:` line at all, so insert one then.
+fn set_project_last_opened_at(data_root: &std::path::Path, stamp: &str) {
+    let file = data_root.join("project.yaml");
+    let raw = std::fs::read_to_string(&file).expect("project.yaml");
+    let mut replaced = false;
+    let mut lines: Vec<String> = raw
+        .lines()
+        .map(|line| {
+            if line.starts_with("last_opened_at:") {
+                replaced = true;
+                format!("last_opened_at: '{stamp}'")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        lines.push(format!("last_opened_at: '{stamp}'"));
+    }
+    std::fs::write(&file, format!("{}\n", lines.join("\n"))).expect("rewrite project.yaml");
+}
+
 /// A live session file, so the row's Agents count (`▶N`) is nonzero.
 fn write_active_session(data_root: &std::path::Path, id: &str) {
     let dir = data_root.join(".kanban/sessions");
@@ -7282,6 +7306,76 @@ fn projects_screen_smart_sort_counts_open_questions_as_unread() {
     // Alpha (questions) and Gamma (unseen review) share the unread tier;
     // newest unread wins, and both still outrank running Beta.
     assert_eq!(visible_project_names(&app), ["Gamma", "Alpha", "Beta"]);
+}
+
+#[test]
+fn projects_screen_smart_sort_orders_tiers_by_last_opened() {
+    // A dedicated store so the recency stage is exercised inside one tier:
+    // Beta and Alpha are both quiet, and their last opened order
+    // deliberately contradicts their created_at order.
+    let store_dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(store_dir.path());
+    let alpha_work = tempfile::tempdir().expect("alpha work");
+    let beta_work = tempfile::tempdir().expect("beta work");
+    let gamma_work = tempfile::tempdir().expect("gamma work");
+    let alpha = store
+        .add(alpha_work.path(), Some("Alpha"))
+        .expect("add alpha");
+    let beta = store.add(beta_work.path(), Some("Beta")).expect("add beta");
+    let gamma = store
+        .add(gamma_work.path(), Some("Gamma"))
+        .expect("add gamma");
+    set_project_created_at(&alpha.project.data_root, "2026-01-01T10:00:00");
+    set_project_created_at(&beta.project.data_root, "2026-03-01T10:00:00");
+    set_project_created_at(&gamma.project.data_root, "2026-02-01T10:00:00");
+    set_project_last_opened_at(&alpha.project.data_root, "2026-09-03T09:10:00");
+    set_project_last_opened_at(&beta.project.data_root, "2026-09-01T21:37:00");
+    write_task_file_with_flags(
+        &gamma.project.data_root,
+        "review",
+        "TASK-001",
+        "review_unseen: true\n",
+    );
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    app.settings.project_sort = "smart".to_string();
+    // Unread Gamma first; the quiet tier follows Last opened (Alpha Sep 3
+    // before Beta Sep 1) even though Beta is the newer registration.
+    assert_eq!(visible_project_names(&app), ["Gamma", "Alpha", "Beta"]);
+}
+
+#[test]
+fn projects_screen_smart_name_sort_orders_tiers_by_display_name() {
+    let (store_dir, store) = sorted_projects_store();
+    // A fourth, newest-created project with no unread work and no agents:
+    // under `smart` it would lead the quiet tier, under `smart_name` it must
+    // come after Alpha because the stage is the display name.
+    let zulu_work = tempfile::tempdir().expect("zulu work");
+    let zulu = store.add(zulu_work.path(), Some("Zulu")).expect("add zulu");
+    set_project_created_at(&zulu.project.data_root, "2026-04-01T10:00:00");
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    app.settings.project_sort = "smart_name".to_string();
+    // Unread Gamma, running Beta, then the quiet tier alphabetical: Alpha
+    // (created Jan) before Zulu (created Apr) — recency is irrelevant here.
+    assert_eq!(
+        visible_project_names(&app),
+        ["Gamma", "Beta", "Alpha", "Zulu"]
+    );
+
+    // Renaming a quiet row reorders its tier, proving the stage is name.
+    let store = ProjectStore::at(store_dir.path());
+    let zulu = store
+        .list()
+        .expect("list")
+        .into_iter()
+        .find(|p| p.name == "Zulu")
+        .expect("zulu");
+    store.rename(&zulu.id, "Aardvark").expect("rename zulu");
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    app.settings.project_sort = "smart_name".to_string();
+    assert_eq!(
+        visible_project_names(&app),
+        ["Gamma", "Beta", "Aardvark", "Alpha"]
+    );
 }
 
 #[test]

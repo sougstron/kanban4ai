@@ -53,10 +53,11 @@ they are edited: press `s` on the Projects screen. Saved under the store
   `tui.escape_to_projects` (TASK-178): the stale per-project key is now
   ignored, so boards that had it enabled need the toggle re-enabled globally.
 - `tui.project_sort`: `name` (default, alphabetical by the name the list
-  displays), `newest` (most recently created first), or `smart` (unread work
+  displays), `newest` (most recently created first), `smart` (unread work
   first — unseen Review or open questions — then rows with running agents,
-  then newest). Unknown values read as `name`. Edited from Global Settings
-  (`s` on the Projects screen).
+  then most recently opened), or `smart_name` (the same tiers, but
+  alphabetical by display name within each). Unknown values read as `name`.
+  Edited from Global Settings (`s` on the Projects screen).
 - `daemon.interval`: 60 - seconds between `kanban daemon` ticks. `--interval` on the command line overrides. This is the only orchestration cadence that lives in the store config, because the daemon spans projects.
 - `tui.file_manager`: unset - command the Projects screen's `o folder` button
   hands the work folder to (the folder is appended as the last argument;
