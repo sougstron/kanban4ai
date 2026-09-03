@@ -17,8 +17,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use serde::Deserialize;
 
+use crate::core::models::RunPhase;
 use crate::core::project::{Project, ProjectStore, default_name};
 use crate::core::session::SessionManager;
+use crate::core::timefmt;
 
 use super::app::{App, HitAction, Hitbox, UiAction};
 use super::card::{sanitize_terminal_text, truncate_display};
@@ -47,6 +49,9 @@ pub struct ProjectCounts {
     pub review: u32,
     pub done: u32,
     pub sessions: u32,
+    /// Tasks that are not consuming a running-agent slot: queued/retrying
+    /// tasks and agents in a declared wait.
+    pub paused: u32,
     pub review_unseen: u32,
     pub questions: u32,
 }
@@ -178,12 +183,19 @@ pub fn scan_counts(data_root: &Path) -> ProjectCounts {
     let tasks = data_root.join(".kanban").join("tasks");
     let [todo, in_progress, review, done] =
         ["todo", "in_progress", "review", "done"].map(|s| scan_task_dir(&tasks.join(s)));
+    let active_sessions = SessionManager::new(data_root).list_active_sessions();
+    let now = timefmt::now();
+    let waiting_sessions = active_sessions
+        .iter()
+        .filter(|session| session.wait_until.is_some_and(|deadline| now <= deadline))
+        .count() as u32;
     ProjectCounts {
         todo: todo.files,
         in_progress: in_progress.files,
         review: review.files,
         done: done.files,
-        sessions: SessionManager::new(data_root).list_active_sessions().len() as u32,
+        sessions: active_sessions.len() as u32 - waiting_sessions,
+        paused: todo.paused + in_progress.paused + review.paused + done.paused + waiting_sessions,
         review_unseen: review.unseen,
         questions: todo.questions + in_progress.questions + review.questions + done.questions,
     }
@@ -517,16 +529,7 @@ fn project_cell(
             count_cell(app, counts.review, style)
         }
         Column::Done => count_cell(app, counts.done, Style::default().fg(app.theme.ok)),
-        Column::Agents => {
-            if counts.sessions == 0 {
-                Text::from(Span::styled("·", Style::default().fg(app.theme.muted)))
-            } else {
-                Text::from(Span::styled(
-                    format!("▶{}", counts.sessions),
-                    Style::default().fg(app.theme.ok),
-                ))
-            }
-        }
+        Column::Agents => agent_cell(app, counts.sessions, counts.paused),
         Column::Opened => Text::from(Span::styled(
             format_opened(row.project.last_opened_at),
             Style::default().fg(app.theme.muted),
@@ -539,6 +542,30 @@ fn marker(shown: bool, glyph: char, color: ratatui::style::Color) -> Span<'stati
         Span::styled(glyph.to_string(), Style::default().fg(color))
     } else {
         Span::raw(" ")
+    }
+}
+
+fn agent_cell(app: &App, running: u32, paused: u32) -> Text<'static> {
+    let mut spans = Vec::new();
+    if running > 0 {
+        spans.push(Span::styled(
+            format!("▶{running}"),
+            Style::default().fg(app.theme.ok),
+        ));
+    }
+    if paused > 0 {
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            format!("⏸{paused}"),
+            Style::default().fg(app.theme.warn),
+        ));
+    }
+    if spans.is_empty() {
+        Text::from(Span::styled("·", Style::default().fg(app.theme.muted)))
+    } else {
+        Text::from(Line::from(spans))
     }
 }
 
@@ -557,6 +584,7 @@ struct DirScan {
     files: u32,
     unseen: u32,
     questions: u32,
+    paused: u32,
 }
 
 #[derive(Deserialize, Default)]
@@ -565,6 +593,10 @@ struct TaskFlags {
     review_unseen: bool,
     #[serde(default)]
     has_questions: bool,
+    #[serde(default)]
+    run_phase: Option<RunPhase>,
+    #[serde(default)]
+    restart_at: Option<serde_yaml_ng::Value>,
 }
 
 fn scan_task_dir(dir: &Path) -> DirScan {
@@ -585,6 +617,8 @@ fn scan_task_dir(dir: &Path) -> DirScan {
         {
             acc.unseen += u32::from(flags.review_unseen);
             acc.questions += u32::from(flags.has_questions);
+            acc.paused +=
+                u32::from(flags.run_phase == Some(RunPhase::Queued) || flags.restart_at.is_some());
         }
     }
     acc
