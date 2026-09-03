@@ -34,6 +34,7 @@ use crate::core::provenance::{
 use crate::core::reply;
 use crate::core::scheduler::{Slots, role_for_phase};
 use crate::core::session::{SessionManager, SessionState};
+use crate::core::stats;
 use crate::core::storage::{NewTask, Storage, atomic_write_text};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
@@ -911,6 +912,12 @@ impl Operations {
                 };
             } else if will_auto_launch && self.queue_is_full(&task)? {
                 queued = true;
+                stats::record_enter(
+                    &self.storage.project_path,
+                    &task.id,
+                    stats::Phase::Queued,
+                    &stats::Tags::default(),
+                );
                 task.run_phase = Some(RunPhase::Queued);
             } else if will_auto_launch && designer_enabled {
                 task.run_phase = Some(RunPhase::Design);
@@ -1039,6 +1046,12 @@ impl Operations {
             )));
         }
         task.reset_human_restart();
+        stats::record_enter(
+            &self.storage.project_path,
+            &task.id,
+            stats::Phase::Queued,
+            &stats::Tags::default(),
+        );
         task.run_phase = Some(RunPhase::Queued);
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
@@ -1518,6 +1531,12 @@ impl Operations {
                 }
                 VerdictRoute::Requeue => {
                     task.status = TaskStatus::InProgress;
+                    stats::record_enter(
+                        &self.storage.project_path,
+                        &task.id,
+                        stats::Phase::Queued,
+                        &stats::Tags::default(),
+                    );
                     task.run_phase = Some(RunPhase::Queued);
                     task.review_unseen = false;
                     task.updated_at = timefmt::now();
@@ -1907,6 +1926,7 @@ impl Operations {
         if task.run_phase != Some(RunPhase::Queued) {
             return Ok(());
         }
+        stats::record_exit(&self.storage.project_path, &task.id, stats::Phase::Queued);
         task.run_phase = Some(upcoming_run_plan(&self.config.load()?, task)?.1);
         Ok(())
     }
@@ -2016,6 +2036,12 @@ impl Operations {
             )?;
             // Same run-replacement bookkeeping as the direct wake below.
             task.reset_auto_restart();
+            stats::record_enter(
+                &self.storage.project_path,
+                &task.id,
+                stats::Phase::Queued,
+                &stats::Tags::default(),
+            );
             task.run_phase = Some(RunPhase::Queued);
             task.session = None;
             task.updated_at = timefmt::now();
@@ -2460,6 +2486,12 @@ impl Operations {
                 // A queued run owns no session; the dispatcher mints one
                 // when it starts the task.
                 task.session = None;
+                stats::record_enter(
+                    &self.storage.project_path,
+                    &task.id,
+                    stats::Phase::Queued,
+                    &stats::Tags::default(),
+                );
                 task.run_phase = Some(RunPhase::Queued);
             } else {
                 task.session = Some(new_session_note.clone());
@@ -4029,6 +4061,12 @@ impl Operations {
             Some("kanban".to_string()),
         )?;
         task.auto_resumes = attempt;
+        stats::record_enter(
+            &self.storage.project_path,
+            &task.id,
+            stats::Phase::Queued,
+            &stats::Tags::default(),
+        );
         task.run_phase = Some(RunPhase::Queued);
         task.session = None;
         task.updated_at = timefmt::now();

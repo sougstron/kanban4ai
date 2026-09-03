@@ -28,6 +28,7 @@ use crate::core::operations::{
     AgentExitOutcome, LandOutcome, Operations, QuestionRef, TaskPatch, Verdict, WaitWake,
 };
 use crate::core::session::{SessionManager, estimate_session_tokens};
+use crate::core::stats;
 use crate::core::storage::NewTask;
 use crate::core::timefmt;
 use crate::core::update;
@@ -356,6 +357,11 @@ enum Command {
         #[command(subcommand)]
         bridge: Option<bridge::LimitsBridge>,
     },
+    /// Show application-collected usage statistics (tokens and time spent,
+    /// by backend/model/project) across every registered project. The board
+    /// collects this itself, purely from state transitions it already
+    /// drives — never from anything an agent writes.
+    Stats,
     /// Check GitHub Releases for a newer kanban4ai; without --check also
     /// install it: download, verify the published SHA-256, and atomically
     /// replace the running binary. A pacman-owned binary is never touched —
@@ -629,6 +635,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 },
                 None => print_limits(&output_format, refresh)?,
             }
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::Stats => {
+            println!("{}", stats::collect_store_report(timefmt::now())?);
             return Ok(ExitCode::SUCCESS);
         }
         Command::Update { check } => return run_update(check),
@@ -1235,6 +1245,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Command::Tui
         | Command::Limits { .. }
+        | Command::Stats
         | Command::Update { .. }
         | Command::StatuslineBridge
         | Command::Daemon { .. } => {

@@ -1,9 +1,9 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 7661
+assertion_line: 8745
 expression: rendered
 ---
-┌ Projects · Enter open · n new · r rename · p path · s settings · d delete · / filter · q quit┐
+┌ Projects · Enter open · n new · r rename · p path · s settings · S stats · d delete · / filte┐
 │No projects. Press n to add this folder or another path.                                      │
 │                                                                                              │
 │                                                                                              │

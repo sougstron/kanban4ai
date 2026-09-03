@@ -145,6 +145,7 @@ tree at `<work>/.kanban/`.
 - `detached/` - `kanban detach` job artifacts: `<task_id>-<stamp>.log` (output) and `.status` (exit code); cleared with the task's logs
 - `worktrees/<task_id>/` - per-task isolated git checkouts (see "Worktree Isolation"); removed on land (with `cleanup: on_land`), Done, abandon, and by the GC pass
 - `recent_models` - most recently launched catalog-backend models (opencode/omp/pi), newest first (drives TUI model-selector ordering)
+- `stats/events.jsonl` - append-only usage-statistics event log the board writes itself (never agents); see `docs/stats.md`
 - `backups/<task_id>/` - pre-edit file backups for revert
 - `assets/images/` - pasted image attachments
 - `.lock` - board-wide flock serializing read-modify-write cycles

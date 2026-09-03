@@ -18,6 +18,7 @@ use crate::core::error::Result;
 use crate::core::models::{Role, RunPhase, TaskStatus};
 use crate::core::operations::{Operations, safe_session_component, sort_tasks};
 use crate::core::session::{SessionManager, SessionState};
+use crate::core::stats;
 use crate::core::timefmt;
 
 /// The role an agent runs under, derived from the task's run phase: a design
@@ -333,6 +334,7 @@ impl Operations {
                 return Ok(None);
             }
             let new_session_id = self.fresh_session_id(&safe_session_component(backend));
+            stats::record_exit(&self.storage.project_path, &task.id, stats::Phase::Queued);
             task.run_phase = Some(phase);
             task.session = Some(new_session_id.clone());
             task.updated_at = timefmt::now();
@@ -383,6 +385,13 @@ impl Operations {
             if restart_at > now {
                 continue;
             }
+            stats::record_exit(&self.storage.project_path, &task.id, stats::Phase::Retry);
+            stats::record_enter(
+                &self.storage.project_path,
+                &task.id,
+                stats::Phase::Queued,
+                &stats::Tags::default(),
+            );
             task.crash_restarts = task.crash_restarts.saturating_add(1);
             task.restart_at = None;
             task.run_phase = Some(RunPhase::Queued);
@@ -469,6 +478,12 @@ impl Operations {
             Some(at) => (at, "provider quota resets then".to_string()),
             None => (backoff_at, format!("backoff {minutes} min")),
         };
+        stats::record_enter(
+            &self.storage.project_path,
+            &task.id,
+            stats::Phase::Retry,
+            &stats::Tags::default(),
+        );
         task.restart_at = Some(restart_at);
         task.run_phase = Some(RunPhase::Queued);
         task.updated_at = timefmt::now();
