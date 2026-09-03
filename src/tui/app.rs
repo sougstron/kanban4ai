@@ -31,6 +31,7 @@ use crate::core::operations::{Operations, QuestionRef, TaskPatch, WaitWake};
 use crate::core::project::{Project, ProjectStore};
 use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
+use crate::core::stats;
 use crate::core::storage::{NewTask, Storage};
 use crate::core::telemetry::{self, SessionProgress};
 use crate::core::thread::ThreadManager;
@@ -1335,6 +1336,7 @@ impl App {
             KeyCode::Char('o') => self.dispatch(UiAction::OpenProjectFolder)?,
             KeyCode::Char('d') => self.dispatch(UiAction::DeleteProject)?,
             KeyCode::Char('s') => self.dispatch(UiAction::OpenGlobalSettings)?,
+            KeyCode::Char('S') => self.open_stats_view()?,
             KeyCode::Enter if self.selected_is_create_cwd() => {
                 self.dispatch(UiAction::CreateCwdProject)?
             }
@@ -4098,6 +4100,18 @@ impl App {
             &lines.join("\n"),
             Screen::Sessions,
         );
+        Ok(())
+    }
+
+    /// Open the read-only usage-stats report (Projects screen `S`): tokens and
+    /// time spent, broken down by backend/model/project, across every
+    /// registered project — the app collects this itself from state
+    /// transitions it already drives, never from agent-reported prose. Reuses
+    /// the text pager; `Screen::Projects` is the only place with no single
+    /// project in context, matching where the report aggregates from.
+    fn open_stats_view(&mut self) -> Result<()> {
+        let report = stats::collect_store_report(timefmt::now())?;
+        self.open_text_view("Stats".to_string(), &report, Screen::Projects);
         Ok(())
     }
 

@@ -28,7 +28,7 @@ use super::card::{sanitize_terminal_text, truncate_display};
 /// `o folder` is deliberately absent: the title already fills a 96-column
 /// terminal, so the open-folder hint lives in the status bar (where it is
 /// clickable and drops on narrow terminals) and in the help overlay.
-const TITLE: &str = " Projects · Enter open · n new · r rename · p path · s settings · d delete · / filter · q quit ";
+const TITLE: &str = " Projects · Enter open · n new · r rename · p path · s settings · S stats · d delete · / filter · q quit ";
 
 /// Column labels plus the rule drawn under them.
 const HEADER_HEIGHT: u16 = 2;

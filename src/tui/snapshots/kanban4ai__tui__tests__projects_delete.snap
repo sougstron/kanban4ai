@@ -1,8 +1,9 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 7491
 expression: rendered
 ---
-┌ Projects · Enter open · n new · r rename · p path · s settings · d delete · / filter · q quit┐
+┌ Projects · Enter open · n new · r rename · p path · s settings · S stats · d delete · / filte┐
 │    Project                               To Do  Doing  Review  Done  Agents       Last opened│
 ├──────────────────────────────────────────────────────────────────────────────────────────────┤
 │    Demo Board                                1      1       0     0       ·             never│

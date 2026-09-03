@@ -43,6 +43,7 @@ auto-loaded into every agent session. Read it when you need the exact flags of a
 - `kanban archive-done` - Move all Done tasks to Archive
 - `kanban limits [--format table|json] [--refresh]` - Remaining subscription capacity per provider (claude, grok, zai, synthetic, yolo); serves the cached snapshot unless it aged out or `--refresh` is given
 - `kanban limits bridge install` / `kanban limits bridge remove` - Wrap / unwrap Claude Code's statusline command with the bridge feeding the claude segment of the limits row
+- `kanban stats` - Print the application-collected usage report (tokens and time, by backend/model/project, all time / this month / this week) across every registered project — see `docs/stats.md`
 - `kanban update [--check]` - Report (or install) the newest GitHub release; see "Updater". Project-independent: runs from any directory with no board. A status cached within `updates.check_interval_hours` answers from the cache, otherwise one blocking check runs; `--check` only prints the report. Without `--check` a newer release is downloaded, verified, and installed — refused with the upgrade command when pacman owns the binary
 - `kanban tui` - Launch the interactive board; with no resolved project, open the projects list
 - `kanban attach <id>` - Attach to the task's running agent tmux session

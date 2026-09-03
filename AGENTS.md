@@ -42,6 +42,7 @@ Load only what the task touches:
 | `docs/tui.md` | TUI keyboard shortcuts and dialogs |
 | `docs/limits.md` | Provider subscription limits (`core/limits.rs`, `tui/limits.rs`) |
 | `docs/agent-io.md` | Agent reply capture, live telemetry, image attachments |
+| `docs/stats.md` | Application-collected usage statistics (`core/stats.rs`): event schema, hooks, the Stats report |
 | `docs/releasing.md` | Updater and the full authorized version-update sequence |
 | `docs/token-profile.md` | Measured token cost of the board, and where to cut |
 
@@ -74,6 +75,7 @@ src/
     ├── scheduler.rs     # Slot census, queue dispatch, crash-restart backoff
     ├── daemon.rs        # Store-wide tick + single-instance `daemon.lock`
     ├── limits.rs        # Provider subscription limits (claude/codex/grok/zai/synthetic/yolo) + cache
+    ├── stats.rs         # App-collected usage stats: event log, aggregation, report
     ├── notifier.rs      # Desktop notifications (notify-send)
     └── vcs.rs           # Worktree isolation: git probe, live snapshots, merge-tree landing
 Additional modules:

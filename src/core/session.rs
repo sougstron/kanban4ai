@@ -8,7 +8,9 @@ use regex::Regex;
 
 use crate::core::error::{KanbanError, Result};
 use crate::core::models::{MessageKind, MessageRole, Session, SessionStatus};
+use crate::core::stats;
 use crate::core::storage::{Storage, atomic_write_text};
+use crate::core::telemetry;
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 
@@ -80,6 +82,7 @@ impl SessionManager {
         Self::validate_session_id(session_id)?;
         let session = Session::new(session_id, task_id);
         self.save_session(&session)?;
+        self.record_stats_running_start(task_id);
         Ok(session)
     }
 
@@ -92,7 +95,59 @@ impl SessionManager {
         Self::validate_session_id(session_id)?;
         let session = Session::named(session_id, task_id, name);
         self.save_session(&session)?;
+        self.record_stats_running_start(task_id);
         Ok(session)
+    }
+
+    /// Every session start is a `Running` phase beginning, whatever role it
+    /// runs as (executor/designer/reviewer) or path claimed it (dispatcher,
+    /// direct launch, revoke). Tags come off the task's current launch fields
+    /// — best effort: a task that vanished between the caller's own lookup
+    /// and this one just yields untagged stats instead of failing the launch.
+    fn record_stats_running_start(&self, task_id: &str) {
+        let tags = Storage::new(&self.project_path)
+            .load_task(task_id)
+            .ok()
+            .flatten()
+            .map(|task| stats::Tags::from_task(&task))
+            .unwrap_or_default();
+        stats::record_enter(&self.project_path, task_id, stats::Phase::Running, &tags);
+    }
+
+    /// End whichever phase a session was actually in when it stopped
+    /// (`Waiting` if a declared wait was still pending, `Running` otherwise),
+    /// and tally its final tokens. Called from [`Self::close_session`] and
+    /// [`Self::crash_session`] before the session record is mutated, so
+    /// `session` still carries its pre-close `wait_until`/status.
+    fn record_stats_session_end(&self, session: &Session) {
+        if session.status != SessionStatus::Active {
+            return; // already ended — never double-record a re-close.
+        }
+        let phase = if session.wait_until.is_some() {
+            stats::Phase::Waiting
+        } else {
+            stats::Phase::Running
+        };
+        stats::record_exit(&self.project_path, &session.task_id, phase);
+
+        let Some(task) = Storage::new(&self.project_path)
+            .load_task(&session.task_id)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let backend = task.agent_backend.as_deref().unwrap_or("claude");
+        let progress = telemetry::read_session_progress(&self.project_path, &session.id, backend);
+        if let Some(tokens) = progress.tokens {
+            stats::record_usage(
+                &self.project_path,
+                &session.task_id,
+                &session.id,
+                tokens,
+                &stats::Tags::from_task(&task),
+            );
+        }
     }
 
     pub fn unlink_session(&self, session_id: &str) {
@@ -189,11 +244,24 @@ impl SessionManager {
         if session.status != SessionStatus::Active {
             return Ok(false);
         }
+        // Only a *fresh* wait is a Running→Waiting transition; renewing an
+        // already-declared wait (a new ETA before the old one expires) must
+        // not re-close a Running span that already ended at the first call.
+        let was_waiting = session.wait_until.is_some();
         session.wait_until = Some(wait_until);
         session.wait_note = note;
         session.wait_exited = false;
         session.last_seen = timefmt::now();
         self.save_session(&session)?;
+        if !was_waiting {
+            stats::record_exit(&self.project_path, &session.task_id, stats::Phase::Running);
+            stats::record_enter(
+                &self.project_path,
+                &session.task_id,
+                stats::Phase::Waiting,
+                &stats::Tags::default(),
+            );
+        }
         Ok(true)
     }
 
@@ -215,6 +283,7 @@ impl SessionManager {
         Self::validate_session_id(session_id)?;
         let _guard = Storage::new(&self.project_path).lock()?;
         if let Some(mut session) = self.load_session(session_id) {
+            self.record_stats_session_end(&session);
             session.status = SessionStatus::Closed;
             session.ended_at = Some(timefmt::now());
             self.save_session(&session)?;
@@ -232,6 +301,7 @@ impl SessionManager {
         if session.status != SessionStatus::Active {
             return Ok(());
         }
+        self.record_stats_session_end(&session);
         let now = timefmt::now();
         session.status = SessionStatus::Crashed;
         self.save_session(&session)?;

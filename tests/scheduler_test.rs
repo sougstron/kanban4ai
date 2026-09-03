@@ -16,6 +16,8 @@ use kanban4ai::core::storage::NewTask;
 use kanban4ai::core::thread::ThreadManager;
 use kanban4ai::core::timefmt;
 
+use kanban4ai::core::stats;
+
 use common::{RecordingLauncher, ops_with_recorder};
 
 /// A board whose config carries the given orchestration overrides.
@@ -1202,4 +1204,128 @@ fn a_crash_restart_after_design_resumes_the_executor() {
         "a crash restart must not pay for a second designer pass"
     );
     assert_eq!(settings.backend, "opencode");
+}
+
+// ------------------------------------------------------------------- stats
+//
+// These exercise the real hook wiring end to end (not just the pure
+// aggregation logic already covered in `core::stats`'s own unit tests):
+// dispatch, waiting, crash-restart and stop must leave the right closed
+// spans behind.
+
+#[test]
+fn dispatch_and_stop_record_a_closed_running_span_tagged_with_the_backend() {
+    let (_dir, ops, _recorder) = dispatch_board(
+        "  queue_enabled: true\n  max_running_total: 3\n  max_running_per_backend: {}\n  max_running_per_role: {}\n",
+    );
+    let id = queued_task(&ops, "Ready", "claude");
+
+    let started = ops.dispatch_queue().unwrap();
+    assert_eq!(started.len(), 1);
+    // Still live: nothing closed yet.
+    assert!(stats::load(&ops.storage.project_path).spans.is_empty());
+
+    ops.stop_session(&started[0].session_id).unwrap();
+
+    let loaded = stats::load(&ops.storage.project_path);
+    let running: Vec<_> = loaded
+        .spans
+        .iter()
+        .filter(|span| span.phase == stats::Phase::Running && span.task_id == id)
+        .collect();
+    assert_eq!(running.len(), 1);
+    assert_eq!(running[0].backend.as_deref(), Some("claude"));
+    // The fixture set run_phase = Queued directly (bypassing queue_run), so
+    // there is no matching Enter(Queued) for claim_queued_task's Exit — it is
+    // correctly dropped instead of paired with nothing.
+    assert!(
+        loaded
+            .spans
+            .iter()
+            .all(|span| span.phase != stats::Phase::Queued)
+    );
+}
+
+#[test]
+fn queue_run_then_dispatch_records_a_closed_queued_span() {
+    let (_dir, ops, _recorder) = dispatch_board(
+        "  queue_enabled: true\n  max_running_total: 3\n  max_running_per_backend: {}\n  max_running_per_role: {}\n",
+    );
+    let task = ops.create_task(NewTask::titled("Queue via API")).unwrap();
+    ops.queue_run(&task.id).unwrap();
+
+    let started = ops.dispatch_queue().unwrap();
+    assert_eq!(started.len(), 1);
+
+    let loaded = stats::load(&ops.storage.project_path);
+    let queued: Vec<_> = loaded
+        .spans
+        .iter()
+        .filter(|span| span.phase == stats::Phase::Queued && span.task_id == task.id)
+        .collect();
+    assert_eq!(
+        queued.len(),
+        1,
+        "queue_run's Enter must pair with claim_queued_task's Exit"
+    );
+}
+
+#[test]
+fn declare_waiting_then_stop_records_a_waiting_span_and_closes_the_running_one() {
+    let (_dir, ops, _recorder) = dispatch_board(
+        "  queue_enabled: true\n  max_running_total: 3\n  max_running_per_backend: {}\n  max_running_per_role: {}\n",
+    );
+    let id = queued_task(&ops, "Waits", "claude");
+    let started = ops.dispatch_queue().unwrap();
+    let session_id = started[0].session_id.clone();
+
+    ops.declare_waiting(&id, &session_id, None, Some("checking a download"))
+        .unwrap();
+    ops.stop_session(&session_id).unwrap();
+
+    let loaded = stats::load(&ops.storage.project_path);
+    let waiting: Vec<_> = loaded
+        .spans
+        .iter()
+        .filter(|span| span.phase == stats::Phase::Waiting && span.task_id == id)
+        .collect();
+    assert_eq!(waiting.len(), 1);
+    let running: Vec<_> = loaded
+        .spans
+        .iter()
+        .filter(|span| span.phase == stats::Phase::Running && span.task_id == id)
+        .collect();
+    assert_eq!(
+        running.len(),
+        1,
+        "the Running span before the wait must close, not vanish"
+    );
+}
+
+#[test]
+fn crash_restart_backoff_records_a_closed_retry_span() {
+    let (_dir, ops, _recorder) = dispatch_board(
+        "  queue_enabled: true\n  auto_restart_enabled: true\n  auto_restart_delays_minutes: [5, 10]\n",
+    );
+    let session_id = live_task(&ops, "Flaky", "claude", None);
+    let id = SessionManager::new(&ops.storage.project_path)
+        .load_session(&session_id)
+        .unwrap()
+        .task_id;
+
+    ops.reconcile_agent_exit(&id, &session_id, 1).unwrap();
+    // The backoff was just scheduled (Enter(Retry) recorded); fast-forward it
+    // to due by rewriting restart_at directly, then let the pump close it out.
+    let mut task = ops.get_task(&id).unwrap().unwrap();
+    task.restart_at = Some(timefmt::now() - chrono::Duration::seconds(1));
+    ops.storage.save_task(&task).unwrap();
+    ops.due_restarts().unwrap();
+
+    let loaded = stats::load(&ops.storage.project_path);
+    let retry: Vec<_> = loaded
+        .spans
+        .iter()
+        .filter(|span| span.phase == stats::Phase::Retry && span.task_id == id)
+        .collect();
+    assert_eq!(retry.len(), 1);
 }

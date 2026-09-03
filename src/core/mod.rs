@@ -17,6 +17,7 @@ pub mod provenance;
 pub mod reply;
 pub mod scheduler;
 pub mod session;
+pub mod stats;
 pub mod storage;
 pub mod telemetry;
 pub mod thread;
