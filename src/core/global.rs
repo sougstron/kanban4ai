@@ -25,8 +25,11 @@ pub const PROJECT_SORT_NAME: &str = "name";
 /// Projects-list ordering: newest project first.
 pub const PROJECT_SORT_NEWEST: &str = "newest";
 /// Projects-list ordering: unread rows first, then rows with running agents,
-/// then newest first.
+/// then most recently opened first.
 pub const PROJECT_SORT_SMART: &str = "smart";
+/// Projects-list ordering: like [`PROJECT_SORT_SMART`] but the final stage is
+/// alphabetical by display name instead of recency.
+pub const PROJECT_SORT_SMART_NAME: &str = "smart_name";
 
 /// Default `kanban daemon` tick interval when the store config omits one.
 pub const DEFAULT_DAEMON_INTERVAL_SECS: u64 = 60;
@@ -39,6 +42,7 @@ pub fn normalize_project_sort(value: &str) -> &'static str {
     match value {
         PROJECT_SORT_NEWEST => PROJECT_SORT_NEWEST,
         PROJECT_SORT_SMART => PROJECT_SORT_SMART,
+        PROJECT_SORT_SMART_NAME => PROJECT_SORT_SMART_NAME,
         _ => PROJECT_SORT_NAME,
     }
 }
@@ -256,6 +260,14 @@ mod tests {
         config.set_project_sort("smart");
         store.save_global_config(&config).expect("save");
         assert_eq!(store.load_global_config().unwrap().project_sort(), "smart");
+
+        let mut config = store.load_global_config().unwrap();
+        config.set_project_sort("smart_name");
+        store.save_global_config(&config).expect("save");
+        assert_eq!(
+            store.load_global_config().unwrap().project_sort(),
+            "smart_name"
+        );
 
         // Unknown values normalize to the default rather than erroring, so a
         // hand-edited file still yields a usable ordering.
