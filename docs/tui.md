@@ -46,7 +46,6 @@ Action hotkeys work on both the board (focused card) and the open detail view.
   (`available`, or `unavailable — <reason>`; probed once when the dialog opens,
   since the probe runs git). On the
   Projects screen `s` instead opens Global Settings (see "Global Settings").
-  The Board status-bar `s settings` hint is clickable when it fits.
 - `e`: Edit task
 - `d` / `Ctrl+d` / `Delete` / `Backspace`: Delete task
 - `m`: Move task
@@ -162,10 +161,11 @@ with the XTWINOPS title stack (`ESC[22;2t` / `ESC[23;2t`) alongside the
 alternate-screen teardown, on the panic path too.
 
 The status bar is contextual per screen (Board, Detail, Sessions, Archive,
-Projects, log view) and its hotkey segments are clickable; when the terminal is
-narrow the least important segments are dropped instead of clipping. Column headers show
-only the column name and visible task count; the status-bar question count
-focuses the first questioned task when clicked. Drag a card to a different
+Projects, log view); it is an informational hotkey panel and not clickable —
+nothing in it reads as a button, so it registers no hitboxes. When the
+terminal is narrow the least important segments are dropped instead of
+clipping. Column headers show
+only the column name and visible task count. Drag a card to a different
 column to move it in human mode. A single click on a card opens its detail;
 a drag still moves it between columns without opening the detail view. The drag
 is visible: the card in flight is inverted, the destination column's border

@@ -360,20 +360,16 @@ fn card_capacity_with_indicators(
     (area.height.saturating_sub((above + below) as u16) / card_height).max(1) as usize
 }
 
-/// A status-bar hint: a hotkey label, an optional click action, and a drop
-/// priority — higher numbers disappear first when the bar overflows.
+/// A status-bar hint: a hotkey label and a drop priority — higher numbers
+/// disappear first when the bar overflows. The bar is an informational
+/// hotkey panel and registers no hitboxes.
 struct StatusSegment {
     label: &'static str,
-    action: Option<UiAction>,
     priority: u8,
 }
 
-fn seg(label: &'static str, action: Option<UiAction>, priority: u8) -> StatusSegment {
-    StatusSegment {
-        label,
-        action,
-        priority,
-    }
+fn seg(label: &'static str, priority: u8) -> StatusSegment {
+    StatusSegment { label, priority }
 }
 
 /// The `Q` hint for the current task, when it applies: a queued card offers
@@ -381,39 +377,37 @@ fn seg(label: &'static str, action: Option<UiAction>, priority: u8) -> StatusSeg
 fn queue_segment(app: &App) -> Option<StatusSegment> {
     let task = app.current_task()?;
     match app.queue_action_for(&task)? {
-        UiAction::Dequeue => Some(seg("Q unqueue", Some(UiAction::Dequeue), 3)),
-        UiAction::Enqueue => Some(seg("Q queue", Some(UiAction::Enqueue), 3)),
+        UiAction::Dequeue => Some(seg("Q unqueue", 3)),
+        UiAction::Enqueue => Some(seg("Q queue", 3)),
         _ => None,
     }
 }
 
 fn status_segments(app: &App) -> Vec<StatusSegment> {
-    let primary_action = match app.current_task() {
-        Some(task) if app.primary_run_action_for(&task) == UiAction::Revoke => {
-            ("r revoke", UiAction::Revoke)
-        }
-        _ => ("r queue", UiAction::Run),
+    let primary_label = match app.current_task() {
+        Some(task) if app.primary_run_action_for(&task) == UiAction::Revoke => "r revoke",
+        _ => "r queue",
     };
     match app.screen {
         Screen::Board => {
             let mut segments = vec![
-                seg("n new", Some(UiAction::NewTask), 2),
-                seg("e edit", Some(UiAction::EditTask), 4),
-                seg(primary_action.0, Some(primary_action.1), 1),
-                seg("F run now", Some(UiAction::RunNow), 7),
-                seg("m move", Some(UiAction::MoveTask), 4),
-                seg("y approve", Some(UiAction::Approve), 5),
-                seg("A archive done", Some(UiAction::ArchiveAllDone), 6),
-                seg("b review done", Some(UiAction::MarkReviewDone), 6),
-                seg("/ filter", Some(UiAction::Search), 3),
-                seg("s settings", Some(UiAction::OpenSettings), 7),
-                seg("? help", Some(UiAction::Help), 1),
+                seg("n new", 2),
+                seg("e edit", 4),
+                seg(primary_label, 1),
+                seg("F run now", 7),
+                seg("m move", 4),
+                seg("y approve", 5),
+                seg("A archive done", 6),
+                seg("b review done", 6),
+                seg("/ filter", 3),
+                seg("s settings", 7),
+                seg("? help", 1),
             ];
             if app
                 .current_task()
                 .is_some_and(|task| app.task_can_stop(&task))
             {
-                segments.insert(3, seg("k stop", Some(UiAction::Stop), 2));
+                segments.insert(3, seg("k stop", 2));
             }
             if let Some(queue) = queue_segment(app) {
                 segments.insert(3, queue);
@@ -425,61 +419,58 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
                 !detail.open_questions().is_empty() || detail.show_edits_panel()
             });
             let mut segments = vec![
-                seg(primary_action.0, Some(primary_action.1), 1),
-                seg("F run now", Some(UiAction::RunNow), 7),
-                seg("w answer", Some(UiAction::AnswerQuestion), 3),
-                seg("y approve", Some(UiAction::Approve), 3),
-                seg("x reject", Some(UiAction::ToggleReject), 5),
+                seg(primary_label, 1),
+                seg("F run now", 7),
+                seg("w answer", 3),
+                seg("y approve", 3),
+                seg("x reject", 5),
             ];
             if app
                 .current_task()
                 .is_some_and(|task| app.task_can_stop(&task))
             {
-                segments.insert(1, seg("k stop", Some(UiAction::Stop), 2));
+                segments.insert(1, seg("k stop", 2));
             }
             if let Some(queue) = queue_segment(app) {
                 segments.insert(1, queue);
             }
             if show_tab {
-                segments.push(seg("Tab editor", None, 4));
-                segments.push(seg("Ctrl+S save", Some(UiAction::SaveReviewEdits), 4));
+                segments.push(seg("Tab editor", 4));
+                segments.push(seg("Ctrl+S save", 4));
             }
-            segments.push(seg("q/Esc back", None, 2));
+            segments.push(seg("q/Esc back", 2));
             segments
         }
         Screen::Sessions => vec![
-            seg("Enter attach", Some(UiAction::OpenDetail), 1),
-            seg("v log", Some(UiAction::ViewLog), 2),
-            seg("x kill", Some(UiAction::KillSession), 2),
-            seg("o task", Some(UiAction::OpenSessionTask), 3),
-            seg("/ filter", Some(UiAction::Search), 4),
-            seg("q back", None, 3),
+            seg("Enter attach", 1),
+            seg("v log", 2),
+            seg("x kill", 2),
+            seg("o task", 3),
+            seg("/ filter", 4),
+            seg("q back", 3),
         ],
         Screen::Archive => vec![
-            seg("Enter detail", Some(UiAction::OpenDetail), 1),
-            seg("u restore", Some(UiAction::Restore), 1),
-            seg("/ filter", Some(UiAction::Search), 3),
-            seg("q back", None, 2),
+            seg("Enter detail", 1),
+            seg("u restore", 1),
+            seg("/ filter", 3),
+            seg("q back", 2),
         ],
-        Screen::LogView => vec![seg("↑/↓ scroll", None, 2), seg("q back", None, 1)],
-        Screen::TextView => vec![seg("↑/↓ PgUp/PgDn scroll", None, 2), seg("q back", None, 1)],
-        Screen::Help => vec![
-            seg("↑/↓ scroll", None, 2),
-            seg("? close", Some(UiAction::Help), 1),
-        ],
+        Screen::LogView => vec![seg("↑/↓ scroll", 2), seg("q back", 1)],
+        Screen::TextView => vec![seg("↑/↓ PgUp/PgDn scroll", 2), seg("q back", 1)],
+        Screen::Help => vec![seg("↑/↓ scroll", 2), seg("? close", 1)],
         Screen::Projects => vec![
-            seg("Enter open", Some(UiAction::OpenProject), 1),
-            seg("n new", Some(UiAction::NewProject), 2),
-            seg("r rename", Some(UiAction::RenameProject), 3),
-            seg("p path", Some(UiAction::SetProjectPath), 4),
+            seg("Enter open", 1),
+            seg("n new", 2),
+            seg("r rename", 3),
+            seg("p path", 4),
             // Ties with settings, which is listed after it and so drops
             // first: the title bar still advertises `s`, but the only hint
             // for the folder button is here.
-            seg("o folder", Some(UiAction::OpenProjectFolder), 5),
-            seg("d delete", Some(UiAction::DeleteProject), 3),
-            seg("s settings", Some(UiAction::OpenGlobalSettings), 5),
-            seg("/ filter", Some(UiAction::Search), 4),
-            seg("? help", Some(UiAction::Help), 1),
+            seg("o folder", 5),
+            seg("d delete", 3),
+            seg("s settings", 5),
+            seg("/ filter", 4),
+            seg("? help", 1),
         ],
     }
 }
@@ -510,7 +501,8 @@ fn fit_segments(segments: Vec<StatusSegment>, available: u16) -> Vec<StatusSegme
 }
 
 /// Screen-specific status bar: warning chips, the last status message, then
-/// clickable hotkey hints for the current screen.
+/// hotkey hints for the current screen. Informational only — it registers no
+/// hitboxes, so clicks and hovers pass through to nothing.
 fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let question_count = app
         .board
@@ -526,15 +518,6 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if question_count > 0 {
         let chip = format!(" ? {question_count} questions ");
         let width = UnicodeWidthStr::width(chip.as_str()) as u16;
-        app.hitboxes.push(Hitbox {
-            area: Rect {
-                x,
-                y: area.y,
-                width,
-                height: 1,
-            },
-            action: HitAction::Action(UiAction::FocusQuestions),
-        });
         spans.push(Span::styled(chip, Style::default().fg(app.theme.warn)));
         x = x.saturating_add(width);
     }
@@ -542,15 +525,6 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if !filter.is_empty() && !app.search.active {
         let chip = format!(" Filter: \"{filter}\" · Esc clear ");
         let width = UnicodeWidthStr::width(chip.as_str()) as u16;
-        app.hitboxes.push(Hitbox {
-            area: Rect {
-                x,
-                y: area.y,
-                width,
-                height: 1,
-            },
-            action: HitAction::Action(UiAction::ClearSearch),
-        });
         spans.push(Span::styled(chip, Style::default().fg(app.theme.warn)));
         x = x.saturating_add(width);
     }
@@ -574,17 +548,6 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             format!("· {} ", segment.label)
         };
         let width = UnicodeWidthStr::width(text.as_str()) as u16;
-        if let Some(action) = segment.action {
-            app.hitboxes.push(Hitbox {
-                area: Rect {
-                    x,
-                    y: area.y,
-                    width,
-                    height: 1,
-                },
-                action: HitAction::Action(action),
-            });
-        }
         spans.push(Span::raw(text));
         x = x.saturating_add(width);
     }
@@ -701,7 +664,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  drag across text: copy it · hold Shift to select interactive text"),
         Line::from("  drag a card onto another column: move it (target column"),
         Line::from("    highlights green; status bar shows what moves where)"),
-        Line::from("  status-bar hints are clickable; column headers show name and count"),
+        Line::from("  column headers show name and count"),
         Line::from(""),
         Line::from("Provider limits (row above the status bar, Board and Projects)"),
         Line::from("  ✳ claude · ✕ grok · ◆ zai · ✦ synthetic · ◉ yolo"),

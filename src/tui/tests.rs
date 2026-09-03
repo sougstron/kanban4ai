@@ -2192,26 +2192,16 @@ fn mouse_backend_selection_refreshes_each_role_popup() {
 }
 
 #[test]
-fn wide_board_status_bar_opens_settings_by_mouse() {
+fn wide_board_status_bar_is_not_clickable() {
     let (_dir, mut app) = settings_app();
     let _ = render_at(&mut app, 240, 28);
-    let settings_hit = app
-        .hitboxes
-        .iter()
-        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::OpenSettings))
-        .copied()
-        .expect("settings status-bar hitbox");
-    app.handle_mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: settings_hit.area.x,
-        row: settings_hit.area.y,
-        modifiers: KeyModifiers::NONE,
-    })
-    .expect("open settings by mouse");
-    assert!(matches!(
-        app.modal.as_ref().map(|modal| &modal.modal),
-        Some(Modal::Settings)
-    ));
+    let status_row = 28u16 - 1;
+    assert!(
+        !app.hitboxes
+            .iter()
+            .any(|hitbox| hitbox.area.y == status_row),
+        "status bar must register no hitboxes"
+    );
 }
 
 #[test]
@@ -4908,22 +4898,10 @@ fn phase_three_column_headers_render_name_and_count_only() {
 }
 
 #[test]
-fn phase_three_header_question_and_drag_hitboxes_drive_board_state() {
+fn phase_three_question_focus_and_drag_hitboxes_drive_board_state() {
     let (_dir, mut app) = populated_app();
     let _ = render_snapshot(&mut app);
-    let question_hit = app
-        .hitboxes
-        .iter()
-        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::FocusQuestions))
-        .copied()
-        .expect("question count hitbox");
-    app.handle_mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: question_hit.area.x,
-        row: question_hit.area.y,
-        modifiers: KeyModifiers::NONE,
-    })
-    .expect("focus first question");
+    app.focus_first_question();
     assert!(
         app.focused_task()
             .expect("focused question task")
@@ -5276,7 +5254,7 @@ fn phase_three_question_count_matches_filtered_and_capped_tasks() {
 
     let output = render_at(&mut app, 96, 18);
     assert!(!output.contains("? 1 questions"));
-    app.dispatch(UiAction::FocusQuestions).unwrap();
+    app.focus_first_question();
     assert_eq!(app.status, "No tasks have open questions");
 }
 
@@ -5625,35 +5603,29 @@ fn phase_six_archive_restore_confirms_and_returns_task_to_todo() {
 }
 
 #[test]
-fn phase_seven_status_bar_is_contextual_and_clickable() {
+fn phase_seven_status_bar_is_contextual_and_not_clickable() {
     let (_dir, mut app) = app_with_board();
     let rendered = render_at(&mut app, 140, 18);
     assert!(rendered.contains("n new"));
     assert!(rendered.contains("b review done"));
-    let help_hit = app
-        .hitboxes
-        .iter()
-        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::Help))
-        .copied()
-        .expect("help segment hitbox");
-    app.handle_mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: help_hit.area.x + 1,
-        row: help_hit.area.y,
-        modifiers: KeyModifiers::NONE,
-    })
-    .unwrap();
-    assert_eq!(app.screen, Screen::Help);
-    app.handle_key(key(KeyCode::Char('?'))).unwrap();
-    assert_eq!(app.screen, Screen::Board);
+    // The status bar is an informational hotkey panel: no hitboxes on its row.
+    let status_row = 18u16 - 1;
+    assert!(
+        !app.hitboxes
+            .iter()
+            .any(|hitbox| hitbox.area.y == status_row),
+        "status bar must register no hitboxes"
+    );
 
     app.handle_key(key(KeyCode::Char('l'))).unwrap();
     let sessions = render_snapshot(&mut app);
     assert!(sessions.contains("x kill"));
+    // The Sessions status bar is informational too: its hints carry no hitboxes.
     assert!(
-        app.hitboxes
+        !app.hitboxes
             .iter()
-            .any(|hitbox| hitbox.action == HitAction::Action(UiAction::ViewLog))
+            .any(|hitbox| hitbox.action == HitAction::Action(UiAction::ViewLog)),
+        "sessions status bar must register no hitboxes"
     );
     app.handle_key(key(KeyCode::Char('q'))).unwrap();
 
@@ -6593,7 +6565,7 @@ fn mouse_move_preselects_a_project_row_without_taking_the_selection() {
     assert_ne!(app.theme.hover, app.theme.bg);
 }
 
-/// The status-bar button hands the selected project's work folder to the
+/// The `o` hotkey hands the selected project's work folder to the
 /// configured file manager, with the folder appended to the command.
 #[test]
 fn the_open_folder_button_hands_the_work_folder_to_the_file_manager() {
@@ -6616,22 +6588,16 @@ fn the_open_folder_button_hands_the_work_folder_to_the_file_manager() {
     let mut app =
         App::projects_at(ProjectStore::at(store_dir.path()), None, None).expect("projects app");
     let rendered = render_at(&mut app, 120, 16);
-    let button = app
-        .hitboxes
-        .iter()
-        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::OpenProjectFolder))
-        .copied()
-        .expect("open-folder button")
-        .area;
     assert!(rendered.contains("o folder"), "{rendered}");
+    // The status bar is informational: the hint is not itself clickable.
+    assert!(
+        !app.hitboxes
+            .iter()
+            .any(|hitbox| hitbox.action == HitAction::Action(UiAction::OpenProjectFolder))
+    );
 
-    app.handle_mouse(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left),
-        column: button.x,
-        row: button.y,
-        modifiers: KeyModifiers::NONE,
-    })
-    .expect("press open-folder");
+    app.handle_key(key(KeyCode::Char('o')))
+        .expect("press open-folder");
     assert!(
         app.status.starts_with("Opened "),
         "unexpected status: {}",
