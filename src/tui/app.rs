@@ -211,8 +211,6 @@ pub enum UiAction {
     SaveReviewEdits,
     ArchiveAllDone,
     MarkReviewDone,
-    FocusQuestions,
-    ClearSearch,
     ViewLog,
     KillSession,
     OpenSessionTask,
@@ -1436,8 +1434,6 @@ impl App {
             UiAction::SaveReviewEdits => self.save_review_edits()?,
             UiAction::ArchiveAllDone => self.open_bulk_confirm(BulkAction::ArchiveAllDone),
             UiAction::MarkReviewDone => self.open_bulk_confirm(BulkAction::MarkReviewDone),
-            UiAction::FocusQuestions => self.focus_first_question(),
-            UiAction::ClearSearch => self.clear_search(),
             UiAction::ViewLog => self.open_log_view(),
             UiAction::KillSession => self.open_kill_confirm(),
             UiAction::OpenSessionTask => self.open_session_task_detail()?,
@@ -3081,7 +3077,8 @@ impl App {
         Ok(())
     }
 
-    fn focus_first_question(&mut self) {
+    #[cfg(test)]
+    pub(crate) fn focus_first_question(&mut self) {
         let first = (0..self.board.columns.len()).find_map(|column_index| {
             self.visible_tasks_for_column(column_index)
                 .iter()
