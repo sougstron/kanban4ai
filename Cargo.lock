@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "kanban4ai"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "assert_cmd",
  "chrono",
