@@ -120,8 +120,9 @@ something other than the default `Kanban`; otherwise the registry name
 (folder basename at add time, or a later `project rename`). The
 `~`-shortened work path sits on the second line (struck through when
 the folder is missing). Count columns (To Do / Doing / Review / Done)
-stay right-aligned under their labels; Agents (`▶N` when live) and
-Last opened drop on a narrow terminal rather than squeezing the name.
+stay right-aligned under their labels; Agents (`▶N` when live, `⏸N` when
+queued, retrying, or waiting) and Last opened drop on a narrow terminal
+rather than squeezing the name.
 A yellow `?` marks open questions and a `●` marks unseen Review work,
 both in a flags column left of the name.
 The selected row carries a border-coloured background; the row the mouse

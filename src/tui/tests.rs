@@ -6883,6 +6883,33 @@ fn project_row_places_running_and_unreviewed_status_next_to_the_name() {
 }
 
 #[test]
+fn project_row_shows_paused_tasks_next_to_running_agents() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-status-paused");
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("work dir");
+    let store_dir = tempfile::tempdir().expect("store");
+    let store = ProjectStore::at(store_dir.path());
+    let added = store.add(&work, Some("Demo Board")).expect("add project");
+    write_task_file(&added.project.data_root, "in_progress", "TASK-001");
+    write_task_file_with_flags(
+        &added.project.data_root,
+        "in_progress",
+        "TASK-002",
+        "run_phase: queued\n",
+    );
+    write_active_session(&added.project.data_root, "ses-running");
+
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let counts = &app.projects[0].counts;
+    assert_eq!(counts.sessions, 1);
+    assert_eq!(counts.paused, 1);
+
+    let rendered = render_at(&mut app, 96, 12);
+    assert!(rendered.contains("▶1 ⏸1"), "{rendered}");
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
 fn scan_counts_includes_open_questions_from_any_column() {
     let root = tempfile::tempdir().expect("root");
     write_task_file(root.path(), "todo", "TASK-001");
