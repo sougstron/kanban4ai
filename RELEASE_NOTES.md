@@ -1,3 +1,63 @@
+# kanban4ai 0.6.2
+
+The board starts counting what the agents cost — tokens and time — and the
+Projects list gets sharper about what its rows mean: paused work is visible,
+the smart ordering follows what you see, and the status bar stops pretending
+to be buttons.
+
+## Added
+
+- **Usage statistics** (`core/stats.rs`, `core/session.rs`, `core/scheduler.rs`,
+  `core/operations.rs`, `cli/mod.rs`, `tui/projects.rs`, new `docs/stats.md`).
+  The board appends one small JSON line per project to
+  `.kanban/stats/events.jsonl` at state transitions it already drives — a
+  session starting or closing (which also tallies the session's final tokens
+  from its transcript), a declared wait, a queue entry, a crash-restart
+  backoff. No agent ever writes to it. The report — `kanban stats`, or `S` on
+  the Projects screen — shows tokens and running time by backend, model, and
+  project for all time, this month, and this week. The grand running-time
+  total is a wall-clock union of concurrent spans, so two agents running at
+  once don't double the clock; the per-backend/model/project breakdowns are
+  honest plain sums. An all-time Tasks section adds task counts and per-task
+  averages by backend/model.
+- **`smart_name` project sort** (`core/global.rs`, `tui/projects.rs`,
+  `docs/config.md`). The smart tiers — unread work first, then projects with
+  live agents — now support alphabetical order by display name within each
+  tier. `smart` itself changed slightly: its final tier follows most recently
+  opened (the visible "Last opened" column) instead of creation date.
+- **Paused-agent indicator** (`tui/projects.rs`, `docs/tui.md`). The Projects
+  list's Agents column shows `⏸N` for tasks that hold no running slot —
+  queued, retrying after a crash, or parked in a declared wait — while `▶N`
+  counts only agents actually running.
+
+## Changed
+
+- **The status bar is no longer clickable** (`tui/board.rs`, `tui/app.rs`,
+  `docs/tui.md`). It is an informational hotkey panel: nothing in it reads as
+  a button, and it registers no hitboxes. Global Settings remains on `s`.
+
+## Verification coverage
+
+- stats: a closed running span tagged with the backend, a closed queued span
+  across dispatch, a waiting span that closes the running one, and a closed
+  retry span after crash backoff (`tests/scheduler_test.rs`:
+  `dispatch_and_stop_record_a_closed_running_span_tagged_with_the_backend`,
+  `queue_run_then_dispatch_records_a_closed_queued_span`,
+  `declare_waiting_then_stop_records_a_waiting_span_and_closes_the_running_one`,
+  `crash_restart_backoff_records_a_closed_retry_span`)
+- status bar renders as plain info with no hitboxes
+  (`src/tui/tests.rs`: `wide_board_status_bar_is_not_clickable`,
+  `phase_seven_status_bar_is_contextual_and_not_clickable`)
+- Projects rows show paused agents beside running ones, and both smart
+  orderings sort their tiers correctly (`src/tui/tests.rs`:
+  `project_row_shows_paused_tasks_next_to_running_agents`,
+  `projects_screen_smart_sort_orders_tiers_by_last_opened`,
+  `projects_screen_smart_name_sort_orders_tiers_by_display_name`)
+- `smart_name` survives a config round-trip (`src/core/global.rs` tests)
+- full `cargo test --locked`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build --release --locked`, `sh scripts/test-packaging.sh`,
+  `sh scripts/token-budget.sh`
+
 # kanban4ai 0.6.1
 
 Relaunches stop paying twice: automatic relaunches of pi/omp agents now reopen
