@@ -11,8 +11,9 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::agent::{
-    KanbanLauncher, build_agent_prompt, resolve_bot_launch_settings, resolve_launch_settings,
-    resolve_task_launch_settings, upcoming_run_plan,
+    KanbanLauncher, build_agent_prompt, materialize_task_launch_settings,
+    resolve_bot_launch_settings, resolve_launch_settings, resolve_task_launch_settings,
+    upcoming_run_plan,
 };
 use crate::core::ask_form::AskForm;
 use crate::core::config::{
@@ -330,13 +331,16 @@ impl Operations {
     // ------------------------------------------------------------------ CRUD
 
     pub fn create_task(&self, new_task: NewTask) -> Result<Task> {
-        self.storage.create_task(new_task)
+        self.storage
+            .create_task(self.materialize_new_task(new_task)?)
     }
 
     /// Create directly in the requested board column, without exposing an
     /// intermediate To Do task to other board users.
     pub fn create_task_in_status(&self, new_task: NewTask, status: TaskStatus) -> Result<Task> {
-        let task = self.storage.create_task_in_status(new_task, status)?;
+        let task = self
+            .storage
+            .create_task_in_status(self.materialize_new_task(new_task)?, status)?;
         if status == TaskStatus::Review {
             self.trigger_chained_tasks(&task.id)?;
         }
@@ -440,9 +444,37 @@ impl Operations {
         if let Some(session) = patch.session {
             task.session = session;
         }
+        self.materialize_task_defaults(&mut task)?;
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         Ok(Some(task))
+    }
+
+    /// Snapshot board defaults onto blank launch fields so a task saved as
+    /// "Default" stores the concrete backend/model/effort/agent.
+    fn materialize_task_defaults(&self, task: &mut Task) -> Result<()> {
+        materialize_task_launch_settings(&self.config.load()?, task)
+    }
+
+    fn materialize_new_task(&self, new_task: NewTask) -> Result<NewTask> {
+        let mut task = Task::new(String::new(), String::new());
+        task.ai_model = new_task.ai_model;
+        task.ai_effort = new_task.ai_effort;
+        task.agent_backend = new_task.agent_backend;
+        task.agent_name = new_task.agent_name;
+        self.materialize_task_defaults(&mut task)?;
+        Ok(NewTask {
+            title: new_task.title,
+            description: new_task.description,
+            ai_model: task.ai_model,
+            ai_effort: task.ai_effort,
+            agent_backend: task.agent_backend,
+            agent_name: task.agent_name,
+            interactive: new_task.interactive,
+            use_designer: new_task.use_designer,
+            use_reviewer: new_task.use_reviewer,
+            chained_to: new_task.chained_to,
+        })
     }
 
     pub fn delete_task(&self, task_id: &str) -> Result<bool> {

@@ -217,10 +217,12 @@ opt-in; models and agents come from project settings), and a "Chain to task"
 selector. The TUI no longer exposes the legacy `interactive` switch:
 TUI-created tasks use `interactive: false`, and TUI edits leave an existing
 value untouched; CLI/YAML compatibility remains. The backend selector leads with
-"Default backend", which leaves the task's `agent_backend` unset so launches
-follow `auto_launch.default_agent` from settings; the label shows the agent it
-resolves to, and the detail view shows `default` while no launch has pinned a
-concrete backend.
+"Default backend" (model/effort/agent have matching Default entries). Saving
+with those selected snapshots the board's current defaults onto the task —
+`auto_launch.default_agent` and that backend's configured model/effort/agent —
+so the detail view and usage stats show the concrete values instead of
+`-`/`default`/`unknown`. The selector labels still show what Default would
+resolve to.
 
 Dialog fields advance on Enter as well as Tab, except in multi-line text
 areas (task Description, Add-message body, custom Answer): those insert a
