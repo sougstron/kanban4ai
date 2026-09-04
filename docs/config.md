@@ -98,7 +98,7 @@ Controls how delegating a task spawns a background agent job (shared across all 
 - `use_tmux`: true - host the agent in a tmux session (falls back to a direct background process if tmux is missing or `new-session` fails)
 - `terminal_fallback`: true
 - `auto_complete_on_exit`: false - whether agent exit auto-completes the task
-- `default_agent`: opencode - backend used when a task has no `agent_backend`
+- `default_agent`: opencode - backend used when a task has no `agent_backend`. Creating or saving a task with Default selected writes this (and that backend's model/effort/agent) onto the task
 - `model` / `models` / `agent`: opencode back-compat mirrors of `agents.opencode.*`
 
 ## Orchestration Settings (.kanban/config.yaml `orchestration:`)
@@ -172,7 +172,7 @@ map entry; a negative or unparseable value is a config error. `enabled` flags
 are coerced like the other boolean settings (`true`/`yes`/`1`).
 
 ## Agent Backends (.kanban/config.yaml `agents:`)
-Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. The `agents:` map defines one entry per backend:
+Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. Create/save with Default selected snapshots those resolved values onto the task so the detail view and stats see a concrete backend/model/effort/agent (provider is the model id's slash prefix). The `agents:` map defines one entry per backend:
 - `command`: executable resolved via PATH (e.g. `opencode`, `claude`, `codex`)
 - `model`: default model when a task has no `ai_model`
 - `models`: list offered in the TUI create/edit dialog for this backend. For the catalog backends (opencode, omp, pi) this is only a fallback: when the backend's catalog is available the dialog lists the live catalog instead, ordered default model first, then up to three most recently launched models (`.kanban/recent_models`, newest first), then the rest alphabetically. Catalog sources: opencode → `opencode models --verbose`; omp → `omp models --json`; pi → on-disk `models-store.json` (builtin/remote cache) merged with custom providers from `models.json` and, for every provider listed in `auth.json`, the matching bundled catalog from the installed `pi-ai` package (`providers/data/<provider>.json`, e.g. OpenRouter). Agent dir is `PI_CODING_AGENT_DIR` (default `~/.pi/agent`). Catalogs are warmed in the background at TUI startup and cached per backend+command for the process lifetime

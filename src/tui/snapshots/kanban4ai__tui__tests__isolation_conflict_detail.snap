@@ -1,12 +1,11 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 8378
 expression: output
 ---
 ┌ Task ────────────────────────────────────────────────────────────────────────────────── ▸ Kanban ┐
 │TASK-001 Landing went sideways                                                                    │
 │Status: review │ Session: - │ Interactive: false                                                  │
-│Backend: default │ Model: - │ Effort: - │ Agent: - │ Chain: -                                     │
+│Backend: opencode │ Model: openai/gpt-5.5 │ Effort: - │ Agent: - │ Chain: -                       │
 │Created: <timestamp> │ Updated: <timestamp>                                                       │
 │Worktree: <board>/.kanban/worktrees/TASK-001 │ Branch: kanban/TASK-001 │ Base: 0123456 │ I│
 │⚠ Integration conflict — resolve in the worktree, then Re-run (Ctrl+R)                            │

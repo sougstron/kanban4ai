@@ -136,6 +136,31 @@ fn pick_setting(value: &Option<String>, default: Option<String>) -> Option<Strin
         .filter(|value| !value.trim().is_empty())
 }
 
+fn blank(value: &Option<String>) -> bool {
+    value.as_deref().is_none_or(|s| s.trim().is_empty())
+}
+
+/// Write the backend/model/effort/agent a launch would resolve onto any
+/// blank task fields. Create/save use this so "Default" in the form becomes
+/// the concrete board defaults instead of leaving the task empty (which the
+/// detail view shows as `-` and stats bucket as `unknown`).
+pub fn materialize_task_launch_settings(config: &BoardConfig, task: &mut Task) -> Result<()> {
+    let settings = resolve_task_launch_settings(config, task)?;
+    if blank(&task.agent_backend) {
+        task.agent_backend = Some(settings.backend);
+    }
+    if blank(&task.ai_model) {
+        task.ai_model = settings.model;
+    }
+    if blank(&task.ai_effort) {
+        task.ai_effort = settings.effort;
+    }
+    if blank(&task.agent_name) {
+        task.agent_name = settings.agent;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
     pub backend: String,

@@ -1,12 +1,11 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 7888
 expression: output
 ---
 ┌ Task ────────────────────────────────────────────────────────────────────────────────── ▸ Kanban ┐
 │TASK-001 Detail phase                                                                             │
 │Status: in_progress · queued │ Session: - │ Interactive: false                                    │
-│Backend: default │ Model: - │ Effort: - │ Agent: - │ Chain: -                                     │
+│Backend: opencode │ Model: openai/gpt-5.5 │ Effort: - │ Agent: - │ Chain: -                       │
 │Created: <timestamp> │ Updated: <timestamp>                                                       │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Thread ──────────────────────────────────────────────────────────────────────────────────────────┐

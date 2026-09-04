@@ -1194,8 +1194,8 @@ fn editing_task_does_not_overwrite_persisted_interactive_state() {
 fn task_form_default_backend_inherits_settings_agent() {
     let (_dir, mut app) = populated_app();
 
-    // Create a task without touching the backend selector: the task must
-    // stay unset so the launch path resolves auto_launch.default_agent.
+    // Create a task without touching the backend selector: save snapshots
+    // auto_launch.default_agent and that backend's configured model.
     app.handle_key(key(KeyCode::Char('n'))).expect("new");
     let modal = app.modal.as_mut().expect("modal");
     modal.title.insert_str("Follows settings");
@@ -1212,10 +1212,11 @@ fn task_form_default_backend_inherits_settings_agent() {
         .get_task(&created_id)
         .expect("load task")
         .expect("task present");
-    assert_eq!(task.agent_backend, None);
+    assert_eq!(task.agent_backend.as_deref(), Some("opencode"));
+    assert_eq!(task.ai_model.as_deref(), Some("openai/gpt-5.5"));
     assert!(!task.interactive, "new TUI tasks stay non-interactive");
 
-    // Editing an unset task keeps Default selected and saving keeps it unset.
+    // Re-saving Default snapshots the same current board defaults.
     app.focused_column = 0;
     app.focused_card = app.board.columns[0]
         .tasks
@@ -1225,7 +1226,7 @@ fn task_form_default_backend_inherits_settings_agent() {
     app.handle_key(key(KeyCode::Char('e'))).expect("edit");
     let modal = app.modal.as_ref().expect("edit modal");
     assert_eq!(modal.backend_options[0].value, None);
-    assert_eq!(modal.backend_text(), None);
+    assert_eq!(modal.backend_text().as_deref(), Some("opencode"));
     let modal = app.modal.as_mut().expect("edit modal");
     modal.field_index = modal.fields().len() - 2;
     app.handle_key(key(KeyCode::Enter)).expect("save edit");
@@ -1234,10 +1235,11 @@ fn task_form_default_backend_inherits_settings_agent() {
         .get_task(&created_id)
         .expect("reload")
         .expect("task");
-    assert_eq!(task.agent_backend, None);
+    assert_eq!(task.agent_backend.as_deref(), Some("opencode"));
+    assert_eq!(task.ai_model.as_deref(), Some("openai/gpt-5.5"));
 
     // A task with a pinned backend can be switched back to Default, which
-    // clears the pin instead of pinning the current default agent.
+    // snapshots the current default agent instead of leaving the field empty.
     app.focused_column = 2;
     app.focused_card = 0;
     app.handle_key(key(KeyCode::Char('e')))
@@ -1256,7 +1258,7 @@ fn task_form_default_backend_inherits_settings_agent() {
     modal.field_index = modal.fields().len() - 2;
     app.handle_key(key(KeyCode::Enter)).expect("save edit");
     let task = app.ops.get_task("TASK-002").expect("reload").expect("task");
-    assert_eq!(task.agent_backend, None);
+    assert_eq!(task.agent_backend.as_deref(), Some("opencode"));
 }
 
 /// Enter, Shift+Enter, and Alt+Enter all break lines inside the description.

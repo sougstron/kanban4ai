@@ -1,12 +1,11 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 767
 expression: render_snapshot(&mut app)
 ---
 ┌ Task ────────────────────────────────────────────────────────────────────────────── ▸ Kanban ┐
 │TASK-001 Question card                                                                        │
 │Status: todo │ Session: - │ Interactive: true                                                 │
-│Backend: default │ Model: - │ Effort: - │ Agent: - │ Chain: -                                 │
+│Backend: opencode │ Model: openai/gpt-5.5 │ Effort: - │ Agent: - │ Chain: -                   │
 │Created: <timestamp> │ Updated: <timestamp>                                                   │
 │Description:                                                                                  │
 │Needs an answer                                                                               │

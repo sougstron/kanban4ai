@@ -3589,6 +3589,76 @@ fn update_task_can_toggle_per_task_bots() {
     assert!(updated.use_reviewer);
 }
 
+#[test]
+fn create_and_update_snapshot_default_launch_settings() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Defaults")).unwrap();
+    assert_eq!(task.agent_backend.as_deref(), Some("opencode"));
+    assert_eq!(task.ai_model.as_deref(), Some("openai/gpt-5.5"));
+    assert_eq!(task.ai_effort, None);
+    assert_eq!(task.agent_name, None);
+
+    let pinned = ops
+        .create_task(NewTask {
+            title: "Pinned".into(),
+            agent_backend: Some("claude".into()),
+            ai_model: Some("sonnet".into()),
+            ai_effort: Some("high".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(pinned.agent_backend.as_deref(), Some("claude"));
+    assert_eq!(pinned.ai_model.as_deref(), Some("sonnet"));
+    assert_eq!(pinned.ai_effort.as_deref(), Some("high"));
+
+    let cleared = ops
+        .update_task(
+            &pinned.id,
+            TaskPatch {
+                agent_backend: Some(None),
+                ai_model: Some(None),
+                ai_effort: Some(None),
+                agent_name: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleared.agent_backend.as_deref(), Some("opencode"));
+    assert_eq!(cleared.ai_model.as_deref(), Some("openai/gpt-5.5"));
+    assert_eq!(cleared.ai_effort, None);
+}
+
+#[test]
+fn default_snapshot_uses_the_selected_backend_config() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops
+        .create_task(NewTask {
+            title: "Claude defaults".into(),
+            agent_backend: Some("claude".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(task.agent_backend.as_deref(), Some("claude"));
+    assert_eq!(task.ai_model.as_deref(), Some("sonnet"));
+}
+
+#[test]
+fn default_snapshot_picks_up_configured_effort_and_agent() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: false\n  default_agent: opencode\nagents:\n  opencode:\n    command: opencode\n    model: zai/glm-4.7\n    effort: high\n    agent: sisyphus\n",
+    )
+    .unwrap();
+    ops.config.load_fresh().unwrap();
+    let task = ops.create_task(NewTask::titled("Full defaults")).unwrap();
+    assert_eq!(task.agent_backend.as_deref(), Some("opencode"));
+    assert_eq!(task.ai_model.as_deref(), Some("zai/glm-4.7"));
+    assert_eq!(task.ai_effort.as_deref(), Some("high"));
+    assert_eq!(task.agent_name.as_deref(), Some("sisyphus"));
+}
+
 // ------------------------------------------------------- bot reviewer / verdict
 
 fn write_reviewer_config(project: &Path, extra: &str) {
