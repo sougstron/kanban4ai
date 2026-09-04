@@ -156,11 +156,13 @@ read-modify-write. The launch itself happens outside the lock. A launch failure
 hands the task to the crash-restart backoff instead of hot-looping.
 
 **Pump points** — `dispatch_queue()` is a library call, not a process of its
-own; something has to call it. Five of the six callers need a human or an
-agent to be present; only (6) runs on a clock:
+own; something has to call it. Most callers need a human or agent process to
+be present; the daemon is the headless clock:
 
-1. `App::tick` → `dispatch_queue_throttled`, at most once every 5 s (the census
-   walks every In Progress task). Errors land in the status line.
+1. `App::tick` → the daemon's store-wide tick, at most once every 5 s, from
+   every TUI screen. It advances every registered project, not only the board
+   currently on screen. An unregistered in-place board keeps the local
+   `dispatch_queue_throttled` fallback. Errors land in the status line.
 2. `kanban check-sessions` — the manual headless one-shot.
 3. `reconcile_agent_exit` — an exit frees a slot, so the launch wrapper pumps
    the queue even with no TUI open.
@@ -171,17 +173,17 @@ agent to be present; only (6) runs on a clock:
    `⏸ queued` (both fall back to the direct launch when the queue could never
    drain — see "Run Phases").
 5. `kanban daemon` — the scheduled headless pump. `--once` is one tick; the
-   looping form is what the systemd user unit runs. Without it, a queued task
-   or a due crash-restart sits until something calls (1)–(4).
+   looping form is what the systemd user unit runs. Without it and with no TUI
+   open, a queued task or due crash-restart sits until something calls (2)–(4).
 
 ## Headless Dispatcher Daemon (`core/daemon.rs`, `cli/daemon.rs`)
 
-This is the answer to "nothing starts while the TUI is closed". Pump points
-(1)–(4) all need someone present: a TUI on screen, an agent exiting, or a
-command typed by hand. Queue five tasks, close the TUI and walk away, and
-without the daemon the queue stops at the concurrency cap and a due
-crash-restart never fires. `kanban daemon` is the one pump that runs on a
-clock.
+This is the answer to "nothing starts while the TUI is closed". The TUI now
+pumps every registered board while it is open, whether it shows a board or the
+projects screen. The other interactive pump points still need a human or agent
+to be present. When no TUI is running, `kanban daemon` is the one pump that
+runs on a clock; without it, a queued task or due crash-restart can sit until
+something calls another pump point.
 
 ```
 kanban daemon [--interval SECONDS] [--once] [--project <id|name|path>]

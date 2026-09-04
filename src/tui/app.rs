@@ -21,6 +21,7 @@ use crate::agent::{
 };
 use crate::core::config::{BoardConfig, OnChangesRequested, OrchestrationSettings};
 use crate::core::context::ContextManager;
+use crate::core::daemon;
 use crate::core::error::{KanbanError, Result};
 use crate::core::limits::LimitsSnapshot;
 use crate::core::models::{
@@ -431,6 +432,10 @@ pub struct App {
     last_wait_resume: Option<Instant>,
     /// Last time the tick pumped the orchestration queue.
     last_queue_dispatch: Option<Instant>,
+    /// Last time the TUI advanced every registered board's orchestration.
+    last_store_pump: Option<Instant>,
+    /// Store-wide warnings already shown during this TUI run.
+    store_pump_warnings: HashSet<String>,
     /// Backends whose warmed model catalog has already been reflected into an
     /// open modal, so `tick` refreshes options at most once per backend.
     catalog_ready: HashSet<String>,
@@ -659,6 +664,8 @@ impl App {
             ctrl_c_exit_deadline: None,
             last_wait_resume: None,
             last_queue_dispatch: None,
+            last_store_pump: None,
+            store_pump_warnings: HashSet::new(),
             catalog_ready,
             project: None,
             projects: Vec::new(),
@@ -676,11 +683,10 @@ impl App {
     pub fn for_project(project: Project) -> Result<Self> {
         let mut app = Self::from_ops(Operations::for_project(&project))?;
         app.settings.project_name = project.name.clone();
+        let store = ProjectStore::open()?;
+        let _ = store.touch_opened(&project.id);
         app.project = Some(project);
-        let _ = app
-            .project
-            .as_ref()
-            .map(|project| ProjectStore::open().and_then(|store| store.touch_opened(&project.id)));
+        app.store = Some(store);
         Ok(app)
     }
 
@@ -753,6 +759,8 @@ impl App {
             ctrl_c_exit_deadline: None,
             last_wait_resume: None,
             last_queue_dispatch: None,
+            last_store_pump: None,
+            store_pump_warnings: HashSet::new(),
             catalog_ready: HashSet::new(),
             project: None,
             projects,
@@ -2090,8 +2098,12 @@ impl App {
         self.expire_limits_status_at(now);
         self.expire_transient_status_at(now);
         self.expire_session_states_at(timefmt::now());
-        self.resume_expired_waits_throttled();
-        self.dispatch_queue_throttled();
+        if self.store.is_some() {
+            self.pump_store_throttled();
+        } else {
+            self.resume_expired_waits_throttled();
+            self.dispatch_queue_throttled();
+        }
         // Log writes bypass the fs watcher (it only covers board dirs), so
         // the pager tail refreshes on the tick.
         if self.screen == Screen::LogView {
@@ -2319,6 +2331,38 @@ impl App {
                 }
             }
             self.board.session_deadlines.remove(&task_id);
+        }
+    }
+
+    /// Advance orchestration for every registered board while any TUI screen
+    /// is open. This uses the daemon's store-wide, lock-safe tick so the
+    /// projects screen and an unrelated board keep retries and queues moving.
+    fn pump_store_throttled(&mut self) {
+        const STORE_PUMP_INTERVAL: Duration = Duration::from_secs(5);
+        if self
+            .last_store_pump
+            .is_some_and(|last| last.elapsed() < STORE_PUMP_INTERVAL)
+        {
+            return;
+        }
+        self.last_store_pump = Some(Instant::now());
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        match daemon::tick(store, None, &mut self.store_pump_warnings) {
+            Ok(lines) if !lines.is_empty() => {
+                self.request_full_redraw();
+                self.status = match lines.as_slice() {
+                    [line] => format!("Background: {line}"),
+                    _ => format!(
+                        "Background: {} events; {}",
+                        lines.len(),
+                        lines.last().expect("non-empty")
+                    ),
+                };
+            }
+            Ok(_) => {}
+            Err(err) => self.status = format!("Background orchestration failed: {err}"),
         }
     }
 

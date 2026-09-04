@@ -6421,6 +6421,59 @@ fn projects_app_with_return(work: &std::path::Path) -> (tempfile::TempDir, App) 
 }
 
 #[test]
+fn projects_screen_ticks_retry_deadlines_on_registered_boards() {
+    let store_dir = tempfile::tempdir().expect("store");
+    let work = tempfile::tempdir().expect("work");
+    let store = ProjectStore::at(store_dir.path());
+    let project = store
+        .add(work.path(), Some("Background Board"))
+        .expect("add project")
+        .project;
+    Storage::new(&project.data_root)
+        .init_board()
+        .expect("init board");
+    std::fs::write(
+        project.data_root.join(".kanban/config.yaml"),
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: true\norchestration:\n  queue_enabled: true\n  max_running_total: 1\n  auto_restart:\n    enabled: true\n    delays_minutes: [1]\nagents:\n  opencode:\n    command: /nonexistent/opencode-disabled-for-tests\n",
+    )
+    .expect("queue config");
+
+    let ops = Operations::for_project(&project);
+    let occupier = ops
+        .create_task(NewTask::titled("Occupy the only slot"))
+        .expect("occupier");
+    let mut occupier = ops.get_task(&occupier.id).unwrap().unwrap();
+    occupier.status = TaskStatus::InProgress;
+    occupier.run_phase = Some(RunPhase::Execute);
+    occupier.session = Some("ses-occupier".to_string());
+    ops.storage.save_task(&occupier).expect("save occupier");
+    SessionManager::new(&project.data_root)
+        .link_named_session(&occupier.id, "ses-occupier", "Occupier")
+        .expect("occupier session");
+
+    let retry = ops
+        .create_task(NewTask::titled("Retry while another board is visible"))
+        .expect("retry task");
+    let mut retry = ops.get_task(&retry.id).unwrap().unwrap();
+    retry.status = TaskStatus::InProgress;
+    retry.run_phase = Some(RunPhase::Queued);
+    retry.restart_at = Some(crate::core::timefmt::now() - chrono::Duration::minutes(1));
+    ops.storage.save_task(&retry).expect("save retry task");
+
+    let mut app = App::projects_at(store, None, None).expect("projects app");
+    app.tick().expect("global TUI tick");
+
+    let retried = ops.get_task(&retry.id).unwrap().unwrap();
+    assert_eq!(retried.crash_restarts, 1);
+    assert_eq!(retried.restart_at, None);
+    assert_eq!(retried.run_phase, Some(RunPhase::Queued));
+    assert!(
+        retried.session.is_none(),
+        "the occupied slot keeps the retry queued"
+    );
+}
+
+#[test]
 fn projects_screen_lists_rows_and_create_cwd() {
     let work = std::path::PathBuf::from("/tmp/k4ai-snap-work");
     let cwd = std::path::PathBuf::from("/tmp/k4ai-snap-cwd");
