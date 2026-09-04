@@ -403,6 +403,17 @@ impl Window {
     }
 }
 
+/// Provider of a model id — the segment before its first slash
+/// (`openai/gpt-5.5` → `openai`, `zai/glm-4.7` → `zai`). Derived at report
+/// time, never stored: nothing new goes into the events file. A bare model id
+/// (`opus`) has no provider and groups under `unknown` downstream.
+fn model_provider(model: Option<&str>) -> Option<String> {
+    model
+        .and_then(|id| id.split_once('/'))
+        .map(|(provider, _)| provider.to_string())
+        .filter(|provider| !provider.is_empty())
+}
+
 /// Sum `value` grouped by `key` (missing key becomes `"unknown"`), sorted by
 /// descending value then ascending key for a stable tie order.
 fn group_sum(pairs: impl Iterator<Item = (Option<String>, i64)>) -> Vec<(String, i64)> {
@@ -564,6 +575,7 @@ const MODEL_TOP_N: usize = 10;
 fn tokens_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveDateTime) -> String {
     let mut total = 0i64;
     let mut by_backend: Vec<(Option<String>, i64)> = Vec::new();
+    let mut by_provider: Vec<(Option<String>, i64)> = Vec::new();
     let mut by_model: Vec<(Option<String>, i64)> = Vec::new();
     let mut by_project: Vec<(String, i64)> = Vec::new();
     for (project, stats) in entries {
@@ -575,6 +587,7 @@ fn tokens_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveD
             total += usage.tokens;
             project_total += usage.tokens;
             by_backend.push((usage.backend.clone(), usage.tokens));
+            by_provider.push((model_provider(usage.model.as_deref()), usage.tokens));
             by_model.push((usage.model.clone(), usage.tokens));
         }
         if project_total > 0 {
@@ -589,6 +602,12 @@ fn tokens_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveD
         &mut out,
         "Top backends:",
         &fmt_rows(&group_sum(by_backend.into_iter()), format_tokens, None),
+    );
+    out.push('\n');
+    push_top_table(
+        &mut out,
+        "Top providers:",
+        &fmt_rows(&group_sum(by_provider.into_iter()), format_tokens, None),
     );
     out.push('\n');
     push_top_table(
@@ -612,6 +631,7 @@ fn tokens_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveD
 fn time_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveDateTime) -> String {
     let mut running: Vec<Span> = Vec::new();
     let mut by_backend: Vec<(Option<String>, i64)> = Vec::new();
+    let mut by_provider: Vec<(Option<String>, i64)> = Vec::new();
     let mut by_model: Vec<(Option<String>, i64)> = Vec::new();
     let mut by_project: Vec<(String, i64)> = Vec::new();
     for (project, stats) in entries {
@@ -623,6 +643,7 @@ fn time_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveDat
             let seconds = span.seconds();
             project_total += seconds;
             by_backend.push((span.backend.clone(), seconds));
+            by_provider.push((model_provider(span.model.as_deref()), seconds));
             by_model.push((span.model.clone(), seconds));
             running.push(span.clone());
         }
@@ -643,6 +664,12 @@ fn time_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveDat
         &mut out,
         "Top backends:",
         &fmt_rows(&group_sum(by_backend.into_iter()), format_span, None),
+    );
+    out.push('\n');
+    push_top_table(
+        &mut out,
+        "Top providers:",
+        &fmt_rows(&group_sum(by_provider.into_iter()), format_span, None),
     );
     out.push('\n');
     push_top_table(
@@ -669,8 +696,10 @@ fn time_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveDat
 fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
     let mut task_ids: HashSet<String> = HashSet::new();
     let mut by_backend_count: Vec<(Option<String>, String)> = Vec::new();
+    let mut by_provider_count: Vec<(Option<String>, String)> = Vec::new();
     let mut by_model_count: Vec<(Option<String>, String)> = Vec::new();
     let mut by_backend_tokens: Vec<(Option<String>, String, i64)> = Vec::new();
+    let mut by_provider_tokens: Vec<(Option<String>, String, i64)> = Vec::new();
     let mut by_model_tokens: Vec<(Option<String>, String, i64)> = Vec::new();
     let mut total_tokens = 0i64;
 
@@ -678,15 +707,19 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         for usage in &stats.usage {
             let key = project_task_key(project, &usage.task_id);
             task_ids.insert(key.clone());
+            let provider = model_provider(usage.model.as_deref());
             by_backend_count.push((usage.backend.clone(), key.clone()));
+            by_provider_count.push((provider.clone(), key.clone()));
             by_model_count.push((usage.model.clone(), key.clone()));
             by_backend_tokens.push((usage.backend.clone(), key.clone(), usage.tokens));
+            by_provider_tokens.push((provider, key.clone(), usage.tokens));
             by_model_tokens.push((usage.model.clone(), key, usage.tokens));
             total_tokens += usage.tokens;
         }
     }
 
     let mut by_backend_time: Vec<(Option<String>, String, i64)> = Vec::new();
+    let mut by_provider_time: Vec<(Option<String>, String, i64)> = Vec::new();
     let mut by_model_time: Vec<(Option<String>, String, i64)> = Vec::new();
     let mut running_task_ids: HashSet<String> = HashSet::new();
     let mut cumulative_running = 0i64;
@@ -703,6 +736,11 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
                     let key = project_task_key(project, &span.task_id);
                     running_task_ids.insert(key.clone());
                     by_backend_time.push((span.backend.clone(), key.clone(), seconds));
+                    by_provider_time.push((
+                        model_provider(span.model.as_deref()),
+                        key.clone(),
+                        seconds,
+                    ));
                     by_model_time.push((span.model.clone(), key, seconds));
                 }
                 Phase::Waiting => cumulative_waiting += seconds,
@@ -738,6 +776,16 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
     out.push('\n');
     push_top_table(
         &mut out,
+        "Top providers by task count:",
+        &fmt_rows(
+            &group_task_count(by_provider_count.into_iter()),
+            |n| n.to_string(),
+            None,
+        ),
+    );
+    out.push('\n');
+    push_top_table(
+        &mut out,
         "Top models by task count (max 10):",
         &fmt_rows(
             &group_task_count(by_model_count.into_iter()),
@@ -766,6 +814,16 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
     out.push('\n');
     push_top_table(
         &mut out,
+        "Top providers by avg tokens/task:",
+        &fmt_avg_rows(
+            &group_average_per_task(by_provider_tokens.into_iter()),
+            format_avg_tokens,
+            None,
+        ),
+    );
+    out.push('\n');
+    push_top_table(
+        &mut out,
         "Top models by avg tokens/task (max 10):",
         &fmt_avg_rows(
             &group_average_per_task(by_model_tokens.into_iter()),
@@ -779,6 +837,16 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         "Top backends by avg time/task:",
         &fmt_avg_rows(
             &group_average_per_task(by_backend_time.into_iter()),
+            format_avg_span,
+            None,
+        ),
+    );
+    out.push('\n');
+    push_top_table(
+        &mut out,
+        "Top providers by avg time/task:",
+        &fmt_avg_rows(
+            &group_average_per_task(by_provider_time.into_iter()),
             format_avg_span,
             None,
         ),
@@ -1037,6 +1105,25 @@ mod tests {
     }
 
     #[test]
+    fn model_provider_is_the_first_slash_segment() {
+        assert_eq!(
+            model_provider(Some("openai/gpt-5.5")).as_deref(),
+            Some("openai")
+        );
+        assert_eq!(model_provider(Some("zai/glm-4.7")).as_deref(), Some("zai"));
+        // Model ids may contain their own slashes; only the first segment is
+        // the provider.
+        assert_eq!(
+            model_provider(Some("openrouter/deepseek/deepseek-r1")).as_deref(),
+            Some("openrouter")
+        );
+        // A bare model id (or empty prefix) has no provider.
+        assert_eq!(model_provider(Some("opus")), None);
+        assert_eq!(model_provider(Some("/weird")), None);
+        assert_eq!(model_provider(None), None);
+    }
+
+    #[test]
     fn cross_project_task_ids_do_not_collide() {
         // Two different projects both use TASK-1; a bare-id HashSet would
         // undercount this as a single task.
@@ -1109,5 +1196,11 @@ mod tests {
         assert!(report.contains("=== TASKS (all time) ==="));
         assert!(report.contains("Total tokens: 42"));
         assert!(report.contains("Total tasks completed: 1"));
+        // Provider tables in every section, grouped under the derived
+        // provider of `anthropic/opus`.
+        assert!(report.contains("Top providers:\n  anthropic"));
+        assert!(report.contains("Top providers by task count:\n  anthropic"));
+        assert!(report.contains("Top providers by avg tokens/task:\n  anthropic"));
+        assert!(report.contains("Top providers by avg time/task:\n  anthropic"));
     }
 }
