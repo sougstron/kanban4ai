@@ -146,6 +146,7 @@ fn missing_sections_are_filled_with_defaults() {
     let board = config.load().unwrap();
     assert!(board.agents.contains_key("opencode"));
     assert!(board.agents.contains_key("claude"));
+    assert!(board.agents.contains_key("codex"));
     assert_eq!(board.column_ids(), vec!["only"]);
 }
 
@@ -295,6 +296,7 @@ fn legacy_board_without_orchestration_gets_defaults() {
     assert!(orch.queue_enabled);
     assert_eq!(orch.max_running_total, 3);
     assert_eq!(orch.max_running_per_backend.get("claude"), Some(&2));
+    assert_eq!(orch.max_running_per_backend.get("codex"), Some(&2));
     assert_eq!(orch.max_running_per_backend.get("opencode"), Some(&2));
     assert_eq!(orch.max_running_per_backend.get("omp"), Some(&2));
     assert_eq!(orch.max_running_per_backend.get("pi"), Some(&2));

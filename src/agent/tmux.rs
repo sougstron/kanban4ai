@@ -291,10 +291,11 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
     // `PIPESTATUS[0]` is the agent command's status in both shapes (it stays
     // the head of the pipeline).
     let log_quoted = shell_quote(&plan.log_file.display().to_string());
-    // The pi family (pi/omp) probes stdin even under `-p` and hangs forever when
-    // it inherits the tmux pane's TTY; claude/opencode never read stdin. Closing
-    // stdin for pi/omp keeps the non-interactive run from blocking.
-    let stdin_redirect = if matches!(plan.backend.as_str(), "pi" | "omp") {
+    // Codex may read additional prompt text from stdin even when a positional
+    // prompt is present; the pi family (pi/omp) also probes stdin under `-p`.
+    // All three backends would hang forever on an inherited tmux pane TTY, so
+    // close stdin for their non-interactive runs.
+    let stdin_redirect = if matches!(plan.backend.as_str(), "codex" | "pi" | "omp") {
         " < /dev/null"
     } else {
         ""

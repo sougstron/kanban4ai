@@ -30,6 +30,8 @@
 //!   message `id` groups the blocks of one message; a `result` event closes
 //!   the run repeating the last message, so it only serves as a fallback when
 //!   the run recorded no assistant text at all.
+//! * codex (`exec --json`) finalizes assistant replies as `item.completed`
+//!   events whose item has type `agent_message`.
 //! * opencode (`run --format json`) emits `text` events tagged with the
 //!   `messageID` they belong to.
 //! * the pi family (pi/omp, `--mode json`) finalizes each assistant turn in one
@@ -49,6 +51,7 @@ pub fn session_messages(backend: &str, transcript: &Path) -> Option<Vec<String>>
     let raw = std::fs::read_to_string(transcript).ok()?;
     let messages = match backend {
         "claude" => claude_session_messages(&raw),
+        "codex" => codex_session_messages(&raw),
         "opencode" => opencode_session_messages(&raw),
         "pi" | "omp" => pi_family_session_messages(&raw),
         _ => None,
@@ -244,6 +247,33 @@ fn claude_session_messages(raw: &str) -> Option<Vec<String>> {
     Some(messages)
 }
 
+/// Codex: completed `agent_message` items carry the whole assistant message.
+/// Streaming `item.updated` events are ignored because the final item is the
+/// canonical reply and avoids duplicating every partial update.
+fn codex_session_messages(raw: &str) -> Option<Vec<String>> {
+    let mut messages = Vec::new();
+    for value in json_lines(raw) {
+        if value.get("type").and_then(Value::as_str) != Some("item.completed") {
+            continue;
+        }
+        let Some(item) = value.get("item") else {
+            continue;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("agent_message") {
+            continue;
+        }
+        if let Some(text) = item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            messages.push(text.to_string());
+        }
+    }
+    (!messages.is_empty()).then_some(messages)
+}
+
 /// opencode: `text` events carry `part.messageID`; every message's text is
 /// kept, grouped by that id and in the order the run printed it.
 fn opencode_session_messages(raw: &str) -> Option<Vec<String>> {
@@ -366,6 +396,21 @@ mod tests {
             joined("claude", &path).as_deref(),
             Some("Only the result text.")
         );
+    }
+
+    #[test]
+    fn codex_gathers_completed_agent_messages_and_ignores_updates() {
+        let (_dir, path) = transcript(concat!(
+            r#"{"type":"thread.started","thread_id":"codex-1"}"#,
+            "\n",
+            r#"{"type":"item.updated","item":{"type":"agent_message","text":"partial"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Final answer."}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"cargo test"}}"#,
+            "\n",
+        ));
+        assert_eq!(joined("codex", &path).as_deref(), Some("Final answer."));
     }
 
     #[test]

@@ -183,6 +183,42 @@ def parse_claude_transcript(path: Path) -> dict:
     return out
 
 
+def parse_codex_transcript(path: Path) -> dict:
+    """Turn-1 context and totals from a Codex ``exec --json`` log.
+
+    Codex reports cumulative usage on ``turn.completed``. Cached input is
+    tracked separately because it is not fresh context, matching the Claude
+    and pi-family reports above.
+    """
+    out = {"turn1_context": None, "final_tokens": None, "cost_usd": None,
+           "turns": 0, "model": None, "cache_read_total": 0}
+    for event in _iter_json_lines(path):
+        if out["model"] is None:
+            model = event.get("model")
+            if isinstance(model, str):
+                out["model"] = model
+        if event.get("type") != "turn.completed":
+            continue
+        usage = event.get("usage") or {}
+        input_tokens = usage.get("input_tokens") or 0
+        cached = usage.get("cached_input_tokens") or 0
+        output = usage.get("output_tokens") or 0
+        context = input_tokens + cached
+        if context <= 0:
+            continue
+        out["turns"] += 1
+        out["cache_read_total"] += cached
+        if out["turn1_context"] is None:
+            out["turn1_context"] = context
+        total = usage.get("total_tokens") or (input_tokens + output)
+        if total:
+            out["final_tokens"] = max(out["final_tokens"] or 0, total)
+        cost = usage.get("cost_usd")
+        if isinstance(cost, (int, float)):
+            out["cost_usd"] = cost
+    return out
+
+
 def parse_pi_family_transcript(path: Path) -> dict:
     """Turn-1 context and totals from an omp/pi NDJSON log.
 
@@ -265,6 +301,7 @@ def parse_opencode_transcript(path: Path) -> dict:
 
 PARSERS = {
     "claude": parse_claude_transcript,
+    "codex": parse_codex_transcript,
     "omp": parse_pi_family_transcript,
     "pi": parse_pi_family_transcript,
     "opencode": parse_opencode_transcript,

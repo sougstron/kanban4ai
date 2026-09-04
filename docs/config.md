@@ -113,7 +113,7 @@ sections keep their long-standing shallow `merge_missing` semantics.
 orchestration:
   queue_enabled: true
   max_running_total: 3
-  max_running_per_backend: {claude: 2, opencode: 2, omp: 2, pi: 2}
+  max_running_per_backend: {claude: 2, codex: 2, opencode: 2, omp: 2, pi: 2}
   max_running_per_backend_model: {}
   max_running_per_role: {designer: 1, reviewer: 1, executor: 3}
   auto_restart: {enabled: true, delays_minutes: [1, 30, 270]}
@@ -126,7 +126,7 @@ orchestration:
   is ever queued and `dispatch_queue` returns immediately. `auto_launch.enabled`
   gates it too: with auto-launch off the dispatcher starts nothing
 - `max_running_total`: 3 - concurrently running agents across the board
-- `max_running_per_backend`: 2 each for claude/opencode/omp/pi - cap per
+- `max_running_per_backend`: 2 each for claude/codex/opencode/omp/pi - cap per
   resolved backend. A key naming a backend the board does not know (a typo, or
   an agent since removed from `agents:`) caps nothing, so `Config::load`
   reports it as a **warning** rather than rejecting it — a hard error would run
@@ -173,11 +173,11 @@ are coerced like the other boolean settings (`true`/`yes`/`1`).
 
 ## Agent Backends (.kanban/config.yaml `agents:`)
 Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. The `agents:` map defines one entry per backend:
-- `command`: executable resolved via PATH (e.g. `opencode`, `claude`)
+- `command`: executable resolved via PATH (e.g. `opencode`, `claude`, `codex`)
 - `model`: default model when a task has no `ai_model`
 - `models`: list offered in the TUI create/edit dialog for this backend. For the catalog backends (opencode, omp, pi) this is only a fallback: when the backend's catalog is available the dialog lists the live catalog instead, ordered default model first, then up to three most recently launched models (`.kanban/recent_models`, newest first), then the rest alphabetically. Catalog sources: opencode → `opencode models --verbose`; omp → `omp models --json`; pi → on-disk `models-store.json` (builtin/remote cache) merged with custom providers from `models.json` and, for every provider listed in `auth.json`, the matching bundled catalog from the installed `pi-ai` package (`providers/data/<provider>.json`, e.g. OpenRouter). Agent dir is `PI_CODING_AGENT_DIR` (default `~/.pi/agent`). Catalogs are warmed in the background at TUI startup and cached per backend+command for the process lifetime
 - `effort`: default reasoning effort when a task has no `ai_effort`
-- `efforts` (claude, omp, pi): effort levels offered in the TUI dialog as a fallback (defaults `low`/`medium`/`high`/`xhigh`/`max`, matching `claude --effort`; omp/pi also expose `off`). For opencode/omp/pi the dialog instead offers the selected model's variants reported by the live catalog when available (opencode exposes them as `variants`, omp as each model's `thinking` list, pi as each model's `thinkingLevelMap` keys)
+- `efforts` (claude, codex, omp, pi): effort levels offered in the TUI dialog as a fallback (defaults `low`/`medium`/`high`/`xhigh`/`max`, matching the backend's supported reasoning levels; omp/pi also expose `off`). For opencode/omp/pi the dialog instead offers the selected model's variants reported by the live catalog when available (opencode exposes them as `variants`, omp as each model's `thinking` list, pi as each model's `thinkingLevelMap` keys)
 - `agent`: optional default `--agent` persona (overridden per task by `task.agent_name`; opencode only)
 - `agent_options` (opencode only): personas offered in the TUI and via `kanban create --agent-name` (e.g. `sisyphus`, `prometheus`, `atlas`). omp/pi have no launch-time persona selector, so they expose no personas
 - `extra_args`: extra CLI flags inserted before `--model`
@@ -187,4 +187,5 @@ Per-task persona: `task.agent_name` is passed to opencode as `--agent`, overridi
 Built-in backends:
 - **opencode**: `opencode run --title "<id>: <title>" [extra_args] [--model M] [--variant E] [--agent A]` plus the prompt file as the last argument. A task's `ai_effort` (or the backend `effort` default) is passed as `--variant`, opencode's per-model reasoning-effort selector.
 - **claude** (Claude Code): `claude --print [extra_args] [--model M] [--effort E]` plus the prompt file as the last argument. Default `extra_args` is `["--dangerously-skip-permissions"]` — tighten in config for stricter permissions. Default models are the `fable`/`opus`/`sonnet`/`haiku` aliases; `ai_effort` is passed as `--effort` (`low`/`medium`/`high`/`xhigh`/`max`).
+- **codex**: `<command> exec --json [extra_args] [--model M] [-c model_reasoning_effort=E]` plus the prompt file as the last argument. `--json` emits Codex's JSONL event stream, which is captured for telemetry, replies, and input provenance. `ai_effort` is passed through Codex's `model_reasoning_effort` config override (`low`/`medium`/`high`/`xhigh`). The default extra args also include `--dangerously-bypass-approvals-and-sandbox` and `--skip-git-repo-check`, matching autonomous launches and kanban's support for non-git folders. Codex has no launch-time persona flag, so `agent_name` is ignored. Codex stdin is closed by the wrapper because `exec` may read additional prompt input from a pane TTY.
 - **omp** / **pi** (the "pi" agent family): `<command> -p --mode json [extra_args] [--model M] [--thinking E]` plus the prompt file as the last argument. Run non-interactively with `-p`; `ai_effort` is passed as `--thinking` (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`). Model uses fuzzy `provider/id` selectors from the live catalog. Neither has a launch-time persona flag, so `agent_name` is ignored. `--mode json` makes them emit the same NDJSON event stream on stdout as their session files, so their runs are harvested for telemetry and input provenance exactly like claude/opencode. Both probe stdin even under `-p` and hang forever on an inherited pane TTY, so the wrapper closes their stdin (`< /dev/null`).

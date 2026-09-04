@@ -3406,7 +3406,7 @@ fn fill_total_slots(ops: &Operations, dir: &Path, count: usize) {
     let session_mgr = SessionManager::new(dir);
     // Spread the fillers across backends so only `max_running_total` is
     // exhausted — every per-backend cap still has room.
-    const BACKENDS: [&str; 4] = ["claude", "opencode", "omp", "pi"];
+    const BACKENDS: [&str; 5] = ["claude", "codex", "opencode", "omp", "pi"];
     for n in 0..count {
         let filler = ops
             .create_task(NewTask::titled(format!("Filler {n}")))

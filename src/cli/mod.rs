@@ -58,10 +58,10 @@ enum Command {
         /// Model to use when this task is delegated (interpreted by the chosen agent backend)
         #[arg(long = "model")]
         ai_model: Option<String>,
-        /// Reasoning effort (claude: low/medium/high/xhigh/max; opencode: a model variant)
+        /// Reasoning effort (claude/codex: backend reasoning level; opencode: a model variant)
         #[arg(long = "effort")]
         ai_effort: Option<String>,
-        /// Agent backend to run this task (e.g. opencode, claude)
+        /// Agent backend to run this task (e.g. opencode, claude, codex)
         #[arg(long = "backend")]
         agent_backend: Option<String>,
         /// opencode agent persona for this task (e.g. sisyphus); opencode backend only

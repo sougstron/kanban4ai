@@ -3,7 +3,7 @@
 ## Project: kanban4ai
 
 A local kanban board application for task management within projects, driven by
-AI coding agents (opencode, Claude Code) via CLI commands. Native Rust rewrite
+AI coding agents (opencode, Claude Code, Codex CLI) via CLI commands. Native Rust rewrite
 of the Python `kanban-cli`; the on-disk format and the CLI contract are fully
 compatible with boards created by the original.
 

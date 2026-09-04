@@ -167,7 +167,7 @@ pub struct LaunchPlan {
     /// the spawned session. `args` carries the requested name as the
     /// `--agent` value; the wrapper substitutes the resolved one.
     pub resolve_agent: Option<String>,
-    /// Native pi/omp conversation reopened for this board relaunch. `None`
+    /// Native Codex/pi/omp conversation reopened for this board relaunch. `None`
     /// means a fresh backend session and the full prompt.
     pub resumed_backend_session: Option<String>,
 }
@@ -200,7 +200,7 @@ pub fn build_launch_plan<'a>(
         None
     };
     let role = Role::from_phase(task.run_phase);
-    let resume = (!revert && matches!(backend.as_str(), "pi" | "omp"))
+    let resume = (!revert && matches!(backend.as_str(), "codex" | "pi" | "omp"))
         .then(|| native_resume_candidate(roots.data_root, task, session_id, &backend))
         .flatten();
     let prompt = if let Some((previous_session, _)) = &resume {
@@ -223,10 +223,13 @@ pub fn build_launch_plan<'a>(
     let prompt_file = logs_dir.join(format!("{session_id}.prompt.txt"));
     atomic_write_text(&prompt_file, &prompt)?;
 
-    // claude, opencode, and the pi family (pi/omp, via `--mode json`) all emit a
-    // parseable JSONL transcript on stdout.
-    let transcript_file = matches!(backend.as_str(), "claude" | "opencode" | "pi" | "omp")
-        .then(|| logs_dir.join(format!("{session_id}.transcript.jsonl")));
+    // claude, codex, opencode, and the pi family (pi/omp, via `--mode json`)
+    // all emit a parseable JSONL transcript on stdout.
+    let transcript_file = matches!(
+        backend.as_str(),
+        "claude" | "codex" | "opencode" | "pi" | "omp"
+    )
+    .then(|| logs_dir.join(format!("{session_id}.transcript.jsonl")));
 
     Ok(LaunchPlan {
         backend,
@@ -246,9 +249,9 @@ pub fn build_launch_plan<'a>(
     })
 }
 
-/// Find the most recent completed kanban session for this task whose pi-family
-/// transcript exposed a native conversation id. Human starts reset both
-/// counters, so only automatic relaunches are eligible.
+/// Find the most recent completed kanban session for this task whose Codex or
+/// pi-family transcript exposed a native conversation id. Human starts reset
+/// both counters, so only automatic relaunches are eligible.
 fn native_resume_candidate(
     data_root: &Path,
     task: &Task,
@@ -346,6 +349,11 @@ fn backend_args(
             "--format".to_string(),
             "json".to_string(),
         ],
+        // Codex runs non-interactively with `exec --json`. The prompt body is
+        // not an argv element here: the wrapper cats `prompt_file` as the
+        // trailing positional. `--json` emits the JSONL event stream used for
+        // logs, telemetry, replies, and provenance.
+        "codex" => vec!["exec".to_string(), "--json".to_string()],
         // omp/pi (the "pi" agent family) run non-interactively with `-p`.
         // The prompt body is not an argv element: the wrapper cats
         // `prompt_file` as the trailing positional. `--mode json` makes them
@@ -356,15 +364,27 @@ fn backend_args(
         _ => vec!["run".to_string()],
     };
     if let Some(session) = resume_session {
-        // pi's `--resume` opens an interactive picker even with a following
-        // value; exact non-interactive lookup is `--session <id>`. OMP exposes
-        // the id-taking form directly as `--resume <id>`.
-        args.push(if backend == "pi" {
-            "--session".to_string()
-        } else {
-            "--resume".to_string()
-        });
-        args.push(session.to_string());
+        match backend {
+            "codex" => {
+                // Codex's native non-interactive resume is a subcommand:
+                // `codex exec resume <thread-id> --json [prompt]`.
+                args.insert(1, "resume".to_string());
+                args.insert(2, session.to_string());
+            }
+            "pi" => {
+                // pi's `--resume` opens an interactive picker even with a
+                // following value; exact non-interactive lookup is
+                // `--session <id>`.
+                args.push("--session".to_string());
+                args.push(session.to_string());
+            }
+            "omp" => {
+                // OMP exposes the id-taking form directly as `--resume <id>`.
+                args.push("--resume".to_string());
+                args.push(session.to_string());
+            }
+            _ => {}
+        }
     }
     args.extend(config.extra_args.clone());
     if let Some(model) = model.filter(|value| !value.trim().is_empty()) {
@@ -374,14 +394,23 @@ fn backend_args(
     if let Some(effort) = effort.filter(|value| !value.trim().is_empty()) {
         // claude exposes reasoning effort as --effort; opencode maps it onto
         // per-model variants selected with --variant; the pi family (omp/pi)
-        // uses --thinking.
-        let flag = match backend {
-            "claude" => "--effort",
-            "omp" | "pi" => "--thinking",
-            _ => "--variant",
-        };
-        args.push(flag.to_string());
-        args.push(effort.to_string());
+        // uses --thinking. Codex stores this setting under its config key and
+        // accepts it through the generic `-c key=value` override.
+        match backend {
+            "codex" => {
+                args.push("-c".to_string());
+                args.push(format!("model_reasoning_effort={effort}"));
+            }
+            _ => {
+                let flag = match backend {
+                    "claude" => "--effort",
+                    "omp" | "pi" => "--thinking",
+                    _ => "--variant",
+                };
+                args.push(flag.to_string());
+                args.push(effort.to_string());
+            }
+        }
     }
     if backend == "opencode"
         && let Some(agent) = agent.filter(|value| !value.trim().is_empty())

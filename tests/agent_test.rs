@@ -438,6 +438,61 @@ agents:
 }
 
 #[test]
+fn codex_launch_plan_uses_exec_json_and_reasoning_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    write_agent_config(
+        dir.path(),
+        r#"auto_launch:
+  enabled: true
+  use_tmux: false
+  terminal_fallback: true
+  default_agent: codex
+notifications:
+  enabled: false
+agents:
+  codex:
+    command: /bin/echo
+    model: gpt-5.5
+    effort: medium
+    extra_args:
+    - --dangerously-bypass-approvals-and-sandbox
+"#,
+    );
+    let task = storage
+        .create_task(NewTask {
+            title: "Codex task".into(),
+            ai_model: Some("gpt-5.5".into()),
+            ai_effort: Some("high".into()),
+            agent_backend: Some("codex".into()),
+            agent_name: Some("ignored-persona".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let plan = build_launch_plan(dir.path(), &task, "ses-codex-test", false).unwrap();
+
+    assert_eq!(plan.backend, "codex");
+    assert_eq!(plan.command, "/bin/echo");
+    assert_eq!(plan.args[0..2], ["exec", "--json"]);
+    assert!(
+        plan.args
+            .contains(&"--dangerously-bypass-approvals-and-sandbox".to_string())
+    );
+    assert!(has_arg_pair(&plan.args, "--model", "gpt-5.5"));
+    assert!(has_arg_pair(
+        &plan.args,
+        "-c",
+        "model_reasoning_effort=high"
+    ));
+    assert!(!plan.args.contains(&"--effort".to_string()));
+    assert!(!plan.args.contains(&"--agent".to_string()));
+    assert!(plan.transcript_file.is_some());
+    assert!(!plan.args.iter().any(|arg| arg == &plan.prompt));
+}
+
+#[test]
 fn opencode_launch_plan_passes_task_effort_as_variant() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::new(dir.path());
@@ -614,6 +669,68 @@ fn pi_family_auto_relaunch_resumes_native_conversation_with_delta_prompt() {
         assert!(!plan.prompt.contains("Before editing an existing file"));
         assert!(plan.prompt.contains("KANBAN_SESSION=ses-current"));
     }
+}
+
+#[test]
+fn codex_auto_relaunch_resumes_native_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    write_agent_config(
+        dir.path(),
+        r#"auto_launch:
+  enabled: true
+  default_agent: codex
+notifications:
+  enabled: false
+agents:
+  codex:
+    command: codex
+"#,
+    );
+    let mut task = storage
+        .create_task(NewTask::titled("Resume Codex"))
+        .unwrap();
+    task.agent_backend = Some("codex".to_string());
+    task.auto_resumes = 1;
+    storage.save_task(&task).unwrap();
+
+    let sessions = SessionManager::new(dir.path());
+    let mut previous = sessions
+        .link_named_session(&task.id, "ses-previous-codex", "old")
+        .unwrap();
+    previous.status = kanban4ai::core::models::SessionStatus::Closed;
+    previous.ended_at = Some(previous.last_seen);
+    sessions.save_session(&previous).unwrap();
+    provenance::write_manifest(
+        &storage.provenance_dir,
+        &InputManifest {
+            session_id: previous.id.clone(),
+            backend: "codex".to_string(),
+            backend_session_id: Some("codex-thread-id".to_string()),
+            ..InputManifest::default()
+        },
+    )
+    .unwrap();
+
+    let plan = build_launch_plan(dir.path(), &task, "ses-current-codex", false).unwrap();
+
+    assert_eq!(
+        plan.args.get(0..3),
+        Some(
+            &[
+                "exec".to_string(),
+                "resume".to_string(),
+                "codex-thread-id".to_string()
+            ][..]
+        )
+    );
+    assert!(plan.args.contains(&"--json".to_string()));
+    assert_eq!(
+        plan.resumed_backend_session.as_deref(),
+        Some("codex-thread-id")
+    );
+    assert!(plan.prompt.contains("KANBAN_SESSION=ses-current-codex"));
 }
 
 #[test]

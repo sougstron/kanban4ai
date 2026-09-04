@@ -29,7 +29,8 @@ use crate::core::models::{
 use crate::core::notifier::{DesktopNotifier, NotificationConfig};
 use crate::core::project::{Project, Roots};
 use crate::core::provenance::{
-    self, ClaudeHarvester, InputManifest, OpencodeHarvester, PiFamilyHarvester, TranscriptHarvester,
+    self, ClaudeHarvester, CodexHarvester, InputManifest, OpencodeHarvester, PiFamilyHarvester,
+    TranscriptHarvester,
 };
 use crate::core::reply;
 use crate::core::scheduler::{Slots, role_for_phase};
@@ -3449,7 +3450,7 @@ impl Operations {
             .load_session(session_id)
             .is_some_and(|session| session.task_id == task_id && session.id == session_id);
         // Harvest before reconciliation: a clean stranded exit may launch its
-        // successor inside `reconcile_agent_exit_inner`, and pi/omp need the
+        // successor inside `reconcile_agent_exit_inner`, and Codex/pi/omp need the
         // just-finished backend conversation id to reopen it. Capture the
         // reply first as well, so a fresh-launch fallback sees all prior work.
         let manifest = session_matched_task
@@ -3481,8 +3482,9 @@ impl Operations {
     /// Harvest the backend's machine transcript into an input-provenance
     /// manifest (`.kanban/provenance/<session>.yaml`) recording what the run
     /// actually consumed — files read into context (including via Bash), files
-    /// written, URLs, MCP calls. Best-effort and backend-gated: claude and
-    /// opencode emit a parseable transcript, and any failure is a soft warning
+    /// written, URLs, MCP calls. Best-effort and backend-gated: claude,
+    /// codex, opencode, and the pi family emit parseable transcripts, and any
+    /// failure is a soft warning
     /// that never disturbs the reconciled exit.
     fn harvest_provenance(&self, task_id: &str, session_id: &str) -> Option<InputManifest> {
         let task = self.storage.load_task(task_id).ok().flatten()?;
@@ -3516,6 +3518,11 @@ impl Operations {
             .unwrap_or_else(|| self.work_path().to_path_buf());
         let harvester: Box<dyn TranscriptHarvester> = match backend.as_str() {
             "claude" => Box::new(ClaudeHarvester {
+                session_id: session,
+                prompt_dump,
+                root: repo_root,
+            }),
+            "codex" => Box::new(CodexHarvester {
                 session_id: session,
                 prompt_dump,
                 root: repo_root,

@@ -53,8 +53,8 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `y`: Approve — move a Review task to Done
 - `t`: Open the task's agent session — attach when it is a live tmux session,
   follow the log when the agent runs in the background (no terminal to attach
-  to), or reopen the recorded conversation with `<backend> --resume` when the
-  session has stopped
+  to), or reopen the recorded conversation with its backend-specific resume
+  command when its session has stopped
 - `c`: Add a context/suggestion message to the task thread
 - `u`: Recover crashed task (restore to To Do); on an archived task (Archive
   list or its detail) the same key restores it to To Do after a confirmation
