@@ -97,21 +97,28 @@ plain text, read by both `kanban stats` and the TUI Stats window
 with no single project in context, matching where the report aggregates
 from):
 
-1. **Tokens** — total, top backends, top models (max 10), top projects; for
-   all time, this month (resets the 1st), and this week (resets Monday).
+1. **Tokens** — total, top backends, top providers, top models (max 10), top
+   projects; for all time, this month (resets the 1st), and this week
+   (resets Monday).
 2. **Time** — same shape, but only the `Running` phase. The single grand
    total is a wall-clock **union** of every running span (`union_seconds`):
    two tasks running at the same moment must not double the clock. The
-   per-backend/model/project breakdowns are plain sums instead — different
-   backends running concurrently really are separate work, so summing them is
-   correct and does not have the grand-total's double-counting problem.
+   per-backend/provider/model/project breakdowns are plain sums instead —
+   different backends running concurrently really are separate work, so
+   summing them is correct and does not have the grand-total's
+   double-counting problem.
 3. **Tasks** (all time only) — task counts and per-task averages (tokens,
-   time) by backend/model, plus four *cumulative* totals (concurrent tasks
-   summed, not deduplicated — the opposite of the Time section's single wall-
-   clock total): running, waiting/pause, retry-wait, queue-wait.
+   time) by backend/provider/model, plus four *cumulative* totals (concurrent
+   tasks summed, not deduplicated — the opposite of the Time section's single
+   wall-clock total): running, waiting/pause, retry-wait, queue-wait.
 
-Model breakdowns are capped at 10 entries everywhere; backends and projects
-are shown in full.
+Model breakdowns are capped at 10 entries everywhere; backends, providers and
+projects are shown in full.
+
+**Providers** are derived at report time from the model id — the segment
+before its first slash (`openai/gpt-5.5` → `openai`, `zai/glm-4.7` → `zai`);
+a bare model id has no provider and lands in `unknown`. Nothing new is stored
+in the events file — existing logs report providers without re-recording.
 
 ## Two accepted approximations
 
