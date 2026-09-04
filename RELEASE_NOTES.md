@@ -1,3 +1,71 @@
+# kanban4ai 0.6.3
+
+Codex CLI joins the board as a first-class agent backend — non-interactive
+launch, reply capture, token telemetry, and native conversation resume — and
+the board gets sharper about what it remembers: usage stats split by model
+provider, tasks saved as "Default" pin the launch settings they resolved to,
+and the TUI keeps every registered board moving, not just the one on screen.
+
+## Added
+
+- **Codex CLI agent backend** (`agent/backends.rs`, `agent/prompt.rs`,
+  `agent/tmux.rs`, `core/provenance.rs`, `core/reply.rs`, `core/telemetry.rs`,
+  `core/operations.rs`, `docs/agent-io.md`, `docs/config.md`). Codex runs
+  non-interactively as `codex exec --json` with the prompt file as the last
+  argument, `-c model_reasoning_effort=E` carrying the task's reasoning
+  effort and `--model` its model. Replies are captured from completed
+  `agent_message` items (`item.completed` events; streamed `item.updated`
+  partials are skipped), and token telemetry reads the cumulative
+  `input_tokens`/`output_tokens`/`total_tokens` of `turn.completed`, with
+  completed command executions providing last activity. Provenance
+  harvesting records the Codex thread id, so automatic relaunches reopen the
+  native conversation with `codex exec resume <thread-id> --json` instead of
+  re-briefing a fresh one. `auto_launch.max_running_per_backend` gains a
+  `codex` slot, the launch wrapper closes stdin for it (Codex may read extra
+  prompt text from stdin even with a positional prompt), and the limits row,
+  CLI docs, and README name the backend everywhere.
+- **Provider breakdown in usage stats** (`core/stats.rs`, `docs/stats.md`).
+  The Tokens, Time, and Tasks sections aggregate by provider next to
+  backend, model, and project. Providers are derived at report time from the
+  model id — the segment before its first slash (`openai/gpt-5.5` →
+  `openai`, `zai/glm-4.7` → `zai`); a bare model id has no provider and
+  lands in `unknown`. Nothing new is stored in the events file — existing
+  logs report providers without re-recording.
+
+## Changed
+
+- **Saving "Default" pins the resolved launch settings** (`agent/mod.rs`,
+  `core/operations.rs`, `docs/config.md`, `docs/tui.md`). Creating or saving
+  a task with Default backend/model/effort/agent selected snapshots the
+  board's current defaults onto the task — including the selected backend's
+  configured model, effort, and agent — so a later change to the board
+  defaults never silently rewrites an existing task's launch.
+- **The TUI pumps every registered board** (`tui/app.rs`,
+  `docs/orchestration.md`). `App::tick` now drives the daemon's store-wide
+  tick — queue dispatch, crash-restart deadlines — across all registered
+  projects from any screen, not only the board in view; an unregistered
+  in-place board keeps the local throttled dispatch fallback. With no TUI
+  open, the `kanban daemon` looping form remains the headless clock.
+
+## Verification coverage
+
+- codex launch plan, reasoning-effort wiring, and native-thread relaunch
+  (`tests/agent_test.rs`: `codex_launch_plan_uses_exec_json_and_reasoning_effort`,
+  `codex_auto_relaunch_resumes_native_thread`)
+- default snapshot on create and update, including the selected backend's
+  configured model/effort/agent (`tests/operations_test.rs`:
+  `create_and_update_snapshot_default_launch_settings`,
+  `default_snapshot_uses_the_selected_backend_config`,
+  `default_snapshot_picks_up_configured_effort_and_agent`)
+- store-wide tick advances retry deadlines on registered boards from the
+  Projects screen (`src/tui/tests.rs`:
+  `projects_screen_ticks_retry_deadlines_on_registered_boards`)
+- provider derivation from model ids (`src/core/stats.rs`:
+  `model_provider_is_the_first_slash_segment`)
+- full `cargo test --locked`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build --release --locked`, `sh scripts/test-packaging.sh`,
+  `sh scripts/token-budget.sh`
+
 # kanban4ai 0.6.2
 
 The board starts counting what the agents cost — tokens and time — and the
