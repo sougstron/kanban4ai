@@ -44,10 +44,6 @@ optional `src/agent/` process launchers.
 - Never regenerate or delete `tests/fixtures/`; they verify compatibility with
   boards created by the earlier implementation.
 - Keep Cargo's single canonical binary and all package aliases as symlinks.
-- Follow the change-log and version-update workflow (summarised in `AGENTS.md`,
-  in full in `docs/releasing.md`): ordinary work remains uncommitted, and
-  commit/tag/push/deploy operations are allowed only for an explicit update to
-  a specific version.
 - `AGENTS.md` and `CLAUDE.md` are auto-loaded into every agent session, so keep
   them small and put long-form material in `docs/`; `scripts/token-budget.sh`
   fails the build when they grow past budget.
