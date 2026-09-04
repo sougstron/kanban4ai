@@ -1,14 +1,14 @@
 # kanban4ai
 
-A fast native local-first kanban board CLI and TUI designed for AI coding agents such as Opencode and Claude Code. Boards are plain Markdown and YAML in a central store (`~/.local/share/kanban4ai/projects/<id>/.kanban/`); there is no database or language runtime dependency. Work without a strong link to git — start in any local folder with two commands. The work folder stays clean: board data does not live in the repo.
+A fast native local-first kanban board CLI and TUI designed for AI coding agents such as Opencode, Claude Code, and Codex CLI. Boards are plain Markdown and YAML in a central store (`~/.local/share/kanban4ai/projects/<id>/.kanban/`); there is no database or language runtime dependency. Work without a strong link to git — start in any local folder with two commands. The work folder stays clean: board data does not live in the repo.
 
 ## Requirements
 
 - Linux or another Unix-like environment
 - Rust 1.88 or newer when building from source
 - Optional integrations: `tmux`, `notify-send`, `wl-paste` or `xclip`, `curl`
-  (subscription limits for claude, grok, z.ai, synthetic, and yolo)
-- Optional agent backends: opencode and/or Claude Code
+  (subscription limits for claude, codex, grok, z.ai, synthetic, and yolo)
+- Optional agent backends: opencode, Claude Code, and/or Codex CLI
 
 ## Install
 
@@ -109,8 +109,8 @@ kanban4ai take TASK-002 --session ses-login --agent
 configured backend when auto-launch is enabled. The TUI is easier for most
 users: select a To Do task and press `r` — the agent starts immediately, with
 no confirmation. The selected task's backend must be installed and
-authenticated separately, for example by signing in to opencode or Claude Code
-before running a task. `tmux` is optional, but enables an attachable agent
+authenticated separately, for example by signing in to opencode, Claude Code,
+or Codex CLI before running a task. `tmux` is optional, but enables an attachable agent
 session when configured.
 
 An agent can record work context and ask a question with:

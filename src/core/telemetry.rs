@@ -15,7 +15,9 @@ use std::path::Path;
 
 use serde_json::Value;
 
-use crate::core::provenance::{claude_tool_summary, opencode_tool_summary, pi_tool_summary};
+use crate::core::provenance::{
+    claude_tool_summary, codex_tool_summary, opencode_tool_summary, pi_tool_summary,
+};
 use crate::core::session::{SessionManager, estimate_session_tokens};
 
 /// A snapshot of an agent run's progress, all fields best-effort and independent
@@ -56,8 +58,8 @@ impl SessionProgress {
 }
 
 /// Read progress for one session. `backend` selects the transcript dialect:
-/// `opencode`, the pi family (`pi`/`omp`), or claude (the default for anything
-/// else). Falls back to the log-scraping [`estimate_session_tokens`] for the
+/// `codex`, `opencode`, the pi family (`pi`/`omp`), or claude (the default for
+/// anything else). Falls back to the log-scraping [`estimate_session_tokens`] for the
 /// token count when the transcript is absent or reported no usage.
 pub fn read_session_progress(
     project_path: &Path,
@@ -74,6 +76,7 @@ pub fn read_session_progress(
         .join(format!("{session_id}.transcript.jsonl"));
     if let Ok(raw) = std::fs::read_to_string(&transcript) {
         match backend {
+            "codex" => parse_codex(&raw, &mut progress),
             "opencode" => parse_opencode(&raw, &mut progress),
             "pi" | "omp" => parse_pi_family(&raw, &mut progress),
             _ => parse_claude(&raw, &mut progress),
@@ -210,6 +213,61 @@ fn parse_opencode(raw: &str, progress: &mut SessionProgress) {
                 apply_todos(todos, progress);
             }
             progress.last_activity = Some(opencode_tool_summary(part));
+        }
+    }
+}
+
+/// Parse Codex's `exec --json` transcript. Codex reports cumulative usage on
+/// `turn.completed` and finalized commands/file changes as `item.completed`.
+/// The stream has no native todo tool, so only tokens, cost, and last activity
+/// are populated here.
+fn parse_codex(raw: &str, progress: &mut SessionProgress) {
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("turn.completed") => {
+                if let Some(usage) = value.get("usage") {
+                    let input = usage.get("input_tokens").and_then(Value::as_i64);
+                    let output = usage.get("output_tokens").and_then(Value::as_i64);
+                    let total =
+                        usage
+                            .get("total_tokens")
+                            .and_then(Value::as_i64)
+                            .or_else(|| match (input, output) {
+                                (None, None) => None,
+                                _ => Some(input.unwrap_or(0) + output.unwrap_or(0)),
+                            });
+                    if total.is_some() {
+                        progress.tokens = total;
+                    }
+                }
+                if let Some(cost) = value
+                    .get("usage")
+                    .and_then(|usage| usage.get("cost_usd"))
+                    .and_then(Value::as_f64)
+                    .or_else(|| value.get("cost_usd").and_then(Value::as_f64))
+                {
+                    progress.cost_usd = Some(cost);
+                }
+            }
+            Some("item.completed") => {
+                let Some(item) = value.get("item") else {
+                    continue;
+                };
+                if matches!(
+                    item.get("type").and_then(Value::as_str),
+                    Some("command_execution")
+                        | Some("file_change")
+                        | Some("mcp_tool_call")
+                        | Some("web_search")
+                        | Some("web_search_call")
+                ) {
+                    progress.last_activity = Some(codex_tool_summary(item));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -367,6 +425,23 @@ mod tests {
         assert_eq!(progress.tokens, Some(5600));
         assert_eq!(progress.cost_usd, Some(0.4231));
         assert_eq!(progress.todos(), Some((2, 3)));
+    }
+
+    #[test]
+    fn codex_progress_reads_completed_turn_usage_and_activity() {
+        let transcript = r#"
+{"type":"item.completed","item":{"type":"command_execution","command":"cargo test"}}
+{"type":"turn.completed","usage":{"input_tokens":1200,"output_tokens":80,"total_tokens":1280}}
+"#;
+        let mut progress = SessionProgress::default();
+        parse_codex(transcript, &mut progress);
+
+        assert_eq!(progress.tokens, Some(1280));
+        assert_eq!(progress.cost_usd, None);
+        assert_eq!(
+            progress.last_activity.as_deref(),
+            Some("command cargo test")
+        );
     }
 
     #[test]

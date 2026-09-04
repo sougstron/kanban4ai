@@ -126,6 +126,21 @@ agents:
     agent: null
     extra_args:
     - --dangerously-skip-permissions
+  codex:
+    command: codex
+    model: gpt-5.5
+    models:
+    - gpt-5.5
+    effort: null
+    efforts:
+    - low
+    - medium
+    - high
+    - xhigh
+    agent: null
+    extra_args:
+    - --dangerously-bypass-approvals-and-sandbox
+    - --skip-git-repo-check
   omp:
     command: omp
     model: null
@@ -165,6 +180,7 @@ orchestration:
   max_running_total: 3
   max_running_per_backend:
     claude: 2
+    codex: 2
     opencode: 2
     omp: 2
     pi: 2
@@ -1150,7 +1166,7 @@ impl Config {
     fn validate_orchestration(config: &mut BoardConfig, warnings: &mut Vec<String>) -> Result<()> {
         // Known backends for `<backend>/<model>` key checks: the built-ins
         // plus anything the user configured under `agents:`.
-        let known_backends: Vec<String> = ["opencode", "claude", "omp", "pi"]
+        let known_backends: Vec<String> = ["opencode", "claude", "codex", "omp", "pi"]
             .into_iter()
             .map(str::to_owned)
             .chain(

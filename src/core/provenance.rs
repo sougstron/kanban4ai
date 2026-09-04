@@ -12,8 +12,8 @@
 //! *next* prompt is built from).
 //!
 //! Every supported backend emits a parseable JSONL transcript on stdout —
-//! claude via `--output-format stream-json`, opencode via `run --format json`,
-//! and the pi family (pi/omp) via `--mode json` — captured to
+//! claude via `--output-format stream-json`, codex via `exec --json`, opencode
+//! via `run --format json`, and the pi family (pi/omp) via `--mode json` — captured to
 //! `.kanban/logs/<session>.transcript.jsonl` by the launch wrapper. Their event
 //! shapes differ but never collide on the top-level `type`, so one
 //! [`render_stream_event`] renders all of them and each backend has its own
@@ -118,6 +118,52 @@ impl TranscriptHarvester for ClaudeHarvester {
                                 record_claude_tool_use(&mut manifest, block);
                             }
                         }
+                    }
+                }
+                _ => {}
+            }
+        }
+        canonicalize_paths(&mut manifest.reads, &self.root);
+        canonicalize_paths(&mut manifest.writes, &self.root);
+        Ok(manifest)
+    }
+}
+
+/// Harvester for Codex's `exec --json` JSONL transcript. Codex reports its
+/// native conversation id in `thread.started`; completed work arrives as
+/// `item.completed` events whose item describes commands, file changes, web
+/// searches, and MCP calls.
+pub struct CodexHarvester {
+    pub session_id: String,
+    pub prompt_dump: Option<String>,
+    /// Repo root, used to canonicalize recorded paths to repo-relative form.
+    pub root: PathBuf,
+}
+
+impl TranscriptHarvester for CodexHarvester {
+    fn harvest(&self, transcript: &Path) -> Result<InputManifest> {
+        let raw = std::fs::read_to_string(transcript)?;
+        let mut manifest = InputManifest {
+            session_id: self.session_id.clone(),
+            backend: "codex".to_string(),
+            prompt_dump: self.prompt_dump.clone(),
+            generated_at: timefmt::format(&timefmt::now()),
+            ..InputManifest::default()
+        };
+        for line in raw.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            match value.get("type").and_then(Value::as_str) {
+                Some("thread.started") if manifest.backend_session_id.is_none() => {
+                    manifest.backend_session_id = value
+                        .get("thread_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string);
+                }
+                Some("item.completed") => {
+                    if let Some(item) = value.get("item") {
+                        record_codex_item(&mut manifest, item);
                     }
                 }
                 _ => {}
@@ -245,8 +291,8 @@ pub fn load_manifest(provenance_dir: &Path, session_id: &str) -> Option<InputMan
 
 /// Every input manifest referenced by a task's thread, in first-seen order.
 /// `agent_step` audit lines carry `session=<id>`; each distinct session's
-/// manifest is loaded once. Sessions without a manifest (non-claude backends,
-/// crashes before any tool call) are simply absent.
+/// manifest is loaded once. Sessions without a manifest (backends that
+/// produced no parseable stream, or crashes before any tool call) are simply absent.
 pub fn collect_for_thread(provenance_dir: &Path, messages: &[Message]) -> Vec<InputManifest> {
     let mut seen = std::collections::HashSet::new();
     let mut manifests = Vec::new();
@@ -374,7 +420,14 @@ pub struct StreamError {
 /// Parse a backend `type: error` event. `None` for any other event, or an
 /// error with no usable message.
 pub fn stream_error(value: &Value) -> Option<StreamError> {
-    if value.get("type").and_then(Value::as_str) != Some("error") {
+    let kind = value.get("type").and_then(Value::as_str);
+    let codex_item_error = kind == Some("item.completed")
+        && value
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            == Some("error");
+    if kind != Some("error") && !codex_item_error {
         return None;
     }
     let message = error_event_message(value)?;
@@ -459,6 +512,12 @@ fn error_event_message(value: &Value) -> Option<String> {
                 .and_then(Value::as_str)
         })
         .or_else(|| value.get("message").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .get("item")
+                .and_then(|item| item.get("message"))
+                .and_then(Value::as_str)
+        })
         .map(str::trim)
         .filter(|message| !message.is_empty())
         .map(str::to_string)
@@ -475,13 +534,20 @@ fn error_event_retryable(value: &Value) -> bool {
                 .and_then(|err| err.get("isRetryable"))
                 .and_then(Value::as_bool)
         })
+        .or_else(|| {
+            value
+                .get("item")
+                .and_then(|item| item.get("isRetryable"))
+                .and_then(Value::as_bool)
+        })
         .unwrap_or(true)
 }
 
-/// Render one backend stream event (claude or opencode) as human-readable log
-/// text, or `None` for events with nothing worth showing. Callers pass non-JSON
-/// lines through untouched; this only decides recognized JSON events. The two
-/// backends' `type` values are disjoint, so a single match handles both.
+/// Render one backend stream event (claude, codex, or opencode) as
+/// human-readable log text, or `None` for events with nothing worth showing.
+/// Callers pass non-JSON lines through untouched; this only decides recognized
+/// JSON events. The backends' `type` values are disjoint, so a single match
+/// handles all of them.
 pub fn render_stream_event(value: &Value) -> Option<String> {
     match value.get("type").and_then(Value::as_str)? {
         // claude
@@ -527,6 +593,10 @@ pub fn render_stream_event(value: &Value) -> Option<String> {
         "tool_use" => value
             .get("part")
             .map(|part| format!("  → {}", opencode_tool_summary(part))),
+        // Codex finalizes each assistant/tool item in `item.completed`.
+        // `item.updated` is intentionally ignored to avoid rendering the same
+        // streamed item repeatedly.
+        "item.completed" => value.get("item").and_then(render_codex_item),
         "error" => stream_error(value).map(|err| format!("error: {}", err.message)),
         // pi family (pi/omp). Each assistant turn is finalized in one `message_end`
         // carrying its text and tool calls; `message_start` (placeholder) and
@@ -621,6 +691,121 @@ pub(crate) fn pi_tool_summary(block: &Value) -> String {
     match str_field(&args, &["i"]) {
         Some(intent) => format!("{name} {intent}"),
         None => name.to_string(),
+    }
+}
+
+/// Short human-readable activity for a completed Codex item.
+fn render_codex_item(item: &Value) -> Option<String> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("agent_message") => item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string),
+        Some("command_execution") => Some(format!("  → {}", codex_tool_summary(item))),
+        Some("file_change") => Some(format!("  → {}", codex_tool_summary(item))),
+        Some("mcp_tool_call") | Some("web_search") | Some("web_search_call") => {
+            Some(format!("  → {}", codex_tool_summary(item)))
+        }
+        Some("error") => stream_error(&serde_json::json!({
+            "type": "item.completed",
+            "item": item,
+        }))
+        .map(|err| format!("error: {}", err.message)),
+        _ => None,
+    }
+}
+
+/// `command_execution cargo test`, `file_change src/lib.rs`, … for Codex's
+/// item-based JSONL stream.
+pub(crate) fn codex_tool_summary(item: &Value) -> String {
+    match item.get("type").and_then(Value::as_str) {
+        Some("command_execution") => item
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|command| format!("command {command}"))
+            .unwrap_or_else(|| "command_execution".to_string()),
+        Some("file_change") => {
+            let paths = item
+                .get("changes")
+                .and_then(Value::as_array)
+                .map(|changes| {
+                    changes
+                        .iter()
+                        .filter_map(|change| str_field(change, &["path", "file_path", "filePath"]))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if paths.is_empty() {
+                str_field(item, &["path", "file_path", "filePath"])
+                    .map(|path| format!("file_change {path}"))
+                    .unwrap_or_else(|| "file_change".to_string())
+            } else {
+                format!("file_change {}", paths.join(", "))
+            }
+        }
+        Some("mcp_tool_call") => {
+            let server = str_field(item, &["server", "server_name"]).unwrap_or_default();
+            let tool = str_field(item, &["tool", "name"]).unwrap_or_default();
+            match (server.is_empty(), tool.is_empty()) {
+                (false, false) => format!("mcp {server}:{tool}"),
+                (false, true) => format!("mcp {server}"),
+                (true, false) => format!("mcp {tool}"),
+                (true, true) => "mcp_tool_call".to_string(),
+            }
+        }
+        Some("web_search") | Some("web_search_call") => str_field(item, &["query", "q"])
+            .map(|query| format!("web_search {query}"))
+            .unwrap_or_else(|| "web_search".to_string()),
+        Some(other) => other.to_string(),
+        None => "item".to_string(),
+    }
+}
+
+fn record_codex_item(manifest: &mut InputManifest, item: &Value) {
+    match item.get("type").and_then(Value::as_str) {
+        // The command is the closest equivalent to Codex's shell tool. Mine
+        // its file operands with the same conservative parser used by the
+        // other shell-capable backends.
+        Some("command_execution") => {
+            if let Some(command) = str_field(item, &["command"]) {
+                record_bash_files(manifest, &command);
+            }
+        }
+        // A file_change item contains one or more `{path, kind, diff}` entries.
+        // Every changed path is an output of the run.
+        Some("file_change") => {
+            if let Some(changes) = item.get("changes").and_then(Value::as_array) {
+                for change in changes {
+                    if let Some(path) = str_field(change, &["path", "file_path", "filePath"]) {
+                        push_unique(&mut manifest.writes, path);
+                    }
+                }
+            } else if let Some(path) = str_field(item, &["path", "file_path", "filePath"]) {
+                push_unique(&mut manifest.writes, path);
+            }
+        }
+        Some("mcp_tool_call") => {
+            let server = str_field(item, &["server", "server_name"]);
+            let tool = str_field(item, &["tool", "name"]);
+            let value = match (server, tool) {
+                (Some(server), Some(tool)) => format!("{server}:{tool}"),
+                (Some(server), None) => server,
+                (None, Some(tool)) => tool,
+                (None, None) => return,
+            };
+            push_unique(&mut manifest.mcp, value);
+        }
+        Some("web_search") | Some("web_search_call") => {
+            if let Some(query) = str_field(item, &["query", "q"]) {
+                push_unique(&mut manifest.urls, format!("search:{query}"));
+            }
+            if let Some(url) = str_field(item, &["url"]) {
+                push_unique(&mut manifest.urls, url);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -966,6 +1151,69 @@ not json at all
         assert_eq!(manifest.urls, vec!["https://example.com/doc"]);
         assert_eq!(manifest.mcp, vec!["github:list_prs"]);
         assert_eq!(manifest.summary(), "reads=3 writes=2 urls=1 mcp=1");
+    }
+
+    const CODEX_TRANSCRIPT: &str = r#"
+{"type":"thread.started","thread_id":"codex-thread-123"}
+{"type":"item.completed","item":{"id":"cmd-1","type":"command_execution","command":"sed -n '1,20p' src/main.rs && cargo test"}}
+{"type":"item.completed","item":{"id":"change-1","type":"file_change","changes":[{"path":"src/lib.rs","kind":"update"},{"path":"README.md","kind":"add"}]}}
+{"type":"item.completed","item":{"id":"search-1","type":"web_search","query":"codex exec json events"}}
+{"type":"item.completed","item":{"id":"mcp-1","type":"mcp_tool_call","server":"github","tool":"list_prs"}}
+{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","text":"Finished."}}
+"#;
+
+    #[test]
+    fn codex_harvester_classifies_items_and_thread_id() {
+        let dir = write_transcript(CODEX_TRANSCRIPT);
+        let harvester = CodexHarvester {
+            session_id: "ses-codex".to_string(),
+            prompt_dump: None,
+            root: PathBuf::from("/repo"),
+        };
+        let manifest = harvester
+            .harvest(&dir.path().join("ses.transcript.jsonl"))
+            .unwrap();
+
+        assert_eq!(manifest.backend, "codex");
+        assert_eq!(
+            manifest.backend_session_id.as_deref(),
+            Some("codex-thread-123")
+        );
+        assert_eq!(manifest.reads, vec!["src/main.rs"]);
+        assert_eq!(manifest.writes, vec!["src/lib.rs", "README.md"]);
+        assert_eq!(manifest.urls, vec!["search:codex exec json events"]);
+        assert_eq!(manifest.mcp, vec!["github:list_prs"]);
+    }
+
+    #[test]
+    fn renders_codex_items_and_errors() {
+        let message: Value = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"Done."}}"#,
+        )
+        .unwrap();
+        assert_eq!(render_stream_event(&message).as_deref(), Some("Done."));
+
+        let command: Value = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"type":"command_execution","command":"cargo test"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_stream_event(&command).as_deref(),
+            Some("  → command cargo test")
+        );
+
+        let error: Value = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"type":"error","message":"Authentication failed"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_stream_event(&error).as_deref(),
+            Some("error: Authentication failed")
+        );
+        assert_eq!(
+            stream_error(&error).map(|error| error.message).as_deref(),
+            Some("Authentication failed")
+        );
     }
 
     #[test]

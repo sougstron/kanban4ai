@@ -23,6 +23,8 @@ as the session rendered it:
 - claude: every `assistant` event's `text` blocks, grouped by message `id`;
   the closing `result` event repeats the last message and is only a fallback
   for runs with no recorded assistant text at all.
+- codex: every completed `agent_message` item from an `item.completed`
+  event; streamed `item.updated` partials are skipped.
 - opencode: every `text` event, grouped by `part.messageID`.
 - pi / omp: every assistant `message_end` carrying text (`turn_end`
   duplicates it and is skipped).
@@ -58,6 +60,9 @@ truth, so no new on-disk record or fixture surface is introduced.
   so tokens are approximated as `last_input + Σ output`; the final `result`
   event's cumulative `usage` supersedes it and carries `total_cost_usd`.
   `TodoWrite` inputs give todo counts (last write wins).
+- codex (`exec --json`): cumulative `input_tokens`, `output_tokens`, and
+  `total_tokens` from `turn.completed` are read, with completed command/file
+  change items providing last activity.
 - opencode (`run --format json`): a `tokens` object on the event `part` is read
   best-effort (placement is not stable across versions), `todowrite` gives todo
   counts.

@@ -121,7 +121,7 @@ not touch the project folder's own checkout.\n"
     Ok(prompt)
 }
 
-/// Small follow-up sent when pi/omp reopen their native conversation. The
+/// Small follow-up sent when Codex/pi/omp reopen their native conversation. The
 /// backend already has the original task, rules, tool history, and its own
 /// replies, so only the new board session identity and thread delta belong in
 /// this turn.

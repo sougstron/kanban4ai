@@ -3829,7 +3829,7 @@ impl App {
     /// Decide how to "open" a session for the user and act on it. tmux-hosted
     /// live sessions are attached (interactive); a running background agent has
     /// no live terminal, so its log is followed instead; a stopped agent with a
-    /// recorded backend session id is reopened with `<backend> --resume`.
+    /// recorded backend session id is reopened with the backend's resume command.
     fn open_session(&mut self, session_id: &str, backend: &str) -> Result<()> {
         if crate::agent::session_exists(session_id) {
             self.pending_terminal = Some(TerminalAction::Attach(session_id.to_string()));
@@ -3855,11 +3855,11 @@ impl App {
         Ok(())
     }
 
-    /// Build the `<backend> --resume <backend_session_id>` action for a stopped
+    /// Build the backend-specific interactive resume action for a stopped
     /// session, or `None` when the backend has no known resume flag or the
-    /// backend session id was never captured. Only claude is supported today.
+    /// backend session id was never captured.
     fn resume_action(&self, session_id: &str, backend: &str) -> Result<Option<TerminalAction>> {
-        if backend != "claude" {
+        if !matches!(backend, "claude" | "codex") {
             return Ok(None);
         }
         let Some(backend_session_id) =
@@ -3870,9 +3870,20 @@ impl App {
         };
         let config = self.ops.config.load()?;
         let command = crate::agent::backend_config(&config, backend)?.command;
+        let args = if backend == "codex" {
+            // `exec` sessions are non-interactive, so Codex needs the explicit
+            // opt-in when reopening one in its interactive TUI.
+            vec![
+                "resume".to_string(),
+                backend_session_id,
+                "--include-non-interactive".to_string(),
+            ]
+        } else {
+            vec!["--resume".to_string(), backend_session_id]
+        };
         Ok(Some(TerminalAction::Foreground {
             command,
-            args: vec!["--resume".to_string(), backend_session_id],
+            args,
             // Resuming a conversation re-runs the backend the way the agent
             // ran it: in the code folder, not in the board's data root.
             cwd: self.ops.work_path().to_path_buf(),
@@ -4465,10 +4476,10 @@ impl App {
         self.refresh_effort_options_for_slot(modal, config, slot);
     }
 
-    /// Model choices for a backend. opencode models come from the live
-    /// `opencode models` catalog ordered default-first, then recently used,
-    /// then alphabetical; other backends (and an unavailable opencode CLI)
-    /// use the configured `models` list as-is.
+    /// Model choices for a backend. Catalog-backed backends (opencode, omp,
+    /// and pi) come from their live catalogs ordered default-first, then
+    /// recently used, then alphabetical; other backends (and an unavailable
+    /// catalog CLI) use the configured `models` list as-is.
     fn backend_model_options(
         &self,
         backend: &str,
@@ -4506,9 +4517,9 @@ impl App {
             .collect()
     }
 
-    /// Effort choices depend on the backend and, for opencode, on the model:
-    /// claude lists its config `efforts`; opencode offers the variants the
-    /// catalog reports for the selected (or default) model.
+    /// Effort choices depend on the backend and, for catalog-backed backends,
+    /// on the model: claude/codex list their config `efforts`; opencode/omp/pi
+    /// offer the variants their catalogs report for the selected model.
     fn refresh_effort_options_for_slot(
         &self,
         modal: &mut ModalState,
@@ -5892,7 +5903,7 @@ fn role_cap(orch: &OrchestrationSettings, role: &str) -> i64 {
     orch.max_running_per_role.get(role).copied().unwrap_or(0)
 }
 
-const BACKEND_CAP_ORDER: [&str; 4] = ["claude", "opencode", "omp", "pi"];
+const BACKEND_CAP_ORDER: [&str; 5] = ["claude", "codex", "opencode", "omp", "pi"];
 
 fn format_backend_cap_map(map: &HashMap<String, i64>) -> String {
     let mut keys: Vec<&String> = map.keys().collect();
@@ -6121,7 +6132,7 @@ fn parse_cap_lines(
                 return Err((
                     field,
                     format!(
-                        "Unknown backend '{backend}' in `{key}` (use claude/opus or opencode/openai/gpt-5.5)"
+                        "Unknown backend '{backend}' in `{key}` (use claude/opus, codex/gpt-5.5, or opencode/openai/gpt-5.5)"
                     ),
                 ));
             }
@@ -6132,7 +6143,7 @@ fn parse_cap_lines(
 }
 
 fn is_known_settings_backend(modal: &ModalState, backend: &str) -> bool {
-    matches!(backend, "opencode" | "claude" | "omp" | "pi")
+    matches!(backend, "opencode" | "claude" | "codex" | "omp" | "pi")
         || modal
             .backend_options
             .iter()
