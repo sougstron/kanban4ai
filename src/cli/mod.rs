@@ -1131,6 +1131,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 println!("Found {} crashed sessions:", crashed.len());
                 for session in crashed {
                     println!("  {} (task: {})", session.id, session.task_id);
+                    // Same steps as the daemon tick: a heartbeat-timeout
+                    // crash gets its backoff (and its desktop alert) even
+                    // when no daemon is running.
+                    let _ = ops.schedule_crash_restart(&session.task_id, "heartbeat timeout");
                 }
             }
             let restarted = ops.due_restarts()?;

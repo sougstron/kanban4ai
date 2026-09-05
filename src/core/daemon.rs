@@ -158,7 +158,7 @@ fn pump_project(project: &Project, warned_once: &mut HashSet<String>) -> Result<
     // would otherwise miss them.
     let timeout = ops.config.get_threshold("session_heartbeat_timeout")?;
     for session in SessionManager::new(ops.data_root()).check_sessions(timeout)? {
-        let _ = ops.schedule_crash_restart(&session.task_id);
+        let _ = ops.schedule_crash_restart(&session.task_id, "heartbeat timeout");
         lines.push(format!(
             "{ts} {} reap {} (task: {})",
             project.id, session.id, session.task_id

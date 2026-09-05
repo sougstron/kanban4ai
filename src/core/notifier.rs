@@ -12,6 +12,7 @@ pub struct NotificationConfig {
     pub completion: bool,
     pub chained_start: bool,
     pub waiting: bool,
+    pub crash: bool,
     pub command: String,
     pub timeout: u64,
     pub max_body_chars: usize,
@@ -25,6 +26,7 @@ impl Default for NotificationConfig {
             completion: true,
             chained_start: true,
             waiting: true,
+            crash: true,
             command: "notify-send".to_string(),
             timeout: 3,
             max_body_chars: 240,
@@ -43,6 +45,7 @@ impl NotificationConfig {
             completion: get_bool("completion", defaults.completion),
             chained_start: get_bool("chained_start", defaults.chained_start),
             waiting: get_bool("waiting", defaults.waiting),
+            crash: get_bool("crash", defaults.crash),
             command: data
                 .get("command")
                 .and_then(|v| v.as_str())
@@ -102,6 +105,20 @@ impl DesktopNotifier {
     pub fn stranded(&self, task_id: &str, title: &str, detail: &str) -> bool {
         self.send(
             &format!("Kanban task stranded: {task_id}"),
+            &format!("{title}\n{detail}"),
+            "critical",
+        )
+    }
+
+    /// A run failed: the agent crashed (non-zero exit, heartbeat timeout) or
+    /// a launch never started. `detail` says what failed and what happens
+    /// next (a scheduled retry, or that no retry is configured).
+    pub fn crash(&self, task_id: &str, title: &str, detail: &str) -> bool {
+        if !self.config.crash {
+            return false;
+        }
+        self.send(
+            &format!("Kanban task failed: {task_id}"),
             &format!("{title}\n{detail}"),
             "critical",
         )
@@ -180,4 +197,19 @@ fn is_executable(path: &std::path::Path) -> bool {
         && std::fs::metadata(path)
             .map(|m| m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_alerts_default_on_and_can_be_toggled_off() {
+        assert!(NotificationConfig::default().crash);
+
+        let mapping: Mapping = serde_yaml_ng::from_str("crash: false\nwaiting: false").unwrap();
+        let config = NotificationConfig::from_mapping(&mapping);
+        assert!(!config.crash);
+        assert!(!config.waiting);
+    }
 }

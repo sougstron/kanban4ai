@@ -88,6 +88,9 @@ they are edited: press `s` on the Projects screen. Saved under the store
 - `completion`: true - notify when a task is completed or ready for review
 - `chained_start`: true - notify when a chained task auto-starts
 - `waiting`: true - notify when an agent declares a wait
+- `crash`: true - notify when a task run fails (non-zero exit, heartbeat
+  timeout, failed launch); the body names the scheduled retry, or that no
+  automatic retry is configured
 - `command`: `notify-send` - notification command
 - `timeout`: 3 - command timeout in seconds
 - `max_body_chars`: 240 - truncate notification body beyond this length

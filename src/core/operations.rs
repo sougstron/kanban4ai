@@ -1408,7 +1408,7 @@ impl Operations {
         ) {
             Ok(true) => Ok(Some(new_session_id)),
             failed => {
-                let _ = self.schedule_crash_restart(task_id);
+                let _ = self.schedule_crash_restart(task_id, "executor launch failed");
                 failed?;
                 Ok(Some(new_session_id))
             }
@@ -1478,7 +1478,7 @@ impl Operations {
             match self.finish_launch(&session_id, self.launch_agent(task_id, &session_id, false)) {
                 Ok(true) => {}
                 failed => {
-                    let _ = self.schedule_crash_restart(task_id);
+                    let _ = self.schedule_crash_restart(task_id, "reviewer launch failed");
                     failed?;
                 }
             }
@@ -3832,13 +3832,14 @@ impl Operations {
         }
         if exit_status != 0 {
             session_mgr.crash_session(session_id)?;
+            let cause = format!("agent exited with code {exit_status}");
             match self.crash_restart_plan(task_id, session_id) {
                 CrashRestart::Skip => {}
                 CrashRestart::Backoff => {
-                    let _ = self.schedule_crash_restart(task_id);
+                    let _ = self.schedule_crash_restart(task_id, &cause);
                 }
                 CrashRestart::After(at) => {
-                    let _ = self.schedule_crash_restart_at(task_id, Some(at));
+                    let _ = self.schedule_crash_restart_at(task_id, Some(at), &cause);
                 }
             }
             return Ok(AgentExitOutcome::Crashed);

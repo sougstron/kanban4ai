@@ -220,7 +220,7 @@ impl Operations {
         // crash-restart backoff (or stay crashed when that budget is spent).
         let heartbeat_timeout = self.config.get_threshold("session_heartbeat_timeout")?;
         for session in self.session_manager().check_sessions(heartbeat_timeout)? {
-            let _ = self.schedule_crash_restart(&session.task_id);
+            let _ = self.schedule_crash_restart(&session.task_id, "heartbeat timeout");
         }
         let _ = self.due_restarts()?;
 
@@ -276,7 +276,7 @@ impl Operations {
                     // Launch failed: the session is crashed. Hand it to the
                     // crash-restart backoff so a subscription-limit crash
                     // retries through the same caps instead of hot-looping.
-                    let _ = self.schedule_crash_restart(&candidate.id);
+                    let _ = self.schedule_crash_restart(&candidate.id, "agent launch failed");
                     continue;
                 }
             }
@@ -411,9 +411,10 @@ impl Operations {
 
     /// After a session reaches `Crashed`, either schedule the next backoff
     /// (`restart_at = now + delays[crash_restarts]`, phase `queued`) or leave
-    /// the task crashed and notify when that schedule is spent.
-    pub(crate) fn schedule_crash_restart(&self, task_id: &str) -> Result<bool> {
-        self.schedule_crash_restart_at(task_id, None)
+    /// the task crashed. Every failure alerts the desktop
+    /// (`notifications.crash`); a spent schedule also notifies as stranded.
+    pub(crate) fn schedule_crash_restart(&self, task_id: &str, cause: &str) -> Result<bool> {
+        self.schedule_crash_restart_at(task_id, None, cause)
     }
 
     /// [`Self::schedule_crash_restart`] with an explicit deadline: the moment
@@ -429,6 +430,7 @@ impl Operations {
         &self,
         task_id: &str,
         deadline: Option<NaiveDateTime>,
+        cause: &str,
     ) -> Result<bool> {
         let orch = self.config.get_orchestration()?;
         // Crash restart runs *through* the queue, so promising a retry the
@@ -436,6 +438,11 @@ impl Operations {
         // badge forever. With the queue (or auto-launch) off the task stays
         // crashed and recoverable, exactly as it did before this feature.
         if !orch.auto_restart_enabled || !self.queue_can_dispatch()? {
+            self.notify_crash(
+                task_id,
+                cause,
+                "no automatic retry is configured — re-run or recover the task.",
+            );
             return Ok(false);
         }
         let _guard = self.storage.lock()?;
@@ -497,7 +504,32 @@ impl Operations {
                 delays.len()
             ),
         );
+        self.notify_crash(
+            &task.id,
+            cause,
+            &format!(
+                "Retry scheduled at {} ({reason}, attempt {}/{}).",
+                timefmt::format(&restart_at),
+                idx + 1,
+                delays.len()
+            ),
+        );
         Ok(true)
+    }
+
+    /// Best-effort desktop alert for a failed run; a missing or failing
+    /// notifier never breaks the crash-restart path.
+    fn notify_crash(&self, task_id: &str, cause: &str, detail: &str) {
+        if let Ok(notifier) = self.notifier() {
+            let title = self
+                .storage
+                .load_task(task_id)
+                .ok()
+                .flatten()
+                .map(|task| task.title)
+                .unwrap_or_else(|| task_id.to_string());
+            notifier.crash(task_id, &title, &format!("{cause}. {detail}"));
+        }
     }
 }
 
