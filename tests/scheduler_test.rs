@@ -1329,3 +1329,99 @@ fn crash_restart_backoff_records_a_closed_retry_span() {
         .collect();
     assert_eq!(retry.len(), 1);
 }
+
+/// A board whose notifications go to a spy script appending its argv to a log
+/// file (returned as the third element). `auto_restart` drives the retry
+/// ladder; `crash_toggle` is the `notifications.crash` value.
+fn alert_board(
+    auto_restart: bool,
+    crash_toggle: &str,
+) -> (
+    tempfile::TempDir,
+    Operations,
+    std::path::PathBuf,
+    RecordingLauncher,
+) {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, ops, recorder) = ops_with_recorder(true);
+    let log = dir.path().join("notify.log");
+    let spy = dir.path().join("notify-spy");
+    fs::write(
+        &spy,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\n", log.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&spy, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        format!(
+            "notifications:\n  enabled: true\n  crash: {crash_toggle}\n  command: {}\n\
+             auto_launch:\n  enabled: true\norchestration:\n  queue_enabled: true\n  \
+             max_running_total: 0\n  auto_restart:\n    enabled: {auto_restart}\n    \
+             delays_minutes: [1, 30]\n",
+            spy.display()
+        ),
+    )
+    .unwrap();
+    ops.config.load_fresh().unwrap();
+    (dir, ops, log, recorder)
+}
+
+/// The notifier spawns and forgets, so poll briefly for the spy's log line.
+fn wait_for_alert(log: &std::path::Path, needle: &str) -> bool {
+    for _ in 0..100 {
+        if let Ok(body) = fs::read_to_string(log)
+            && body.contains(needle)
+        {
+            return true;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    false
+}
+
+#[test]
+fn a_failed_run_alerts_with_the_scheduled_retry() {
+    let (_dir, ops, log, _recorder) = alert_board(true, "true");
+    let id = take_running(&ops, "Fragile", "ses-alert-1");
+
+    let outcome = ops.reconcile_agent_exit(&id, "ses-alert-1", 1).unwrap();
+
+    assert_eq!(outcome, AgentExitOutcome::Crashed);
+    assert!(
+        wait_for_alert(&log, "Kanban task failed"),
+        "the crash must fire a desktop alert"
+    );
+    let body = fs::read_to_string(&log).unwrap();
+    assert!(body.contains("agent exited with code 1"), "body: {body}");
+    assert!(body.contains("Retry scheduled at"), "body: {body}");
+    assert!(body.contains("attempt 1/2"), "body: {body}");
+}
+
+#[test]
+fn the_crash_alert_respects_its_toggle() {
+    let (_dir, ops, log, _recorder) = alert_board(true, "false");
+    let id = take_running(&ops, "Quiet", "ses-alert-2");
+
+    ops.reconcile_agent_exit(&id, "ses-alert-2", 1).unwrap();
+
+    thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        !log.exists(),
+        "notifications.crash: false must silence the failure alert"
+    );
+}
+
+#[test]
+fn a_failure_without_auto_restart_still_alerts() {
+    let (_dir, ops, log, _recorder) = alert_board(false, "true");
+    let id = take_running(&ops, "Noretry", "ses-alert-3");
+
+    let outcome = ops.reconcile_agent_exit(&id, "ses-alert-3", 1).unwrap();
+
+    assert_eq!(outcome, AgentExitOutcome::Crashed);
+    assert!(
+        wait_for_alert(&log, "no automatic retry is configured"),
+        "a crash with auto-restart off must still alert instead of failing silently"
+    );
+}

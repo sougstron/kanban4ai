@@ -304,6 +304,12 @@ action on the task (run, re-run, recover, take, queue, unqueue) resets
 `auto_restart.enabled: false` disables the whole mechanism and restores the
 previous behavior (crashed tasks wait for `u` recover).
 
+Every failure on this path fires a desktop alert (`notifications.crash`,
+urgency critical): with a retry pending it names the retry time and attempt;
+with auto-restart off — or the queue unable to drain — it says so instead,
+so a crashed task is never silent until a human happens to look at the board.
+A spent schedule keeps the stronger stranded notification.
+
 A backend transcript error with `isRetryable: false` (OpenCode credits/401,
 and similar hard API failures) is posted on the thread as `✖ agent error: …`
 and does **not** enter this backoff: the task stays crashed so a billing or
