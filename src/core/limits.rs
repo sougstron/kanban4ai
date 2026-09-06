@@ -107,6 +107,80 @@ pub const PROVIDERS: [&str; 6] = ["claude", "codex", "grok", "zai", "synthetic",
 /// screen has no project, so no `.kanban/config.yaml` to read).
 pub const DEFAULT_REFRESH_INTERVAL: i64 = 120;
 
+/// Which tracked provider a backend/model pair spends quota on. `claude` and
+/// `codex` are their own subscriptions; catalog backends (`opencode`, `omp`,
+/// `pi`) resolve by model-id prefix — the OpenAI subscription backs both the
+/// codex CLI and `openai/*` models, `anthropic/*` spends Claude's, and so on.
+/// `None` = unknown, which the executor-pool gate treats as "passes" (a
+/// candidate with no observable quota must not be permanently blocked).
+pub fn provider_for(backend: &str, model: Option<&str>) -> Option<&'static str> {
+    match backend {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "opencode" | "omp" | "pi" => {
+            let model = model?;
+            if model.starts_with("openai") {
+                Some("codex")
+            } else if model.starts_with("anthropic") {
+                Some("claude")
+            } else if model.starts_with("zai") || model.starts_with("glm") {
+                Some("zai")
+            } else if model.starts_with("synthetic") {
+                Some("synthetic")
+            } else if model.starts_with("yolo") {
+                Some("yolo")
+            } else if model.starts_with("xai") || model.starts_with("grok") {
+                Some("grok")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether every live window of `provider` is at or above the configured
+/// floors. Inclusive boundary: exactly the floor passes. Windows with an
+/// unknown reset time, rolling windows, and providers without usable numbers
+/// all pass — "unknown is not exhausted", or a board whose limits cannot be
+/// read would stall every task.
+pub fn has_headroom(
+    provider_limits: &ProviderLimits,
+    thresholds: &crate::core::config::PoolThresholds,
+    now: i64,
+) -> bool {
+    provider_limits.live_windows(now).iter().all(|window| {
+        let floor = match window.label.as_str() {
+            "5h" => thresholds.five_hour_percent,
+            // Weekly windows and any other label (24h, mon, …) floor at
+            // the weekly threshold.
+            _ => thresholds.week_percent,
+        };
+        window.remaining_percent >= floor
+    })
+}
+
+/// Convenience over [`has_headroom`]: look the provider up in `snapshot`.
+/// `true` when the backend does not map to a provider or the snapshot has no
+/// usable entry for it — unknown is not exhausted.
+pub fn pool_candidate_has_headroom(
+    snapshot: Option<&LimitsSnapshot>,
+    backend: &str,
+    model: Option<&str>,
+    thresholds: &crate::core::config::PoolThresholds,
+    now: i64,
+) -> bool {
+    let Some(provider) = provider_for(backend, model) else {
+        return true;
+    };
+    match snapshot.and_then(|snapshot| snapshot.get(provider)) {
+        Some(provider_limits) if provider_limits.is_ready() => {
+            has_headroom(provider_limits, thresholds, now)
+        }
+        _ => true,
+    }
+}
+
 /// One rate-limit window of one provider.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LimitWindow {
@@ -1941,6 +2015,31 @@ fn cache_file() -> Option<PathBuf> {
 
 /// The most recent snapshot: the in-memory one, or the one persisted by an
 /// earlier run so the board has numbers to draw before the first fetch returns.
+/// Current Unix time in seconds, exported for the integration tests that
+/// build their own [`LimitsSnapshot`] fixtures.
+#[doc(hidden)]
+pub fn now_secs_for_tests() -> i64 {
+    now_secs()
+}
+
+/// Install a snapshot into the in-memory cache, **replacing** whatever is
+/// cached wholesale and touching neither the merge logic nor the on-disk
+/// `limits.json`.
+///
+/// `#[doc(hidden)]`, debug builds only: this exists so tests can drive the
+/// executor-pool gate deterministically instead of reading the developer
+/// machine's real `limits.json`. A merge (rather than a replace) would let a
+/// concurrent test process — or a stale file — overwrite the fixtures
+/// through `retain_fresher_providers`, and persisting would write fake quota
+/// numbers into the real store.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn set_cached_snapshot_for_tests(snapshot: LimitsSnapshot) {
+    if let Ok(mut value) = cache().lock() {
+        *value = Some(Arc::new(snapshot));
+    }
+}
+
 pub fn cached() -> Option<Arc<LimitsSnapshot>> {
     if let Some(snapshot) = cache().lock().ok().and_then(|value| value.clone()) {
         return Some(snapshot);
@@ -2014,6 +2113,7 @@ pub fn refresh_if_stale(ttl: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::PoolThresholds;
 
     #[test]
     fn claude_usage_maps_utilization_to_remaining_percent() {
@@ -3128,5 +3228,118 @@ mod tests {
         let kept = retain_fresher_providers(Some(&previous), vec![incoming.clone()], now);
 
         assert_eq!(kept[0], incoming);
+    }
+
+    #[test]
+    fn provider_for_maps_backends_and_model_prefixes() {
+        assert_eq!(provider_for("claude", None), Some("claude"));
+        assert_eq!(provider_for("codex", Some("gpt-5.5")), Some("codex"));
+        assert_eq!(provider_for("claude", Some("opus")), Some("claude"));
+        // Catalog backends resolve by model-id prefix.
+        assert_eq!(
+            provider_for("opencode", Some("openai/gpt-5.5")),
+            Some("codex")
+        );
+        assert_eq!(
+            provider_for("omp", Some("anthropic/claude-sonnet-5")),
+            Some("claude")
+        );
+        assert_eq!(provider_for("pi", Some("zai/glm-4.7")), Some("zai"));
+        assert_eq!(provider_for("opencode", Some("glm-4.7")), Some("zai"));
+        assert_eq!(
+            provider_for("opencode", Some("synthetic/foo")),
+            Some("synthetic")
+        );
+        assert_eq!(provider_for("opencode", Some("yolo/bar")), Some("yolo"));
+        assert_eq!(
+            provider_for("opencode", Some("xai-oauth/grok-4.5")),
+            Some("grok")
+        );
+        // Unknown model ids and unknown backends map to nothing.
+        assert_eq!(provider_for("opencode", Some("some/local")), None);
+        assert_eq!(provider_for("opencode", None), None);
+        assert_eq!(provider_for("custom-shim", Some("claude/opus")), None);
+    }
+
+    fn window(label: &str, remaining: f64, resets_at: Option<i64>) -> LimitWindow {
+        LimitWindow {
+            label: label.to_string(),
+            remaining_percent: remaining,
+            resets_at,
+            rolling: false,
+        }
+    }
+
+    fn ready(provider: &str, windows: Vec<LimitWindow>) -> ProviderLimits {
+        ProviderLimits {
+            provider: provider.to_string(),
+            state: ProviderState::Ready,
+            windows,
+            observed_at: None,
+        }
+    }
+
+    #[test]
+    fn has_headroom_boundaries_are_inclusive() {
+        let thresholds = PoolThresholds {
+            week_percent: 5.0,
+            five_hour_percent: 15.0,
+        };
+        // Exactly the floors: pass.
+        let limits = ready(
+            "claude",
+            vec![
+                window("5h", 15.0, Some(2_000)),
+                window("7d", 5.0, Some(9_000)),
+            ],
+        );
+        assert!(has_headroom(&limits, &thresholds, 1_500));
+        // Just below either floor: blocked.
+        let limits = ready(
+            "claude",
+            vec![
+                window("5h", 14.9, Some(2_000)),
+                window("7d", 5.0, Some(9_000)),
+            ],
+        );
+        assert!(!has_headroom(&limits, &thresholds, 1_500));
+        let limits = ready(
+            "claude",
+            vec![
+                window("5h", 15.0, Some(2_000)),
+                window("7d", 4.9, Some(9_000)),
+            ],
+        );
+        assert!(!has_headroom(&limits, &thresholds, 1_500));
+    }
+
+    #[test]
+    fn has_headroom_ignores_expired_windows_and_unknown_states() {
+        let thresholds = PoolThresholds {
+            week_percent: 5.0,
+            five_hour_percent: 15.0,
+        };
+        // An expired 5h window is dropped, so only the healthy 7d counts.
+        let limits = ready(
+            "claude",
+            vec![
+                window("5h", 0.0, Some(1_000)),
+                window("7d", 50.0, Some(9_000)),
+            ],
+        );
+        assert!(has_headroom(&limits, &thresholds, 1_500));
+        // A rolling window keeps counting past its reset time.
+        let mut rolling = window("5h", 20.0, Some(1_000));
+        rolling.rolling = true;
+        let limits = ready("claude", vec![rolling]);
+        assert!(has_headroom(&limits, &thresholds, 1_500));
+        // NotConfigured (or SignedOut/Unavailable): nothing to check.
+        let limits = ProviderLimits {
+            provider: "claude".to_string(),
+            state: ProviderState::NotConfigured,
+            windows: Vec::new(),
+            observed_at: None,
+        };
+        assert!(has_headroom(&limits, &thresholds, 1_500));
     }
 }

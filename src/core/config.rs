@@ -214,6 +214,13 @@ orchestration:
     max_subtasks: 12
     upstream_budget_chars: 4000
   roles: {}
+  executors:
+    middle: []
+    cheap: []
+    thresholds:
+      week_percent: 5
+      five_hour_percent: 15
+    ask_grace_secs: 60
   isolation:
     mode: auto
     branch_prefix: kanban/
@@ -316,6 +323,9 @@ pub struct OrchestrationSettings {
     /// (`orchestration.roles`). Ordered map so the roster list handed to the
     /// orchestrator prompt is stable between runs.
     pub roles: BTreeMap<String, Vec<RoleCandidate>>,
+    /// Board-level executor pools (`orchestration.executors`). Empty pools
+    /// mean today's behaviour: the task's own assignment runs.
+    pub executors: ExecutorPools,
     pub isolation: IsolationSettings,
 }
 
@@ -331,6 +341,88 @@ pub struct OrchestratorSettings {
     /// Character budget for the whole *Upstream results* section a dependent
     /// task is prompted with, split across its dependencies.
     pub upstream_budget_chars: i64,
+}
+
+/// `orchestration.executors.thresholds`: the *remaining*-percent floors a
+/// provider must clear before a pool candidate counts as usable. Inclusive
+/// (exactly the floor passes).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PoolThresholds {
+    pub week_percent: f64,
+    pub five_hour_percent: f64,
+}
+
+impl Default for PoolThresholds {
+    fn default() -> Self {
+        Self {
+            week_percent: 5.0,
+            five_hour_percent: 15.0,
+        }
+    }
+}
+
+/// `orchestration.executors`: the board-level executor pools. `cheap` is the
+/// default executor assignment for tasks with no explicit one, `middle` the
+/// opt-in "smart" pool (reviews, designers, or `role_profile: middle`). Both
+/// are ordered — the first candidate with provider headroom runs — and hold
+/// at most three entries. Empty pools mean today's behaviour.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecutorPools {
+    pub middle: Vec<RoleCandidate>,
+    pub cheap: Vec<RoleCandidate>,
+    pub thresholds: PoolThresholds,
+    /// Added to the earliest provider reset when every candidate is blocked.
+    pub ask_grace_secs: i64,
+}
+
+impl Default for ExecutorPools {
+    fn default() -> Self {
+        Self {
+            middle: Vec::new(),
+            cheap: Vec::new(),
+            thresholds: PoolThresholds::default(),
+            ask_grace_secs: 60,
+        }
+    }
+}
+
+impl ExecutorPools {
+    /// Parsed from the loaded (defaults-merged) `orchestration.executors`
+    /// mapping. Same entry spellings as `orchestration.roles`.
+    pub(crate) fn from_mapping(mapping: &Mapping) -> Self {
+        let pool_at = |key: &str| -> Vec<RoleCandidate> {
+            mapping
+                .get(Value::String(key.to_owned()))
+                .and_then(Value::as_sequence)
+                .map(|items| items.iter().filter_map(parse_role_candidate).collect())
+                .unwrap_or_default()
+        };
+        let thresholds = mapping
+            .get(Value::String("thresholds".to_owned()))
+            .and_then(Value::as_mapping);
+        let percent_at = |key: &str| -> Option<f64> {
+            thresholds
+                .and_then(|t| t.get(Value::String(key.to_owned())))
+                .and_then(|value| match value {
+                    Value::Number(number) => number.as_f64(),
+                    Value::String(text) => text.trim().parse::<f64>().ok(),
+                    _ => None,
+                })
+        };
+        let ask_grace_secs = mapping
+            .get(Value::String("ask_grace_secs".to_owned()))
+            .and_then(as_int)
+            .unwrap_or(60);
+        Self {
+            middle: pool_at("middle"),
+            cheap: pool_at("cheap"),
+            thresholds: PoolThresholds {
+                week_percent: percent_at("week_percent").unwrap_or(5.0),
+                five_hour_percent: percent_at("five_hour_percent").unwrap_or(15.0),
+            },
+            ask_grace_secs,
+        }
+    }
 }
 
 /// One entry in an `orchestration.roles` roster: a launch the orchestrator may
@@ -504,12 +596,10 @@ impl OrchestrationSettings {
     }
 }
 
-/// Parse `orchestration.roles` into ordered rosters. Two spellings per entry:
-/// a mapping (`{backend: claude, model: sonnet}`) or the `<backend>/<model>`
-/// shorthand string; a bare string with no slash is a backend on its own
-/// defaults. Malformed entries are dropped here and rejected with a message by
-/// [`Config::validate_orchestration`].
-fn parse_role_rosters(mapping: &Mapping) -> BTreeMap<String, Vec<RoleCandidate>> {
+/// Parse one roster/pool entry: a mapping (`{backend: claude, model:
+/// sonnet}`) or the `<backend>/<model>` shorthand string; a bare string with
+/// no slash is a backend on its own defaults.
+pub(crate) fn parse_role_candidate(item: &Value) -> Option<RoleCandidate> {
     let field = |m: &Mapping, key: &str| -> Option<String> {
         m.get(Value::String(key.to_owned()))
             .and_then(Value::as_str)
@@ -517,6 +607,38 @@ fn parse_role_rosters(mapping: &Mapping) -> BTreeMap<String, Vec<RoleCandidate>>
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
     };
+    match item {
+        Value::Mapping(m) => Some(RoleCandidate {
+            backend: field(m, "backend"),
+            model: field(m, "model"),
+            effort: field(m, "effort"),
+            agent: field(m, "agent"),
+        }),
+        Value::String(spec) => {
+            let spec = spec.trim();
+            if spec.is_empty() {
+                return None;
+            }
+            let (backend, model) = match spec.split_once('/') {
+                Some((backend, model)) => (backend, Some(model.to_owned())),
+                None => (spec, None),
+            };
+            Some(RoleCandidate {
+                backend: Some(backend.to_owned()),
+                model,
+                effort: None,
+                agent: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse `orchestration.roles` into ordered rosters. Two spellings per entry:
+/// a mapping or the `<backend>/<model>` shorthand. Malformed entries are
+/// dropped here and rejected with a message by
+/// [`Config::validate_orchestration`].
+fn parse_role_rosters(mapping: &Mapping) -> BTreeMap<String, Vec<RoleCandidate>> {
     let mut rosters = BTreeMap::new();
     for (name, value) in mapping {
         let Some(name) = name.as_str().map(str::to_owned) else {
@@ -532,34 +654,8 @@ fn parse_role_rosters(mapping: &Mapping) -> BTreeMap<String, Vec<RoleCandidate>>
         let Some(items) = items else {
             continue;
         };
-        let candidates: Vec<RoleCandidate> = items
-            .iter()
-            .filter_map(|item| match item {
-                Value::Mapping(m) => Some(RoleCandidate {
-                    backend: field(m, "backend"),
-                    model: field(m, "model"),
-                    effort: field(m, "effort"),
-                    agent: field(m, "agent"),
-                }),
-                Value::String(spec) => {
-                    let spec = spec.trim();
-                    if spec.is_empty() {
-                        return None;
-                    }
-                    let (backend, model) = match spec.split_once('/') {
-                        Some((backend, model)) => (backend, Some(model.to_owned())),
-                        None => (spec, None),
-                    };
-                    Some(RoleCandidate {
-                        backend: Some(backend.to_owned()),
-                        model,
-                        effort: None,
-                        agent: None,
-                    })
-                }
-                _ => None,
-            })
-            .collect();
+        let candidates: Vec<RoleCandidate> =
+            items.iter().filter_map(parse_role_candidate).collect();
         if !candidates.is_empty() {
             rosters.insert(name, candidates);
         }
@@ -827,6 +923,112 @@ fn validate_isolation_string(iso: &Mapping, key: &str) -> Result<()> {
     )))
 }
 
+/// `orchestration.executors`: pools hold at most three entries each (the
+/// user-specified "up to 3"), every entry must parse, and an unknown backend
+/// is a warning (the entry stays and behaves exactly like an unknown
+/// `roles` entry: the launch falls back to the task's own assignment).
+/// Thresholds are percentages (0..=100); `ask_grace_secs` is non-negative.
+fn validate_executor_pools(
+    orch: &Mapping,
+    known_backends: &[String],
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let yaml_key = Value::String("executors".to_owned());
+    let Some(executors) = orch.get(&yaml_key).filter(|v| !matches!(v, Value::Null)) else {
+        return Ok(());
+    };
+    let Some(executors) = executors.as_mapping() else {
+        return Err(KanbanError::Invalid(format!(
+            "orchestration.executors must be a mapping (middle, cheap, thresholds), got: {executors:?}"
+        )));
+    };
+    for pool in ["middle", "cheap"] {
+        let pool_key = Value::String(pool.to_owned());
+        let Some(value) = executors
+            .get(&pool_key)
+            .filter(|v| !matches!(v, Value::Null))
+        else {
+            continue;
+        };
+        let Some(items) = value.as_sequence() else {
+            return Err(KanbanError::Invalid(format!(
+                "orchestration.executors.{pool} must be a list of '<backend>/<model>' strings or \
+                 {{backend, model}} mappings, got: {value:?}"
+            )));
+        };
+        if items.len() > 3 {
+            return Err(KanbanError::Invalid(format!(
+                "orchestration.executors.{pool} holds {} entries; a pool holds at most 3",
+                items.len()
+            )));
+        }
+        for item in items {
+            let Some(candidate) = parse_role_candidate(item) else {
+                return Err(KanbanError::Invalid(format!(
+                    "orchestration.executors.{pool} entry {item:?} is not a '<backend>/<model>' \
+                     string or a {{backend, model}} mapping"
+                )));
+            };
+            if let Some(backend) = candidate.backend.as_deref()
+                && !known_backends.iter().any(|known| known == backend)
+            {
+                warnings.push(format!(
+                    "orchestration.executors.{pool} entry '{}' names unknown backend '{backend}' \
+                     and falls back to the task's own settings (known: {})",
+                    candidate.label(),
+                    known_backends.join(", ")
+                ));
+            }
+        }
+    }
+    if let Some(thresholds) = executors
+        .get(Value::String("thresholds".to_owned()))
+        .and_then(Value::as_mapping)
+    {
+        for key in ["week_percent", "five_hour_percent"] {
+            let Some(value) = thresholds
+                .get(Value::String(key.to_owned()))
+                .filter(|v| !matches!(v, Value::Null))
+                .cloned()
+            else {
+                continue;
+            };
+            let parsed = match &value {
+                Value::Number(number) => number.as_f64(),
+                Value::String(text) => text.trim().parse::<f64>().ok(),
+                _ => None,
+            }
+            .ok_or_else(|| {
+                KanbanError::Invalid(format!(
+                    "Invalid percentage for orchestration.executors.thresholds.{key}: {value:?}"
+                ))
+            })?;
+            if !(0.0..=100.0).contains(&parsed) {
+                return Err(KanbanError::Invalid(format!(
+                    "orchestration.executors.thresholds.{key} must be 0..=100, got {parsed}"
+                )));
+            }
+        }
+    }
+    if let Some(value) = executors
+        .get(Value::String("ask_grace_secs".to_owned()))
+        .filter(|v| !matches!(v, Value::Null))
+        .cloned()
+    {
+        let parsed = as_int(&value).ok_or_else(|| {
+            KanbanError::Invalid(format!(
+                "Invalid integer for orchestration.executors.ask_grace_secs: {value:?}"
+            ))
+        })?;
+        if parsed < 0 {
+            return Err(KanbanError::Invalid(format!(
+                "orchestration.executors.ask_grace_secs must not be negative: {parsed}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// `orchestration.roles`: every profile must be a non-empty roster whose
 /// entries name a known backend. A roster the orchestrator would find empty is
 /// an error (it would silently drop the assignment); an unknown backend is a
@@ -961,7 +1163,7 @@ impl OrchestrationSettings {
     /// Build the typed snapshot from a loaded (defaults-merged) mapping.
     /// Every key falls back to the built-in default so callers never see a
     /// missing value.
-    pub(crate) fn from_mapping(mapping: &Mapping) -> Self {
+    pub fn from_mapping(mapping: &Mapping) -> Self {
         let defaults = BoardConfig::default().orchestration;
         let bool_at = |key: &str| -> bool {
             mapping
@@ -1097,6 +1299,11 @@ impl OrchestrationSettings {
             .and_then(Value::as_mapping)
             .map(parse_role_rosters)
             .unwrap_or_default();
+        let executors = mapping
+            .get("executors")
+            .and_then(Value::as_mapping)
+            .map(ExecutorPools::from_mapping)
+            .unwrap_or_default();
 
         OrchestrationSettings {
             queue_enabled: bool_at("queue_enabled"),
@@ -1121,6 +1328,7 @@ impl OrchestrationSettings {
                 upstream_budget_chars: orchestrator_int("upstream_budget_chars", 4000),
             },
             roles,
+            executors,
             isolation: IsolationSettings {
                 mode: isolation
                     .get("mode")
@@ -1464,6 +1672,7 @@ impl Config {
         }
 
         validate_role_rosters(orch, &known_backends, warnings)?;
+        validate_executor_pools(orch, &known_backends, warnings)?;
         validate_isolation(orch)?;
 
         Ok(())

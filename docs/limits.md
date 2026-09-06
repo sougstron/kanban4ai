@@ -162,3 +162,30 @@ poll, capped at 64×; the backoff is claude's own and never delays the other
 providers. A transient fetch failure likewise keeps the cached numbers rather
 than flipping a provider to `n/a`; only a real state change (signed out,
 credentials removed) replaces them.
+
+## Executor-pool gate (`provider_for`, `has_headroom`)
+
+`core/executors.rs` decides a launch before it happens (see **Executor
+Pools** in `docs/orchestration.md`); the limits side exposes two pure helpers.
+
+`provider_for(backend, model)` maps a launch pair onto one of the row's
+providers: `claude` → `claude`, `codex` → `codex`; the catalog backends
+(`opencode`/`omp`/`pi`) resolve by model-id prefix — `openai/*` → `codex`
+(the OpenAI subscription backs those runs), `anthropic/*` → `claude`,
+`zai*`/`glm*` → `zai`, `synthetic/*` → `synthetic`, `yolo*` → `yolo`,
+`xai/*`/`grok*` → `grok`. Anything else returns `None` — a pair no
+subscription covers, such as a purely local model.
+
+`has_headroom` checks every **live** window of the resolved provider against
+the `orchestration.executors.thresholds` floors: a `5h` label needs
+`five_hour_percent` remaining, a `7d`/weekly label needs `week_percent`, any
+other label uses `week_percent`. The boundary is inclusive (exactly 5%
+passes). `None` (no provider), `not_configured`, `signed out`, `unavailable`,
+or a provider with no live window all **pass** the gate: unknown is not
+exhausted, and a board whose limits cannot be read must keep running rather
+than silently stall every task.
+
+The gate reads `limits::cached()` only — never a blocking fetch. Dispatch
+runs on the TUI tick and in the daemon, where an HTTP call would freeze the
+event loop; the daemon's tick calls `refresh_if_stale` so the numbers the
+gate sees stay fresh without ever blocking on them.

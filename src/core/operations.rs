@@ -2,6 +2,32 @@
 //! module; it owns CRUD, move/rule enforcement, questions, review edits,
 //! chaining, and delegates agent process launching to an [`AgentLauncher`].
 
+/// `author` of the board question the executor-pool gate posts when every
+/// candidate is out of quota.
+pub const EXECUTOR_POOL_QUESTION_SOURCE: &str = "kanban:executor-pool";
+
+/// The final variant of that question: keep the parked deadline instead of
+/// switching providers.
+pub const WAIT_FOR_QUOTA_VARIANT: &str = "Wait for the quota window";
+
+/// What [`Operations::apply_executor_pool`] decided for one task.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PoolOutcome {
+    /// A pool candidate was materialized onto the task.
+    Assigned {
+        pool: String,
+        index: u32,
+        label: String,
+    },
+    /// Every candidate is out of quota: the task parks until `wake_at`.
+    Parked {
+        wake_at: chrono::NaiveDateTime,
+        blocked: Vec<String>,
+    },
+    /// No pool applies: empty pools or an explicit per-task assignment.
+    Unchanged,
+}
+
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,11 +44,12 @@ use crate::agent::{
 };
 use crate::core::ask_form::AskForm;
 use crate::core::config::{
-    Config, IsolationCleanup, IsolationLand, IsolationMode, IsolationOnConflict, IsolationSeed,
-    IsolationSettings, OnChangesRequested,
+    Config, ExecutorPools, IsolationCleanup, IsolationLand, IsolationMode, IsolationOnConflict,
+    IsolationSeed, IsolationSettings, OnChangesRequested, RoleCandidate,
 };
 use crate::core::context::{ContextManager, role_for_source};
 use crate::core::error::{KanbanError, Result};
+use crate::core::executors::{self, Pool, PoolChoice};
 use crate::core::graph;
 use crate::core::limits;
 use crate::core::models::{
@@ -1042,6 +1069,21 @@ impl Operations {
             let known_session = !queued || session_mgr.load_session(session_id).is_some();
             if known_session {
                 task.session = Some(session_id.to_string());
+            }
+            // Direct launches (Run-now, delegated takes, chained starts) run
+            // the pre-flight pool gate here; the dispatcher path runs it in
+            // the claim. Only a board whose queue actually drains may park:
+            // otherwise a quota block would strand the task forever.
+            if !queued
+                && self.queue_can_dispatch()?
+                && matches!(task.run_phase, None | Some(RunPhase::Execute))
+            {
+                if let PoolOutcome::Parked { .. } = self.apply_executor_pool(&mut task)? {
+                    queued = true;
+                    // The parked task owns no live session: the
+                    // dispatcher minted id would paint it as running.
+                    task.session = None;
+                }
             }
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
@@ -2129,7 +2171,11 @@ impl Operations {
         Ok(started)
     }
 
-    /// Move a node onto the next model in its `orchestration.roles` roster.
+    /// Move a node onto the next model in its `orchestration.roles` roster
+    /// — or, when the profile names an executor pool (`middle` / `cheap`),
+    /// the next candidate of that pool. The two mechanisms share one roster
+    /// concept: the pool is a pre-launch gate, this is the post-mortem
+    /// failover for a run that died on a limit the gate could not predict.
     ///
     /// Called when a run died on a provider limit: the point of a roster is
     /// that the work continues on the next backend instead of parking until
@@ -2150,13 +2196,29 @@ impl Operations {
         let Some(profile) = task.role_profile.clone() else {
             return Ok(false);
         };
-        if !orch.has_next_role_candidate(&profile, task.roster_index) {
-            return Ok(false);
-        }
-        let next_index = task.roster_index + 1;
-        let Some(candidate) = orch.role_candidate(&profile, next_index) else {
+        // Pool profiles read the executor pools, not `orchestration.roles`.
+        let pool_roster: Option<&Vec<RoleCandidate>> = match profile.as_str() {
+            "middle" => Some(&orch.executors.middle),
+            "cheap" => Some(&orch.executors.cheap),
+            _ => None,
+        };
+        let next_candidate: Option<RoleCandidate> = match pool_roster {
+            Some(roster) => {
+                let next_index = task.roster_index + 1;
+                roster.get(next_index as usize).cloned()
+            }
+            None => {
+                if !orch.has_next_role_candidate(&profile, task.roster_index) {
+                    return Ok(false);
+                }
+                let next_index = task.roster_index + 1;
+                orch.role_candidate(&profile, next_index).cloned()
+            }
+        };
+        let Some(candidate) = next_candidate else {
             return Ok(false);
         };
+        let next_index = task.roster_index + 1;
         task.roster_index = next_index;
         task.agent_backend = candidate.backend.clone().or(task.agent_backend);
         task.ai_model = candidate.model.clone();
@@ -2168,13 +2230,301 @@ impl Operations {
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         let label = candidate.label();
+        let roster_len = match profile.as_str() {
+            "middle" => orch.executors.middle.len(),
+            "cheap" => orch.executors.cheap.len(),
+            _ => orch.roles.get(&profile).map_or(0, Vec::len),
+        };
         self.post_queue_note(
             task_id,
             &format!(
                 "↻ role '{profile}' failed over to {label} (candidate {}/{}) — {cause}",
                 next_index + 1,
-                orch.roles.get(&profile).map_or(0, Vec::len)
+                roster_len
             ),
+        );
+        Ok(true)
+    }
+
+    // -------------------------------------------------- executor pools
+
+    /// The first executor-pool candidate with provider headroom is
+    /// materialized onto `task` (backend/model/effort/agent plus
+    /// `role_profile`/`roster_index`), exactly like `advance_role_roster`:
+    /// the census, the caps, the stats and the detail view all describe what
+    /// will really run. When every candidate is out of quota the task parks
+    /// (`restart_at`, phase `queued`, no session — not a crash: the
+    /// crash-restart budget is untouched) and one board question asks the
+    /// human for another provider. Whoever comes first wins: an answer
+    /// materializes the chosen candidate before the wake, the deadline
+    /// re-runs the walk and withdraws the question.
+    ///
+    /// Mutates `task` only — never saves and never takes the board lock, so
+    /// callers inside a locked read-modify-write can persist it atomically.
+    pub fn apply_executor_pool(&self, task: &mut Task) -> Result<PoolOutcome> {
+        let orch = self.config.get_orchestration()?;
+        let pools = &orch.executors;
+        if pools.middle.is_empty() && pools.cheap.is_empty() {
+            return Ok(PoolOutcome::Unchanged);
+        }
+        // Pools decide executor launches only: a queued task (dispatcher
+        // claim) and a direct executor launch participate; design and review
+        // phases keep their bot settings, and the orchestrator plans on the
+        // task's own assignment.
+        if !matches!(
+            task.run_phase,
+            None | Some(RunPhase::Execute) | Some(RunPhase::Queued)
+        ) {
+            return Ok(PoolOutcome::Unchanged);
+        }
+        let config = self.config.load()?;
+        let pool = match task.role_profile.as_deref() {
+            Some("middle") => Pool::Middle,
+            Some("cheap") => Pool::Cheap,
+            // An explicit per-task assignment always wins: the pool only
+            // replaces the *default* resolution, never a model the user
+            // picked on the task.
+            _ if self.task_assignment_is_default(&config, task)? => Pool::Cheap,
+            _ => return Ok(PoolOutcome::Unchanged),
+        };
+        if pool.roster(pools).is_empty() {
+            return Ok(PoolOutcome::Unchanged);
+        }
+
+        // Dispatch runs on the TUI tick and in the daemon: the gate reads the
+        // cached snapshot only, never a blocking fetch.
+        let snapshot = limits::cached();
+        let now_ts = chrono::Utc::now().timestamp();
+        match executors::select(pools, pool, snapshot.as_deref(), now_ts) {
+            PoolChoice::Candidate { candidate, index } => {
+                task.role_profile = Some(pool.name().to_string());
+                task.roster_index = index;
+                task.agent_backend = candidate.backend.clone();
+                task.ai_model = candidate.model.clone();
+                task.ai_effort = candidate.effort.clone();
+                task.agent_name = candidate.agent.clone();
+                materialize_task_launch_settings(&config, task)?;
+                self.withdraw_executor_pool_question(task)?;
+                Ok(PoolOutcome::Assigned {
+                    pool: pool.name().to_string(),
+                    index,
+                    label: candidate.label(),
+                })
+            }
+            PoolChoice::AllBlocked { wake_at, blocked } => {
+                let Some(wake) = DateTime::from_timestamp(wake_at, 0).map(|dt| dt.naive_utc())
+                else {
+                    return Ok(PoolOutcome::Unchanged);
+                };
+                let now = timefmt::now();
+                let Some(wake) = crate::core::scheduler::usable_deadline(wake, now) else {
+                    return Ok(PoolOutcome::Unchanged);
+                };
+                task.restart_at = Some(wake);
+                task.run_phase = Some(RunPhase::Queued);
+                task.session = None;
+                task.has_questions = true;
+                task.updated_at = now;
+                self.post_queue_note(
+                    &task.id,
+                    &format!(
+                        "⏸ every {} executor candidate is out of quota — retrying at {} ({})",
+                        pool.name(),
+                        timefmt::format(&wake),
+                        blocked.join(", ")
+                    ),
+                );
+                self.post_executor_pool_question(task, pool, pools, snapshot.as_deref(), now_ts)?;
+                Ok(PoolOutcome::Parked {
+                    wake_at: wake,
+                    blocked,
+                })
+            }
+            PoolChoice::NoPool => Ok(PoolOutcome::Unchanged),
+        }
+    }
+
+    /// Whether the task's launch settings are indistinguishable from the
+    /// board defaults — i.e. the human left the task on "Default" rather
+    /// than picking a backend/model, so the cheap pool may decide.
+    fn task_assignment_is_default(
+        &self,
+        config: &crate::core::config::BoardConfig,
+        task: &Task,
+    ) -> Result<bool> {
+        let probe = Task::new(String::new(), String::new());
+        let default = resolve_task_launch_settings(config, &probe)?;
+        let actual = resolve_task_launch_settings(config, task)?;
+        Ok(actual == default)
+    }
+
+    /// The one open `kanban:executor-pool` question on the task, if any.
+    pub(crate) fn open_executor_pool_question(&self, task_id: &str) -> Result<Option<Message>> {
+        let tm = self.thread_manager()?;
+        Ok(tm
+            .open_messages(task_id, Some(MessageKind::Question))?
+            .into_iter()
+            .find(|message| message.author.as_deref() == Some(EXECUTOR_POOL_QUESTION_SOURCE)))
+    }
+
+    /// Post the "another provider?" board question for a parked task — once.
+    /// A no-op while an unanswered executor-pool question is already open, or
+    /// every daemon tick would fan out questions. Board infrastructure asks,
+    /// not the agent: the `questions_go_to_review` status move does not
+    /// apply, and the task keeps its parked run state.
+    fn post_executor_pool_question(
+        &self,
+        task: &mut Task,
+        pool: Pool,
+        pools: &ExecutorPools,
+        snapshot: Option<&limits::LimitsSnapshot>,
+        now_ts: i64,
+    ) -> Result<()> {
+        if self.open_executor_pool_question(&task.id)?.is_some() {
+            return Ok(());
+        }
+        let tm = self.thread_manager()?;
+        let variants = self.executor_pool_variants(pools, pool, snapshot, now_ts)?;
+        let question = format!(
+            "every {} executor candidate is out of quota — run on another provider now, or wait for the reset?",
+            pool.name()
+        );
+        tm.post(
+            &task.id,
+            MessageRole::System,
+            MessageKind::Question,
+            &question,
+            None,
+            variants.clone(),
+            Some(EXECUTOR_POOL_QUESTION_SOURCE.to_string()),
+        )?;
+        self.notify_question(task, &question);
+        Ok(())
+    }
+
+    /// Answer choices for the park question: every configured
+    /// `backend/model` pair with headroom right now that the pool does not
+    /// already name, then the final "wait" option.
+    fn executor_pool_variants(
+        &self,
+        pools: &ExecutorPools,
+        pool: Pool,
+        snapshot: Option<&limits::LimitsSnapshot>,
+        now_ts: i64,
+    ) -> Result<Vec<String>> {
+        let config = self.config.load()?;
+        let thresholds = &pools.thresholds;
+        let pool_backend_models: Vec<String> = pool
+            .roster(pools)
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.backend.as_deref().unwrap_or_default(),
+                    candidate.model.as_deref().unwrap_or_default(),
+                )
+            })
+            .map(|(backend, model)| format!("{backend}/{model}"))
+            .collect();
+        let mut variants: Vec<String> = Vec::new();
+        for (backend, value) in config.agents.iter() {
+            let Some(backend) = backend.as_str() else {
+                continue;
+            };
+            let Some(settings) = value.as_mapping() else {
+                continue;
+            };
+            let models: Vec<String> = settings
+                .get(serde_yaml_ng::Value::String("models".to_string()))
+                .and_then(serde_yaml_ng::Value::as_sequence)
+                .map(|models| {
+                    models
+                        .iter()
+                        .filter_map(|model| model.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if models.is_empty() {
+                if limits::pool_candidate_has_headroom(snapshot, backend, None, thresholds, now_ts)
+                    && !pool_backend_models.contains(&format!("{backend}/"))
+                {
+                    variants.push(backend.to_string());
+                }
+                continue;
+            }
+            for model in models {
+                let key = format!("{backend}/{model}");
+                if pool_backend_models.contains(&key) {
+                    continue;
+                }
+                if limits::pool_candidate_has_headroom(
+                    snapshot,
+                    backend,
+                    Some(&model),
+                    thresholds,
+                    now_ts,
+                ) && !variants.contains(&key)
+                {
+                    variants.push(key);
+                }
+            }
+        }
+        variants.truncate(6);
+        variants.push(WAIT_FOR_QUOTA_VARIANT.to_string());
+        Ok(variants)
+    }
+
+    /// The deadline won: withdraw the open park question so no dangling
+    /// "another provider?" is left on the board.
+    fn withdraw_executor_pool_question(&self, task: &mut Task) -> Result<()> {
+        let Some(message) = self.open_executor_pool_question(&task.id)? else {
+            return Ok(());
+        };
+        let tm = self.thread_manager()?;
+        tm.answer(
+            &task.id,
+            &message.id,
+            "↻ quota window rolled over — question withdrawn",
+            MessageRole::System,
+        )?;
+        task.has_questions = tm.has_open_questions(&task.id)?;
+        Ok(())
+    }
+
+    /// A `kanban:executor-pool` answer was just recorded: when it names one
+    /// of the offered providers, materialize that candidate and clear the
+    /// park deadline before the re-queue — the dispatcher then starts the run
+    /// immediately on the chosen provider. "Wait…" leaves the deadline alone.
+    fn apply_executor_pool_answer(&self, task: &mut Task, answer: &str) -> Result<bool> {
+        let answer = answer.trim();
+        if answer.is_empty() || answer == WAIT_FOR_QUOTA_VARIANT {
+            return Ok(false);
+        }
+        let (backend, model) = match answer.split_once('/') {
+            Some((backend, model)) => (backend.to_string(), Some(model.to_string())),
+            None => (answer.to_string(), None),
+        };
+        let config = self.config.load()?;
+        if !config
+            .agents
+            .contains_key(serde_yaml_ng::Value::String(backend.clone()))
+        {
+            self.post_queue_note(
+                &task.id,
+                &format!("⚠ executor-pool answer {answer:?} is not a configured backend — still waiting for the quota window"),
+            );
+            return Ok(false);
+        }
+        task.agent_backend = Some(backend);
+        task.ai_model = model;
+        task.ai_effort = None;
+        task.agent_name = None;
+        task.role_profile = None;
+        task.roster_index = 0;
+        task.restart_at = None;
+        materialize_task_launch_settings(&config, task)?;
+        self.post_queue_note(
+            &task.id,
+            &format!("↻ executor reassigned to {answer} — handing to the queue"),
         );
         Ok(true)
     }
@@ -2281,7 +2631,7 @@ impl Operations {
         question_ref: QuestionRef,
         answer: &str,
     ) -> Result<Option<AnswerOutcome>> {
-        let (mut task, tm, expected_session) = {
+        let (mut task, tm, expected_session, pool_wait_answer) = {
             let _guard = self.storage.lock()?;
             let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
                 return Ok(None);
@@ -2311,13 +2661,31 @@ impl Operations {
                 return Ok(None);
             }
 
+            let source = tm
+                .get_message(&task.id, &msg_id)?
+                .and_then(|message| message.author)
+                .unwrap_or_default();
+            let is_pool_question = source == EXECUTOR_POOL_QUESTION_SOURCE;
             tm.answer(&task.id, &msg_id, answer, MessageRole::Human)?;
             task.has_questions = tm.has_open_questions(&task.id)?;
+            // Answer-first: a provider answer is materialized before the
+            // wake, so the fresh run starts on the chosen backend. A "wait"
+            // answer keeps the parked deadline — the quota window is the
+            // wake, and resuming now would relaunch into the same 429.
+            let mut pool_answer_wakes = false;
+            if is_pool_question {
+                pool_answer_wakes = self.apply_executor_pool_answer(&mut task, answer)?;
+            }
             task.review_unseen = false;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
             let expected_session = task.session.clone();
-            (task, tm, expected_session)
+            (
+                task,
+                tm,
+                expected_session,
+                !pool_answer_wakes && is_pool_question,
+            )
         };
 
         // Once every open question is answered, the human has unblocked the
@@ -2329,7 +2697,7 @@ impl Operations {
             .len();
         let mut resumed_session = None;
         let mut queued = false;
-        if task.status == TaskStatus::InProgress && remaining == 0 {
+        if task.status == TaskStatus::InProgress && remaining == 0 && !pool_wait_answer {
             match self.resume_answered_agent(&task.id, expected_session.as_deref()) {
                 Ok(Some(resumed)) => {
                     resumed_session = resumed.session.clone();

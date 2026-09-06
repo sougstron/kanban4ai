@@ -20,7 +20,9 @@ use super::app::{
     App, DetailFocus, HitAction, Screen, UiAction, load_log_tail, normalize_command_key,
 };
 use super::board;
-use super::dialogs::{AgentSlot, DialogField, Modal, ModalButton, ModalState, SelectOption};
+use super::dialogs::{
+    AgentSlot, DialogField, Modal, ModalButton, ModalState, SelectOption, SettingsTab,
+};
 use super::event::LoopOutcome;
 use super::theme::Theme;
 
@@ -1146,17 +1148,402 @@ fn project_settings_has_separate_role_agent_launchers() {
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open settings");
 
-    // Then all three launcher fields are present and flat role fields are not.
+    // Then every tab carries its own launcher and the flat role fields are
+    // gone: the primary launcher lives on Common, the role launchers on
+    // their own tabs.
     let modal = app.modal.as_ref().expect("settings");
-    for field in [
-        DialogField::AgentSettings,
-        DialogField::DesignerAgentSettings,
-        DialogField::ReviewerAgentSettings,
+    assert!(
+        modal.fields().contains(&DialogField::AgentSettings),
+        "missing AgentSettings on the Common tab"
+    );
+    for (tab, field) in [
+        (SettingsTab::Designer, DialogField::DesignerAgentSettings),
+        (SettingsTab::Reviewer, DialogField::ReviewerAgentSettings),
     ] {
+        let modal = app.modal.as_mut().expect("settings");
+        modal.set_settings_tab(tab);
+        let modal = app.modal.as_ref().expect("settings");
         assert!(modal.fields().contains(&field), "missing {field:?}");
+        assert!(
+            !modal.fields().contains(&DialogField::DesignerBackend),
+            "flat DesignerBackend must stay gone"
+        );
+        assert!(
+            !modal.fields().contains(&DialogField::ReviewerBackend),
+            "flat ReviewerBackend must stay gone"
+        );
     }
-    assert!(!modal.fields().contains(&DialogField::DesignerBackend));
-    assert!(!modal.fields().contains(&DialogField::ReviewerBackend));
+}
+
+/// Every settings tab shows exactly its own page; Save/Cancel render under
+/// all four because they persist the whole dialog.
+#[test]
+fn settings_tabs_split_fields_and_keep_buttons_on_every_tab() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    for (tab, contains, excludes) in [
+        (
+            SettingsTab::Common,
+            &[
+                DialogField::Title,
+                DialogField::AgentSettings,
+                DialogField::IsolationStatus,
+            ][..],
+            &[DialogField::DesignerEnabled, DialogField::ReviewerEnabled][..],
+        ),
+        (
+            SettingsTab::Designer,
+            &[
+                DialogField::DesignerEnabled,
+                DialogField::DesignerAgentSettings,
+            ][..],
+            &[DialogField::Title, DialogField::ReviewerEnabled][..],
+        ),
+        (
+            SettingsTab::Reviewer,
+            &[
+                DialogField::ReviewerEnabled,
+                DialogField::ReviewerOnChanges,
+                DialogField::ReviewerMaxRounds,
+            ][..],
+            &[DialogField::Title, DialogField::DesignerEnabled][..],
+        ),
+        (
+            SettingsTab::Executor,
+            &[
+                DialogField::ExecutorMiddle1,
+                DialogField::ExecutorCheap3,
+                DialogField::ExecutorWeekThreshold,
+                DialogField::ExecutorFiveHourThreshold,
+            ][..],
+            &[DialogField::Title, DialogField::ReviewerEnabled][..],
+        ),
+    ] {
+        app.modal.as_mut().expect("settings").set_settings_tab(tab);
+        let modal = app.modal.as_ref().expect("settings");
+        let fields = modal.fields();
+        for field in contains {
+            assert!(fields.contains(field), "{tab:?} must show {field:?}");
+        }
+        for field in excludes {
+            assert!(!fields.contains(field), "{tab:?} must hide {field:?}");
+        }
+        assert!(
+            fields.contains(&DialogField::Confirm) && fields.contains(&DialogField::Cancel),
+            "{tab:?} must offer Save/Cancel"
+        );
+    }
+}
+
+/// Left/Right walk the tab strip from plain fields (checkboxes, the
+/// isolation row) but never steal the arrows from a text caret or a
+/// filtered selector. Tab/BackTab keep cycling inside the active tab.
+#[test]
+fn settings_arrows_switch_tabs_unless_the_field_owns_them() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+
+    // From Title (text caret): arrows stay in the field.
+    app.handle_key(key(KeyCode::Right))
+        .expect("caret right in title");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Common
+    );
+
+    // From the QueueEnabled checkbox: Right lands on Designer.
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::QueueEnabled);
+    app.handle_key(key(KeyCode::Right)).expect("next tab");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Designer
+    );
+
+    // From IsolationStatus (Common): Right walks Common→Designer.
+    let modal = app.modal.as_mut().unwrap();
+    modal.set_settings_tab(SettingsTab::Common);
+    modal.focus_field(DialogField::IsolationStatus);
+    app.handle_key(key(KeyCode::Right)).expect("next tab again");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Designer
+    );
+
+    // MaxRunningPerBackend is a textarea: its arrows must not switch tabs.
+    let modal = app.modal.as_mut().unwrap();
+    modal.set_settings_tab(SettingsTab::Common);
+    modal.focus_field(DialogField::MaxRunningPerBackend);
+    app.handle_key(key(KeyCode::Left)).expect("caret left");
+    app.handle_key(key(KeyCode::Right)).expect("caret right");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Common
+    );
+}
+
+/// Tab navigation wraps around both ends of the strip, while Tab/BackTab
+/// never leave the visible page.
+#[test]
+fn settings_tab_arrows_wrap_and_tab_stays_in_page() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+
+    // Left from the first tab wraps to the last one.
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::QueueEnabled);
+    app.handle_key(key(KeyCode::Left)).expect("wrap left");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Executor
+    );
+    // Right from the last tab wraps back to the first. The Executor page
+    // opens on a slot selector that owns the arrows, so Confirm — which
+    // surrendered them to the tab strip — is the vantage point here.
+    let modal = app.modal.as_mut().unwrap();
+    modal.focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Right)).expect("wrap right");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Common
+    );
+
+    // Tab walks the Executor page to its own Cancel, then wraps within it.
+    let modal = app.modal.as_mut().unwrap();
+    modal.set_settings_tab(SettingsTab::Executor);
+    assert_eq!(modal.active_field(), DialogField::ExecutorMiddle1);
+    for _ in 0..(modal.fields().len() - 1) {
+        app.handle_key(key(KeyCode::Tab)).expect("next field");
+    }
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Cancel
+    );
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Executor
+    );
+    app.handle_key(key(KeyCode::Tab)).expect("wrap in page");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::ExecutorMiddle1
+    );
+}
+
+/// Tab labels are clickable, and a click on a field of the active tab still
+/// focuses that field.
+#[test]
+fn settings_tab_click_switches_tabs_and_field_click_focuses() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let _ = render_at(&mut app, 120, 32);
+    let tab_hit = modal_hitbox(&app, HitAction::ModalTab(SettingsTab::Executor));
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: tab_hit.x,
+        row: tab_hit.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("click Executor tab");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Executor
+    );
+
+    let _ = render_at(&mut app, 120, 32);
+    let field_hit = modal_hitbox(&app, HitAction::ModalField(DialogField::ExecutorMiddle1));
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: field_hit.x,
+        row: field_hit.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("click Middle 1st slot");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::ExecutorMiddle1
+    );
+}
+
+/// A validation error names a field that may live on a hidden tab: the
+/// dialog must surface that tab with the field focused.
+#[test]
+fn settings_validation_error_focuses_the_field_tab() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().expect("settings");
+        modal.max_running_total = TextArea::new(vec!["not-a-number".to_string()]);
+        modal.set_settings_tab(SettingsTab::Executor);
+        modal.field_index = modal.fields().len() - 2;
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("save rejected");
+    let modal = app.modal.as_ref().expect("stays open");
+    assert_eq!(modal.settings_tab, SettingsTab::Common);
+    assert_eq!(modal.active_field(), DialogField::MaxRunningTotal);
+    assert!(modal.error.is_some(), "{:?}", modal.error);
+}
+
+/// Edits made on different tabs all live in the one dialog state: they
+/// survive a tab round-trip and a single Save persists them together.
+#[test]
+fn settings_edits_survive_tab_round_trips_and_one_save_persists_all() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().expect("settings");
+        modal.set_settings_tab(SettingsTab::Designer);
+        modal.designer_enabled = true;
+    }
+    {
+        let modal = app.modal.as_mut().expect("settings");
+        modal.set_settings_tab(SettingsTab::Executor);
+        let sonnet = modal
+            .executor_slot_options
+            .iter()
+            .position(|option| option.value.as_deref() == Some("claude/sonnet"))
+            .expect("claude/sonnet option");
+        modal.executor_selected[3] = sonnet;
+        modal.executor_week_threshold = TextArea::new(vec!["9".to_string()]);
+    }
+
+    // A round-trip through Common and back must not drop either edit.
+    {
+        let modal = app.modal.as_mut().expect("settings");
+        modal.set_settings_tab(SettingsTab::Common);
+        modal.set_settings_tab(SettingsTab::Executor);
+    }
+    let modal = app.modal.as_ref().expect("settings");
+    assert!(modal.designer_enabled);
+    assert_eq!(modal.executor_week_threshold.lines(), ["9"]);
+
+    // Save from the Executor tab persists both tabs' edits.
+    let modal = app.modal.as_mut().expect("settings");
+    modal.field_index = modal.fields().len() - 2;
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+    assert!(app.modal.is_none(), "save should close the dialog");
+    let saved = app.ops.config.load_fresh().expect("reload");
+    let orch = crate::core::config::OrchestrationSettings::from_mapping(&saved.orchestration);
+    assert!(orch.designer.enabled);
+    assert_eq!(
+        orch.executors
+            .cheap
+            .first()
+            .and_then(|candidate| candidate.backend.as_deref()),
+        Some("claude")
+    );
+    assert_eq!(
+        orch.executors
+            .cheap
+            .first()
+            .and_then(|candidate| candidate.model.as_deref()),
+        Some("sonnet")
+    );
+    assert_eq!(orch.executors.thresholds.week_percent, 9.0);
+}
+
+/// The four tabs, rendered: the strip, the rule and each tab's page. The
+/// limits cache is pinned first so the Executor tab's quota annotations are
+/// identical on every machine.
+#[test]
+fn settings_tab_pages_render() {
+    let now = crate::core::limits::now_secs_for_tests();
+    let window = |label: &str, remaining: f64| crate::core::limits::LimitWindow {
+        label: label.to_string(),
+        remaining_percent: remaining,
+        resets_at: Some(now + 3_600),
+        rolling: false,
+    };
+    crate::core::limits::set_cached_snapshot_for_tests(crate::core::limits::LimitsSnapshot {
+        fetched_at: now,
+        providers: vec![
+            crate::core::limits::ProviderLimits {
+                provider: "claude".to_string(),
+                state: crate::core::limits::ProviderState::Ready,
+                windows: vec![window("5h", 66.0), window("7d", 95.0)],
+                observed_at: None,
+            },
+            crate::core::limits::ProviderLimits {
+                provider: "codex".to_string(),
+                state: crate::core::limits::ProviderState::Ready,
+                windows: vec![window("5h", 1.0), window("7d", 2.0)],
+                observed_at: None,
+            },
+        ],
+    });
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    insta::assert_snapshot!("settings_tab_common", render_at(&mut app, 80, 24));
+    let modal = app.modal.as_mut().unwrap();
+    modal.set_settings_tab(SettingsTab::Designer);
+    insta::assert_snapshot!("settings_tab_designer", render_at(&mut app, 80, 24));
+    let modal = app.modal.as_mut().unwrap();
+    modal.set_settings_tab(SettingsTab::Reviewer);
+    insta::assert_snapshot!("settings_tab_reviewer", render_at(&mut app, 80, 24));
+    let modal = app.modal.as_mut().unwrap();
+    modal.set_settings_tab(SettingsTab::Executor);
+    insta::assert_snapshot!("settings_tab_executor", render_at(&mut app, 80, 24));
+}
+
+/// Slot options carry the live provider numbers from the cached limits
+/// snapshot, with an `(out of quota)` mark where the gate rejects a pair.
+#[test]
+fn settings_executor_tab_annotates_slots_with_live_quota() {
+    let now = crate::core::limits::now_secs_for_tests();
+    let window = |label: &str, remaining: f64| crate::core::limits::LimitWindow {
+        label: label.to_string(),
+        remaining_percent: remaining,
+        resets_at: Some(now + 3_600),
+        rolling: false,
+    };
+    crate::core::limits::set_cached_snapshot_for_tests(crate::core::limits::LimitsSnapshot {
+        fetched_at: now,
+        providers: vec![
+            crate::core::limits::ProviderLimits {
+                provider: "claude".to_string(),
+                state: crate::core::limits::ProviderState::Ready,
+                windows: vec![window("5h", 66.0), window("7d", 95.0)],
+                observed_at: None,
+            },
+            crate::core::limits::ProviderLimits {
+                provider: "codex".to_string(),
+                state: crate::core::limits::ProviderState::Ready,
+                windows: vec![window("5h", 1.0), window("7d", 2.0)],
+                observed_at: None,
+            },
+        ],
+    });
+
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let modal = app.modal.as_mut().expect("settings");
+    modal.set_settings_tab(SettingsTab::Executor);
+    // Only the first slot's first options fit the frame; filter it down to
+    // the claude pairs so their annotations are on screen.
+    app.handle_key(key(KeyCode::Char('c'))).expect("filter");
+    app.handle_key(key(KeyCode::Char('l'))).expect("filter");
+    app.handle_key(key(KeyCode::Char('a'))).expect("filter");
+    let rendered = render_at(&mut app, 120, 40);
+    assert!(
+        rendered.contains("claude/sonnet  5h 66%  7d 95%"),
+        "{rendered}"
+    );
+    let modal = app.modal.as_mut().expect("settings");
+    modal.executor_filters[0].clear();
+    let rendered = render_at(&mut app, 120, 40);
+    assert!(rendered.contains("(out of quota)"), "{rendered}");
 }
 
 #[test]
@@ -1453,11 +1840,11 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     app.handle_key(ctrl_key(KeyCode::Char('s')))
         .expect("stage agent settings");
     app.handle_key(key(KeyCode::Tab)).expect("theme");
-    app.handle_key(key(KeyCode::Left)).expect("dark theme");
+    app.handle_key(key(KeyCode::Up)).expect("dark theme");
     app.handle_key(key(KeyCode::Tab)).expect("task sorting");
-    app.handle_key(key(KeyCode::Right))
+    app.handle_key(key(KeyCode::Down))
         .expect("task number down");
-    app.handle_key(key(KeyCode::Right))
+    app.handle_key(key(KeyCode::Down))
         .expect("updated ascending sorting");
     let save_field = app.modal.as_ref().unwrap().fields().len() - 2;
     app.modal.as_mut().unwrap().field_index = save_field;

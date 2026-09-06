@@ -356,6 +356,46 @@ With either off it schedules nothing and the task simply stays crashed and
 recoverable: promising a retry the dispatcher can never honour would leave the
 card wearing a `↻ retry` badge forever.
 
+
+## Executor Pools (pre-flight, limit-aware)
+
+`orchestration.roles` fail over **after** a run dies on a provider limit; the
+executor pools (`orchestration.executors`, documented in `docs/config.md`)
+check **before** launching. When the dispatcher claims a queued task — inside
+the claim's locked read-modify-write, so a concurrent pump can never pick a
+different candidate — and also on direct executor launches (`r` Run with the
+queue off, `F` run-now, chained starts), `Operations::apply_executor_pool`
+walks the task's pool in priority order:
+
+1. The first candidate whose provider passes the quota gate (cached snapshot
+   only — see `docs/limits.md`) is materialized onto the task exactly like
+   `advance_role_roster` does: `agent_backend` / `ai_model` / `ai_effort` /
+   `agent_name` plus `role_profile` / `roster_index`, so the census, the caps,
+   stats and the detail view all describe what will really run. A task with
+   default launch settings resolves through the **cheap** pool; `role_profile:
+   middle` opts into the **middle** ("smart") pool. An explicit per-task
+   assignment always wins.
+2. Every candidate blocked → the task **parks**: `restart_at` = earliest
+   blocking reset + `ask_grace_secs`, phase `queued`, no session — this is not
+   a crash, so `crash_restarts` is untouched and no crash notification fires.
+   The thread gets `⏸ every executor candidate is out of quota — retrying at
+   HH:MM (…)`, and the board posts **one** question (`source =
+   kanban:executor-pool`) whose variants are the other configured providers
+   that currently pass the gate, plus `Wait for the quota window`. The
+   question is not re-posted while it stays unanswered.
+3. **Whoever comes first wins.** An answer naming a variant materializes that
+   candidate and clears `restart_at`, so the dispatcher starts it immediately
+   (`Wait…` just leaves the park alone). The deadline instead re-queues the
+   task via `due_restarts()`; the next pool walk either finds headroom — and
+   withdraws the question as answered (`↻ quota window rolled over — question
+   withdrawn`) so nothing dangles on the board — or parks again with a fresh
+   wake time.
+
+The post-mortem ladder stays as the safety net: a run that dies on a 429 the
+pre-flight gate could not predict still fails over through
+`advance_role_roster`, which reads the pool when the task's `role_profile`
+names one.
+
 ## Task Chaining
 A task may carry a `chained_to` target task id. When the **target** task enters Review — via `move` or an agent's `done` — every task whose `chained_to` equals that id and is still in **To Do** is auto-run with a fresh per-task session (its own backend/model/persona/description). Only the To-Do→Review transition fires it (re-entering Review does not). Gated by the `auto_launch_chained` rule and `auto_launch.enabled`.
 

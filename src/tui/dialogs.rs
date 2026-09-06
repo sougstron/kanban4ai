@@ -134,6 +134,14 @@ pub enum DialogField {
     ReviewerAgent,
     ReviewerOnChanges,
     ReviewerMaxRounds,
+    ExecutorMiddle1,
+    ExecutorMiddle2,
+    ExecutorMiddle3,
+    ExecutorCheap1,
+    ExecutorCheap2,
+    ExecutorCheap3,
+    ExecutorWeekThreshold,
+    ExecutorFiveHourThreshold,
     IsolationStatus,
     Confirm,
     Cancel,
@@ -150,7 +158,64 @@ const TASK_FORM_FIELDS: [DialogField; 7] = [
     DialogField::UseReviewer,
 ];
 
-const SETTINGS_FORM_FIELDS: [DialogField; 21] = [
+/// Which page of the project settings dialog is showing. One [`ModalState`]
+/// holds every tab's field state, so switching tabs never loses an edit —
+/// Save writes the whole dialog, not just the visible tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    Common,
+    Designer,
+    Reviewer,
+    Executor,
+}
+
+impl SettingsTab {
+    pub const ALL: [SettingsTab; 4] = [
+        SettingsTab::Common,
+        SettingsTab::Designer,
+        SettingsTab::Reviewer,
+        SettingsTab::Executor,
+    ];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SettingsTab::Common => "Common",
+            SettingsTab::Designer => "Designer",
+            SettingsTab::Reviewer => "Reviewer",
+            SettingsTab::Executor => "Executor",
+        }
+    }
+
+    /// Degrades with dialog width (see `render_settings_form`).
+    fn short_label(self) -> &'static str {
+        match self {
+            SettingsTab::Common => "Com",
+            SettingsTab::Designer => "Des",
+            SettingsTab::Reviewer => "Rev",
+            SettingsTab::Executor => "Exe",
+        }
+    }
+
+    /// Arrow keys walk the tabs and wrap around.
+    pub fn next(self) -> Self {
+        let index = self.index();
+        Self::ALL[(index + 1) % Self::ALL.len()]
+    }
+
+    pub fn prev(self) -> Self {
+        let index = self.index();
+        let len = Self::ALL.len();
+        Self::ALL[(index + len - 1) % len]
+    }
+}
+
+/// One settings tab's field page, Save/Cancel inclusive: the buttons render
+/// under every tab and save the whole dialog, not just the visible one.
+const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 17] = [
     DialogField::Title,
     DialogField::AgentSettings,
     DialogField::Theme,
@@ -165,14 +230,94 @@ const SETTINGS_FORM_FIELDS: [DialogField; 21] = [
     DialogField::MaxRunningPerBackendModel,
     DialogField::AutoRestartEnabled,
     DialogField::AutoRestartDelays,
+    DialogField::IsolationStatus,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
+const SETTINGS_PAGE_DESIGNER_FIELDS: [DialogField; 4] = [
     DialogField::DesignerEnabled,
     DialogField::DesignerAgentSettings,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
+const SETTINGS_PAGE_REVIEWER_FIELDS: [DialogField; 6] = [
     DialogField::ReviewerEnabled,
     DialogField::ReviewerAgentSettings,
     DialogField::ReviewerOnChanges,
     DialogField::ReviewerMaxRounds,
-    DialogField::IsolationStatus,
+    DialogField::Confirm,
+    DialogField::Cancel,
 ];
+
+const SETTINGS_PAGE_EXECUTOR_FIELDS: [DialogField; 10] = [
+    DialogField::ExecutorMiddle1,
+    DialogField::ExecutorMiddle2,
+    DialogField::ExecutorMiddle3,
+    DialogField::ExecutorCheap1,
+    DialogField::ExecutorCheap2,
+    DialogField::ExecutorCheap3,
+    DialogField::ExecutorWeekThreshold,
+    DialogField::ExecutorFiveHourThreshold,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
+/// The whole field page of one settings tab, buttons included.
+pub(crate) fn settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
+    match tab {
+        SettingsTab::Common => &SETTINGS_PAGE_COMMON_FIELDS,
+        SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS,
+        SettingsTab::Reviewer => &SETTINGS_PAGE_REVIEWER_FIELDS,
+        SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS,
+    }
+}
+
+/// The fields visible on one settings tab (Save/Cancel excluded — they sit
+/// under every tab).
+pub(crate) fn settings_fields(tab: SettingsTab) -> &'static [DialogField] {
+    let page = settings_page_fields(tab);
+    &page[..page.len() - 2]
+}
+
+/// The tab a settings field lives on — the inverse of [`settings_fields`].
+/// A validation error focuses its own tab through this map.
+pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
+    match field {
+        DialogField::Title
+        | DialogField::AgentSettings
+        | DialogField::Theme
+        | DialogField::TaskSort
+        | DialogField::HideKanbanMessages
+        | DialogField::QueueEnabled
+        | DialogField::MaxRunningTotal
+        | DialogField::MaxRunningDesigner
+        | DialogField::MaxRunningReviewer
+        | DialogField::MaxRunningExecutor
+        | DialogField::MaxRunningPerBackend
+        | DialogField::MaxRunningPerBackendModel
+        | DialogField::AutoRestartEnabled
+        | DialogField::AutoRestartDelays
+        | DialogField::IsolationStatus => Some(SettingsTab::Common),
+        DialogField::DesignerEnabled | DialogField::DesignerAgentSettings => {
+            Some(SettingsTab::Designer)
+        }
+        DialogField::ReviewerEnabled
+        | DialogField::ReviewerAgentSettings
+        | DialogField::ReviewerOnChanges
+        | DialogField::ReviewerMaxRounds => Some(SettingsTab::Reviewer),
+        DialogField::ExecutorMiddle1
+        | DialogField::ExecutorMiddle2
+        | DialogField::ExecutorMiddle3
+        | DialogField::ExecutorCheap1
+        | DialogField::ExecutorCheap2
+        | DialogField::ExecutorCheap3
+        | DialogField::ExecutorWeekThreshold
+        | DialogField::ExecutorFiveHourThreshold => Some(SettingsTab::Executor),
+        _ => None,
+    }
+}
 
 const PRIMARY_AGENT_FIELDS: [DialogField; 6] = [
     DialogField::Backend,
@@ -279,6 +424,7 @@ impl AgentPicker {
 }
 
 pub struct ModalState {
+    pub settings_tab: SettingsTab,
     pub modal: Modal,
     pub field_index: usize,
     pub title: TextArea<'static>,
@@ -357,6 +503,16 @@ pub struct ModalState {
     pub(crate) reviewer: AgentPicker,
     pub reviewer_on_changes: TextArea<'static>,
     pub reviewer_on_changes_options: Vec<SelectOption>,
+    /// Executor-pool slot selectors share one backend/model option list;
+    /// each slot keeps its own selection and filter text. Index order is
+    /// priority: 0-2 middle ("smart"), 3-5 cheap.
+    pub executor_slot_options: Vec<SelectOption>,
+    pub executor_selected: [usize; 6],
+    pub executor_filters: [String; 6],
+    /// Remaining-percent floors a provider must clear before a pool
+    /// candidate is considered usable.
+    pub executor_week_threshold: TextArea<'static>,
+    pub executor_five_hour_threshold: TextArea<'static>,
     pub reviewer_on_changes_selected: usize,
     pub reviewer_max_rounds: TextArea<'static>,
     /// Availability probe for the current project, taken once when the
@@ -370,6 +526,7 @@ impl ModalState {
         let wraps_description = matches!(&modal, Modal::NewTask { .. } | Modal::EditTask { .. });
         Self {
             modal,
+            settings_tab: SettingsTab::Common,
             field_index: 0,
             title: one_line(""),
             description: if wraps_description {
@@ -432,6 +589,11 @@ impl ModalState {
             max_running_designer: one_line("1"),
             max_running_reviewer: one_line("1"),
             max_running_executor: one_line("3"),
+            executor_slot_options: Vec::new(),
+            executor_selected: [0; 6],
+            executor_filters: Default::default(),
+            executor_week_threshold: one_line("5"),
+            executor_five_hour_threshold: one_line("15"),
             max_running_per_backend: TextArea::default(),
             max_running_per_backend_model: TextArea::default(),
             auto_restart_enabled: true,
@@ -508,31 +670,7 @@ impl ModalState {
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
-            Modal::Settings => &[
-                DialogField::Title,
-                DialogField::AgentSettings,
-                DialogField::Theme,
-                DialogField::TaskSort,
-                DialogField::HideKanbanMessages,
-                DialogField::QueueEnabled,
-                DialogField::MaxRunningTotal,
-                DialogField::MaxRunningDesigner,
-                DialogField::MaxRunningReviewer,
-                DialogField::MaxRunningExecutor,
-                DialogField::MaxRunningPerBackend,
-                DialogField::MaxRunningPerBackendModel,
-                DialogField::AutoRestartEnabled,
-                DialogField::AutoRestartDelays,
-                DialogField::DesignerEnabled,
-                DialogField::DesignerAgentSettings,
-                DialogField::ReviewerEnabled,
-                DialogField::ReviewerAgentSettings,
-                DialogField::ReviewerOnChanges,
-                DialogField::ReviewerMaxRounds,
-                DialogField::IsolationStatus,
-                DialogField::Confirm,
-                DialogField::Cancel,
-            ],
+            Modal::Settings => settings_page_fields(self.settings_tab),
             Modal::GlobalSettings => &[
                 DialogField::EscapeToProjects,
                 DialogField::ProjectSort,
@@ -883,6 +1021,13 @@ impl ModalState {
     }
 
     pub fn focus_field(&mut self, field: DialogField) {
+        // A validation error may name a field on a hidden tab; surface its
+        // tab first so the focus below can actually land on it.
+        if matches!(self.modal, Modal::Settings)
+            && let Some(tab) = tab_for_field(field)
+        {
+            self.set_settings_tab(tab);
+        }
         if let Some(index) = self
             .fields()
             .iter()
@@ -890,6 +1035,27 @@ impl ModalState {
         {
             self.set_field_index(index);
         }
+    }
+
+    /// Show another settings tab. Field values are never touched — one
+    /// [`ModalState`] holds every tab's state and Save writes them all.
+    pub fn set_settings_tab(&mut self, tab: SettingsTab) {
+        if !matches!(self.modal, Modal::Settings) || tab == self.settings_tab {
+            return;
+        }
+        // Leaving a selector drops its filter, exactly as leaving the field
+        // would; the filter must never outlive its visit.
+        let leaving = self.active_field();
+        if let Some(filter) = self.field_filter_mut(leaving) {
+            filter.clear();
+        }
+        if self.filter_error == Some(leaving) {
+            self.filter_error = None;
+        }
+        self.settings_tab = tab;
+        self.field_index = 0;
+        self.form_scroll = 0;
+        self.ensure_active_field_visible();
     }
 
     pub fn capture_initial_values(&mut self) {
@@ -933,6 +1099,14 @@ impl ModalState {
             DialogField::DesignerModel => Some(self.designer.model_filter.as_str()),
             DialogField::ReviewerBackend => Some(self.reviewer.backend_filter.as_str()),
             DialogField::ReviewerModel => Some(self.reviewer.model_filter.as_str()),
+            DialogField::ExecutorMiddle1
+            | DialogField::ExecutorMiddle2
+            | DialogField::ExecutorMiddle3
+            | DialogField::ExecutorCheap1
+            | DialogField::ExecutorCheap2
+            | DialogField::ExecutorCheap3 => {
+                Some(self.executor_filters[executor_slot_index(field)].as_str())
+            }
             _ => None,
         }
     }
@@ -946,6 +1120,14 @@ impl ModalState {
             DialogField::DesignerModel => Some(&mut self.designer.model_filter),
             DialogField::ReviewerBackend => Some(&mut self.reviewer.backend_filter),
             DialogField::ReviewerModel => Some(&mut self.reviewer.model_filter),
+            DialogField::ExecutorMiddle1
+            | DialogField::ExecutorMiddle2
+            | DialogField::ExecutorMiddle3
+            | DialogField::ExecutorCheap1
+            | DialogField::ExecutorCheap2
+            | DialogField::ExecutorCheap3 => {
+                Some(&mut self.executor_filters[executor_slot_index(field)])
+            }
             _ => None,
         }
     }
@@ -970,6 +1152,12 @@ impl ModalState {
             DialogField::ReviewerEffort => &self.reviewer.effort_options,
             DialogField::ReviewerAgent => &self.reviewer.agent_options,
             DialogField::ReviewerOnChanges => &self.reviewer_on_changes_options,
+            DialogField::ExecutorMiddle1
+            | DialogField::ExecutorMiddle2
+            | DialogField::ExecutorMiddle3
+            | DialogField::ExecutorCheap1
+            | DialogField::ExecutorCheap2
+            | DialogField::ExecutorCheap3 => &self.executor_slot_options,
             _ => &[],
         }
     }
@@ -1034,7 +1222,8 @@ impl ModalState {
 
     pub fn input(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         let before = self.editable_signature();
-        match self.active_field() {
+        let field = self.active_field();
+        match field {
             DialogField::Title => input_single_line(&mut self.title, key),
             DialogField::Description => {
                 if !super::app::apply_word_edit(&mut self.description, key) {
@@ -1112,6 +1301,20 @@ impl ModalState {
                 self.input_select(key, SelectorKind::ReviewerOnChanges)
             }
             DialogField::ReviewerMaxRounds => input_single_line(&mut self.reviewer_max_rounds, key),
+            DialogField::ExecutorMiddle1
+            | DialogField::ExecutorMiddle2
+            | DialogField::ExecutorMiddle3
+            | DialogField::ExecutorCheap1
+            | DialogField::ExecutorCheap2
+            | DialogField::ExecutorCheap3 => {
+                self.input_select(key, SelectorKind::ExecutorSlot(executor_slot_index(field)));
+            }
+            DialogField::ExecutorWeekThreshold => {
+                input_single_line(&mut self.executor_week_threshold, key)
+            }
+            DialogField::ExecutorFiveHourThreshold => {
+                input_single_line(&mut self.executor_five_hour_threshold, key)
+            }
             DialogField::IsolationStatus => {}
             DialogField::Confirm | DialogField::Cancel => {}
         }
@@ -1166,6 +1369,14 @@ impl ModalState {
             DialogField::ReviewerMaxRounds => {
                 self.reviewer_max_rounds.insert_str(text.replace('\n', " "));
             }
+            DialogField::ExecutorWeekThreshold => {
+                self.executor_week_threshold
+                    .insert_str(text.replace('\n', " "));
+            }
+            DialogField::ExecutorFiveHourThreshold => {
+                self.executor_five_hour_threshold
+                    .insert_str(text.replace('\n', " "));
+            }
             _ => return false,
         }
         if self.editable_signature() != before {
@@ -1216,7 +1427,15 @@ impl ModalState {
             DialogField::ReviewerAgent => &mut self.reviewer.agent,
             DialogField::ReviewerOnChanges => &mut self.reviewer_on_changes,
             DialogField::ReviewerMaxRounds => &mut self.reviewer_max_rounds,
-            DialogField::Confirm
+            DialogField::ExecutorWeekThreshold => &mut self.executor_week_threshold,
+            DialogField::ExecutorFiveHourThreshold => &mut self.executor_five_hour_threshold,
+            DialogField::ExecutorMiddle1
+            | DialogField::ExecutorMiddle2
+            | DialogField::ExecutorMiddle3
+            | DialogField::ExecutorCheap1
+            | DialogField::ExecutorCheap2
+            | DialogField::ExecutorCheap3
+            | DialogField::Confirm
             | DialogField::Cancel
             | DialogField::PurgeData
             | DialogField::QueueEnabled
@@ -1380,6 +1599,31 @@ impl ModalState {
 
     pub fn reviewer_on_changes_text(&self) -> Option<String> {
         non_empty(textarea_text(&self.reviewer_on_changes))
+    }
+
+    /// The `<backend>/<model>` a pool slot currently points at, or `None`
+    /// for the leading `— none —` option.
+    pub fn executor_slot_value(&self, index: usize) -> Option<String> {
+        let selected = self.executor_selected.get(index).copied().unwrap_or(0);
+        self.executor_slot_options
+            .get(selected)
+            .and_then(|option| option.value.clone())
+    }
+
+    pub fn set_executor_slot_options(&mut self, options: Vec<SelectOption>) {
+        let len = options.len();
+        self.executor_slot_options = options;
+        for selected in &mut self.executor_selected {
+            *selected = (*selected).min(len.saturating_sub(1));
+        }
+    }
+
+    pub fn executor_week_threshold_text(&self) -> Option<String> {
+        non_empty(textarea_text(&self.executor_week_threshold))
+    }
+
+    pub fn executor_five_hour_threshold_text(&self) -> Option<String> {
+        non_empty(textarea_text(&self.executor_five_hour_threshold))
     }
 
     fn maybe_prefix_backend_model_cap(&mut self, key: &ratatui::crossterm::event::KeyEvent) {
@@ -1565,6 +1809,7 @@ impl ModalState {
             SelectorKind::TaskSort => self.task_sort_options.len(),
             SelectorKind::ProjectSort => self.project_sort_options.len(),
             SelectorKind::ReviewerOnChanges => self.reviewer_on_changes_options.len(),
+            SelectorKind::ExecutorSlot(_) => self.executor_slot_options.len(),
         }
     }
 
@@ -1599,6 +1844,7 @@ impl ModalState {
             SelectorKind::TaskSort => &mut self.task_sort_selected,
             SelectorKind::ProjectSort => &mut self.project_sort_selected,
             SelectorKind::ReviewerOnChanges => &mut self.reviewer_on_changes_selected,
+            SelectorKind::ExecutorSlot(index) => &mut self.executor_selected[index],
         }
     }
 
@@ -1632,6 +1878,7 @@ impl ModalState {
             SelectorKind::TaskSort => self.task_sort_selected,
             SelectorKind::ProjectSort => self.project_sort_selected,
             SelectorKind::ReviewerOnChanges => self.reviewer_on_changes_selected,
+            SelectorKind::ExecutorSlot(index) => self.executor_selected[index],
         }
     }
 
@@ -1722,6 +1969,8 @@ impl ModalState {
                 );
                 self.reviewer_on_changes = one_line(text.as_deref().unwrap_or("in_progress"));
             }
+            // The slot selection is the value; nothing to sync.
+            SelectorKind::ExecutorSlot(_) => {}
         }
     }
 
@@ -1753,7 +2002,7 @@ impl ModalState {
         }
         let fields = match self.modal {
             Modal::NewTask { .. } | Modal::EditTask { .. } => Some(&TASK_FORM_FIELDS[..]),
-            Modal::Settings => Some(&SETTINGS_FORM_FIELDS[..]),
+            Modal::Settings => Some(settings_page_fields(self.settings_tab)),
             Modal::GlobalSettings => Some(&GLOBAL_SETTINGS_FORM_FIELDS[..]),
             _ => None,
         };
@@ -1826,8 +2075,30 @@ impl ModalState {
             raw_textarea_text(&self.reviewer_on_changes),
             self.reviewer_on_changes_selected.to_string(),
             raw_textarea_text(&self.reviewer_max_rounds),
+            self.executor_selected
+                .iter()
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join("\u{1f}"),
+            self.executor_filters.join("\u{1f}"),
+            raw_textarea_text(&self.executor_week_threshold),
+            raw_textarea_text(&self.executor_five_hour_threshold),
         ]
         .join("\u{1f}")
+    }
+}
+
+/// Which executor-pool slot (0-5) a settings field edits. 0-2 are the
+/// middle "smart" pool, 3-5 the cheap working pool; index order is priority.
+pub(crate) fn executor_slot_index(field: DialogField) -> usize {
+    match field {
+        DialogField::ExecutorMiddle1 => 0,
+        DialogField::ExecutorMiddle2 => 1,
+        DialogField::ExecutorMiddle3 => 2,
+        DialogField::ExecutorCheap1 => 3,
+        DialogField::ExecutorCheap2 => 4,
+        DialogField::ExecutorCheap3 => 5,
+        _ => 0,
     }
 }
 
@@ -1854,6 +2125,7 @@ enum SelectorKind {
     TaskSort,
     ProjectSort,
     ReviewerOnChanges,
+    ExecutorSlot(usize),
 }
 
 fn selector_kind(field: DialogField) -> Option<SelectorKind> {
@@ -1871,6 +2143,15 @@ fn selector_kind(field: DialogField) -> Option<SelectorKind> {
             Some(SelectorKind::Agent)
         }
         DialogField::ChainTo => Some(SelectorKind::ChainTo),
+        DialogField::ReviewerOnChanges => Some(SelectorKind::ReviewerOnChanges),
+        DialogField::ExecutorMiddle1
+        | DialogField::ExecutorMiddle2
+        | DialogField::ExecutorMiddle3
+        | DialogField::ExecutorCheap1
+        | DialogField::ExecutorCheap2
+        | DialogField::ExecutorCheap3 => {
+            Some(SelectorKind::ExecutorSlot(executor_slot_index(field)))
+        }
         DialogField::TargetStatus => Some(SelectorKind::TargetStatus),
         DialogField::MessageKind => Some(SelectorKind::MessageKind),
         DialogField::Question => Some(SelectorKind::Question),
@@ -1878,7 +2159,6 @@ fn selector_kind(field: DialogField) -> Option<SelectorKind> {
         DialogField::Theme => Some(SelectorKind::Theme),
         DialogField::TaskSort => Some(SelectorKind::TaskSort),
         DialogField::ProjectSort => Some(SelectorKind::ProjectSort),
-        DialogField::ReviewerOnChanges => Some(SelectorKind::ReviewerOnChanges),
         _ => None,
     }
 }
@@ -2099,7 +2379,140 @@ fn render_settings_form(
     area: Rect,
     hitboxes: &mut Vec<Hitbox>,
 ) {
-    render_selector_form(frame, app, modal, area, hitboxes, &SETTINGS_FORM_FIELDS);
+    let tab = modal.settings_tab;
+    let tab_strip_height = 2u16;
+    // The Executor tab opens with the resolved order the board would run
+    // right now, so the priority slots read as live data, not labels.
+    let status_line = match tab {
+        SettingsTab::Executor => app.executor_pool_status_line(),
+        _ => String::new(),
+    };
+    let strip_height = if status_line.is_empty() {
+        tab_strip_height
+    } else {
+        tab_strip_height + 1
+    };
+    let form_area = if area.height > strip_height {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(strip_height), Constraint::Min(0)])
+            .split(area);
+        render_settings_tab_strip(frame, app, modal, rows[0], hitboxes);
+        if !status_line.is_empty() {
+            frame.render_widget(
+                Paragraph::new(sanitize_terminal_text(&status_line))
+                    .style(Style::default().fg(app.theme.muted)),
+                Rect {
+                    y: rows[0].y.saturating_add(tab_strip_height),
+                    height: 1,
+                    ..rows[0]
+                },
+            );
+        }
+        rows[1]
+    } else {
+        area
+    };
+    render_selector_form(frame, app, modal, form_area, hitboxes, settings_fields(tab));
+}
+
+/// The ` Common │ Designer │ Reviewer │ Executor ` header. Labels degrade to
+/// short forms and then to the active label alone so a narrow terminal never
+/// overflows. Each label registers a [`HitAction::ModalTab`] hitbox over
+/// exactly its own cells.
+fn render_settings_tab_strip(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &ModalState,
+    area: Rect,
+    hitboxes: &mut Vec<Hitbox>,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let active = modal.settings_tab;
+    let fit = |short: bool| -> Option<u16> {
+        let width: usize = SettingsTab::ALL
+            .iter()
+            .map(|tab| {
+                let label = if short {
+                    tab.short_label()
+                } else {
+                    tab.label()
+                };
+                label.chars().count() + 2 // one leading and trailing space
+            })
+            .sum::<usize>()
+            + SettingsTab::ALL.len()
+            - 1; // dividers between labels
+        u16::try_from(width)
+            .ok()
+            .filter(|width| *width <= area.width)
+    };
+    let (short, show_all) = match (fit(false), fit(true)) {
+        (Some(_), _) => (false, true),
+        (None, Some(_)) => (true, true),
+        (None, None) => (true, false),
+    };
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut x = area.x;
+    let mut widths: Vec<(SettingsTab, u16)> = Vec::new();
+    for (index, tab) in SettingsTab::ALL.into_iter().enumerate() {
+        let label = if short {
+            tab.short_label()
+        } else {
+            tab.label()
+        };
+        if show_all && index > 0 {
+            spans.push(Span::raw("│".to_string()));
+            x = x.saturating_add(1);
+        }
+        if !show_all && tab != active {
+            continue;
+        }
+        let highlighted = tab == active || app.is_hovered(HitAction::ModalTab(tab));
+        let style = if highlighted {
+            Style::default()
+                .fg(app.theme.focus)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(app.theme.muted)
+        };
+        let cell = format!(" {label} ");
+        let cell_width = cell.chars().count() as u16;
+        widths.push((tab, cell_width));
+        spans.push(Span::styled(cell, style));
+        x = x.saturating_add(cell_width);
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect { height: 1, ..area },
+    );
+    let mut cell_x = area.x;
+    for (tab, width) in widths {
+        hitboxes.push(Hitbox {
+            area: Rect {
+                x: cell_x,
+                y: area.y,
+                width,
+                height: 1,
+            },
+            action: HitAction::ModalTab(tab),
+        });
+        cell_x = cell_x.saturating_add(width + 1); // + divider
+    }
+    // The rule under the labels is what makes the strip read as tabs.
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(app.theme.border)),
+        Rect {
+            y: area.y.saturating_add(1),
+            height: 1,
+            ..area
+        },
+    );
 }
 
 fn render_global_settings_form(
@@ -2484,6 +2897,8 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::MaxRunningExecutor
         | DialogField::AutoRestartDelays
         | DialogField::ReviewerMaxRounds
+        | DialogField::ExecutorWeekThreshold
+        | DialogField::ExecutorFiveHourThreshold
         | DialogField::IsolationStatus => 3,
         DialogField::Description
         | DialogField::MaxRunningPerBackend
@@ -2496,7 +2911,13 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::DesignerBackend
         | DialogField::DesignerModel
         | DialogField::ReviewerBackend
-        | DialogField::ReviewerModel => 5,
+        | DialogField::ReviewerModel
+        | DialogField::ExecutorMiddle1
+        | DialogField::ExecutorMiddle2
+        | DialogField::ExecutorMiddle3
+        | DialogField::ExecutorCheap1
+        | DialogField::ExecutorCheap2
+        | DialogField::ExecutorCheap3 => 5,
         _ => 4,
     }
 }
@@ -2528,7 +2949,12 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         DialogField::DesignerModel => modal.designer.model_options.len(),
         DialogField::DesignerEffort => modal.designer.effort_options.len(),
         DialogField::DesignerAgent => modal.designer.agent_options.len(),
-        DialogField::ReviewerBackend => modal.reviewer.backend_options.len(),
+        DialogField::ExecutorMiddle1
+        | DialogField::ExecutorMiddle2
+        | DialogField::ExecutorMiddle3
+        | DialogField::ExecutorCheap1
+        | DialogField::ExecutorCheap2
+        | DialogField::ExecutorCheap3 => modal.executor_slot_options.len(),
         DialogField::ReviewerModel => modal.reviewer.model_options.len(),
         DialogField::ReviewerEffort => modal.reviewer.effort_options.len(),
         DialogField::ReviewerAgent => modal.reviewer.agent_options.len(),
@@ -3118,6 +3544,45 @@ fn render_selector_field(
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::IsolationStatus => render_isolation_status(frame, app, modal, area),
+        DialogField::ExecutorMiddle1
+        | DialogField::ExecutorMiddle2
+        | DialogField::ExecutorMiddle3
+        | DialogField::ExecutorCheap1
+        | DialogField::ExecutorCheap2
+        | DialogField::ExecutorCheap3 => {
+            let slot = executor_slot_index(field);
+            let pool = if slot < 3 { "Middle" } else { "Cheap" };
+            let position = (slot % 3) + 1;
+            let filter = &modal.executor_filters[slot];
+            let selected = modal.executor_selected[slot];
+            render_select_filtered(
+                frame,
+                app,
+                &format!("Executor · {pool} {position}"),
+                &modal.executor_slot_options,
+                selected,
+                area,
+                modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+                Some(filter),
+                modal.filter_error == Some(field),
+            );
+        }
+        DialogField::ExecutorWeekThreshold => render_textarea(
+            frame,
+            app,
+            &modal.executor_week_threshold,
+            area,
+            "Executor · Week quota floor % (out of quota below)",
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::ExecutorFiveHourThreshold => render_textarea(
+            frame,
+            app,
+            &modal.executor_five_hour_threshold,
+            area,
+            "Executor · 5h quota floor % (out of quota below)",
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
         _ => {}
     }
 }
@@ -3253,6 +3718,15 @@ fn register_task_options(
         DialogField::ReviewerOnChanges => (
             modal.reviewer_on_changes_options.len(),
             modal.reviewer_on_changes_selected,
+        ),
+        DialogField::ExecutorMiddle1
+        | DialogField::ExecutorMiddle2
+        | DialogField::ExecutorMiddle3
+        | DialogField::ExecutorCheap1
+        | DialogField::ExecutorCheap2
+        | DialogField::ExecutorCheap3 => (
+            modal.executor_slot_options.len(),
+            modal.executor_selected[executor_slot_index(field)],
         ),
         _ => (0, 0),
     };

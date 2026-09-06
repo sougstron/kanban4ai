@@ -96,6 +96,21 @@ pub fn tick(
         store.list()?
     };
 
+    // Keep the shared limits cache warm while the TUI is closed: the
+    // executor-pool gate reads the cached snapshot only (never a blocking
+    // fetch), so without this a daemon-only board's numbers would go stale.
+    // Never fails the tick — the gate treats an unreadable cache as usable.
+    let limits_ttl = projects
+        .first()
+        .map(|project| {
+            Operations::for_project(project)
+                .config
+                .get_threshold("limits_refresh_interval")
+        })
+        .unwrap_or_else(|| Ok(crate::core::limits::DEFAULT_REFRESH_INTERVAL))
+        .unwrap_or(crate::core::limits::DEFAULT_REFRESH_INTERVAL);
+    crate::core::limits::refresh_if_stale(limits_ttl);
+
     for project in projects {
         match pump_project(&project, warned_once) {
             Ok(mut extra) => lines.append(&mut extra),
