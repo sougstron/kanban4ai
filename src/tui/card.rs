@@ -1,6 +1,6 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -10,6 +10,7 @@ use crate::core::session::SessionState;
 use crate::core::telemetry::SessionProgress;
 
 use super::app::App;
+use super::theme::Theme;
 
 pub fn render_card(
     frame: &mut Frame<'_>,
@@ -92,12 +93,30 @@ pub fn render_card(
             .collect::<Vec<_>>();
         lines.push(Line::from(badge_spans));
     }
+    // A live designer/reviewer earns its own "▶ running" row in the role
+    // color: those stages run long, and the colored row marks the burning
+    // card at a glance. Executor keeps the badge-only look.
+    if session_state == Some(SessionState::Live)
+        && matches!(task.run_phase, Some(RunPhase::Design | RunPhase::Review))
+    {
+        lines.push(Line::from(Span::styled(
+            "▶ running",
+            Style::default()
+                .fg(phase_color(&app.theme, task.run_phase))
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
     // Live agent telemetry replaces the description on a running card: what the
     // agent is doing now is more actionable than the static blurb, and it keeps
     // the card's height bounded.
     let progress = app.session_progress.get(&task.id).filter(|p| p.has_data());
     if let Some(progress) = progress {
-        lines.extend(telemetry_lines(progress, app, line_width));
+        lines.extend(telemetry_lines(
+            progress,
+            phase_color(&app.theme, task.run_phase),
+            app.theme.muted,
+            line_width,
+        ));
     } else if !task.description.is_empty() {
         let description = truncate_display(
             &sanitize_terminal_text(&task.description).replace('\n', " "),
@@ -239,13 +258,13 @@ pub fn badges(
     };
     match session_state {
         Some(SessionState::Live) => {
-            let (label, color) = match task.run_phase {
-                Some(RunPhase::Orchestrate) => ("◧ plan", app.theme.focus),
-                Some(RunPhase::Design) => ("✎ design", app.theme.focus),
-                Some(RunPhase::Review) => ("⚖ review", app.theme.review),
-                _ => ("▶ running", app.theme.ok),
+            let label = match task.run_phase {
+                Some(RunPhase::Orchestrate) => "◧ plan",
+                Some(RunPhase::Design) => "✎ design",
+                Some(RunPhase::Review) => "⚖ review",
+                _ => "▶ running",
             };
-            badges.push((label.to_string(), color));
+            badges.push((label.to_string(), phase_color(&app.theme, task.run_phase)));
         }
         Some(SessionState::Waiting) => {
             let label = app
@@ -333,6 +352,17 @@ pub fn badges(
     badges
 }
 
+/// Role color for a delegated run: blue for design/planning, purple for
+/// review, the default ok green for the executor. Shared by the live badge,
+/// the "▶ running" row and the telemetry stats line so all three agree.
+fn phase_color(theme: &Theme, phase: Option<RunPhase>) -> Color {
+    match phase {
+        Some(RunPhase::Orchestrate | RunPhase::Design) => theme.focus,
+        Some(RunPhase::Review) => theme.review,
+        _ => theme.ok,
+    }
+}
+
 pub fn retry_badge(restart_at: chrono::NaiveDateTime) -> String {
     format!("↻ retry {}", restart_at.format("%H:%M"))
 }
@@ -340,7 +370,14 @@ pub fn retry_badge(restart_at: chrono::NaiveDateTime) -> String {
 /// The two live-telemetry rows for a running agent: a stats line (todo progress
 /// bar, tokens, cost) and, when known, a `→ <last tool>` activity line. Either
 /// may be empty; callers only reach here when [`SessionProgress::has_data`].
-fn telemetry_lines(progress: &SessionProgress, app: &App, line_width: usize) -> Vec<Line<'static>> {
+/// `color` tints the stats line with the run role's color; `muted` styles the
+/// activity line.
+fn telemetry_lines(
+    progress: &SessionProgress,
+    color: Color,
+    muted: Color,
+    line_width: usize,
+) -> Vec<Line<'static>> {
     let mut rows = Vec::new();
     let mut stats: Vec<String> = Vec::new();
     if let Some((done, total)) = progress.todos() {
@@ -355,7 +392,7 @@ fn telemetry_lines(progress: &SessionProgress, app: &App, line_width: usize) -> 
     if !stats.is_empty() {
         rows.push(Line::from(Span::styled(
             truncate_display(&stats.join("  "), line_width),
-            Style::default().fg(app.theme.ok),
+            Style::default().fg(color),
         )));
     }
     if let Some(activity) = progress.last_activity.as_deref() {
@@ -364,7 +401,7 @@ fn telemetry_lines(progress: &SessionProgress, app: &App, line_width: usize) -> 
                 &format!("→ {}", sanitize_terminal_text(activity)),
                 line_width,
             ),
-            Style::default().fg(app.theme.muted),
+            Style::default().fg(muted),
         )));
     }
     rows
@@ -409,6 +446,12 @@ pub(crate) fn card_line_count(app: &App, task: &Task) -> u16 {
         badge_count += 1;
     }
     if badge_count > 0 {
+        lines += 1;
+    }
+    // Mirrors render_card: a live design/review phase adds the "▶ running" row.
+    if session_state == Some(SessionState::Live)
+        && matches!(task.run_phase, Some(RunPhase::Design | RunPhase::Review))
+    {
         lines += 1;
     }
     // The description is deliberately excluded: it stays the one row allowed to
@@ -468,9 +511,13 @@ mod tests {
 
     use chrono::NaiveDate;
 
+    use crate::core::models::RunPhase;
+    use crate::core::telemetry::SessionProgress;
+    use crate::tui::theme::Theme;
+
     use super::{
-        case_insensitive_match, format_tokens, highlight_title_matches, progress_bar, retry_badge,
-        sanitize_terminal_text, truncate_display,
+        case_insensitive_match, format_tokens, highlight_title_matches, phase_color, progress_bar,
+        retry_badge, sanitize_terminal_text, telemetry_lines, truncate_display,
     };
 
     #[test]
@@ -547,5 +594,34 @@ mod tests {
         assert!(case_insensitive_match("İstanbul", "i"));
         assert_eq!(spans[0].content.as_ref(), "İ");
         assert_eq!(spans[0].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn phase_color_maps_run_roles_to_theme_colors() {
+        let theme = Theme::named("dark");
+        assert_eq!(phase_color(&theme, Some(RunPhase::Design)), theme.focus);
+        assert_eq!(
+            phase_color(&theme, Some(RunPhase::Orchestrate)),
+            theme.focus
+        );
+        assert_eq!(phase_color(&theme, Some(RunPhase::Review)), theme.review);
+        assert_eq!(phase_color(&theme, Some(RunPhase::Execute)), theme.ok);
+        assert_eq!(phase_color(&theme, None), theme.ok);
+    }
+
+    #[test]
+    fn telemetry_stats_line_takes_the_role_color() {
+        let theme = Theme::named("dark");
+        let progress = SessionProgress {
+            tokens: Some(12_400),
+            last_activity: Some("Edit src/x.rs".to_string()),
+            ..SessionProgress::default()
+        };
+        let rows = telemetry_lines(&progress, theme.focus, theme.muted, 40);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].spans.len(), 1);
+        assert_eq!(rows[0].spans[0].style.fg, Some(theme.focus));
+        assert_eq!(rows[0].spans[0].content.as_ref(), "12.4k tok");
+        assert_eq!(rows[1].spans[0].style.fg, Some(theme.muted));
     }
 }

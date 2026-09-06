@@ -225,7 +225,12 @@ straight to the answer panel. Interactive tasks whose agent is blocked on
 `⏳ until HH:MM`. A session that is actually crashed (status crashed, stale
 heartbeat, or missing session file) shows `✖ crashed · u recover`. A cleanly
 closed session on In Progress is idle — `r` runs a fresh agent; it is not
-painted crashed. The review-edits editor is
+painted crashed.
+A live design or review session also earns its own bold `▶ running` row under
+the card's badges — blue for the designer, purple for the reviewer — and the
+live token/cost stats line is tinted in the same role color (executor runs
+keep the green badge-only card).
+The review-edits editor is
 editable only while the task is in Review (read-only or hidden otherwise), and
 saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
 `Ctrl+R` / action-bar button. Create/edit dialogs expose one `Agent settings`
