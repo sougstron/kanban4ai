@@ -1,3 +1,92 @@
+# kanban4ai 0.6.4
+
+The board learns to plan in graphs: a task can wait on its dependencies (an
+AND-join over Review-or-Done), an orchestrator mode decomposes one task into a
+planned DAG of subtasks, nodes fail over across a named model roster when a
+provider caps out, and a crashed run raises a desktop alarm instead of failing
+silently.
+
+## Added
+
+- **Task dependencies — the DAG** (`core/graph.rs`, `core/operations.rs`,
+  `core/scheduler.rs`, `core/models.rs`, `core/storage.rs`,
+  `docs/orchestration.md`, `docs/cli.md`; `tests/graph_test.rs`).
+  `kanban depends TASK-310 [--on TASK-NNN ...] [--clear]` and the repeatable
+  `kanban create --depends-on TASK-NNN` maintain `Task.depends_on`. A
+  dependency is an AND-join: the node cannot start until every listed task has
+  reached Review or Done. The edge is pulled, not pushed —
+  `dispatch_ready_dependents()` runs in every daemon / TUI / `check-sessions`
+  pump before the queue dispatch and hands ready To Do tasks to the normal
+  cap-checked queue, so a wide fan-out cannot bypass the concurrency caps. A
+  dependency whose task no longer exists counts as satisfied and is reported
+  in the thread note (`missing: TASK-nnn`). Cycles are refused at write time
+  by a DFS over the whole board plus the proposed edges, naming the path —
+  acyclicity is the termination guarantee. The edge also carries context: the
+  node's prompt opens with an *Upstream results* section built from each
+  dependency's recorded context and harvested final reply, compacted by the
+  existing rule-based compaction and capped by
+  `orchestration.orchestrator.upstream_budget_chars` (split across the
+  dependencies), with the task's `needs` contract printed above it. Legacy
+  boards load untouched — the new task fields default and the golden fixtures
+  still round-trip (`tests/golden_compat.rs`).
+- **Orchestrator mode** (`agent/prompt.rs`, `core/operations.rs`,
+  `docs/orchestration.md`). A per-task opt-in (`use_orchestrator` — the
+  Orchestrator checkbox in the task form, `kanban create --orchestrator`);
+  there is deliberately no board-wide switch. The task's first run enters a
+  new `orchestrate` phase before any design pass, with a role-scoped
+  orchestrator prompt carrying the DAG rules, the plan schema, the configured
+  model rosters and the `max_subtasks` cap. The plan is submitted with
+  `kanban plan <task> --file <plan.yaml>` and validated whole — unknown
+  references, duplicate or colliding keys, cycles, unknown role profiles,
+  size — before anything is created. Accepted, each node becomes a To Do task
+  with its `depends_on` wired, its `needs` contract, its role profile and
+  `parent_task`; the planner itself becomes the join node (`orchestrated:
+  true`, `depends_on` every node it created), returns to To Do, and the
+  graph's root nodes are queued immediately. Finishing without an accepted
+  plan is refused; moving an orchestrated task back to To Do by hand drops the
+  join so the next run plans again (subtask edges are never cleared this way).
+  New config: `orchestration.orchestrator {max_subtasks: 12,
+  upstream_budget_chars: 4000}`, and `orchestration.max_running_per_role`
+  gains `orchestrator: 1`.
+- **Role model rosters** (`orchestration.roles`, `docs/config.md`). Named,
+  ordered backend/model candidates — plain `claude/haiku` strings or
+  `{backend, model, effort}` maps — the orchestrator may assign to a node with
+  `role:`. A node starts on the first candidate, materialized onto its own
+  backend/model/effort/agent fields; when a run dies on a provider limit,
+  `advance_role_roster` moves it to the next candidate and re-queues it
+  immediately instead of parking it until the quota window rolls over. A
+  failover spends no crash-restart step and `roster_index` is never reset
+  automatically; with no candidate left, the normal crash-restart backoff
+  takes over.
+- **Role-scoped instructions** (`agent/prompt.rs`, `docs/orchestration.md`).
+  `<board>/.kanban/instructions/<role>.md` (`orchestrator`, `designer`,
+  `reviewer`, `executor`) is appended to that role's prompt only, when that
+  role is actually launched — the opposite of AGENTS.md/CLAUDE.md, which every
+  session pays for. Missing or empty files are skipped.
+- **Crash notifications** (`core/notifier.rs`, `core/scheduler.rs`,
+  `core/daemon.rs`, `docs/config.md`; `tests/scheduler_test.rs`). New
+  `notifications.crash` (default true, urgency critical): every failure on the
+  auto-restart path — non-zero exit, heartbeat timeout, failed launch — fires
+  a desktop alert that names the scheduled retry and attempt, or says plainly
+  that no automatic retry is configured, so a crashed task is never silent. A
+  spent schedule keeps the stronger stranded notification.
+
+## Changed
+
+- **TUI** (`tui/card.rs`, `tui/detail.rs`, `tui/dialogs.rs`, `tui/app.rs`).
+  To Do cards wearing `depends_on` show a graph-node badge, the detail view
+  renders `Depends: …`, `Orchestrator: on` / `Orchestrator: planned` and the
+  `needs` contract, the task form gains the Orchestrator checkbox, and the new
+  phase shows as `◧ plan`.
+- **Docs**: `docs/orchestration.md` documents the `orchestrate` phase, Task
+  Dependencies, Orchestrator Mode and role rosters; `docs/cli.md`,
+  `docs/config.md`, `docs/data-model.md` follow; `docs/research/dag-orchestration.md`
+  records the design investigation.
+- **Housekeeping**: the `update-app` maintainer skill lands under
+  `.agents/skills/` with `docs/releasing.md` aligned, AGENTS.md/CLAUDE.md are
+  trimmed, and the tracked AUR packaging metadata catches up to the published
+  0.6.3-1.
+
 # kanban4ai 0.6.3
 
 Codex CLI joins the board as a first-class agent backend — non-interactive
