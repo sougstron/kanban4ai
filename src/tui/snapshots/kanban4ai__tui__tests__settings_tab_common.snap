@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 1928
 expression: "render_at(&mut app, 80, 24)"
 ---
 ┌ To Do (0) ───────┐┌ In Progress (0) ─┐┌ Review (0) ──────┐┌ Done (0) ────────┐

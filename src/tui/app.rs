@@ -19,10 +19,12 @@ use crate::agent::{
     backend_has_catalog, cached_backend_catalog, recent_models, sort_opencode_models,
     warm_backend_catalog,
 };
+use crate::core::config::RoleCandidate;
 use crate::core::config::{BoardConfig, OnChangesRequested, OrchestrationSettings};
 use crate::core::context::ContextManager;
 use crate::core::daemon;
 use crate::core::error::{KanbanError, Result};
+use crate::core::executors::{self, Pool};
 use crate::core::limits::LimitsSnapshot;
 use crate::core::models::{
     Message, MessageKind, MessageStatus, RunMode, RunPhase, Session, SessionStatus, Task,
@@ -44,7 +46,7 @@ use super::card::{
 };
 use super::dialogs::{
     AgentSlot, BulkAction, DialogField, Modal, ModalButton, ModalState, QuestionChoice,
-    SelectOption,
+    SelectOption, SettingsTab, executor_slot_index,
 };
 use super::event::LoopOutcome;
 use super::image;
@@ -166,6 +168,8 @@ pub enum HitAction {
         index: usize,
     },
     DetailThread,
+    /// A tab label inside the project settings dialog.
+    ModalTab(SettingsTab),
     DetailEdits,
     FocusProject {
         index: usize,
@@ -1640,6 +1644,7 @@ impl App {
                 HitAction::OpenAnswer { .. }
                 | HitAction::Action(_)
                 | HitAction::ModalField(_)
+                | HitAction::ModalTab(_)
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
                 | HitAction::DetailAnswerOption { .. }
@@ -1835,6 +1840,7 @@ impl App {
                 | HitAction::ModalField(_)
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
+                | HitAction::ModalTab(_)
                 | HitAction::DetailAnswerOption { .. }
                 | HitAction::DetailEdits
                 | HitAction::DetailThread
@@ -1890,7 +1896,8 @@ impl App {
             Some(
                 HitAction::ModalField(_)
                 | HitAction::ModalOption { .. }
-                | HitAction::ModalButton(_),
+                | HitAction::ModalButton(_)
+                | HitAction::ModalTab(_),
             ) => Ok(()),
             Some(HitAction::FocusProject { index }) => {
                 self.project_selected = index;
@@ -1908,6 +1915,11 @@ impl App {
                     if let Some(slot) = ModalState::launcher_slot(field) {
                         modal.open_agent_settings(slot);
                     }
+                }
+            }
+            Some(HitAction::ModalTab(tab)) => {
+                if let Some(modal) = self.modal.as_mut() {
+                    modal.set_settings_tab(tab);
                 }
             }
             Some(HitAction::ModalOption { field, index }) => {
@@ -1987,6 +1999,7 @@ impl App {
                 | HitAction::ModalField(_)
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
+                | HitAction::ModalTab(_)
                 | HitAction::DetailAnswerOption { .. }
                 | HitAction::DetailEdits
                 | HitAction::DetailThread
@@ -3245,7 +3258,27 @@ impl App {
             OnChangesRequested::Todo => "todo".to_string(),
         }]);
         modal.reviewer_max_rounds = TextArea::new(vec![orch.reviewer.max_rounds.to_string()]);
+        modal.executor_week_threshold =
+            TextArea::new(vec![format!("{}", orch.executors.thresholds.week_percent)]);
+        modal.executor_five_hour_threshold = TextArea::new(vec![format!(
+            "{}",
+            orch.executors.thresholds.five_hour_percent
+        )]);
         self.populate_settings_form_options(&mut modal);
+        // Slot selections need the option list, so they are set after the
+        // population above.
+        for slot in 0..3usize {
+            if let Some(candidate) = orch.executors.middle.get(slot) {
+                modal.executor_selected[slot] =
+                    executor_option_index(&modal, &candidate_key(candidate));
+            }
+        }
+        for slot in 3..6usize {
+            if let Some(candidate) = orch.executors.cheap.get(slot - 3) {
+                modal.executor_selected[slot] =
+                    executor_option_index(&modal, &candidate_key(candidate));
+            }
+        }
         modal.capture_initial_values();
         self.modal = Some(modal);
     }
@@ -3555,6 +3588,123 @@ impl App {
         modal.set_chain_options(chain_options);
     }
 
+    /// The `— none —` + `backend/model` option list shared by the six
+    /// executor-pool slot selectors. Every configured backend × its models,
+    /// annotated with the live provider numbers from the cached limits
+    /// snapshot; candidates the gate currently rejects are marked
+    /// `(out of quota)`.
+    fn executor_pool_options(&self, config: &BoardConfig) -> Vec<SelectOption> {
+        let orch = OrchestrationSettings::from_mapping(&config.orchestration);
+        let thresholds = &orch.executors.thresholds;
+        let snapshot = crate::core::limits::cached();
+        let now = chrono::Utc::now().timestamp();
+        let mut options = vec![SelectOption {
+            label: "— none —".to_string(),
+            value: None,
+        }];
+        for (backend_value, _) in config.agents.iter() {
+            let Some(backend) = backend_value.as_str() else {
+                continue;
+            };
+            let backend_settings = config.agents.get(backend_value).and_then(Value::as_mapping);
+            for model_option in
+                self.backend_model_options(backend, backend_settings, &config.auto_launch)
+            {
+                let Some(model) = model_option.value.clone() else {
+                    continue;
+                };
+                let key = format!("{backend}/{model}");
+                if options
+                    .iter()
+                    .any(|option| option.value.as_deref() == Some(&key))
+                {
+                    continue;
+                }
+                options.push(SelectOption {
+                    label: self.annotated_pool_label(&snapshot, backend, &model, thresholds, now),
+                    value: Some(key),
+                });
+            }
+        }
+        options
+    }
+
+    /// `claude/haiku  5h 66% · 7d 95%` with a muted `(out of quota)` suffix
+    /// when the gate rejects the pair right now. Unknown providers show no
+    /// annotation.
+    fn annotated_pool_label(
+        &self,
+        snapshot: &Option<std::sync::Arc<LimitsSnapshot>>,
+        backend: &str,
+        model: &str,
+        thresholds: &crate::core::config::PoolThresholds,
+        now: i64,
+    ) -> String {
+        let mut label = format!("{backend}/{model}");
+        let Some(provider) = crate::core::limits::provider_for(backend, Some(model)) else {
+            return label;
+        };
+        let Some(limits) = snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.get(provider))
+        else {
+            return label;
+        };
+        if !limits.is_ready() {
+            return label;
+        }
+        let windows = limits.live_windows(now);
+        if windows.is_empty() {
+            return label;
+        }
+        let mut out_of_quota = false;
+        for window in &windows {
+            let floor = match window.label.as_str() {
+                "5h" => thresholds.five_hour_percent,
+                _ => thresholds.week_percent,
+            };
+            if window.remaining_percent < floor {
+                out_of_quota = true;
+            }
+            label.push_str(&format!(
+                "  {} {:.0}%",
+                window.label, window.remaining_percent
+            ));
+        }
+        if out_of_quota {
+            label.push_str("  (out of quota)");
+        }
+        label
+    }
+
+    /// The resolved cheap-pool order the board would run right now, shown on
+    /// the Executor tab: `next: claude/haiku` or the park horizon.
+    pub(crate) fn executor_pool_status_line(&self) -> String {
+        let Ok(orch) = self.ops.config.get_orchestration() else {
+            return String::new();
+        };
+        let snapshot = crate::core::limits::cached();
+        let now = chrono::Utc::now().timestamp();
+        match executors::select(&orch.executors, Pool::Cheap, snapshot.as_deref(), now) {
+            executors::PoolChoice::Candidate { candidate, index } => format!(
+                "next: {} ({} position {})",
+                candidate.label(),
+                Pool::Cheap.name(),
+                index + 1
+            ),
+            executors::PoolChoice::AllBlocked { wake_at, blocked } => {
+                let wake = chrono::DateTime::from_timestamp(wake_at, 0)
+                    .map(|dt| timefmt::format(&dt.naive_utc()))
+                    .unwrap_or_else(|| "?".to_string());
+                format!(
+                    "all candidates out of quota — would wait until {wake} ({})",
+                    blocked.join(", ")
+                )
+            }
+            executors::PoolChoice::NoPool => "no cheap executor candidates configured".to_string(),
+        }
+    }
+
     fn populate_settings_form_options(&self, modal: &mut ModalState) {
         let Ok(config) = self.ops.config.load() else {
             return;
@@ -3608,6 +3758,7 @@ impl App {
                 value: Some("light".to_string()),
             },
         ]);
+        modal.set_executor_slot_options(self.executor_pool_options(&config));
         modal.set_task_sort_options(vec![
             SelectOption {
                 label: "Task number up".to_string(),
@@ -4635,6 +4786,22 @@ impl App {
                 KeyCode::Esc => return self.request_modal_close(modal),
                 KeyCode::Tab => modal.next_field(),
                 KeyCode::BackTab => modal.prev_field(),
+                // In the settings dialog the arrows walk the tab strip —
+                // except where a field owns them (text carets, filtered
+                // selectors), and while an agent popup is open. Tab/BackTab
+                // still reach the Save/Cancel buttons from any field.
+                KeyCode::Left | KeyCode::Right
+                    if matches!(modal.modal, Modal::Settings)
+                        && modal.agent_popup_slot().is_none()
+                        && !field_consumes_horizontal(modal.active_field()) =>
+                {
+                    let current = modal.settings_tab;
+                    modal.set_settings_tab(if key.code == KeyCode::Left {
+                        current.prev()
+                    } else {
+                        current.next()
+                    });
+                }
                 KeyCode::Left | KeyCode::Right
                     if matches!(
                         modal.active_field(),
@@ -5608,6 +5775,61 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
         && y < area.y.saturating_add(area.height)
 }
 
+/// `backend/model` key of a pool candidate, the spelling the slot selectors
+/// store as option values.
+fn candidate_key(candidate: &RoleCandidate) -> String {
+    match (candidate.backend.as_deref(), candidate.model.as_deref()) {
+        (Some(backend), Some(model)) => format!("{backend}/{model}"),
+        (Some(backend), None) => backend.to_string(),
+        (None, Some(model)) => model.to_string(),
+        (None, None) => String::new(),
+    }
+}
+
+/// Index of the option with value `key`, or 0 (`— none —`).
+fn executor_option_index(modal: &ModalState, key: &str) -> usize {
+    modal
+        .executor_slot_options
+        .iter()
+        .position(|option| option.value.as_deref() == Some(key))
+        .unwrap_or(0)
+}
+
+/// Whether a dialog field already owns Left/Right: a text caret or a
+/// filtered selector (where Left/Right move the selection). On those the
+/// settings tab strip must not steal the arrows.
+fn field_consumes_horizontal(field: DialogField) -> bool {
+    matches!(
+        field,
+        DialogField::Title
+            | DialogField::Description
+            | DialogField::Answer
+            | DialogField::MaxRunningTotal
+            | DialogField::MaxRunningDesigner
+            | DialogField::MaxRunningReviewer
+            | DialogField::MaxRunningExecutor
+            | DialogField::MaxRunningPerBackend
+            | DialogField::MaxRunningPerBackendModel
+            | DialogField::AutoRestartDelays
+            | DialogField::ReviewerMaxRounds
+            | DialogField::ExecutorWeekThreshold
+            | DialogField::ExecutorFiveHourThreshold
+            | DialogField::Backend
+            | DialogField::Model
+            | DialogField::ChainTo
+            | DialogField::DesignerBackend
+            | DialogField::DesignerModel
+            | DialogField::ReviewerBackend
+            | DialogField::ReviewerModel
+            | DialogField::ExecutorMiddle1
+            | DialogField::ExecutorMiddle2
+            | DialogField::ExecutorMiddle3
+            | DialogField::ExecutorCheap1
+            | DialogField::ExecutorCheap2
+            | DialogField::ExecutorCheap3
+    )
+}
+
 fn is_confirmation_modal(modal: &Modal) -> bool {
     matches!(
         modal,
@@ -5732,6 +5954,14 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::ReviewerEffort => Some(modal.reviewer.effort_selected),
         DialogField::ReviewerAgent => Some(modal.reviewer.agent_selected),
         DialogField::ReviewerOnChanges => Some(modal.reviewer_on_changes_selected),
+        DialogField::ExecutorMiddle1
+        | DialogField::ExecutorMiddle2
+        | DialogField::ExecutorMiddle3
+        | DialogField::ExecutorCheap1
+        | DialogField::ExecutorCheap2
+        | DialogField::ExecutorCheap3 => {
+            Some(modal.executor_selected[super::dialogs::executor_slot_index(field)])
+        }
         DialogField::Title
         | DialogField::Description
         | DialogField::AgentSettings
@@ -5757,6 +5987,8 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::DesignerEnabled
         | DialogField::ReviewerEnabled
         | DialogField::ReviewerMaxRounds
+        | DialogField::ExecutorWeekThreshold
+        | DialogField::ExecutorFiveHourThreshold
         | DialogField::IsolationStatus
         | DialogField::UpdateCheckOnOpen => None,
     }
@@ -5962,6 +6194,10 @@ fn lines_or_blank(text: &str) -> Vec<String> {
 }
 
 struct OrchestrationDraft {
+    executor_middle: Vec<RoleCandidate>,
+    executor_cheap: Vec<RoleCandidate>,
+    executor_week_percent: f64,
+    executor_five_hour_percent: f64,
     queue_enabled: bool,
     max_running_total: i64,
     max_running_per_role: Vec<(String, i64)>,
@@ -5983,9 +6219,76 @@ struct OrchestrationDraft {
     reviewer_max_rounds: i64,
 }
 
+/// Parse a pool slot selector into a candidate: `backend/model` strings (the
+/// option values), `— none —` is skipped.
+fn parse_executor_slot(
+    modal: &ModalState,
+    field: DialogField,
+) -> std::result::Result<Option<RoleCandidate>, (DialogField, String)> {
+    let slot = executor_slot_index(field);
+    Ok(modal.executor_slot_value(slot).map(|key| {
+        let (backend, model) = key.split_once('/').unwrap_or((key.as_str(), ""));
+        RoleCandidate {
+            backend: Some(backend.to_string()),
+            model: (!model.is_empty()).then(|| model.to_string()),
+            effort: None,
+            agent: None,
+        }
+    }))
+}
+
+fn parse_threshold_field(
+    modal: &ModalState,
+    field: DialogField,
+    label: &str,
+) -> std::result::Result<f64, (DialogField, String)> {
+    let text = match field {
+        DialogField::ExecutorWeekThreshold => modal.executor_week_threshold_text(),
+        DialogField::ExecutorFiveHourThreshold => modal.executor_five_hour_threshold_text(),
+        _ => None,
+    };
+    let Some(text) = text else {
+        return Err((field, format!("{label} cannot be empty")));
+    };
+    let parsed = text
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| (field, format!("{label} must be a number between 0 and 100")))?;
+    if !(0.0..=100.0).contains(&parsed) {
+        return Err((field, format!("{label} must be between 0 and 100")));
+    }
+    Ok(parsed)
+}
+
 fn parse_orchestration_modal(
     modal: &ModalState,
 ) -> std::result::Result<OrchestrationDraft, (DialogField, String)> {
+    let executor_middle = [
+        parse_executor_slot(modal, DialogField::ExecutorMiddle1)?,
+        parse_executor_slot(modal, DialogField::ExecutorMiddle2)?,
+        parse_executor_slot(modal, DialogField::ExecutorMiddle3)?,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let executor_cheap = [
+        parse_executor_slot(modal, DialogField::ExecutorCheap1)?,
+        parse_executor_slot(modal, DialogField::ExecutorCheap2)?,
+        parse_executor_slot(modal, DialogField::ExecutorCheap3)?,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let executor_week_percent = parse_threshold_field(
+        modal,
+        DialogField::ExecutorWeekThreshold,
+        "Executor week quota floor %",
+    )?;
+    let executor_five_hour_percent = parse_threshold_field(
+        modal,
+        DialogField::ExecutorFiveHourThreshold,
+        "Executor 5h quota floor %",
+    )?;
     let max_running_total = parse_cap_field(
         &modal.max_running_total,
         DialogField::MaxRunningTotal,
@@ -6037,6 +6340,10 @@ fn parse_orchestration_modal(
         ));
     }
     Ok(OrchestrationDraft {
+        executor_middle,
+        executor_cheap,
+        executor_week_percent,
+        executor_five_hour_percent,
         queue_enabled: modal.queue_enabled,
         max_running_total,
         max_running_per_role: vec![
@@ -6233,8 +6540,100 @@ fn parse_delays(
     Ok(delays)
 }
 
+/// Serialize one executor-pool entry. A candidate the dialog did not change
+/// (same backend/model as the entry it replaces) keeps its hand-written
+/// `effort:`/`agent:` — the dialog edits priority order, not personas.
+fn pool_entry(previous: Option<&Value>, candidate: &RoleCandidate) -> Value {
+    let previous_candidate: Option<RoleCandidate> = previous.and_then(|value| {
+        let mapping = value.as_mapping()?;
+        let field = |key: &str| -> Option<String> {
+            mapping
+                .get(Value::String(key.to_owned()))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        Some(RoleCandidate {
+            backend: field("backend"),
+            model: field("model"),
+            effort: field("effort"),
+            agent: field("agent"),
+        })
+    });
+    let mut mapping = Mapping::new();
+    mapping.insert(
+        Value::String("backend".to_string()),
+        candidate
+            .backend
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    mapping.insert(
+        Value::String("model".to_string()),
+        candidate
+            .model
+            .clone()
+            .map(Value::String)
+            .unwrap_or(Value::Null),
+    );
+    let same_pair = previous_candidate.as_ref().is_some_and(|previous| {
+        previous.backend == candidate.backend && previous.model == candidate.model
+    });
+    if same_pair {
+        if let Some(previous) = previous_candidate {
+            if let Some(effort) = previous.effort {
+                mapping.insert(Value::String("effort".to_string()), Value::String(effort));
+            }
+            if let Some(agent) = previous.agent {
+                mapping.insert(Value::String("agent".to_string()), Value::String(agent));
+            }
+        }
+    }
+    Value::Mapping(mapping)
+}
+
 fn apply_orchestration_draft(orch: &mut Mapping, draft: &OrchestrationDraft) {
     insert_bool(orch, "queue_enabled", draft.queue_enabled);
+    // Snapshot the hand-written pools before rewriting them, so entries the
+    // dialog left unchanged keep their `effort:`/`agent:` personas.
+    let previous_executors = orch
+        .get(Value::String("executors".to_owned()))
+        .and_then(Value::as_mapping)
+        .cloned();
+    let previous_pool = |key: &str| -> Vec<Value> {
+        previous_executors
+            .as_ref()
+            .and_then(|executors| executors.get(Value::String(key.to_owned())))
+            .and_then(Value::as_sequence)
+            .cloned()
+            .unwrap_or_default()
+    };
+    {
+        let executors = ensure_mapping(orch, "executors");
+        for (key, candidates) in [
+            ("middle", &draft.executor_middle),
+            ("cheap", &draft.executor_cheap),
+        ] {
+            let previous = previous_pool(key);
+            let entries: Vec<Value> = candidates
+                .iter()
+                .enumerate()
+                .map(|(index, candidate)| pool_entry(previous.get(index), candidate))
+                .collect();
+            executors.insert(Value::String(key.to_string()), Value::Sequence(entries));
+        }
+        let thresholds = ensure_mapping(executors, "thresholds");
+        thresholds.insert(
+            Value::String("week_percent".to_string()),
+            Value::Number(draft.executor_week_percent.into()),
+        );
+        thresholds.insert(
+            Value::String("five_hour_percent".to_string()),
+            Value::Number(draft.executor_five_hour_percent.into()),
+        );
+    }
     insert_int(orch, "max_running_total", draft.max_running_total);
     insert_cap_map(orch, "max_running_per_role", &draft.max_running_per_role);
     insert_cap_map(

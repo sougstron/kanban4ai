@@ -5,6 +5,7 @@ mod common;
 use common::ops_with_recorder;
 use kanban4ai::core::context::ContextManager;
 use kanban4ai::core::error::KanbanError;
+use kanban4ai::core::limits::{LimitWindow, LimitsSnapshot, ProviderLimits, ProviderState};
 use kanban4ai::core::models::{
     MessageKind, MessageRole, MessageStatus, Role, RunMode, RunPhase, SessionStatus, Task,
     TaskStatus,
@@ -4383,4 +4384,269 @@ fn rerun_in_progress_task_in_queued_mode_parks_the_task_without_a_session() {
             .any(|m| m.body.contains("queued — the dispatcher starts it")),
         "the thread must say the new run waits in the queue"
     );
+}
+
+// ------------------------------------------------------------- executor pools
+
+/// One shared, deterministic limits snapshot for every pool test: claude is
+/// out of quota (both windows far below the floors), codex is healthy, and
+/// both reset in the future relative to the real clock. Installing it is
+/// idempotent, so concurrent tests can all call it up front.
+fn install_pool_snapshot() {
+    let now = kanban4ai::core::limits::now_secs_for_tests();
+    let provider = |name: &str, five_hour: f64, week: f64, resets_at: i64| ProviderLimits {
+        provider: name.to_string(),
+        state: ProviderState::Ready,
+        windows: vec![
+            window_of("5h", five_hour, resets_at),
+            window_of("7d", week, resets_at),
+        ],
+        observed_at: None,
+    };
+    kanban4ai::core::limits::set_cached_snapshot_for_tests(LimitsSnapshot {
+        fetched_at: now + 100_000, // fresher than any real observation
+        providers: vec![
+            provider("claude", 0.1, 1.0, now + 7_200),
+            provider("codex", 80.0, 90.0, now + 3_600),
+        ],
+    });
+}
+
+fn window_of(label: &str, remaining: f64, resets_at: i64) -> LimitWindow {
+    LimitWindow {
+        label: label.to_string(),
+        remaining_percent: remaining,
+        resets_at: Some(resets_at),
+        rolling: false,
+    }
+}
+
+/// Board with a cheap pool led by the blocked provider: the gate must skip
+/// claude and materialize the second candidate.
+fn pool_board() -> (tempfile::TempDir, Operations, common::RecordingLauncher) {
+    queue_board(
+        "  executors:\n    thresholds:\n      week_percent: 5\n      five_hour_percent: 15\n    cheap:\n      - claude/haiku\n      - codex/gpt-5.5\n",
+    )
+}
+
+#[test]
+fn executor_pool_skips_blocked_candidate_and_materializes_next() {
+    install_pool_snapshot();
+    let (_dir, ops, _recorder) = pool_board();
+    let task = ops.create_task(NewTask::titled("Pooled")).unwrap();
+    ops.queue_run(&task.id).unwrap();
+
+    let dispatched = ops.dispatch_queue().unwrap();
+    assert_eq!(dispatched.len(), 1, "the pooled task must launch");
+    let task = ops.storage.load_task(&task.id).unwrap().unwrap();
+    assert_eq!(task.agent_backend.as_deref(), Some("codex"));
+    assert_eq!(task.ai_model.as_deref(), Some("gpt-5.5"));
+    assert_eq!(task.role_profile.as_deref(), Some("cheap"));
+    assert_eq!(task.roster_index, 1);
+    assert!(task.restart_at.is_none());
+}
+
+#[test]
+fn executor_pool_never_overrides_an_explicit_assignment() {
+    install_pool_snapshot();
+    let (_dir, ops, recorder) = pool_board();
+    let task = ops
+        .create_task(NewTask {
+            title: "Explicit".to_string(),
+            agent_backend: Some("claude".to_string()),
+            ai_model: Some("haiku".to_string()),
+            ..NewTask::titled("Explicit")
+        })
+        .unwrap();
+    ops.queue_run(&task.id).unwrap();
+    let dispatched = ops.dispatch_queue().unwrap();
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(
+        dispatched[0].backend, "claude",
+        "an explicit per-task model runs even when its provider is blocked"
+    );
+    assert_eq!(recorder.calls().len(), 1);
+}
+
+#[test]
+fn executor_pool_parks_blocked_task_with_question_and_no_crash_cost() {
+    install_pool_snapshot();
+    // A pool whose only candidate is the blocked provider.
+    let (dir, ops, recorder) = queue_board("  executors:\n    cheap:\n      - claude/haiku\n");
+    let task = ops.create_task(NewTask::titled("Blocked")).unwrap();
+    ops.queue_run(&task.id).unwrap();
+
+    let dispatched = ops.dispatch_queue().unwrap();
+    assert!(
+        dispatched.is_empty(),
+        "a fully blocked pool launches nothing"
+    );
+    assert!(recorder.calls().is_empty());
+
+    let task = ops.storage.load_task(&task.id).unwrap().unwrap();
+    assert_eq!(task.run_phase, Some(RunPhase::Queued));
+    assert!(task.restart_at.is_some(), "the task parks until the reset");
+    assert!(task.session.is_none(), "a parked task owns no session");
+    assert_eq!(
+        task.crash_restarts, 0,
+        "a quota park is not a crash restart"
+    );
+    assert!(task.has_questions, "the park asks the human");
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    let questions: Vec<_> = thread
+        .messages
+        .iter()
+        .filter(|m| m.kind == MessageKind::Question)
+        .collect();
+    assert_eq!(
+        questions.len(),
+        1,
+        "exactly one park question: {questions:?}"
+    );
+    assert_eq!(questions[0].author.as_deref(), Some("kanban:executor-pool"));
+    assert!(
+        questions[0]
+            .variants
+            .contains(&"Wait for the quota window".to_string()),
+        "the wait option closes the list: {:?}",
+        questions[0].variants
+    );
+    assert!(
+        !questions[0]
+            .variants
+            .iter()
+            .any(|variant| variant.starts_with("claude/")),
+        "the blocked provider is not offered: {:?}",
+        questions[0].variants
+    );
+    assert!(
+        questions[0]
+            .variants
+            .iter()
+            .any(|variant| variant.starts_with("opencode/")),
+        "configured non-pool backends with headroom are offered: {:?}",
+        questions[0].variants
+    );
+
+    // Re-pumping must not fan out more questions.
+    let _ = ops.dispatch_queue().unwrap();
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    let questions: Vec<_> = thread
+        .messages
+        .iter()
+        .filter(|m| m.kind == MessageKind::Question)
+        .collect();
+    assert_eq!(questions.len(), 1, "the park question is never re-posted");
+}
+
+#[test]
+fn executor_pool_answer_materializes_provider_and_clears_the_park() {
+    install_pool_snapshot();
+    let (dir, ops, _recorder) = queue_board("  executors:\n    cheap:\n      - claude/haiku\n");
+    let task = ops.create_task(NewTask::titled("Blocked")).unwrap();
+    ops.queue_run(&task.id).unwrap();
+    assert!(ops.dispatch_queue().unwrap().is_empty());
+
+    let thread = ThreadManager::new(dir.path()).unwrap();
+    let question = thread
+        .load(&task.id)
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|m| m.kind == MessageKind::Question)
+        .expect("park question exists");
+
+    ops.answer_question(
+        &task.id,
+        QuestionRef::MsgId(question.id.clone()),
+        "codex/gpt-5.5",
+    )
+    .unwrap()
+    .expect("task exists");
+
+    let task = ops.storage.load_task(&task.id).unwrap().unwrap();
+    assert_eq!(task.agent_backend.as_deref(), Some("codex"));
+    assert_eq!(task.ai_model.as_deref(), Some("gpt-5.5"));
+    assert!(
+        task.restart_at.is_none(),
+        "an answered park loses its deadline"
+    );
+}
+
+#[test]
+fn executor_pool_wait_answer_keeps_the_deadline() {
+    install_pool_snapshot();
+    let (dir, ops, _recorder) = queue_board("  executors:\n    cheap:\n      - claude/haiku\n");
+    let task = ops.create_task(NewTask::titled("Blocked")).unwrap();
+    ops.queue_run(&task.id).unwrap();
+    assert!(ops.dispatch_queue().unwrap().is_empty());
+    let parked = ops.storage.load_task(&task.id).unwrap().unwrap();
+    let deadline = parked.restart_at.expect("parked");
+
+    let thread = ThreadManager::new(dir.path()).unwrap();
+    let question = thread
+        .load(&task.id)
+        .unwrap()
+        .messages
+        .into_iter()
+        .find(|m| m.kind == MessageKind::Question)
+        .expect("park question exists");
+
+    ops.answer_question(
+        &task.id,
+        QuestionRef::MsgId(question.id.clone()),
+        "Wait for the quota window",
+    )
+    .unwrap()
+    .unwrap();
+
+    let task = ops.storage.load_task(&task.id).unwrap().unwrap();
+    assert_eq!(
+        task.restart_at,
+        Some(deadline),
+        "waiting keeps the deadline"
+    );
+}
+
+#[test]
+fn executor_pool_deadline_wins_and_withdraws_the_question() {
+    install_pool_snapshot();
+    let (dir, ops, _recorder) = queue_board("  executors:\n    cheap:\n      - claude/haiku\n");
+    let task = ops.create_task(NewTask::titled("Blocked")).unwrap();
+    ops.queue_run(&task.id).unwrap();
+    assert!(ops.dispatch_queue().unwrap().is_empty());
+
+    // Force the parked deadline into the past: the walk re-runs, the pool is
+    // still blocked (the snapshot is static), so the task re-parks — and the
+    // open question is left alone instead of re-posted.
+    {
+        let _guard = ops.storage.lock().unwrap();
+        let mut task = ops.storage.load_task(&task.id).unwrap().unwrap();
+        task.restart_at = Some(timefmt::now() - chrono::Duration::minutes(2));
+        ops.storage.save_task(&task).unwrap();
+    }
+    assert!(ops.dispatch_queue().unwrap().is_empty());
+
+    let task = ops.storage.load_task(&task.id).unwrap().unwrap();
+    assert_eq!(task.run_phase, Some(RunPhase::Queued));
+    assert!(task.restart_at.is_some(), "re-parked with a fresh deadline");
+    assert!(task.has_questions, "the question stays open");
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    let questions: Vec<_> = thread
+        .messages
+        .iter()
+        .filter(|m| m.kind == MessageKind::Question)
+        .collect();
+    assert_eq!(questions.len(), 1);
 }

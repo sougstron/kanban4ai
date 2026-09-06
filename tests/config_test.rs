@@ -742,3 +742,119 @@ fn isolation_must_be_a_mapping_with_string_free_form_keys() {
     let err = format!("{}", config.load().unwrap_err());
     assert!(err.contains("branch_prefix must be a string"), "{err}");
 }
+
+#[test]
+fn executor_pools_parse_both_candidate_spellings() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  executors:\n    middle:\n      - backend: claude\n        model: opus\n        effort: high\n      - opencode/openai/gpt-5.5\n    cheap:\n      - claude/haiku\n",
+    );
+    let orch = config.get_orchestration().unwrap();
+    assert_eq!(orch.executors.middle.len(), 2);
+    assert_eq!(
+        orch.executors.middle[0],
+        kanban4ai::core::config::RoleCandidate {
+            backend: Some("claude".into()),
+            model: Some("opus".into()),
+            effort: Some("high".into()),
+            agent: None,
+        }
+    );
+    assert_eq!(orch.executors.middle[1].label(), "opencode/openai/gpt-5.5");
+    assert_eq!(orch.executors.cheap.len(), 1);
+    assert_eq!(orch.executors.cheap[0].label(), "claude/haiku");
+    // Defaults survive a partial block.
+    assert_eq!(orch.executors.thresholds.week_percent, 5.0);
+    assert_eq!(orch.executors.thresholds.five_hour_percent, 15.0);
+    assert_eq!(orch.executors.ask_grace_secs, 60);
+}
+
+#[test]
+fn executor_pools_reject_more_than_three_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  executors:\n    cheap:\n      - claude/haiku\n      - claude/opus\n      - codex/gpt-5.5\n      - codex/gpt-5.6\n",
+    );
+    let err = format!("{}", config.load().unwrap_err());
+    assert!(err.contains("at most 3"), "{err}");
+}
+
+#[test]
+fn executor_pools_warn_on_unknown_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  executors:\n    cheap:\n      - nosuchbackend/model-x\n",
+    );
+    let board = config.load().unwrap();
+    let warnings = config.warnings();
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.contains("nosuchbackend")),
+        "unknown backend must warn: {warnings:?}"
+    );
+    // The entry still round-trips in the typed view (same policy as roles).
+    let orch = OrchestrationSettings::from_mapping(&board.orchestration);
+    assert_eq!(orch.executors.cheap.len(), 1);
+}
+
+#[test]
+fn executor_pool_thresholds_must_be_percentages() {
+    for bad in ["-1", "101"] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = write_config(
+            &dir,
+            &format!(
+                "columns:\n- name: To Do\n  id: todo\norchestration:\n  executors:\n    thresholds:\n      week_percent: {bad}\n"
+            ),
+        );
+        let err = format!("{}", config.load().unwrap_err());
+        assert!(
+            err.contains("week_percent must be 0..=100"),
+            "{bad} must be rejected: {err}"
+        );
+    }
+}
+
+#[test]
+fn executor_pool_ask_grace_must_not_be_negative() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  executors:\n    ask_grace_secs: -5\n",
+    );
+    let err = format!("{}", config.load().unwrap_err());
+    assert!(err.contains("ask_grace_secs"), "{err}");
+}
+
+#[test]
+fn executor_pools_defaults_when_block_is_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(&dir, "columns:\n- name: To Do\n  id: todo\n");
+    let orch = config.get_orchestration().unwrap();
+    assert!(orch.executors.middle.is_empty());
+    assert!(orch.executors.cheap.is_empty());
+    assert_eq!(orch.executors.thresholds.week_percent, 5.0);
+    assert_eq!(orch.executors.ask_grace_secs, 60);
+}
+
+#[test]
+fn executor_pools_round_trip_preserves_unknown_keys_and_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(".kanban/config.yaml");
+    let config = write_config(
+        &dir,
+        "columns:\n- name: To Do\n  id: todo\norchestration:\n  executors:\n    cheap:\n      - backend: claude\n        model: haiku\n        effort: max\n        agent: builder\n    custom_note: keep-me\n",
+    );
+    let loaded = config.load().unwrap();
+    // A save must not lose the unknown key or the per-candidate effort.
+    config.save(&loaded).unwrap();
+    let _ = &config;
+    let raw = fs::read_to_string(&path).unwrap();
+    assert!(raw.contains("custom_note: keep-me"), "{raw}");
+    assert!(raw.contains("effort: max"), "{raw}");
+    assert!(raw.contains("agent: builder"), "{raw}");
+}

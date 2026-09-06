@@ -38,14 +38,33 @@ Action hotkeys work on both the board (focused card) and the open detail view.
   out. The status bar hint flips between `Q queue` and `Q unqueue`; a task with
   a live session cannot be queued
 - `n`: New task — always created in To Do, regardless of the focused column
-- `s`: Open Project Settings from Board or Detail: project name, default agent
-  settings (backend/model/effort/persona) through a nested launcher, dark/light
-  theme, task sorting, and the whole `orchestration:` block (queue switch, the
-  four cap groups, crash-restart schedule, designer and reviewer bots, each with
-  its own nested agent-settings launcher), plus a read-only Worktree isolation row
-  (`available`, or `unavailable — <reason>`; probed once when the dialog opens,
-  since the probe runs git). On the
-  Projects screen `s` instead opens Global Settings (see "Global Settings").
+- `s`: Open Project Settings from Board or Detail. The dialog is split into
+  four **tabs** — `Common │ Designer │ Reviewer │ Executor` — rendered as a
+  labelled strip with a rule under it. **Left/Right switch tabs** (wrapping at
+  the ends) whenever the focused field does not own those arrows — i.e.
+  everywhere except text inputs, the per-backend cap lists, and the filtered
+  selectors (backend/model/chain-to and the Executor slots); Tab/BackTab keep
+  cycling inside the active tab, and a tab label is also clickable with the
+  mouse. Each tab shows only its own page, but Save/Cancel sit under every
+  tab and persist the **whole** dialog, so switching tabs never loses an
+  edit; a validation error flips to the tab owning the offending field.
+  - **Common**: project name, default agent (nested launcher), theme, task
+    sorting, queue switch, the four cap groups, crash-restart schedule, and
+    the read-only Worktree isolation row (`available`, or
+    `unavailable — <reason>`; probed once when the dialog opens, since the
+    probe runs git)
+  - **Designer**: enable-for-all toggle and the designer bot's nested
+    agent-settings launcher
+  - **Reviewer**: enable-for-all toggle, launcher, where `--changes` verdicts
+    drop the task, and the review bounce cap
+  - **Executor**: the six ordered pool slots (`Middle 1st–3rd`, `Cheap
+    1st–3rd`, filterable `backend/model` selectors annotated with live quota
+    numbers from the limits cache and an `(out of quota)` mark), the resolved
+    `next:` order line, and the two quota floors (`Week %`, `5h %`). See
+    `docs/config.md` (`orchestration.executors`) and `docs/orchestration.md`
+    (Executor Pools).
+  On the Projects screen `s` instead opens Global Settings (see "Global
+  Settings").
 - `e`: Edit task
 - `d` / `Ctrl+d` / `Delete` / `Backspace`: Delete task
 - `m`: Move task

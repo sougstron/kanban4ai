@@ -4,6 +4,7 @@ pub mod config;
 pub mod context;
 pub mod daemon;
 pub mod error;
+pub mod executors;
 pub mod global;
 pub mod graph;
 pub mod http;

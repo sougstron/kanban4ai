@@ -125,6 +125,8 @@ orchestration:
              on_changes_requested: in_progress, max_rounds: 3}
   orchestrator: {max_subtasks: 12, upstream_budget_chars: 4000}
   roles: {}
+  executors: {middle: [], cheap: [], thresholds: {week_percent: 5, five_hour_percent: 15},
+              ask_grace_secs: 60}
 ```
 
 - `queue_enabled`: true - master switch for the dispatcher. Off means nothing
@@ -216,6 +218,57 @@ unknown backend is a warning and falls back to the task's own settings.
 These profile names are a separate namespace from the four bot roles
 (`executor`, `orchestrator`, `designer`, `reviewer`) that `max_running_per_role`
 caps.
+
+### `orchestration.executors`
+
+Limit-aware executor pools: ordered candidate lists the board walks **before**
+launching, so a task starts on a provider that actually has quota instead of
+dying on a 429 and failing over afterwards (that after-the-fact ladder remains
+for runs `orchestration.roles` starts; see `docs/orchestration.md`).
+
+```yaml
+orchestration:
+  executors:
+    middle:                                   # "smart" pool, ordered, max 3
+      - {backend: claude, model: opus, effort: high}
+      - opencode/openai/gpt-5.5
+    cheap:                                    # working pool, ordered, max 3
+      - claude/haiku
+      - opencode/zai/glm-4.7
+    thresholds: {week_percent: 5, five_hour_percent: 15}
+    ask_grace_secs: 60                        # added to the earliest reset
+```
+
+- `middle`: [] - up to three ordered candidates. Opt-in: a task only uses it
+  with `role_profile: middle` (the orchestrator's plan can assign that
+  profile). "Middle" is the smart pool — the same roster resolves designer and
+  reviewer launches when their bot settings opt in through it
+- `cheap`: [] - up to three ordered candidates. This is the executor default:
+  any queued task whose launch settings are indistinguishable from the board
+  defaults (the human left backend/model on Default) resolves through it. An
+  explicit per-task assignment always wins — the pool never overrides a model
+  the user picked
+- `thresholds.week_percent`: 5 - minimum *remaining* percentage a provider's
+  weekly window must show (inclusive boundary) for a candidate to pass
+- `thresholds.five_hour_percent`: 15 - the same floor for 5h windows; every
+  other window label (24h, mon, rolling) uses `week_percent` as its floor
+- `ask_grace_secs`: 60 - added to the earliest provider reset when every
+  candidate is blocked: the task wakes one minute after quota returns
+
+Entries accept both `roles` spellings (`claude/haiku` shorthand or
+`{backend:, model:, effort:}`); a hand-written `effort:`/`agent:` on an entry
+the settings dialog did not change is preserved when the dialog rewrites the
+pool. Validation: more than three entries in a pool is a config error; an
+entry naming an unknown backend is a **warning** that drops the entry (same
+policy as `roles`); thresholds must be 0..=100 and `ask_grace_secs` >= 0.
+
+When every candidate in the pool is below its floor the queued task parks at
+the earliest reset plus `ask_grace_secs` (no crash-restart cost) and the board
+asks one question offering the other configured providers — whoever wins
+first (an answer or the deadline) runs the task; see
+**Executor pools** in `docs/orchestration.md`. The gate reads the cached
+limits snapshot only (`docs/limits.md`): a provider with no cached numbers is
+treated as usable, never as exhausted.
 
 ## Agent Backends (.kanban/config.yaml `agents:`)
 Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. Create/save with Default selected snapshots those resolved values onto the task so the detail view and stats see a concrete backend/model/effort/agent (provider is the model id's slash prefix). The `agents:` map defines one entry per backend:

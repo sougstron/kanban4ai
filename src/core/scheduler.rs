@@ -16,7 +16,7 @@ use crate::agent::{resolve_launch_settings, upcoming_run_plan};
 use crate::core::config::{BoardConfig, OrchestrationSettings};
 use crate::core::error::Result;
 use crate::core::models::{Role, RunPhase, TaskStatus};
-use crate::core::operations::{Operations, safe_session_component, sort_tasks};
+use crate::core::operations::{Operations, PoolOutcome, safe_session_component, sort_tasks};
 use crate::core::session::{SessionManager, SessionState};
 use crate::core::stats;
 use crate::core::timefmt;
@@ -197,7 +197,10 @@ const MAX_CRASH_RESTART_DELAY_HOURS: i64 = 24;
 
 /// A crash-supplied restart deadline as an actual deadline: never sooner than
 /// a minute out, never further than [`MAX_CRASH_RESTART_DELAY_HOURS`].
-fn usable_deadline(deadline: NaiveDateTime, now: NaiveDateTime) -> Option<NaiveDateTime> {
+pub(crate) fn usable_deadline(
+    deadline: NaiveDateTime,
+    now: NaiveDateTime,
+) -> Option<NaiveDateTime> {
     let floor = now.checked_add_signed(chrono::Duration::minutes(1))?;
     let ceiling = now.checked_add_signed(chrono::Duration::hours(MAX_CRASH_RESTART_DELAY_HOURS))?;
     (deadline <= ceiling).then(|| deadline.max(floor))
@@ -308,7 +311,7 @@ impl Operations {
         let session_mgr = self.session_manager();
         let new_session_id = {
             let _guard = self.storage.lock()?;
-            let Some(mut task) = self.storage.load_task(task_id)? else {
+            let Some(task) = self.storage.load_task(task_id)? else {
                 return Ok(None);
             };
             if task.status != TaskStatus::InProgress || task.run_phase != Some(RunPhase::Queued) {
@@ -324,6 +327,17 @@ impl Operations {
             {
                 return Ok(None);
             }
+            // Pre-flight executor-pool gate, inside the claim's locked
+            // read-modify-write: the chosen candidate is persisted with the
+            // claim, so a concurrent pump can never pick a different one.
+            let mut claimed = task;
+            if let PoolOutcome::Parked { .. } = self.apply_executor_pool(&mut claimed)? {
+                // Every candidate out of quota: persist the park (and its
+                // one board question) and leave the task queued.
+                self.storage.save_task(&claimed)?;
+                return Ok(None);
+            }
+            let mut task = claimed;
             // Concurrent pumps (TUI tick + daemon) serialize here: re-measure
             // so a claim that just filled the last slot is visible.
             let orch = self.config.get_orchestration()?;
@@ -383,6 +397,18 @@ impl Operations {
                 continue;
             };
             if restart_at > now {
+                continue;
+            }
+            // A task parked by the executor-pool gate carries an open
+            // `kanban:executor-pool` question; its deadline re-runs the pool
+            // walk and must not charge the crash budget. This ladder is for
+            // crashed runs only.
+            if self.open_executor_pool_question(&task.id)?.is_some() {
+                task.restart_at = None;
+                task.run_phase = Some(RunPhase::Queued);
+                task.updated_at = now;
+                self.storage.save_task(&task)?;
+                due.push(task.id);
                 continue;
             }
             stats::record_exit(&self.storage.project_path, &task.id, stats::Phase::Retry);
@@ -543,6 +569,7 @@ impl Operations {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::config::ExecutorPools;
     use crate::core::config::{BotSettings, OnChangesRequested, ReviewerSettings};
 
     /// A crash-supplied deadline is used as-is inside the sane range, floored
@@ -578,6 +605,7 @@ mod tests {
             max_running_per_role: role.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             auto_restart_enabled: false,
             auto_restart_delays_minutes: Vec::new(),
+            executors: ExecutorPools::default(),
             designer: BotSettings {
                 enabled: false,
                 backend: None,
