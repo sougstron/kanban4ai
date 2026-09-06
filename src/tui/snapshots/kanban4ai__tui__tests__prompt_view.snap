@@ -2,7 +2,7 @@
 source: src/tui/tests.rs
 expression: render_snapshot(&mut app)
 ---
-┌ Prompt · TASK-001 · ↑/↓ PgUp/PgDn scroll · q back ───────────────────────────────────────────┐
+┌ Prompt · TASK-001 · ↑/↓ PgUp/PgDn scroll · Shift x3 · Ctrl x10 · q back ─────────────────────┐
 │PROMPT-MARKER assembled body                                                                  │
 │second line                                                                                   │
 │                                                                                              │
@@ -29,7 +29,7 @@ expression: render_snapshot(&mut app)
 │                                                                                              │
 │                                                                                              │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
- Prompt · TASK-001 │ ↑/↓ PgUp/PgDn scroll · q back                                              
+ Prompt · TASK-001 │ ↑/↓ PgUp/PgDn scroll · Shift x3 · Ctrl x10 · q back                        
 
 --- style runs ---
 0:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

@@ -6800,6 +6800,54 @@ fn prompt_viewer_wraps_long_lines() {
     );
 }
 
+/// Speedup scrolling in the text pager (the stats/prompt/inputs viewers):
+/// plain arrows move one row, Shift+arrows three, Ctrl+arrows ten.
+#[test]
+fn text_pager_arrow_scroll_steps() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Scroll task"))
+        .expect("create task");
+
+    let session_id = "ses-scroll-1";
+    let mut stored = app.ops.get_task(&task.id).unwrap().unwrap();
+    stored.session = Some(session_id.to_string());
+    app.ops.storage.save_task(&stored).expect("save session");
+    let body: String = (0..60).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(
+        dir.path()
+            .join(".kanban/logs")
+            .join(format!("{session_id}.prompt.txt")),
+        body,
+    )
+    .expect("write prompt dump");
+
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Char('p')))
+        .expect("view prompt");
+    assert_eq!(app.screen, Screen::TextView);
+
+    let scroll = |app: &App| app.text_view.as_ref().expect("view").scroll;
+    app.handle_key(key(KeyCode::Down)).expect("plain down");
+    assert_eq!(scroll(&app), 1);
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+        .expect("shift down");
+    assert_eq!(scroll(&app), 4);
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL))
+        .expect("ctrl down");
+    assert_eq!(scroll(&app), 14);
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL))
+        .expect("ctrl up");
+    assert_eq!(scroll(&app), 4);
+    app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT))
+        .expect("shift up");
+    assert_eq!(scroll(&app), 1);
+    app.handle_key(key(KeyCode::Up)).expect("plain up");
+    assert_eq!(scroll(&app), 0);
+}
+
 /// A task with neither a prompt dump nor provenance hides both viewer buttons.
 #[test]
 fn viewer_buttons_absent_without_prompt_or_provenance() {

@@ -225,7 +225,7 @@ pub fn render_text_view(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     };
     let title = format!(
-        " {} · ↑/↓ PgUp/PgDn scroll · q back ",
+        " {} · ↑/↓ PgUp/PgDn scroll · Shift x3 · Ctrl x10 · q back ",
         truncate_display(&sanitize_terminal_text(&view.title), 60)
     );
     let lines = view
