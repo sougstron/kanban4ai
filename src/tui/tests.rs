@@ -5655,6 +5655,60 @@ fn running_card_and_sessions_show_live_telemetry() {
 }
 
 #[test]
+fn live_design_and_review_cards_show_the_role_running_row() {
+    for (phase, badge, color) in [
+        (RunPhase::Design, "✎ design", "Rgb(106, 153, 255)"),
+        (RunPhase::Review, "⚖ review", "Rgb(210, 95, 180)"),
+    ] {
+        let (dir, mut app) = app_with_board();
+        let mut running = app.ops.create_task(NewTask::titled("Palette")).unwrap();
+        SessionManager::new(dir.path())
+            .link_session(&running.id, "ses-pal")
+            .unwrap();
+        running.session = Some("ses-pal".to_string());
+        running.agent_backend = Some("claude".to_string());
+        running.run_phase = Some(phase);
+        app.ops.storage.save_task(&running).unwrap();
+        // Same claude transcript as the executor telemetry test: tokens and a
+        // last-tool line, no todos.
+        let transcript = dir.path().join(".kanban/logs/ses-pal.transcript.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","message":{"usage":{"input_tokens":12000,"output_tokens":400},"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/x.rs"}}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+        app.tick().unwrap();
+
+        let board = render_at(&mut app, 120, 18);
+        assert!(board.contains(badge), "phase badge:\n{board}");
+        // The badge names the phase, so "▶ running" can only come from the
+        // dedicated role-colored row under it.
+        assert!(board.contains("▶ running"), "running row:\n{board}");
+        assert!(board.contains("12.4k"), "tokens:\n{board}");
+        assert!(board.contains(color), "role color:\n{board}");
+        // Title + badge + running row + stats + activity.
+        assert_eq!(super::card::card_line_count(&app, &running), 5);
+    }
+
+    // An executor run keeps the badge-only card: no extra row, and without a
+    // transcript no telemetry rows either.
+    let (dir, mut app) = app_with_board();
+    let mut running = app.ops.create_task(NewTask::titled("Executor")).unwrap();
+    SessionManager::new(dir.path())
+        .link_session(&running.id, "ses-exec")
+        .unwrap();
+    running.session = Some("ses-exec".to_string());
+    app.ops.storage.save_task(&running).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    assert_eq!(super::card::card_line_count(&app, &running), 2);
+}
+
+#[test]
 fn phase_three_mark_review_done_reconfirms_when_source_set_changes() {
     let (_dir, mut app) = app_with_board();
     let first = app.ops.create_task(NewTask::titled("First")).unwrap();
@@ -9054,9 +9108,11 @@ fn live_design_session_shows_the_design_badge() {
         output.contains("✎ design"),
         "design badge missing:\n{output}"
     );
+    // TASK-300: a live design session now also gets the role-colored
+    // "▶ running" row under the phase badge (the badge keeps naming the phase).
     assert!(
-        !output.contains("▶ running"),
-        "design phase must override the run label:\n{output}"
+        output.contains("▶ running"),
+        "design phase must still show the running row:\n{output}"
     );
 }
 
