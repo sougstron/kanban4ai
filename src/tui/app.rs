@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{
 };
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
-use ratatui_textarea::{TextArea, WrapMode};
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use serde_yaml_ng::{Mapping, Value};
 use unicode_width::UnicodeWidthStr;
 
@@ -167,6 +167,8 @@ pub enum HitAction {
     DetailAnswerOption {
         index: usize,
     },
+    DetailPrevQuestion,
+    DetailNextQuestion,
     DetailThread,
     /// A tab label inside the project settings dialog.
     ModalTab(SettingsTab),
@@ -1197,8 +1199,6 @@ impl App {
                 }
             }
             KeyCode::Enter => self.submit_detail_answer()?,
-            KeyCode::Left => self.switch_detail_question(-1),
-            KeyCode::Right => self.switch_detail_question(1),
             KeyCode::Up => self.move_detail_variant(-1),
             KeyCode::Down => self.move_detail_variant(1),
             _ => {
@@ -1648,6 +1648,8 @@ impl App {
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
                 | HitAction::DetailAnswerOption { .. }
+                | HitAction::DetailPrevQuestion
+                | HitAction::DetailNextQuestion
                 | HitAction::DetailEdits,
             ) => shift,
             Some(
@@ -1842,6 +1844,8 @@ impl App {
                 | HitAction::ModalButton(_)
                 | HitAction::ModalTab(_)
                 | HitAction::DetailAnswerOption { .. }
+                | HitAction::DetailPrevQuestion
+                | HitAction::DetailNextQuestion
                 | HitAction::DetailEdits
                 | HitAction::DetailThread
                 | HitAction::FocusProject { .. },
@@ -1875,6 +1879,14 @@ impl App {
                     detail.variant_selected = index;
                 }
                 self.set_detail_focus(DetailFocus::Answer);
+                Ok(())
+            }
+            Some(HitAction::DetailPrevQuestion) => {
+                self.switch_detail_question(-1);
+                Ok(())
+            }
+            Some(HitAction::DetailNextQuestion) => {
+                self.switch_detail_question(1);
                 Ok(())
             }
             // Column areas only steer wheel targeting for now; clicking the
@@ -2001,6 +2013,8 @@ impl App {
                 | HitAction::ModalButton(_)
                 | HitAction::ModalTab(_)
                 | HitAction::DetailAnswerOption { .. }
+                | HitAction::DetailPrevQuestion
+                | HitAction::DetailNextQuestion
                 | HitAction::DetailEdits
                 | HitAction::DetailThread
                 | HitAction::FocusProject { .. },
@@ -4518,7 +4532,7 @@ impl App {
         if apply_word_edit(&mut detail.review_edits, key) {
             return;
         }
-        detail.review_edits.input(key);
+        input_multiline(&mut detail.review_edits, key);
     }
 
     /// Persist the review-edits buffer. Saving no longer re-runs the agent —
@@ -5713,6 +5727,23 @@ fn input_single_line(textarea: &mut TextArea<'static>, key: KeyEvent) {
         return;
     }
     textarea.input(key);
+}
+
+/// Feed a multiline textarea, then rescue the cursor at the vertical ends:
+/// with soft wrap enabled `Up` on the first visual row and `Down` on the
+/// last are no-ops, so they jump to the line start/end instead. Mid-text
+/// `Up`/`Down` always moves the cursor (wrap steps change the column), and
+/// re-hitting the key after the jump is an idempotent no-op.
+pub(super) fn input_multiline(textarea: &mut TextArea<'static>, key: KeyEvent) {
+    let before = textarea.cursor();
+    textarea.input(key);
+    if textarea.cursor() == before {
+        match key.code {
+            KeyCode::Up => textarea.move_cursor(CursorMove::Head),
+            KeyCode::Down => textarea.move_cursor(CursorMove::End),
+            _ => {}
+        }
+    }
 }
 
 /// Keys that belong to a focused textarea (typing and cursor movement),

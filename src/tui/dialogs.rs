@@ -1227,7 +1227,7 @@ impl ModalState {
             DialogField::Title => input_single_line(&mut self.title, key),
             DialogField::Description => {
                 if !super::app::apply_word_edit(&mut self.description, key) {
-                    self.description.input(key);
+                    super::app::input_multiline(&mut self.description, key);
                 }
             }
             DialogField::Backend => self.input_select(key, SelectorKind::Backend),
@@ -1261,9 +1261,7 @@ impl ModalState {
             DialogField::MessageKind => self.input_select(key, SelectorKind::MessageKind),
             DialogField::Question => self.input_select(key, SelectorKind::Question),
             DialogField::Variant => self.input_select(key, SelectorKind::Variant),
-            DialogField::Answer => {
-                self.answer.input(key);
-            }
+            DialogField::Answer => super::app::input_multiline(&mut self.answer, key),
             DialogField::Theme => self.input_select(key, SelectorKind::Theme),
             DialogField::TaskSort => self.input_select(key, SelectorKind::TaskSort),
             DialogField::HideKanbanMessages => toggle_on_space(&mut self.hide_kanban_messages, key),
@@ -1279,11 +1277,11 @@ impl ModalState {
                 input_single_line(&mut self.max_running_executor, key)
             }
             DialogField::MaxRunningPerBackend => {
-                self.max_running_per_backend.input(key);
+                super::app::input_multiline(&mut self.max_running_per_backend, key);
             }
             DialogField::MaxRunningPerBackendModel => {
                 self.maybe_prefix_backend_model_cap(&key);
-                self.max_running_per_backend_model.input(key);
+                super::app::input_multiline(&mut self.max_running_per_backend_model, key);
             }
             DialogField::AutoRestartEnabled => toggle_on_space(&mut self.auto_restart_enabled, key),
             DialogField::AutoRestartDelays => input_single_line(&mut self.auto_restart_delays, key),
@@ -2851,7 +2849,7 @@ fn selector_form_rows_from_scroll(
         .iter_mut()
         .find(|(field, _)| *field == DialogField::Description)
     {
-        let growth = (10 - *height).min(surplus);
+        let growth = (15 - *height).min(surplus);
         *height += growth;
         surplus -= growth;
     }
@@ -2900,14 +2898,15 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::ExecutorWeekThreshold
         | DialogField::ExecutorFiveHourThreshold
         | DialogField::IsolationStatus => 3,
-        DialogField::Description
-        | DialogField::MaxRunningPerBackend
-        | DialogField::MaxRunningPerBackendModel => 5,
+        DialogField::Description => 5,
+        DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel => 5,
+        // The chain selector always shows its filter and the "No chain"
+        // entry, so two content rows already cover an empty board.
+        DialogField::ChainTo => 4,
         // Filterable selectors spend a row on the filter input, so they need
         // one more line to still show two options.
         DialogField::Backend
         | DialogField::Model
-        | DialogField::ChainTo
         | DialogField::DesignerBackend
         | DialogField::DesignerModel
         | DialogField::ReviewerBackend
@@ -2923,13 +2922,20 @@ fn task_field_min_height(field: DialogField) -> u16 {
 }
 
 fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
+    if field == DialogField::Description {
+        return 15;
+    }
     if matches!(
         field,
-        DialogField::Description
-            | DialogField::MaxRunningPerBackend
-            | DialogField::MaxRunningPerBackendModel
+        DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel
     ) {
         return 10;
+    }
+    if field == DialogField::ChainTo {
+        // Filter + borders + one row per candidate, capped so a long chain
+        // list never crowds out the description; the filter finds tasks by
+        // number instead.
+        return modal.chain_options.len().saturating_add(3).clamp(4, 8) as u16;
     }
     let chrome = if modal.field_filter(field).is_some() {
         3

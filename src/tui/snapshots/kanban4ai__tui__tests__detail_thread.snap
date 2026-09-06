@@ -21,7 +21,7 @@ expression: render_snapshot(&mut app)
 │Variants: Fast path | Safe path                                                               █
 │                                                                                              █
 └──────────────────────────────────────────────────────────────────────────────────────────────▼
-┌ Answer question 1/1 · ←→ question · ↑↓ variant · Enter send ─────────────────────────────────┐
+┌ Answer question 1/1 · ↑↓ variant · Enter send ───────────────────────────────────────────────┐
 │Choose a route?                                                                               │
 │› Custom answer: (type to fill)                                                               │
 │  1. Fast path                                                                                │

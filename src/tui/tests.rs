@@ -122,7 +122,7 @@ fn task_description_height_is_bounded_and_other_editors_remain_unwrapped() {
     let _ = render_at(&mut app, 120, 80);
 
     let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
-    assert_eq!(description.height, 10);
+    assert_eq!(description.height, 15);
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.description.wrap_mode(), WrapMode::WordOrGlyph);
     assert_eq!(modal.title.wrap_mode(), WrapMode::None);
@@ -146,12 +146,38 @@ fn constrained_task_form_keeps_description_and_buttons_separate() {
 
     let _ = render_at(&mut app, 60, 18);
     let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
-    assert!((5..=10).contains(&description.height));
+    assert!((5..=15).contains(&description.height));
     let save = modal_hitbox(&app, HitAction::ModalButton(ModalButton::Save));
     let cancel = modal_hitbox(&app, HitAction::ModalButton(ModalButton::Cancel));
     assert!(!overlaps(description, save));
     assert!(!overlaps(description, cancel));
     let _ = render_at(&mut app, 24, 8);
+}
+
+/// The chain selector stays compact (filter + "No chain" minimum, hard cap
+/// of 8) while the description takes the spare rows up to 15.
+#[test]
+fn chain_selector_height_clamps_and_description_grows_taller() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let _ = render_at(&mut app, 120, 80);
+    let chain = modal_hitbox(&app, HitAction::ModalField(DialogField::ChainTo));
+    assert_eq!(
+        chain.height, 4,
+        "only the filter and the No chain entry remain"
+    );
+    drop(app);
+
+    let (_dir, mut app) = plain_tasks_app(6);
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let _ = render_at(&mut app, 120, 80);
+    let chain = modal_hitbox(&app, HitAction::ModalField(DialogField::ChainTo));
+    assert_eq!(chain.height, 8, "many chain candidates must cap at 8 rows");
+    let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
+    assert_eq!(
+        description.height, 15,
+        "spare rows must grow the description to its cap"
+    );
 }
 
 fn settings_app() -> (tempfile::TempDir, App) {
@@ -1735,6 +1761,89 @@ fn description_ctrl_delete_removes_next_word_after_wrap_render() {
     assert_eq!(
         app.modal.as_ref().expect("modal").description.lines(),
         [" foo"]
+    );
+}
+
+/// Up on the first row of a multiline field jumps to the line start and Down
+/// on the last row to the line end, instead of stalling at the boundary.
+#[test]
+fn multiline_up_at_top_and_down_at_bottom_reach_line_edges() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("new task modal")
+        .focus_field(DialogField::Description);
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        modal.description = TextArea::from(["first", "second", "third"]);
+    }
+
+    app.handle_key(key(KeyCode::Down)).expect("down");
+    app.handle_key(key(KeyCode::Down)).expect("down");
+    let cursor = app.modal.as_ref().expect("modal").description.cursor();
+    assert_eq!((cursor.0, cursor.1), (2, 0));
+    app.handle_key(key(KeyCode::Down)).expect("down at bottom");
+    let cursor = app.modal.as_ref().expect("modal").description.cursor();
+    assert_eq!(
+        (cursor.0, cursor.1),
+        (2, 5),
+        "Down on the last row must land on the line end"
+    );
+
+    app.handle_key(key(KeyCode::Up)).expect("up");
+    app.handle_key(key(KeyCode::Up)).expect("up");
+    let cursor = app.modal.as_ref().expect("modal").description.cursor();
+    assert_eq!((cursor.0, cursor.1), (0, 5));
+    app.handle_key(key(KeyCode::Up)).expect("up at top");
+    let cursor = app.modal.as_ref().expect("modal").description.cursor();
+    assert_eq!(
+        (cursor.0, cursor.1),
+        (0, 0),
+        "Up on the first row must land on the line start"
+    );
+}
+
+/// The review editor shares the multiline boundary rescue.
+#[test]
+fn review_editor_up_down_reach_line_edges_too() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Edge arrows"))
+        .expect("task");
+    app.ops.set_review_edits(&task.id, "one\ntwo").unwrap();
+    app.ops.move_task(&task.id, "review", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Tab)).expect("focus editor");
+    app.handle_key(key(KeyCode::End))
+        .expect("end of first line");
+    let cursor = app.detail.as_ref().expect("detail").review_edits.cursor();
+    assert_eq!((cursor.0, cursor.1), (0, 3));
+
+    app.handle_key(key(KeyCode::Down))
+        .expect("down to last row");
+    app.handle_key(key(KeyCode::Home)).expect("line start");
+    app.handle_key(key(KeyCode::Down)).expect("down at bottom");
+    let cursor = app.detail.as_ref().expect("detail").review_edits.cursor();
+    assert_eq!(
+        (cursor.0, cursor.1),
+        (1, 3),
+        "Down on the last row must land on the line end"
+    );
+
+    app.handle_key(key(KeyCode::Up)).expect("up one row");
+    let cursor = app.detail.as_ref().expect("detail").review_edits.cursor();
+    assert_eq!((cursor.0, cursor.1), (0, 3));
+    app.handle_key(key(KeyCode::Up)).expect("up at top");
+    let cursor = app.detail.as_ref().expect("detail").review_edits.cursor();
+    assert_eq!(
+        (cursor.0, cursor.1),
+        (0, 0),
+        "Up on the first row must land on the line start"
     );
 }
 
@@ -6166,30 +6275,45 @@ fn phase_four_scrolled_selector_click_uses_visible_option_index() {
         app.handle_key(key(KeyCode::Down)).unwrap();
     }
     assert_eq!(app.modal.as_ref().unwrap().chain_selected, 4);
-    let expected = app.modal.as_ref().unwrap().chain_options[3].value.clone();
 
     let _ = render_at(&mut app, 80, 24);
-    let first_visible = app
+    // The chain row is capped small at this size, so the list is scrolled:
+    // clicking the single visible option must map the visible row back to
+    // its absolute option index.
+    let visible = app
         .hitboxes
         .iter()
         .find(|hitbox| {
-            hitbox.action
-                == HitAction::ModalOption {
+            matches!(
+                hitbox.action,
+                HitAction::ModalOption {
                     field: DialogField::ChainTo,
-                    index: 3,
+                    ..
                 }
+            )
         })
         .copied()
-        .expect("first visible scrolled option");
+        .expect("visible scrolled option");
+    let HitAction::ModalOption {
+        field: DialogField::ChainTo,
+        index: visible_index,
+    } = visible.action
+    else {
+        unreachable!("matched above");
+    };
+    assert_ne!(visible_index, 0, "the selector must be scrolled");
+    let expected = app.modal.as_ref().unwrap().chain_options[visible_index]
+        .value
+        .clone();
     app.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: first_visible.area.x,
-        row: first_visible.area.y,
+        column: visible.area.x,
+        row: visible.area.y,
         modifiers: KeyModifiers::NONE,
     })
     .unwrap();
     let modal = app.modal.as_ref().unwrap();
-    assert_eq!(modal.chain_selected, 3);
+    assert_eq!(modal.chain_selected, visible_index);
     assert_eq!(modal.chain_text(), expected);
 }
 
@@ -6647,6 +6771,107 @@ fn review_editor_shift_and_alt_enter_break_lines() {
             .join("\n"),
         "abcdef\ns\na"
     );
+}
+
+/// In the detail answer panel ←/→ move the custom-answer caret; switching
+/// questions happens through the explicit prev/next buttons only.
+#[test]
+fn detail_answer_arrows_edit_text_and_buttons_switch_questions() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Two questions"))
+        .expect("task");
+    app.ops
+        .ask_question(&task.id, "First?", "agent", vec!["one".to_string()])
+        .expect("first question");
+    app.ops
+        .ask_question(
+            &task.id,
+            "Second?",
+            "agent",
+            vec!["alpha".to_string(), "beta".to_string()],
+        )
+        .expect("second question");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Tab)).expect("focus answer");
+    assert_eq!(
+        app.detail.as_ref().expect("detail state").focus,
+        DetailFocus::Answer
+    );
+
+    for character in "hello world".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("type answer");
+    }
+    app.handle_key(key(KeyCode::Left)).expect("left");
+    app.handle_key(key(KeyCode::Left)).expect("left");
+    let detail = app.detail.as_ref().expect("detail state");
+    assert_eq!(detail.answer_input.lines(), ["hello world"]);
+    let cursor = detail.answer_input.cursor();
+    assert_eq!((cursor.0, cursor.1), (0, 9), "← moves the answer caret");
+    assert_eq!(detail.question_index, 0, "← must not switch questions");
+    assert_eq!(detail.variant_selected, 0);
+    app.handle_key(key(KeyCode::Home)).expect("home");
+    let cursor = app
+        .detail
+        .as_ref()
+        .expect("detail state")
+        .answer_input
+        .cursor();
+    assert_eq!((cursor.0, cursor.1), (0, 0));
+    assert_eq!(app.detail.as_ref().expect("detail state").question_index, 0);
+
+    // Only "next question >" is offered on the first question, and clicking
+    // it swaps to the second question with a fresh answer draft.
+    let _ = render_snapshot(&mut app);
+    assert!(
+        !app.hitboxes
+            .iter()
+            .any(|hitbox| hitbox.action == HitAction::DetailPrevQuestion),
+        "previous is disabled on the first question"
+    );
+    let next = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::DetailNextQuestion)
+        .copied()
+        .expect("next question button");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: next.area.x,
+        row: next.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("click next question");
+    let detail = app.detail.as_ref().expect("detail state");
+    assert_eq!(detail.question_index, 1);
+    assert!(detail.answer_input.lines()[0].is_empty(), "draft resets");
+    assert_eq!(detail.variant_selected, 0);
+
+    // On the last question only "< previous question" remains.
+    let _ = render_snapshot(&mut app);
+    assert!(
+        !app.hitboxes
+            .iter()
+            .any(|hitbox| hitbox.action == HitAction::DetailNextQuestion),
+        "next is disabled on the last question"
+    );
+    let prev = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::DetailPrevQuestion)
+        .copied()
+        .expect("previous question button");
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: prev.area.x,
+        row: prev.area.y,
+        modifiers: KeyModifiers::NONE,
+    })
+    .expect("click previous question");
+    assert_eq!(app.detail.as_ref().expect("detail state").question_index, 0);
 }
 
 /// The description title names Enter as the newline key so a terminal that
@@ -9428,4 +9653,35 @@ fn project_settings_shows_isolation_availability() {
     );
     assert!(output.contains("unavailable"), "{output}");
     insta::assert_snapshot!("settings_isolation_status", output);
+}
+
+/// The one-row custom answer preview windows its tail so the text cursor
+/// stays visible on long answers instead of being truncated away.
+#[test]
+fn answer_preview_windows_to_keep_the_cursor_visible() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Long answer"))
+        .expect("task");
+    app.ops
+        .ask_question(&task.id, "Only?", "agent", vec![])
+        .expect("ask");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Tab)).expect("focus answer");
+    // 60 chars: wider than the 50-column panel's 31-column answer area.
+    for character in "headmark zzzzzzzzzz zzzzzzzzzz zzzzzzzzzz zzzzzzzzzz tailmark".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("type answer");
+    }
+    let rendered = render_at(&mut app, 50, 24);
+    assert!(
+        rendered.contains("tailmark"),
+        "cursor end must stay visible: {rendered}"
+    );
+    assert!(
+        !rendered.contains("headmark"),
+        "the overflowed head must be scrolled off: {rendered}"
+    );
 }

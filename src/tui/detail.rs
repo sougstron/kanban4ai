@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::core::models::{
     IntegrationState, Message, MessageKind, MessageStatus, Task, TaskStatus,
@@ -67,7 +67,10 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let meta_height = 6 + meta_extra_lines;
     let answer_height = if show_answer {
         let question = &open_questions[detail.question_index.min(open_questions.len() - 1)];
-        let desired = 4 + question.variants.len() as u16 + 1;
+        // Two more rows when several questions are open: the prev/next
+        // question button row pinned under the variants.
+        let switch_rows = if open_questions.len() > 1 { 2 } else { 0 };
+        let desired = 4 + question.variants.len() as u16 + 1 + switch_rows;
         let reserved = meta_height
             .saturating_add(if show_edits { 6 } else { 0 })
             .saturating_add(1)
@@ -385,14 +388,34 @@ fn render_answer_panel(
     open_questions: &[Message],
     area: Rect,
 ) {
-    let (focused, index, input_text, selected, question_body, variants) = {
+    let (focused, index, input_text, cursor_col, selected, question_body, variants) = {
         let detail = app.detail.as_ref().unwrap();
         let index = detail.question_index.min(open_questions.len() - 1);
         let question = &open_questions[index];
+        let lines = detail.answer_input.lines();
+        let cursor = detail.answer_input.cursor();
+        let (row, col) = (cursor.0, cursor.1);
+        // Display column of the text cursor inside the single-line preview:
+        // every preceding line contributes its width plus the ` ` joiner.
+        let cursor_col = lines
+            .iter()
+            .take(row)
+            .map(|line| UnicodeWidthStr::width(line.as_str()) + 1)
+            .sum::<usize>()
+            + lines
+                .get(row)
+                .map(|line| {
+                    line.chars()
+                        .take(col)
+                        .map(|c| c.width().unwrap_or(0))
+                        .sum::<usize>()
+                })
+                .unwrap_or(0);
         (
             detail.focus == DetailFocus::Answer,
             index,
-            sanitize_terminal_text(&detail.answer_input.lines().join(" ")),
+            sanitize_terminal_text(&lines.join(" ")),
+            cursor_col,
             detail.variant_selected,
             sanitize_terminal_text(&question.body),
             question.variants.clone(),
@@ -400,14 +423,19 @@ fn render_answer_panel(
     };
 
     let title = format!(
-        " Answer question {}/{} · ←→ question · ↑↓ variant · Enter send ",
+        " Answer question {}/{} · ↑↓ variant · Enter send ",
         index + 1,
         open_questions.len()
     );
+    // The preview is one terminal row, so long answers scroll a window that
+    // keeps the text cursor visible instead of hiding it past the truncation.
+    let content_width = area.width.saturating_sub(19) as usize;
+    let window_start = cursor_col.saturating_sub(content_width.saturating_sub(1));
+    let display_text = width_slice_from(&input_text, window_start);
     let custom_label = if input_text.is_empty() {
         "Custom answer: (type to fill)".to_string()
     } else {
-        format!("Custom answer: {input_text}")
+        format!("Custom answer: {display_text}")
     };
     let mut options = vec![option_line(
         &custom_label,
@@ -428,11 +456,15 @@ fn render_answer_panel(
             theme,
         ));
     }
+    let show_switch = open_questions.len() > 1;
     let mut lines = vec![Line::from(Span::styled(
         question_body,
         Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
     ))];
-    let visible_options = area.height.saturating_sub(3).max(1) as usize;
+    let visible_options = area
+        .height
+        .saturating_sub(3 + u16::from(show_switch))
+        .max(1) as usize;
     let max_start = options.len().saturating_sub(visible_options);
     let start = selected
         .saturating_add(1)
@@ -490,16 +522,115 @@ fn render_answer_panel(
             .style(Style::default().bg(theme.bg).fg(theme.fg)),
         area,
     );
+    if show_switch {
+        render_question_switch_buttons(app, frame, theme, area, index, open_questions.len());
+    }
     if focused && selected == 0 && start == 0 {
-        let cursor_x = area.x.saturating_add(3).saturating_add(
-            UnicodeWidthStr::width("Custom answer: ") as u16
-                + UnicodeWidthStr::width(input_text.as_str()) as u16,
-        );
+        let cursor_x = area
+            .x
+            .saturating_add(3)
+            .saturating_add(UnicodeWidthStr::width("Custom answer: ") as u16)
+            .saturating_add((cursor_col - window_start) as u16);
         frame.set_cursor_position((
             cursor_x.min(area.x.saturating_add(area.width.saturating_sub(2))),
             area.y.saturating_add(2),
         ));
     }
+}
+
+/// The `< previous question` / `next question >` row pinned to the bottom of
+/// the answer panel. Question switching lives here because ←/→ belong to the
+/// custom answer text while that panel is focused.
+fn render_question_switch_buttons(
+    app: &mut App,
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    area: Rect,
+    index: usize,
+    count: usize,
+) {
+    let prev_label = "< previous question";
+    let next_label = "next question >";
+    let prev_enabled = index > 0;
+    let next_enabled = index + 1 < count;
+    let switch_style = |enabled: bool, hovered: bool| {
+        if !enabled {
+            Style::default().fg(theme.muted)
+        } else if hovered {
+            Style::default()
+                .fg(theme.focus)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.focus)
+        }
+    };
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(area.height.saturating_sub(2)),
+        width: area.width.saturating_sub(2),
+        height: 1,
+    };
+    let gap = inner
+        .width
+        .saturating_sub((prev_label.len() + next_label.len()) as u16)
+        .max(2);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                prev_label,
+                switch_style(prev_enabled, app.is_hovered(HitAction::DetailPrevQuestion)),
+            ),
+            Span::raw(" ".repeat(gap as usize)),
+            Span::styled(
+                next_label,
+                switch_style(next_enabled, app.is_hovered(HitAction::DetailNextQuestion)),
+            ),
+        ])),
+        inner,
+    );
+    if prev_enabled {
+        app.hitboxes.insert(
+            0,
+            Hitbox {
+                area: Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: prev_label.len() as u16,
+                    height: 1,
+                },
+                action: HitAction::DetailPrevQuestion,
+            },
+        );
+    }
+    if next_enabled {
+        app.hitboxes.insert(
+            0,
+            Hitbox {
+                area: Rect {
+                    x: inner
+                        .x
+                        .saturating_add(inner.width.saturating_sub(next_label.len() as u16)),
+                    y: inner.y,
+                    width: next_label.len() as u16,
+                    height: 1,
+                },
+                action: HitAction::DetailNextQuestion,
+            },
+        );
+    }
+}
+
+/// Subslice of `text` starting at the first char boundary at or after
+/// display-width offset `start_width` (wide chars are never split).
+fn width_slice_from(text: &str, start_width: usize) -> &str {
+    let mut acc = 0;
+    for (offset, ch) in text.char_indices() {
+        if acc >= start_width {
+            return &text[offset..];
+        }
+        acc += ch.width().unwrap_or(0);
+    }
+    ""
 }
 
 fn option_line(
