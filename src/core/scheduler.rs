@@ -226,6 +226,7 @@ impl Operations {
             let _ = self.schedule_crash_restart(&session.task_id, "heartbeat timeout");
         }
         let _ = self.due_restarts()?;
+        let _ = self.due_launches()?;
 
         let orch = self.config.get_orchestration()?;
         if !orch.queue_enabled || !self.auto_launch_enabled()? {
@@ -430,6 +431,36 @@ impl Operations {
                     task.crash_restarts
                 ),
             );
+            due.push(task.id);
+        }
+        Ok(due)
+    }
+
+    /// Hand every To Do task whose `launch_at` has passed to the normal
+    /// queue: [`Self::queue_run`] moves it to In Progress, clears the
+    /// one-shot deadline, and sets phase `queued`; dispatch (not this method)
+    /// starts it, so a planned launch is gated by the same caps as any other
+    /// run. Only To Do is scanned — a task the human already moved on is
+    /// never double-queued.
+    pub fn due_launches(&self) -> Result<Vec<String>> {
+        if !self.queue_can_dispatch()? {
+            // Keep the schedule on the task instead of parking it in a queue
+            // nothing drains; it fires (immediately — the time has passed)
+            // on the first tick after the queue/auto-launch is re-enabled.
+            return Ok(Vec::new());
+        }
+        let now = timefmt::now();
+        let _guard = self.storage.lock()?;
+        let mut due = Vec::new();
+        for task in self.storage.list_tasks(Some("todo"))? {
+            let Some(launch_at) = task.launch_at else {
+                continue;
+            };
+            if launch_at > now {
+                continue;
+            }
+            self.queue_run(&task.id)?;
+            self.post_queue_note(&task.id, "🕐 planned launch — queued by the timer");
             due.push(task.id);
         }
         Ok(due)

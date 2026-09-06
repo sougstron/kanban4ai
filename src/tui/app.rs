@@ -5102,6 +5102,17 @@ impl App {
                     self.modal = Some(modal);
                     return Ok(());
                 }
+                let launch_at = match planned_launch_from_modal(&modal) {
+                    PlannedLaunchInput::None => None,
+                    PlannedLaunchInput::Some(at) => Some(at),
+                    PlannedLaunchInput::Invalid => {
+                        modal.focus_field(DialogField::LaunchTime);
+                        modal.error =
+                            Some("Launch time must be HH:MM (local time), e.g. 09:30".to_string());
+                        self.modal = Some(modal);
+                        return Ok(());
+                    }
+                };
                 let new_task = NewTask {
                     title,
                     description: modal.description_text(),
@@ -5114,6 +5125,7 @@ impl App {
                     use_reviewer: modal.use_reviewer,
                     use_orchestrator: modal.use_orchestrator,
                     chained_to: modal.chain_text(),
+                    launch_at,
                     depends_on: Vec::new(),
                     needs: None,
                     parent_task: None,
@@ -5138,6 +5150,17 @@ impl App {
                     self.modal = Some(modal);
                     return Ok(());
                 }
+                let launch_at = match planned_launch_from_modal(&modal) {
+                    PlannedLaunchInput::None => Some(None),
+                    PlannedLaunchInput::Some(at) => Some(Some(at)),
+                    PlannedLaunchInput::Invalid => {
+                        modal.focus_field(DialogField::LaunchTime);
+                        modal.error =
+                            Some("Launch time must be HH:MM (local time), e.g. 09:30".to_string());
+                        self.modal = Some(modal);
+                        return Ok(());
+                    }
+                };
                 let updated = self.ops.update_task(
                     &task_id,
                     TaskPatch {
@@ -5152,6 +5175,7 @@ impl App {
                         use_reviewer: Some(modal.use_reviewer),
                         use_orchestrator: Some(modal.use_orchestrator),
                         chained_to: Some(modal.chain_text()),
+                        launch_at,
                         ..Default::default()
                     },
                 )?;
@@ -5826,6 +5850,26 @@ fn executor_option_index(modal: &ModalState, key: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// The planned-launch fields of an open task form, validated.
+enum PlannedLaunchInput {
+    /// Checkbox off: no schedule (an edit clears any pending one).
+    None,
+    /// Checkbox on with a valid HH:MM: the next local occurrence.
+    Some(chrono::NaiveDateTime),
+    /// Checkbox on with an empty or unparseable time: keep the dialog open.
+    Invalid,
+}
+
+fn planned_launch_from_modal(modal: &ModalState) -> PlannedLaunchInput {
+    if !modal.planned_launch {
+        return PlannedLaunchInput::None;
+    }
+    match timefmt::parse_hhmm(&modal.launch_time_text()) {
+        Some(time) => PlannedLaunchInput::Some(timefmt::next_launch_at(time)),
+        None => PlannedLaunchInput::Invalid,
+    }
+}
+
 /// Whether a dialog field already owns Left/Right: a text caret or a
 /// filtered selector (where Left/Right move the selection). On those the
 /// settings tab strip must not steal the arrows.
@@ -5848,6 +5892,7 @@ fn field_consumes_horizontal(field: DialogField) -> bool {
             | DialogField::Backend
             | DialogField::Model
             | DialogField::ChainTo
+            | DialogField::LaunchTime
             | DialogField::DesignerBackend
             | DialogField::DesignerModel
             | DialogField::ReviewerBackend
@@ -6001,6 +6046,8 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::UseOrchestrator
         | DialogField::UseDesigner
         | DialogField::UseReviewer
+        | DialogField::PlannedLaunch
+        | DialogField::LaunchTime
         | DialogField::EscapeToProjects
         | DialogField::Answer
         | DialogField::Confirm

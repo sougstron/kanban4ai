@@ -395,6 +395,17 @@ pub struct Task {
         skip_serializing_if = "Option::is_none"
     )]
     pub restart_at: Option<NaiveDateTime>,
+    /// One-shot scheduled launch time (naive local, hour/minute resolution).
+    /// While the task sits in To Do past this moment the timer pump hands it
+    /// to the queue and clears the field; re-scheduling means editing it
+    /// again. Omitted while unset so legacy boards round-trip
+    /// byte-identically.
+    #[serde(
+        default,
+        with = "timefmt::serde_naive_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub launch_at: Option<NaiveDateTime>,
     /// Consecutive bot-review rounds consumed for this task. Capped by
     /// `orchestration.reviewer.max_rounds`; exhausting it falls through to
     /// human Review. Reset on a human restart. Omitted while zero.
@@ -477,6 +488,7 @@ impl Task {
             run_phase: None,
             crash_restarts: 0,
             restart_at: None,
+            launch_at: None,
             review_rounds: 0,
             designed: false,
             worktree: None,

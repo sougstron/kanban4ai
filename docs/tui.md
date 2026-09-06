@@ -237,8 +237,13 @@ saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
 row that opens a nested popup for backend, model, effort, and persona; popup
 Save stages those values in the task form and popup Cancel restores the exact
 opening state. They also expose Designer and Reviewer checkboxes (per-task
-opt-in; models and agents come from project settings), and a "Chain to task"
-selector. The TUI no longer exposes the legacy `interactive` switch:
+opt-in; models and agents come from project settings), a "Chain to task"
+selector, and a "Planned launch" checkbox with an HH:MM time field: when the
+checkbox is on the time is required (an empty or invalid value keeps the
+dialog open with an error), and saving stores the next local occurrence of
+that time as `launch_at`, which the queue dispatcher enqueues when it comes
+due (see `docs/orchestration.md`). The card shows a `🕐 HH:MM` badge while the
+schedule is pending, and the detail view lists the full timestamp. The TUI no longer exposes the legacy `interactive` switch:
 TUI-created tasks use `interactive: false`, and TUI edits leave an existing
 value untouched; CLI/YAML compatibility remains. The backend selector leads with
 "Default backend" (model/effort/agent have matching Default entries). Saving

@@ -4295,6 +4295,120 @@ fn queue_run_rejects_a_task_with_a_live_session() {
     assert!(recorder.calls().is_empty());
 }
 
+// ------------------------------------------------------------- planned launch
+
+#[test]
+fn due_launches_queues_a_due_todo_task_and_consumes_the_schedule() {
+    let (dir, ops, recorder) = queue_board("");
+    let task = ops
+        .create_task(NewTask {
+            title: "Launch me".to_string(),
+            launch_at: Some(timefmt::now() - chrono::Duration::minutes(5)),
+            ..NewTask::default()
+        })
+        .unwrap();
+
+    let due = ops.due_launches().unwrap();
+    assert_eq!(due, vec![task.id.clone()]);
+    assert!(
+        recorder.calls().is_empty(),
+        "the timer only queues; dispatch launches"
+    );
+
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_eq!(stored.run_phase, Some(RunPhase::Queued));
+    assert_eq!(stored.launch_at, None, "the one-shot schedule is consumed");
+
+    // A second tick finds nothing left to fire.
+    assert!(ops.due_launches().unwrap().is_empty());
+
+    let thread = ThreadManager::new(dir.path())
+        .unwrap()
+        .load(&task.id)
+        .unwrap();
+    assert!(
+        thread
+            .messages
+            .iter()
+            .any(|m| m.body.contains("planned launch")),
+        "the timer must leave an audit note on the thread"
+    );
+}
+
+#[test]
+fn due_launches_leaves_future_schedules_alone() {
+    let (_dir, ops, _recorder) = queue_board("");
+    let task = ops
+        .create_task(NewTask {
+            title: "Later".to_string(),
+            launch_at: Some(timefmt::now() + chrono::Duration::hours(2)),
+            ..NewTask::default()
+        })
+        .unwrap();
+
+    assert!(ops.due_launches().unwrap().is_empty());
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Todo);
+    assert_eq!(stored.launch_at, task.launch_at);
+}
+
+#[test]
+fn due_launches_is_inert_when_the_queue_cannot_dispatch() {
+    // auto-launch off: nothing would drain the queue, so the schedule stays
+    // on the task and fires on the first tick after re-enable.
+    let (dir, _storage) = common::quiet_board(false);
+    let ops = Operations::new(dir.path());
+    let task = ops
+        .create_task(NewTask {
+            title: "Held".to_string(),
+            launch_at: Some(timefmt::now() - chrono::Duration::minutes(5)),
+            ..NewTask::default()
+        })
+        .unwrap();
+
+    assert!(ops.due_launches().unwrap().is_empty());
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Todo);
+    assert_eq!(stored.launch_at, task.launch_at);
+}
+
+#[test]
+fn due_launches_never_touches_a_task_that_left_to_do() {
+    let (_dir, ops, _recorder) = queue_board("");
+    let task = ops
+        .create_task(NewTask {
+            title: "Already running".to_string(),
+            launch_at: Some(timefmt::now() - chrono::Duration::minutes(5)),
+            ..NewTask::default()
+        })
+        .unwrap();
+    ops.move_task(&task.id, "in_progress", false).unwrap();
+
+    assert!(ops.due_launches().unwrap().is_empty());
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::InProgress);
+    assert_ne!(stored.run_phase, Some(RunPhase::Queued), "no double-queue");
+}
+
+#[test]
+fn queue_run_clears_a_pending_planned_launch() {
+    let (_dir, ops, _recorder) = queue_board("");
+    let task = ops
+        .create_task(NewTask {
+            title: "Manual start".to_string(),
+            launch_at: Some(timefmt::now() + chrono::Duration::hours(2)),
+            ..NewTask::default()
+        })
+        .unwrap();
+
+    let queued = ops.queue_run(&task.id).unwrap().unwrap();
+    assert_eq!(
+        queued.launch_at, None,
+        "an explicit run supersedes the schedule"
+    );
+}
+
 #[test]
 fn queue_can_dispatch_tracks_the_queue_and_auto_launch_switches() {
     let (_dir, ops, _recorder) = queue_board("");

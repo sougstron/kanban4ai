@@ -2,7 +2,7 @@
 //! uses: naive local time, `T` separator, microseconds omitted when zero
 //! (e.g. `2026-07-01T10:13:22.036493` or `2026-06-01T10:00:00`).
 
-use chrono::{NaiveDateTime, Timelike};
+use chrono::{NaiveDateTime, NaiveTime, Timelike};
 
 const FMT: &str = "%Y-%m-%dT%H:%M:%S%.f";
 const FMT_NO_FRAC: &str = "%Y-%m-%dT%H:%M:%S";
@@ -21,6 +21,26 @@ pub fn now() -> NaiveDateTime {
     let now = chrono::Local::now().naive_local();
     now.with_nanosecond(now.nanosecond() / 1000 * 1000)
         .unwrap_or(now)
+}
+
+/// Parse an `HH:MM` time-of-day (the planned-launch field). Seconds are
+/// deliberately not part of the input: the timer compares at minute
+/// resolution.
+pub fn parse_hhmm(value: &str) -> Option<NaiveTime> {
+    NaiveTime::parse_from_str(value.trim(), "%H:%M").ok()
+}
+
+/// Next local occurrence of an `HH:MM` time-of-day: today at that time, or
+/// tomorrow once that moment has already passed (an exact match counts as
+/// passed — a launch typed at its own second is re-armed for tomorrow).
+pub fn next_launch_at(time: NaiveTime) -> NaiveDateTime {
+    let now = now();
+    let today = now.date().and_time(time);
+    if today > now {
+        today
+    } else {
+        today + chrono::Duration::days(1)
+    }
 }
 
 /// Quote timestamp-looking YAML scalars so Python's YAML loader keeps them as
@@ -111,6 +131,54 @@ mod tests {
     fn now_round_trips() {
         let dt = now();
         assert_eq!(parse(&format(&dt)).unwrap(), dt);
+    }
+
+    #[test]
+    fn parses_hhmm_and_rejects_garbage() {
+        assert_eq!(
+            parse_hhmm("09:05"),
+            Some(NaiveTime::from_hms_opt(9, 5, 0).unwrap())
+        );
+        assert_eq!(
+            parse_hhmm(" 23:59 "),
+            Some(NaiveTime::from_hms_opt(23, 59, 0).unwrap())
+        );
+        assert_eq!(parse_hhmm(""), None);
+        assert_eq!(parse_hhmm("24:00"), None);
+        // chrono's %H:%M is lenient about padding: "9:5" means 09:05.
+        assert_eq!(
+            parse_hhmm("9:5"),
+            Some(NaiveTime::from_hms_opt(9, 5, 0).unwrap())
+        );
+        assert_eq!(parse_hhmm("10:60"), None);
+        assert_eq!(parse_hhmm("10:10:10"), None);
+        assert_eq!(parse_hhmm("10am"), None);
+    }
+
+    #[test]
+    fn next_launch_at_rolls_to_tomorrow_once_the_moment_has_passed() {
+        let now = now();
+        // A time two minutes ahead (truncated to the minute) still fires
+        // today — or tomorrow exactly when the truncation crossed midnight,
+        // which the roll does for us.
+        let ahead_dt = (now + chrono::Duration::minutes(2)).with_second(0).unwrap();
+        let ahead = ahead_dt.time();
+        let at = next_launch_at(ahead);
+        assert!(at > now);
+        assert_eq!(at.time(), ahead);
+        assert!(at.date() - now.date() <= chrono::Duration::days(1));
+
+        // A time already past today rolls to tomorrow.
+        let past_hour = if now.hour() > 0 { now.hour() - 1 } else { 23 };
+        let past = NaiveTime::from_hms_opt(past_hour, now.minute(), 0).unwrap();
+        let rolled = next_launch_at(past);
+        assert_eq!(rolled.date(), now.date() + chrono::Duration::days(1));
+        assert_eq!(rolled.time(), past);
+
+        // The exact current minute counts as passed: re-armed for tomorrow.
+        let exact = NaiveTime::from_hms_opt(now.hour(), now.minute(), 0).unwrap();
+        let re_armed = next_launch_at(exact);
+        assert_eq!(re_armed.date(), now.date() + chrono::Duration::days(1));
     }
 
     #[test]

@@ -128,6 +128,17 @@ When a task is handed to an agent (`take --agent`, or the TUI `r` Run action) an
 `Operations::dispatch_queue()` starts queued tasks while the concurrency caps
 have room. It is a plain library call with no TUI or terminal assumptions.
 
+**Planned launches.** A To Do task may carry an optional `launch_at`
+(`Task.launch_at`, a local timestamp; set from the TUI task form's "Planned
+launch" checkbox + HH:MM field, or `kanban create --launch-at HH:MM`). Every
+pump, before the queue walk, `due_launches()` scans To Do for schedules that
+have come due and enqueues each one through the normal `queue_run` path —
+so the same caps, claiming and crash-restart rules apply — and posts a
+"planned launch" note on the thread. The schedule is consumed by the enqueue
+(`queue_run` clears `launch_at`), so a task launches at most once per schedule.
+When the queue can never dispatch (`queue_enabled: false` / auto-launch off)
+the scan is a no-op and the schedule stays pending until the queue is on again.
+
 **Occupied slots.** The census (`Slots::measure`) counts every **In Progress**
 task whose session state is `Live`. A declared wait is a pause: the agent
 process is normally already gone, so the pause releases its slot, and the task

@@ -1,5 +1,6 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 9133
 expression: "render_at(&mut app, 80, 24)"
 ---
 ┌ To Do (1) ───────┐┌ In Progress (0) ─┐┌ Review (1) ──────┐┌ Done (0) ────────┐
@@ -11,11 +12,11 @@ expression: "render_at(&mut app, 80, 24)"
 │           ││/ task-00                                           ││           │
 │           ││› TASK-002 (Implement selectors)                    ││           │
 │           │└────────────────────────────────────────────────────┘│           │
-│           │┌ Orchestrator ──────────────────────────────────────┐│           │
-│           ││☐ plan a subtask graph first (Space toggles)        ││           │
+│           │┌ Planned launch ────────────────────────────────────┐│           │
+│           ││☐ start automatically at a set time (Space toggles) ││           │
 │           │└────────────────────────────────────────────────────┘│           │
-│           │┌ Designer ──────────────────────────────────────────┐│           │
-│           ││☐ designer for this task (Space toggles)            ││           │
+│           │┌────────────────────────────────────────────────────┐│           │
+│           ││ Launch at — enable “Planned launch”                ││           │
 │           │└────────────────────────────────────────────────────┘│           │
 │           │┌────────────────────────────────────────────────────┐│           │
 │           ││[ Save ]  [ Cancel ]                                ││           │
@@ -131,7 +132,7 @@ expression: "render_at(&mut app, 80, 24)"
 13:1-12 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:12-13 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:13-14 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-13:14-66 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+13:14-66 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:66-67 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:67-68 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:68-79 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

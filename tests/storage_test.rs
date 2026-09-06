@@ -67,6 +67,46 @@ fn saved_task_quotes_timestamps_for_legacy_python_yaml() {
 }
 
 #[test]
+fn launch_at_round_trips_and_stays_off_the_frontmatter_while_unset() {
+    let (dir, storage) = temp_board();
+    let at = kanban4ai::core::timefmt::next_launch_at(
+        chrono::NaiveTime::parse_from_str("09:30", "%H:%M").unwrap(),
+    );
+    let plain = storage.create_task(NewTask::titled("Unscheduled")).unwrap();
+    let scheduled = storage
+        .create_task(NewTask {
+            title: "Scheduled".into(),
+            launch_at: Some(at),
+            ..Default::default()
+        })
+        .unwrap();
+
+    // Legacy shape: an unscheduled task carries no launch_at key at all.
+    let plain_raw = fs::read_to_string(
+        dir.path()
+            .join(".kanban/tasks/todo")
+            .join(format!("{}.md", plain.id)),
+    )
+    .unwrap();
+    assert!(!plain_raw.contains("launch_at"), "{plain_raw}");
+
+    // Scheduled: quoted like every other timestamp, and it survives a reload.
+    let scheduled_raw = fs::read_to_string(
+        dir.path()
+            .join(".kanban/tasks/todo")
+            .join(format!("{}.md", scheduled.id)),
+    )
+    .unwrap();
+    assert!(scheduled_raw.contains("launch_at: '"), "{scheduled_raw}");
+    let reloaded = storage.load_task(&scheduled.id).unwrap().unwrap();
+    assert_eq!(reloaded.launch_at, Some(at));
+    assert_eq!(
+        storage.load_task(&plain.id).unwrap().unwrap().launch_at,
+        None
+    );
+}
+
+#[test]
 fn create_task_persists_designer_and_reviewer_flags_and_omits_them_when_false() {
     let (dir, storage) = temp_board();
     let plain = storage.create_task(NewTask::titled("Plain")).unwrap();

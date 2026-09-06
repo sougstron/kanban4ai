@@ -127,6 +127,55 @@ fn create_can_opt_one_task_into_designer_and_reviewer() {
 }
 
 #[test]
+fn create_with_launch_at_schedules_the_next_local_occurrence() {
+    let dir = board();
+    kanban(&dir)
+        .args(["create", "Nightly job", "--launch-at", "03:30"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created task TASK-001"))
+        .stdout(predicate::str::contains("Planned launch at "));
+
+    let ops = Operations::new(dir.data_root());
+    let task = ops.get_task("TASK-001").unwrap().unwrap();
+    let launch_at = task.launch_at.expect("schedule stored");
+    assert_eq!(launch_at.format("%H:%M").to_string(), "03:30");
+    assert!(launch_at > kanban4ai::core::timefmt::now());
+
+    // `show` surfaces the schedule; `list --format json` carries it in the dump.
+    kanban(&dir)
+        .args(["show", "TASK-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Planned launch: "));
+    let json = kanban(&dir)
+        .args(["list", "--format", "json"])
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(parsed[0]["launch_at"].is_string());
+}
+
+#[test]
+fn create_rejects_an_invalid_launch_at() {
+    let dir = board();
+    for bad in ["25:00", "10:60", "tomorrow", ""] {
+        kanban(&dir)
+            .args(["create", "Bad schedule", "--launch-at", bad])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("invalid --launch-at"));
+    }
+    let ops = Operations::new(dir.data_root());
+    assert!(
+        ops.list_tasks(Some("todo"), None, "created", "asc")
+            .unwrap()
+            .is_empty(),
+        "no task may be created on a refused --launch-at"
+    );
+}
+
+#[test]
 fn list_json_is_valid_and_complete() {
     let dir = board();
     kanban(&dir)

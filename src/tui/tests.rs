@@ -934,6 +934,8 @@ fn task_parent_form_opens_nested_agent_settings_without_interactive_field() {
             DialogField::Description,
             DialogField::AgentSettings,
             DialogField::ChainTo,
+            DialogField::PlannedLaunch,
+            DialogField::LaunchTime,
             DialogField::UseOrchestrator,
             DialogField::UseDesigner,
             DialogField::UseReviewer,
@@ -5383,6 +5385,149 @@ fn phase_three_headers_new_task_always_targets_todo_and_bulk_confirmation_work()
 }
 
 #[test]
+fn new_task_dialog_planned_launch_round_trips_to_the_task() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    {
+        let modal = app.modal.as_mut().expect("new task modal");
+        modal.title.insert_str("Scheduled work");
+        modal.focus_field(DialogField::PlannedLaunch);
+    }
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("enable planned launch");
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        assert!(modal.planned_launch);
+        modal.focus_field(DialogField::LaunchTime);
+        modal.launch_time.insert_str("09:30");
+        modal.focus_field(DialogField::Confirm);
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("create task");
+
+    let task = app
+        .ops
+        .list_tasks(Some("todo"), None, "created", "asc")
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("created task");
+    let launch_at = task.launch_at.expect("planned launch stored");
+    assert_eq!(launch_at.format("%H:%M").to_string(), "09:30");
+    // The next local occurrence is never in the past.
+    assert!(launch_at > crate::core::timefmt::now() - chrono::Duration::seconds(5));
+}
+
+#[test]
+fn new_task_dialog_rejects_an_invalid_launch_time_and_stays_open() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    {
+        let modal = app.modal.as_mut().expect("new task modal");
+        modal.title.insert_str("Bad time");
+        modal.planned_launch = true;
+        modal.focus_field(DialogField::Confirm);
+    }
+
+    // Empty time: refused, dialog stays open, focus lands on the time field.
+    app.handle_key(key(KeyCode::Enter))
+        .expect("confirm with empty time");
+    let modal = app.modal.as_ref().expect("dialog must stay open");
+    assert!(
+        modal
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("HH:MM")),
+        "error: {:?}",
+        modal.error
+    );
+    assert_eq!(modal.active_field(), DialogField::LaunchTime);
+    assert!(
+        app.ops
+            .list_tasks(Some("todo"), None, "created", "asc")
+            .unwrap()
+            .is_empty(),
+        "no task may be created on a refused confirm"
+    );
+
+    // Garbage value: refused the same way.
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        modal.launch_time.insert_str("25:99");
+        modal.focus_field(DialogField::Confirm);
+    }
+    app.handle_key(key(KeyCode::Enter))
+        .expect("confirm with garbage time");
+    assert!(
+        app.modal.is_some(),
+        "invalid time must keep the dialog open"
+    );
+
+    // A valid value goes through.
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        modal.launch_time = TextArea::new(vec!["08:15".to_string()]);
+        modal.focus_field(DialogField::Confirm);
+    }
+    app.handle_key(key(KeyCode::Enter))
+        .expect("confirm with valid time");
+    assert!(app.modal.is_none());
+    let task = app
+        .ops
+        .list_tasks(Some("todo"), None, "created", "asc")
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        task.launch_at.expect("stored").format("%H:%M").to_string(),
+        "08:15"
+    );
+}
+
+#[test]
+fn edit_task_dialog_prefills_and_clears_planned_launch() {
+    let (_dir, mut app) = app_with_board();
+    let at = crate::core::timefmt::next_launch_at(
+        chrono::NaiveTime::parse_from_str("23:45", "%H:%M").unwrap(),
+    );
+    let task = app
+        .ops
+        .create_task(NewTask {
+            title: "Scheduled".to_string(),
+            launch_at: Some(at),
+            ..NewTask::default()
+        })
+        .unwrap();
+
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.focused_column = 0;
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Char('e'))).expect("edit task");
+    {
+        let modal = app.modal.as_ref().expect("edit modal");
+        assert!(modal.planned_launch, "checkbox pre-filled from the task");
+        assert_eq!(modal.launch_time_text(), "23:45");
+    }
+
+    // Unchecking and saving clears the pending schedule.
+    {
+        let modal = app.modal.as_mut().expect("edit modal");
+        modal.focus_field(DialogField::PlannedLaunch);
+    }
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("disable planned launch");
+    {
+        app.modal
+            .as_mut()
+            .expect("edit modal")
+            .focus_field(DialogField::Confirm);
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("save edit");
+    assert!(app.modal.is_none());
+    let stored = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.launch_at, None, "unchecking must clear the schedule");
+}
+
+#[test]
 fn phase_three_column_headers_render_name_and_count_only() {
     let (_dir, mut app) = app_with_board();
     let task = app.ops.create_task(NewTask::titled("Bulk target")).unwrap();
@@ -8650,7 +8795,7 @@ fn enter_on_a_single_filter_match_selects_it_and_advances() {
     assert_eq!(modal.chain_text().as_deref(), Some("TASK-002"));
     assert_eq!(
         modal.active_field(),
-        DialogField::UseOrchestrator,
+        DialogField::PlannedLaunch,
         "Enter moves on like Tab"
     );
     assert_eq!(modal.filter_error, None);
@@ -8882,7 +9027,7 @@ fn new_task_bot_toggles_save_on_the_task() {
         .expect("modal")
         .title
         .insert_str("Per-task bots");
-    for _ in 0..4 {
+    for _ in 0..6 {
         app.handle_key(key(KeyCode::Tab)).expect("tab");
     }
     assert_eq!(

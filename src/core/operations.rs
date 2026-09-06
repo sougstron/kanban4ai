@@ -112,6 +112,8 @@ pub struct TaskPatch {
     pub use_reviewer: Option<bool>,
     pub use_orchestrator: Option<bool>,
     pub chained_to: Option<Option<String>>,
+    /// One-shot scheduled launch; `Some(None)` clears a pending schedule.
+    pub launch_at: Option<Option<NaiveDateTime>>,
     /// Replaces the whole dependency set; validated for cycles by
     /// [`Operations::set_dependencies`], which is the only way in from the CLI.
     pub depends_on: Option<Vec<String>>,
@@ -507,6 +509,9 @@ impl Operations {
         if let Some(chained_to) = patch.chained_to {
             task.chained_to = chained_to;
         }
+        if let Some(launch_at) = patch.launch_at {
+            task.launch_at = launch_at;
+        }
         if let Some(depends_on) = patch.depends_on {
             task.depends_on = depends_on;
         }
@@ -555,6 +560,7 @@ impl Operations {
             use_reviewer: new_task.use_reviewer,
             use_orchestrator: new_task.use_orchestrator,
             chained_to: new_task.chained_to,
+            launch_at: new_task.launch_at,
             depends_on: new_task.depends_on,
             needs: new_task.needs,
             parent_task: new_task.parent_task,
@@ -1195,6 +1201,8 @@ impl Operations {
             )));
         }
         task.reset_human_restart();
+        // An explicit run supersedes any pending planned launch.
+        task.launch_at = None;
         stats::record_enter(
             &self.storage.project_path,
             &task.id,
@@ -2070,6 +2078,7 @@ impl Operations {
                 // task spend the board without limit.
                 use_orchestrator: false,
                 chained_to: None,
+                launch_at: None,
                 depends_on: Vec::new(),
                 needs: node
                     .needs
