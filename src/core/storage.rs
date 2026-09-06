@@ -226,7 +226,12 @@ impl Storage {
         task.interactive = new_task.interactive;
         task.use_designer = new_task.use_designer;
         task.use_reviewer = new_task.use_reviewer;
+        task.use_orchestrator = new_task.use_orchestrator;
         task.chained_to = new_task.chained_to;
+        task.depends_on = new_task.depends_on;
+        task.needs = new_task.needs;
+        task.parent_task = new_task.parent_task;
+        task.role_profile = new_task.role_profile;
         task.status = status;
         if matches!(status, TaskStatus::Review | TaskStatus::Done) {
             task.completed_at = Some(task.created_at);
@@ -433,7 +438,13 @@ pub struct NewTask {
     pub interactive: bool,
     pub use_designer: bool,
     pub use_reviewer: bool,
+    pub use_orchestrator: bool,
     pub chained_to: Option<String>,
+    /// DAG edges for an orchestrator-planned node (see [`Task::depends_on`]).
+    pub depends_on: Vec<String>,
+    pub needs: Option<String>,
+    pub parent_task: Option<String>,
+    pub role_profile: Option<String>,
 }
 
 impl NewTask {

@@ -906,6 +906,7 @@ fn task_parent_form_opens_nested_agent_settings_without_interactive_field() {
             DialogField::Description,
             DialogField::AgentSettings,
             DialogField::ChainTo,
+            DialogField::UseOrchestrator,
             DialogField::UseDesigner,
             DialogField::UseReviewer,
             DialogField::Confirm,
@@ -7983,7 +7984,7 @@ fn enter_on_a_single_filter_match_selects_it_and_advances() {
     assert_eq!(modal.chain_text().as_deref(), Some("TASK-002"));
     assert_eq!(
         modal.active_field(),
-        DialogField::UseDesigner,
+        DialogField::UseOrchestrator,
         "Enter moves on like Tab"
     );
     assert_eq!(modal.filter_error, None);
@@ -8207,7 +8208,7 @@ fn title_enter_walks_on_and_description_enter_writes_a_newline() {
 }
 
 #[test]
-fn new_task_designer_and_reviewer_toggles_save_on_the_task() {
+fn new_task_bot_toggles_save_on_the_task() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     app.modal
@@ -8218,6 +8219,12 @@ fn new_task_designer_and_reviewer_toggles_save_on_the_task() {
     for _ in 0..4 {
         app.handle_key(key(KeyCode::Tab)).expect("tab");
     }
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::UseOrchestrator
+    );
+    app.handle_key(key(KeyCode::Char(' '))).expect("space");
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
         DialogField::UseDesigner
@@ -8243,6 +8250,7 @@ fn new_task_designer_and_reviewer_toggles_save_on_the_task() {
         .into_iter()
         .find(|task| task.title == "Per-task bots")
         .expect("created task");
+    assert!(created.use_orchestrator);
     assert!(created.use_designer);
     assert!(created.use_reviewer);
 }
@@ -8585,6 +8593,66 @@ fn chain_and_interactive_badges_follow_the_column() {
         output.contains("↪ chain -> 154"),
         "chain target missing on the board:\n{output}"
     );
+}
+
+#[test]
+fn graph_badges_show_planning_and_waiting_nodes() {
+    let (_dir, mut app) = app_with_board();
+    let planner = app
+        .ops
+        .create_task(NewTask {
+            title: "Big feature".to_string(),
+            use_orchestrator: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let node = app
+        .ops
+        .create_task(NewTask {
+            title: "Planned node".to_string(),
+            depends_on: vec![planner.id.clone()],
+            ..Default::default()
+        })
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+
+    let badge_labels = |app: &App, id: &str| {
+        let task = app.ops.get_task(id).unwrap().unwrap();
+        super::card::badges(&task, None, app)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect::<Vec<_>>()
+    };
+
+    let planner_badges = badge_labels(&app, &planner.id);
+    assert!(
+        planner_badges.iter().any(|label| label == "◧ plan"),
+        "a task that still owes a plan is marked: {planner_badges:?}"
+    );
+    let node_badges = badge_labels(&app, &node.id);
+    assert!(
+        node_badges.iter().any(|label| label == "⇢ after 1"),
+        "a waiting node names how many edges hold it: {node_badges:?}"
+    );
+
+    // Once the plan is in, the planner is the join node instead.
+    let mut planned = app.ops.get_task(&planner.id).unwrap().unwrap();
+    planned.orchestrated = true;
+    planned.depends_on = vec![node.id.clone()];
+    app.ops.storage.save_task(&planned).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    let planner_badges = badge_labels(&app, &planner.id);
+    assert!(
+        planner_badges.iter().any(|label| label == "◧ joins 1"),
+        "the join node is distinguished from a plain waiting node: {planner_badges:?}"
+    );
+    assert!(
+        !planner_badges.iter().any(|label| label == "◧ plan"),
+        "a planned task does not still advertise a pending plan: {planner_badges:?}"
+    );
+
+    let output = render_at(&mut app, 200, 30);
+    assert!(output.contains("⇢ after 1"), "board:\n{output}");
 }
 
 #[test]

@@ -232,6 +232,7 @@ pub fn badges(
     // SessionState.
     let phase_badge = match task.run_phase {
         Some(RunPhase::Queued) => Some(("⏸ queued", app.theme.warn)),
+        Some(RunPhase::Orchestrate) => Some(("◧ plan", app.theme.focus)),
         Some(RunPhase::Design) => Some(("✎ design", app.theme.focus)),
         Some(RunPhase::Review) => Some(("⚖ review", app.theme.review)),
         _ => None,
@@ -239,6 +240,7 @@ pub fn badges(
     match session_state {
         Some(SessionState::Live) => {
             let (label, color) = match task.run_phase {
+                Some(RunPhase::Orchestrate) => ("◧ plan", app.theme.focus),
                 Some(RunPhase::Design) => ("✎ design", app.theme.focus),
                 Some(RunPhase::Review) => ("⚖ review", app.theme.review),
                 _ => ("▶ running", app.theme.ok),
@@ -281,7 +283,30 @@ pub fn badges(
     // (`designed`), review until the verdict lands the task in human Review.
     // An active phase badge above already shows a running stage; it wins and
     // the pending mark stays off rather than duplicating it.
+    // Waiting on a graph edge is the reason a To Do card is not running, so
+    // it earns a badge of its own; `orchestrated` distinguishes the join node
+    // (waiting for its own plan) from an ordinary planned node.
+    if task.status == TaskStatus::Todo && !task.depends_on.is_empty() {
+        badges.push((
+            format!(
+                "{} {}",
+                if task.orchestrated {
+                    "◧ joins"
+                } else {
+                    "⇢ after"
+                },
+                task.depends_on.len()
+            ),
+            app.theme.muted,
+        ));
+    }
     if matches!(task.status, TaskStatus::Todo | TaskStatus::InProgress) {
+        if task.use_orchestrator
+            && !task.orchestrated
+            && !badges.iter().any(|(label, _)| label == "◧ plan")
+        {
+            badges.push(("◧ plan".to_string(), app.theme.focus));
+        }
         if (app.board.designer_bot || task.use_designer)
             && !task.designed
             && !badges.iter().any(|(label, _)| label == "✎ design")

@@ -37,7 +37,7 @@ Load only what the task touches:
 | `docs/data-model.md` | Task/Session/Thread models, task & thread file formats, context/questions/review edits, `.kanban/` directories, projects & store |
 | `docs/cli.md` | Every implemented `kanban` command (`kanban <cmd> --help` is authoritative) |
 | `docs/config.md` | Thresholds, TUI/global/notification/auto-launch/orchestration settings, agent backends |
-| `docs/orchestration.md` | Run phases, integration model, auto-launch, queue dispatcher, headless daemon, crash restart, chaining |
+| `docs/orchestration.md` | Run phases, integration model, auto-launch, queue dispatcher, headless daemon, crash restart, chaining, task dependencies (DAG) & orchestrator mode |
 | `docs/worktrees.md` | Worktree isolation (`core/vcs.rs`), landing/merge, backup & revert |
 | `docs/tui.md` | TUI keyboard shortcuts and dialogs |
 | `docs/limits.md` | Provider subscription limits (`core/limits.rs`, `tui/limits.rs`) |

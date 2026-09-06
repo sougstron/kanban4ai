@@ -1,8 +1,28 @@
 # Graph (DAG) orchestration — investigation
 
-Research artifact for TASK-295. **Nothing here is implemented.** It is kept out
-of the `AGENTS.md` reference map on purpose: that map indexes shipped behavior,
-and adding a row would charge every agent session for a proposal.
+Research artifact for TASK-295: the reasoning behind the feature, kept out of
+the `AGENTS.md` reference map on purpose (that map indexes shipped behavior and
+a row would charge every agent session for background reading).
+
+**Status.** Increments 1 and 2 of §2.3 shipped, plus orchestrator mode, which
+is what §2.3 called "the planner emitting a task graph". The shipped behavior
+is documented in `docs/orchestration.md` ("Task Dependencies", "Orchestrator
+Mode") and `docs/config.md`; read those for how it works today. What shipped,
+against the proposal:
+
+- `depends_on` is a **new** field, not an extension of `chained_to` — chaining
+  stays exactly as it was, as the human's push. Dependencies are the
+  orchestrator's graph: pulled by a readiness sweep, AND-joined, cycle-checked.
+- The edge carries context (increment 2) for `depends_on` only. A chain still
+  starts blind, deliberately: chained tasks frequently share no context.
+- Orchestrator mode is a per-task opt-in that plans a graph and becomes its
+  join node. Its instructions are role-scoped, never in `AGENTS.md`.
+- Role model rosters (`orchestration.roles`) with limit-driven failover were
+  not in the proposal; they came out of the subscription-economics section
+  below — a node that hits a quota wall moves to the next model instead of
+  waiting for the window.
+- Increment 3 (fan-out/join as a `kanban split`) was **not** built. §2.4 still
+  stands: width on one codebase is the risky direction.
 
 Sources are listed at the end.
 

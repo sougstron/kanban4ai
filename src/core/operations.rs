@@ -2,6 +2,7 @@
 //! module; it owns CRUD, move/rule enforcement, questions, review edits,
 //! chaining, and delegates agent process launching to an [`AgentLauncher`].
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -11,7 +12,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::agent::{
-    KanbanLauncher, build_agent_prompt, materialize_task_launch_settings,
+    KanbanLauncher, build_agent_prompt, materialize_task_launch_settings, orchestrator_pending,
     resolve_bot_launch_settings, resolve_launch_settings, resolve_task_launch_settings,
     upcoming_run_plan,
 };
@@ -22,6 +23,7 @@ use crate::core::config::{
 };
 use crate::core::context::{ContextManager, role_for_source};
 use crate::core::error::{KanbanError, Result};
+use crate::core::graph;
 use crate::core::limits;
 use crate::core::models::{
     IntegrationState, Message, MessageKind, MessageRole, MessageStatus, Role, RunMode, RunPhase,
@@ -81,7 +83,13 @@ pub struct TaskPatch {
     pub interactive: Option<bool>,
     pub use_designer: Option<bool>,
     pub use_reviewer: Option<bool>,
+    pub use_orchestrator: Option<bool>,
     pub chained_to: Option<Option<String>>,
+    /// Replaces the whole dependency set; validated for cycles by
+    /// [`Operations::set_dependencies`], which is the only way in from the CLI.
+    pub depends_on: Option<Vec<String>>,
+    pub needs: Option<Option<String>>,
+    pub role_profile: Option<Option<String>>,
     pub session: Option<Option<String>>,
 }
 
@@ -119,6 +127,18 @@ enum VerdictRoute {
     Requeue,
 }
 
+/// Drop an orchestrated task's join: a human sending it back to To Do is
+/// asking for a fresh plan, and `apply_plan` refuses to plan a task that
+/// already carries one. Only the planning task itself is affected — a
+/// subtask's `depends_on` is graph structure, not run state, so moving one
+/// back to To Do keeps its edges (the readiness sweep will re-queue it).
+fn clear_orchestration_join(task: &mut Task) {
+    if task.use_orchestrator && task.orchestrated {
+        task.orchestrated = false;
+        task.depends_on.clear();
+    }
+}
+
 fn apply_human_review(task: &mut Task) {
     task.status = TaskStatus::Review;
     task.run_phase = None;
@@ -142,6 +162,15 @@ pub enum LandOutcome {
     Conflict { paths: Vec<String> },
     /// The landing did not run; the reason is on the thread.
     Deferred(String),
+}
+
+/// Result of ingesting an orchestrator plan ([`Operations::apply_plan`]).
+#[derive(Debug, Clone)]
+pub struct PlanOutcome {
+    /// The orchestrated task, now the join node of the graph it planned.
+    pub parent: Task,
+    /// The subtasks, in plan order.
+    pub created: Vec<Task>,
 }
 
 /// What [`Operations::reconcile_agent_exit`] decided about an exited agent
@@ -376,6 +405,13 @@ impl Operations {
         copied.restart_at = None;
         copied.review_rounds = 0;
         copied.designed = false;
+        // A copy is a fresh root, not a second node of the same graph: it
+        // keeps the settings (including `use_orchestrator`) but never the
+        // edges, or the duplicate would silently re-join someone else's plan.
+        copied.orchestrated = false;
+        copied.depends_on = Vec::new();
+        copied.parent_task = None;
+        copied.roster_index = 0;
         copied.worktree = None;
         copied.branch = None;
         copied.base_commit = None;
@@ -438,8 +474,25 @@ impl Operations {
         if let Some(use_reviewer) = patch.use_reviewer {
             task.use_reviewer = use_reviewer;
         }
+        if let Some(use_orchestrator) = patch.use_orchestrator {
+            task.use_orchestrator = use_orchestrator;
+        }
         if let Some(chained_to) = patch.chained_to {
             task.chained_to = chained_to;
+        }
+        if let Some(depends_on) = patch.depends_on {
+            task.depends_on = depends_on;
+        }
+        if let Some(needs) = patch.needs {
+            task.needs = needs;
+        }
+        if let Some(role_profile) = patch.role_profile {
+            // A new profile restarts the roster: the failover position of the
+            // previous profile means nothing in the new one.
+            if task.role_profile != role_profile {
+                task.roster_index = 0;
+            }
+            task.role_profile = role_profile;
         }
         if let Some(session) = patch.session {
             task.session = session;
@@ -473,7 +526,12 @@ impl Operations {
             interactive: new_task.interactive,
             use_designer: new_task.use_designer,
             use_reviewer: new_task.use_reviewer,
+            use_orchestrator: new_task.use_orchestrator,
             chained_to: new_task.chained_to,
+            depends_on: new_task.depends_on,
+            needs: new_task.needs,
+            parent_task: new_task.parent_task,
+            role_profile: new_task.role_profile,
         })
     }
 
@@ -645,6 +703,7 @@ impl Operations {
         task.run_phase = None;
         // Back at the top of the pipeline: the next run plans again.
         task.designed = false;
+        clear_orchestration_join(&mut task);
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         Ok(Some(task))
@@ -696,6 +755,13 @@ impl Operations {
 
             if is_agent {
                 match Role::from_phase(task.run_phase) {
+                    Role::Orchestrator => {
+                        return Err(KanbanError::Permission(
+                            "orchestrator cannot move a task; submit the plan with kanban plan \
+                             and finish with kanban done"
+                                .to_string(),
+                        ));
+                    }
                     Role::Designer => {
                         return Err(KanbanError::Permission(
                             "designer cannot move a task; finish the design phase with kanban done"
@@ -757,6 +823,7 @@ impl Operations {
         // next run plans again. Any other human move keeps the existing plan.
         if task.status == TaskStatus::Todo {
             task.designed = false;
+            clear_orchestration_join(&mut task);
         }
         self.storage.save_task(&task)?;
         Ok(Some(task))
@@ -931,14 +998,19 @@ impl Operations {
             // executor, however this run was started (see `upcoming_run_plan`).
             let designer_enabled =
                 self.config.get_orchestration()?.designer_enabled_for(&task) && !task.designed;
+            // Orchestration outranks design: the graph is planned first, and
+            // each node runs its own design pass when it starts.
+            let orchestrator_enabled = orchestrator_pending(&task);
             let will_auto_launch = is_agent
                 && self.config.get_rule("auto_launch_on_delegate")?
                 && self.auto_launch_enabled()?
                 && task.status == TaskStatus::InProgress;
             if immediate {
                 // A manual start bypasses the queue, but not an enabled
-                // designer: the planning pass still runs first.
-                task.run_phase = if designer_enabled {
+                // orchestrator or designer: the planning pass still runs first.
+                task.run_phase = if orchestrator_enabled {
+                    Some(RunPhase::Orchestrate)
+                } else if designer_enabled {
                     Some(RunPhase::Design)
                 } else {
                     None
@@ -952,6 +1024,8 @@ impl Operations {
                     &stats::Tags::default(),
                 );
                 task.run_phase = Some(RunPhase::Queued);
+            } else if will_auto_launch && orchestrator_enabled {
+                task.run_phase = Some(RunPhase::Orchestrate);
             } else if will_auto_launch && designer_enabled {
                 task.run_phase = Some(RunPhase::Design);
             } else {
@@ -1219,6 +1293,10 @@ impl Operations {
                 return Ok(None);
             };
 
+            if is_agent && task.run_phase == Some(RunPhase::Orchestrate) {
+                drop(_guard);
+                return self.complete_orchestrate_phase(task_id, session_id);
+            }
             if is_agent && task.run_phase == Some(RunPhase::Design) {
                 drop(_guard);
                 return self.complete_design_phase(task_id, session_id);
@@ -1333,6 +1411,51 @@ impl Operations {
         }
 
         Ok(Some(task))
+    }
+
+    /// Orchestrator `kanban done`: the plan is the deliverable, so the task
+    /// stops being a running job and becomes the join node of the graph it
+    /// planned. It goes back to To Do carrying `depends_on` for every subtask;
+    /// the readiness sweep re-queues it — as an ordinary executor — once they
+    /// have all reached Review or Done, which is where the integration and
+    /// verification pass happens. Finishing without a submitted plan is an
+    /// error: it would leave the task looking planned but with no graph.
+    fn complete_orchestrate_phase(&self, task_id: &str, session_id: &str) -> Result<Option<Task>> {
+        let task = {
+            let _guard = self.storage.lock()?;
+            let Some(mut task) = self.storage.load_task(task_id)? else {
+                return Ok(None);
+            };
+            if task.run_phase != Some(RunPhase::Orchestrate)
+                || task.status != TaskStatus::InProgress
+            {
+                return Ok(None);
+            }
+            self.require_current_agent_session(&task, session_id)?;
+            if !task.orchestrated || task.depends_on.is_empty() {
+                return Err(KanbanError::Permission(
+                    "Orchestrator cannot finish without submitting a plan: write the graph and \
+                     run kanban plan <task> --file <plan.yaml>"
+                        .to_string(),
+                ));
+            }
+            task.status = TaskStatus::Todo;
+            task.run_phase = None;
+            task.updated_at = timefmt::now();
+            self.storage.save_task(&task)?;
+            task
+        };
+        self.session_manager().close_session(session_id)?;
+        self.post_queue_note(
+            task_id,
+            &format!(
+                "◧ orchestration done — waiting on {} subtask(s): {}",
+                task.depends_on.len(),
+                task.depends_on.join(", ")
+            ),
+        );
+        self.dispatch_plan_roots(task_id)?;
+        self.storage.load_task(task_id)
     }
 
     /// Designer `kanban done`: stay In Progress, close the design session,
@@ -1719,6 +1842,341 @@ impl Operations {
             }
         }
         Ok(launched)
+    }
+
+    // ------------------------------------------------------ dependency graph
+
+    /// Tasks that wait for `task_id` through a `depends_on` edge.
+    pub fn dependents_of(&self, task_id: &str) -> Result<Vec<Task>> {
+        Ok(self
+            .storage
+            .get_all_tasks()?
+            .into_iter()
+            .filter(|task| task.depends_on.iter().any(|d| d == task_id))
+            .collect())
+    }
+
+    /// Where one task's dependencies stand against the current board.
+    pub fn dependency_readiness(&self, task: &Task) -> Result<graph::Readiness> {
+        let tasks = self.storage.get_all_tasks()?;
+        Ok(graph::readiness(task, &graph::index_by_id(&tasks)))
+    }
+
+    /// Replace a task's dependency set. Every id must exist and the result
+    /// must stay acyclic — this is the only write path for `depends_on`
+    /// outside plan ingestion, and both go through the same check.
+    pub fn set_dependencies(
+        &self,
+        task_id: &str,
+        dependencies: Vec<String>,
+    ) -> Result<Option<Task>> {
+        let tasks = self.storage.get_all_tasks()?;
+        if !tasks.iter().any(|task| task.id == task_id) {
+            return Ok(None);
+        }
+        let mut cleaned: Vec<String> = Vec::new();
+        for dependency in dependencies {
+            let dependency = dependency.trim().to_string();
+            if dependency.is_empty() || cleaned.contains(&dependency) {
+                continue;
+            }
+            if !tasks.iter().any(|task| task.id == dependency) {
+                return Err(KanbanError::Invalid(format!(
+                    "dependency {dependency} not found"
+                )));
+            }
+            cleaned.push(dependency);
+        }
+        graph::check_acyclic(&tasks, task_id, &cleaned)?;
+        self.update_task(
+            task_id,
+            TaskPatch {
+                depends_on: Some(cleaned),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// The pull half of the graph: hand every To Do task whose dependencies
+    /// are all finished to the dispatcher queue.
+    ///
+    /// Deliberately a sweep rather than a push from the finished task. A push
+    /// fires on whichever predecessor finished first (wrong for an AND-join),
+    /// misses dependencies satisfied by a *human* moving a task, and cannot be
+    /// re-run safely. This is idempotent, so it runs on every daemon tick.
+    /// Ready nodes enter the queue in phase `queued` and start through
+    /// [`Self::dispatch_queue`] — never directly, or one wide fan-out would
+    /// bypass every concurrency cap at once.
+    pub fn dispatch_ready_dependents(&self) -> Result<Vec<String>> {
+        if !self.queue_can_dispatch()? {
+            return Ok(Vec::new());
+        }
+        let tasks = self.storage.get_all_tasks()?;
+        let index = graph::index_by_id(&tasks);
+        let session_mgr = self.session_manager();
+        let mut started = Vec::new();
+        for task in &tasks {
+            if task.status != TaskStatus::Todo || task.depends_on.is_empty() {
+                continue;
+            }
+            if task
+                .session
+                .as_deref()
+                .is_some_and(|session| session_mgr.is_session_active(session))
+            {
+                continue;
+            }
+            let state = graph::readiness(task, &index);
+            if !state.is_ready() {
+                continue;
+            }
+            // One task that cannot be queued (it just acquired a session, say)
+            // must not abort the sweep for the rest of the graph.
+            if matches!(self.queue_run(&task.id), Ok(Some(_))) {
+                self.post_queue_note(
+                    &task.id,
+                    &format!(
+                        "▶ dependencies satisfied ({}) — handed to the queue",
+                        state.summary()
+                    ),
+                );
+                started.push(task.id.clone());
+            }
+        }
+        Ok(started)
+    }
+
+    /// Ingest an orchestrator plan: validate the whole graph, then create the
+    /// subtasks and wire the edges. The orchestrated task itself becomes the
+    /// join node — it depends on every node it planned, so it runs again (as
+    /// an ordinary executor) once the graph has finished, to integrate and
+    /// verify.
+    ///
+    /// Nothing is created until validation passes, and the edges are written
+    /// in a second pass because a node's dependencies may name siblings whose
+    /// ids do not exist yet. Root nodes are *not* started here — that happens
+    /// when the orchestrator finishes its phase, so a half-submitted plan
+    /// never launches anything.
+    pub fn apply_plan(
+        &self,
+        parent_id: &str,
+        plan: &graph::Plan,
+        session_id: Option<&str>,
+    ) -> Result<PlanOutcome> {
+        let orch = self.config.get_orchestration()?;
+        let tasks = self.storage.get_all_tasks()?;
+        let Some(parent) = tasks.iter().find(|task| task.id == parent_id).cloned() else {
+            return Err(KanbanError::Invalid(format!("task {parent_id} not found")));
+        };
+        // An agent may only plan the task its own live orchestrate session owns.
+        if let Some(session_id) = session_id {
+            self.require_current_agent_session(&parent, session_id)?;
+            if parent.run_phase != Some(RunPhase::Orchestrate) {
+                return Err(KanbanError::Permission(format!(
+                    "{parent_id} is not in the orchestrate phase; only the orchestrator submits \
+                     a plan"
+                )));
+            }
+        }
+        if parent.orchestrated {
+            return Err(KanbanError::Invalid(format!(
+                "{parent_id} already has a plan ({} subtask(s)); a second plan would fork the \
+                 graph. Re-run the task from To Do to plan it again.",
+                parent.depends_on.len()
+            )));
+        }
+        let known_roles: Vec<String> = orch.roles.keys().cloned().collect();
+        let max_subtasks = orch.orchestrator.max_subtasks.max(1) as usize;
+        plan.validate(parent_id, &tasks, max_subtasks, &known_roles)?;
+
+        // Pass one: create every node, inheriting the parent's isolation-
+        // relevant settings but not its edges.
+        let mut created: Vec<Task> = Vec::new();
+        let mut by_key: HashMap<String, String> = HashMap::new();
+        for node in &plan.nodes {
+            let key = node.key.trim().to_string();
+            let profile = node
+                .role
+                .as_deref()
+                .map(str::trim)
+                .filter(|role| !role.is_empty())
+                .map(str::to_owned);
+            let candidate = profile
+                .as_deref()
+                .and_then(|profile| orch.role_candidate(profile, 0));
+            let new_task = NewTask {
+                title: node.title.trim().to_string(),
+                description: node.description.trim().to_string(),
+                // A role profile is the node's assignment; without one the node
+                // inherits the orchestrated task's own backend and model.
+                ai_model: candidate
+                    .and_then(|c| c.model.clone())
+                    .or_else(|| parent.ai_model.clone()),
+                ai_effort: candidate
+                    .and_then(|c| c.effort.clone())
+                    .or_else(|| parent.ai_effort.clone()),
+                agent_backend: candidate
+                    .and_then(|c| c.backend.clone())
+                    .or_else(|| parent.agent_backend.clone()),
+                agent_name: candidate
+                    .and_then(|c| c.agent.clone())
+                    .or_else(|| parent.agent_name.clone()),
+                interactive: false,
+                use_designer: node.designer,
+                use_reviewer: node.reviewer,
+                // A node that planned more nodes would let one orchestrated
+                // task spend the board without limit.
+                use_orchestrator: false,
+                chained_to: None,
+                depends_on: Vec::new(),
+                needs: node
+                    .needs
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|needs| !needs.is_empty())
+                    .map(str::to_owned),
+                parent_task: Some(parent_id.to_string()),
+                role_profile: profile,
+            };
+            let task = self.create_task(new_task)?;
+            by_key.insert(key, task.id.clone());
+            created.push(task);
+        }
+
+        // Pass two: resolve plan keys to the ids just minted and write the
+        // edges, including the parent's join.
+        for (node, task) in plan.nodes.iter().zip(created.iter_mut()) {
+            let dependencies: Vec<String> = node
+                .depends_on
+                .iter()
+                .map(|reference| {
+                    let reference = reference.trim();
+                    by_key
+                        .get(reference)
+                        .cloned()
+                        .unwrap_or_else(|| reference.to_string())
+                })
+                .collect();
+            if dependencies.is_empty() {
+                continue;
+            }
+            let _guard = self.storage.lock()?;
+            if let Some(mut stored) = self.storage.load_task(&task.id)? {
+                stored.depends_on = dependencies.clone();
+                stored.updated_at = timefmt::now();
+                self.storage.save_task(&stored)?;
+                *task = stored;
+            }
+        }
+
+        let parent = {
+            let _guard = self.storage.lock()?;
+            let Some(mut stored) = self.storage.load_task(parent_id)? else {
+                return Err(KanbanError::Invalid(format!("task {parent_id} not found")));
+            };
+            stored.depends_on = created.iter().map(|task| task.id.clone()).collect();
+            stored.orchestrated = true;
+            stored.updated_at = timefmt::now();
+            self.storage.save_task(&stored)?;
+            stored
+        };
+
+        let mut note = format!(
+            "◧ plan accepted: {} subtask(s) — {}",
+            created.len(),
+            created
+                .iter()
+                .map(|task| format!("{} {}", task.id, task.title))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        if let Some(summary) = plan
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            note.push('\n');
+            note.push_str(summary);
+        }
+        self.post_queue_note(parent_id, &note);
+        Ok(PlanOutcome { parent, created })
+    }
+
+    /// Start the roots of a freshly planned graph: the nodes with no
+    /// dependencies of their own, which the readiness sweep never picks up
+    /// (it only considers tasks that *have* edges).
+    fn dispatch_plan_roots(&self, parent_id: &str) -> Result<Vec<String>> {
+        if !self.queue_can_dispatch()? {
+            return Ok(Vec::new());
+        }
+        let mut started = Vec::new();
+        for task in self.storage.get_all_tasks()? {
+            if task.parent_task.as_deref() != Some(parent_id)
+                || task.status != TaskStatus::Todo
+                || !task.depends_on.is_empty()
+            {
+                continue;
+            }
+            if matches!(self.queue_run(&task.id), Ok(Some(_))) {
+                self.post_queue_note(
+                    &task.id,
+                    "▶ graph root — handed to the queue by the orchestrator",
+                );
+                started.push(task.id);
+            }
+        }
+        Ok(started)
+    }
+
+    /// Move a node onto the next model in its `orchestration.roles` roster.
+    ///
+    /// Called when a run died on a provider limit: the point of a roster is
+    /// that the work continues on the next backend instead of parking until
+    /// the quota window rolls over. The new assignment is written onto the
+    /// task's own fields, so the census, the caps and the detail view all
+    /// describe what will actually run. It deliberately does not spend a
+    /// crash-restart step — the roster length already bounds how often this
+    /// can happen, and `roster_index` is never reset automatically.
+    pub fn advance_role_roster(&self, task_id: &str, cause: &str) -> Result<bool> {
+        let orch = self.config.get_orchestration()?;
+        let _guard = self.storage.lock()?;
+        let Some(mut task) = self.storage.load_task(task_id)? else {
+            return Ok(false);
+        };
+        if task.status != TaskStatus::InProgress || task.restart_at.is_some() {
+            return Ok(false);
+        }
+        let Some(profile) = task.role_profile.clone() else {
+            return Ok(false);
+        };
+        if !orch.has_next_role_candidate(&profile, task.roster_index) {
+            return Ok(false);
+        }
+        let next_index = task.roster_index + 1;
+        let Some(candidate) = orch.role_candidate(&profile, next_index) else {
+            return Ok(false);
+        };
+        task.roster_index = next_index;
+        task.agent_backend = candidate.backend.clone().or(task.agent_backend);
+        task.ai_model = candidate.model.clone();
+        task.ai_effort = candidate.effort.clone();
+        task.agent_name = candidate.agent.clone();
+        materialize_task_launch_settings(&self.config.load()?, &mut task)?;
+        task.run_phase = Some(RunPhase::Queued);
+        task.restart_at = None;
+        task.updated_at = timefmt::now();
+        self.storage.save_task(&task)?;
+        let label = candidate.label();
+        self.post_queue_note(
+            task_id,
+            &format!(
+                "↻ role '{profile}' failed over to {label} (candidate {}/{}) — {cause}",
+                next_index + 1,
+                orch.roles.get(&profile).map_or(0, Vec::len)
+            ),
+        );
+        Ok(true)
     }
 
     // ---------------------------------------------------- questions / thread

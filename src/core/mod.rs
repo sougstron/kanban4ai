@@ -5,6 +5,7 @@ pub mod context;
 pub mod daemon;
 pub mod error;
 pub mod global;
+pub mod graph;
 pub mod http;
 pub mod limits;
 pub mod migrate;

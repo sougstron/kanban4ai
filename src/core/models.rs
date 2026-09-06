@@ -61,6 +61,7 @@ string_enum!(TaskStatus {
 // `RunPhase::Execute` wherever a phase is required.
 string_enum!(RunPhase {
     Queued => "queued",
+    Orchestrate => "orchestrate",
     Design => "design",
     Execute => "execute",
     Review => "review",
@@ -97,11 +98,13 @@ pub enum RunMode {
     Immediate,
 }
 
-// Which bot a session is running as. Derived from `RunPhase` (`design` →
-// designer, `review` → reviewer, everything else including a missing
-// phase → executor) and handed to the prompt builder and the move gate.
+// Which bot a session is running as. Derived from `RunPhase` (`orchestrate` →
+// orchestrator, `design` → designer, `review` → reviewer, everything else
+// including a missing phase → executor) and handed to the prompt builder and
+// the move gate.
 string_enum!(Role {
     Executor => "executor",
+    Orchestrator => "orchestrator",
     Designer => "designer",
     Reviewer => "reviewer",
 });
@@ -109,6 +112,7 @@ string_enum!(Role {
 impl Role {
     pub fn from_phase(phase: Option<RunPhase>) -> Self {
         match phase {
+            Some(RunPhase::Orchestrate) => Role::Orchestrator,
             Some(RunPhase::Design) => Role::Designer,
             Some(RunPhase::Review) => Role::Reviewer,
             _ => Role::Executor,
@@ -310,8 +314,52 @@ pub struct Task {
     /// come from the project reviewer settings. Omitted while false.
     #[serde(default, skip_serializing_if = "is_false")]
     pub use_reviewer: bool,
+    /// Opt this task into the orchestrator bot: a plan-only role that
+    /// decomposes the task into a DAG of subtasks (`kanban plan`) instead of
+    /// implementing it. There is no board-wide switch on purpose — an
+    /// orchestrated run spends a whole graph of sessions, so it is always a
+    /// per-task decision, and the orchestrator runs on the *task's own*
+    /// backend/model. Omitted while false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_orchestrator: bool,
     #[serde(default)]
     pub chained_to: Option<String>,
+    /// DAG edges: every task id that must reach Review or Done before this
+    /// one becomes ready. Deliberately separate from [`Task::chained_to`] —
+    /// chaining is the human's fire-and-forget push (one parent, no shared
+    /// context), `depends_on` is the orchestrator's AND-join and carries the
+    /// upstream results into this task's prompt. Omitted while empty so
+    /// legacy boards round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// What this node needs from its dependencies, written by the
+    /// orchestrator when it planned the graph. The edge's context contract:
+    /// it is shown to the agent above the upstream results so a node reads
+    /// only the part of the upstream that concerns it. Omitted while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<String>,
+    /// The orchestrated task this one was planned from. Set on every subtask
+    /// `kanban plan` creates; omitted for hand-written tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_task: Option<String>,
+    /// Name of the `orchestration.roles` profile the orchestrator assigned to
+    /// this node. The profile is an ordered roster of backend/model
+    /// candidates; [`Task::roster_index`] says which one is in use. Omitted
+    /// while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_profile: Option<String>,
+    /// Candidate currently taken from the [`Task::role_profile`] roster.
+    /// Advanced (never reset automatically) when a run fails on a provider
+    /// limit, so the next model in the row takes over instead of waiting for
+    /// the quota window. Omitted while zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub roster_index: u32,
+    /// An orchestrator pass already produced a plan for this task. Mirrors
+    /// [`Task::designed`]: it gates the orchestrate phase directly, so a
+    /// re-queue of the join node runs the executor instead of re-planning the
+    /// graph from scratch. Omitted while false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub orchestrated: bool,
     #[serde(default)]
     pub review_edits: String,
     /// Automatic relaunches consumed after clean agent exits that left the
@@ -415,7 +463,14 @@ impl Task {
             interactive: false,
             use_designer: false,
             use_reviewer: false,
+            use_orchestrator: false,
             chained_to: None,
+            depends_on: Vec::new(),
+            needs: None,
+            parent_task: None,
+            role_profile: None,
+            roster_index: 0,
+            orchestrated: false,
             review_edits: String::new(),
             auto_resumes: 0,
             review_unseen: false,

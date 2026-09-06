@@ -55,6 +55,9 @@ pub struct LaunchSettings {
 /// task fields, falling back to the backend's configured defaults.
 pub fn resolve_launch_settings(config: &BoardConfig, task: &Task) -> Result<LaunchSettings> {
     let orch = OrchestrationSettings::from_mapping(&config.orchestration);
+    // The orchestrator runs on the task's own assignment on purpose: planning
+    // a graph is the expensive judgment call, so the model is chosen per task
+    // rather than board-wide (there is no `orchestration.orchestrator` bot).
     if task.run_phase == Some(RunPhase::Design) && orch.designer_enabled_for(task) {
         return resolve_bot_launch_settings(config, &orch.designer);
     }
@@ -69,6 +72,16 @@ pub fn resolve_launch_settings(config: &BoardConfig, task: &Task) -> Result<Laun
 /// and occupies a designer slot; otherwise it starts executing immediately.
 pub fn upcoming_run_plan(config: &BoardConfig, task: &Task) -> Result<(LaunchSettings, RunPhase)> {
     let orch = OrchestrationSettings::from_mapping(&config.orchestration);
+    // Planning comes before everything: an orchestrated task decomposes into a
+    // graph first and only runs itself (as the join node) once that graph is
+    // finished. `orchestrated` gates it exactly like `designed` gates the
+    // design phase, so a crash restart mid-graph never re-plans.
+    if orchestrator_pending(task) {
+        return Ok((
+            resolve_task_launch_settings(config, task)?,
+            RunPhase::Orchestrate,
+        ));
+    }
     // Two ways a run must go straight to the executor. `designed`: the plan is
     // already on the thread, so a crash restart (or any other re-queue) of an
     // execute-phase task resumes the work instead of re-planning it — the
@@ -89,6 +102,14 @@ pub fn upcoming_run_plan(config: &BoardConfig, task: &Task) -> Result<(LaunchSet
             RunPhase::Execute,
         ))
     }
+}
+
+/// Whether this task still owes an orchestrator pass. A per-task opt-in with
+/// no board-wide switch: an orchestrated run spends a whole graph of sessions.
+/// A bot-review bounce (`review_rounds > 0`) is the executor's work coming
+/// back, never a reason to re-plan.
+pub fn orchestrator_pending(task: &Task) -> bool {
+    task.use_orchestrator && !task.orchestrated && task.review_rounds == 0
 }
 
 /// Launch settings from the task's own assignment (the executor bot).

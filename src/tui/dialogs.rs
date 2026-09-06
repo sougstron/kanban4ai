@@ -99,6 +99,7 @@ pub enum DialogField {
     Effort,
     Agent,
     ChainTo,
+    UseOrchestrator,
     UseDesigner,
     UseReviewer,
     TargetStatus,
@@ -139,11 +140,12 @@ pub enum DialogField {
     PurgeData,
 }
 
-const TASK_FORM_FIELDS: [DialogField; 6] = [
+const TASK_FORM_FIELDS: [DialogField; 7] = [
     DialogField::Title,
     DialogField::Description,
     DialogField::AgentSettings,
     DialogField::ChainTo,
+    DialogField::UseOrchestrator,
     DialogField::UseDesigner,
     DialogField::UseReviewer,
 ];
@@ -291,6 +293,7 @@ pub struct ModalState {
     pub theme: TextArea<'static>,
     pub task_sort: TextArea<'static>,
     pub interactive: bool,
+    pub use_orchestrator: bool,
     pub use_designer: bool,
     pub use_reviewer: bool,
     pub escape_to_projects: bool,
@@ -384,6 +387,7 @@ impl ModalState {
             theme: one_line("dark"),
             task_sort: one_line("task_number"),
             interactive: false,
+            use_orchestrator: false,
             use_designer: false,
             use_reviewer: false,
             escape_to_projects: false,
@@ -455,6 +459,7 @@ impl ModalState {
         state.agent = one_line(task.agent_name.as_deref().unwrap_or(""));
         state.chain_to = one_line(task.chained_to.as_deref().unwrap_or(""));
         state.interactive = task.interactive;
+        state.use_orchestrator = task.use_orchestrator;
         state.use_designer = task.use_designer;
         state.use_reviewer = task.use_reviewer;
         state
@@ -474,6 +479,7 @@ impl ModalState {
                 DialogField::Description,
                 DialogField::AgentSettings,
                 DialogField::ChainTo,
+                DialogField::UseOrchestrator,
                 DialogField::UseDesigner,
                 DialogField::UseReviewer,
                 DialogField::Confirm,
@@ -1043,6 +1049,7 @@ impl ModalState {
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings => {}
+            DialogField::UseOrchestrator => toggle_on_space(&mut self.use_orchestrator, key),
             DialogField::UseDesigner => toggle_on_space(&mut self.use_designer, key),
             DialogField::UseReviewer => toggle_on_space(&mut self.use_reviewer, key),
             DialogField::EscapeToProjects => {
@@ -1179,6 +1186,7 @@ impl ModalState {
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings
+            | DialogField::UseOrchestrator
             | DialogField::UseDesigner
             | DialogField::UseReviewer
             | DialogField::EscapeToProjects
@@ -1765,6 +1773,7 @@ impl ModalState {
             raw_textarea_text(&self.chain_to),
             raw_textarea_text(&self.target_status),
             self.interactive.to_string(),
+            self.use_orchestrator.to_string(),
             self.use_designer.to_string(),
             self.use_reviewer.to_string(),
             self.backend_selected.to_string(),
@@ -2459,6 +2468,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::AgentSettings
         | DialogField::DesignerAgentSettings
         | DialogField::ReviewerAgentSettings
+        | DialogField::UseOrchestrator
         | DialogField::UseDesigner
         | DialogField::UseReviewer
         | DialogField::EscapeToProjects
@@ -2834,6 +2844,15 @@ fn render_selector_field(
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
             Some(&modal.chain_filter),
             modal.filter_error == Some(field),
+        ),
+        DialogField::UseOrchestrator => render_checkbox(
+            frame,
+            app,
+            area,
+            "Orchestrator",
+            "plan a subtask graph first",
+            modal.use_orchestrator,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::UseDesigner => render_checkbox(
             frame,
