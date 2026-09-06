@@ -184,6 +184,10 @@ fn pump_project(project: &Project, warned_once: &mut HashSet<String>) -> Result<
         lines.push(format!("{ts} {} restart {task_id}", project.id));
     }
 
+    for task_id in ops.due_launches()? {
+        lines.push(format!("{ts} {} launch {task_id}", project.id));
+    }
+
     // The graph's pull step, between the restart schedule and dispatch so a
     // node that just became ready is queued and started in the same tick.
     for task_id in ops.dispatch_ready_dependents()? {

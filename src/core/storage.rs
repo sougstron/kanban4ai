@@ -17,6 +17,8 @@ use std::str::FromStr;
 
 use fs2::FileExt;
 
+use chrono::NaiveDateTime;
+
 use crate::core::config::Config;
 use crate::core::error::{KanbanError, Result};
 use crate::core::models::{Task, TaskStatus};
@@ -204,7 +206,13 @@ impl Storage {
     fn write_task_file(&self, filepath: &Path, task: &Task) -> Result<()> {
         let frontmatter = timefmt::quote_yaml_timestamp_fields(
             &serde_yaml_ng::to_string(task)?,
-            &["created_at", "updated_at", "completed_at", "restart_at"],
+            &[
+                "created_at",
+                "updated_at",
+                "completed_at",
+                "restart_at",
+                "launch_at",
+            ],
         );
         let content = format!("---\n{frontmatter}---\n{}\n", task.description);
         atomic_write_text(filepath, &content)
@@ -228,6 +236,7 @@ impl Storage {
         task.use_reviewer = new_task.use_reviewer;
         task.use_orchestrator = new_task.use_orchestrator;
         task.chained_to = new_task.chained_to;
+        task.launch_at = new_task.launch_at;
         task.depends_on = new_task.depends_on;
         task.needs = new_task.needs;
         task.parent_task = new_task.parent_task;
@@ -440,6 +449,8 @@ pub struct NewTask {
     pub use_reviewer: bool,
     pub use_orchestrator: bool,
     pub chained_to: Option<String>,
+    /// One-shot scheduled launch (see [`Task::launch_at`]).
+    pub launch_at: Option<NaiveDateTime>,
     /// DAG edges for an orchestrator-planned node (see [`Task::depends_on`]).
     pub depends_on: Vec<String>,
     pub needs: Option<String>,

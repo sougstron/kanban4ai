@@ -82,6 +82,10 @@ enum Command {
         /// Auto-run this task when target task (e.g. TASK-029) reaches Review
         #[arg(long = "chain-to")]
         chained_to: Option<String>,
+        /// Planned launch time HH:MM (local): while the task sits in To Do,
+        /// the timer queues it once that time passes
+        #[arg(long = "launch-at")]
+        launch_at: Option<String>,
         /// Wait for these tasks to reach Review/Done, and read their results (repeatable)
         #[arg(long = "depends-on")]
         depends_on: Vec<String>,
@@ -717,8 +721,21 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             reviewer,
             orchestrator,
             chained_to,
+            launch_at,
             depends_on,
         } => {
+            let launch_at = match launch_at.as_deref() {
+                Some(value) => Some(
+                    timefmt::parse_hhmm(value)
+                        .map(timefmt::next_launch_at)
+                        .ok_or_else(|| {
+                            KanbanError::Invalid(format!(
+                                "invalid --launch-at '{value}': expected HH:MM (local time)"
+                            ))
+                        })?,
+                ),
+                None => None,
+            };
             let task = ops.create_task(NewTask {
                 title,
                 description,
@@ -731,6 +748,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 use_reviewer: reviewer,
                 use_orchestrator: orchestrator,
                 chained_to: chained_to.filter(|c| !c.is_empty()),
+                launch_at,
                 depends_on: depends_on
                     .into_iter()
                     .filter(|d| !d.trim().is_empty())
@@ -742,6 +760,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             println!("Created task {}: {}", task.id, task.title);
             if let Some(chained_to) = &task.chained_to {
                 println!("Chained to {chained_to} (auto-runs when it reaches Review)");
+            }
+            if let Some(launch_at) = &task.launch_at {
+                println!("Planned launch at {}", timefmt::format(launch_at));
             }
         }
         Command::Init { .. } | Command::Project(_) => unreachable!("handled before resolve"),
@@ -1101,6 +1122,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             if let Some(chained_to) = &task.chained_to {
                 println!("Chained to: {chained_to}");
             }
+            if let Some(launch_at) = &task.launch_at {
+                println!("Planned launch: {}", timefmt::format(launch_at));
+            }
             if !task.depends_on.is_empty() {
                 let readiness = ops.dependency_readiness(&task)?;
                 println!(
@@ -1243,6 +1267,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let restarted = ops.due_restarts()?;
             for task_id in &restarted {
                 println!("Crash-restart due: {task_id} handed to the queue");
+            }
+            let launched = ops.due_launches()?;
+            for task_id in &launched {
+                println!("Planned launch due: {task_id} handed to the queue");
             }
             for task_id in ops.dispatch_ready_dependents()? {
                 println!("Dependencies satisfied: {task_id} handed to the queue");
@@ -1665,6 +1693,10 @@ fn task_to_json(task: &Task) -> serde_json::Value {
         "use_reviewer": task.use_reviewer,
         "use_orchestrator": task.use_orchestrator,
         "chained_to": task.chained_to,
+        "launch_at": task
+            .launch_at
+            .as_ref()
+            .map(timefmt::format),
         "depends_on": task.depends_on,
         "needs": task.needs,
         "parent_task": task.parent_task,

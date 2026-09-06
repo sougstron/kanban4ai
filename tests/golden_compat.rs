@@ -329,6 +329,7 @@ fn rust_written_task_is_parseable_and_stable() {
             use_reviewer: false,
             use_orchestrator: false,
             chained_to: Some("TASK-999".into()),
+            launch_at: None,
             depends_on: Vec::new(),
             needs: None,
             parent_task: None,

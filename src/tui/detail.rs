@@ -61,6 +61,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let meta_extra_lines = u16::from(waiting)
         + u16::from(wait_deadline.is_some())
         + u16::from(task.restart_at.is_some() || session_state == Some(SessionState::Crashed))
+        + u16::from(task.launch_at.is_some())
         + u16::from(isolated)
         + u16::from(conflicted)
         + description_lines;
@@ -250,6 +251,12 @@ fn render_meta(
             timefmt::format(&task.updated_at)
         )),
     ];
+    if let Some(launch_at) = task.launch_at {
+        meta.push(Line::from(format!(
+            "🕐 Planned launch at {}",
+            timefmt::format(&launch_at)
+        )));
+    }
     // Graph state costs a row, so it only appears on tasks that have any:
     // an ordinary task's detail keeps the height it always had.
     if !task.depends_on.is_empty()

@@ -99,6 +99,8 @@ pub enum DialogField {
     Effort,
     Agent,
     ChainTo,
+    PlannedLaunch,
+    LaunchTime,
     UseOrchestrator,
     UseDesigner,
     UseReviewer,
@@ -148,11 +150,13 @@ pub enum DialogField {
     PurgeData,
 }
 
-const TASK_FORM_FIELDS: [DialogField; 7] = [
+const TASK_FORM_FIELDS: [DialogField; 9] = [
     DialogField::Title,
     DialogField::Description,
     DialogField::AgentSettings,
     DialogField::ChainTo,
+    DialogField::PlannedLaunch,
+    DialogField::LaunchTime,
     DialogField::UseOrchestrator,
     DialogField::UseDesigner,
     DialogField::UseReviewer,
@@ -434,6 +438,8 @@ pub struct ModalState {
     pub effort: TextArea<'static>,
     pub agent: TextArea<'static>,
     pub chain_to: TextArea<'static>,
+    pub planned_launch: bool,
+    pub launch_time: TextArea<'static>,
     pub target_status: TextArea<'static>,
     pub answer: TextArea<'static>,
     pub theme: TextArea<'static>,
@@ -539,6 +545,8 @@ impl ModalState {
             effort: one_line(""),
             agent: one_line(""),
             chain_to: one_line(""),
+            planned_launch: false,
+            launch_time: one_line(""),
             target_status: one_line("todo"),
             answer: TextArea::default(),
             theme: one_line("dark"),
@@ -620,6 +628,13 @@ impl ModalState {
         state.effort = one_line(task.ai_effort.as_deref().unwrap_or(""));
         state.agent = one_line(task.agent_name.as_deref().unwrap_or(""));
         state.chain_to = one_line(task.chained_to.as_deref().unwrap_or(""));
+        state.planned_launch = task.launch_at.is_some();
+        state.launch_time = one_line(
+            task.launch_at
+                .map(|at| at.format("%H:%M").to_string())
+                .as_deref()
+                .unwrap_or(""),
+        );
         state.interactive = task.interactive;
         state.use_orchestrator = task.use_orchestrator;
         state.use_designer = task.use_designer;
@@ -641,6 +656,8 @@ impl ModalState {
                 DialogField::Description,
                 DialogField::AgentSettings,
                 DialogField::ChainTo,
+                DialogField::PlannedLaunch,
+                DialogField::LaunchTime,
                 DialogField::UseOrchestrator,
                 DialogField::UseDesigner,
                 DialogField::UseReviewer,
@@ -1235,6 +1252,8 @@ impl ModalState {
             DialogField::Effort => self.input_select(key, SelectorKind::Effort),
             DialogField::Agent => self.input_select(key, SelectorKind::Agent),
             DialogField::ChainTo => self.input_select(key, SelectorKind::ChainTo),
+            DialogField::PlannedLaunch => toggle_on_space(&mut self.planned_launch, key),
+            DialogField::LaunchTime => input_single_line(&mut self.launch_time, key),
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings => {}
@@ -1392,12 +1411,14 @@ impl ModalState {
             DialogField::Effort => &mut self.effort,
             DialogField::Agent => &mut self.agent,
             DialogField::ChainTo => &mut self.chain_to,
+            DialogField::LaunchTime => &mut self.launch_time,
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings
             | DialogField::UseOrchestrator
             | DialogField::UseDesigner
             | DialogField::UseReviewer
+            | DialogField::PlannedLaunch
             | DialogField::EscapeToProjects
             | DialogField::UpdateCheckOnOpen => &mut self.answer,
             DialogField::ProjectSort => &mut self.project_sort,
@@ -1676,6 +1697,10 @@ impl ModalState {
 
     pub fn chain_text(&self) -> Option<String> {
         non_empty(textarea_text(&self.chain_to))
+    }
+
+    pub fn launch_time_text(&self) -> String {
+        textarea_text(&self.launch_time)
     }
 
     pub fn target_text(&self) -> String {
@@ -2018,6 +2043,8 @@ impl ModalState {
             raw_textarea_text(&self.effort),
             raw_textarea_text(&self.agent),
             raw_textarea_text(&self.chain_to),
+            self.planned_launch.to_string(),
+            raw_textarea_text(&self.launch_time),
             raw_textarea_text(&self.target_status),
             self.interactive.to_string(),
             self.use_orchestrator.to_string(),
@@ -2882,6 +2909,8 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::UseOrchestrator
         | DialogField::UseDesigner
         | DialogField::UseReviewer
+        | DialogField::PlannedLaunch
+        | DialogField::LaunchTime
         | DialogField::EscapeToProjects
         | DialogField::UpdateCheckOnOpen
         | DialogField::QueueEnabled
@@ -3286,6 +3315,40 @@ fn render_selector_field(
             modal.use_orchestrator,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
+        DialogField::PlannedLaunch => render_checkbox(
+            frame,
+            app,
+            area,
+            "Planned launch",
+            "start automatically at a set time",
+            modal.planned_launch,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::LaunchTime => {
+            if modal.planned_launch {
+                render_textarea(
+                    frame,
+                    app,
+                    &modal.launch_time,
+                    area,
+                    "Launch at (HH:MM, local time)",
+                    modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+                );
+            } else {
+                // Disabled while the checkbox is off: a dimmed placeholder
+                // keeps the row's shape so the form never jumps.
+                frame.render_widget(
+                    Paragraph::new(" Launch at — enable “Planned launch” ")
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(app.theme.border)),
+                        )
+                        .style(Style::default().fg(app.theme.muted)),
+                    area,
+                );
+            }
+        }
         DialogField::UseDesigner => render_checkbox(
             frame,
             app,

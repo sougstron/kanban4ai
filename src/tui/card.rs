@@ -296,6 +296,13 @@ pub fn badges(
         let number = target.rsplit('-').next().unwrap_or(target);
         badges.push((format!("↪ chain -> {number}"), app.theme.ok));
     }
+    // A scheduled launch only matters while the task can still be picked up
+    // by the timer, i.e. in To Do; once it runs the field is consumed.
+    if task.status == TaskStatus::Todo
+        && let Some(launch_at) = task.launch_at
+    {
+        badges.push((format!("🕐 {}", launch_at.format("%H:%M")), app.theme.focus));
+    }
     // Pending design/review stage marks, shown like the chain badge from the
     // moment the stage is scheduled (project-wide bot or the task's own
     // opt-in) until the stage completes: design until the plan is recorded
