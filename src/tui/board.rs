@@ -456,7 +456,10 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
             seg("q back", 2),
         ],
         Screen::LogView => vec![seg("↑/↓ scroll", 2), seg("q back", 1)],
-        Screen::TextView => vec![seg("↑/↓ PgUp/PgDn scroll", 2), seg("q back", 1)],
+        Screen::TextView => vec![
+            seg("↑/↓ PgUp/PgDn scroll · Shift x3 · Ctrl x10", 2),
+            seg("q back", 1),
+        ],
         Screen::Help => vec![seg("↑/↓ scroll", 2), seg("? close", 1)],
         Screen::Projects => vec![
             seg("Enter open", 1),
@@ -655,6 +658,9 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Log view"),
         Line::from("  ↑/↓ PgUp/PgDn Home/End: scroll · End re-enables follow · q: back"),
+        Line::from(""),
+        Line::from("Text pager (prompt, inputs, session, stats)"),
+        Line::from("  ↑/↓ PgUp/PgDn Home/End: scroll · Shift+↑/↓ x3 · Ctrl+↑/↓ x10 · q: back"),
         Line::from(""),
         Line::from("Mouse"),
         Line::from("  hover a card: select it — Enter and hotkeys act on it; arrows"),

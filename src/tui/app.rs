@@ -4364,8 +4364,8 @@ impl App {
                     self.refresh_active_sessions()?;
                 }
             }
-            KeyCode::Up => self.scroll_text_view(-1),
-            KeyCode::Down => self.scroll_text_view(1),
+            KeyCode::Up => self.scroll_text_view(-self.text_view_step(&key)),
+            KeyCode::Down => self.scroll_text_view(self.text_view_step(&key)),
             KeyCode::PageUp => self.scroll_text_view(-10),
             KeyCode::PageDown => self.scroll_text_view(10),
             KeyCode::Home => {
@@ -4393,6 +4393,18 @@ impl App {
                     .saturating_add(delta as u16)
                     .min(view.max_scroll);
             }
+        }
+    }
+
+    /// Arrow-key row step for the text pager: Ctrl scrolls x10 rows, Shift x3,
+    /// plain arrows x1 — the fast path for long reports such as the stats view.
+    fn text_view_step(&self, key: &KeyEvent) -> i32 {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            10
+        } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+            3
+        } else {
+            1
         }
     }
 
