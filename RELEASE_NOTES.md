@@ -1,3 +1,95 @@
+# kanban4ai 0.6.5
+
+The board starts work on a provider that still has quota, and can wait until
+a clock time: limit-aware executor pools pick a live candidate before launch
+instead of dying on a 429, a planned `launch_at` enqueues a To Do card when
+that local time comes due, and Project Settings split into four tabs so the
+executor roster is its own page.
+
+## Added
+
+- **Limit-aware executor pools** (`core/executors.rs`, `core/operations.rs`,
+  `core/scheduler.rs`, `core/limits.rs`, `core/config.rs`, `core/daemon.rs`,
+  `docs/config.md`, `docs/orchestration.md`, `docs/limits.md`;
+  `tests/config_test.rs`, `tests/operations_test.rs`). New
+  `orchestration.executors` holds two ordered candidate lists — `cheap` (the
+  executor default for tasks whose launch settings still match the board
+  defaults) and `middle` (opt-in via `role_profile: middle`) — each at most
+  three entries, in either `roles` spelling. Before a launch the dispatcher
+  walks the pool against the *cached* limits snapshot only: the first
+  candidate whose provider is at or above the floors
+  (`thresholds.week_percent` 5, `thresholds.five_hour_percent` 15, inclusive)
+  is materialized onto the task the same way `advance_role_roster` is. An
+  explicit per-task assignment always wins. When every candidate is blocked
+  the task parks at the earliest reset plus `ask_grace_secs` (no crash-
+  restart cost, no crash notification) and the board posts one
+  `kanban:executor-pool` question whose variants are the other providers that
+  still pass; an answer or the deadline, whichever comes first, runs the
+  task. The daemon tick now warms the limits cache so a headless pump has
+  numbers to read. The post-mortem 429 ladder is unchanged.
+- **Planned launches** (`core/models.rs`, `core/scheduler.rs`, `core/timefmt.rs`,
+  `core/storage.rs`, `cli/mod.rs`, `tui/dialogs.rs`, `docs/orchestration.md`,
+  `docs/cli.md`, `docs/tui.md`; `tests/operations_test.rs`, `tests/cli_test.rs`,
+  `tests/storage_test.rs`). A To Do task may carry `launch_at` — the next
+  local occurrence of an HH:MM — set from the task form's "Planned launch"
+  checkbox or `kanban create --launch-at HH:MM`. Every pump, before the queue
+  walk, `due_launches()` enqueues schedules that have come due through the
+  normal `queue_run` path (same caps, claiming, crash-restart) and consumes
+  the field, so a task launches at most once per schedule. With the queue off
+  the scan is a no-op and the time stays on the task. The card shows
+  `🕐 HH:MM` while pending; `kanban check-sessions` reports the step.
+
+## Changed
+
+- **Tabbed Project Settings** (`tui/dialogs.rs`, `tui/app.rs`, `docs/tui.md`).
+  `s` on Board/Detail is four tabs — Common, Designer, Reviewer, Executor —
+  with Left/Right switching (wrapping; skipped inside text inputs and
+  filtered selectors), clickable labels, and one Save for the whole dialog.
+  A validation error flips to the tab that owns the field. The Executor tab
+  holds the six ordered pool slots (filterable `backend/model` selectors
+  annotated with live quota numbers and `(out of quota)`), the resolved
+  `next:` line, and the two quota floors.
+- **Answer panel and form sizing** (`tui/detail.rs`, `tui/dialogs.rs`,
+  `tui/app.rs`). Left/Right in the detail answer panel edit the custom
+  answer; question switching is explicit previous/next buttons under the
+  variants. Multiline textareas jump to line start/end at wrap boundaries.
+  The task-form description cap is 15 lines and the chain selector is pinned
+  to 4..=8 rows so a long chain list cannot crowd out the description.
+- **Role-colored live cards** (`tui/card.rs`, `docs/tui.md`). A live design
+  or review session gets a bold `▶ running` row under the badges — blue for
+  designer, purple for reviewer — and the token/cost stats line uses the
+  same color; executor cards keep the green badge-only look.
+- **Text-pager scroll speedups** (`tui/app.rs`, `tui/board.rs`, `docs/tui.md`).
+  Shift+Up/Down moves the stats report and every other text pager by 3 rows,
+  Ctrl+Up/Down by 10; plain arrows stay at 1.
+
+## Verification coverage
+
+- executor-pool parse, size cap, unknown-backend warning, threshold bounds
+  (`tests/config_test.rs`: `executor_pools_parse_both_candidate_spellings`,
+  `executor_pools_reject_more_than_three_entries`,
+  `executor_pools_warn_on_unknown_backend`,
+  `executor_pool_thresholds_must_be_percentages`)
+- pool walk materializes the next candidate, never overrides an explicit
+  assignment, parks with a question and no crash cost, and lets answer or
+  deadline win (`tests/operations_test.rs`:
+  `executor_pool_skips_blocked_candidate_and_materializes_next`,
+  `executor_pool_never_overrides_an_explicit_assignment`,
+  `executor_pool_parks_blocked_task_with_question_and_no_crash_cost`,
+  `executor_pool_answer_materializes_provider_and_clears_the_park`,
+  `executor_pool_deadline_wins_and_withdraws_the_question`)
+- planned launch queues a due To Do, leaves the future alone, stays inert
+  when the queue cannot dispatch, and round-trips off the frontmatter while
+  unset (`tests/operations_test.rs`:
+  `due_launches_queues_a_due_todo_task_and_consumes_the_schedule`;
+  `tests/storage_test.rs`:
+  `launch_at_round_trips_and_stays_off_the_frontmatter_while_unset`)
+- inclusive quota floors (`src/core/limits.rs`:
+  `has_headroom_boundaries_are_inclusive`)
+- full `cargo test --locked`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo build --release --locked`, `sh scripts/test-packaging.sh`,
+  `sh scripts/token-budget.sh`
+
 # kanban4ai 0.6.4
 
 The board learns to plan in graphs: a task can wait on its dependencies (an
