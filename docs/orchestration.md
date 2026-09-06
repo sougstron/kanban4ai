@@ -35,7 +35,10 @@ leads the card and displaces the plain worktree badge it implies.
 
 **To Do stays manual-start-only.** The dispatcher never pulls from To Do. A
 task reaches In Progress only through an explicit start (`r` Run, `Q` queue, a
-move, `take --agent`) or the chaining rule. **Done stays human-only** — rule 2
+move, `take --agent`) or one of the two declared automatic edges: the chaining
+rule, and a `depends_on` set whose tasks have all finished (see **Task
+Dependencies**). Both are edges a human or an orchestrator wrote on the task on
+purpose; a task with neither is never started for you. **Done stays human-only** — rule 2
 is unchanged and every role prompt repeats it.
 
 How a task enters each phase:
