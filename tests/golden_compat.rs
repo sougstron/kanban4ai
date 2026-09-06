@@ -327,7 +327,12 @@ fn rust_written_task_is_parseable_and_stable() {
             interactive: true,
             use_designer: false,
             use_reviewer: false,
+            use_orchestrator: false,
             chained_to: Some("TASK-999".into()),
+            depends_on: Vec::new(),
+            needs: None,
+            parent_task: None,
+            role_profile: None,
         })
         .unwrap();
 

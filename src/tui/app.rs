@@ -2415,6 +2415,11 @@ impl App {
             return;
         }
         self.last_queue_dispatch = Some(Instant::now());
+        // The graph's pull step first, so a node whose dependencies just
+        // finished is queued in time for this same dispatch pass.
+        if let Err(err) = self.ops.dispatch_ready_dependents() {
+            self.status = format!("Dependency sweep failed: {err}");
+        }
         match self.ops.dispatch_queue() {
             Ok(started) if !started.is_empty() => {
                 self.request_full_redraw();
@@ -4926,7 +4931,12 @@ impl App {
                     interactive: false,
                     use_designer: modal.use_designer,
                     use_reviewer: modal.use_reviewer,
+                    use_orchestrator: modal.use_orchestrator,
                     chained_to: modal.chain_text(),
+                    depends_on: Vec::new(),
+                    needs: None,
+                    parent_task: None,
+                    role_profile: None,
                 };
                 let target = target_status
                     .as_deref()
@@ -4959,6 +4969,7 @@ impl App {
                         interactive: None,
                         use_designer: Some(modal.use_designer),
                         use_reviewer: Some(modal.use_reviewer),
+                        use_orchestrator: Some(modal.use_orchestrator),
                         chained_to: Some(modal.chain_text()),
                         ..Default::default()
                     },
@@ -5726,6 +5737,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::AgentSettings
         | DialogField::DesignerAgentSettings
         | DialogField::ReviewerAgentSettings
+        | DialogField::UseOrchestrator
         | DialogField::UseDesigner
         | DialogField::UseReviewer
         | DialogField::EscapeToProjects

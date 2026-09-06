@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 8086
 expression: "render_at(&mut app, 80, 24)"
 ---
 ┌ To Do (1) ───────┐┌ In Progress (0) ─┐┌ Review (1) ──────┐┌ Done (0) ────────┐
@@ -14,8 +13,8 @@ expression: "render_at(&mut app, 80, 24)"
 │           ││  TASK-001 (Question card)                          ││           │
 │           ││                                                    ││           │
 │           │└────────────────────────────────────────────────────┘│           │
-│           │┌ Designer ──────────────────────────────────────────┐│           │
-│           ││☐ designer for this task (Space toggles)            ││           │
+│           │┌ Orchestrator ──────────────────────────────────────┐│           │
+│           ││☐ plan a subtask graph first (Space toggles)        ││           │
 │           │└────────────────────────────────────────────────────┘│           │
 │           │                                                      │           │
 │           │┌────────────────────────────────────────────────────┐│           │

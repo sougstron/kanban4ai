@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -186,6 +186,7 @@ orchestration:
     pi: 2
   max_running_per_backend_model: {}
   max_running_per_role:
+    orchestrator: 1
     designer: 1
     reviewer: 1
     executor: 3
@@ -209,6 +210,10 @@ orchestration:
     agent: null
     on_changes_requested: in_progress
     max_rounds: 3
+  orchestrator:
+    max_subtasks: 12
+    upstream_budget_chars: 4000
+  roles: {}
   isolation:
     mode: auto
     branch_prefix: kanban/
@@ -306,7 +311,49 @@ pub struct OrchestrationSettings {
     pub auto_restart_delays_minutes: Vec<i64>,
     pub designer: BotSettings,
     pub reviewer: ReviewerSettings,
+    pub orchestrator: OrchestratorSettings,
+    /// Named model rosters the orchestrator assigns to the nodes it plans
+    /// (`orchestration.roles`). Ordered map so the roster list handed to the
+    /// orchestrator prompt is stable between runs.
+    pub roles: BTreeMap<String, Vec<RoleCandidate>>,
     pub isolation: IsolationSettings,
+}
+
+/// `orchestration.orchestrator`: bounds on a planning pass. There is no
+/// `enabled` key — the orchestrator is a per-task opt-in
+/// ([`Task::use_orchestrator`]) and runs on the task's own backend/model, so
+/// nothing here selects a bot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratorSettings {
+    /// Most nodes one plan may create. A refused plan costs one message; an
+    /// accepted 200-node plan costs 200 sessions.
+    pub max_subtasks: i64,
+    /// Character budget for the whole *Upstream results* section a dependent
+    /// task is prompted with, split across its dependencies.
+    pub upstream_budget_chars: i64,
+}
+
+/// One entry in an `orchestration.roles` roster: a launch the orchestrator may
+/// assign to a node. Candidates are tried in order — the next one takes over
+/// when the current one fails on a provider limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleCandidate {
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub agent: Option<String>,
+}
+
+impl RoleCandidate {
+    /// `claude/sonnet`-style label for prompts, logs and the detail view.
+    pub fn label(&self) -> String {
+        match (self.backend.as_deref(), self.model.as_deref()) {
+            (Some(backend), Some(model)) => format!("{backend}/{model}"),
+            (Some(backend), None) => backend.to_string(),
+            (None, Some(model)) => model.to_string(),
+            (None, None) => "default".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -436,6 +483,88 @@ impl OrchestrationSettings {
     pub fn reviewer_enabled_for(&self, task: &Task) -> bool {
         self.reviewer.enabled || task.use_reviewer
     }
+}
+
+impl OrchestrationSettings {
+    /// The candidate a node with this role profile and roster position runs
+    /// on. An index past the end of the roster clamps to the last entry, so a
+    /// task whose failover ran out keeps a usable assignment instead of
+    /// silently losing its profile.
+    pub fn role_candidate(&self, profile: &str, index: u32) -> Option<&RoleCandidate> {
+        let roster = self.roles.get(profile).filter(|r| !r.is_empty())?;
+        Some(&roster[(index as usize).min(roster.len() - 1)])
+    }
+
+    /// Whether a further candidate exists after `index` — i.e. whether a
+    /// limit failure can fail over instead of waiting for the quota window.
+    pub fn has_next_role_candidate(&self, profile: &str, index: u32) -> bool {
+        self.roles
+            .get(profile)
+            .is_some_and(|roster| (index as usize + 1) < roster.len())
+    }
+}
+
+/// Parse `orchestration.roles` into ordered rosters. Two spellings per entry:
+/// a mapping (`{backend: claude, model: sonnet}`) or the `<backend>/<model>`
+/// shorthand string; a bare string with no slash is a backend on its own
+/// defaults. Malformed entries are dropped here and rejected with a message by
+/// [`Config::validate_orchestration`].
+fn parse_role_rosters(mapping: &Mapping) -> BTreeMap<String, Vec<RoleCandidate>> {
+    let field = |m: &Mapping, key: &str| -> Option<String> {
+        m.get(Value::String(key.to_owned()))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let mut rosters = BTreeMap::new();
+    for (name, value) in mapping {
+        let Some(name) = name.as_str().map(str::to_owned) else {
+            continue;
+        };
+        // Both `roles.x: [..]` and `roles.x.models: [..]` are accepted; the
+        // second leaves room for future per-profile keys.
+        let items = match value {
+            Value::Sequence(items) => Some(items),
+            Value::Mapping(m) => m.get("models").and_then(Value::as_sequence),
+            _ => None,
+        };
+        let Some(items) = items else {
+            continue;
+        };
+        let candidates: Vec<RoleCandidate> = items
+            .iter()
+            .filter_map(|item| match item {
+                Value::Mapping(m) => Some(RoleCandidate {
+                    backend: field(m, "backend"),
+                    model: field(m, "model"),
+                    effort: field(m, "effort"),
+                    agent: field(m, "agent"),
+                }),
+                Value::String(spec) => {
+                    let spec = spec.trim();
+                    if spec.is_empty() {
+                        return None;
+                    }
+                    let (backend, model) = match spec.split_once('/') {
+                        Some((backend, model)) => (backend, Some(model.to_owned())),
+                        None => (spec, None),
+                    };
+                    Some(RoleCandidate {
+                        backend: Some(backend.to_owned()),
+                        model,
+                        effort: None,
+                        agent: None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        if !candidates.is_empty() {
+            rosters.insert(name, candidates);
+        }
+    }
+    rosters
 }
 
 impl ReviewerSettings {
@@ -633,7 +762,7 @@ fn validate_cap_map(
                 }
                 if check_roles && key_str.parse::<Role>().is_err() {
                     return Err(KanbanError::Invalid(format!(
-                        "orchestration '{key}' entry '{key_str}' is not a role (known: executor, designer, reviewer)"
+                        "orchestration '{key}' entry '{key_str}' is not a role (known: executor, orchestrator, designer, reviewer)"
                     )));
                 }
                 let parsed = as_int(&value).ok_or_else(|| {
@@ -696,6 +825,55 @@ fn validate_isolation_string(iso: &Mapping, key: &str) -> Result<()> {
     Err(KanbanError::Invalid(format!(
         "orchestration.isolation.{key} must be a string, got: {value:?}"
     )))
+}
+
+/// `orchestration.roles`: every profile must be a non-empty roster whose
+/// entries name a known backend. A roster the orchestrator would find empty is
+/// an error (it would silently drop the assignment); an unknown backend is a
+/// warning, matching `max_running_per_backend` — the board still runs, the
+/// profile just falls back to the task's own settings.
+fn validate_role_rosters(
+    orch: &Mapping,
+    known_backends: &[String],
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let yaml_key = Value::String("roles".to_owned());
+    let Some(roles) = orch.get(&yaml_key).filter(|v| !matches!(v, Value::Null)) else {
+        return Ok(());
+    };
+    let Some(roles) = roles.as_mapping() else {
+        return Err(KanbanError::Invalid(format!(
+            "orchestration.roles must be a mapping of profile name to model roster, got: {roles:?}"
+        )));
+    };
+    let parsed = parse_role_rosters(roles);
+    for (name, _) in roles {
+        let Some(name) = name.as_str() else {
+            return Err(KanbanError::Invalid(
+                "orchestration.roles profile names must be strings".to_string(),
+            ));
+        };
+        let Some(candidates) = parsed.get(name) else {
+            return Err(KanbanError::Invalid(format!(
+                "orchestration.roles '{name}' has no usable model: give a list of \
+                 '<backend>/<model>' strings or {{backend, model}} mappings"
+            )));
+        };
+        for candidate in candidates {
+            let Some(backend) = candidate.backend.as_deref() else {
+                continue;
+            };
+            if !known_backends.iter().any(|known| known == backend) {
+                warnings.push(format!(
+                    "orchestration.roles '{name}' entry '{}' names unknown backend '{backend}' \
+                     and falls back to the task's own settings (known: {})",
+                    candidate.label(),
+                    known_backends.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `orchestration.isolation`: strict validation of the worktree-isolation
@@ -899,6 +1077,27 @@ impl OrchestrationSettings {
                 .unwrap_or_else(|| default.to_owned())
         };
 
+        let orchestrator = mapping
+            .get("orchestrator")
+            .and_then(Value::as_mapping)
+            .or_else(|| default_section("orchestrator"));
+        let orchestrator_int = |key: &str, fallback: i64| -> i64 {
+            orchestrator
+                .and_then(|m| m.get(key))
+                .and_then(as_int)
+                .or_else(|| {
+                    default_section("orchestrator")
+                        .and_then(|m| m.get(key))
+                        .and_then(as_int)
+                })
+                .unwrap_or(fallback)
+        };
+        let roles = mapping
+            .get("roles")
+            .and_then(Value::as_mapping)
+            .map(parse_role_rosters)
+            .unwrap_or_default();
+
         OrchestrationSettings {
             queue_enabled: bool_at("queue_enabled"),
             max_running_total: int_at("max_running_total"),
@@ -917,6 +1116,11 @@ impl OrchestrationSettings {
                 on_changes_requested,
                 max_rounds,
             },
+            orchestrator: OrchestratorSettings {
+                max_subtasks: orchestrator_int("max_subtasks", 12),
+                upstream_budget_chars: orchestrator_int("upstream_budget_chars", 4000),
+            },
+            roles,
             isolation: IsolationSettings {
                 mode: isolation
                     .get("mode")
@@ -1235,6 +1439,31 @@ impl Config {
             }
         }
 
+        if let Some(orchestrator) = sub_mapping_mut(orch, "orchestrator") {
+            for key in ["max_subtasks", "upstream_budget_chars"] {
+                let yaml_key = Value::String(key.into());
+                let Some(value) = orchestrator
+                    .get(&yaml_key)
+                    .filter(|v| !matches!(v, Value::Null))
+                    .cloned()
+                else {
+                    continue;
+                };
+                let parsed = as_int(&value).ok_or_else(|| {
+                    KanbanError::Invalid(format!(
+                        "Invalid integer value for orchestration.orchestrator.{key}: {value:?}"
+                    ))
+                })?;
+                if parsed <= 0 {
+                    return Err(KanbanError::Invalid(format!(
+                        "orchestration.orchestrator.{key} must be positive: {parsed}"
+                    )));
+                }
+                orchestrator.insert(yaml_key, Value::Number(parsed.into()));
+            }
+        }
+
+        validate_role_rosters(orch, &known_backends, warnings)?;
         validate_isolation(orch)?;
 
         Ok(())

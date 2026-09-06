@@ -445,6 +445,13 @@ impl Operations {
             );
             return Ok(false);
         }
+        // A provider limit is the one failure a second model can simply
+        // absorb. When the node has a role roster with another candidate,
+        // move to it and re-queue now instead of parking the task until the
+        // quota window rolls over.
+        if deadline.is_some() && self.advance_role_roster(task_id, cause)? {
+            return Ok(true);
+        }
         let _guard = self.storage.lock()?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(false);
@@ -587,6 +594,8 @@ mod tests {
                 on_changes_requested: OnChangesRequested::InProgress,
                 max_rounds: 3,
             },
+            orchestrator: OrchestrationSettings::default().orchestrator,
+            roles: OrchestrationSettings::default().roles,
             isolation: OrchestrationSettings::default().isolation,
         }
     }

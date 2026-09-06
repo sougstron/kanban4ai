@@ -118,11 +118,13 @@ orchestration:
   max_running_total: 3
   max_running_per_backend: {claude: 2, codex: 2, opencode: 2, omp: 2, pi: 2}
   max_running_per_backend_model: {}
-  max_running_per_role: {designer: 1, reviewer: 1, executor: 3}
+  max_running_per_role: {orchestrator: 1, designer: 1, reviewer: 1, executor: 3}
   auto_restart: {enabled: true, delays_minutes: [1, 30, 270]}
   designer: {enabled: false, backend: claude, model: sonnet, effort: null, agent: null}
   reviewer: {enabled: false, backend: claude, model: sonnet, effort: null, agent: null,
              on_changes_requested: in_progress, max_rounds: 3}
+  orchestrator: {max_subtasks: 12, upstream_budget_chars: 4000}
+  roles: {}
 ```
 
 - `queue_enabled`: true - master switch for the dispatcher. Off means nothing
@@ -173,6 +175,47 @@ orchestration:
 Every cap is an integer where **`0` means unlimited**, and so does an absent
 map entry; a negative or unparseable value is a config error. `enabled` flags
 are coerced like the other boolean settings (`true`/`yes`/`1`).
+
+### `orchestration.orchestrator`
+
+Bounds on a planning pass. There is no `enabled` key: the orchestrator is a
+per-task opt-in (`use_orchestrator`) and runs on the **task's own**
+backend/model, so nothing here selects a bot.
+
+- `max_subtasks`: 12 - most nodes one plan may create. A refused plan costs one
+  message; an accepted 200-node plan costs 200 sessions
+- `upstream_budget_chars`: 4000 - character budget for the whole *Upstream
+  results* section a dependent task is prompted with, split across its
+  dependencies. `0` turns the section off
+
+Both must be positive integers; anything else is a config error.
+
+### `orchestration.roles`
+
+Named, ordered model rosters the orchestrator may assign to the nodes it plans
+(`role:` in the plan file). Empty by default, which means every node inherits
+the planning task's own backend and model.
+
+```yaml
+orchestration:
+  roles:
+    cheap:
+      - claude/haiku                      # "<backend>/<model>" shorthand
+      - opencode/openai/gpt-5.5           # model ids may contain slashes
+    heavy:
+      - {backend: claude, model: opus, effort: high}
+      - {backend: codex, model: gpt-5.5}
+```
+
+A node runs on the first candidate; when a run dies on a provider limit the
+board moves it to the next one and re-queues immediately (see **Orchestrator
+mode** in `docs/orchestration.md`). A profile with no usable entry is a config
+error — it would silently drop the assignment — while an entry naming an
+unknown backend is a warning and falls back to the task's own settings.
+
+These profile names are a separate namespace from the four bot roles
+(`executor`, `orchestrator`, `designer`, `reviewer`) that `max_running_per_role`
+caps.
 
 ## Agent Backends (.kanban/config.yaml `agents:`)
 Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. Create/save with Default selected snapshots those resolved values onto the task so the detail view and stats see a concrete backend/model/effort/agent (provider is the model id's slash prefix). The `agents:` map defines one entry per backend:

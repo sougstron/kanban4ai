@@ -76,9 +76,15 @@ enum Command {
         /// Run the project reviewer bot for this task even if it is off board-wide
         #[arg(long)]
         reviewer: bool,
+        /// Plan this task as a graph of subtasks first (orchestrator mode)
+        #[arg(long)]
+        orchestrator: bool,
         /// Auto-run this task when target task (e.g. TASK-029) reaches Review
         #[arg(long = "chain-to")]
         chained_to: Option<String>,
+        /// Wait for these tasks to reach Review/Done, and read their results (repeatable)
+        #[arg(long = "depends-on")]
+        depends_on: Vec<String>,
     },
     /// Register a project in the store (migrating a local .kanban if present).
     Init {
@@ -255,6 +261,48 @@ enum Command {
         /// Remove the chain from this task
         #[arg(long)]
         clear: bool,
+    },
+    /// Show or set the tasks TASK_ID waits for (DAG edges; also feeds it their results).
+    Depends {
+        task_id: String,
+        /// Task this one waits for; repeat for several (replaces the current set)
+        #[arg(long = "on")]
+        on: Vec<String>,
+        /// Remove every dependency from this task
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Submit an orchestrator plan: create the subtask graph for TASK_ID.
+    ///
+    /// The plan file is YAML. Every node becomes a To Do task; `depends_on`
+    /// entries name plan keys or existing task ids and become DAG edges, which
+    /// order the work *and* carry each dependency's results into the node's
+    /// prompt. The whole plan is validated (unknown references, duplicate
+    /// keys, cycles, unknown roles, size) before anything is created.
+    ///
+    ///   summary: why the graph is shaped this way   # optional
+    ///   nodes:
+    ///     - key: schema            # plan-local handle, not a task id
+    ///       title: Add the field
+    ///       description: |
+    ///         Everything this node's agent needs that upstream will not send.
+    ///       depends_on: []         # plan keys and/or TASK-ids
+    ///       needs: null            # what this node takes from upstream
+    ///       role: null             # orchestration.roles profile to run on
+    ///       designer: false
+    ///       reviewer: false
+    #[command(verbatim_doc_comment)]
+    Plan {
+        task_id: String,
+        /// Plan file (YAML). See `kanban plan --help` for the schema.
+        #[arg(long)]
+        file: String,
+        /// Agent session ID
+        #[arg(long)]
+        session: Option<String>,
+        /// Agent mode (enforces rules)
+        #[arg(long)]
+        agent: bool,
     },
     /// Move all Done tasks to Archive.
     #[command(name = "archive-done")]
@@ -667,7 +715,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             interactive,
             designer,
             reviewer,
+            orchestrator,
             chained_to,
+            depends_on,
         } => {
             let task = ops.create_task(NewTask {
                 title,
@@ -679,7 +729,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 interactive,
                 use_designer: designer,
                 use_reviewer: reviewer,
+                use_orchestrator: orchestrator,
                 chained_to: chained_to.filter(|c| !c.is_empty()),
+                depends_on: depends_on
+                    .into_iter()
+                    .filter(|d| !d.trim().is_empty())
+                    .collect(),
+                needs: None,
+                parent_task: None,
+                role_profile: None,
             })?;
             println!("Created task {}: {}", task.id, task.title);
             if let Some(chained_to) = &task.chained_to {
@@ -984,6 +1042,17 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             target_id,
             clear,
         } => return chain_command(&ops, &task_id, target_id.as_deref(), clear),
+        Command::Depends { task_id, on, clear } => {
+            return depends_command(&ops, &task_id, &on, clear);
+        }
+        Command::Plan {
+            task_id,
+            file,
+            session,
+            agent,
+        } => {
+            return plan_command(&ops, &task_id, &file, session.as_deref().filter(|_| agent));
+        }
         Command::ArchiveDone => {
             let archived = ops.archive_done_tasks()?;
             println!("Archived {} done task(s).", archived.len());
@@ -1031,6 +1100,40 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             if let Some(chained_to) = &task.chained_to {
                 println!("Chained to: {chained_to}");
+            }
+            if !task.depends_on.is_empty() {
+                let readiness = ops.dependency_readiness(&task)?;
+                println!(
+                    "Depends on: {} ({})",
+                    task.depends_on.join(", "),
+                    if readiness.is_ready() {
+                        "ready".to_string()
+                    } else {
+                        readiness.summary()
+                    }
+                );
+            }
+            if let Some(needs) = &task.needs {
+                println!("Needs from upstream: {needs}");
+            }
+            if let Some(role_profile) = &task.role_profile {
+                println!(
+                    "Role profile: {role_profile} (candidate {})",
+                    task.roster_index + 1
+                );
+            }
+            if let Some(parent_task) = &task.parent_task {
+                println!("Planned by: {parent_task}");
+            }
+            if task.use_orchestrator {
+                println!(
+                    "Orchestrator: on ({})",
+                    if task.orchestrated {
+                        "graph planned"
+                    } else {
+                        "plans a subtask graph on the next run"
+                    }
+                );
             }
             if let Some(session) = &task.session {
                 println!("Session: {session}");
@@ -1140,6 +1243,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let restarted = ops.due_restarts()?;
             for task_id in &restarted {
                 println!("Crash-restart due: {task_id} handed to the queue");
+            }
+            for task_id in ops.dispatch_ready_dependents()? {
+                println!("Dependencies satisfied: {task_id} handed to the queue");
             }
             let dispatched = ops.dispatch_queue()?;
             for item in &dispatched {
@@ -1447,6 +1553,90 @@ fn chain_command(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `kanban depends`: show or replace a task's DAG edges.
+fn depends_command(
+    ops: &Operations,
+    task_id: &str,
+    on: &[String],
+    clear: bool,
+) -> Result<ExitCode> {
+    let Some(task) = ops.get_task(task_id)? else {
+        eprintln!("Task {task_id} not found");
+        return Ok(ExitCode::SUCCESS);
+    };
+    if !clear && on.is_empty() {
+        if task.depends_on.is_empty() {
+            println!("{task_id} does not depend on any task");
+        } else {
+            let readiness = ops.dependency_readiness(&task)?;
+            println!("{task_id} depends on: {}", task.depends_on.join(", "));
+            println!(
+                "Status: {} — {}",
+                if readiness.is_ready() {
+                    "ready"
+                } else {
+                    "waiting"
+                },
+                readiness.summary()
+            );
+        }
+        let dependents = ops.dependents_of(task_id)?;
+        if !dependents.is_empty() {
+            println!(
+                "Waiting on {task_id}: {}",
+                dependents
+                    .iter()
+                    .map(|task| task.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let dependencies = if clear { Vec::new() } else { on.to_vec() };
+    let updated = ops.set_dependencies(task_id, dependencies)?;
+    match updated {
+        None => eprintln!("Task {task_id} not found"),
+        Some(task) if task.depends_on.is_empty() => {
+            println!("Dependencies removed from {task_id}")
+        }
+        Some(task) => println!(
+            "{task_id} now waits for {} (and is prompted with their results)",
+            task.depends_on.join(", ")
+        ),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `kanban plan`: ingest an orchestrator's subtask graph.
+fn plan_command(
+    ops: &Operations,
+    task_id: &str,
+    file: &str,
+    session_id: Option<&str>,
+) -> Result<ExitCode> {
+    let yaml = std::fs::read_to_string(file).map_err(|err| {
+        crate::core::error::KanbanError::Invalid(format!("cannot read plan file {file}: {err}"))
+    })?;
+    let plan = crate::core::graph::Plan::parse(&yaml)?;
+    let outcome = ops.apply_plan(task_id, &plan, session_id)?;
+    println!(
+        "Plan accepted for {task_id}: {} subtask(s) created",
+        outcome.created.len()
+    );
+    for task in &outcome.created {
+        let waits = if task.depends_on.is_empty() {
+            "root".to_string()
+        } else {
+            format!("after {}", task.depends_on.join(", "))
+        };
+        println!("  {} {} ({waits})", task.id, task.title);
+    }
+    println!("{task_id} now waits for all of them; finish the planning phase with kanban done.");
+    Ok(ExitCode::SUCCESS)
+}
+
 fn tasks_to_json(tasks: &[Task]) -> Result<String> {
     let values: Vec<serde_json::Value> = tasks.iter().map(task_to_json).collect();
     serde_json::to_string_pretty(&values)
@@ -1473,7 +1663,12 @@ fn task_to_json(task: &Task) -> serde_json::Value {
         "interactive": task.interactive,
         "use_designer": task.use_designer,
         "use_reviewer": task.use_reviewer,
+        "use_orchestrator": task.use_orchestrator,
         "chained_to": task.chained_to,
+        "depends_on": task.depends_on,
+        "needs": task.needs,
+        "parent_task": task.parent_task,
+        "role_profile": task.role_profile,
         "review_edits": task.review_edits,
     })
 }

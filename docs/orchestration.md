@@ -6,13 +6,14 @@ auto-loaded into every agent session. Read it when you are touching run phases, 
 ## Run Phases (In Progress sub-states)
 
 The board columns are unchanged. What is new is a sub-state on In Progress:
-`Task.run_phase`, one of `queued`, `design`, `execute`, `review`. `None` means
+`Task.run_phase`, one of `queued`, `orchestrate`, `design`, `execute`,
+`review`. `None` means
 "In Progress the old way" and reads as `execute` everywhere a phase is needed,
 so legacy boards keep working untouched.
 
 ```
-To Do            manual start only (unchanged)
-In Progress      queued → [design] → execute → [bot review]
+To Do            manual start only, or a graph node whose dependencies are all done
+In Progress      queued → [orchestrate] → [design] → execute → [bot review]
 Review           human review
 Done             human only (unchanged)
 ```
@@ -20,6 +21,7 @@ Done             human only (unchanged)
 | phase | badge | meaning |
 |---|---|---|
 | `queued` | `⏸ queued` | waiting for a free agent slot; the dispatcher starts it. No session runs, so a queued task occupies no slot. A paused task whose wait deadline passed or that was revoked while paused is parked here too |
+| `orchestrate` | `◧ plan` | the orchestrator bot is decomposing the task into a subtask graph (only when the task has `use_orchestrator`) |
 | `design` | `✎ design` | the designer bot is planning (only when `orchestration.designer.enabled`) |
 | `execute` | `▶ running` | the task's own assigned bot is doing the work |
 | `review` | `⚖ review` | the reviewer bot is checking the result; the task is still In Progress |
@@ -33,7 +35,10 @@ leads the card and displaces the plain worktree badge it implies.
 
 **To Do stays manual-start-only.** The dispatcher never pulls from To Do. A
 task reaches In Progress only through an explicit start (`r` Run, `Q` queue, a
-move, `take --agent`) or the chaining rule. **Done stays human-only** — rule 2
+move, `take --agent`) or one of the two declared automatic edges: the chaining
+rule, and a `depends_on` set whose tasks have all finished (see **Task
+Dependencies**). Both are edges a human or an orchestrator wrote on the task on
+purpose; a task with neither is never started for you. **Done stays human-only** — rule 2
 is unchanged and every role prompt repeats it.
 
 How a task enters each phase:
@@ -57,6 +62,13 @@ How a task enters each phase:
   human-restart counters reset, and nothing launches. `Q` on an already-queued
   task unqueues it (phase back to `None`, run it manually). A task with a live
   session cannot be queued.
+- **`orchestrate` → the graph** — the orchestrator's `kanban done` closes the
+  planning session, and the task leaves In Progress: it goes back to **To Do**
+  as the join node of the graph it planned, carrying `depends_on` for every
+  subtask. The graph's root nodes are queued immediately; the join node is
+  re-queued by the readiness sweep once every subtask has reached Review or
+  Done, and runs then as an ordinary executor (the integration pass). Finishing
+  without an accepted plan is refused. See **Orchestrator mode**.
 - **`design` → `execute`** — the designer's `kanban done` closes the design
   session, sets `designed: true`, flips the phase to `execute`, and launches the task's own bot
   directly on the same slot (re-queueing would stall a task whose slot is
@@ -215,7 +227,13 @@ the sleep and the log append.
    crashed, so a later tick would never see them again.
 3. `due_restarts()` — crash-restarts whose `restart_at` has passed go back to
    phase `queued`.
-4. `dispatch_queue()` — the normal cap-checked dispatch described above.
+4. `dispatch_ready_dependents()` — the graph's pull step: every To Do task
+   whose `depends_on` are all satisfied is handed to the queue, so a node that
+   became ready is started by the same tick.
+5. `dispatch_queue()` — the normal cap-checked dispatch described above.
+
+(The TUI's throttled pump and `kanban check-sessions` run steps 4 and 5 in the
+same order.)
 
 So a crash detected in tick *N* is scheduled in the same tick, and started in
 whichever later tick its backoff comes due. The daemon adds no new rules: it
@@ -340,3 +358,110 @@ card wearing a `↻ retry` badge forever.
 
 ## Task Chaining
 A task may carry a `chained_to` target task id. When the **target** task enters Review — via `move` or an agent's `done` — every task whose `chained_to` equals that id and is still in **To Do** is auto-run with a fresh per-task session (its own backend/model/persona/description). Only the To-Do→Review transition fires it (re-entering Review does not). Gated by the `auto_launch_chained` rule and `auto_launch.enabled`.
+
+## Task Dependencies (the DAG)
+
+`chained_to` is the human's push: one target, fire-and-forget, no shared
+context. `depends_on` is the orchestrator's graph and is a different mechanism
+on purpose.
+
+A task's `depends_on` is a list of task ids that must reach **Review or Done**
+before it becomes ready. Two things ride on that edge:
+
+- **ordering** — the node cannot start until every dependency has finished
+  (an AND-join, unlike a chain's single parent);
+- **context** — the node's prompt is opened with an *Upstream results* section
+  built from each dependency's recorded context and harvested final reply,
+  compacted by the existing rule-based compaction and capped by
+  `orchestration.orchestrator.upstream_budget_chars` (split across the
+  dependencies). Nothing is summarized by a model, so the section is
+  deterministic. `Task.needs` — one or two sentences the orchestrator wrote
+  about what this node takes from upstream — is printed above it.
+
+The edge is **pulled, not pushed**. `dispatch_ready_dependents()` sweeps every
+To Do task with edges and hands the ready ones to the queue in phase `queued`;
+they start through the normal cap-checked dispatcher, so a wide fan-out cannot
+bypass the concurrency caps. A sweep (rather than firing from the finished
+task) is what makes an AND-join correct, picks up dependencies satisfied by a
+*human* move, and stays idempotent enough to run on every tick.
+
+A dependency whose task no longer exists counts as satisfied — a deleted
+predecessor must not deadlock the graph — and the release is reported in the
+thread note (`missing: TASK-nnn`).
+
+**Cycles are refused at write time.** `kanban depends` and plan ingestion both
+run a DFS over the whole board plus the proposed edges and reject anything that
+closes a cycle, naming the path. Acyclicity is the termination guarantee: a
+cyclic graph can never become ready.
+
+```sh
+kanban depends TASK-310                          # show edges, readiness, dependents
+kanban depends TASK-310 --on TASK-308 --on TASK-309   # replace the set
+kanban depends TASK-310 --clear
+kanban create "Docs" --depends-on TASK-308
+```
+
+## Orchestrator Mode
+
+A per-task opt-in (`use_orchestrator`, the **Orchestrator** checkbox in the
+task form, `kanban create --orchestrator`). There is deliberately **no**
+board-wide switch: an orchestrated run spends a whole graph of sessions, so it
+is always a per-task decision. The orchestrator runs on the **task's own**
+backend/model — the model is chosen on the task, not in `orchestration.*`.
+
+The pass itself:
+
+1. The task's first run enters phase `orchestrate` (before any design pass) and
+   gets the orchestrator prompt: the DAG rules, the plan schema, the configured
+   model rosters and the `max_subtasks` cap. That prompt is **role-scoped** —
+   it is never added to `AGENTS.md`, which every session pays for.
+2. The orchestrator writes a plan file and submits it with
+   `kanban plan <task> --file <plan.yaml> --session <s> --agent`. The plan is
+   validated whole (unknown references, duplicate or colliding keys, cycles,
+   unknown role profiles, size) **before anything is created**; a refused plan
+   costs one message, an accepted 200-node plan would cost 200 sessions.
+3. Accepted, each node becomes a To Do task with its `depends_on` wired, its
+   `needs` contract, its role profile and `parent_task` set to the planner. The
+   planner itself becomes the **join node**: `depends_on` every node it created,
+   `orchestrated: true`.
+4. `kanban done` ends the phase: the planner returns to To Do, the graph's roots
+   are queued, and the sweep drives the rest.
+
+Moving an orchestrated task back to To Do by hand (a human move or `recover`)
+drops its join (`orchestrated` and `depends_on` clear) so the next run plans
+again — the same "start from the top" semantics `designed` has. A subtask's own
+edges are never cleared this way: they are graph structure, not run state.
+
+### Role model rosters (`orchestration.roles`)
+
+Named, ordered lists of backend/model candidates the orchestrator may assign to
+a node with `role:`:
+
+```yaml
+orchestration:
+  roles:
+    cheap:
+      - claude/haiku
+      - opencode/openai/gpt-5.5
+    heavy:
+      - backend: claude
+        model: opus
+        effort: high
+```
+
+A node starts on the first candidate (materialized onto its own
+backend/model/effort/agent fields, so the census, the caps and the detail view
+all describe what will actually run). When a run dies on a **provider limit**,
+`advance_role_roster` moves the node to the next candidate and re-queues it
+immediately instead of parking it until the quota window rolls over. A failover
+does not spend a crash-restart step — the roster length already bounds it, and
+`roster_index` is never reset automatically. With no candidate left, the normal
+crash-restart backoff takes over.
+
+### Role-scoped instructions
+
+`<board>/.kanban/instructions/<role>.md` (`orchestrator`, `designer`,
+`reviewer`, `executor`) is appended to that role's prompt only, when that role
+is actually launched. `AGENTS.md` and `CLAUDE.md` are loaded into *every*
+session, so anything role-specific written there is charged to every run on the
+board; a role file is the opposite. Missing or empty files are skipped.

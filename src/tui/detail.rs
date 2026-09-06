@@ -247,6 +247,55 @@ fn render_meta(
             timefmt::format(&task.updated_at)
         )),
     ];
+    // Graph state costs a row, so it only appears on tasks that have any:
+    // an ordinary task's detail keeps the height it always had.
+    if !task.depends_on.is_empty()
+        || task.needs.is_some()
+        || task.role_profile.is_some()
+        || task.parent_task.is_some()
+        || task.use_orchestrator
+    {
+        let mut line = format!(
+            "Depends: {}",
+            if task.depends_on.is_empty() {
+                "-".to_string()
+            } else {
+                sanitize_terminal_text(&task.depends_on.join(", "))
+            }
+        );
+        if let Some(profile) = &task.role_profile {
+            line.push_str(&format!(
+                " │ Role: {} #{}",
+                sanitize_terminal_text(profile),
+                task.roster_index + 1
+            ));
+        }
+        if let Some(parent) = &task.parent_task {
+            line.push_str(&format!(
+                " │ Planned by: {}",
+                sanitize_terminal_text(parent)
+            ));
+        }
+        if task.use_orchestrator {
+            line.push_str(if task.orchestrated {
+                " │ Orchestrator: planned"
+            } else {
+                " │ Orchestrator: on"
+            });
+        }
+        meta.push(Line::from(line));
+        if let Some(needs) = task
+            .needs
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
+            meta.push(Line::from(format!(
+                "Needs: {}",
+                sanitize_terminal_text(needs)
+            )));
+        }
+    }
     if let Some(worktree) = &meta_state.worktree_path {
         let mut line = format!(
             "Worktree: {} │ Branch: {} │ Base: {}",
