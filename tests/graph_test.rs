@@ -440,6 +440,84 @@ fn only_depends_on_carries_upstream_results_into_the_prompt() {
     drop(dir);
 }
 
+/// The upstream digest carries the compact `kanban context` notes, not the
+/// harvested chat reply. The reply is the newest message, so without the
+/// filter it spends the whole budget and evicts exactly what the digest
+/// exists to hand downstream.
+#[test]
+fn the_upstream_digest_skips_the_harvested_reply_when_context_was_recorded() {
+    let (dir, ops, _recorder) =
+        graph_board("  queue_enabled: true\n  orchestrator:\n    upstream_budget_chars: 400\n");
+    let upstream = todo(&ops, "Upstream work");
+    let context = ContextManager::new(ops.data_root());
+    context
+        .append_context(
+            &upstream.id,
+            "probe flag is --stop-loc 2",
+            "agent",
+            &ops.storage,
+        )
+        .unwrap();
+    // Posted last, and long enough to swallow the whole budget on its own.
+    context
+        .append_context(
+            &upstream.id,
+            &format!("Dear human, here is the full report: {}", "x".repeat(600)),
+            "agent-reply",
+            &ops.storage,
+        )
+        .unwrap();
+    ops.move_task(&upstream.id, TaskStatus::Review.as_str(), false)
+        .unwrap();
+
+    let mut dependent = todo(&ops, "Dependent");
+    dependent.depends_on = vec![upstream.id.clone()];
+    ops.storage.save_task(&dependent).unwrap();
+
+    let prompt =
+        build_agent_prompt(ops.roots(), &dependent, "ses-test", false, Role::Executor).unwrap();
+    assert!(
+        prompt.contains("probe flag is --stop-loc 2"),
+        "the compact note must survive the budget: {prompt}"
+    );
+    assert!(
+        !prompt.contains("Dear human, here is the full report"),
+        "the harvested reply must not crowd out the notes: {prompt}"
+    );
+    drop(dir);
+}
+
+/// A run that recorded nothing but its reply still has to hand *something*
+/// downstream, so the reply is kept when it is the only result there is.
+#[test]
+fn the_upstream_digest_keeps_the_reply_when_it_is_the_only_result() {
+    let (dir, ops, _recorder) =
+        graph_board("  queue_enabled: true\n  orchestrator:\n    upstream_budget_chars: 400\n");
+    let upstream = todo(&ops, "Upstream work");
+    ContextManager::new(ops.data_root())
+        .append_context(
+            &upstream.id,
+            "only the reply was ever harvested",
+            "agent-reply",
+            &ops.storage,
+        )
+        .unwrap();
+    ops.move_task(&upstream.id, TaskStatus::Review.as_str(), false)
+        .unwrap();
+
+    let mut dependent = todo(&ops, "Dependent");
+    dependent.depends_on = vec![upstream.id.clone()];
+    ops.storage.save_task(&dependent).unwrap();
+
+    let prompt =
+        build_agent_prompt(ops.roots(), &dependent, "ses-test", false, Role::Executor).unwrap();
+    assert!(
+        prompt.contains("only the reply was ever harvested"),
+        "{prompt}"
+    );
+    drop(dir);
+}
+
 /// Role instructions are the opposite of `AGENTS.md`: only the role they name
 /// ever sees them, and only when that role is launched.
 #[test]

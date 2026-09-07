@@ -473,9 +473,26 @@ pub fn package_upgrade_command() -> Option<String> {
     }
 }
 
+/// The file the running process was started from, with the `/proc/self/exe`
+/// `" (deleted)"` suffix resolved away.
+///
+/// That suffix appears whenever the binary is replaced in place while this
+/// process runs (an install, or a previous self-update). Installing onto the
+/// literal `… (deleted)` name would leave a stale build sitting next to the
+/// real one forever — and the same reading feeds the pacman ownership probe,
+/// which would silently miss a package-managed install.
 fn current_exe_path() -> Result<PathBuf, ApplyError> {
-    std::env::current_exe()
-        .map_err(|err| ApplyError::Io(format!("cannot locate the running binary: {err}")))
+    let exe = std::env::current_exe()
+        .map_err(|err| ApplyError::Io(format!("cannot locate the running binary: {err}")))?;
+    if let Some(stripped) = exe
+        .to_str()
+        .and_then(|path| path.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        && stripped.exists()
+    {
+        return Ok(stripped);
+    }
+    Ok(exe)
 }
 
 fn pacman_owner(exe: &Path) -> Option<String> {

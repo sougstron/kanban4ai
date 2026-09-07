@@ -345,12 +345,26 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
 /// binary exists at the original path; callbacks must target that fresh
 /// file, not the nonexistent suffixed one. Returns `None` when no
 /// existing path remains.
+/// The binary an agent's callbacks (`context`, `done`, `agent-exit`, …) must
+/// run.
+///
+/// `/proc/self/exe` reads as `<path> (deleted)` once the file has been
+/// replaced in place — an install or self-update while the TUI/daemon is
+/// running. The stripped path is checked **first**: a file literally named
+/// `… (deleted)` can exist (an older self-update renamed its download onto
+/// that reading), and it is by construction the *superseded* build. Handing
+/// agents that copy makes every callback run an outdated binary, which
+/// silently drops task fields it does not know.
 fn resolve_callback_binary(exe: PathBuf) -> Option<PathBuf> {
-    if exe.exists() {
-        return Some(exe);
+    if let Some(stripped) = exe
+        .to_str()
+        .and_then(|path| path.strip_suffix(" (deleted)"))
+        .map(PathBuf::from)
+        && stripped.exists()
+    {
+        return Some(stripped);
     }
-    let stripped = PathBuf::from(exe.to_str()?.strip_suffix(" (deleted)")?);
-    stripped.exists().then_some(stripped)
+    exe.exists().then_some(exe)
 }
 
 fn command_available(command: &str) -> bool {
@@ -766,7 +780,27 @@ mod tests {
         let plain = dir.path().join("kanban4ai");
         std::fs::write(&plain, b"").unwrap();
         assert_eq!(resolve_callback_binary(plain.clone()), Some(plain));
+    }
 
+    /// A real file named `… (deleted)` left behind by an older self-update is
+    /// the superseded build: the fresh binary at the stripped path wins, or
+    /// every agent callback would run the outdated one and drop task fields
+    /// that build does not know.
+    #[test]
+    fn resolve_callback_binary_prefers_the_fresh_path_over_a_literal_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("kanban4ai");
+        std::fs::write(&fresh, b"").unwrap();
+        let stale = dir.path().join("kanban4ai (deleted)");
+        std::fs::write(&stale, b"").unwrap();
+        assert_eq!(resolve_callback_binary(stale), Some(fresh));
+    }
+
+    /// With no fresh binary at the stripped path, a literal `… (deleted)`
+    /// file is still better than falling back to bare "kanban".
+    #[test]
+    fn resolve_callback_binary_falls_back_to_a_literal_deleted_file() {
+        let dir = tempfile::tempdir().unwrap();
         let literal = dir.path().join("kanban4ai (deleted)");
         std::fs::write(&literal, b"").unwrap();
         assert_eq!(resolve_callback_binary(literal.clone()), Some(literal));
