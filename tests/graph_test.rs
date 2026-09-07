@@ -276,6 +276,77 @@ fn a_plan_that_cannot_run_creates_nothing() {
     assert!(!ops.get_task(&parent.id).unwrap().unwrap().orchestrated);
 }
 
+/// The executor pools are assignable profiles, and a node that names none
+/// lands on `orchestrator.default_role` instead of inheriting the planner's
+/// own (expensive) model — inheriting also looked like an explicit per-task
+/// assignment, which kept the pools from ever replacing it.
+#[test]
+fn planned_nodes_default_to_the_cheap_pool_instead_of_the_planners_model() {
+    let (_dir, ops, _recorder) = graph_board(
+        "  queue_enabled: true\n  \
+         executors:\n    \
+         middle:\n    - {backend: claude, model: opus, effort: high}\n    \
+         cheap:\n    - claude/haiku\n    - opencode/openai/gpt-5.5\n",
+    );
+    let parent = ops
+        .create_task(NewTask {
+            title: "Big feature".into(),
+            agent_backend: Some("claude".into()),
+            ai_model: Some("opus".into()),
+            ai_effort: Some("high".into()),
+            use_orchestrator: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let plan = Plan::parse(
+        "nodes:\n\
+         - key: grind\n  title: Grind through it\n\
+         - key: think\n  title: Think hard\n  role: middle\n",
+    )
+    .unwrap();
+    let outcome = ops.apply_plan(&parent.id, &plan, None).unwrap();
+    let grind = &outcome.created[0];
+    assert_eq!(grind.role_profile.as_deref(), Some("cheap"));
+    assert_eq!(grind.agent_backend.as_deref(), Some("claude"));
+    assert_eq!(grind.ai_model.as_deref(), Some("haiku"));
+    assert_eq!(
+        grind.ai_effort, None,
+        "a candidate is the whole assignment: the planner's effort is not glued onto it"
+    );
+
+    // A pool the orchestrator names explicitly is accepted the same way.
+    let think = &outcome.created[1];
+    assert_eq!(think.role_profile.as_deref(), Some("middle"));
+    assert_eq!(think.ai_model.as_deref(), Some("opus"));
+    assert_eq!(think.ai_effort.as_deref(), Some("high"));
+}
+
+/// `default_role: inherit` is the legacy behaviour, kept for boards that plan
+/// onto the planner's own model on purpose.
+#[test]
+fn default_role_inherit_keeps_the_planners_assignment() {
+    let (_dir, ops, _recorder) = graph_board(
+        "  queue_enabled: true\n  orchestrator:\n    default_role: inherit\n  \
+         executors:\n    cheap:\n    - claude/haiku\n",
+    );
+    let parent = ops
+        .create_task(NewTask {
+            title: "Big feature".into(),
+            agent_backend: Some("claude".into()),
+            ai_model: Some("opus".into()),
+            ai_effort: Some("high".into()),
+            use_orchestrator: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let plan = Plan::parse("nodes:\n- key: grind\n  title: Grind\n").unwrap();
+    let node = &ops.apply_plan(&parent.id, &plan, None).unwrap().created[0];
+    assert_eq!(node.role_profile, None);
+    assert_eq!(node.ai_model.as_deref(), Some("opus"));
+    assert_eq!(node.ai_effort.as_deref(), Some("high"));
+}
+
 /// A subscription limit is the one failure another model absorbs: the node
 /// moves to the next roster entry and re-queues instead of parking until the
 /// provider's window rolls over.
@@ -436,6 +507,29 @@ fn the_orchestrator_prompt_lists_the_configured_rosters() {
     assert!(
         !executor.contains("cheap: claude/haiku"),
         "the roster list is not charged to every session: {executor}"
+    );
+}
+
+/// The pools are part of that list: a board that configures only
+/// `orchestration.executors` still gets a roster the planner may assign, and
+/// the prompt names the profile an unset `role` falls back to.
+#[test]
+fn the_orchestrator_prompt_lists_the_executor_pools_and_the_default_role() {
+    let (_dir, ops, _recorder) = graph_board(
+        "  queue_enabled: true\n  \
+         executors:\n    \
+         middle:\n    - {backend: claude, model: opus, effort: high}\n    \
+         cheap:\n    - claude/haiku\n",
+    );
+    let task = todo(&ops, "Plan me");
+    let prompt =
+        build_agent_prompt(ops.roots(), &task, "ses-test", false, Role::Orchestrator).unwrap();
+    assert!(prompt.contains("cheap: claude/haiku"), "{prompt}");
+    assert!(prompt.contains("middle: claude/opus"), "{prompt}");
+    assert!(
+        prompt.contains("`role` unset \nruns on `cheap`")
+            || prompt.contains("`role` unset runs on `cheap`"),
+        "{prompt}"
     );
 }
 

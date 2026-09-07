@@ -158,7 +158,8 @@ pub struct PlanNode {
     /// The edge's context contract: what this node needs from upstream.
     #[serde(default)]
     pub needs: Option<String>,
-    /// `orchestration.roles` profile the node runs on.
+    /// Profile the node runs on: an `orchestration.roles` roster or a
+    /// non-empty `orchestration.executors` pool (`middle` / `cheap`).
     #[serde(default)]
     pub role: Option<String>,
     /// Run the reviewer bot on this node even when it is off board-wide.
@@ -243,8 +244,8 @@ impl Plan {
                 && !known_roles.iter().any(|known| known == role)
             {
                 return Err(KanbanError::Invalid(format!(
-                    "plan node '{key}' asks for role '{role}', which is not configured under \
-                     orchestration.roles (available: {})",
+                    "plan node '{key}' asks for role '{role}', which is not a configured \
+                     orchestration.roles roster or executor pool (available: {})",
                     if known_roles.is_empty() {
                         "none".to_string()
                     } else {

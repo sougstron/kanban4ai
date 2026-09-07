@@ -330,30 +330,53 @@ The plan is validated before anything is created: unknown references, duplicate 
         "Limits: at most {} nodes in one plan.\n",
         orch.orchestrator.max_subtasks
     ));
-    if orch.roles.is_empty() {
+    // The assignable profiles are the configured rosters *plus* the board's
+    // executor pools, which is what `apply_plan` accepts — a prompt that only
+    // listed `orchestration.roles` left an empty-roles board no way to ask for
+    // the cheap pool, so every node silently ran on the planner's own model.
+    let rosters: Vec<(String, String)> = orch
+        .known_role_names()
+        .into_iter()
+        .filter_map(|name| {
+            let label = orch
+                .roster(&name)?
+                .iter()
+                .map(|candidate| candidate.label())
+                .collect::<Vec<_>>()
+                .join(" → ");
+            Some((name, label))
+        })
+        .collect();
+    let default_role = orch
+        .orchestrator
+        .default_role
+        .profile()
+        .filter(|profile| orch.roster(profile).is_some());
+    if rosters.is_empty() {
         prompt.push_str(
-            "Model rosters: none are configured (orchestration.roles is empty), so leave `role`\
- unset — every node inherits this task's own backend and model.\n\n",
+            "Model rosters: none are configured (orchestration.roles and \
+orchestration.executors are empty), so leave `role` unset — every node inherits this task's \
+own backend and model.\n\n",
         );
     } else {
         prompt.push_str(
             "Model rosters you may assign with `role` (a node runs on the first entry; if that \
 backend hits a subscription limit the board moves the node to the next one automatically):\n",
         );
-        for (name, candidates) in &orch.roles {
-            prompt.push_str(&format!(
-                "- {name}: {}\n",
-                candidates
-                    .iter()
-                    .map(|candidate| candidate.label())
-                    .collect::<Vec<_>>()
-                    .join(" → ")
-            ));
+        for (name, label) in &rosters {
+            prompt.push_str(&format!("- {name}: {label}\n"));
         }
-        prompt.push_str(
-            "Pick the cheapest roster that can do each node's work; leave `role` unset to \
+        match default_role {
+            Some(default_role) => prompt.push_str(&format!(
+                "Pick the cheapest roster that can do each node's work; a node with `role` unset \
+runs on `{default_role}`. This task's own (larger) model is not inherited — ask for a roster \
+explicitly when a node truly needs one.\n\n"
+            )),
+            None => prompt.push_str(
+                "Pick the cheapest roster that can do each node's work; leave `role` unset to \
 inherit this task's own backend and model.\n\n",
-        );
+            ),
+        }
     }
     prompt.push_str(&format!(
         "Session contract:\n\

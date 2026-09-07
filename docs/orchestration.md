@@ -472,7 +472,15 @@ The pass itself:
    unknown role profiles, size) **before anything is created**; a refused plan
    costs one message, an accepted 200-node plan would cost 200 sessions.
 3. Accepted, each node becomes a To Do task with its `depends_on` wired, its
-   `needs` contract, its role profile and `parent_task` set to the planner. The
+   `needs` contract, its role profile and `parent_task` set to the planner. A
+   node that named no `role:` takes
+   `orchestration.orchestrator.default_role` (`cheap` by default, or `inherit`
+   for the planner's own assignment) — the planner's model is not inherited by
+   default, because a large planning model made every subtask expensive *and*
+   made each subtask look explicitly assigned, which stopped the executor
+   pools from ever replacing it. A profile's candidate is the node's whole
+   assignment: a field the candidate leaves unset is that backend's default,
+   never the planner's value. The
    planner itself becomes the **join node**: `depends_on` every node it created,
    `orchestrated: true`.
 4. `kanban done` ends the phase: the planner returns to To Do, the graph's roots
@@ -486,7 +494,11 @@ edges are never cleared this way: they are graph structure, not run state.
 ### Role model rosters (`orchestration.roles`)
 
 Named, ordered lists of backend/model candidates the orchestrator may assign to
-a node with `role:`:
+a node with `role:`. The assignable names are these rosters plus the non-empty
+`orchestration.executors` pools (`middle`, `cheap`), which the plan validator
+accepts and the orchestrator prompt lists with their contents; a roster shadows
+a pool of the same name. A node assigned a pool starts on candidate #0 and is
+re-resolved against provider headroom at launch like any other pooled task.
 
 ```yaml
 orchestration:

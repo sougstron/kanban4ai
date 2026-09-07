@@ -2035,7 +2035,7 @@ impl Operations {
                 parent.depends_on.len()
             )));
         }
-        let known_roles: Vec<String> = orch.roles.keys().cloned().collect();
+        let known_roles = orch.known_role_names();
         let max_subtasks = orch.orchestrator.max_subtasks.max(1) as usize;
         plan.validate(parent_id, &tasks, max_subtasks, &known_roles)?;
 
@@ -2045,32 +2045,51 @@ impl Operations {
         let mut by_key: HashMap<String, String> = HashMap::new();
         for node in &plan.nodes {
             let key = node.key.trim().to_string();
+            // A node that names no role falls back to
+            // `orchestrator.default_role` (the cheap pool by default) rather
+            // than to the planner's own assignment: inheriting made every
+            // node look explicitly assigned, which also kept the executor
+            // pools from ever touching it.
             let profile = node
                 .role
                 .as_deref()
                 .map(str::trim)
                 .filter(|role| !role.is_empty())
-                .map(str::to_owned);
+                .map(str::to_owned)
+                .or_else(|| {
+                    orch.orchestrator
+                        .default_role
+                        .profile()
+                        .filter(|profile| orch.roster(profile).is_some())
+                        .map(str::to_owned)
+                });
             let candidate = profile
                 .as_deref()
                 .and_then(|profile| orch.role_candidate(profile, 0));
             let new_task = NewTask {
                 title: node.title.trim().to_string(),
                 description: node.description.trim().to_string(),
-                // A role profile is the node's assignment; without one the node
-                // inherits the orchestrated task's own backend and model.
-                ai_model: candidate
-                    .and_then(|c| c.model.clone())
-                    .or_else(|| parent.ai_model.clone()),
-                ai_effort: candidate
-                    .and_then(|c| c.effort.clone())
-                    .or_else(|| parent.ai_effort.clone()),
-                agent_backend: candidate
-                    .and_then(|c| c.backend.clone())
-                    .or_else(|| parent.agent_backend.clone()),
-                agent_name: candidate
-                    .and_then(|c| c.agent.clone())
-                    .or_else(|| parent.agent_name.clone()),
+                // A candidate is the node's whole assignment — a field it
+                // leaves unset means "that backend's default", never the
+                // planner's value, or a `claude/haiku` node would inherit an
+                // `opus`-sized effort. Only a node with no profile at all
+                // falls back to the orchestrated task's own settings.
+                ai_model: match candidate {
+                    Some(candidate) => candidate.model.clone(),
+                    None => parent.ai_model.clone(),
+                },
+                ai_effort: match candidate {
+                    Some(candidate) => candidate.effort.clone(),
+                    None => parent.ai_effort.clone(),
+                },
+                agent_backend: match candidate {
+                    Some(candidate) => candidate.backend.clone(),
+                    None => parent.agent_backend.clone(),
+                },
+                agent_name: match candidate {
+                    Some(candidate) => candidate.agent.clone(),
+                    None => parent.agent_name.clone(),
+                },
                 interactive: false,
                 use_designer: node.designer,
                 use_reviewer: node.reviewer,
