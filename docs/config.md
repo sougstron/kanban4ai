@@ -123,7 +123,7 @@ orchestration:
   designer: {enabled: false, backend: claude, model: sonnet, effort: null, agent: null}
   reviewer: {enabled: false, backend: claude, model: sonnet, effort: null, agent: null,
              on_changes_requested: in_progress, max_rounds: 3}
-  orchestrator: {max_subtasks: 12, upstream_budget_chars: 4000}
+  orchestrator: {max_subtasks: 12, upstream_budget_chars: 4000, default_role: cheap}
   roles: {}
   executors: {middle: [], cheap: [], thresholds: {week_percent: 5, five_hour_percent: 15},
               ask_grace_secs: 60}
@@ -189,14 +189,25 @@ backend/model, so nothing here selects a bot.
 - `upstream_budget_chars`: 4000 - character budget for the whole *Upstream
   results* section a dependent task is prompted with, split across its
   dependencies. `0` turns the section off
+- `default_role`: cheap - the profile a plan node with **no** `role:` is
+  assigned: `cheap` or `middle` (the executor pool of that name, or a
+  same-named `roles` roster), or `inherit` for the pre-0.6.6 behaviour of
+  copying the planning task's own backend/model/effort. A planner usually runs
+  on a large model precisely because the *planning* is hard; inheriting it made
+  every subtask run there too, and made each subtask look explicitly assigned,
+  which locked the executor pools out of it. A `cheap`/`middle` value with no
+  candidates behind it falls back to `inherit`
 
-Both must be positive integers; anything else is a config error.
+The two integers must be positive and `default_role` must be one of the three
+names; anything else is a config error.
 
 ### `orchestration.roles`
 
 Named, ordered model rosters the orchestrator may assign to the nodes it plans
-(`role:` in the plan file). Empty by default, which means every node inherits
-the planning task's own backend and model.
+(`role:` in the plan file). Empty by default; the assignable names are these
+rosters **plus** whichever `orchestration.executors` pools are non-empty
+(`middle`, `cheap`), so a board that configures only pools still gives the
+planner something to assign. A roster shadows a pool of the same name.
 
 ```yaml
 orchestration:
@@ -240,14 +251,14 @@ orchestration:
 ```
 
 - `middle`: [] - up to three ordered candidates. Opt-in: a task only uses it
-  with `role_profile: middle` (the orchestrator's plan can assign that
-  profile). "Middle" is the smart pool — the same roster resolves designer and
+  with `role_profile: middle` (a plan node asks for it with `role: middle`). "Middle" is the smart pool — the same roster resolves designer and
   reviewer launches when their bot settings opt in through it
 - `cheap`: [] - up to three ordered candidates. This is the executor default:
   any queued task whose launch settings are indistinguishable from the board
   defaults (the human left backend/model on Default) resolves through it. An
   explicit per-task assignment always wins — the pool never overrides a model
-  the user picked
+  the user picked. It is also the default `orchestration.orchestrator.default_role`,
+  so plan nodes land here unless the planner asked for something else
 - `thresholds.week_percent`: 5 - minimum *remaining* percentage a provider's
   weekly window must show (inclusive boundary) for a candidate to pass
 - `thresholds.five_hour_percent`: 15 - the same floor for 5h windows; every

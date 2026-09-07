@@ -213,6 +213,7 @@ orchestration:
   orchestrator:
     max_subtasks: 12
     upstream_budget_chars: 4000
+    default_role: cheap
   roles: {}
   executors:
     middle: []
@@ -341,6 +342,42 @@ pub struct OrchestratorSettings {
     /// Character budget for the whole *Upstream results* section a dependent
     /// task is prompted with, split across its dependencies.
     pub upstream_budget_chars: i64,
+    /// What a planned node with no `role:` runs on. Without this every node
+    /// inherited the planner's own (usually expensive) assignment, which also
+    /// made the node look explicitly assigned and locked the executor pools
+    /// out of it.
+    pub default_role: DefaultRole,
+}
+
+/// `orchestration.orchestrator.default_role`: the profile a plan node with no
+/// `role:` is assigned. `Cheap`/`Middle` name the executor pool of that name
+/// (falling back to a same-named `orchestration.roles` roster), `Inherit`
+/// keeps the legacy behaviour of copying the planner's own assignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefaultRole {
+    Cheap,
+    Middle,
+    Inherit,
+}
+
+impl DefaultRole {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "cheap" => Some(Self::Cheap),
+            "middle" => Some(Self::Middle),
+            "inherit" => Some(Self::Inherit),
+            _ => None,
+        }
+    }
+
+    /// The role profile name to assign, or `None` for "inherit the planner".
+    pub fn profile(self) -> Option<&'static str> {
+        match self {
+            Self::Cheap => Some("cheap"),
+            Self::Middle => Some("middle"),
+            Self::Inherit => None,
+        }
+    }
 }
 
 /// `orchestration.executors.thresholds`: the *remaining*-percent floors a
@@ -583,16 +620,44 @@ impl OrchestrationSettings {
     /// task whose failover ran out keeps a usable assignment instead of
     /// silently losing its profile.
     pub fn role_candidate(&self, profile: &str, index: u32) -> Option<&RoleCandidate> {
-        let roster = self.roles.get(profile).filter(|r| !r.is_empty())?;
+        let roster = self.roster(profile)?;
         Some(&roster[(index as usize).min(roster.len() - 1)])
     }
 
     /// Whether a further candidate exists after `index` — i.e. whether a
     /// limit failure can fail over instead of waiting for the quota window.
     pub fn has_next_role_candidate(&self, profile: &str, index: u32) -> bool {
-        self.roles
-            .get(profile)
+        self.roster(profile)
             .is_some_and(|roster| (index as usize + 1) < roster.len())
+    }
+
+    /// The candidate list behind a profile name. `orchestration.roles` wins —
+    /// an explicitly configured roster is never shadowed — and the `middle` /
+    /// `cheap` executor pools are addressable as profiles of the same name so
+    /// the orchestrator can plan onto the board's pools instead of only onto
+    /// hand-written rosters.
+    pub fn roster(&self, profile: &str) -> Option<&[RoleCandidate]> {
+        if let Some(roster) = self.roles.get(profile).filter(|r| !r.is_empty()) {
+            return Some(roster);
+        }
+        let pool = match profile {
+            "middle" => &self.executors.middle,
+            "cheap" => &self.executors.cheap,
+            _ => return None,
+        };
+        (!pool.is_empty()).then_some(pool.as_slice())
+    }
+
+    /// Every profile name a plan node may name: the configured rosters plus
+    /// whichever executor pools are non-empty.
+    pub fn known_role_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.roles.keys().cloned().collect();
+        for pool in ["middle", "cheap"] {
+            if self.roster(pool).is_some() && !names.iter().any(|known| known == pool) {
+                names.push(pool.to_owned());
+            }
+        }
+        names
     }
 }
 
@@ -1326,6 +1391,11 @@ impl OrchestrationSettings {
             orchestrator: OrchestratorSettings {
                 max_subtasks: orchestrator_int("max_subtasks", 12),
                 upstream_budget_chars: orchestrator_int("upstream_budget_chars", 4000),
+                default_role: orchestrator
+                    .and_then(|m| m.get("default_role"))
+                    .and_then(Value::as_str)
+                    .and_then(DefaultRole::parse)
+                    .unwrap_or(DefaultRole::Cheap),
             },
             roles,
             executors,
@@ -1668,6 +1738,25 @@ impl Config {
                     )));
                 }
                 orchestrator.insert(yaml_key, Value::Number(parsed.into()));
+            }
+            let role_key = Value::String("default_role".into());
+            if let Some(value) = orchestrator
+                .get(&role_key)
+                .filter(|v| !matches!(v, Value::Null))
+                .cloned()
+            {
+                let parsed = value.as_str().and_then(DefaultRole::parse).ok_or_else(|| {
+                    KanbanError::Invalid(format!(
+                        "orchestration.orchestrator.default_role must be one of cheap, \
+                             middle, inherit, got: {value:?}"
+                    ))
+                })?;
+                let canonical = match parsed {
+                    DefaultRole::Cheap => "cheap",
+                    DefaultRole::Middle => "middle",
+                    DefaultRole::Inherit => "inherit",
+                };
+                orchestrator.insert(role_key, Value::String(canonical.to_owned()));
             }
         }
 
