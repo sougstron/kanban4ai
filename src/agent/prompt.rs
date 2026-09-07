@@ -622,8 +622,20 @@ fn append_upstream_results(roots: Roots<'_>, task: &Task, prompt: &mut String) -
 /// One dependency's result, newest first and truncated to `budget` characters.
 /// Newest first because the last thing a task recorded is its conclusion; the
 /// earlier entries are the road to it and are the right thing to lose.
+///
+/// The harvested whole-session reply (`author: agent-reply`) is skipped when
+/// the run also posted explicit `kanban context` entries — the same rule
+/// [`append_thread_context`] applies to a task's own thread. A reply is chat
+/// prose addressed to the human: several kilobytes of tables and pleasantries
+/// that, being the newest message, would spend the entire budget and evict
+/// the deliberately compact progress notes the digest exists to carry.
 fn upstream_digest(threads: &ThreadManager, task_id: &str, budget: usize) -> Result<String> {
     let thread = threads.load(task_id)?;
+    let has_agent_context = thread.messages.iter().any(|message| {
+        message.kind == MessageKind::Context
+            && message.status != MessageStatus::Rejected
+            && message.author.as_deref() == Some("agent")
+    });
     let mut kept: Vec<String> = Vec::new();
     let mut used = 0usize;
     for message in thread
@@ -632,6 +644,7 @@ fn upstream_digest(threads: &ThreadManager, task_id: &str, budget: usize) -> Res
         .rev()
         .filter(|message| message.kind == MessageKind::Context)
         .filter(|message| message.status != MessageStatus::Rejected)
+        .filter(|message| !(has_agent_context && message.author.as_deref() == Some("agent-reply")))
     {
         let body = compact_text(message.body.trim());
         if body.is_empty() {
