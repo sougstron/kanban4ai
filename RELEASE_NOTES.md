@@ -1,3 +1,39 @@
+# kanban4ai 0.6.6
+
+Orchestrated plan nodes no longer inherit the planner's large model. A
+role-less node lands on the cheap executor pool, so subtasks can fail over
+instead of every child running opus/high because the planner did.
+
+## Changed
+
+- **Plan nodes default to the cheap executor pool** (`core/config.rs`,
+  `core/operations.rs`, `core/graph.rs`, `agent/prompt.rs`, `docs/config.md`,
+  `docs/orchestration.md`; `tests/graph_test.rs`). An orchestrated node with
+  no `role:` used to copy the planner's own backend/model/effort. The planner
+  runs on a large model because planning is hard, so every subtask inherited
+  that assignment — and because the copy looked like an explicit per-task
+  pick, `apply_executor_pool` refused to touch it. New
+  `orchestration.orchestrator.default_role` (`cheap` | `middle` | `inherit`,
+  default `cheap`) picks what a role-less node is assigned. The non-empty
+  executor pools are addressable as role profiles: plan validation accepts
+  them, the orchestrator prompt lists their contents and names the default,
+  and `apply_plan` materializes candidate #0. A candidate is the node's whole
+  assignment; an unset field is the backend's default, not the planner's
+  value. `inherit` keeps the pre-0.6.6 copy. A `cheap`/`middle` value with no
+  candidates behind it falls back to inherit.
+
+## Verification coverage
+
+- role-less nodes land on cheap candidate #0 and do not glue the planner's
+  effort onto it; `role: middle` is accepted as a pool name
+  (`tests/graph_test.rs`:
+  `planned_nodes_default_to_the_cheap_pool_instead_of_the_planners_model`)
+- `default_role: inherit` still copies the planner
+  (`tests/graph_test.rs`: `default_role_inherit_keeps_the_planners_assignment`)
+- the orchestrator prompt lists pool contents and the unset-role default
+  (`tests/graph_test.rs`:
+  `the_orchestrator_prompt_lists_the_executor_pools_and_the_default_role`)
+
 # kanban4ai 0.6.5
 
 The board starts work on a provider that still has quota, and can wait until
