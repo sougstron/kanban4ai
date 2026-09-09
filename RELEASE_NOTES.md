@@ -1,3 +1,15 @@
+# kanban4ai 0.6.8
+
+Six popular color themes join the built-in TUI palette.
+
+## Added
+
+- **New TUI themes** (`tui/theme.rs`, `tui/tests.rs`,
+  `docs/config.md`). Project Settings and the `Ctrl+T` quick-toggle now
+  also offer `catppuccin-mocha`, `tokyo-night`, `rose-pine`, `kanagawa`,
+  `one-dark`, and `github-dark`. The quick-toggle cycle wraps from
+  `github-dark` back to `dark`.
+
 # kanban4ai 0.6.7
 
 Project Settings now offers every built-in theme, and two agent-facing
