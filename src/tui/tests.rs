@@ -1936,6 +1936,12 @@ fn project_settings_offers_all_builtin_themes() {
             "solarized-dark",
             "dracula",
             "gruvbox-dark",
+            "catppuccin-mocha",
+            "tokyo-night",
+            "rose-pine",
+            "kanagawa",
+            "one-dark",
+            "github-dark",
         ]
     );
 }

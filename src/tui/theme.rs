@@ -13,6 +13,12 @@ pub(super) const BUILTIN_THEMES: &[(&str, &str)] = &[
     ("Solarized Dark", "solarized-dark"),
     ("Dracula", "dracula"),
     ("Gruvbox Dark", "gruvbox-dark"),
+    ("Catppuccin Mocha", "catppuccin-mocha"),
+    ("Tokyo Night", "tokyo-night"),
+    ("Rose Pine", "rose-pine"),
+    ("Kanagawa", "kanagawa"),
+    ("One Dark", "one-dark"),
+    ("GitHub Dark", "github-dark"),
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -41,6 +47,12 @@ impl Theme {
             "solarized-dark" => Self::solarized_dark(),
             "dracula" => Self::dracula(),
             "gruvbox-dark" => Self::gruvbox_dark(),
+            "catppuccin-mocha" => Self::catppuccin_mocha(),
+            "tokyo-night" => Self::tokyo_night(),
+            "rose-pine" => Self::rose_pine(),
+            "kanagawa" => Self::kanagawa(),
+            "one-dark" => Self::one_dark(),
+            "github-dark" => Self::github_dark(),
             _ => Self::dark(),
         }
     }
@@ -54,6 +66,12 @@ impl Theme {
             "green" => "green",
             "dracula" => "dracula",
             "gruvbox-dark" => "gruvbox-dark",
+            "catppuccin-mocha" => "catppuccin-mocha",
+            "tokyo-night" => "tokyo-night",
+            "rose-pine" => "rose-pine",
+            "kanagawa" => "kanagawa",
+            "one-dark" => "one-dark",
+            "github-dark" => "github-dark",
             "dark" | "textual-dark" => "dark",
             _ => "dark",
         }
@@ -187,6 +205,96 @@ impl Theme {
             review: Color::Rgb(211, 134, 155),
         }
     }
+
+    fn catppuccin_mocha() -> Self {
+        Self {
+            bg: Color::Rgb(30, 30, 46),
+            fg: Color::Rgb(205, 214, 244),
+            muted: Color::Rgb(147, 153, 178),
+            border: Color::Rgb(69, 71, 90),
+            hover: Color::Rgb(49, 50, 68),
+            focus: Color::Rgb(137, 180, 250),
+            warn: Color::Rgb(249, 226, 175),
+            ok: Color::Rgb(166, 227, 161),
+            err: Color::Rgb(243, 139, 168),
+            review: Color::Rgb(203, 166, 247),
+        }
+    }
+
+    fn tokyo_night() -> Self {
+        Self {
+            bg: Color::Rgb(26, 27, 38),
+            fg: Color::Rgb(192, 202, 245),
+            muted: Color::Rgb(86, 95, 137),
+            border: Color::Rgb(59, 66, 97),
+            hover: Color::Rgb(36, 40, 59),
+            focus: Color::Rgb(122, 162, 247),
+            warn: Color::Rgb(224, 175, 104),
+            ok: Color::Rgb(158, 206, 106),
+            err: Color::Rgb(247, 118, 142),
+            review: Color::Rgb(187, 154, 247),
+        }
+    }
+
+    fn rose_pine() -> Self {
+        Self {
+            bg: Color::Rgb(25, 23, 36),
+            fg: Color::Rgb(224, 222, 244),
+            muted: Color::Rgb(144, 140, 170),
+            border: Color::Rgb(64, 61, 82),
+            hover: Color::Rgb(38, 35, 58),
+            focus: Color::Rgb(196, 167, 231),
+            warn: Color::Rgb(246, 193, 119),
+            ok: Color::Rgb(156, 207, 216),
+            err: Color::Rgb(235, 111, 146),
+            review: Color::Rgb(235, 188, 186),
+        }
+    }
+
+    fn kanagawa() -> Self {
+        Self {
+            bg: Color::Rgb(31, 31, 40),
+            fg: Color::Rgb(220, 215, 186),
+            muted: Color::Rgb(114, 113, 105),
+            border: Color::Rgb(84, 84, 109),
+            hover: Color::Rgb(42, 42, 55),
+            focus: Color::Rgb(126, 156, 216),
+            warn: Color::Rgb(230, 195, 132),
+            ok: Color::Rgb(152, 187, 108),
+            err: Color::Rgb(228, 104, 118),
+            review: Color::Rgb(149, 127, 184),
+        }
+    }
+
+    fn one_dark() -> Self {
+        Self {
+            bg: Color::Rgb(40, 44, 52),
+            fg: Color::Rgb(171, 178, 191),
+            muted: Color::Rgb(127, 132, 142),
+            border: Color::Rgb(75, 82, 99),
+            hover: Color::Rgb(44, 50, 60),
+            focus: Color::Rgb(97, 175, 239),
+            warn: Color::Rgb(229, 192, 123),
+            ok: Color::Rgb(152, 195, 121),
+            err: Color::Rgb(224, 108, 117),
+            review: Color::Rgb(198, 120, 221),
+        }
+    }
+
+    fn github_dark() -> Self {
+        Self {
+            bg: Color::Rgb(13, 17, 23),
+            fg: Color::Rgb(230, 237, 243),
+            muted: Color::Rgb(139, 148, 158),
+            border: Color::Rgb(48, 54, 61),
+            hover: Color::Rgb(22, 27, 34),
+            focus: Color::Rgb(88, 166, 255),
+            warn: Color::Rgb(210, 153, 34),
+            ok: Color::Rgb(63, 185, 80),
+            err: Color::Rgb(248, 81, 73),
+            review: Color::Rgb(188, 140, 255),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -223,6 +331,6 @@ mod tests {
             name = Theme::next_name(name);
             assert_eq!(name, *expected);
         }
-        assert_eq!(Theme::next_name("gruvbox-dark"), "dark");
+        assert_eq!(Theme::next_name("github-dark"), "dark");
     }
 }

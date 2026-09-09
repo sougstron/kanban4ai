@@ -28,9 +28,11 @@ auto-loaded into every agent session. Read it when you are reading or adding a s
 - `max_tasks_per_column`: 100 - cap rendered per column
 - `name`: project name shown in Project Settings
 - `theme`: `dark`, `light`, `nord`, `green`, `solarized` (Solarized Light),
-  `solarized-dark`, `dracula`, or `gruvbox-dark`. Quick-toggle/persist via
-  `Ctrl+T`, or edit in Project Settings. Legacy aliases `textual-dark`,
-  `textual-light`, `nordic`, and `solarized-light` are accepted.
+  `solarized-dark`, `dracula`, `gruvbox-dark`, `catppuccin-mocha`
+  (Catppuccin Mocha), `tokyo-night`, `rose-pine`, `kanagawa`, `one-dark`,
+  or `github-dark`. Quick-toggle/persist via `Ctrl+T`, or edit in Project
+  Settings. Legacy aliases `textual-dark`, `textual-light`, `nordic`, and
+  `solarized-light` are accepted.
 - `task_sort`: `task_number` (default, ascending TASK id), `task_number_desc`
   (descending TASK id — highest task number first; doubles as the
   queue-priority control for the dispatcher), `updated_at_asc` (least recently
