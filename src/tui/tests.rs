@@ -5111,6 +5111,7 @@ fn russian_layout_maps_commands_without_changing_text_input() {
         ('м', 'v'),
         ('Ф', 'A'),
         ('К', 'R'),
+        ('Ы', 'S'),
         ('ч', 'x'),
         ('щ', 'o'),
         ('з', 'p'),
@@ -8017,6 +8018,19 @@ fn board_russian_uppercase_ze_switches_to_the_projects_list() {
         Some(LoopOutcome::ShowProjects { return_to }) => assert!(return_to.is_none()),
         other => panic!("expected ShowProjects, got {other:?}"),
     }
+}
+
+#[test]
+fn projects_russian_uppercase_yeru_opens_stats() {
+    let work = tempfile::tempdir().expect("work");
+    let (_store, mut app) = projects_app(work.path(), None);
+    app.handle_key(key(KeyCode::Char('Ы')))
+        .expect("RU stats hotkey");
+    assert_eq!(app.screen, Screen::TextView);
+    assert_eq!(
+        app.text_view.as_ref().map(|view| view.title.as_str()),
+        Some("Stats")
+    );
 }
 
 #[test]
