@@ -157,8 +157,8 @@ desktop's own file manager — outside the TUI, in a real window, using
 the pinned create row it opens the folder that row offers to register. The
 opener is spawned detached with its streams closed so it cannot write over the
 frame, and a folder that no longer exists is reported in the status bar instead
-of being launched. `s` opens the Global Settings dialog, `S` opens the
-read-only usage-stats report (tokens and time spent, by backend/model/project,
+of being launched. `s` opens the Global Settings dialog, `S` (`Ы` in a Russian
+layout) opens the read-only usage-stats report (tokens and time spent, by backend/model/project,
 across every registered project — see `docs/stats.md`) in the text pager
 (↑/↓ scroll one row, Shift+↑/↓ three, Ctrl+↑/↓ ten),
 `d` opens the remove
