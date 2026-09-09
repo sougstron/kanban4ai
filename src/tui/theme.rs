@@ -1,5 +1,20 @@
 use ratatui::style::Color;
 
+/// Built-in themes shown in Project Settings, in quick-toggle order.
+///
+/// The values are stable config-file spellings. Keep aliases in
+/// [`Theme::normalize_name`] so older or hand-written configs remain usable.
+pub(super) const BUILTIN_THEMES: &[(&str, &str)] = &[
+    ("Dark", "dark"),
+    ("Light", "light"),
+    ("Nord", "nord"),
+    ("Green", "green"),
+    ("Solarized Light", "solarized"),
+    ("Solarized Dark", "solarized-dark"),
+    ("Dracula", "dracula"),
+    ("Gruvbox Dark", "gruvbox-dark"),
+];
+
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
     pub bg: Color,
@@ -18,8 +33,14 @@ pub struct Theme {
 
 impl Theme {
     pub fn named(name: &str) -> Self {
-        match name {
-            "light" | "textual-light" => Self::light(),
+        match Self::normalize_name(name) {
+            "light" => Self::light(),
+            "nord" => Self::nord(),
+            "green" => Self::green(),
+            "solarized" => Self::solarized(),
+            "solarized-dark" => Self::solarized_dark(),
+            "dracula" => Self::dracula(),
+            "gruvbox-dark" => Self::gruvbox_dark(),
             _ => Self::dark(),
         }
     }
@@ -27,15 +48,24 @@ impl Theme {
     pub fn normalize_name(name: &str) -> &'static str {
         match name {
             "light" | "textual-light" => "light",
+            "nord" | "nordic" => "nord",
+            "solarized" | "solarized-light" => "solarized",
+            "solarized-dark" => "solarized-dark",
+            "green" => "green",
+            "dracula" => "dracula",
+            "gruvbox-dark" => "gruvbox-dark",
+            "dark" | "textual-dark" => "dark",
             _ => "dark",
         }
     }
 
     pub fn next_name(name: &str) -> &'static str {
-        match Self::normalize_name(name) {
-            "dark" => "light",
-            _ => "dark",
-        }
+        let current = Self::normalize_name(name);
+        let index = BUILTIN_THEMES
+            .iter()
+            .position(|(_, value)| *value == current)
+            .unwrap_or(0);
+        BUILTIN_THEMES[(index + 1) % BUILTIN_THEMES.len()].1
     }
 
     fn dark() -> Self {
@@ -66,5 +96,133 @@ impl Theme {
             err: Color::Rgb(190, 45, 70),
             review: Color::Rgb(165, 45, 145),
         }
+    }
+
+    fn nord() -> Self {
+        Self {
+            bg: Color::Rgb(46, 52, 64),
+            fg: Color::Rgb(236, 239, 244),
+            muted: Color::Rgb(129, 143, 166),
+            border: Color::Rgb(76, 86, 106),
+            hover: Color::Rgb(59, 66, 82),
+            focus: Color::Rgb(136, 192, 208),
+            warn: Color::Rgb(235, 203, 139),
+            ok: Color::Rgb(163, 190, 140),
+            err: Color::Rgb(191, 97, 106),
+            review: Color::Rgb(180, 142, 173),
+        }
+    }
+
+    fn green() -> Self {
+        Self {
+            bg: Color::Rgb(7, 26, 13),
+            fg: Color::Rgb(215, 255, 217),
+            muted: Color::Rgb(112, 168, 120),
+            border: Color::Rgb(45, 106, 59),
+            hover: Color::Rgb(18, 53, 27),
+            focus: Color::Rgb(101, 214, 138),
+            warn: Color::Rgb(230, 200, 110),
+            ok: Color::Rgb(103, 224, 138),
+            err: Color::Rgb(240, 107, 107),
+            review: Color::Rgb(192, 132, 252),
+        }
+    }
+
+    fn solarized() -> Self {
+        Self {
+            bg: Color::Rgb(253, 246, 227),
+            fg: Color::Rgb(101, 123, 131),
+            muted: Color::Rgb(147, 161, 161),
+            border: Color::Rgb(238, 232, 213),
+            hover: Color::Rgb(245, 239, 218),
+            focus: Color::Rgb(38, 139, 210),
+            warn: Color::Rgb(181, 137, 0),
+            ok: Color::Rgb(133, 153, 0),
+            err: Color::Rgb(220, 50, 47),
+            review: Color::Rgb(211, 54, 130),
+        }
+    }
+
+    fn solarized_dark() -> Self {
+        Self {
+            bg: Color::Rgb(0, 43, 54),
+            fg: Color::Rgb(131, 148, 150),
+            muted: Color::Rgb(88, 110, 117),
+            border: Color::Rgb(7, 54, 66),
+            hover: Color::Rgb(8, 60, 72),
+            focus: Color::Rgb(38, 139, 210),
+            warn: Color::Rgb(181, 137, 0),
+            ok: Color::Rgb(133, 153, 0),
+            err: Color::Rgb(220, 50, 47),
+            review: Color::Rgb(211, 54, 130),
+        }
+    }
+
+    fn dracula() -> Self {
+        Self {
+            bg: Color::Rgb(40, 42, 54),
+            fg: Color::Rgb(248, 248, 242),
+            muted: Color::Rgb(98, 114, 164),
+            border: Color::Rgb(68, 71, 90),
+            hover: Color::Rgb(52, 55, 70),
+            focus: Color::Rgb(189, 147, 249),
+            warn: Color::Rgb(241, 250, 140),
+            ok: Color::Rgb(80, 250, 123),
+            err: Color::Rgb(255, 85, 85),
+            review: Color::Rgb(255, 121, 198),
+        }
+    }
+
+    fn gruvbox_dark() -> Self {
+        Self {
+            bg: Color::Rgb(40, 40, 40),
+            fg: Color::Rgb(235, 219, 178),
+            muted: Color::Rgb(168, 153, 132),
+            border: Color::Rgb(80, 73, 69),
+            hover: Color::Rgb(60, 56, 54),
+            focus: Color::Rgb(131, 165, 152),
+            warn: Color::Rgb(250, 189, 47),
+            ok: Color::Rgb(184, 187, 38),
+            err: Color::Rgb(251, 73, 52),
+            review: Color::Rgb(211, 134, 155),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_legacy_and_friendly_theme_names() {
+        assert_eq!(Theme::normalize_name("textual-dark"), "dark");
+        assert_eq!(Theme::normalize_name("textual-light"), "light");
+        assert_eq!(Theme::normalize_name("nordic"), "nord");
+        assert_eq!(Theme::normalize_name("solarized-light"), "solarized");
+        assert_eq!(Theme::normalize_name("unknown"), "dark");
+    }
+
+    #[test]
+    fn every_builtin_theme_has_a_distinct_background() {
+        let backgrounds = BUILTIN_THEMES
+            .iter()
+            .map(|(_, name)| Theme::named(name).bg)
+            .collect::<Vec<_>>();
+        let unique = backgrounds.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), BUILTIN_THEMES.len());
+    }
+
+    #[test]
+    fn quick_toggle_visits_all_builtin_themes() {
+        let mut name = "dark";
+        for (_, expected) in BUILTIN_THEMES
+            .iter()
+            .skip(1)
+            .chain(std::iter::once(&BUILTIN_THEMES[0]))
+        {
+            name = Theme::next_name(name);
+            assert_eq!(name, *expected);
+        }
+        assert_eq!(Theme::next_name("gruvbox-dark"), "dark");
     }
 }

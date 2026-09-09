@@ -1913,6 +1913,34 @@ fn settings_hotkey_navigates_fields_and_reloads_backend_defaults() {
 }
 
 #[test]
+fn project_settings_offers_all_builtin_themes() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let values = app
+        .modal
+        .as_ref()
+        .expect("settings modal")
+        .theme_options
+        .iter()
+        .filter_map(|option| option.value.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        vec![
+            "dark",
+            "light",
+            "nord",
+            "green",
+            "solarized",
+            "solarized-dark",
+            "dracula",
+            "gruvbox-dark",
+        ]
+    );
+}
+
+#[test]
 fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     let (_dir, mut app) = settings_app();
     assert_eq!(app.settings.task_sort, "task_number");

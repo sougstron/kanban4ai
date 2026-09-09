@@ -52,7 +52,7 @@ use super::event::LoopOutcome;
 use super::image;
 use super::projects::{self, ProjectListItem, ProjectRow};
 use super::search::SearchState;
-use super::theme::Theme;
+use super::theme::{BUILTIN_THEMES, Theme};
 use super::thread_view::is_kanban_authored;
 
 const CTRL_C_EXIT_PROMPT: &str = "Press ctrl + C again to close";
@@ -3762,16 +3762,15 @@ impl App {
                 value: Some("todo".to_string()),
             },
         ]);
-        modal.set_theme_options(vec![
-            SelectOption {
-                label: "Dark".to_string(),
-                value: Some("dark".to_string()),
-            },
-            SelectOption {
-                label: "Light".to_string(),
-                value: Some("light".to_string()),
-            },
-        ]);
+        modal.set_theme_options(
+            BUILTIN_THEMES
+                .iter()
+                .map(|(label, value)| SelectOption {
+                    label: (*label).to_string(),
+                    value: Some((*value).to_string()),
+                })
+                .collect(),
+        );
         modal.set_executor_slot_options(self.executor_pool_options(&config));
         modal.set_task_sort_options(vec![
             SelectOption {
