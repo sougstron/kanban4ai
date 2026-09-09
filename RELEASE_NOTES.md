@@ -1,3 +1,50 @@
+# kanban4ai 0.6.7
+
+Project Settings now offers every built-in theme, and two agent-facing
+regressions are fixed: upstream digests no longer spend their budget on the
+harvested chat reply, and agents never run a superseded binary after an
+in-place update.
+
+## Added
+
+- **Popular TUI themes** (`tui/theme.rs`, `tui/app.rs`,
+  `docs/config.md`). Project Settings and the `Ctrl+T` quick-toggle now
+  list all built-in themes: `dark`, `light`, `nord`, `green`,
+  `solarized` (Solarized Light), `solarized-dark`, `dracula`, and
+  `gruvbox-dark`. Legacy aliases `textual-dark`, `textual-light`,
+  `nordic`, and `solarized-light` keep working through
+  `Theme::normalize_name`.
+
+## Fixed
+
+- **Upstream digests carry context notes, not the chat reply**
+  (`agent/prompt.rs`). When a run also recorded explicit
+  `kanban context` entries, the harvested whole-session reply
+  (`author: agent-reply`) is now skipped: being the newest message, it
+  spent the whole budget and evicted exactly the compact notes the
+  digest exists to hand downstream. A reply with no recorded context is
+  still forwarded.
+- **Agents never run a superseded binary** (`core/update.rs`,
+  `agent/tmux.rs`). Once an install or self-update replaces the binary in
+  place, `/proc/self/exe` reads `… (deleted)`. Both the updater and the
+  agent wrapper now resolve the stripped path first, so agent callbacks
+  (`context`, `done`, `agent-exit`, …) run the fresh build instead of a
+  stale `… (deleted)` file left beside it.
+
+## Verification coverage
+
+- `project_settings_offers_all_builtin_themes`,
+  `normalizes_legacy_and_friendly_theme_names`,
+  `every_builtin_theme_has_a_distinct_background`,
+  `quick_toggle_visits_all_builtin_themes`
+- `the_upstream_digest_skips_the_harvested_reply_when_context_was_recorded`,
+  `the_upstream_digest_keeps_the_reply_when_it_is_the_only_result`
+- `resolve_callback_binary_prefers_the_fresh_path_over_a_literal_deleted_file`,
+  `resolve_callback_binary_falls_back_to_a_literal_deleted_file`
+- `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test --locked`, `cargo build --release --locked`, and
+  `sh scripts/test-packaging.sh`
+
 # kanban4ai 0.6.6
 
 Orchestrated plan nodes no longer inherit the planner's large model. A
