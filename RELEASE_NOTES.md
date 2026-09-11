@@ -1,3 +1,53 @@
+# kanban4ai 0.6.9
+
+Per-task readonly mode for delegated agents, and a drag&drop overhaul
+that turns a mouse drop into a full run action instead of a bare move.
+
+## Added
+
+- **Readonly tasks** (`core/models.rs`, `core/operations.rs`,
+  `cli/mod.rs`, `agent/prompt.rs`, `docs/cli.md`,
+  `docs/data-model.md`). `kanban create --readonly` and the task
+  dialog's Readonly checkbox mark a task so its delegated agents
+  investigate and report through kanban4ai only: the agent prompt
+  forbids creating, editing, deleting, or moving any project file —
+  including plans, generated files, and build artifacts — and any
+  command that writes into the project, while board operations
+  (context, suggest, ask, done) remain fully available. `kanban show`
+  prints `Readonly: on` and the task JSON exposes the `readonly`
+  field. The frontmatter key is omitted while false, so legacy task
+  files round-trip unchanged.
+- **Drag&drop runs the column** (`tui/app.rs`, `tui/board.rs`,
+  `tui/card.rs`, `docs/tui.md`). The lifted card now rides the cursor
+  at its grab offset while its slot keeps a dash-dot placeholder, so
+  no other card shifts during a drag, and every column the pointer
+  crosses lights up as a drop zone. Drops carry the run semantics of
+  the landing column: empty space in In Progress moves and queues the
+  task for the dispatcher, To Do/Done move it and stop its agent,
+  Review stops it and starts every task chained to it, and a drop
+  onto another card chains that card after the dragged one (the chain
+  start ignores the `auto_launch_chained` rule — the drop is an
+  explicit human request).
+- **`S` opens the usage-stats report in the Russian layout too**
+  (`tui/app.rs`, `docs/tui.md`). The board shortcut now also accepts
+  `Ы`, matching the rest of the keyboard bindings.
+
+## Verification coverage
+
+- `create_can_mark_a_task_readonly`,
+  `readonly_task_prompt_forbids_project_writes_but_allows_board_output`,
+  `new_task_mode_toggles_save_on_the_task`
+- `board_mid_drag_snapshot`,
+  `every_column_under_the_pointer_lights_up_during_a_drag`,
+  `dropping_a_card_into_in_progress_queues_it`,
+  `dropping_a_card_into_review_starts_every_chained_task`,
+  `dropping_a_running_card_back_into_todo_stops_its_agent`,
+  `dropping_a_card_onto_another_card_chains_the_two_tasks`,
+  `projects_russian_uppercase_yeru_opens_stats`
+- `cargo fmt --all -- --check`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo test --locked`, `cargo build --release --locked`, and
+  `sh scripts/test-packaging.sh`
+
 # kanban4ai 0.6.8
 
 Six popular color themes join the built-in TUI palette.
