@@ -99,9 +99,11 @@ Schema and examples: \"$KANBAN_CMD\" ask-form --help.\n",
             "\nReadonly mode (mandatory): investigate and report, but do not create, edit, \
 delete, rename, or move any project file, including plans, notes, generated files, and build \
 artifacts. Do not run formatters, fixers, builds, tests, or commands that write into the project. \
-You may only write through kanban4ai board commands and the absolute `.kanban` form path given \
-above. If the task appears to require a project-file change, report the proposed change through \
-context or suggest instead of applying it.\n",
+Board operations remain fully available: you may create or edit tasks and use the required \
+callbacks through kanban4ai, including finishing this task as instructed below. The usual role \
+and column rules still apply. The only other permitted write is the absolute `.kanban` form path \
+given above. If the task appears to require a project-file change, report the proposed change \
+through context or suggest instead of applying it.\n",
         );
     }
     if task.interactive {
@@ -177,7 +179,8 @@ Heartbeat: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
     if task.readonly {
         prompt.push_str(
             "\nReadonly mode remains mandatory: do not modify project files or run commands that \
-write into the project; only kanban4ai board writes are allowed.",
+write into the project. Board operations remain fully available through kanban4ai, including \
+creating or editing tasks and finishing this task; usual role and column rules still apply.",
         );
     }
     append_thread_delta(roots, task, previous_session_id, &mut prompt)?;

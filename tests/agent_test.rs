@@ -337,7 +337,10 @@ fn readonly_task_prompt_forbids_project_writes_but_allows_board_output() {
         build_agent_prompt(dir.path(), &task, "ses-readonly", false, Role::Executor).unwrap();
     assert!(prompt.contains("Readonly mode (mandatory)"));
     assert!(prompt.contains("do not create, edit, delete, rename, or move any project file"));
-    assert!(prompt.contains("only write through kanban4ai board commands"));
+    assert!(prompt.contains("Board operations remain fully available"));
+    assert!(prompt.contains("create or edit tasks"));
+    assert!(prompt.contains("finishing this task"));
+    assert!(prompt.contains("usual role and column rules still apply"));
 }
 
 #[test]
