@@ -237,8 +237,9 @@ saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
 `Ctrl+R` / action-bar button. Create/edit dialogs expose one `Agent settings`
 row that opens a nested popup for backend, model, effort, and persona; popup
 Save stages those values in the task form and popup Cancel restores the exact
-opening state. They also expose Designer and Reviewer checkboxes (per-task
-opt-in; models and agents come from project settings), a "Chain to task"
+opening state. They also expose Readonly (investigation and board-side reporting
+without project-file writes), Designer and Reviewer checkboxes (per-task opt-in;
+models and agents come from project settings), a "Chain to task"
 selector, and a "Planned launch" checkbox with an HH:MM time field: when the
 checkbox is on the time is required (an empty or invalid value keeps the
 dialog open with an error), and saving stores the next local occurrence of

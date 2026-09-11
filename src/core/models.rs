@@ -303,6 +303,10 @@ pub struct Task {
     pub agent_name: Option<String>,
     #[serde(default)]
     pub interactive: bool,
+    /// Restrict delegated agents to investigation and board-side output.
+    /// Omitted while false so legacy task files round-trip unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub readonly: bool,
     /// Opt this task into the designer bot even when
     /// `orchestration.designer.enabled` is off. Models and agents still
     /// come from the project designer settings. Omitted while false so
@@ -472,6 +476,7 @@ impl Task {
             agent_backend: None,
             agent_name: None,
             interactive: false,
+            readonly: false,
             use_designer: false,
             use_reviewer: false,
             use_orchestrator: false,

@@ -232,6 +232,7 @@ impl Storage {
         task.agent_backend = new_task.agent_backend;
         task.agent_name = new_task.agent_name;
         task.interactive = new_task.interactive;
+        task.readonly = new_task.readonly;
         task.use_designer = new_task.use_designer;
         task.use_reviewer = new_task.use_reviewer;
         task.use_orchestrator = new_task.use_orchestrator;
@@ -445,6 +446,7 @@ pub struct NewTask {
     pub agent_backend: Option<String>,
     pub agent_name: Option<String>,
     pub interactive: bool,
+    pub readonly: bool,
     pub use_designer: bool,
     pub use_reviewer: bool,
     pub use_orchestrator: bool,

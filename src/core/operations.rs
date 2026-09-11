@@ -108,6 +108,7 @@ pub struct TaskPatch {
     pub agent_backend: Option<Option<String>>,
     pub agent_name: Option<Option<String>>,
     pub interactive: Option<bool>,
+    pub readonly: Option<bool>,
     pub use_designer: Option<bool>,
     pub use_reviewer: Option<bool>,
     pub use_orchestrator: Option<bool>,
@@ -497,6 +498,9 @@ impl Operations {
         if let Some(interactive) = patch.interactive {
             task.interactive = interactive;
         }
+        if let Some(readonly) = patch.readonly {
+            task.readonly = readonly;
+        }
         if let Some(use_designer) = patch.use_designer {
             task.use_designer = use_designer;
         }
@@ -556,6 +560,7 @@ impl Operations {
             agent_backend: task.agent_backend,
             agent_name: task.agent_name,
             interactive: new_task.interactive,
+            readonly: new_task.readonly,
             use_designer: new_task.use_designer,
             use_reviewer: new_task.use_reviewer,
             use_orchestrator: new_task.use_orchestrator,
@@ -2091,6 +2096,7 @@ impl Operations {
                     None => parent.agent_name.clone(),
                 },
                 interactive: false,
+                readonly: false,
                 use_designer: node.designer,
                 use_reviewer: node.reviewer,
                 // A node that planned more nodes would let one orchestrated

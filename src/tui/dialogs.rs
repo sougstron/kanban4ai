@@ -101,6 +101,7 @@ pub enum DialogField {
     ChainTo,
     PlannedLaunch,
     LaunchTime,
+    Readonly,
     UseOrchestrator,
     UseDesigner,
     UseReviewer,
@@ -150,13 +151,14 @@ pub enum DialogField {
     PurgeData,
 }
 
-const TASK_FORM_FIELDS: [DialogField; 9] = [
+const TASK_FORM_FIELDS: [DialogField; 10] = [
     DialogField::Title,
     DialogField::Description,
     DialogField::AgentSettings,
     DialogField::ChainTo,
     DialogField::PlannedLaunch,
     DialogField::LaunchTime,
+    DialogField::Readonly,
     DialogField::UseOrchestrator,
     DialogField::UseDesigner,
     DialogField::UseReviewer,
@@ -445,6 +447,7 @@ pub struct ModalState {
     pub theme: TextArea<'static>,
     pub task_sort: TextArea<'static>,
     pub interactive: bool,
+    pub readonly: bool,
     pub use_orchestrator: bool,
     pub use_designer: bool,
     pub use_reviewer: bool,
@@ -552,6 +555,7 @@ impl ModalState {
             theme: one_line("dark"),
             task_sort: one_line("task_number"),
             interactive: false,
+            readonly: false,
             use_orchestrator: false,
             use_designer: false,
             use_reviewer: false,
@@ -636,6 +640,7 @@ impl ModalState {
                 .unwrap_or(""),
         );
         state.interactive = task.interactive;
+        state.readonly = task.readonly;
         state.use_orchestrator = task.use_orchestrator;
         state.use_designer = task.use_designer;
         state.use_reviewer = task.use_reviewer;
@@ -658,6 +663,7 @@ impl ModalState {
                 DialogField::ChainTo,
                 DialogField::PlannedLaunch,
                 DialogField::LaunchTime,
+                DialogField::Readonly,
                 DialogField::UseOrchestrator,
                 DialogField::UseDesigner,
                 DialogField::UseReviewer,
@@ -1254,6 +1260,7 @@ impl ModalState {
             DialogField::ChainTo => self.input_select(key, SelectorKind::ChainTo),
             DialogField::PlannedLaunch => toggle_on_space(&mut self.planned_launch, key),
             DialogField::LaunchTime => input_single_line(&mut self.launch_time, key),
+            DialogField::Readonly => toggle_on_space(&mut self.readonly, key),
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings => {}
@@ -1415,6 +1422,7 @@ impl ModalState {
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings
+            | DialogField::Readonly
             | DialogField::UseOrchestrator
             | DialogField::UseDesigner
             | DialogField::UseReviewer
@@ -2047,6 +2055,7 @@ impl ModalState {
             raw_textarea_text(&self.launch_time),
             raw_textarea_text(&self.target_status),
             self.interactive.to_string(),
+            self.readonly.to_string(),
             self.use_orchestrator.to_string(),
             self.use_designer.to_string(),
             self.use_reviewer.to_string(),
@@ -3305,6 +3314,15 @@ fn render_selector_field(
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
             Some(&modal.chain_filter),
             modal.filter_error == Some(field),
+        ),
+        DialogField::Readonly => render_checkbox(
+            frame,
+            app,
+            area,
+            "Readonly",
+            "investigate without changing project files",
+            modal.readonly,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::UseOrchestrator => render_checkbox(
             frame,
