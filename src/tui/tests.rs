@@ -936,6 +936,7 @@ fn task_parent_form_opens_nested_agent_settings_without_interactive_field() {
             DialogField::ChainTo,
             DialogField::PlannedLaunch,
             DialogField::LaunchTime,
+            DialogField::Readonly,
             DialogField::UseOrchestrator,
             DialogField::UseDesigner,
             DialogField::UseReviewer,
@@ -9115,7 +9116,7 @@ fn title_enter_walks_on_and_description_enter_writes_a_newline() {
 }
 
 #[test]
-fn new_task_bot_toggles_save_on_the_task() {
+fn new_task_mode_toggles_save_on_the_task() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     app.modal
@@ -9126,6 +9127,12 @@ fn new_task_bot_toggles_save_on_the_task() {
     for _ in 0..6 {
         app.handle_key(key(KeyCode::Tab)).expect("tab");
     }
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::Readonly
+    );
+    app.handle_key(key(KeyCode::Char(' '))).expect("space");
+    app.handle_key(key(KeyCode::Enter)).expect("enter");
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
         DialogField::UseOrchestrator
@@ -9157,6 +9164,7 @@ fn new_task_bot_toggles_save_on_the_task() {
         .into_iter()
         .find(|task| task.title == "Per-task bots")
         .expect("created task");
+    assert!(created.readonly);
     assert!(created.use_orchestrator);
     assert!(created.use_designer);
     assert!(created.use_reviewer);

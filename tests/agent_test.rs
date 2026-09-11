@@ -321,6 +321,26 @@ fn every_role_can_ask_for_clarification_and_interactive_tasks_can_wait() {
 }
 
 #[test]
+fn readonly_task_prompt_forbids_project_writes_but_allows_board_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let task = storage
+        .create_task(NewTask {
+            title: "Investigate only".into(),
+            readonly: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let prompt =
+        build_agent_prompt(dir.path(), &task, "ses-readonly", false, Role::Executor).unwrap();
+    assert!(prompt.contains("Readonly mode (mandatory)"));
+    assert!(prompt.contains("do not create, edit, delete, rename, or move any project file"));
+    assert!(prompt.contains("only write through kanban4ai board commands"));
+}
+
+#[test]
 fn prompt_follows_role_not_run_phase() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::new(dir.path());

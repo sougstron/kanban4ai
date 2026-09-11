@@ -303,6 +303,9 @@ pub fn badges(
     {
         badges.push((format!("🕐 {}", launch_at.format("%H:%M")), app.theme.focus));
     }
+    if task.readonly {
+        badges.push(("🔒 readonly".to_string(), app.theme.muted));
+    }
     // Pending design/review stage marks, shown like the chain badge from the
     // moment the stage is scheduled (project-wide bot or the task's own
     // opt-in) until the stage completes: design until the plan is recorded

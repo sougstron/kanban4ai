@@ -127,6 +127,26 @@ fn create_can_opt_one_task_into_designer_and_reviewer() {
 }
 
 #[test]
+fn create_can_mark_a_task_readonly() {
+    let dir = board();
+    kanban(&dir)
+        .args(["create", "Investigate only", "--readonly"])
+        .assert()
+        .success();
+
+    let task = Operations::new(dir.data_root())
+        .get_task("TASK-001")
+        .unwrap()
+        .unwrap();
+    assert!(task.readonly);
+    kanban(&dir)
+        .args(["show", "TASK-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Readonly: on"));
+}
+
+#[test]
 fn create_with_launch_at_schedules_the_next_local_occurrence() {
     let dir = board();
     kanban(&dir)

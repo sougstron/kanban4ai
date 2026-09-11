@@ -29,6 +29,7 @@ fn parses_python_written_task_with_agent_fields() {
     assert_eq!(task.ai_model.as_deref(), Some("opus"));
     assert_eq!(task.agent_backend.as_deref(), Some("claude"));
     assert!(task.interactive);
+    assert!(!task.readonly);
     assert_eq!(task.context_size, 2840);
     assert_eq!(task.review_edits, "");
     assert_eq!(
@@ -325,6 +326,7 @@ fn rust_written_task_is_parseable_and_stable() {
             agent_backend: Some("claude".into()),
             agent_name: None,
             interactive: true,
+            readonly: true,
             use_designer: false,
             use_reviewer: false,
             use_orchestrator: false,
