@@ -1871,7 +1871,19 @@ impl Operations {
         if !self.config.get_rule("auto_launch_chained")? || !self.auto_launch_enabled()? {
             return Ok(Vec::new());
         }
+        self.launch_chained_tasks(target_task_id)
+    }
 
+    /// Launch the chain on explicit demand (dropping a card into Review with
+    /// the mouse), bypassing the `auto_launch_chained` rule and the master
+    /// auto-launch switch: the human asked for these runs by hand. Safe to call
+    /// after a move that already auto-triggered the chain — tasks that left To
+    /// Do are skipped.
+    pub fn start_chained_tasks(&self, target_task_id: &str) -> Result<Vec<Task>> {
+        self.launch_chained_tasks(target_task_id)
+    }
+
+    fn launch_chained_tasks(&self, target_task_id: &str) -> Result<Vec<Task>> {
         let session_mgr = self.session_manager();
         let mut launched = Vec::new();
         for task in self.chained_tasks(target_task_id)? {
