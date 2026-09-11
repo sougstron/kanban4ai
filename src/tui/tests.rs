@@ -379,6 +379,68 @@ fn overlaps(left: ratatui::layout::Rect, right: ratatui::layout::Rect) -> bool {
         && right.y < left.y.saturating_add(left.height)
 }
 
+fn rendered_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal.draw(|frame| board::ui(frame, app)).expect("draw");
+    terminal.backend().buffer().clone()
+}
+
+fn symbol_at(buffer: &ratatui::buffer::Buffer, x: u16, y: u16) -> String {
+    buffer.cell((x, y)).expect("cell").symbol().to_string()
+}
+
+fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..buffer.area.width)
+        .map(|x| symbol_at(buffer, x, y))
+        .collect()
+}
+
+/// Column area registered by the last frame.
+fn column_hit(app: &App, column: usize) -> ratatui::layout::Rect {
+    app.hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::ColumnFocus(column))
+        .expect("column area")
+        .area
+}
+
+/// An empty spot inside a column: below every card the column drew, so a drop
+/// there is a column drop and not a drop onto another card.
+fn empty_spot_in_column(app: &App, column: usize) -> (u16, u16) {
+    let area = column_hit(app, column);
+    let lowest = card_hits(app)
+        .into_iter()
+        .filter(|(hit_column, _, _)| *hit_column == column)
+        .map(|(_, _, rect)| rect.y + rect.height)
+        .max()
+        .unwrap_or(area.y + 1);
+    (area.x + 1, lowest.max(area.y + 1).min(area.bottom() - 2))
+}
+
+fn mouse(kind: MouseEventKind, x: u16, y: u16) -> MouseEvent {
+    MouseEvent {
+        kind,
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    }
+}
+
+/// Lift the card at `source` and release it at `(x, y)`.
+fn drag_card(app: &mut App, source: ratatui::layout::Rect, x: u16, y: u16) {
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        source.x + 1,
+        source.y + 1,
+    ))
+    .expect("lift card");
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x, y))
+        .expect("drag card");
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x, y))
+        .expect("drop card");
+}
+
 fn style_at(app: &mut App, width: u16, height: u16, x: u16, y: u16) -> Style {
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("terminal");
@@ -5682,11 +5744,241 @@ fn drag_is_visualized_with_lifted_card_drop_target_and_status_hint() {
     assert_eq!(border.fg, Some(ok));
     assert!(border.add_modifier.contains(Modifier::BOLD));
 
-    // The card in flight is inverted so its origin stays visible.
-    let lifted = style_at(&mut app, 96, 28, source_rect.x + 1, source_rect.y + 1);
+    // The slot the card was lifted from keeps its size and is drawn as an
+    // empty dash-dot rectangle, so nothing else in the column shifts.
+    let buffer = rendered_buffer(&mut app, 96, 28);
+    assert_eq!(symbol_at(&buffer, source_rect.x + 1, source_rect.y), "┄");
+    assert_eq!(symbol_at(&buffer, source_rect.x, source_rect.y + 1), "┆");
+    let placeholder_body = (1..source_rect.height.saturating_sub(1))
+        .map(|line| row_text(&buffer, source_rect.y + line))
+        .collect::<String>();
     assert!(
-        lifted.add_modifier.contains(Modifier::REVERSED),
-        "the dragged source card should render lifted"
+        !placeholder_body.contains(&source_task),
+        "the placeholder should be empty:\n{placeholder_body}"
+    );
+
+    // The card itself hangs off the cursor, keeping the grab offset it was
+    // lifted with.
+    let flying = row_text(&buffer, target.area.y + 10);
+    assert!(
+        flying.contains(&source_task),
+        "the dragged card should follow the pointer:\n{flying}"
+    );
+}
+
+/// The whole mid-drag frame: placeholder in the source slot, card on the
+/// cursor, drop column lit up, and the hint in the status bar.
+#[test]
+fn board_mid_drag_snapshot() {
+    let (_dir, mut app) = plain_tasks_app(3);
+    let _ = render_snapshot(&mut app);
+    let (_, _, source_rect) = card_hits(&app)[0];
+    let in_progress = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == TaskStatus::InProgress.as_str())
+        .expect("in progress column");
+    let target = column_hit(&app, in_progress);
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        source_rect.x + 3,
+        source_rect.y + 1,
+    ))
+    .expect("lift card");
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        target.x + 6,
+        target.y + 6,
+    ))
+    .expect("drag over in progress");
+    insta::assert_snapshot!("board_mid_drag", render_snapshot(&mut app));
+}
+
+#[test]
+fn every_column_under_the_pointer_lights_up_during_a_drag() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let (column, _, source_rect) = card_hits(&app)[0];
+    let ok = app.theme.ok;
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        source_rect.x + 1,
+        source_rect.y + 1,
+    ))
+    .expect("lift card");
+
+    for target_column in 0..app.board.columns.len() {
+        let area = column_hit(&app, target_column);
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            area.x + 1,
+            area.bottom() - 2,
+        ))
+        .expect("drag over column");
+        assert_eq!(app.drag_hover_column(), Some(target_column));
+        let border = style_at(&mut app, 96, 28, area.x, area.y);
+        assert_eq!(
+            border.fg,
+            Some(ok),
+            "column {target_column} should read as a drop zone (source was {column})"
+        );
+    }
+}
+
+#[test]
+fn dropping_a_card_onto_another_card_chains_the_two_tasks() {
+    let (_dir, mut app) = plain_tasks_app(2);
+    let _ = render_snapshot(&mut app);
+    let hits = card_hits(&app);
+    let source_rect = hits[0].2;
+    let target_rect = hits[1].2;
+    let source_task = app.visible_tasks_for_column(hits[0].0)[hits[0].1]
+        .id
+        .clone();
+    let target_task = app.visible_tasks_for_column(hits[1].0)[hits[1].1]
+        .id
+        .clone();
+
+    drag_card(&mut app, source_rect, target_rect.x + 2, target_rect.y + 1);
+
+    let chained = app
+        .ops
+        .get_task(&target_task)
+        .expect("load target")
+        .expect("target task");
+    assert_eq!(chained.chained_to.as_deref(), Some(source_task.as_str()));
+    // Chaining links the cards where they are: neither task changes column.
+    assert_eq!(chained.status, TaskStatus::Todo);
+    assert_eq!(
+        app.ops
+            .get_task(&source_task)
+            .expect("load source")
+            .expect("source task")
+            .status,
+        TaskStatus::Todo
+    );
+    assert!(
+        app.status
+            .contains(&format!("Chained {target_task} to run after {source_task}"))
+    );
+}
+
+#[test]
+fn dropping_a_card_into_in_progress_queues_it() {
+    let (_dir, mut app) = plain_tasks_app(1);
+    let _ = render_snapshot(&mut app);
+    let (_, _, source_rect) = card_hits(&app)[0];
+    let task_id = app.visible_tasks_for_column(0)[0].id.clone();
+    let in_progress = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == TaskStatus::InProgress.as_str())
+        .expect("in progress column");
+    let (x, y) = empty_spot_in_column(&app, in_progress);
+
+    drag_card(&mut app, source_rect, x, y);
+
+    let queued = app
+        .ops
+        .get_task(&task_id)
+        .expect("load task")
+        .expect("task");
+    assert_eq!(queued.status, TaskStatus::InProgress);
+    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
+    assert!(
+        app.status.contains(&format!("Queued {task_id}")),
+        "status should announce the queue: {}",
+        app.status
+    );
+}
+
+#[test]
+fn dropping_a_running_card_back_into_todo_stops_its_agent() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Running work"))
+        .expect("create task");
+    app.ops
+        .take_task(&task.id, "ses-drop-stop", true)
+        .expect("take task")
+        .expect("taken");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    let _ = render_snapshot(&mut app);
+    let (_, _, source_rect) = card_hits(&app)[0];
+    let todo = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == TaskStatus::Todo.as_str())
+        .expect("todo column");
+    let (x, y) = empty_spot_in_column(&app, todo);
+
+    drag_card(&mut app, source_rect, x, y);
+
+    let parked = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(parked.status, TaskStatus::Todo);
+    assert!(!SessionManager::new(dir.path()).is_session_active("ses-drop-stop"));
+    assert!(
+        app.status.contains("stopped its agent"),
+        "status should report the stop: {}",
+        app.status
+    );
+}
+
+#[test]
+fn dropping_a_card_into_review_starts_every_chained_task() {
+    let (_dir, mut app) = plain_tasks_app(2);
+    let _ = render_snapshot(&mut app);
+    let source_task = app.visible_tasks_for_column(0)[0].id.clone();
+    let chained_task = app.visible_tasks_for_column(0)[1].id.clone();
+    app.ops
+        .update_task(
+            &chained_task,
+            crate::core::operations::TaskPatch {
+                chained_to: Some(Some(source_task.clone())),
+                ..Default::default()
+            },
+        )
+        .expect("chain the second task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    let _ = render_snapshot(&mut app);
+    let (_, _, source_rect) = card_hits(&app)[0];
+    let review = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == TaskStatus::Review.as_str())
+        .expect("review column");
+    let (x, y) = empty_spot_in_column(&app, review);
+
+    drag_card(&mut app, source_rect, x, y);
+
+    assert_eq!(
+        app.ops
+            .get_task(&source_task)
+            .expect("load source")
+            .expect("source task")
+            .status,
+        TaskStatus::Review
+    );
+    // Auto-launch is off in the test config, so the chained task is started by
+    // the drop itself rather than by the chain rule.
+    assert_eq!(
+        app.ops
+            .get_task(&chained_task)
+            .expect("load chained")
+            .expect("chained task")
+            .status,
+        TaskStatus::InProgress
+    );
+    assert!(
+        app.status.contains("started 1 chained task"),
+        "status should report the started chain: {}",
+        app.status
     );
 }
 

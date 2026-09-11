@@ -465,7 +465,18 @@ pub struct DragState {
     pub from_column: usize,
     pub card: usize,
     pub target_column: Option<usize>,
+    /// Card the pointer currently rests on, when it is not the dragged card
+    /// itself. Releasing there chains the two tasks instead of moving one.
+    pub target_card: Option<(usize, usize)>,
     pub moved: bool,
+    /// Latest pointer position, so the lifted card can ride the cursor.
+    pub pointer: (u16, u16),
+    /// The source card's rect at lift time: the placeholder keeps that slot
+    /// (nothing else on the board shifts) and the flying copy keeps its size.
+    pub origin: Rect,
+    /// Where inside the card the pointer grabbed it, so the card does not
+    /// jump under the cursor when the drag starts.
+    pub grab: (u16, u16),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1602,12 +1613,21 @@ impl App {
                 mouse.modifiers.contains(KeyModifiers::SHIFT)
             }
             MouseEventKind::Drag(MouseButton::Left) if self.text_selection.is_some() => {
-                let crossing_card_columns = !mouse.modifiers.contains(KeyModifiers::SHIFT)
+                // Text selection owns a sweep that stays inside the card it
+                // started on; the moment the pointer reaches another card or
+                // column the gesture is a card drag instead.
+                let left_source_card = !mouse.modifiers.contains(KeyModifiers::SHIFT)
                     && self.dragging.as_ref().is_some_and(|dragging| {
-                        self.column_at(mouse.column, mouse.row)
-                            .is_some_and(|column| column != dragging.from_column)
+                        match self.card_at(mouse.column, mouse.row) {
+                            Some((column, card)) => {
+                                column != dragging.from_column || card != dragging.card
+                            }
+                            None => self
+                                .column_at(mouse.column, mouse.row)
+                                .is_some_and(|column| column != dragging.from_column),
+                        }
                     });
-                if crossing_card_columns {
+                if left_source_card {
                     self.text_selection = None;
                     return false;
                 }
@@ -1744,12 +1764,24 @@ impl App {
             self.focused_column = column;
             self.focused_card = card;
             self.ensure_focused_visible();
+            let origin = self
+                .hitbox_area(HitAction::FocusCard { column, card })
+                .unwrap_or(Rect {
+                    x,
+                    y,
+                    width: 1,
+                    height: 1,
+                });
             self.dragging = Some(DragState {
                 task_id,
                 from_column: column,
                 card,
-                target_column: None,
+                target_column: Some(column),
+                target_card: None,
                 moved: false,
+                pointer: (x, y),
+                origin,
+                grab: (x.saturating_sub(origin.x), y.saturating_sub(origin.y)),
             });
             return Ok(());
         }
@@ -1758,9 +1790,15 @@ impl App {
 
     fn update_drag_target(&mut self, x: u16, y: u16) {
         let target = self.column_at(x, y);
+        let card = self.card_at(x, y);
         if let Some(dragging) = self.dragging.as_mut() {
+            dragging.pointer = (x, y);
             dragging.target_column = target;
-            if target.is_some_and(|target| target != dragging.from_column) {
+            dragging.target_card = card
+                .filter(|(column, card)| *column != dragging.from_column || *card != dragging.card);
+            if target.is_some_and(|target| target != dragging.from_column)
+                || dragging.target_card.is_some()
+            {
                 dragging.moved = true;
             }
         }
@@ -1770,28 +1808,111 @@ impl App {
         let Some(dragging) = self.dragging.take() else {
             return Ok(());
         };
+        // Released over another card: the drop links the two tasks rather than
+        // moving one, so a chain can be built without opening a dialog.
+        if let Some((column, card)) = self
+            .card_at(x, y)
+            .filter(|(column, card)| *column != dragging.from_column || *card != dragging.card)
+        {
+            let target_id = self
+                .visible_tasks_for_column(column)
+                .get(card)
+                .map(|task| task.id.clone());
+            if let Some(target_id) = target_id {
+                self.chain_dropped_task(&dragging.task_id, &target_id)?;
+            }
+            return Ok(());
+        }
         let target = self.column_at(x, y);
         if dragging.moved
             && let Some(target) = target.filter(|target| *target != dragging.from_column)
         {
-            let target_status = self
-                .board
-                .columns
-                .get(target)
-                .map(|column| column.id.clone());
-            if let Some(target_status) = target_status {
-                self.ops
-                    .move_task(&dragging.task_id, &target_status, false)?;
-                self.refresh_after_action()?;
-                self.focused_column = target;
-                self.focused_card = 0;
-                self.clamp_focus();
-                self.status = format!("Moved {} to {}", dragging.task_id, target_status);
-            }
+            self.drop_task_into_column(&dragging.task_id, target)?;
         } else if !dragging.moved {
             self.open_focused_detail()?;
         }
         Ok(())
+    }
+
+    /// Dropping a card onto another card chains the two in drag direction: the
+    /// task under the pointer waits for the dragged one and auto-starts once it
+    /// reaches Review.
+    fn chain_dropped_task(&mut self, source_id: &str, target_id: &str) -> Result<()> {
+        if source_id == target_id {
+            return Ok(());
+        }
+        let updated = self.ops.update_task(
+            target_id,
+            TaskPatch {
+                chained_to: Some(Some(source_id.to_string())),
+                ..Default::default()
+            },
+        )?;
+        self.refresh_after_action()?;
+        self.status = if updated.is_some() {
+            format!("Chained {target_id} to run after {source_id}")
+        } else {
+            format!("Task {target_id} not found")
+        };
+        Ok(())
+    }
+
+    /// A card dropped on empty column space. Beyond the move, the drop carries
+    /// the run action the column stands for: In Progress queues the task for
+    /// the dispatcher, every other column parks it — the agent working it is
+    /// stopped — and Review additionally starts everything chained to it.
+    fn drop_task_into_column(&mut self, task_id: &str, target: usize) -> Result<()> {
+        let Some(target_status) = self
+            .board
+            .columns
+            .get(target)
+            .map(|column| column.id.clone())
+        else {
+            return Ok(());
+        };
+        let queues = target_status == TaskStatus::InProgress.as_str();
+        let starts_chain = target_status == TaskStatus::Review.as_str();
+        let stopped = if queues {
+            false
+        } else {
+            self.stop_task_if_running(task_id)?
+        };
+        self.ops.move_task(task_id, &target_status, false)?;
+        // The move itself succeeded; a queue or chain-start that fails after it
+        // is reported in the status bar rather than thrown at the event loop.
+        let mut warning = None;
+        let mut queued = queues;
+        if queues && let Err(err) = self.ops.queue_run(task_id) {
+            warning = Some(err.to_string());
+            queued = false;
+        }
+        let mut chained = 0;
+        if starts_chain {
+            match self.ops.start_chained_tasks(task_id) {
+                Ok(started) => chained = started.len(),
+                Err(err) => warning = Some(err.to_string()),
+            }
+        }
+        self.refresh_after_action()?;
+        self.focused_column = target;
+        self.focused_card = 0;
+        self.clamp_focus();
+        let status = drop_status(task_id, &target_status, queued, stopped, chained);
+        self.status = match warning {
+            Some(warning) => format!("{status} · {warning}"),
+            None => status,
+        };
+        Ok(())
+    }
+
+    /// Best effort stop for a hand-parked task: a task without a live agent is
+    /// the normal case here, not an error worth showing.
+    fn stop_task_if_running(&self, task_id: &str) -> Result<bool> {
+        match self.ops.stop_task(task_id) {
+            Ok(stopped) => Ok(stopped.is_some()),
+            Err(KanbanError::Invalid(_)) => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     /// Contextual status-bar text shown while a card is being dragged, naming
@@ -1799,19 +1920,47 @@ impl App {
     /// release would drop it. `None` when no drag is in flight.
     pub fn drag_hint(&self) -> Option<String> {
         let dragging = self.dragging.as_ref()?;
+        if let Some(target) = dragging
+            .target_card
+            .and_then(|(column, card)| self.visible_tasks_for_column(column).get(card).copied())
+        {
+            return Some(format!(
+                "Moving {} → {} · release to chain {} after {}",
+                dragging.task_id, target.id, target.id, dragging.task_id
+            ));
+        }
         match self
             .drop_target_column()
             .and_then(|target| self.board.columns.get(target))
         {
             Some(column) => Some(format!(
-                "Moving {} → {} · release to move",
-                dragging.task_id, column.name
+                "Moving {} → {} · release to {}",
+                dragging.task_id,
+                column.name,
+                drop_verb(&column.id)
             )),
             None => Some(format!(
-                "Moving {} · drag onto another column to move it",
+                "Moving {} · drop on a column to move it, on a card to chain it",
                 dragging.task_id
             )),
         }
+    }
+
+    /// Column under the pointer during a drag — including the card's own
+    /// column, so the board always shows where a release would land.
+    pub fn drag_hover_column(&self) -> Option<usize> {
+        self.dragging.as_ref()?.target_column
+    }
+
+    /// The task riding the cursor, looked up across the whole board so the
+    /// flying copy survives a column the drag has already left.
+    pub fn dragged_task(&self) -> Option<&Task> {
+        let dragging = self.dragging.as_ref()?;
+        self.board
+            .columns
+            .iter()
+            .flat_map(|column| column.tasks.iter())
+            .find(|task| task.id == dragging.task_id)
     }
 
     /// Column a release would drop the dragged card into — only when it differs
@@ -1852,6 +2001,25 @@ impl App {
             )
             | None => None,
         }
+    }
+
+    /// The card under a point, whether the pointer is on the card body or on
+    /// its question-preview line.
+    fn card_at(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        match self.hit_at(x, y) {
+            Some(HitAction::FocusCard { column, card })
+            | Some(HitAction::OpenAnswer { column, card }) => Some((column, card)),
+            _ => None,
+        }
+    }
+
+    /// Where the last frame drew a given region, used to lift a card at the
+    /// exact size and position it had on screen.
+    fn hitbox_area(&self, action: HitAction) -> Option<Rect> {
+        self.hitboxes
+            .iter()
+            .find(|hitbox| hitbox.action == action)
+            .map(|hitbox| hitbox.area)
     }
 
     fn hit_at(&self, x: u16, y: u16) -> Option<HitAction> {
@@ -6806,4 +6974,39 @@ fn insert_cap_map(map: &mut Mapping, key: &str, entries: &[(String, i64)]) {
         caps.insert(Value::String(name.clone()), Value::Number((*value).into()));
     }
     map.insert(Value::String(key.to_string()), Value::Mapping(caps));
+}
+
+/// What releasing a dragged card over a column will do, phrased for the drag
+/// hint: the columns carry run semantics, not just a status change.
+fn drop_verb(column_id: &str) -> &'static str {
+    if column_id == TaskStatus::InProgress.as_str() {
+        "queue it"
+    } else if column_id == TaskStatus::Review.as_str() {
+        "stop it and start its chain"
+    } else {
+        "move it and stop its agent"
+    }
+}
+
+/// Status line for a completed drop, naming only what actually happened.
+fn drop_status(
+    task_id: &str,
+    target_status: &str,
+    queued: bool,
+    stopped: bool,
+    chained: usize,
+) -> String {
+    let mut status = if queued {
+        format!("Queued {task_id} in {target_status}")
+    } else {
+        format!("Moved {task_id} to {target_status}")
+    };
+    if stopped {
+        status.push_str(" · stopped its agent");
+    }
+    if chained > 0 {
+        let plural = if chained == 1 { "task" } else { "tasks" };
+        status.push_str(&format!(" · started {chained} chained {plural}"));
+    }
+    status
 }

@@ -192,9 +192,26 @@ clipping. Column headers show
 only the column name and visible task count. Drag a card to a different
 column to move it in human mode. A single click on a card opens its detail;
 a drag still moves it between columns without opening the detail view. The drag
-is visible: the card in flight is inverted, the destination column's border
-turns green and bold once the cursor crosses into it, and the status bar shows
-`Moving <task> → <column>` so the pending move is never ambiguous.
+is visible: the card in flight hangs off the cursor at the offset it was
+grabbed with, the slot it came from keeps its size as an empty dash-dot
+rectangle (nothing else on the board shifts until the drop), every column the
+pointer crosses — the source column included — gets a bold green border, and
+the status bar shows `Moving <task> → <column>` with the action a release
+would perform.
+
+A drop carries the run semantics of the column it lands on, so the mouse
+drives a run and not just a status change:
+
+| Drop target | What happens |
+|---|---|
+| empty space in In Progress | move, then queue the task for the dispatcher (run phase `Queued`) |
+| empty space in Review | stop the task's agent, move, then start every task chained to it |
+| empty space in To Do / Done | stop the task's agent and move it |
+| another card | chain in drag direction: the card under the pointer gets `chained_to = <dragged task>`, so it auto-starts when the dragged task reaches Review. Neither card moves. |
+
+Stopping is best effort — a task with no live agent is simply moved. The
+chain start ignores the `auto_launch_chained` rule (the drop is an explicit
+human request) and skips chained tasks that already left To Do.
 
 Cards have exactly one selection, driven by whichever input moved last.
 Hovering a card *is* selecting it — `Enter` and every card hotkey act on the

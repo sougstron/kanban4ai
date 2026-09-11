@@ -81,10 +81,10 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     for index in 0..app.board.columns.len() {
         let column = &app.board.columns[index];
         let focused = index == app.focused_column;
-        // A card being dropped here (a column other than its own) gets a
-        // distinct bold "drop zone" border so the drag reads differently from
-        // ordinary keyboard focus.
-        let drop_target = app.drop_target_column() == Some(index);
+        // Every column the pointer crosses during a drag lights up as a bold
+        // "drop zone", so the card in flight always shows where it can land;
+        // the highlight reads differently from ordinary keyboard focus.
+        let drop_target = app.drag_hover_column() == Some(index);
         let border_style = if drop_target {
             Style::default()
                 .fg(app.theme.ok)
@@ -135,6 +135,37 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         hitboxes.insert(0, hitbox);
     }
     app.hitboxes = hitboxes;
+    // Drawn last and registering no hitbox, so the flying card covers the
+    // board without ever swallowing the card it is dropped onto.
+    render_drag_overlay(frame, app, area);
+}
+
+/// The dragged card itself, hanging off the cursor at the offset it was
+/// grabbed with. Its source slot keeps a dash-dot placeholder (see
+/// `render_cards`), so nothing on the board moves until the drop.
+fn render_drag_overlay(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(dragging) = app.dragging.as_ref() else {
+        return;
+    };
+    let Some(task) = app.dragged_task() else {
+        return;
+    };
+    let width = dragging.origin.width.min(area.width);
+    let height = dragging.origin.height.min(area.height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let (x, y) = dragging.pointer;
+    let card = Rect {
+        x: x.saturating_sub(dragging.grab.0)
+            .clamp(area.x, area.right().saturating_sub(width).max(area.x)),
+        y: y.saturating_sub(dragging.grab.1)
+            .clamp(area.y, area.bottom().saturating_sub(height).max(area.y)),
+        width,
+        height,
+    };
+    frame.render_widget(Clear, card);
+    card::render_card(frame, app, task, card, true, false, true);
 }
 
 /// Marker in front of the project name, so the badge reads as a label rather
@@ -308,8 +339,11 @@ fn render_cards(frame: &mut Frame<'_>, app: &App, column_index: usize, area: Rec
             }));
         let row = rows[row_index];
         row_index += 1;
-        let dragging = app.is_dragging_card(column_index, absolute_index);
-        card::render_card(frame, app, task, row, focused, hovered, dragging);
+        if app.is_dragging_card(column_index, absolute_index) {
+            card::render_drag_placeholder(frame, &app.theme, row);
+        } else {
+            card::render_card(frame, app, task, row, focused, hovered, false);
+        }
         // The question-preview line (second content line of the card) jumps
         // straight to the answer panel; register it before the card region.
         let has_preview = app
@@ -668,8 +702,11 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  click: open a card, press a button, or pick a dialog field"),
         Line::from("  wheel: scrolls the column under the cursor"),
         Line::from("  drag across text: copy it · hold Shift to select interactive text"),
-        Line::from("  drag a card onto another column: move it (target column"),
-        Line::from("    highlights green; status bar shows what moves where)"),
+        Line::from("  drag a card: it rides the cursor, its slot keeps a dashed"),
+        Line::from("    outline, and the column under the pointer highlights green"),
+        Line::from("  drop on In Progress: queue it · on To Do/Done: move and stop"),
+        Line::from("    its agent · on Review: stop it and start its chained tasks"),
+        Line::from("  drop on another card: chain that card after the dragged one"),
         Line::from("  column headers show name and count"),
         Line::from(""),
         Line::from("Provider limits (row above the status bar, Board and Projects)"),

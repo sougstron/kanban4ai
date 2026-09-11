@@ -1,8 +1,9 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::core::models::{IntegrationState, RunPhase, Task, TaskStatus};
@@ -144,6 +145,31 @@ pub fn render_card(
         .borders(Borders::ALL)
         .border_style(border_style);
     frame.render_widget(Paragraph::new(lines).block(block).style(card_style), area);
+}
+
+/// The hole a lifted card leaves behind: the exact slot it occupied, drawn as
+/// an empty dash-dot rectangle. Nothing else in the column shifts while the
+/// card rides the cursor, so the drop reads as "back here or somewhere else".
+pub fn render_drag_placeholder(frame: &mut Frame<'_>, theme: &Theme, area: Rect) {
+    let dash_dot = symbols::border::Set {
+        top_left: "┌",
+        top_right: "┐",
+        bottom_left: "└",
+        bottom_right: "┘",
+        vertical_left: "┆",
+        vertical_right: "┆",
+        horizontal_top: "┄",
+        horizontal_bottom: "┄",
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(dash_dot)
+            .border_style(Style::default().fg(theme.muted))
+            .style(Style::default().bg(theme.bg)),
+        area,
+    );
 }
 
 #[cfg(test)]
