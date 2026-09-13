@@ -5843,26 +5843,26 @@ fn dropping_a_card_onto_another_card_chains_the_two_tasks() {
 
     drag_card(&mut app, source_rect, target_rect.x + 2, target_rect.y + 1);
 
-    let chained = app
+    let source = app
+        .ops
+        .get_task(&source_task)
+        .expect("load source")
+        .expect("source task");
+    assert_eq!(source.chained_to.as_deref(), Some(target_task.as_str()));
+    // Chaining links the cards where they are: neither task changes column.
+    assert_eq!(source.status, TaskStatus::Todo);
+    let target = app
         .ops
         .get_task(&target_task)
         .expect("load target")
         .expect("target task");
-    assert_eq!(chained.chained_to.as_deref(), Some(source_task.as_str()));
-    // Chaining links the cards where they are: neither task changes column.
-    assert_eq!(chained.status, TaskStatus::Todo);
-    assert_eq!(
-        app.ops
-            .get_task(&source_task)
-            .expect("load source")
-            .expect("source task")
-            .status,
-        TaskStatus::Todo
-    );
+    assert_eq!(target.chained_to, None);
+    assert_eq!(target.status, TaskStatus::Todo);
     assert!(
         app.status
-            .contains(&format!("Chained {target_task} to run after {source_task}"))
+            .contains(&format!("Chained {source_task} to run after {target_task}"))
     );
+    assert!(!app.status.contains(&format!("Chained {target_task}")));
 }
 
 #[test]

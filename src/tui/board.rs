@@ -706,7 +706,9 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("    outline, and the column under the pointer highlights green"),
         Line::from("  drop on In Progress: queue it · on To Do/Done: move and stop"),
         Line::from("    its agent · on Review: stop it and start its chained tasks"),
-        Line::from("  drop on another card: chain that card after the dragged one"),
+        Line::from(
+            "  drop on another card: chain the dragged card after the one under the pointer",
+        ),
         Line::from("  column headers show name and count"),
         Line::from(""),
         Line::from("Provider limits (row above the status bar, Board and Projects)"),
