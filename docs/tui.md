@@ -207,7 +207,7 @@ drives a run and not just a status change:
 | empty space in In Progress | move, then queue the task for the dispatcher (run phase `Queued`) |
 | empty space in Review | stop the task's agent, move, then start every task chained to it |
 | empty space in To Do / Done | stop the task's agent and move it |
-| another card | chain in drag direction: the card under the pointer gets `chained_to = <dragged task>`, so it auto-starts when the dragged task reaches Review. Neither card moves. |
+| another card | chain the dragged task: it gets `chained_to = <card under the pointer>`, so it auto-starts when the drop target reaches Review. Neither card moves. |
 
 Stopping is best effort — a task with no live agent is simply moved. The
 chain start ignores the `auto_launch_chained` rule (the drop is an explicit

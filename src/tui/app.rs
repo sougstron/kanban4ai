@@ -1834,25 +1834,25 @@ impl App {
         Ok(())
     }
 
-    /// Dropping a card onto another card chains the two in drag direction: the
-    /// task under the pointer waits for the dragged one and auto-starts once it
-    /// reaches Review.
+    /// Dropping a card onto another card chains the dragged task to the one
+    /// under the pointer: it waits for the drop target and auto-starts once
+    /// that target reaches Review.
     fn chain_dropped_task(&mut self, source_id: &str, target_id: &str) -> Result<()> {
         if source_id == target_id {
             return Ok(());
         }
         let updated = self.ops.update_task(
-            target_id,
+            source_id,
             TaskPatch {
-                chained_to: Some(Some(source_id.to_string())),
+                chained_to: Some(Some(target_id.to_string())),
                 ..Default::default()
             },
         )?;
         self.refresh_after_action()?;
         self.status = if updated.is_some() {
-            format!("Chained {target_id} to run after {source_id}")
+            format!("Chained {source_id} to run after {target_id}")
         } else {
-            format!("Task {target_id} not found")
+            format!("Task {source_id} not found")
         };
         Ok(())
     }
@@ -1926,7 +1926,7 @@ impl App {
         {
             return Some(format!(
                 "Moving {} → {} · release to chain {} after {}",
-                dragging.task_id, target.id, target.id, dragging.task_id
+                dragging.task_id, target.id, dragging.task_id, target.id
             ));
         }
         match self
