@@ -1,3 +1,24 @@
+# kanban4ai 0.6.10
+
+Two release fixes: safer Codex subscription probing and corrected
+drag-and-drop chaining direction.
+
+## Fixed
+
+- **Codex subscription probing uses `-a never`** (`core/limits.rs`,
+  `docs/limits.md`) so the read-only app-server probe never requests command
+  approval.
+- **Drag-and-drop chaining follows the drop target** (`tui/app.rs`,
+  `tui/board.rs`, `tui/tests.rs`, `docs/tui.md`). Dropping a card onto another
+  card now makes the dragged card wait for the card under the pointer, with
+  status text, help, documentation, and regression coverage matching that
+  direction.
+
+## Verification coverage
+
+- `dropping_a_card_onto_another_card_chains_the_two_tasks`
+- release quality gates listed below
+
 # kanban4ai 0.6.9
 
 Per-task readonly mode for delegated agents, and a drag&drop overhaul
