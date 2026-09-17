@@ -56,7 +56,7 @@ Sources, all read-only and best effort:
 - **codex**: the OpenAI subscription, which backs the codex CLI *and*
   opencode's `openai/*` models — both spend the same quota, so the row covers
   both. Three sources, newest `observed_at` winning. (1) The codex app-server
-  JSON-RPC (`codex -s read-only -a untrusted app-server`, `initialize` then
+  JSON-RPC (`codex -s read-only -a never app-server`, `initialize` then
   `account/rateLimits/read`) answers with live server-side numbers and costs no
   usage; `fetch_all` uses it on its own `CODEX_RPC_MIN_INTERVAL_SECS` (300s)
   poll interval — persisted in `<store>/codex-rpc-poll` so a run of CLI

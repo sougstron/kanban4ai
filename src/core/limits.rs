@@ -1716,7 +1716,7 @@ fn wait_with_timeout(
 fn fetch_codex_rpc() -> std::result::Result<ProviderLimits, String> {
     let cwd = cli_scratch_dir().ok_or_else(|| "no scratch directory".to_string())?;
     let mut child = Command::new("codex")
-        .args(["-s", "read-only", "-a", "untrusted", "app-server"])
+        .args(["-s", "read-only", "-a", "never", "app-server"])
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
