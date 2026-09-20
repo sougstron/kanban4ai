@@ -74,7 +74,7 @@ src/
     ├── compaction.rs    # Rule-based context compaction (no LLM)
     ├── scheduler.rs     # Slot census, queue dispatch, crash-restart backoff
     ├── daemon.rs        # Store-wide tick + single-instance `daemon.lock`
-    ├── limits.rs        # Provider subscription limits (claude/codex/grok/zai/synthetic/yolo) + cache
+    ├── limits.rs        # Provider subscription limits (claude/codex/grok/zai/synthetic) + cache
     ├── stats.rs         # App-collected usage stats: event log, aggregation, report
     ├── notifier.rs      # Desktop notifications (notify-send)
     └── vcs.rs           # Worktree isolation: git probe, live snapshots, merge-tree landing

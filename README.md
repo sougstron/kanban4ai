@@ -7,7 +7,7 @@ A fast native local-first kanban board CLI and TUI designed for AI coding agents
 - Linux or another Unix-like environment
 - Rust 1.88 or newer when building from source
 - Optional integrations: `tmux`, `notify-send`, `wl-paste` or `xclip`, `curl`
-  (subscription limits for claude, codex, grok, z.ai, synthetic, and yolo)
+  (subscription limits for claude, codex, grok, z.ai, and synthetic)
 - Optional agent backends: opencode, Claude Code, and/or Codex CLI
 
 ## Install
@@ -231,19 +231,17 @@ clickable.
 
 Directly above the status bar, the Board and Projects screens show how much of
 each AI subscription is left — `✳ claude 5h 66% ↻3h30m · 7d 95% ↻6d11h │ ✕ grok
-7d 93% ↻4d22h │ ◆ zai 5h 85% ↻4h48m · 7d 97% ↻6d23h │ ✦ synthetic 5h 91% ↻3h59m ·
-7d 12% ↻3h22m │ ◉ yolo 24h 95%` — with the percentage that **remains** in each
+7d 93% ↻4d22h │ ◆ zai 5h 85% ↻4h48m · 7d 97% ↻6d23h │ ✦ synthetic 5h 91%
+↻3h59m · 7d 12% ↻3h22m` — with the percentage that **remains** in each
 window and the time until it resets. Providers you are not signed in to are
-left out. The numbers refresh in the background (claude, grok, z.ai, synthetic,
-and yolo over HTTPS via `curl`). Clicking any provider segment refreshes that
+left out. The numbers refresh in the background (claude, grok, z.ai, and
+synthetic over HTTPS via `curl`). Clicking any provider segment refreshes that
 provider on the spot — claude force-polls its usage endpoint, the grok CLI
-renews its login token, and z.ai / synthetic / yolo re-fetch over HTTPS. A
-window whose reset time has passed is
-dropped rather than shown frozen (synthetic's tick-regenerating quotas and
-yolo's rolling day keep their seat until the next poll), and a provider with
-nothing current left
-reads `stale`. `kanban4ai limits` prints the same data, and
-`tui.show_limits: false` hides the row.
+renews its login token, and z.ai / synthetic re-fetch over HTTPS. A window
+whose reset time has passed is dropped rather than shown frozen (synthetic's
+tick-regenerating quotas keep their seat until the next poll), and a provider
+with nothing current left reads `stale`. `kanban4ai limits` prints the same
+data, and `tui.show_limits: false` hides the row.
 
 ### 5. Sessions, archives, projects, and data
 
