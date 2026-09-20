@@ -1,3 +1,35 @@
+# kanban4ai 0.6.11
+
+Grok remaining no longer goes n/a on a live billing period that omits
+`creditUsagePercent`, and the limits row drops the unused yolo provider.
+
+## Fixed
+
+- **Grok billing without `creditUsagePercent` stays Ready**
+  (`core/limits.rs`, `docs/limits.md`). The credits endpoint often
+  returns a live `currentPeriod` without `creditUsagePercent`; requiring
+  that field made grok Unavailable. Used percent now falls back to
+  `productUsage` (`GrokBuild` first), and a live period with no percent
+  is 0% used rather than n/a. An expired OIDC token (`expires_at`,
+  5-minute skew) is renewed with `grok models` on the background fetch
+  as well as on a click; a 401 retries the same way.
+
+## Changed
+
+- **Yolo is no longer a limits provider** (`core/limits.rs`,
+  `tui/limits.rs`, `tui/board.rs`, `cli/mod.rs`, `docs/limits.md`,
+  AUR `optdepends`). The row and `kanban limits` cover claude, codex,
+  grok, zai, and synthetic. `yolo*` models no longer map to a
+  subscription segment.
+
+## Verification coverage
+
+- `grok_billing_without_percent_uses_the_live_period`,
+  `grok_billing_falls_back_to_grok_build_product_usage`,
+  `grok_billing_reads_wrapped_and_string_percents`,
+  `grok_token_needs_refresh_reads_expires_at`
+- release quality gates listed below
+
 # kanban4ai 0.6.10
 
 Two release fixes: safer Codex subscription probing and corrected
