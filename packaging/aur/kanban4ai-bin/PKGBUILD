@@ -9,7 +9,7 @@ license=('MIT')
 depends=('glibc' 'gcc-libs')
 optdepends=(
   'tmux: attachable background agent sessions'
-  'curl: subscription limits row for claude, grok, zai, synthetic, and yolo; update checks and self-update'
+  'curl: subscription limits row for claude, grok, zai, synthetic; update checks and self-update'
   'libnotify: desktop notifications through notify-send'
   'wl-clipboard: paste images under Wayland'
   'xclip: paste images under X11'
