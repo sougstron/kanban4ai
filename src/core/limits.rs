@@ -30,8 +30,13 @@
 //!   `usage_limit_reached` hands its `x-codex-*` response headers to
 //!   [`record_codex_usage`], which is how a machine that only ever drives
 //!   OpenAI through opencode gets numbers at all.
-//! - **grok**: `GET /v1/billing` on the grok CLI proxy with the OIDC key from
-//!   `~/.grok/auth.json`. Reports credit usage for the current billing period.
+//! - **grok**: `GET /v1/billing?format=credits` on the grok CLI proxy with the
+//!   OIDC key from `~/.grok/auth.json`. Reports credit usage for the current
+//!   billing period. `creditUsagePercent` is omitted on some 200s (a fresh
+//!   window, or before the credits view is populated); the parser then takes
+//!   `productUsage` (`GrokBuild` first) and treats a live `currentPeriod` with
+//!   no percent as 0% used. An expired OIDC token is renewed via `grok models`
+//!   on the background fetch, not only on a click.
 //! - **zai**: `GET /api/monitor/usage/quota/limit` on `api.z.ai` with the API
 //!   key opencode stores for the GLM Coding Plan
 //!   (`~/.local/share/opencode/auth.json`, `zai-coding-plan.key`). Reports a
@@ -73,9 +78,11 @@
 //! provider (see [`refresh_provider_async`]): claude force-polls the usage
 //! endpoint (skipping the current-bridge short-circuit and the 15-minute
 //! interval the background refresh honors), running the grok CLI renews the
-//! short-lived token in `~/.grok/auth.json` that the billing fetch uses, and
-//! zai / synthetic / yolo simply re-fetch over HTTPS (their keys are long-lived,
-//! so no renewal step is needed). Each runs on a background thread and merges
+//! short-lived token in `~/.grok/auth.json` that the billing fetch uses (the
+//! background fetch does the same when `expires_at` has passed or the endpoint
+//! answers 401), and zai / synthetic / yolo simply re-fetch over HTTPS (their
+//! keys are long-lived, so no renewal step is needed). Each runs on a background
+//! thread and merges
 //! into the same cache, so the row updates on the next tick. Codex re-asks its
 //! app-server for the live numbers (see `refresh_provider_now`), skipping the
 //! poll interval the background refresh honors.
@@ -1176,10 +1183,14 @@ fn grok_auth_path() -> Option<PathBuf> {
 
 /// The stored grok CLI session: bearer key and user id. `auth.json` is keyed by
 /// `<issuer>::<client id>`, so the single entry is taken as-is.
-fn grok_session(path: &Path) -> Option<(String, String)> {
+fn grok_auth_entry(path: &Path) -> Option<Value> {
     let text = fs::read_to_string(path).ok()?;
     let value: Value = serde_json::from_str(&text).ok()?;
-    let entry = value.as_object()?.values().next()?;
+    value.as_object()?.values().next().cloned()
+}
+
+fn grok_session(path: &Path) -> Option<(String, String)> {
+    let entry = grok_auth_entry(path)?;
     let key = entry.get("key")?.as_str()?.to_string();
     let user_id = entry
         .get("user_id")
@@ -1189,10 +1200,31 @@ fn grok_session(path: &Path) -> Option<(String, String)> {
     (!key.is_empty()).then_some((key, user_id))
 }
 
+/// Renew the access token this long before its stated expiry, so a poll never
+/// races the boundary. Same skew as Claude: grok's OIDC key lasts ~6h.
+const GROK_TOKEN_SKEW_SECS: i64 = 300;
+
+fn grok_token_needs_refresh(path: &Path, now: i64) -> bool {
+    grok_auth_entry(path)
+        .as_ref()
+        .and_then(|entry| entry.get("expires_at"))
+        .and_then(Value::as_str)
+        .and_then(parse_rfc3339)
+        .is_some_and(|expires_at| expires_at <= now + GROK_TOKEN_SKEW_SECS)
+}
+
 fn fetch_grok() -> ProviderLimits {
+    fetch_grok_inner(true)
+}
+
+fn fetch_grok_inner(allow_refresh: bool) -> ProviderLimits {
     let Some(path) = grok_auth_path().filter(|path| path.exists()) else {
         return ProviderLimits::new("grok", ProviderState::NotConfigured);
     };
+    if allow_refresh && grok_token_needs_refresh(&path, now_secs()) {
+        let _ = refresh_grok_cli();
+        return fetch_grok_inner(false);
+    }
     let Some((key, user_id)) = grok_session(&path) else {
         return ProviderLimits::new("grok", ProviderState::SignedOut);
     };
@@ -1213,15 +1245,27 @@ fn fetch_grok() -> ProviderLimits {
                 ProviderState::Unavailable("no billing period".to_string()),
             ),
         },
-        Err(err) => ProviderLimits::new("grok", err.into_state()),
+        Err(err) => {
+            let state = err.into_state();
+            if allow_refresh && matches!(state, ProviderState::SignedOut) {
+                let _ = refresh_grok_cli();
+                return fetch_grok_inner(false);
+            }
+            ProviderLimits::new("grok", state)
+        }
     }
 }
 
 /// Read the grok billing response: one window for the current billing period,
 /// labelled by its period type and reset at the period end.
+///
+/// `creditUsagePercent` is not always present: a freshly rolled window, and
+/// some 200s before the credits view is populated, omit it. `productUsage`
+/// (preferring `GrokBuild`, the coding quota) is the fallback; a live
+/// `currentPeriod` with no percent at all is 0% used rather than n/a.
 pub fn parse_grok_billing(value: &Value) -> Option<LimitWindow> {
     let config = value.get("config")?;
-    let used = config.get("creditUsagePercent")?.as_f64()?;
+    let used = grok_used_percent(config)?;
     let period = config.get("currentPeriod");
     let label = period
         .and_then(|period| period.get("type"))
@@ -1239,6 +1283,40 @@ pub fn parse_grok_billing(value: &Value) -> Option<LimitWindow> {
                 .and_then(parse_rfc3339)
         });
     Some(LimitWindow::new(label, used, resets_at))
+}
+
+fn grok_used_percent(config: &Value) -> Option<f64> {
+    grok_json_f64(config.get("creditUsagePercent"))
+        .or_else(|| grok_product_used_percent(config))
+        .or_else(|| config.get("currentPeriod").is_some().then_some(0.0))
+}
+
+fn grok_product_used_percent(config: &Value) -> Option<f64> {
+    let products = config.get("productUsage")?.as_array()?;
+    let mut fallback = None;
+    for product in products {
+        let Some(percent) = grok_json_f64(product.get("usagePercent")) else {
+            continue;
+        };
+        let name = product
+            .get("product")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if name.eq_ignore_ascii_case("GrokBuild") {
+            return Some(percent);
+        }
+        fallback = Some(fallback.map_or(percent, |current: f64| current.max(percent)));
+    }
+    fallback
+}
+
+fn grok_json_f64(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.trim().parse().ok(),
+        Value::Object(map) => map.get("val").and_then(Value::as_f64),
+        _ => None,
+    }
 }
 
 fn grok_period_label(period_type: &str) -> &'static str {
@@ -2259,6 +2337,58 @@ mod tests {
     }
 
     #[test]
+    fn grok_billing_without_percent_uses_the_live_period() {
+        let value: Value = serde_json::from_str(
+            r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2026-09-16T07:11:32.007632+00:00","end":"2026-09-23T07:11:32.007632+00:00"},"onDemandCap":{"val":0}}}"#,
+        )
+        .unwrap();
+
+        let window = parse_grok_billing(&value).expect("window");
+
+        assert_eq!(window.label, "7d");
+        assert_eq!(window.remaining_percent, 100.0);
+        assert_eq!(window.resets_at, Some(1790147492));
+    }
+
+    #[test]
+    fn grok_billing_falls_back_to_grok_build_product_usage() {
+        let value: Value = serde_json::from_str(
+            r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-09-23T07:11:32.007632+00:00"},"productUsage":[{"product":"GrokChat"},{"product":"GrokBuild","usagePercent":12.5}]}}"#,
+        )
+        .unwrap();
+
+        let window = parse_grok_billing(&value).expect("window");
+
+        assert_eq!(window.remaining_percent, 87.5);
+        assert_eq!(window.label, "7d");
+    }
+
+    #[test]
+    fn grok_billing_reads_wrapped_and_string_percents() {
+        let wrapped: Value = serde_json::from_str(
+            r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_DAILY","end":"2026-09-21T00:00:00Z"},"creditUsagePercent":{"val":25}}}"#,
+        )
+        .unwrap();
+        let as_string: Value = serde_json::from_str(
+            r#"{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_MONTHLY","end":"2026-10-01T00:00:00Z"},"creditUsagePercent":"8"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parse_grok_billing(&wrapped)
+                .expect("wrapped")
+                .remaining_percent,
+            75.0
+        );
+        assert_eq!(
+            parse_grok_billing(&as_string)
+                .expect("string")
+                .remaining_percent,
+            92.0
+        );
+    }
+
+    #[test]
     fn zai_quota_maps_credit_windows() {
         let value: Value = serde_json::from_str(
             r#"{"code":200,"msg":"Operation successful","data":{"limits":[
@@ -3039,6 +3169,32 @@ mod tests {
             grok_session(&path),
             Some(("abc".to_string(), "user-1".to_string()))
         );
+    }
+
+    #[test]
+    fn grok_token_needs_refresh_reads_expires_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{"https://auth.x.ai::client":{"key":"abc","user_id":"u","expires_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        assert!(grok_token_needs_refresh(&path, 1_800_000_000));
+
+        fs::write(
+            &path,
+            r#"{"https://auth.x.ai::client":{"key":"abc","user_id":"u","expires_at":"2099-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        assert!(!grok_token_needs_refresh(&path, 1_800_000_000));
+
+        fs::write(
+            &path,
+            r#"{"https://auth.x.ai::client":{"key":"abc","user_id":"u"}}"#,
+        )
+        .unwrap();
+        assert!(!grok_token_needs_refresh(&path, 1_800_000_000));
     }
 
     #[test]

@@ -72,7 +72,11 @@ Sources, all read-only and best effort:
 - **grok**: `GET https://cli-chat-proxy.grok.com/v1/billing?format=credits`
   with the key and user id from `~/.grok/auth.json` plus
   `X-XAI-Token-Auth: xai-grok-cli`. Yields one window for the current billing
-  period (`creditUsagePercent`, `currentPeriod.type`/`.end`).
+  period (`currentPeriod.type`/`.end`). Used percent is `creditUsagePercent`
+  when present, otherwise `productUsage` (`GrokBuild` first); a live period
+  that has not yet published a percent is 0% used rather than `n/a`. An
+  expired OIDC token (`expires_at`, 5-minute skew) is renewed with `grok models`
+  on the background fetch as well as on a click — a 401 retries the same way.
 - **zai**: `GET https://api.z.ai/api/monitor/usage/quota/limit` with the GLM
   Coding Plan API key opencode stores in `~/.local/share/opencode/auth.json`
   (`zai-coding-plan.key`, `$XDG_DATA_HOME` respected). Yields the 5-hour and
@@ -150,9 +154,9 @@ on claude force-polls `GET /api/oauth/usage` (skipping the 15-minute interval
 and the current-bridge short-circuit the background refresh honors) and merges
 the result with whatever the statusline bridge still holds, and running
 `grok models` renews the short-lived
-OIDC token in `~/.grok/auth.json` before the billing fetch — that fixes
-"grok reads signed out after
-~6h" without a periodic poller — while zai / synthetic / yolo re-fetch over HTTPS
+OIDC token in `~/.grok/auth.json` before the billing fetch — the background
+refresh does the same once `expires_at` has passed, so grok does not sit on
+`n/a` between clicks — while zai / synthetic / yolo re-fetch over HTTPS
 (their keys are long-lived, so no renewal step is needed). The CLIs run in
 the scratch cwd `<store>/limits-refresh-cwd` so stray session state never
 lands in a project. A 429 from the
