@@ -1,3 +1,56 @@
+# kanban4ai 0.6.12
+
+Grok Build is a first-class agent backend. Delegated tasks can run `grok`
+headlessly, and replies, telemetry, logs, and provenance reuse the Claude
+Messages API path.
+
+## Added
+
+- **Grok Build backend** (`agent/backends.rs`, `agent/tmux.rs`,
+  `core/config.rs`, `docs/config.md`). Built-in `agents.grok` launches
+  `grok --output-format streaming-messages-json --verbatim [extra_args]
+  [--model M] [--reasoning-effort E] --prompt-file <file>`. Headless mode is
+  `--prompt-file`, not a trailing positional. Default `extra_args` is
+  `--permission-mode bypassPermissions`. Default model is `grok-4.7`; the
+  fallback list is `grok-4.7`, `grok-4.7-build-fast`, `grok-4.6`, and
+  `grok-4.5`. Effort fallback is `low`/`medium`/`high`/`xhigh`. `agent_name`
+  is ignored. Stdin is closed so a tmux pane is not extra prompt context.
+  A missing `agents.grok` entry and `max_running_per_backend.grok: 2` are
+  filled in by the usual default merge.
+- **Live model catalog** (`agent/backends.rs`, `docs/config.md`,
+  `docs/data-model.md`). The create/edit dialog treats grok like the other
+  catalog backends. `grok models` supplies launchable ids (`*`, `-`, and `+`
+  bullets; a trailing `(default)` is not part of the id), and
+  `~/.grok/models_cache.json` (`GROK_HOME` when set) supplies each model's
+  `reasoning_efforts`. A failed CLI still falls back to that cache. Hidden
+  cache models are omitted. Recent launches are recorded in
+  `.kanban/recent_models`.
+- **Shared Messages API capture** (`core/reply.rs`, `core/telemetry.rs`,
+  `core/provenance.rs`, `core/operations.rs`, `docs/agent-io.md`).
+  `streaming-messages-json` is harvested with the claude stream parser, and
+  the wrapper reformats it through `kanban format-stream`. Provenance records
+  grok tool ids `read_file`, `search_replace`, `grep`, `list_dir`,
+  `web_search`, `web_fetch`, and `run_terminal_cmd`. Live telemetry also
+  accepts `todo_write`. The manifest backend stays `grok`.
+- **Resume** (`agent/backends.rs`, `tui/app.rs`). Automatic relaunches pass
+  `grok --resume <uuid>` only for a `session_id` harvested from the
+  transcript. Opening a stopped grok session in the TUI uses the same
+  `--resume` flag.
+- **Limits mapping** (`core/limits.rs`, `docs/limits.md`). The grok backend
+  spends the grok subscription directly, so executor-pool headroom applies
+  to it the same way it already did for catalog `xai/*` and `grok*` models.
+
+## Verification coverage
+
+- `grok_launch_plan_uses_prompt_file_and_reasoning_effort`,
+  `grok_auto_relaunch_resumes_native_session`,
+  `grok_models_text_lists_ids_and_ignores_prose`,
+  `grok_models_cache_skips_hidden_and_sorts_efforts`
+- `grok_tool_ids_are_harvested_like_claude_tools`,
+  `claude_gathers_every_assistant_message_and_ignores_result` (grok path)
+- `provider_for("grok", …)` and default `max_running_per_backend.grok` is 2
+- release quality gates listed below
+
 # kanban4ai 0.6.11
 
 Grok remaining no longer goes n/a on a live billing period that omits
