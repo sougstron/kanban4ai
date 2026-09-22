@@ -300,6 +300,7 @@ fn legacy_board_without_orchestration_gets_defaults() {
     assert_eq!(orch.max_running_per_backend.get("opencode"), Some(&2));
     assert_eq!(orch.max_running_per_backend.get("omp"), Some(&2));
     assert_eq!(orch.max_running_per_backend.get("pi"), Some(&2));
+    assert_eq!(orch.max_running_per_backend.get("grok"), Some(&2));
     assert!(orch.max_running_per_backend_model.is_empty());
     assert_eq!(orch.max_running_per_role.get("designer"), Some(&1));
     assert_eq!(orch.max_running_per_role.get("reviewer"), Some(&1));

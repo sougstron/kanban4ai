@@ -246,7 +246,7 @@ pub fn build_launch_plan<'a>(
         None
     };
     let role = Role::from_phase(task.run_phase);
-    let resume = (!revert && matches!(backend.as_str(), "codex" | "pi" | "omp"))
+    let resume = (!revert && matches!(backend.as_str(), "codex" | "pi" | "omp" | "grok"))
         .then(|| native_resume_candidate(roots.data_root, task, session_id, &backend))
         .flatten();
     let prompt = if let Some((previous_session, _)) = &resume {
@@ -254,7 +254,7 @@ pub fn build_launch_plan<'a>(
     } else {
         build_agent_prompt(roots, task, session_id, revert, role)?
     };
-    let args = backend_args(
+    let mut args = backend_args(
         &backend,
         &backend_config,
         model.as_deref(),
@@ -269,13 +269,24 @@ pub fn build_launch_plan<'a>(
     let prompt_file = logs_dir.join(format!("{session_id}.prompt.txt"));
     atomic_write_text(&prompt_file, &prompt)?;
 
-    // claude, codex, opencode, and the pi family (pi/omp, via `--mode json`)
-    // all emit a parseable JSONL transcript on stdout.
+    // claude, codex, opencode, the pi family (pi/omp, via `--mode json`), and
+    // grok (`--output-format streaming-messages-json`) all emit a parseable
+    // JSONL transcript on stdout.
     let transcript_file = matches!(
         backend.as_str(),
-        "claude" | "codex" | "opencode" | "pi" | "omp"
+        "claude" | "codex" | "opencode" | "pi" | "omp" | "grok"
     )
     .then(|| logs_dir.join(format!("{session_id}.transcript.jsonl")));
+    // Grok's headless mode is `--prompt-file`, not a trailing positional.
+    // Leaving `prompt_file` set would make the wrapper also `cat` the body
+    // onto argv, which grok treats as an interactive prompt.
+    let prompt_on_argv = if backend == "grok" {
+        args.push("--prompt-file".to_string());
+        args.push(prompt_file.display().to_string());
+        false
+    } else {
+        true
+    };
 
     Ok(LaunchPlan {
         backend,
@@ -284,7 +295,7 @@ pub fn build_launch_plan<'a>(
         model,
         args,
         prompt,
-        prompt_file: Some(prompt_file),
+        prompt_file: prompt_on_argv.then_some(prompt_file),
         log_file: logs_dir.join(format!("{session_id}.log")),
         transcript_file,
         session_id: session_id.to_string(),
@@ -295,9 +306,9 @@ pub fn build_launch_plan<'a>(
     })
 }
 
-/// Find the most recent completed kanban session for this task whose Codex or
-/// pi-family transcript exposed a native conversation id. Human starts reset
-/// both counters, so only automatic relaunches are eligible.
+/// Find the most recent completed kanban session for this task whose Codex,
+/// pi-family, or Grok transcript exposed a native conversation id. Human starts
+/// reset both counters, so only automatic relaunches are eligible.
 fn native_resume_candidate(
     data_root: &Path,
     task: &Task,
@@ -407,6 +418,17 @@ fn backend_args(
         // (`message_end`/`turn_end` carry `usage`, `cost`, and tool calls), so
         // the wrapper harvests it exactly like claude/opencode.
         "omp" | "pi" => vec!["-p".to_string(), "--mode".to_string(), "json".to_string()],
+        // Grok Build (`grok`) runs headlessly. `--prompt-file` (appended once
+        // the prompt file exists) is what selects headless mode; this stream
+        // is the Messages API `stream-json` shape claude already emits, so
+        // the same harvester, reply capture, and log formatter apply.
+        // `--verbatim` keeps kanban's instructions from being rewritten as
+        // `@` file references.
+        "grok" => vec![
+            "--output-format".to_string(),
+            "streaming-messages-json".to_string(),
+            "--verbatim".to_string(),
+        ],
         _ => vec!["run".to_string()],
     };
     if let Some(session) = resume_session {
@@ -429,6 +451,13 @@ fn backend_args(
                 args.push("--resume".to_string());
                 args.push(session.to_string());
             }
+            "grok" => {
+                // `grok --resume <uuid>` continues that headless session.
+                // Non-UUID values are title lookups, so only an id harvested
+                // from the transcript's `session_id` is passed.
+                args.push("--resume".to_string());
+                args.push(session.to_string());
+            }
             _ => {}
         }
     }
@@ -440,8 +469,9 @@ fn backend_args(
     if let Some(effort) = effort.filter(|value| !value.trim().is_empty()) {
         // claude exposes reasoning effort as --effort; opencode maps it onto
         // per-model variants selected with --variant; the pi family (omp/pi)
-        // uses --thinking. Codex stores this setting under its config key and
-        // accepts it through the generic `-c key=value` override.
+        // uses --thinking; Grok Build uses --reasoning-effort. Codex stores
+        // this setting under its config key and accepts it through the
+        // generic `-c key=value` override.
         match backend {
             "codex" => {
                 args.push("-c".to_string());
@@ -451,6 +481,7 @@ fn backend_args(
                 let flag = match backend {
                     "claude" => "--effort",
                     "omp" | "pi" => "--thinking",
+                    "grok" => "--reasoning-effort",
                     _ => "--variant",
                 };
                 args.push(flag.to_string());
@@ -545,10 +576,13 @@ pub fn resolve_opencode_agent(command: &str, requested: &str) -> String {
 
 /// Model catalog reported by an agent backend: every launchable model id plus
 /// the reasoning-effort variants each model accepts. Sourced from the backend
-/// CLI (`opencode models --verbose`, `omp models --json`) or, for pi, the
-/// on-disk `models-store.json` builtin/remote cache merged with custom
-/// providers from `models.json` and bundled catalogs for providers listed
-/// in `auth.json` (e.g. OpenRouter from the installed `pi-ai` package).
+/// CLI (`opencode models --verbose`, `omp models --json`, `grok models`) or,
+/// for pi, the on-disk `models-store.json` builtin/remote cache merged with
+/// custom providers from `models.json` and bundled catalogs for providers
+/// listed in `auth.json` (e.g. OpenRouter from the installed `pi-ai` package).
+/// Grok's text listing is enriched with per-model efforts from
+/// `$GROK_HOME/models_cache.json` (default `~/.grok`), which `grok models`
+/// refreshes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackendCatalog {
     pub models: Vec<String>,
@@ -568,7 +602,7 @@ impl BackendCatalog {
 /// pi's on-disk store + custom providers) instead of relying solely on the
 /// configured `models` list.
 pub fn backend_has_catalog(backend: &str) -> bool {
-    matches!(backend, "opencode" | "omp" | "pi")
+    matches!(backend, "opencode" | "omp" | "pi" | "grok")
 }
 
 static CATALOG_CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<BackendCatalog>>>>> =
@@ -620,6 +654,19 @@ fn fetch_backend_catalog(backend: &str, command: &str) -> Option<BackendCatalog>
             &pi_agent_dir(),
             pi_builtin_data_dir(command).as_deref(),
         )),
+        // `grok models` is the scan (it also refreshes models_cache.json).
+        // The text listing is the set of launchable ids; the cache supplies
+        // each model's reasoning-effort menu. A failed CLI still falls back
+        // to the cache so the dialog is not empty offline.
+        "grok" => {
+            let mut catalog = run_capture(command, &["models"])
+                .map(|text| parse_grok_models_text(&text))
+                .unwrap_or_default();
+            if let Some(cache_text) = read_grok_models_cache() {
+                apply_grok_cache(&mut catalog, &parse_grok_models_cache(&cache_text));
+            }
+            (!catalog.models.is_empty()).then_some(catalog)
+        }
         _ => None,
     }
 }
@@ -631,6 +678,106 @@ fn run_capture(command: &str, args: &[&str]) -> Option<String> {
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
+}
+
+/// Parse `grok models`: a prose header plus a bullet list. The default model
+/// is marked `*`; the rest use `-`. A trailing `(default)` annotation is not
+/// part of the id.
+pub fn parse_grok_models_text(text: &str) -> BackendCatalog {
+    let mut catalog = BackendCatalog::default();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("* ")
+            .or_else(|| line.strip_prefix("- "))
+            .or_else(|| line.strip_prefix("+ "))
+        else {
+            continue;
+        };
+        let Some(id) = rest.split_whitespace().next() else {
+            continue;
+        };
+        let id = id.strip_suffix("(default)").unwrap_or(id);
+        if id.is_empty() || id.contains(':') || catalog.models.iter().any(|model| model == id) {
+            continue;
+        }
+        catalog.models.push(id.to_string());
+    }
+    catalog
+}
+
+/// Parse `~/.grok/models_cache.json`. Hidden models are omitted. Each model's
+/// `reasoning_efforts` values (falling back to ids) become its effort menu.
+pub fn parse_grok_models_cache(text: &str) -> BackendCatalog {
+    let mut catalog = BackendCatalog::default();
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
+        return catalog;
+    };
+    let Some(models) = root.get("models").and_then(serde_json::Value::as_object) else {
+        return catalog;
+    };
+    for (key, entry) in models {
+        let info = entry.get("info").unwrap_or(entry);
+        if info.get("hidden").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
+        let model_id = info
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .unwrap_or(key.as_str());
+        if model_id.is_empty() || catalog.models.iter().any(|model| model == model_id) {
+            continue;
+        }
+        let efforts = info
+            .get("reasoning_efforts")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                let names = items
+                    .iter()
+                    .filter_map(|item| {
+                        item.get("value")
+                            .and_then(serde_json::Value::as_str)
+                            .or_else(|| item.get("id").and_then(serde_json::Value::as_str))
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>();
+                sort_efforts(names)
+            })
+            .unwrap_or_default();
+        catalog.models.push(model_id.to_string());
+        if !efforts.is_empty() {
+            catalog.variants.insert(model_id.to_string(), efforts);
+        }
+    }
+    catalog
+}
+
+fn apply_grok_cache(catalog: &mut BackendCatalog, cache: &BackendCatalog) {
+    if catalog.models.is_empty() {
+        *catalog = cache.clone();
+        return;
+    }
+    for model in &catalog.models {
+        let efforts = cache.variants_for(model);
+        if !efforts.is_empty() {
+            catalog.variants.insert(model.clone(), efforts.to_vec());
+        }
+    }
+}
+
+/// Grok's config directory (`GROK_HOME`, default `~/.grok`).
+fn grok_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("GROK_HOME")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home));
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".grok"))
+}
+
+fn read_grok_models_cache() -> Option<String> {
+    fs::read_to_string(grok_home()?.join("models_cache.json")).ok()
 }
 
 /// pi's agent config directory (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`).

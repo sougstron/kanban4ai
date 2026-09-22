@@ -4196,7 +4196,7 @@ impl App {
     /// session, or `None` when the backend has no known resume flag or the
     /// backend session id was never captured.
     fn resume_action(&self, session_id: &str, backend: &str) -> Result<Option<TerminalAction>> {
-        if !matches!(backend, "claude" | "codex") {
+        if !matches!(backend, "claude" | "codex" | "grok") {
             return Ok(None);
         }
         let Some(backend_session_id) =
@@ -4216,6 +4216,7 @@ impl App {
                 "--include-non-interactive".to_string(),
             ]
         } else {
+            // claude and grok both reopen a captured session with `--resume`.
             vec!["--resume".to_string(), backend_session_id]
         };
         Ok(Some(TerminalAction::Foreground {
@@ -4867,7 +4868,7 @@ impl App {
     }
 
     /// Effort choices depend on the backend and, for catalog-backed backends,
-    /// on the model: claude/codex list their config `efforts`; opencode/omp/pi
+    /// on the model: claude/codex list their config `efforts`; opencode/omp/pi/grok
     /// offer the variants their catalogs report for the selected model.
     fn refresh_effort_options_for_slot(
         &self,
@@ -6408,7 +6409,7 @@ fn role_cap(orch: &OrchestrationSettings, role: &str) -> i64 {
     orch.max_running_per_role.get(role).copied().unwrap_or(0)
 }
 
-const BACKEND_CAP_ORDER: [&str; 5] = ["claude", "codex", "opencode", "omp", "pi"];
+const BACKEND_CAP_ORDER: [&str; 6] = ["claude", "codex", "opencode", "omp", "pi", "grok"];
 
 fn format_backend_cap_map(map: &HashMap<String, i64>) -> String {
     let mut keys: Vec<&String> = map.keys().collect();
@@ -6723,11 +6724,13 @@ fn parse_cap_lines(
 }
 
 fn is_known_settings_backend(modal: &ModalState, backend: &str) -> bool {
-    matches!(backend, "opencode" | "claude" | "codex" | "omp" | "pi")
-        || modal
-            .backend_options
-            .iter()
-            .any(|option| option.value.as_deref() == Some(backend))
+    matches!(
+        backend,
+        "opencode" | "claude" | "codex" | "omp" | "pi" | "grok"
+    ) || modal
+        .backend_options
+        .iter()
+        .any(|option| option.value.as_deref() == Some(backend))
 }
 
 fn canonicalize_backend_model_key(

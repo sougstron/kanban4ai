@@ -107,16 +107,18 @@ pub const PROVIDERS: [&str; 5] = ["claude", "codex", "grok", "zai", "synthetic"]
 /// screen has no project, so no `.kanban/config.yaml` to read).
 pub const DEFAULT_REFRESH_INTERVAL: i64 = 120;
 
-/// Which tracked provider a backend/model pair spends quota on. `claude` and
-/// `codex` are their own subscriptions; catalog backends (`opencode`, `omp`,
-/// `pi`) resolve by model-id prefix — the OpenAI subscription backs both the
-/// codex CLI and `openai/*` models, `anthropic/*` spends Claude's, and so on.
-/// `None` = unknown, which the executor-pool gate treats as "passes" (a
-/// candidate with no observable quota must not be permanently blocked).
+/// Which tracked provider a backend/model pair spends quota on. `claude`,
+/// `codex`, and `grok` are their own subscriptions; catalog backends
+/// (`opencode`, `omp`, `pi`) resolve by model-id prefix — the OpenAI
+/// subscription backs both the codex CLI and `openai/*` models, `anthropic/*`
+/// spends Claude's, and so on. `None` = unknown, which the executor-pool gate
+/// treats as "passes" (a candidate with no observable quota must not be
+/// permanently blocked).
 pub fn provider_for(backend: &str, model: Option<&str>) -> Option<&'static str> {
     match backend {
         "claude" => Some("claude"),
         "codex" => Some("codex"),
+        "grok" => Some("grok"),
         "opencode" | "omp" | "pi" => {
             let model = model?;
             if model.starts_with("openai") {
@@ -3068,6 +3070,8 @@ mod tests {
         assert_eq!(provider_for("claude", None), Some("claude"));
         assert_eq!(provider_for("codex", Some("gpt-5.5")), Some("codex"));
         assert_eq!(provider_for("claude", Some("opus")), Some("claude"));
+        assert_eq!(provider_for("grok", Some("grok-4.7")), Some("grok"));
+        assert_eq!(provider_for("grok", None), Some("grok"));
         // Catalog backends resolve by model-id prefix.
         assert_eq!(
             provider_for("opencode", Some("openai/gpt-5.5")),

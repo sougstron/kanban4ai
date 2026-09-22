@@ -4,10 +4,10 @@ use std::fs;
 
 use kanban4ai::agent::{
     build_agent_prompt, build_launch_plan, cached_opencode_catalog, load_pi_catalog,
-    load_pi_catalog_from_dir, parse_omp_models_json, parse_opencode_agent_list,
-    parse_opencode_models_verbose, parse_pi_builtin_catalog, parse_pi_models_json,
-    parse_pi_models_store, pi_builtin_data_dir, recent_models, record_recent_model, sort_efforts,
-    sort_opencode_models,
+    load_pi_catalog_from_dir, parse_grok_models_cache, parse_grok_models_text,
+    parse_omp_models_json, parse_opencode_agent_list, parse_opencode_models_verbose,
+    parse_pi_builtin_catalog, parse_pi_models_json, parse_pi_models_store, pi_builtin_data_dir,
+    recent_models, record_recent_model, sort_efforts, sort_opencode_models,
 };
 use kanban4ai::core::models::{MessageKind, MessageRole, Role, RunPhase, Task};
 use kanban4ai::core::project::Roots;
@@ -615,6 +615,125 @@ agents:
 }
 
 #[test]
+fn grok_launch_plan_uses_prompt_file_and_reasoning_effort() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    write_agent_config(
+        dir.path(),
+        r#"auto_launch:
+  enabled: true
+  use_tmux: false
+  terminal_fallback: true
+  default_agent: grok
+notifications:
+  enabled: false
+agents:
+  grok:
+    command: grok
+    model: grok-4.7
+    extra_args:
+    - --permission-mode
+    - bypassPermissions
+"#,
+    );
+    let task = storage
+        .create_task(NewTask {
+            title: "Grok task".into(),
+            ai_model: Some("grok-4.5".into()),
+            ai_effort: Some("high".into()),
+            agent_name: Some("ignored-persona".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let plan = build_launch_plan(dir.path(), &task, "ses-grok-test", false).unwrap();
+
+    assert_eq!(plan.backend, "grok");
+    assert_eq!(plan.command, "grok");
+    assert!(
+        plan.prompt_file.is_none(),
+        "wrapper must not also cat the prompt"
+    );
+    assert!(
+        !plan.args.iter().any(|arg| arg == &plan.prompt),
+        "prompt body must not be placed on argv"
+    );
+    let prompt_path = plan
+        .args
+        .windows(2)
+        .find(|pair| pair[0] == "--prompt-file")
+        .map(|pair| pair[1].as_str())
+        .expect("prompt file flag");
+    assert_eq!(std::fs::read_to_string(prompt_path).unwrap(), plan.prompt);
+    assert!(has_arg_pair(
+        &plan.args,
+        "--output-format",
+        "streaming-messages-json"
+    ));
+    assert!(plan.args.iter().any(|arg| arg == "--verbatim"));
+    assert!(has_arg_pair(&plan.args, "--model", "grok-4.5"));
+    assert!(has_arg_pair(&plan.args, "--reasoning-effort", "high"));
+    assert!(has_arg_pair(
+        &plan.args,
+        "--permission-mode",
+        "bypassPermissions"
+    ));
+    assert!(!plan.args.contains(&"--agent".to_string()));
+    assert!(!plan.args.contains(&"ignored-persona".to_string()));
+    assert!(!plan.args.contains(&"--variant".to_string()));
+    assert!(!plan.args.contains(&"--thinking".to_string()));
+    assert!(plan.transcript_file.is_some());
+    assert!(plan.resolve_agent.is_none());
+}
+
+#[test]
+fn grok_auto_relaunch_resumes_native_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    write_agent_config(
+        dir.path(),
+        "auto_launch:\n  enabled: true\n  default_agent: grok\nnotifications:\n  enabled: false\nagents:\n  grok:\n    command: grok\n",
+    );
+    let mut task = storage.create_task(NewTask::titled("Resume grok")).unwrap();
+    task.agent_backend = Some("grok".to_string());
+    task.auto_resumes = 1;
+    storage.save_task(&task).unwrap();
+
+    let sessions = SessionManager::new(dir.path());
+    let mut previous = sessions
+        .link_named_session(&task.id, "ses-previous", "old")
+        .unwrap();
+    previous.status = kanban4ai::core::models::SessionStatus::Closed;
+    previous.ended_at = Some(previous.last_seen);
+    sessions.save_session(&previous).unwrap();
+    provenance::write_manifest(
+        &storage.provenance_dir,
+        &InputManifest {
+            session_id: previous.id.clone(),
+            backend: "grok".to_string(),
+            backend_session_id: Some("11111111-1111-1111-1111-111111111111".to_string()),
+            ..InputManifest::default()
+        },
+    )
+    .unwrap();
+
+    let plan = build_launch_plan(dir.path(), &task, "ses-current", false).unwrap();
+    assert!(has_arg_pair(
+        &plan.args,
+        "--resume",
+        "11111111-1111-1111-1111-111111111111"
+    ));
+    assert!(plan.args.windows(2).any(|pair| pair[0] == "--prompt-file"));
+    assert_eq!(
+        plan.resumed_backend_session.as_deref(),
+        Some("11111111-1111-1111-1111-111111111111")
+    );
+    assert!(plan.prompt.contains("KANBAN_SESSION=ses-current"));
+}
+
+#[test]
 fn pi_family_auto_relaunch_resumes_native_conversation_with_delta_prompt() {
     for backend in ["pi", "omp"] {
         let dir = tempfile::tempdir().unwrap();
@@ -936,6 +1055,51 @@ fn omp_models_json_yields_models_and_thinking_efforts() {
         ["low", "medium", "high", "max"]
     );
     assert!(catalog.variants_for("xai-oauth/grok-build").is_empty());
+}
+
+#[test]
+fn grok_models_text_lists_ids_and_ignores_prose() {
+    let text = "\
+You are logged in with grok.com.\n\
+\n\
+Default model: grok-4.7\n\
+\n\
+Available models:\n\
+  * grok-4.7 (default)\n\
+  - grok-4.7-build-fast\n\
+  - grok-4.6\n\
+  - grok-4.5\n\
+";
+    let catalog = parse_grok_models_text(text);
+    assert_eq!(
+        catalog.models,
+        ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]
+    );
+    assert!(parse_grok_models_text("not a listing").models.is_empty());
+}
+
+#[test]
+fn grok_models_cache_skips_hidden_and_sorts_efforts() {
+    let text = r#"{
+      "models": {
+        "grok-4.7": {
+          "info": {
+            "id": "grok-4.7",
+            "hidden": false,
+            "reasoning_efforts": [
+              {"id": "xhigh", "value": "xhigh"},
+              {"id": "low", "value": "low"},
+              {"id": "high", "value": "high"}
+            ]
+          }
+        },
+        "secret": {"info": {"id": "secret", "hidden": true, "reasoning_efforts": []}}
+      }
+    }"#;
+    let catalog = parse_grok_models_cache(text);
+    assert_eq!(catalog.models, ["grok-4.7"]);
+    assert_eq!(catalog.variants_for("grok-4.7"), ["low", "high", "xhigh"]);
+    assert!(parse_grok_models_cache("not json").models.is_empty());
 }
 
 #[test]
