@@ -20,9 +20,10 @@ only the last message demonstrably posted just that wrap-up and lost the
 answer. Every backend therefore gathers all assistant text in order, exactly
 as the session rendered it:
 
-- claude: every `assistant` event's `text` blocks, grouped by message `id`;
-  the closing `result` event repeats the last message and is only a fallback
-  for runs with no recorded assistant text at all.
+- claude, and grok (`--output-format streaming-messages-json`, the same
+  Messages API shape): every `assistant` event's `text` blocks, grouped by
+  message `id`; the closing `result` event repeats the last message and is
+  only a fallback for runs with no recorded assistant text at all.
 - codex: every completed `agent_message` item from an `item.completed`
   event; streamed `item.updated` partials are skipped.
 - opencode: every `text` event, grouped by `part.messageID`.

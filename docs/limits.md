@@ -149,7 +149,8 @@ credentials removed) replaces them.
 Pools** in `docs/orchestration.md`); the limits side exposes two pure helpers.
 
 `provider_for(backend, model)` maps a launch pair onto one of the row's
-providers: `claude` → `claude`, `codex` → `codex`; the catalog backends
+providers: `claude` → `claude`, `codex` → `codex`, `grok` → `grok` (the Grok
+Build CLI spends that subscription directly); the catalog backends
 (`opencode`/`omp`/`pi`) resolve by model-id prefix — `openai/*` → `codex`
 (the OpenAI subscription backs those runs), `anthropic/*` → `claude`,
 `zai*`/`glm*` → `zai`, `synthetic/*` → `synthetic`,

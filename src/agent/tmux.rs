@@ -293,9 +293,10 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
     let log_quoted = shell_quote(&plan.log_file.display().to_string());
     // Codex may read additional prompt text from stdin even when a positional
     // prompt is present; the pi family (pi/omp) also probes stdin under `-p`.
-    // All three backends would hang forever on an inherited tmux pane TTY, so
-    // close stdin for their non-interactive runs.
-    let stdin_redirect = if matches!(plan.backend.as_str(), "codex" | "pi" | "omp") {
+    // Grok Build treats a piped stdin as extra prompt context. All of them
+    // would hang forever on an inherited tmux pane TTY, so close stdin for
+    // their non-interactive runs.
+    let stdin_redirect = if matches!(plan.backend.as_str(), "codex" | "pi" | "omp" | "grok") {
         " < /dev/null"
     } else {
         ""

@@ -175,6 +175,24 @@ agents:
     - max
     agent: null
     extra_args: []
+  grok:
+    command: grok
+    model: grok-4.7
+    models:
+    - grok-4.7
+    - grok-4.7-build-fast
+    - grok-4.6
+    - grok-4.5
+    effort: null
+    efforts:
+    - low
+    - medium
+    - high
+    - xhigh
+    agent: null
+    extra_args:
+    - --permission-mode
+    - bypassPermissions
 orchestration:
   queue_enabled: true
   max_running_total: 3
@@ -184,6 +202,7 @@ orchestration:
     opencode: 2
     omp: 2
     pi: 2
+    grok: 2
   max_running_per_backend_model: {}
   max_running_per_role:
     orchestrator: 1
@@ -1648,7 +1667,7 @@ impl Config {
     fn validate_orchestration(config: &mut BoardConfig, warnings: &mut Vec<String>) -> Result<()> {
         // Known backends for `<backend>/<model>` key checks: the built-ins
         // plus anything the user configured under `agents:`.
-        let known_backends: Vec<String> = ["opencode", "claude", "codex", "omp", "pi"]
+        let known_backends: Vec<String> = ["opencode", "claude", "codex", "omp", "pi", "grok"]
             .into_iter()
             .map(str::to_owned)
             .chain(

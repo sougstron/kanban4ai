@@ -12,7 +12,8 @@
 //! *next* prompt is built from).
 //!
 //! Every supported backend emits a parseable JSONL transcript on stdout —
-//! claude via `--output-format stream-json`, codex via `exec --json`, opencode
+//! claude via `--output-format stream-json`, grok via `--output-format
+//! streaming-messages-json` (the same Messages API shape), codex via `exec --json`, opencode
 //! via `run --format json`, and the pi family (pi/omp) via `--mode json` — captured to
 //! `.kanban/logs/<session>.transcript.jsonl` by the launch wrapper. Their event
 //! shapes differ but never collide on the top-level `type`, so one
@@ -78,9 +79,13 @@ pub trait TranscriptHarvester {
     fn harvest(&self, transcript: &Path) -> Result<InputManifest>;
 }
 
-/// Harvester for claude's `--output-format stream-json` JSONL transcript.
+/// Harvester for claude's `--output-format stream-json` JSONL transcript, and
+/// for Grok Build's `--output-format streaming-messages-json`, which uses the
+/// same Messages API wire shape. `backend` is the name written on the manifest
+/// (`claude` or `grok`) so a later relaunch resumes the matching CLI.
 pub struct ClaudeHarvester {
     pub session_id: String,
+    pub backend: String,
     pub prompt_dump: Option<String>,
     /// Repo root, used to canonicalize recorded paths to repo-relative form.
     pub root: PathBuf,
@@ -91,7 +96,7 @@ impl TranscriptHarvester for ClaudeHarvester {
         let raw = std::fs::read_to_string(transcript)?;
         let mut manifest = InputManifest {
             session_id: self.session_id.clone(),
-            backend: "claude".to_string(),
+            backend: self.backend.clone(),
             prompt_dump: self.prompt_dump.clone(),
             generated_at: timefmt::format(&timefmt::now()),
             ..InputManifest::default()
@@ -817,35 +822,35 @@ fn record_claude_tool_use(manifest: &mut InputManifest, block: &Value) {
     }
     let input = block.get("input").cloned().unwrap_or(Value::Null);
     match name {
-        "Read" | "NotebookRead" => {
+        "Read" | "NotebookRead" | "read_file" => {
             if let Some(path) = str_field(&input, &["file_path", "notebook_path", "path"]) {
                 push_unique(&mut manifest.reads, path);
             }
         }
-        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
+        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "search_replace" => {
             if let Some(path) = str_field(&input, &["file_path", "notebook_path", "path"]) {
                 push_unique(&mut manifest.writes, path);
             }
         }
-        "Glob" | "Grep" => {
+        "Glob" | "Grep" | "grep" | "list_dir" => {
             if let Some(path) = str_field(&input, &["path"]) {
                 push_unique(&mut manifest.reads, path);
             } else if let Some(pattern) = str_field(&input, &["pattern"]) {
                 push_unique(&mut manifest.reads, format!("pattern:{pattern}"));
             }
         }
-        "WebFetch" => {
+        "WebFetch" | "web_fetch" => {
             if let Some(url) = str_field(&input, &["url"]) {
                 push_unique(&mut manifest.urls, url);
             }
         }
-        "WebSearch" => {
+        "WebSearch" | "web_search" => {
             if let Some(query) = str_field(&input, &["query"]) {
                 push_unique(&mut manifest.urls, format!("search:{query}"));
             }
         }
-        "Bash" => {
-            if let Some(command) = str_field(&input, &["command"]) {
+        "Bash" | "run_terminal_cmd" => {
+            if let Some(command) = str_field(&input, &["command", "cmd"]) {
                 record_bash_files(manifest, &command);
             }
         }
@@ -1127,6 +1132,7 @@ not json at all
         let dir = write_transcript(TRANSCRIPT);
         let harvester = ClaudeHarvester {
             session_id: "ses-x".to_string(),
+            backend: "claude".to_string(),
             prompt_dump: Some(".kanban/logs/ses-x.prompt.txt".to_string()),
             root: PathBuf::from("/repo"),
         };
@@ -1151,6 +1157,31 @@ not json at all
         assert_eq!(manifest.urls, vec!["https://example.com/doc"]);
         assert_eq!(manifest.mcp, vec!["github:list_prs"]);
         assert_eq!(manifest.summary(), "reads=3 writes=2 urls=1 mcp=1");
+    }
+
+    #[test]
+    fn grok_tool_ids_are_harvested_like_claude_tools() {
+        let transcript = r#"
+{"type":"system","subtype":"init","session_id":"11111111-1111-1111-1111-111111111111"}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"read_file","input":{"path":"src/main.rs"}},{"type":"tool_use","name":"search_replace","input":{"path":"src/lib.rs"}},{"type":"tool_use","name":"run_terminal_cmd","input":{"command":"sed -n '1,5p' README.md"}},{"type":"tool_use","name":"web_search","input":{"query":"grok build"}}]}}
+"#;
+        let dir = write_transcript(transcript);
+        let manifest = ClaudeHarvester {
+            session_id: "ses-grok".to_string(),
+            backend: "grok".to_string(),
+            prompt_dump: None,
+            root: PathBuf::from("/repo"),
+        }
+        .harvest(&dir.path().join("ses.transcript.jsonl"))
+        .unwrap();
+        assert_eq!(manifest.backend, "grok");
+        assert_eq!(
+            manifest.backend_session_id.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
+        );
+        assert_eq!(manifest.reads, vec!["src/main.rs", "README.md"]);
+        assert_eq!(manifest.writes, vec!["src/lib.rs"]);
+        assert_eq!(manifest.urls, vec!["search:grok build"]);
     }
 
     const CODEX_TRANSCRIPT: &str = r#"
@@ -1249,6 +1280,7 @@ not json at all
         let dir = write_transcript(transcript);
         let manifest = ClaudeHarvester {
             session_id: "ses-dup".to_string(),
+            backend: "claude".to_string(),
             prompt_dump: None,
             root: PathBuf::from("/repo"),
         }

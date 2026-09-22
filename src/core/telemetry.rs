@@ -79,6 +79,8 @@ pub fn read_session_progress(
             "codex" => parse_codex(&raw, &mut progress),
             "opencode" => parse_opencode(&raw, &mut progress),
             "pi" | "omp" => parse_pi_family(&raw, &mut progress),
+            // Grok Build's streaming-messages-json is the claude stream shape.
+            "claude" | "grok" => parse_claude(&raw, &mut progress),
             _ => parse_claude(&raw, &mut progress),
         }
     }
@@ -147,11 +149,13 @@ fn parse_claude(raw: &str, progress: &mut SessionProgress) {
                         if block.get("type").and_then(Value::as_str) != Some("tool_use") {
                             continue;
                         }
-                        if block.get("name").and_then(Value::as_str) == Some("TodoWrite")
-                            && let Some(todos) = block
-                                .get("input")
-                                .and_then(|input| input.get("todos"))
-                                .and_then(Value::as_array)
+                        if matches!(
+                            block.get("name").and_then(Value::as_str),
+                            Some("TodoWrite" | "todo_write")
+                        ) && let Some(todos) = block
+                            .get("input")
+                            .and_then(|input| input.get("todos"))
+                            .and_then(Value::as_array)
                         {
                             apply_todos(todos, progress);
                         }

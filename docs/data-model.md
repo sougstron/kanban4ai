@@ -145,7 +145,7 @@ tree at `<work>/.kanban/`.
 - `logs/` - per-session agent run logs
 - `detached/` - `kanban detach` job artifacts: `<task_id>-<stamp>.log` (output) and `.status` (exit code); cleared with the task's logs
 - `worktrees/<task_id>/` - per-task isolated git checkouts (see "Worktree Isolation"); removed on land (with `cleanup: on_land`), Done, abandon, and by the GC pass
-- `recent_models` - most recently launched catalog-backend models (opencode/omp/pi), newest first (drives TUI model-selector ordering)
+- `recent_models` - most recently launched catalog-backend models (opencode/omp/pi/grok), newest first (drives TUI model-selector ordering)
 - `stats/events.jsonl` - append-only usage-statistics event log the board writes itself (never agents); see `docs/stats.md`
 - `instructions/<role>.md` - optional per-role prompt additions (`orchestrator`, `designer`, `reviewer`, `executor`), appended only to that role's prompt when that role is launched — unlike `AGENTS.md`, which every session pays for
 - `backups/<task_id>/` - pre-edit file backups for revert

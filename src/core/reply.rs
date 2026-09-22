@@ -50,7 +50,8 @@ const SEPARATOR: &str = "\n\n";
 pub fn session_messages(backend: &str, transcript: &Path) -> Option<Vec<String>> {
     let raw = std::fs::read_to_string(transcript).ok()?;
     let messages = match backend {
-        "claude" => claude_session_messages(&raw),
+        // Grok Build emits the same Messages API stream as claude.
+        "claude" | "grok" => claude_session_messages(&raw),
         "codex" => codex_session_messages(&raw),
         "opencode" => opencode_session_messages(&raw),
         "pi" | "omp" => pi_family_session_messages(&raw),
@@ -365,6 +366,10 @@ mod tests {
         ));
         assert_eq!(
             joined("claude", &path).as_deref(),
+            Some("Planning.\n\nSummary line.")
+        );
+        assert_eq!(
+            joined("grok", &path).as_deref(),
             Some("Planning.\n\nSummary line.")
         );
     }

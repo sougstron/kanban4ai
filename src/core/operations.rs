@@ -4387,8 +4387,8 @@ impl Operations {
     /// manifest (`.kanban/provenance/<session>.yaml`) recording what the run
     /// actually consumed — files read into context (including via Bash), files
     /// written, URLs, MCP calls. Best-effort and backend-gated: claude,
-    /// codex, opencode, and the pi family emit parseable transcripts, and any
-    /// failure is a soft warning
+    /// codex, opencode, the pi family, and grok emit parseable transcripts, and
+    /// any failure is a soft warning
     /// that never disturbs the reconciled exit.
     fn harvest_provenance(&self, task_id: &str, session_id: &str) -> Option<InputManifest> {
         let task = self.storage.load_task(task_id).ok().flatten()?;
@@ -4421,8 +4421,11 @@ impl Operations {
             .task_worktree_path(&task)
             .unwrap_or_else(|| self.work_path().to_path_buf());
         let harvester: Box<dyn TranscriptHarvester> = match backend.as_str() {
-            "claude" => Box::new(ClaudeHarvester {
+            // Grok Build's `streaming-messages-json` is the same Messages API
+            // shape as claude's `stream-json`.
+            "claude" | "grok" => Box::new(ClaudeHarvester {
                 session_id: session,
+                backend: backend.clone(),
                 prompt_dump,
                 root: repo_root,
             }),
