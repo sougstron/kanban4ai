@@ -677,7 +677,13 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Command::FormatStream => {
-            format_stream(std::io::stdin().lock(), &mut std::io::stdout().lock())?;
+            format_stream(
+                std::io::stdin().lock(),
+                &mut std::io::stdout().lock(),
+                |event| {
+                    limits::record_claude_stream_event(event);
+                },
+            )?;
             return Ok(ExitCode::SUCCESS);
         }
         Command::CheckoutWorktree => {
@@ -1478,11 +1484,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
 /// human-readable text. Recognized events are rendered (assistant text, tool
 /// one-liners, final result); other JSON events are dropped; non-JSON lines
 /// (backend stderr, banners) pass through untouched so nothing is lost.
-fn format_stream(input: impl std::io::BufRead, output: &mut impl std::io::Write) -> Result<()> {
+/// `on_event` sees every JSON event first; the wrapper uses it to record the
+/// run's live claude rate-limit windows.
+fn format_stream(
+    input: impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+    mut on_event: impl FnMut(&serde_json::Value),
+) -> Result<()> {
     for line in input.lines() {
         let line = line?;
         match serde_json::from_str::<serde_json::Value>(line.trim()) {
             Ok(value) => {
+                on_event(&value);
                 if let Some(rendered) = crate::core::provenance::render_stream_event(&value) {
                     writeln!(output, "{rendered}")?;
                 }
