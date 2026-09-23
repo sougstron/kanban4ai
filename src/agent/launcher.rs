@@ -21,6 +21,10 @@ impl AgentLauncher for KanbanLauncher {
     ) -> Result<bool> {
         launch(roots, task, session_id, revert)
     }
+
+    fn detach(&self) -> Option<Box<dyn AgentLauncher + Send>> {
+        Some(Box::new(KanbanLauncher))
+    }
 }
 
 fn launch(

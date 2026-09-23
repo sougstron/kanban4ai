@@ -22,6 +22,8 @@ pub enum AppEvent {
     FsChanged,
     FsDebounced(u64),
     Tick,
+    /// A background launch finished; its report is waiting on the app.
+    LaunchDone,
 }
 
 /// Why the per-project event loop returned. `run` keeps the input/tick threads
@@ -53,6 +55,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
     threads: &EventThreads,
 ) -> Result<LoopOutcome> {
     let _watcher = start_watcher(app.watch_root(), threads.tx.clone());
+    app.enable_background_launches(threads.tx.clone());
     let mut window_title = String::new();
 
     refresh_limits(app);
@@ -75,6 +78,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
                 spawn_debounce_timer(threads.tx.clone(), generation);
             }
             AppEvent::FsDebounced(generation) => app.reload_debounced_change(generation)?,
+            AppEvent::LaunchDone => app.poll_launches(),
             AppEvent::Tick => {
                 refresh_limits(app);
                 app.poll_update_banner();

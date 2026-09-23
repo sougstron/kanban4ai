@@ -79,6 +79,14 @@ use crate::core::vcs;
 pub trait AgentLauncher {
     fn launch(&self, roots: Roots<'_>, task: &Task, session_id: &str, revert: bool)
     -> Result<bool>;
+
+    /// A copy of this launcher that may move to a worker thread, so a slow
+    /// launch (worktree snapshot, tmux spawn) runs off the TUI event thread.
+    /// `None` keeps callers on the inline path — the default, which test
+    /// stubs rely on for deterministic, synchronous assertions.
+    fn detach(&self) -> Option<Box<dyn AgentLauncher + Send>> {
+        None
+    }
 }
 
 /// Test and fallback launcher that deliberately does not spawn processes.
@@ -283,6 +291,28 @@ pub struct DetachedJob {
     pub deadline: chrono::NaiveDateTime,
 }
 
+/// Everything needed to rebuild an [`Operations`] on another thread.
+/// `Operations` itself is not `Send` (config cache, boxed launcher), so a
+/// worker receives this and calls [`OperationsSeed::build`] on its side.
+pub struct OperationsSeed {
+    data_root: PathBuf,
+    work_path: PathBuf,
+    project_id: Option<String>,
+    launcher: Box<dyn AgentLauncher + Send>,
+}
+
+impl OperationsSeed {
+    pub fn build(self) -> Operations {
+        Operations {
+            storage: Storage::new(&self.data_root),
+            config: Config::new(&self.data_root),
+            work_path: self.work_path,
+            project_id: self.project_id,
+            launcher: self.launcher,
+        }
+    }
+}
+
 pub struct Operations {
     pub storage: Storage,
     pub config: Config,
@@ -335,6 +365,17 @@ impl Operations {
     /// ever read from or written to.
     pub fn work_path(&self) -> &Path {
         &self.work_path
+    }
+
+    /// A seed for a worker-thread copy of these operations, or `None` when
+    /// the launcher cannot leave this thread.
+    pub fn detach(&self) -> Option<OperationsSeed> {
+        Some(OperationsSeed {
+            data_root: self.data_root().to_path_buf(),
+            work_path: self.work_path.clone(),
+            project_id: self.project_id.clone(),
+            launcher: self.launcher.detach()?,
+        })
     }
 
     pub fn roots(&self) -> Roots<'_> {
