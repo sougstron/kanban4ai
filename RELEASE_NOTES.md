@@ -1,3 +1,50 @@
+# kanban4ai 0.6.13
+
+Starting an isolated task no longer freezes the TUI, and a board that only
+runs headless Claude agents keeps the Claude limits row current.
+
+## Fixed
+
+- **Isolated launch no longer blocks the board** (`core/vcs.rs`,
+  `agent/backends.rs`, `agent/tmux.rs`, `cli/mod.rs`, `tui/app.rs`,
+  `tui/event.rs`, `core/operations.rs`). `git worktree add` is created with
+  `--no-checkout`, so a large checkout is not done under the board lock. The
+  session wrapper runs hidden `kanban checkout-worktree` after the heartbeat
+  loop starts and before the agent; a failed checkout exits without running
+  the agent on an empty tree. `populate_worktree` is a no-op once files are
+  present, including agent edits. Live snapshots seed the throwaway index
+  from the user's index and load it with `read-tree --reset`, so `add -A`
+  does not re-hash every unchanged file; a seeding failure falls back to an
+  empty index. The snapshot still matches the live working tree.
+- **TUI stays responsive while a launch or pump runs** (`tui/app.rs`,
+  `tui/event.rs`, `core/operations.rs`, `agent/launcher.rs`). Task launches,
+  queue pumps, and store orchestration ticks run on worker threads via
+  `AgentLauncher::detach` / `OperationsSeed`. The event loop is woken with
+  `LaunchDone` and applies the report on the UI thread. A second launch of a
+  task that is already in flight is refused. Launchers that cannot detach
+  stay on the inline path.
+
+## Changed
+
+- **Headless Claude runs feed the limits bridge** (`core/limits.rs`,
+  `cli/mod.rs`, `docs/limits.md`). `kanban format-stream` records each
+  `rate_limit_event` in a Claude stream-json transcript
+  (`rate_limit_info.unifiedWindows.five_hour` / `seven_day`, `utilization`
+  as a 0–1 fraction, `resetsAt` in Unix seconds) into the same bridge file
+  the statusline uses, merged per window. Windows the event does not carry
+  keep their previous reading. A board driven only by delegated `--print`
+  sessions stays live without waiting for an interactive statusline or the
+  usage endpoint.
+
+## Verification coverage
+
+- `wrapper_script_checks_out_the_worktree_before_the_agent`
+- `add_worktree_is_unpopulated_until_populate_which_is_idempotent`,
+  `snapshot_from_seeded_index_matches_working_tree`
+- `claude_rate_limit_event_maps_unified_windows`,
+  `claude_rate_limit_event_ignores_other_events`
+- release quality gates listed below
+
 # kanban4ai 0.6.12
 
 Grok Build is a first-class agent backend. Delegated tasks can run `grok`
