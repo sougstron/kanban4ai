@@ -216,6 +216,11 @@ pub struct LaunchPlan {
     /// Native Codex/pi/omp conversation reopened for this board relaunch. `None`
     /// means a fresh backend session and the full prompt.
     pub resumed_backend_session: Option<String>,
+    /// The run happens in the task's isolated worktree, which the launcher
+    /// creates without files (a large checkout would block the caller — the
+    /// TUI event loop). The wrapper populates it via `kanban
+    /// checkout-worktree` before the agent starts.
+    pub checkout_worktree: bool,
 }
 
 /// Build the plan for one agent run. Board files (config, prompt, log,
@@ -303,6 +308,10 @@ pub fn build_launch_plan<'a>(
         heartbeat_interval_secs,
         resolve_agent,
         resumed_backend_session: resume.map(|(_, backend_id)| backend_id),
+        checkout_worktree: task
+            .worktree
+            .as_deref()
+            .is_some_and(|rel| roots.work_path.ends_with(rel)),
     })
 }
 
