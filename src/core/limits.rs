@@ -18,6 +18,10 @@
 //!   token comes from `~/.claude/.credentials.json`; when it has expired the
 //!   stored refresh token is traded for a new one and the rotated pair is
 //!   written back, so the board keeps working while Claude Code is idle.
+//!   Headless agent runs render no statusline, so the wrapper's
+//!   `format-stream` feeds each `rate_limit_event` in the claude stream-json
+//!   transcript into the same bridge file (see
+//!   [`record_claude_stream_event`]): delegated sessions keep the row live.
 //! - **codex**: the OpenAI subscription, which backs both the codex CLI and
 //!   opencode's `openai/*` models. Three sources, newest observation wins.
 //!   The codex app-server JSON-RPC (`account/rateLimits/read`) answers with
@@ -829,6 +833,54 @@ pub fn store_claude_bridge(windows: &[LimitWindow]) -> bool {
         return false;
     };
     atomic_write_text(&path, &text).is_ok()
+}
+
+/// Read the `rate_limit_event` headless Claude Code (`-p --output-format
+/// stream-json`) emits after each API call: `rate_limit_info.unifiedWindows`
+/// carries `five_hour` / `seven_day` with `utilization` as a 0-1 fraction and
+/// `resetsAt` as Unix seconds. Any other event yields nothing.
+pub fn parse_claude_rate_limit_event(value: &Value) -> Vec<LimitWindow> {
+    if value.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
+        return Vec::new();
+    }
+    let Some(windows) = value
+        .get("rate_limit_info")
+        .and_then(|info| info.get("unifiedWindows"))
+    else {
+        return Vec::new();
+    };
+    [("five_hour", "5h"), ("seven_day", "7d")]
+        .into_iter()
+        .filter_map(|(key, label)| {
+            let window = windows.get(key)?;
+            let used = window.get("utilization").and_then(Value::as_f64)? * 100.0;
+            let resets_at = window
+                .get("resetsAt")
+                .and_then(Value::as_i64)
+                .filter(|at| *at > 0);
+            Some(LimitWindow::new(label, used, resets_at))
+        })
+        .collect()
+}
+
+/// Record the windows of a headless agent run's `rate_limit_event` into the
+/// bridge file. Agent runs never render a statusline, so without this a board
+/// driven only by delegated claude sessions would keep the numbers from the
+/// last interactive turn — or the last usage-endpoint poll that was not
+/// 429'd — while the five-hour window quietly drains. Windows the event does
+/// not carry keep their previous bridge reading.
+pub fn record_claude_stream_event(value: &Value) -> bool {
+    let fresh = parse_claude_rate_limit_event(value);
+    if fresh.is_empty() {
+        return false;
+    }
+    let mut windows = read_claude_bridge()
+        .map(|bridge| bridge.windows)
+        .unwrap_or_default();
+    windows.retain(|kept| fresh.iter().all(|window| window.label != kept.label));
+    windows.extend(fresh);
+    windows.sort_by_key(|window| claude_window_rank(&window.label));
+    store_claude_bridge(&windows)
 }
 
 /// The recorded statusline bridge windows, when any exist. `observed_at`
@@ -2478,6 +2530,39 @@ mod tests {
         assert_eq!(windows[0].label, "5h");
         assert_eq!(windows[0].remaining_percent, 50.0);
         assert_eq!(windows[0].resets_at, Some(1_786_708_199));
+    }
+
+    #[test]
+    fn claude_rate_limit_event_maps_unified_windows() {
+        let value: Value = serde_json::from_str(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed",
+                "resetsAt":1790161200,"rateLimitType":"five_hour",
+                "unifiedWindows":{"five_hour":{"utilization":0.31,"resetsAt":1790161200},
+                                  "seven_day":{"utilization":0.25,"resetsAt":1790280000}}}}"#,
+        )
+        .unwrap();
+
+        let windows = parse_claude_rate_limit_event(&value);
+
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "5h");
+        assert!((windows[0].remaining_percent - 69.0).abs() < 1e-9);
+        assert_eq!(windows[0].resets_at, Some(1_790_161_200));
+        assert_eq!(windows[1].label, "7d");
+        assert!((windows[1].remaining_percent - 75.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn claude_rate_limit_event_ignores_other_events() {
+        let assistant: Value =
+            serde_json::from_str(r#"{"type":"assistant","message":{"content":[]}}"#).unwrap();
+        assert!(parse_claude_rate_limit_event(&assistant).is_empty());
+
+        let bare: Value = serde_json::from_str(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"allowed"}}"#,
+        )
+        .unwrap();
+        assert!(parse_claude_rate_limit_event(&bare).is_empty());
     }
 
     #[test]

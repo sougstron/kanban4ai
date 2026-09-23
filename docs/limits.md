@@ -49,9 +49,14 @@ Sources, all read-only and best effort:
   rotated pair is written back into `claudeAiOauth`, preserving every other
   field and the file's `0600` mode — the grant rotates the refresh token, so
   keeping the new one private would strand Claude Code with a retired one.
-  Note the bridge only fires for interactive Claude Code sessions (`--print`
-  runs do not invoke the statusline), which is also when the subscription
-  windows actually move; the endpoint is what covers the hours in between.
+  The statusline only fires for interactive Claude Code sessions, but
+  delegated `--print` agent runs spend the same windows, so the wrapper's
+  `kanban format-stream` also records every `rate_limit_event` in the claude
+  stream-json transcript (`rate_limit_info.unifiedWindows.five_hour` /
+  `seven_day`, `utilization` as a 0-1 fraction, `resetsAt` in Unix seconds)
+  into the same bridge file, merged per window. A board driven only by agents
+  therefore stays live without polling the endpoint, which covers the hours
+  when nothing claude runs at all.
 - **codex**: the OpenAI subscription, which backs the codex CLI *and*
   opencode's `openai/*` models — both spend the same quota, so the row covers
   both. Three sources, newest `observed_at` winning. (1) The codex app-server
