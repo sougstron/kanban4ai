@@ -239,6 +239,26 @@ fn s(v: &str) -> &OsStr {
     OsStr::new(v)
 }
 
+/// Check out the files of a worktree created by [`GitRepo::add_worktree`].
+/// A no-op once the worktree has an index: only a never-populated checkout
+/// lacks one, so agent edits are never reset. Idempotent, so every consumer
+/// of a task worktree may call it first.
+pub fn populate_worktree(worktree: &Path) -> Result<()> {
+    let out = require(
+        run(worktree, &["rev-parse", "--git-path", "index"], None)?,
+        "rev-parse --git-path index",
+    )?;
+    let index = worktree.join(String::from_utf8_lossy(&out.stdout).trim_end_matches(['\n', '\r']));
+    if index.exists() {
+        return Ok(());
+    }
+    require(
+        run(worktree, &["reset", "--quiet", "--hard", "HEAD"], None)?,
+        "reset --hard",
+    )?;
+    Ok(())
+}
+
 impl GitRepo {
     /// The work tree root this repo was detected at.
     pub fn root(&self) -> &Path {
@@ -247,6 +267,31 @@ impl GitRepo {
 
     fn git(&self, args: &[&str]) -> Result<Output> {
         run(&self.root, args, None)
+    }
+
+    /// Copy the user's index into `dest` for [`Self::snapshot`]. The copy
+    /// keeps the original mtime: git trusts cached stat data only for entries
+    /// older than the index file itself, and a fresh mtime would hide a
+    /// racily modified file. False when there is no index to copy.
+    fn seed_index(&self, dest: &Path) -> bool {
+        let Ok(out) = self.git(&["rev-parse", "--git-path", "index"]) else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        let source = self
+            .root
+            .join(String::from_utf8_lossy(&out.stdout).trim_end_matches(['\n', '\r']));
+        let Ok(modified) = fs::metadata(&source).and_then(|meta| meta.modified()) else {
+            return false;
+        };
+        fs::copy(&source, dest).is_ok()
+            && fs::File::options()
+                .write(true)
+                .open(dest)
+                .and_then(|file| file.set_modified(modified))
+                .is_ok()
     }
 
     /// False while HEAD points at a branch with no commits (fresh `git init`).
@@ -278,10 +323,25 @@ impl GitRepo {
     ///
     /// `parent` is any commit-ish (an oid, `HEAD`, or a ref name). `git status`,
     /// `git diff --cached` and HEAD are all unchanged afterwards.
+    ///
+    /// A bare `read-tree` leaves the throwaway index without stat data, so
+    /// `add -A` would re-hash every file in the work folder — seconds on a
+    /// large repo, blocking whoever launches the task (TASK-327). The temp
+    /// index is therefore seeded with a copy of the user's index and loaded
+    /// with `read-tree --reset`, which keeps the stat data of entries whose
+    /// content matches `parent`; the resulting tree is identical. Any
+    /// seeding failure falls back to the empty throwaway index.
     pub fn snapshot(&self, parent: &str, message: &str) -> Result<Oid> {
         let tmp = NamedTempFile::new()?;
         let index = Some(tmp.path());
-        require(run(&self.root, &["read-tree", parent], index)?, "read-tree")?;
+        let seeded = self.seed_index(tmp.path())
+            && run(&self.root, &["read-tree", "--reset", parent], index)?
+                .status
+                .success();
+        if !seeded {
+            fs::write(tmp.path(), b"")?;
+            require(run(&self.root, &["read-tree", parent], index)?, "read-tree")?;
+        }
         require(run(&self.root, &["add", "-A"], index)?, "add -A")?;
         let out = require(run(&self.root, &["write-tree"], index)?, "write-tree")?;
         let tree = parse_oid(&String::from_utf8_lossy(&out.stdout))?;
@@ -339,11 +399,16 @@ impl GitRepo {
         parse_oid(&String::from_utf8_lossy(&out.stdout))
     }
 
-    /// Create a worktree at `path` on a new branch `branch` rooted at `base`.
+    /// Create a worktree at `path` on a new branch `branch` rooted at `base`,
+    /// WITHOUT checking out its files: the checkout of a large repo takes
+    /// seconds and the launcher runs it under the board lock (TASK-327).
+    /// [`populate_worktree`] fills it in — the agent's wrapper script does so
+    /// through `kanban checkout-worktree` before the agent starts.
     pub fn add_worktree(&self, path: &Path, branch: &str, base: &Oid) -> Result<()> {
         let args = [
             s("worktree"),
             s("add"),
+            s("--no-checkout"),
             s("-b"),
             s(branch),
             path.as_os_str(),
@@ -362,6 +427,9 @@ impl GitRepo {
     /// conflicted snapshot as a parent, the next landing's merge-base would
     /// sit past the conflict and "cleanly" land the markered tree.
     pub fn commit_all(&self, worktree: &Path, message: &str) -> Result<Option<Oid>> {
+        // An unpopulated checkout has no index: `add -A` would stage the
+        // whole tree as deleted.
+        populate_worktree(worktree)?;
         let unmerged = require(
             run(worktree, &["ls-files", "--unmerged", "-z"], None)?,
             "ls-files --unmerged",
@@ -590,6 +658,7 @@ impl GitRepo {
     /// user's `work_path` stays untouched. A clean merge commits; conflicts
     /// stop with markers and are not an error.
     pub fn merge_into_worktree(&self, worktree: &Path, refname: &str) -> Result<()> {
+        populate_worktree(worktree)?;
         let out = run(worktree, &["merge", "--no-edit", refname], None)?;
         match out.status.code() {
             Some(0) | Some(1) => Ok(()),
@@ -1025,6 +1094,7 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_path = wt.path().join("TASK-X");
         r.add_worktree(&wt_path, "kanban/TASK-X", &base).unwrap();
+        populate_worktree(&wt_path).unwrap();
         assert!(wt_path.join("f.txt").exists());
 
         write(&wt_path, "dirty.txt", "uncommitted\n");
@@ -1032,6 +1102,66 @@ mod tests {
         assert!(wt_path.exists());
         r.remove_worktree(&wt_path, true).unwrap();
         assert!(!wt_path.exists());
+    }
+
+    /// TASK-327: `add_worktree` returns before any file is written, so a
+    /// huge checkout never blocks the launcher; `populate_worktree` fills it
+    /// in once and is a no-op afterwards, keeping the agent's edits.
+    #[test]
+    fn add_worktree_is_unpopulated_until_populate_which_is_idempotent() {
+        let dir = init_repo();
+        write(dir.path(), "f.txt", "x\n");
+        commit_all(dir.path(), "init");
+        let r = repo(&dir);
+        let base = r.snapshot("HEAD", "S").unwrap();
+
+        let wt = tempfile::tempdir().unwrap();
+        let wt_path = wt.path().join("TASK-X");
+        r.add_worktree(&wt_path, "kanban/TASK-X", &base).unwrap();
+        assert!(!wt_path.join("f.txt").exists());
+
+        populate_worktree(&wt_path).unwrap();
+        assert_eq!(fs::read_to_string(wt_path.join("f.txt")).unwrap(), "x\n");
+        assert_eq!(ok(&wt_path, &["status", "--porcelain"]), "");
+
+        write(&wt_path, "f.txt", "agent edit\n");
+        write(&wt_path, "new.txt", "agent file\n");
+        populate_worktree(&wt_path).unwrap();
+        assert_eq!(
+            fs::read_to_string(wt_path.join("f.txt")).unwrap(),
+            "agent edit\n"
+        );
+        assert!(wt_path.join("new.txt").exists());
+    }
+
+    /// TASK-327: the snapshot seeds its throwaway index from the user's, so
+    /// staged-but-since-edited files, deletions and a partially staged index
+    /// must still yield exactly the live working tree — and leave the user's
+    /// index untouched.
+    #[test]
+    fn snapshot_from_seeded_index_matches_working_tree() {
+        let dir = init_repo();
+        write(dir.path(), "a.txt", "one\n");
+        write(dir.path(), "gone.txt", "bye\n");
+        commit_all(dir.path(), "init");
+        write(dir.path(), "a.txt", "staged\n");
+        ok(dir.path(), &["add", "a.txt"]);
+        write(dir.path(), "a.txt", "live\n");
+        fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        write(dir.path(), "new.txt", "untracked\n");
+        let cached_before = ok(dir.path(), &["diff", "--cached"]);
+
+        let r = repo(&dir);
+        let snap = r.snapshot("HEAD", "seeded").unwrap();
+        let rev = snap.as_str();
+
+        assert_eq!(ok(dir.path(), &["show", &format!("{rev}:a.txt")]), "live");
+        assert_eq!(
+            ok(dir.path(), &["show", &format!("{rev}:new.txt")]),
+            "untracked"
+        );
+        assert!(!has_blob(&r, rev, "gone.txt"));
+        assert_eq!(cached_before, ok(dir.path(), &["diff", "--cached"]));
     }
 
     #[test]
@@ -1125,6 +1255,7 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_path = wt.path().join("TASK-X");
         r.add_worktree(&wt_path, "kanban/TASK-X", &w).unwrap();
+        populate_worktree(&wt_path).unwrap();
         write(&wt_path, "land.txt", "landed\n");
         r.commit_all(&wt_path, "task edit").unwrap();
         let Preflight::Clean { tree } = r.preflight(&w, "kanban/TASK-X").unwrap() else {
@@ -1164,6 +1295,7 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_path = wt.path().join("TASK-X");
         r.add_worktree(&wt_path, "kanban/TASK-X", &w).unwrap();
+        populate_worktree(&wt_path).unwrap();
         write(&wt_path, "brand-new.txt", "from the task\n");
         r.commit_all(&wt_path, "task edit").unwrap();
         let Preflight::Clean { tree } = r.preflight(&w, "kanban/TASK-X").unwrap() else {
@@ -1196,6 +1328,7 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_path = wt.path().join("TASK-X");
         r.add_worktree(&wt_path, "kanban/TASK-X", &w).unwrap();
+        populate_worktree(&wt_path).unwrap();
         write(&wt_path, "land.txt", "landed\n");
         write(&wt_path, "brand-new.txt", "new file\n");
         r.commit_all(&wt_path, "task edit").unwrap();
@@ -1272,6 +1405,7 @@ mod tests {
         let wt = tempfile::tempdir().unwrap();
         let wt_path = wt.path().join("TASK-X");
         r.add_worktree(&wt_path, "kanban/TASK-X", &base).unwrap();
+        populate_worktree(&wt_path).unwrap();
         write(&wt_path, "hero.txt", "one\nTASK\n");
         assert!(r.commit_all(&wt_path, "task edit").unwrap().is_some());
 

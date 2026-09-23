@@ -456,6 +456,12 @@ enum Command {
         #[arg(long)]
         command: String,
     },
+    /// Internal command used by the agent runtime wrapper: check out the
+    /// files of the task worktree it runs in (the current directory). The
+    /// launcher creates the worktree empty so a large checkout never blocks
+    /// the launching process; a no-op once the worktree is populated.
+    #[command(name = "checkout-worktree", hide = true)]
+    CheckoutWorktree,
     /// Internal command used by the agent runtime wrapper: read a backend's
     /// stream-json transcript on stdin and print human-readable text on stdout,
     /// keeping the session log readable while the raw JSONL is captured to a
@@ -672,6 +678,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Command::FormatStream => {
             format_stream(std::io::stdin().lock(), &mut std::io::stdout().lock())?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::CheckoutWorktree => {
+            crate::core::vcs::populate_worktree(&std::env::current_dir()?)?;
             return Ok(ExitCode::SUCCESS);
         }
         Command::StatuslineBridge => {
@@ -1457,7 +1467,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::WaitResume { task_id, session } => {
             wait_resume_monitor(&ops, &task_id, &session)?;
         }
-        Command::ResolveAgent { .. } | Command::FormatStream => {
+        Command::ResolveAgent { .. } | Command::FormatStream | Command::CheckoutWorktree => {
             unreachable!("handled before resolve")
         }
     }

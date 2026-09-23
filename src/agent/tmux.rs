@@ -291,6 +291,15 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
     // `PIPESTATUS[0]` is the agent command's status in both shapes (it stays
     // the head of the pipeline).
     let log_quoted = shell_quote(&plan.log_file.display().to_string());
+    // The isolated worktree is created without files so the launch returns
+    // at once; checking out a large repo happens here, after the heartbeat
+    // loop starts. A failed checkout must never run the agent on an empty
+    // tree, so it skips straight to the exit reconciliation.
+    let checkout_guard = if plan.checkout_worktree {
+        format!("{kanban_cmd} checkout-worktree >> {log_quoted} 2>&1 && ")
+    } else {
+        String::new()
+    };
     // Codex may read additional prompt text from stdin even when a positional
     // prompt is present; the pi family (pi/omp) also probes stdin under `-p`.
     // Grok Build treats a piped stdin as extra prompt context. All of them
@@ -327,7 +336,7 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
         .map(|parent| format!("mkdir -p {}; ", shell_quote(&parent.display().to_string())))
         .unwrap_or_default();
     format!(
-        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; {project_export}{data_dir_export}{mkdir_logs}{}{}{run_pipeline}; status=${{PIPESTATUS[0]}}; kill $hb_pid 2>/dev/null; {}{}; exit $status",
+        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; {project_export}{data_dir_export}{mkdir_logs}{}{}if {checkout_guard}true; then {run_pipeline}; status=${{PIPESTATUS[0]}}; else status=1; fi; kill $hb_pid 2>/dev/null; {}{}; exit $status",
         shell_quote(&roots.work_path.display().to_string()),
         shell_quote(&plan.session_id),
         shell_quote(&plan.task_id),
@@ -436,6 +445,7 @@ mod tests {
             heartbeat_interval_secs: 100,
             resolve_agent: None,
             resumed_backend_session: None,
+            checkout_worktree: false,
         }
     }
 
@@ -590,6 +600,52 @@ mod tests {
             output.status.success(),
             "bash -n rejected transcript pipeline:\n{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// TASK-327: an isolated run checks its worktree out inside the session,
+    /// and a failed checkout skips the agent instead of running it on an
+    /// empty tree. Plain runs carry no checkout step.
+    #[test]
+    fn wrapper_script_checks_out_the_worktree_before_the_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut plan = test_plan(
+            dir.path(),
+            "TASK-010",
+            "ses-checkout",
+            "/bin/echo",
+            vec!["AGENT_RAN".to_string()],
+            false,
+        );
+        assert!(!wrapper_script(dir.path(), &plan).contains("checkout-worktree"));
+
+        plan.checkout_worktree = true;
+        let script = wrapper_script(dir.path(), &plan);
+        assert!(script.contains("checkout-worktree >> "));
+
+        // Run the script with a failing `kanban` stand-in: the agent must
+        // not run, and the exit status must report the failure.
+        let script = script.replace(
+            &format!(
+                "{} checkout-worktree",
+                std::env::current_exe()
+                    .ok()
+                    .and_then(resolve_callback_binary)
+                    .map(|p| shell_quote(&p.display().to_string()))
+                    .unwrap_or_else(|| "kanban".to_string())
+            ),
+            "false",
+        );
+        let output = Command::new("bash")
+            .args(["-c", &script])
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("bash should run");
+        assert_eq!(output.status.code(), Some(1));
+        let log = std::fs::read_to_string(&plan.log_file).unwrap_or_default();
+        assert!(
+            !log.contains("AGENT_RAN"),
+            "agent ran after a failed checkout: {log:?}"
         );
     }
 

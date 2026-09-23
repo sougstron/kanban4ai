@@ -87,6 +87,16 @@ impl AgentLauncher for RecordingLauncher {
             roots.work_path.to_path_buf(),
             roots.project_id.map(str::to_string),
         ));
+        // A real launch's wrapper checks the isolated worktree out before the
+        // agent runs (`kanban checkout-worktree`); do the same so tests can
+        // act as the agent inside it.
+        if task
+            .worktree
+            .as_deref()
+            .is_some_and(|rel| roots.work_path.ends_with(rel))
+        {
+            kanban4ai::core::vcs::populate_worktree(roots.work_path)?;
+        }
         Ok(true)
     }
 }
