@@ -2,7 +2,9 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
@@ -48,7 +50,7 @@ use super::dialogs::{
     AgentSlot, BulkAction, DialogField, Modal, ModalButton, ModalState, QuestionChoice,
     SelectOption, SettingsTab, executor_slot_index,
 };
-use super::event::LoopOutcome;
+use super::event::{AppEvent, LoopOutcome};
 use super::image;
 use super::projects::{self, ProjectListItem, ProjectRow};
 use super::search::SearchState;
@@ -441,7 +443,7 @@ pub struct App {
     /// Last time the TUI advanced every registered board's orchestration.
     last_store_pump: Option<Instant>,
     /// Store-wide warnings already shown during this TUI run.
-    store_pump_warnings: HashSet<String>,
+    store_pump_warnings: Arc<Mutex<HashSet<String>>>,
     /// Backends whose warmed model catalog has already been reflected into an
     /// open modal, so `tick` refreshes options at most once per backend.
     catalog_ready: HashSet<String>,
@@ -457,6 +459,96 @@ pub struct App {
     pending_switch: Option<LoopOutcome>,
     has_board: bool,
     pub help_return: Screen,
+    /// Launches and orchestration pumps running on worker threads, so a
+    /// worktree snapshot or tmux spawn never freezes the event loop.
+    launches: Vec<LaunchJob>,
+    launch_tx: Sender<LaunchReport>,
+    launch_rx: Receiver<LaunchReport>,
+    /// Wakes the event loop when a worker finishes. `None` until the event
+    /// loop opts in (and always in tests), which runs every job inline.
+    launch_wake: Option<Sender<AppEvent>>,
+}
+
+/// A background launch; `task_id` is `None` for a board/store pump.
+struct LaunchJob {
+    task_id: Option<String>,
+    handle: JoinHandle<()>,
+}
+
+/// What a finished launch job asks the UI thread to do.
+#[derive(Default)]
+struct LaunchReport {
+    status: Option<String>,
+    /// Close the detail screen if it still shows this task.
+    close_detail_for: Option<String>,
+    focus: Option<String>,
+    refresh: bool,
+    redraw: bool,
+}
+
+/// One queue pump's outcome: the tasks it started and any failure line.
+struct QueuePump {
+    started: Vec<String>,
+    error: Option<String>,
+}
+
+impl QueuePump {
+    fn status(&self) -> Option<String> {
+        if self.started.is_empty() {
+            return self.error.clone();
+        }
+        Some(format!("Queue dispatched: {}", self.started.join(", ")))
+    }
+}
+
+/// The graph's pull step first, so a node whose dependencies just finished
+/// is queued in time for this same dispatch pass; then start queued tasks.
+fn pump_queue(ops: &Operations) -> QueuePump {
+    let mut error = ops
+        .dispatch_ready_dependents()
+        .err()
+        .map(|err| format!("Dependency sweep failed: {err}"));
+    let started = match ops.dispatch_queue() {
+        Ok(started) => started.into_iter().map(|item| item.task_id).collect(),
+        Err(err) => {
+            error = Some(format!("Queue dispatch failed: {err}"));
+            Vec::new()
+        }
+    };
+    QueuePump { started, error }
+}
+
+/// Status line after a queued run + immediate pump: report what actually
+/// happened to the pressed task — an older queued task may have taken the
+/// freed slot first, so "Started" is never unconditional.
+fn post_queue_run_status(ops: &Operations, task_id: &str) -> String {
+    match ops.get_task(task_id) {
+        Ok(Some(task)) if task.run_phase == Some(RunPhase::Queued) => {
+            format!("Queued {task_id} — starts when a slot frees")
+        }
+        Ok(Some(task)) => match task.session {
+            Some(session) => format!("Started {task_id} → {session}"),
+            None => format!("Queued {task_id} — starts when a slot frees"),
+        },
+        _ => format!("Queued {task_id} — starts when a slot frees"),
+    }
+}
+
+fn task_started_after_queue_run(ops: &Operations, task_id: &str) -> bool {
+    ops.get_task(task_id)
+        .ok()
+        .flatten()
+        .is_some_and(|task| task.run_phase != Some(RunPhase::Queued) && task.session.is_some())
+}
+
+impl Drop for App {
+    /// Let in-flight launches finish so quitting never abandons a
+    /// half-created worktree or an unrecorded tmux session.
+    fn drop(&mut self) {
+        for job in self.launches.drain(..) {
+            let _ = job.handle.join();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -634,6 +726,7 @@ impl App {
             Some(warning) => warning.clone(),
             None => DEFAULT_STATUS.to_string(),
         };
+        let (launch_tx, launch_rx) = mpsc::channel();
         Ok(Self {
             ops,
             screen: Screen::Board,
@@ -682,7 +775,7 @@ impl App {
             last_wait_resume: None,
             last_queue_dispatch: None,
             last_store_pump: None,
-            store_pump_warnings: HashSet::new(),
+            store_pump_warnings: Arc::new(Mutex::new(HashSet::new())),
             catalog_ready,
             project: None,
             projects: Vec::new(),
@@ -694,6 +787,10 @@ impl App {
             pending_switch: None,
             has_board: true,
             help_return: Screen::Board,
+            launches: Vec::new(),
+            launch_tx,
+            launch_rx,
+            launch_wake: None,
         })
     }
 
@@ -729,6 +826,7 @@ impl App {
     ) -> Result<Self> {
         let projects = projects::load_rows(&store)?;
         let dummy = store.root().join(".no-board");
+        let (launch_tx, launch_rx) = mpsc::channel();
         let mut app = Self {
             ops: Operations::new(&dummy),
             screen: Screen::Projects,
@@ -777,7 +875,7 @@ impl App {
             last_wait_resume: None,
             last_queue_dispatch: None,
             last_store_pump: None,
-            store_pump_warnings: HashSet::new(),
+            store_pump_warnings: Arc::new(Mutex::new(HashSet::new())),
             catalog_ready: HashSet::new(),
             project: None,
             projects,
@@ -789,6 +887,10 @@ impl App {
             pending_switch: None,
             has_board: false,
             help_return: Screen::Projects,
+            launches: Vec::new(),
+            launch_tx,
+            launch_rx,
+            launch_wake: None,
         };
         if let Some(store) = app.store.as_ref()
             && let Ok(config) = store.load_global_config()
@@ -2284,6 +2386,7 @@ impl App {
     }
 
     pub fn tick(&mut self) -> Result<()> {
+        self.poll_launches();
         self.reload_if_changed()?;
         self.refresh_modal_after_catalog_warm();
         let now = Instant::now();
@@ -2540,25 +2643,37 @@ impl App {
         {
             return;
         }
+        if self.pump_in_flight() {
+            return;
+        }
         self.last_store_pump = Some(Instant::now());
-        let Some(store) = self.store.as_ref() else {
+        let Some(store) = self.store.clone() else {
             return;
         };
-        match daemon::tick(store, None, &mut self.store_pump_warnings) {
-            Ok(lines) if !lines.is_empty() => {
-                self.request_full_redraw();
-                self.status = match lines.as_slice() {
-                    [line] => format!("Background: {line}"),
-                    _ => format!(
-                        "Background: {} events; {}",
-                        lines.len(),
-                        lines.last().expect("non-empty")
-                    ),
-                };
+        let warnings = Arc::clone(&self.store_pump_warnings);
+        self.spawn_launch(None, move |_| {
+            let mut warned = warnings.lock().unwrap_or_else(|poison| poison.into_inner());
+            match daemon::tick(&store, None, &mut warned) {
+                Ok(lines) if !lines.is_empty() => LaunchReport {
+                    status: Some(match lines.as_slice() {
+                        [line] => format!("Background: {line}"),
+                        _ => format!(
+                            "Background: {} events; {}",
+                            lines.len(),
+                            lines.last().expect("non-empty")
+                        ),
+                    }),
+                    refresh: true,
+                    redraw: true,
+                    ..LaunchReport::default()
+                },
+                Ok(_) => LaunchReport::default(),
+                Err(err) => LaunchReport {
+                    status: Some(format!("Background orchestration failed: {err}")),
+                    ..LaunchReport::default()
+                },
             }
-            Ok(_) => {}
-            Err(err) => self.status = format!("Background orchestration failed: {err}"),
-        }
+        });
     }
 
     /// End agents' declared waits whose deadline expired: the task parks in
@@ -2574,10 +2689,13 @@ impl App {
         {
             return;
         }
+        if self.pump_in_flight() {
+            return;
+        }
         self.last_wait_resume = Some(Instant::now());
-        match self.ops.wake_expired_waits() {
+        // A direct relaunch (queue off) prepares a worktree and spawns tmux.
+        self.spawn_launch(None, |ops| match ops.wake_expired_waits() {
             Ok(woken) if !woken.is_empty() => {
-                self.request_full_redraw();
                 let tasks = woken
                     .iter()
                     .map(|wake| match wake {
@@ -2586,11 +2704,19 @@ impl App {
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
-                self.status = format!("Wait deadline passed — woken: {tasks}");
+                LaunchReport {
+                    status: Some(format!("Wait deadline passed — woken: {tasks}")),
+                    refresh: true,
+                    redraw: true,
+                    ..LaunchReport::default()
+                }
             }
-            Ok(_) => {}
-            Err(err) => self.status = format!("Wait resume failed: {err}"),
-        }
+            Ok(_) => LaunchReport::default(),
+            Err(err) => LaunchReport {
+                status: Some(format!("Wait resume failed: {err}")),
+                ..LaunchReport::default()
+            },
+        });
     }
 
     /// Start queued tasks while slots are free. Throttled like wait-resume:
@@ -2609,25 +2735,113 @@ impl App {
         {
             return;
         }
+        if self.pump_in_flight() {
+            return;
+        }
         self.last_queue_dispatch = Some(Instant::now());
-        // The graph's pull step first, so a node whose dependencies just
-        // finished is queued in time for this same dispatch pass.
-        if let Err(err) = self.ops.dispatch_ready_dependents() {
-            self.status = format!("Dependency sweep failed: {err}");
-        }
-        match self.ops.dispatch_queue() {
-            Ok(started) if !started.is_empty() => {
-                self.request_full_redraw();
-                let tasks = started
-                    .iter()
-                    .map(|item| item.task_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                self.status = format!("Queue dispatched: {tasks}");
+        self.spawn_launch(None, |ops| {
+            let pump = pump_queue(ops);
+            let started = !pump.started.is_empty();
+            LaunchReport {
+                status: pump.status(),
+                refresh: started,
+                redraw: started,
+                ..LaunchReport::default()
             }
-            Ok(_) => {}
-            Err(err) => self.status = format!("Queue dispatch failed: {err}"),
+        });
+    }
+
+    /// Let launches run on worker threads; `wake` tells the event loop a
+    /// finished job's report is waiting (see [`Self::poll_launches`]).
+    pub fn enable_background_launches(&mut self, wake: Sender<AppEvent>) {
+        self.launch_wake = Some(wake);
+    }
+
+    /// Run `job` on a worker thread with its own [`Operations`] for this
+    /// board, or inline when background launches are off or the launcher
+    /// cannot leave this thread. Its report lands via [`Self::poll_launches`].
+    fn spawn_launch<F>(&mut self, task_id: Option<String>, job: F)
+    where
+        F: FnOnce(&Operations) -> LaunchReport + Send + 'static,
+    {
+        let background = self
+            .launch_wake
+            .clone()
+            .and_then(|wake| Some((wake, self.ops.detach()?)));
+        let Some((wake, seed)) = background else {
+            let report = job(&self.ops);
+            self.apply_launch_report(report);
+            return;
+        };
+        let tx = self.launch_tx.clone();
+        let handle = thread::spawn(move || {
+            let _ = tx.send(job(&seed.build()));
+            let _ = wake.send(AppEvent::LaunchDone);
+        });
+        self.launches.push(LaunchJob { task_id, handle });
+    }
+
+    /// Reap finished workers, then apply every report they sent. Reaping
+    /// first is what makes this complete: a joined worker has already sent.
+    pub fn poll_launches(&mut self) {
+        let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.launches)
+            .into_iter()
+            .partition(|job| job.handle.is_finished());
+        self.launches = running;
+        for job in done {
+            if job.handle.join().is_err() {
+                let target = job.task_id.as_deref().unwrap_or("queue pump");
+                self.status = format!("Launch worker for {target} crashed");
+            }
         }
+        while let Ok(report) = self.launch_rx.try_recv() {
+            self.apply_launch_report(report);
+        }
+    }
+
+    fn apply_launch_report(&mut self, report: LaunchReport) {
+        if report.redraw {
+            self.request_full_redraw();
+        }
+        if report.refresh
+            && let Err(err) = self.refresh_after_action()
+        {
+            self.status = err.to_string();
+            return;
+        }
+        if let Some(task_id) = report.close_detail_for
+            && self.screen == Screen::Detail
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.task_id == task_id)
+            && let Err(err) = self.close_detail()
+        {
+            self.status = err.to_string();
+            return;
+        }
+        if let Some(task_id) = report.focus {
+            let _ = self.focus_task(&task_id);
+        }
+        if let Some(status) = report.status {
+            self.status = status;
+        }
+    }
+
+    fn pump_in_flight(&self) -> bool {
+        self.launches.iter().any(|job| job.task_id.is_none())
+    }
+
+    /// Refuse a second launch of a task whose first is still on a worker.
+    fn launch_busy(&mut self, task_id: &str) -> bool {
+        let busy = self
+            .launches
+            .iter()
+            .any(|job| job.task_id.as_deref() == Some(task_id));
+        if busy {
+            self.status = format!("{task_id} is still starting…");
+        }
+        busy
     }
 
     fn focus_prev_column(&mut self) {
@@ -3996,19 +4210,34 @@ impl App {
         if !self.ops.queue_can_dispatch()? {
             return self.run_current_task_now_with_suffix(" (queue is off — started directly)");
         }
+        if self.launch_busy(&task_id) {
+            return Ok(());
+        }
         let should_close_detail = self.screen == Screen::Detail;
         self.request_full_redraw();
         if let Err(err) = self.ops.queue_run(&task_id) {
             self.status = err.to_string();
             return Ok(());
         }
-        self.last_queue_dispatch = None;
-        self.dispatch_queue_throttled();
         self.refresh_after_action()?;
-        self.status = self.post_queue_run_status(&task_id);
-        if self.task_started_after_queue_run(&task_id) && should_close_detail {
-            self.close_detail()?;
-        }
+        self.status = format!("Queued {task_id} — dispatching…");
+        // The pump below replaces the tick's next one.
+        self.last_queue_dispatch = Some(Instant::now());
+        self.spawn_launch(Some(task_id.clone()), move |ops| {
+            let pump = pump_queue(ops);
+            let started = task_started_after_queue_run(ops, &task_id);
+            let status = match pump.error {
+                Some(error) if !started => error,
+                _ => post_queue_run_status(ops, &task_id),
+            };
+            LaunchReport {
+                status: Some(status),
+                close_detail_for: (started && should_close_detail).then_some(task_id),
+                refresh: true,
+                redraw: true,
+                ..LaunchReport::default()
+            }
+        });
         Ok(())
     }
 
@@ -4023,51 +4252,28 @@ impl App {
             self.status = "No task selected".to_string();
             return Ok(());
         };
+        if self.launch_busy(&task_id) {
+            return Ok(());
+        }
         let should_close_detail = self.screen == Screen::Detail;
         self.request_full_redraw();
-        let started = match self.ops.start_task(&task_id) {
-            Ok(Some(session_id)) => {
-                self.status = format!("Started {task_id} → {session_id}{suffix}");
-                true
+        self.status = format!("Starting {task_id}…");
+        let suffix = suffix.to_string();
+        self.spawn_launch(Some(task_id.clone()), move |ops| {
+            let (status, started) = match ops.start_task(&task_id) {
+                Ok(Some(session_id)) => (format!("Started {task_id} → {session_id}{suffix}"), true),
+                Ok(None) => (format!("Task {task_id} not found"), false),
+                Err(err) => (err.to_string(), false),
+            };
+            LaunchReport {
+                status: Some(status),
+                close_detail_for: (started && should_close_detail).then_some(task_id),
+                refresh: true,
+                redraw: true,
+                ..LaunchReport::default()
             }
-            Ok(None) => {
-                self.status = format!("Task {task_id} not found");
-                false
-            }
-            Err(err) => {
-                self.status = err.to_string();
-                false
-            }
-        };
-        self.refresh_after_action()?;
-        if started && should_close_detail {
-            self.close_detail()?;
-        }
+        });
         Ok(())
-    }
-
-    /// Status line after a queued run + immediate pump: report what actually
-    /// happened to the pressed task — an older queued task may have taken the
-    /// freed slot first, so "Started" is never unconditional.
-    fn post_queue_run_status(&self, task_id: &str) -> String {
-        match self.ops.get_task(task_id) {
-            Ok(Some(task)) if task.run_phase == Some(RunPhase::Queued) => {
-                format!("Queued {task_id} — starts when a slot frees")
-            }
-            Ok(Some(task)) => match task.session {
-                Some(session) => format!("Started {task_id} → {session}"),
-                None => format!("Queued {task_id} — starts when a slot frees"),
-            },
-            _ => format!("Queued {task_id} — starts when a slot frees"),
-        }
-    }
-
-    fn task_started_after_queue_run(&self, task_id: &str) -> bool {
-        self.ops
-            .get_task(task_id)
-            .ok()
-            .flatten()
-            .is_some_and(|task| task.run_phase != Some(RunPhase::Queued) && task.session.is_some())
     }
 
     /// Enqueue (`true`) or dequeue (`false`) the current task. The detail
@@ -4234,8 +4440,10 @@ impl App {
             self.status = "No task selected".to_string();
             return Ok(());
         };
+        if self.launch_busy(&task.id) {
+            return Ok(());
+        }
         let from_review = task.status == TaskStatus::Review;
-        self.request_full_redraw();
         // Same hard fallback as `r`: never park a re-run in a queue nothing
         // can drain (queue or auto-launch switched off) — start it directly.
         let mode = if self.ops.queue_can_dispatch()? {
@@ -4243,48 +4451,62 @@ impl App {
         } else {
             RunMode::Immediate
         };
-        let reran = match task.status {
-            TaskStatus::Review => {
-                self.save_visible_review_edits_before_rerun(&task)?;
-                self.ops.rerun_review_task(&task.id, None, mode)?.is_some()
-            }
-            TaskStatus::InProgress => self
-                .ops
-                .rerun_in_progress_task(&task.id, None, mode)?
-                .is_some(),
+        match task.status {
+            TaskStatus::Review => self.save_visible_review_edits_before_rerun(&task)?,
+            TaskStatus::InProgress => {}
             _ => {
                 self.status = format!("{} can be re-run only from Review or In Progress", task.id);
                 return Ok(());
             }
-        };
-        // Same pump as `r`: with free caps the re-run starts on the spot;
-        // otherwise the task waits in the queue with the edits folded in.
-        if reran && mode == RunMode::Queued {
-            self.last_queue_dispatch = None;
-            self.dispatch_queue_throttled();
         }
-        self.refresh_after_action()?;
-        if reran && from_review {
+        self.request_full_redraw();
+        if mode == RunMode::Queued {
+            self.last_queue_dispatch = Some(Instant::now());
+        }
+        self.status = format!("Re-running {}…", task.id);
+        let task_id = task.id;
+        self.spawn_launch(Some(task_id.clone()), move |ops| {
+            let rerun = if from_review {
+                ops.rerun_review_task(&task_id, None, mode)
+            } else {
+                ops.rerun_in_progress_task(&task_id, None, mode)
+            };
+            let reran = match rerun {
+                Ok(task) => task.is_some(),
+                Err(err) => {
+                    return LaunchReport {
+                        status: Some(err.to_string()),
+                        refresh: true,
+                        redraw: true,
+                        ..LaunchReport::default()
+                    };
+                }
+            };
+            // Same pump as `r`: with free caps the re-run starts on the spot;
+            // otherwise the task waits in the queue with the edits folded in.
+            if reran && mode == RunMode::Queued {
+                pump_queue(ops);
+            }
+            let status = if !reran {
+                format!("Re-run of {task_id} was not started")
+            } else if mode == RunMode::Immediate {
+                format!("Re-ran {task_id}")
+            } else if task_started_after_queue_run(ops, &task_id) {
+                post_queue_run_status(ops, &task_id)
+            } else {
+                format!("Queued {task_id} for re-run")
+            };
             // Leave the Review column/detail and show the task where it now
             // lives — In Progress — so the rework send is visible immediately.
-            if self.screen == Screen::Detail {
-                self.close_detail()?;
+            let moved = (reran && from_review).then(|| task_id.clone());
+            LaunchReport {
+                status: Some(status),
+                close_detail_for: moved.clone(),
+                focus: moved,
+                refresh: true,
+                redraw: true,
             }
-            let _ = self.focus_task(&task.id);
-        }
-        self.status = if reran {
-            if mode == RunMode::Queued {
-                if self.task_started_after_queue_run(&task.id) {
-                    self.post_queue_run_status(&task.id)
-                } else {
-                    format!("Queued {} for re-run", task.id)
-                }
-            } else {
-                format!("Re-ran {}", task.id)
-            }
-        } else {
-            format!("Re-run of {} was not started", task.id)
-        };
+        });
         Ok(())
     }
 

@@ -4304,6 +4304,101 @@ fn run_hotkey_queues_and_pumps_the_queue() {
     assert_ne!(revoked.session.as_deref(), Some(session_id.as_str()));
 }
 
+/// A launcher that may leave the UI thread and blocks every launch until the
+/// test opens the gate — a stand-in for a slow worktree snapshot + spawn.
+#[derive(Clone, Default)]
+struct GatedLauncher {
+    gate: std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    spy: QueueLaunchSpy,
+}
+
+impl GatedLauncher {
+    fn open(&self) {
+        let (open, cvar) = &*self.gate;
+        *open.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+}
+
+/// Opens the gate on drop, so a failed assertion never leaves `App::drop`
+/// joining a worker that waits forever.
+struct OpenOnDrop(GatedLauncher);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+impl crate::core::operations::AgentLauncher for GatedLauncher {
+    fn launch(
+        &self,
+        roots: crate::core::project::Roots<'_>,
+        task: &crate::core::models::Task,
+        session_id: &str,
+        revert: bool,
+    ) -> crate::core::error::Result<bool> {
+        let (open, cvar) = &*self.gate;
+        let _open = cvar
+            .wait_while(open.lock().unwrap(), |open| !*open)
+            .unwrap();
+        self.spy.launch(roots, task, session_id, revert)
+    }
+
+    fn detach(&self) -> Option<Box<dyn crate::core::operations::AgentLauncher + Send>> {
+        Some(Box::new(self.clone()))
+    }
+}
+
+#[test]
+fn run_hotkey_launches_on_a_worker_without_blocking_the_ui() {
+    let (_dir, mut app, _) = queue_run_app();
+    let launcher = GatedLauncher::default();
+    app.ops = Operations::with_launcher(app.ops.data_root(), Box::new(launcher.clone()));
+    let _release = OpenOnDrop(launcher.clone());
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    app.enable_background_launches(wake_tx);
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Slow start"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+
+    // The key returns while the launch is still parked on the gate.
+    app.handle_key(key(KeyCode::Char('r'))).expect("run");
+    assert!(app.status.contains("dispatching"), "status: {}", app.status);
+    assert!(launcher.spy.calls().is_empty(), "launch is still gated");
+    let queued = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
+
+    // A second press of the same task is refused, not double-started.
+    app.focused_column = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == "in_progress")
+        .expect("in_progress column");
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Char('r'))).expect("run again");
+    assert!(
+        app.status.contains("still starting"),
+        "status: {}",
+        app.status
+    );
+
+    launcher.open();
+    wake_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("worker wakes the event loop");
+    app.poll_launches();
+    assert!(app.status.starts_with("Started"), "status: {}", app.status);
+    assert_eq!(launcher.spy.calls().len(), 1);
+    let started = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert!(started.session.is_some());
+    assert_ne!(started.run_phase, Some(RunPhase::Queued));
+}
+
 #[test]
 fn run_hotkey_leaves_task_queued_when_caps_are_full() {
     let (dir, mut app, spy) = queue_run_app();

@@ -226,6 +226,7 @@ impl From<&Project> for ProjectFile {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ProjectStore {
     root: PathBuf,
 }
