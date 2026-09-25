@@ -556,7 +556,7 @@ fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
             limits::ProviderState::Unavailable(reason) => Some(reason.clone()),
         };
         if let Some(note) = note {
-            println!("{provider:<8} {note}");
+            println!("{provider:<9} {note}");
             continue;
         }
         let age = entry
@@ -568,7 +568,7 @@ fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
         // say so rather than print the number it froze at.
         let windows = entry.live_windows(now);
         if windows.is_empty() {
-            println!("{provider:<8} stale{age}");
+            println!("{provider:<9} stale{age}");
             continue;
         }
         for (index, window) in windows.into_iter().enumerate() {
@@ -577,12 +577,18 @@ fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
                 .resets_in(now)
                 .map(|seconds| format!("resets in {}", limits::format_span(seconds)))
                 .unwrap_or_else(|| "reset unknown".to_string());
-            println!(
-                "{name:<8} {:<4}{:>4.0}% left  {reset}{}",
-                window.label,
-                window.remaining_percent,
-                if index == 0 { age.as_str() } else { "" }
-            );
+            let age = if index == 0 { age.as_str() } else { "" };
+            match window.spent_usd {
+                Some(usd) => println!(
+                    "{name:<9} {:<5}{:>6} spent{age}",
+                    window.label,
+                    limits::format_usd(usd)
+                ),
+                None => println!(
+                    "{name:<9} {:<5}{:>5.0}% left  {reset}{age}",
+                    window.label, window.remaining_percent
+                ),
+            }
         }
     }
     Ok(())

@@ -1554,6 +1554,7 @@ fn settings_tab_pages_render() {
         remaining_percent: remaining,
         resets_at: Some(now + 3_600),
         rolling: false,
+        spent_usd: None,
     };
     crate::core::limits::set_cached_snapshot_for_tests(crate::core::limits::LimitsSnapshot {
         fetched_at: now,
@@ -1597,6 +1598,7 @@ fn settings_executor_tab_annotates_slots_with_live_quota() {
         remaining_percent: remaining,
         resets_at: Some(now + 3_600),
         rolling: false,
+        spent_usd: None,
     };
     crate::core::limits::set_cached_snapshot_for_tests(crate::core::limits::LimitsSnapshot {
         fetched_at: now,
@@ -8854,6 +8856,7 @@ fn limits_fixture() -> std::sync::Arc<crate::core::limits::LimitsSnapshot> {
         remaining_percent: remaining,
         resets_at: Some(now + resets_in),
         rolling: false,
+        spent_usd: None,
     };
     std::sync::Arc::new(LimitsSnapshot {
         fetched_at: now,
@@ -8919,6 +8922,55 @@ fn limits_row_sits_above_the_status_bar_and_lists_every_provider() {
     );
 }
 
+/// gemini mixes a Code Assist quota window (a percentage) with the spend pi
+/// logged for its API key, which has no ceiling and so prints as dollars.
+#[test]
+fn limits_row_shows_gemini_quota_and_spend() {
+    use crate::core::limits::{LimitWindow, LimitsSnapshot, ProviderLimits, ProviderState};
+
+    let (_dir, mut app) = populated_app();
+    let now = chrono::Utc::now().timestamp();
+    let spend = |label: &str, usd: f64| LimitWindow {
+        label: label.to_string(),
+        remaining_percent: 100.0,
+        resets_at: None,
+        rolling: false,
+        spent_usd: Some(usd),
+    };
+    app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
+        fetched_at: now,
+        providers: vec![ProviderLimits {
+            provider: "gemini".to_string(),
+            state: ProviderState::Ready,
+            windows: vec![
+                LimitWindow {
+                    label: "pro".to_string(),
+                    remaining_percent: 12.0,
+                    resets_at: Some(now + 2 * 3600 + 1830),
+                    rolling: false,
+                    spent_usd: None,
+                },
+                spend("24h", 0.0031),
+                spend("30d", 4.5),
+            ],
+            observed_at: None,
+        }],
+    }));
+
+    let lines = rendered_lines(&mut app, 120, 28);
+    let row = &lines[lines.len() - 2];
+    assert!(
+        row.contains("✧ gemini pro 12% ↻2h30m · 24h <$0.01 · 30d $4.50"),
+        "{row}"
+    );
+    let narrow = rendered_lines(&mut app, 30, 20);
+    let narrow_row = &narrow[narrow.len() - 2];
+    assert!(
+        narrow_row.contains("✧ 12% · <$0.01 · $4.50"),
+        "{narrow_row}"
+    );
+}
+
 #[test]
 fn limits_row_drops_reset_times_then_names_as_the_terminal_narrows() {
     let (_dir, mut app) = populated_app();
@@ -8959,6 +9011,7 @@ fn limits_row_drops_windows_that_have_already_reset() {
         remaining_percent: remaining,
         resets_at: Some(resets_at),
         rolling: false,
+        spent_usd: None,
     };
     app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
         fetched_at: now,
@@ -9042,6 +9095,7 @@ fn limits_row_registers_refresh_hitboxes_on_every_provider() {
         remaining_percent: remaining,
         resets_at: Some(now + 86_400),
         rolling: false,
+        spent_usd: None,
     };
     app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
         fetched_at: now,
