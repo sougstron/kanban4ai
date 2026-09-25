@@ -99,10 +99,28 @@ Sources, all read-only and best effort:
   at `nextRegenAt`). Both quotas regenerate in small ticks rather than resetting
   on a timer, so the reset time is the next capacity gain. The key never
   expires, so the segment needs no CLI-driven click refresh.
+- **gemini**: two sources, both shown. When gemini-cli is signed in
+  (`~/.gemini/oauth_creds.json`, the login Google AI Plus/Pro/Ultra use),
+  `POST cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` names the
+  companion project and `:retrieveUserQuota` returns per-model buckets
+  (`remainingFraction`, `resetTime`); the row keeps the tightest bucket per
+  family as `pro` / `flash` / `lite`. An expired access token is refreshed
+  with gemini-cli's public OAuth client and cached in memory only —
+  `oauth_creds.json` is never rewritten. pi, by contrast, drives Gemini with a
+  plain API key (`~/.pi/agent/auth.json` → `google`, `$PI_CODING_AGENT_DIR`
+  respected), and the Gemini API exposes no quota or rate-limit headers for
+  keys, so the row tallies what pi logged instead: `usage.cost.total` of
+  every `provider: "google"` assistant message in
+  `<agent>/sessions/*/*.jsonl` over the trailing `24h` and `30d`. These are
+  spend windows (`spent_usd`), printed as dollars; they read as 100% left, so
+  they never trip a pool floor. When the newest Gemini response was a 429
+  `RESOURCE_EXHAUSTED`, a `quota` window at 0% lasts until
+  `RetryInfo.retryDelay` passes (per-day quotas: the next 08:00 UTC, midnight
+  Pacific), which holds pi's `google/*` pool candidates back until then.
 HTTPS goes through `curl -K -`, with the request config (URL and headers) piped
 on stdin: no TLS dependency is linked into the crate, and bearer tokens never
 appear in a command line where `ps` would expose them. `curl` is an optional
-dependency — without it claude, grok, zai, and synthetic degrade to `n/a`.
+dependency — without it claude, grok, zai, synthetic, and gemini's quota degrade to `n/a`.
 
 A provider with no credentials on the machine reports `not_configured` and is
 omitted from the row entirely; `401`/`403` becomes `signed out`. Fetches run on

@@ -12,7 +12,7 @@
 //!
 //! Every provider segment is clickable: a click refreshes that provider on
 //! the spot (claude force-polls the usage endpoint; grok renews its token via
-//! the grok CLI; zai and synthetic re-fetch over HTTPS — see
+//! the grok CLI; zai, synthetic, and gemini re-fetch — see
 //! [`crate::core::limits::refresh_provider_async`]).
 
 use ratatui::Frame;
@@ -51,6 +51,7 @@ fn provider_color(app: &App, provider: &str) -> Color {
         "codex" => Color::Rgb(90, 190, 160),
         "zai" => Color::Rgb(112, 145, 219),
         "synthetic" => Color::Rgb(178, 142, 212),
+        "gemini" => Color::Rgb(96, 156, 250),
         _ => app.theme.fg,
     }
 }
@@ -62,6 +63,7 @@ pub fn provider_icon(provider: &str) -> &'static str {
         "grok" => "✕",
         "zai" => "◆",
         "synthetic" => "✦",
+        "gemini" => "✧",
         _ => "•",
     }
 }
@@ -225,10 +227,14 @@ fn provider_spans(
                 Style::default().fg(app.theme.muted),
             ));
         }
-        spans.push(Span::styled(
-            format!("{:.0}%", window.remaining_percent),
-            Style::default().fg(percent_color(app, window.remaining_percent)),
-        ));
+        // A spend tally (gemini's API key) has no ceiling: show the amount.
+        spans.push(match window.spent_usd {
+            Some(usd) => Span::styled(limits::format_usd(usd), Style::default().fg(app.theme.fg)),
+            None => Span::styled(
+                format!("{:.0}%", window.remaining_percent),
+                Style::default().fg(percent_color(app, window.remaining_percent)),
+            ),
+        });
         if detail == Detail::Full
             && let Some(seconds) = window.resets_in(now)
         {

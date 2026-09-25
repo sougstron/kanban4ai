@@ -4532,6 +4532,7 @@ fn window_of(label: &str, remaining: f64, resets_at: i64) -> LimitWindow {
         remaining_percent: remaining,
         resets_at: Some(resets_at),
         rolling: false,
+        spent_usd: None,
     }
 }
 

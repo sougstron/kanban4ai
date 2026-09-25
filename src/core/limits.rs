@@ -1,7 +1,7 @@
 //! Subscription usage limits for the AI providers kanban launches.
 //!
 //! Each provider reports how much of a rate-limit window is already spent; the
-//! board shows what is left. Three sources, all read-only and best effort — a
+//! board shows what is left. Every source is read-only and best effort — a
 //! provider that is not installed, not signed in, or unreachable degrades to a
 //! note instead of an error:
 //!
@@ -54,6 +54,11 @@
 //!   `subscription.renewsAt`) and the weekly credit window
 //!   (`weeklyTokenLimit.percentRemaining`); both regenerate in small ticks, so
 //!   the reset time is the next capacity gain, not a hard rollover.
+//! - **gemini**: the Code Assist quota (`retrieveUserQuota`) when gemini-cli
+//!   is signed in, plus the spend pi logged for its Gemini API key — the
+//!   Gemini API has no quota endpoint for keys — as `24h` / `30d` spend
+//!   windows, and a 0% `quota` window while the newest Gemini response is a
+//!   429 `RESOURCE_EXHAUSTED`.
 //!
 //! HTTPS is done by piping a config file into `curl -K -` rather than by
 //! linking a TLS stack: it keeps the dependency set unchanged, and it keeps
@@ -105,7 +110,7 @@ use crate::core::storage::atomic_write_text;
 /// Providers rendered on the board and listed by `kanban limits`, in display
 /// order. `codex` is the OpenAI subscription: it covers the codex CLI and
 /// opencode's `openai/*` models alike, since both spend the same quota.
-pub const PROVIDERS: [&str; 5] = ["claude", "codex", "grok", "zai", "synthetic"];
+pub const PROVIDERS: [&str; 6] = ["claude", "codex", "grok", "zai", "synthetic", "gemini"];
 
 /// Fallback refresh interval when no board config is available (the projects
 /// screen has no project, so no `.kanban/config.yaml` to read).
@@ -135,6 +140,8 @@ pub fn provider_for(backend: &str, model: Option<&str>) -> Option<&'static str> 
                 Some("synthetic")
             } else if model.starts_with("xai") || model.starts_with("grok") {
                 Some("grok")
+            } else if model.starts_with("google") || model.starts_with("gemini") {
+                Some("gemini")
             } else {
                 None
             }
@@ -202,6 +209,12 @@ pub struct LimitWindow {
     /// ends at its reset time.
     #[serde(default)]
     pub rolling: bool,
+    /// A spend tally rather than a quota: dollars spent over the window
+    /// (gemini's local pi usage, where the API key has no server-side
+    /// quota to read). Such a window has no ceiling, so it reads as 100%
+    /// remaining and never trips a pool floor; renderers print the amount.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spent_usd: Option<f64>,
 }
 
 impl LimitWindow {
@@ -211,6 +224,16 @@ impl LimitWindow {
             remaining_percent: (100.0 - used_percent).clamp(0.0, 100.0),
             resets_at,
             rolling: false,
+            spent_usd: None,
+        }
+    }
+
+    /// A spend tally over the trailing `label` window (see
+    /// [`LimitWindow::spent_usd`]).
+    fn spend(label: impl Into<String>, usd: f64) -> Self {
+        Self {
+            spent_usd: Some(usd),
+            ..Self::new(label, 0.0, None)
         }
     }
 
@@ -1204,6 +1227,18 @@ pub fn window_label(minutes: i64) -> String {
     }
 }
 
+/// A spend amount for the limits row: cents while small, whole dollars once
+/// the cents stop mattering.
+pub fn format_usd(usd: f64) -> String {
+    if usd > 0.0 && usd < 0.005 {
+        "<$0.01".to_string()
+    } else if usd < 100.0 {
+        format!("${usd:.2}")
+    } else {
+        format!("${usd:.0}")
+    }
+}
+
 /// Compact time span for the board and the CLI: `<1m`, `48m`, `3h12m`,
 /// `6d4h`, `23d`.
 pub fn format_span(seconds: i64) -> String {
@@ -1598,6 +1633,366 @@ pub fn parse_synthetic_quotas(value: &Value) -> Vec<LimitWindow> {
 }
 
 // ---------------------------------------------------------------------------
+// gemini — Code Assist quota when gemini-cli is signed in, plus the spend pi
+// logs for its Gemini API key (which has no server-side quota to read).
+// ---------------------------------------------------------------------------
+
+const CODE_ASSIST_URL: &str = "https://cloudcode-pa.googleapis.com/v1internal";
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+
+/// gemini-cli's OAuth client. An installed-app client: Google documents its
+/// secret as non-confidential, and gemini-cli ships both in its source.
+const GEMINI_CLI_CLIENT_ID: &str =
+    "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com";
+const GEMINI_CLI_CLIENT_SECRET: &str = "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";
+
+/// Refresh the access token this long before `expiry_date`.
+const GEMINI_TOKEN_SKEW_SECS: i64 = 300;
+
+/// Trailing spend windows tallied from pi's session logs, in seconds.
+const GEMINI_SPEND_WINDOWS: [(&str, i64); 2] = [("24h", 86_400), ("30d", 30 * 86_400)];
+
+/// An access token refreshed in memory, so a background poll does not trade
+/// the refresh token on every tick. gemini-cli owns `oauth_creds.json` and is
+/// never written behind its back: Google refresh tokens do not rotate.
+static GEMINI_TOKEN: Mutex<Option<(String, i64)>> = Mutex::new(None);
+
+/// gemini-cli's OAuth login (Google AI Pro/Plus/Ultra and the free Code
+/// Assist tier all sign in through it).
+fn gemini_oauth_path() -> Option<PathBuf> {
+    Some(home_dir()?.join(".gemini").join("oauth_creds.json"))
+}
+
+/// pi's agent directory: `$PI_CODING_AGENT_DIR`, else `~/.pi/agent`.
+fn pi_agent_dir() -> Option<PathBuf> {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .or_else(|| home_dir().map(|home| home.join(".pi").join("agent")))
+}
+
+/// Whether pi has a Gemini API key stored (`auth.json` → `google`).
+fn pi_has_google_key(agent_dir: &Path) -> bool {
+    fs::read_to_string(agent_dir.join("auth.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .is_some_and(|value| value.get("google").is_some())
+}
+
+fn fetch_gemini() -> ProviderLimits {
+    let now = now_secs();
+    let oauth = gemini_oauth_path()
+        .filter(|path| path.exists())
+        .map(|path| fetch_gemini_quota(&path, now));
+    let local = pi_agent_dir().and_then(|dir| {
+        let usage = scan_pi_gemini_usage(&dir.join("sessions"), now);
+        (usage.seen || pi_has_google_key(&dir)).then_some(usage)
+    });
+    let mut windows = Vec::new();
+    let mut failure = None;
+    match oauth {
+        Some(Ok(quota)) => windows.extend(quota),
+        Some(Err(err)) => failure = Some(err.into_state()),
+        None => {}
+    }
+    if let Some(usage) = local {
+        windows.extend(usage.into_windows(now));
+    }
+    match (windows.is_empty(), failure) {
+        (false, _) => ProviderLimits {
+            windows,
+            ..ProviderLimits::new("gemini", ProviderState::Ready)
+        },
+        (true, Some(state)) => ProviderLimits::new("gemini", state),
+        (true, None) => ProviderLimits::new("gemini", ProviderState::NotConfigured),
+    }
+}
+
+/// Code Assist quota for the gemini-cli login: `loadCodeAssist` names the
+/// user's companion project, `retrieveUserQuota` reports its buckets.
+fn fetch_gemini_quota(path: &Path, now: i64) -> std::result::Result<Vec<LimitWindow>, HttpError> {
+    let token = gemini_access_token(path, now)?;
+    let headers = [
+        ("Authorization", format!("Bearer {token}")),
+        ("Content-Type", "application/json".to_string()),
+        ("Accept", "application/json".to_string()),
+    ];
+    let metadata = json!({
+        "metadata": {
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        }
+    });
+    let loaded = http_request_json(
+        &format!("{CODE_ASSIST_URL}:loadCodeAssist"),
+        &headers,
+        Some(&metadata.to_string()),
+    )?;
+    let project = loaded.get("cloudaicompanionProject").and_then(|project| {
+        project
+            .as_str()
+            .or_else(|| project.get("id").and_then(Value::as_str))
+    });
+    let body = match project {
+        Some(project) => json!({ "project": project }),
+        None => json!({}),
+    };
+    let quota = http_request_json(
+        &format!("{CODE_ASSIST_URL}:retrieveUserQuota"),
+        &headers,
+        Some(&body.to_string()),
+    )?;
+    Ok(parse_gemini_quota(&quota))
+}
+
+/// A live access token: the stored one while it is valid, else one traded
+/// for the refresh token (and remembered until it expires).
+fn gemini_access_token(path: &Path, now: i64) -> std::result::Result<String, HttpError> {
+    if let Some((token, expires_at)) = GEMINI_TOKEN.lock().ok().and_then(|slot| slot.clone())
+        && expires_at - GEMINI_TOKEN_SKEW_SECS > now
+    {
+        return Ok(token);
+    }
+    let value: Value = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .ok_or(HttpError::Status(401))?;
+    let stored = value.get("access_token").and_then(Value::as_str);
+    let expires_at = value
+        .get("expiry_date")
+        .and_then(Value::as_i64)
+        .map(|millis| millis / 1000)
+        .unwrap_or(0);
+    if let Some(token) = stored.filter(|_| expires_at - GEMINI_TOKEN_SKEW_SECS > now) {
+        return Ok(token.to_string());
+    }
+    let refresh = value
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .ok_or(HttpError::Status(401))?;
+    let form = format!(
+        "grant_type=refresh_token&client_id={}&client_secret={}&refresh_token={}",
+        form_encode(GEMINI_CLI_CLIENT_ID),
+        form_encode(GEMINI_CLI_CLIENT_SECRET),
+        form_encode(refresh)
+    );
+    let headers = [
+        (
+            "Content-Type",
+            "application/x-www-form-urlencoded".to_string(),
+        ),
+        ("Accept", "application/json".to_string()),
+    ];
+    let response = http_request_json(GOOGLE_TOKEN_URL, &headers, Some(&form)).map_err(|err| {
+        // A revoked refresh token answers 400 invalid_grant: signed out.
+        match err {
+            HttpError::Status(400) => HttpError::Status(401),
+            other => other,
+        }
+    })?;
+    let token = response
+        .get("access_token")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HttpError::Transport("no access token".to_string()))?
+        .to_string();
+    let lifetime = response
+        .get("expires_in")
+        .and_then(Value::as_i64)
+        .unwrap_or(3_600);
+    if let Ok(mut slot) = GEMINI_TOKEN.lock() {
+        *slot = Some((token.clone(), now + lifetime));
+    }
+    Ok(token)
+}
+
+/// `application/x-www-form-urlencoded` for one value.
+fn form_encode(text: &str) -> String {
+    text.bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+/// Read the `retrieveUserQuota` response: one window per model family
+/// (`pro`, `flash`, `lite`), holding the tightest bucket of that family —
+/// the family runs dry when its most-spent model does. Buckets carry
+/// `remainingFraction` (0–1) and an RFC 3339 `resetTime`.
+pub fn parse_gemini_quota(value: &Value) -> Vec<LimitWindow> {
+    let mut windows: Vec<LimitWindow> = Vec::new();
+    for bucket in value
+        .get("buckets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(remaining) = bucket.get("remainingFraction").and_then(Value::as_f64) else {
+            continue;
+        };
+        let model = bucket
+            .get("modelId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let label = if model.contains("lite") {
+            "lite"
+        } else if model.contains("flash") {
+            "flash"
+        } else if model.contains("pro") {
+            "pro"
+        } else {
+            continue;
+        };
+        let resets_at = bucket
+            .get("resetTime")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339);
+        let window = LimitWindow::new(label, (1.0 - remaining) * 100.0, resets_at);
+        match windows.iter_mut().find(|known| known.label == label) {
+            Some(known) if known.remaining_percent <= window.remaining_percent => {}
+            Some(known) => *known = window,
+            None => windows.push(window),
+        }
+    }
+    let rank = |label: &str| ["pro", "flash", "lite"].iter().position(|l| *l == label);
+    windows.sort_by_key(|window| rank(&window.label));
+    windows
+}
+
+/// What pi's session logs say about its Gemini API key.
+#[derive(Debug, Default, PartialEq)]
+pub struct GeminiLocalUsage {
+    /// Any Gemini request at all was found.
+    pub seen: bool,
+    /// Dollars spent per [`GEMINI_SPEND_WINDOWS`] entry.
+    pub spent: [f64; 2],
+    /// Newest Gemini response: when, and until when it said the quota is
+    /// exhausted (a 429 `RESOURCE_EXHAUSTED`), if it did.
+    pub last: Option<(i64, Option<i64>)>,
+}
+
+impl GeminiLocalUsage {
+    /// Fold one session-log line in. Only assistant messages from pi's
+    /// `google` provider count; everything else is skipped cheaply.
+    pub fn record_line(&mut self, line: &str, now: i64) {
+        if !line.contains("\"provider\":\"google\"") {
+            return;
+        }
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        let Some(message) = entry.get("message") else {
+            return;
+        };
+        if message.get("role").and_then(Value::as_str) != Some("assistant")
+            || message.get("provider").and_then(Value::as_str) != Some("google")
+        {
+            return;
+        }
+        let Some(at) = message
+            .get("timestamp")
+            .and_then(Value::as_i64)
+            .map(|millis| millis / 1000)
+        else {
+            return;
+        };
+        self.seen = true;
+        let cost = message
+            .pointer("/usage/cost/total")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        for (index, (_, span)) in GEMINI_SPEND_WINDOWS.iter().enumerate() {
+            if now - at < *span {
+                self.spent[index] += cost;
+            }
+        }
+        if self.last.is_none_or(|(newest, _)| at >= newest) {
+            let exhausted = message
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .and_then(|error| gemini_exhausted_until(error, at));
+            self.last = Some((at, exhausted));
+        }
+    }
+
+    fn into_windows(self, now: i64) -> Vec<LimitWindow> {
+        let mut windows = Vec::new();
+        if let Some((_, Some(until))) = self.last
+            && until > now
+        {
+            windows.push(LimitWindow::new("quota", 100.0, Some(until)));
+        }
+        windows.extend(
+            GEMINI_SPEND_WINDOWS
+                .iter()
+                .zip(self.spent)
+                .map(|((label, _), usd)| LimitWindow::spend(*label, usd)),
+        );
+        windows
+    }
+}
+
+/// Tally the Gemini requests in pi's session logs
+/// (`<sessions>/<cwd>/<stamp>.jsonl`) touched within the longest spend window.
+fn scan_pi_gemini_usage(sessions_dir: &Path, now: i64) -> GeminiLocalUsage {
+    let mut usage = GeminiLocalUsage::default();
+    let horizon = now - GEMINI_SPEND_WINDOWS[1].1;
+    for dir in sorted_dirs(sessions_dir) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if path.extension().is_none_or(|ext| ext != "jsonl")
+                || file_modified_secs(&path).is_none_or(|at| at < horizon)
+            {
+                continue;
+            }
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+            for line in BufReader::new(file).lines().map_while(|line| line.ok()) {
+                usage.record_line(&line, now);
+            }
+        }
+    }
+    usage
+}
+
+/// When a Gemini API error says the key's quota is spent (HTTP 429,
+/// `RESOURCE_EXHAUSTED`), the time it frees up: `RetryInfo.retryDelay` after
+/// the failure, or — for a per-day quota — the next midnight Pacific, when
+/// Google resets daily limits (08:00 UTC; an hour conservative under PDT).
+/// pi stores the error body as nested, escaped JSON, so this scans the text
+/// rather than parsing it.
+pub fn gemini_exhausted_until(error: &str, at: i64) -> Option<i64> {
+    if !error.contains("RESOURCE_EXHAUSTED") {
+        return None;
+    }
+    let retry = error.find("retryDelay").and_then(|start| {
+        let rest = &error[start + "retryDelay".len()..];
+        let digits_at = rest
+            .find(|c: char| c.is_ascii_digit())
+            .filter(|at| *at < 8)?;
+        let digits: String = rest[digits_at..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        digits
+            .parse::<f64>()
+            .ok()
+            .map(|secs| at + secs.ceil() as i64)
+    });
+    let daily = error.contains("PerDay").then(|| {
+        let reset = at - at.rem_euclid(86_400) + 8 * 3_600;
+        if reset > at { reset } else { reset + 86_400 }
+    });
+    Some(retry.max(daily).unwrap_or(at + 60))
+}
+
+// ---------------------------------------------------------------------------
 // CLI-driven refresh (TUI limits-row click)
 // ---------------------------------------------------------------------------
 
@@ -1795,6 +2190,7 @@ pub fn refresh_provider_now(provider: &str) {
         "claude" => resolve_claude(cached().as_deref(), true),
         "zai" => fetch_zai(),
         "synthetic" => fetch_synthetic(),
+        "gemini" => fetch_gemini(),
         _ => return,
     };
     let mut providers = cached()
@@ -1864,6 +2260,7 @@ pub fn fetch_all(force: bool) -> LimitsSnapshot {
                 fetch_grok(),
                 fetch_zai(),
                 fetch_synthetic(),
+                fetch_gemini(),
             ],
             now,
         ),
@@ -3176,6 +3573,10 @@ mod tests {
             provider_for("opencode", Some("xai-oauth/grok-4.5")),
             Some("grok")
         );
+        assert_eq!(
+            provider_for("pi", Some("google/gemini-3.7-flash")),
+            Some("gemini")
+        );
         // Unknown model ids and unknown backends map to nothing.
         assert_eq!(provider_for("opencode", Some("yolo/bar")), None);
         assert_eq!(provider_for("opencode", Some("some/local")), None);
@@ -3189,6 +3590,7 @@ mod tests {
             remaining_percent: remaining,
             resets_at,
             rolling: false,
+            spent_usd: None,
         }
     }
 
@@ -3263,5 +3665,112 @@ mod tests {
             observed_at: None,
         };
         assert!(has_headroom(&limits, &thresholds, 1_500));
+    }
+
+    #[test]
+    fn gemini_quota_keeps_the_tightest_bucket_per_family() {
+        let value = json!({
+            "buckets": [
+                {"modelId": "gemini-2.5-pro", "remainingFraction": 0.8,
+                 "resetTime": "2026-09-26T00:00:00Z", "tokenType": "REQUESTS"},
+                {"modelId": "gemini-3-pro-preview", "remainingFraction": 0.25,
+                 "resetTime": "2026-09-26T01:00:00Z"},
+                {"modelId": "gemini-2.5-flash", "remainingFraction": 1.0},
+                {"modelId": "gemini-2.5-flash-lite", "remainingFraction": 0.5},
+                {"modelId": "text-embedding", "remainingFraction": 0.1},
+                {"modelId": "gemini-2.5-pro"}
+            ]
+        });
+        let windows = parse_gemini_quota(&value);
+        let labels: Vec<_> = windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["pro", "flash", "lite"]);
+        assert_eq!(windows[0].remaining_percent, 25.0);
+        assert_eq!(windows[0].resets_at, parse_rfc3339("2026-09-26T01:00:00Z"));
+        assert_eq!(windows[1].remaining_percent, 100.0);
+        assert_eq!(windows[1].resets_at, None);
+        assert!(parse_gemini_quota(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn gemini_exhaustion_reads_retry_delay_and_daily_quotas() {
+        // pi keeps the API error as escaped JSON inside JSON.
+        let per_minute = r#"{"error":{"message":"{\n  \"error\": {\n    \"code\": 429,\n    \"status\": \"RESOURCE_EXHAUSTED\",\n    \"details\": [{\"@type\": \"type.googleapis.com/google.rpc.QuotaFailure\", \"violations\": [{\"quotaId\": \"GenerateRequestsPerMinutePerProjectPerModel\"}]}, {\"@type\": \"type.googleapis.com/google.rpc.RetryInfo\", \"retryDelay\": \"37.5s\"}]\n  }\n}\n","code":429}}"#;
+        assert_eq!(gemini_exhausted_until(per_minute, 1_000), Some(1_038));
+        // 2026-09-25 10:00 UTC: the daily quota frees at 08:00 UTC next day.
+        let at = parse_rfc3339("2026-09-25T10:00:00Z").unwrap();
+        let per_day = r#"RESOURCE_EXHAUSTED quotaId: GenerateRequestsPerDayPerProjectPerModel retryDelay: 20s"#;
+        assert_eq!(
+            gemini_exhausted_until(per_day, at),
+            parse_rfc3339("2026-09-26T08:00:00Z")
+        );
+        assert_eq!(gemini_exhausted_until("RESOURCE_EXHAUSTED", 5), Some(65));
+        assert_eq!(gemini_exhausted_until("503 UNAVAILABLE", 5), None);
+    }
+
+    #[test]
+    fn gemini_local_usage_tallies_pi_spend_and_the_last_429() {
+        let now = 10 * 86_400;
+        let line = |at: i64, cost: f64, error: Option<&str>| {
+            let mut message = json!({
+                "role": "assistant", "provider": "google", "model": "gemini-3.7-flash",
+                "timestamp": at * 1000,
+                "usage": {"cost": {"total": cost}},
+            });
+            if let Some(error) = error {
+                message["errorMessage"] = json!(error);
+            }
+            serde_json::to_string(&json!({"type": "message", "message": message})).unwrap()
+        };
+        let mut usage = GeminiLocalUsage::default();
+        usage.record_line(&line(now - 3 * 86_400, 2.0, None), now);
+        usage.record_line(&line(now - 3600, 0.5, None), now);
+        usage.record_line(
+            &line(now - 30, 0.0, Some("RESOURCE_EXHAUSTED retryDelay 120s")),
+            now,
+        );
+        // Another provider's message and a user turn are ignored.
+        usage.record_line(
+            r#"{"type":"message","message":{"role":"assistant","provider":"openai","timestamp":1,"usage":{"cost":{"total":9}}}}"#,
+            now,
+        );
+        usage.record_line(
+            r#"{"message":{"role":"user","provider":"google","timestamp":1}}"#,
+            now,
+        );
+        assert!(usage.seen);
+        assert_eq!(usage.spent, [0.5, 2.5]);
+        let windows = usage.into_windows(now);
+        let quota = &windows[0];
+        assert_eq!(
+            (quota.label.as_str(), quota.remaining_percent),
+            ("quota", 0.0)
+        );
+        assert_eq!(quota.resets_at, Some(now + 90));
+        assert_eq!(windows[1].spent_usd, Some(0.5));
+        assert_eq!(windows[2].spent_usd, Some(2.5));
+        // Spend windows never trip a pool floor.
+        let spend_only = ProviderLimits {
+            windows: windows[1..].to_vec(),
+            ..ProviderLimits::new("gemini", ProviderState::Ready)
+        };
+        let thresholds = crate::core::config::PoolThresholds {
+            five_hour_percent: 20.0,
+            week_percent: 20.0,
+        };
+        assert!(has_headroom(&spend_only, &thresholds, now));
+
+        // A later success clears the exhaustion.
+        let mut usage = GeminiLocalUsage::default();
+        usage.record_line(&line(now - 60, 0.0, Some("RESOURCE_EXHAUSTED")), now);
+        usage.record_line(&line(now - 10, 0.1, None), now);
+        assert!(usage.into_windows(now).iter().all(|w| w.label != "quota"));
+    }
+
+    #[test]
+    fn usd_amounts_stay_compact() {
+        assert_eq!(format_usd(0.0), "$0.00");
+        assert_eq!(format_usd(0.003), "<$0.01");
+        assert_eq!(format_usd(4.5), "$4.50");
+        assert_eq!(format_usd(1234.4), "$1234");
     }
 }
