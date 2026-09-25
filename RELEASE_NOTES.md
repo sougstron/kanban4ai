@@ -1,3 +1,37 @@
+# kanban4ai 0.6.14
+
+The limits row grows a Gemini segment: Code Assist quota when gemini-cli is
+signed in, and the spend pi logged for a Gemini API key.
+
+## Added
+
+- **Gemini limits** (`core/limits.rs`, `tui/limits.rs`, `cli/mod.rs`,
+  `docs/limits.md`). `gemini` joins the provider list. When
+  `~/.gemini/oauth_creds.json` exists, the row reads Code Assist
+  `retrieveUserQuota` (after `loadCodeAssist` names the companion project)
+  and keeps the tightest bucket per family as `pro` / `flash` / `lite`. An
+  expired access token is refreshed with gemini-cli's public OAuth client
+  and cached in memory only; `oauth_creds.json` is never rewritten. A Gemini
+  API key has no quota endpoint, so when pi stores `google` in `auth.json`
+  (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`) the row also tallies
+  `usage.cost.total` of `provider: "google"` assistant messages in pi
+  session logs over the trailing `24h` and `30d`. Those windows print as
+  dollars and stay at 100% left, so they do not trip a pool floor. When the
+  newest Gemini response is a 429 `RESOURCE_EXHAUSTED`, a `quota` window at
+  0% lasts until `RetryInfo.retryDelay` passes — or the next 08:00 UTC for
+  a per-day quota — and holds pi's `google/*` pool candidates back until
+  then. Without `curl`, the quota side degrades to `n/a` like the other
+  HTTPS providers. `kanban limits` widens the name column so `gemini` fits
+  and prints spend as dollars instead of a percent.
+
+## Verification coverage
+
+- `gemini_quota_keeps_the_tightest_bucket_per_family`
+- `gemini_exhaustion_reads_retry_delay_and_daily_quotas`
+- `gemini_local_usage_tallies_pi_spend_and_the_last_429`
+- `limits_row_shows_gemini_quota_and_spend`
+- release quality gates listed below
+
 # kanban4ai 0.6.13
 
 Starting an isolated task no longer freezes the TUI, and a board that only
