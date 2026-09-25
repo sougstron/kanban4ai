@@ -401,7 +401,7 @@ enum Command {
 
     /// List active sessions.
     Sessions,
-    /// Show remaining subscription limits for the agent providers (claude, codex, grok, zai, synthetic).
+    /// Show remaining subscription limits for the agent providers (claude, codex, grok, zai, synthetic, gemini).
     Limits {
         /// Output format
         #[arg(long = "format", value_parser = ["table", "json"], default_value = "table")]
@@ -531,8 +531,10 @@ fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
     let snapshot = match limits::cached() {
         Some(snapshot)
             if !refresh
-                && snapshot.age(chrono::Utc::now().timestamp())
-                    < limits::DEFAULT_REFRESH_INTERVAL =>
+                && !snapshot.is_stale(
+                    chrono::Utc::now().timestamp(),
+                    limits::DEFAULT_REFRESH_INTERVAL,
+                ) =>
         {
             snapshot
         }

@@ -337,6 +337,15 @@ impl LimitsSnapshot {
     pub fn age(&self, now: i64) -> i64 {
         now.saturating_sub(self.fetched_at)
     }
+
+    /// Due for a full fetch: older than `ttl`, or missing a provider this
+    /// build knows (a cache written before that provider was added).
+    pub fn is_stale(&self, now: i64, ttl: i64) -> bool {
+        self.age(now) >= ttl
+            || PROVIDERS
+                .iter()
+                .any(|provider| self.get(provider).is_none())
+    }
 }
 
 fn now_secs() -> i64 {
@@ -1033,16 +1042,32 @@ pub fn record_codex_usage(windows: Vec<LimitWindow>, observed_at: i64) {
         observed_at: Some(observed_at),
         ..ProviderLimits::new("codex", ProviderState::Ready)
     };
-    let mut providers = cached()
+    store_provider("codex", |previous| {
+        prefer_newer_observation(previous, fresh)
+    });
+}
+
+/// Replace one provider's entry in the cache, persisting it. `fetched_at`
+/// stays put: it dates the last full fetch, and bumping it on a one-provider
+/// update would keep the others (and any provider missing from the cache)
+/// from ever being fetched again.
+fn store_provider(provider: &str, update: impl FnOnce(Option<&ProviderLimits>) -> ProviderLimits) {
+    let base = cached();
+    let mut providers = base
+        .as_ref()
         .map(|snapshot| snapshot.providers.clone())
         .unwrap_or_default();
-    match providers.iter_mut().find(|entry| entry.provider == "codex") {
-        Some(entry) => *entry = prefer_newer_observation(Some(entry), fresh),
-        None => providers.push(fresh),
+    let fetched_at = base.map_or(0, |snapshot| snapshot.fetched_at);
+    match providers
+        .iter_mut()
+        .find(|entry| entry.provider == provider)
+    {
+        Some(entry) => *entry = update(Some(entry)),
+        None => providers.push(update(None)),
     }
     store(
         Arc::new(LimitsSnapshot {
-            fetched_at: now_secs(),
+            fetched_at,
             providers,
         }),
         true,
@@ -2193,22 +2218,7 @@ pub fn refresh_provider_now(provider: &str) {
         "gemini" => fetch_gemini(),
         _ => return,
     };
-    let mut providers = cached()
-        .map(|snapshot| snapshot.as_ref().clone())
-        .map(|base: LimitsSnapshot| base.providers)
-        .unwrap_or_default();
-    match providers
-        .iter_mut()
-        .find(|entry| entry.provider == fresh.provider)
-    {
-        Some(entry) => *entry = fresh,
-        None => providers.push(fresh),
-    }
-    let snapshot = Arc::new(LimitsSnapshot {
-        fetched_at: now_secs(),
-        providers,
-    });
-    store(snapshot, true);
+    store_provider(provider, |_| fresh);
 }
 
 static CLI_REFRESHING: AtomicBool = AtomicBool::new(false);
@@ -2414,7 +2424,7 @@ pub fn refresh_blocking(force: bool) -> Arc<LimitsSnapshot> {
 /// drawing the previous snapshot until the new one lands.
 pub fn refresh_if_stale(ttl: i64) {
     let ttl = ttl.max(1);
-    if cached().is_some_and(|snapshot| snapshot.age(now_secs()) < ttl) {
+    if cached().is_some_and(|snapshot| !snapshot.is_stale(now_secs(), ttl)) {
         return;
     }
     if REFRESHING.swap(true, Ordering::SeqCst) {
@@ -3392,6 +3402,25 @@ mod tests {
         assert!(parsed.get("claude").unwrap().is_ready());
         assert!(!parsed.get("codex").unwrap().is_ready());
         assert_eq!(parsed.age(1_700_000_060), 60);
+    }
+
+    #[test]
+    fn a_snapshot_missing_a_known_provider_is_stale() {
+        let now = 1_700_000_000;
+        let mut snapshot = LimitsSnapshot {
+            fetched_at: now - 10,
+            providers: PROVIDERS
+                .iter()
+                .map(|provider| ProviderLimits::new(provider, ProviderState::NotConfigured))
+                .collect(),
+        };
+        assert!(!snapshot.is_stale(now, 60));
+        assert!(snapshot.is_stale(now, 10));
+
+        snapshot
+            .providers
+            .retain(|entry| entry.provider != "gemini");
+        assert!(snapshot.is_stale(now, 60));
     }
 
     #[test]
