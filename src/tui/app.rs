@@ -1237,6 +1237,10 @@ impl App {
                             self.dispatch(UiAction::Rerun)?;
                             return Ok(true);
                         }
+                        KeyCode::Char('v') => {
+                            self.paste_review_image();
+                            return Ok(true);
+                        }
                         _ => {}
                     }
                 }
@@ -4935,6 +4939,28 @@ impl App {
             return;
         }
         input_multiline(&mut detail.review_edits, key);
+    }
+
+    /// Ctrl+V in the review editor: attach a clipboard image the same way the
+    /// Description field does, so screenshots reach the re-run as feedback.
+    fn paste_review_image(&mut self) {
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
+        if !detail.edits_editable() {
+            self.status =
+                "Review edits can be changed only while the task is in Review".to_string();
+            return;
+        }
+        match image::paste_image_markdown(self.ops.data_root()) {
+            Ok(markdown) => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.review_edits.insert_str(&markdown);
+                }
+                self.status = "Image attached to review edits".to_string();
+            }
+            Err(err) => self.status = format!("Image paste failed: {err}"),
+        }
     }
 
     /// Persist the review-edits buffer. Saving no longer re-runs the agent —
