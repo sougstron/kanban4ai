@@ -1604,6 +1604,34 @@ fn abandon_task_removes_the_sidecar_thread() {
 }
 
 #[test]
+fn abandon_task_removes_images_pasted_into_review_edits_and_thread() {
+    let (dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Screenshots")).unwrap();
+    let images = dir.path().join(".kanban/assets/images");
+    fs::create_dir_all(&images).unwrap();
+    fs::write(images.join("thread.png"), b"png").unwrap();
+    fs::write(images.join("pending.png"), b"png").unwrap();
+    fs::write(images.join("unrelated.png"), b"png").unwrap();
+    ops.ask_question(
+        &task.id,
+        "Look: ![pasted image](.kanban/assets/images/thread.png)",
+        "agent",
+        vec![],
+    )
+    .unwrap();
+    ops.set_review_edits(
+        &task.id,
+        "![pasted image](.kanban/assets/images/pending.png)",
+    )
+    .unwrap();
+
+    assert!(ops.abandon_task(&task.id).unwrap());
+    assert!(!images.join("thread.png").exists());
+    assert!(!images.join("pending.png").exists());
+    assert!(images.join("unrelated.png").exists());
+}
+
+#[test]
 fn abandon_stalled_tasks_skips_questioned_ones() {
     let (dir, ops, _rec) = ops_with_recorder(false);
     let stalled = ops.create_task(NewTask::titled("Stalled")).unwrap();

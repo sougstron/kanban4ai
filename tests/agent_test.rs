@@ -416,6 +416,41 @@ agents:
 }
 
 #[test]
+fn prompt_points_pasted_images_at_absolute_board_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let task = storage
+        .create_task(NewTask {
+            title: "Screenshot bug".into(),
+            description: "See ![pasted image](.kanban/assets/images/desc.png)".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    ThreadManager::new(dir.path())
+        .unwrap()
+        .post(
+            &task.id,
+            MessageRole::Human,
+            MessageKind::ReviewEdit,
+            "Still broken: ![pasted image](.kanban/assets/images/review.png)",
+            None,
+            vec![],
+            Some("user".to_string()),
+        )
+        .unwrap();
+
+    let roots = kanban4ai::core::project::Roots::new(dir.path(), work.path(), None);
+    let prompt = build_agent_prompt(roots, &task, "ses-img", false, Role::Executor).unwrap();
+
+    let images = roots.data_path("assets/images");
+    assert!(prompt.contains(&format!("]({}/desc.png)", images.display())));
+    assert!(prompt.contains(&format!("]({}/review.png)", images.display())));
+    assert!(!prompt.contains("](.kanban/assets/"));
+}
+
+#[test]
 fn claude_launch_plan_uses_print_and_default_model() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::new(dir.path());

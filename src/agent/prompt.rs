@@ -132,7 +132,7 @@ not touch the project folder's own checkout.\n"
     if task.description.trim().is_empty() {
         prompt.push_str(&task.title);
     } else {
-        prompt.push_str(task.description.trim());
+        prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
     }
     append_upstream_results(roots, task, &mut prompt)?;
     append_thread_context(roots, task, &mut prompt)?;
@@ -273,7 +273,7 @@ Schema and examples: \"$KANBAN_CMD\" ask-form --help.\n",
     if task.description.trim().is_empty() {
         prompt.push_str(&task.title);
     } else {
-        prompt.push_str(task.description.trim());
+        prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
     }
     append_upstream_results(roots, task, &mut prompt)?;
     append_thread_context(roots, task, &mut prompt)?;
@@ -426,7 +426,7 @@ inherit this task's own backend and model.\n\n",
     if task.description.trim().is_empty() {
         prompt.push_str(&task.title);
     } else {
-        prompt.push_str(task.description.trim());
+        prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
     }
     append_thread_context(roots, task, &mut prompt)?;
     Ok(prompt)
@@ -493,7 +493,7 @@ each question renders with selectable options. Write {form_file} then submit it:
     if task.description.trim().is_empty() {
         prompt.push_str(&task.title);
     } else {
-        prompt.push_str(task.description.trim());
+        prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
     }
     append_thread_context(roots, task, &mut prompt)?;
     Ok(prompt)
@@ -719,7 +719,7 @@ fn append_thread_context(roots: Roots<'_>, task: &Task, prompt: &mut String) -> 
 
     prompt.push_str("\n\nThread context and review feedback:\n");
     for message in messages {
-        append_message(prompt, &message);
+        append_message(roots, prompt, &message);
     }
     Ok(())
 }
@@ -752,13 +752,13 @@ fn append_thread_delta(
     if !messages.is_empty() {
         prompt.push_str("\n\nNew thread context since the previous run:\n");
         for message in messages {
-            append_message(prompt, &message);
+            append_message(roots, prompt, &message);
         }
     }
     Ok(())
 }
 
-fn append_message(prompt: &mut String, message: &Message) {
+fn append_message(roots: Roots<'_>, prompt: &mut String, message: &Message) {
     prompt.push_str("- [");
     prompt.push_str(message.role.as_str());
     prompt.push(' ');
@@ -782,7 +782,7 @@ fn append_message(prompt: &mut String, message: &Message) {
         prompt.push_str(origin.trim());
     }
     prompt.push_str("] ");
-    prompt.push_str(message.body.trim());
+    prompt.push_str(&absolute_asset_links(roots, message.body.trim()));
     if let Some(answer) = message
         .answer
         .as_deref()
@@ -792,6 +792,14 @@ fn append_message(prompt: &mut String, message: &Message) {
         prompt.push_str(answer.trim());
     }
     prompt.push('\n');
+}
+
+/// Pasted images are stored as `![…](.kanban/assets/…)` relative to the data
+/// root, but agents run in the code folder or a worktree where that path does
+/// not resolve; point them at the absolute file instead.
+fn absolute_asset_links(roots: Roots<'_>, text: &str) -> String {
+    let assets = roots.data_path("assets");
+    text.replace("](.kanban/assets/", &format!("]({}/", assets.display()))
 }
 
 fn build_revert_prompt(roots: Roots<'_>, task: &Task, session_id: &str) -> String {

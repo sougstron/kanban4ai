@@ -5251,15 +5251,27 @@ impl Operations {
         }
     }
 
-    /// Delete pasted images referenced by the task description (only ever
-    /// touches files inside `.kanban/assets/`).
+    /// Delete pasted images referenced by the task description, its review
+    /// edits, or its thread (only ever touches files inside `.kanban/assets/`).
     fn clear_task_assets(&self, task: &Task) {
         let assets_dir = self.data_root().join(".kanban").join("assets");
         let Ok(assets_dir) = assets_dir.canonicalize() else {
             return;
         };
 
-        for raw_path in asset_paths_from_description(&task.description) {
+        let mut texts = vec![task.description.clone(), task.review_edits.clone()];
+        if let Ok(thread) = self.thread_manager().and_then(|tm| tm.load(&task.id)) {
+            texts.extend(thread.messages.into_iter().map(|message| message.body));
+        }
+        let mut raw_paths = Vec::new();
+        for text in &texts {
+            for path in asset_paths_from_description(text) {
+                if !raw_paths.contains(&path) {
+                    raw_paths.push(path);
+                }
+            }
+        }
+        for raw_path in raw_paths {
             let Ok(asset_path) = self.data_root().join(&raw_path).canonicalize() else {
                 continue;
             };

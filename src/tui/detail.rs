@@ -682,7 +682,8 @@ fn render_edits_panel(
     } else if conflicted {
         " Review edits — conflict report · resolve in the worktree · Ctrl+R re-run ".to_string()
     } else if focused {
-        " Review edits [focused] · Ctrl+S save · Ctrl+R re-run · Esc thread ".to_string()
+        " Review edits [focused] · Ctrl+S save · Ctrl+V image · Ctrl+R re-run · Esc thread "
+            .to_string()
     } else if hovered {
         " Review edits [click to focus] · Ctrl+S save · Ctrl+R re-run ".to_string()
     } else {
