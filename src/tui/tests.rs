@@ -8902,17 +8902,26 @@ fn limits_row_sits_above_the_status_bar_and_lists_every_provider() {
     app.limits = Some(limits_fixture());
 
     let lines = rendered_lines(&mut app, 120, 28);
-    let row = &lines[lines.len() - 2];
+    let upper = &lines[lines.len() - 3];
+    let lower = &lines[lines.len() - 2];
     let status = &lines[lines.len() - 1];
 
-    assert!(
-        row.contains("✳ claude 5h 66% ↻3h30m · 7d 95% ↻6d11h"),
-        "{row}"
-    );
+    // claude has both kinds of window, so the row is two lines: the 5h window
+    // beside the name, the weekly one stacked under it.
+    assert!(upper.contains("✳ claude 5h 66% ↻3h30m"), "{upper}");
+    assert!(lower.contains("7d 95% ↻6d11h"), "{lower}");
+    let column = |line: &str, text: &str| {
+        unicode_width::UnicodeWidthStr::width(&line[..line.find(text).expect(text)])
+    };
+    assert_eq!(column(upper, "5h"), column(lower, "7d"), "{upper}\n{lower}");
+    assert!(!lower.contains("claude"), "{lower}");
     // codex reports whatever its last observation said, so the row carries
-    // that reading's age alongside the window.
-    assert!(row.contains("✺ codex mon 75% ↻18d (7d old)"), "{row}");
-    assert!(row.contains("✕ grok signed out"), "{row}");
+    // that reading's age alongside the window. Its only window sits level
+    // with its name, as does grok's state.
+    assert!(upper.contains("✺ codex mon 75% ↻18d (7d old)"), "{upper}");
+    assert!(upper.contains("✕ grok signed out"), "{upper}");
+    // Separators line up across both lines.
+    assert_eq!(column(upper, "│"), column(lower, "│"), "{upper}\n{lower}");
     // The status bar keeps the last line, and the board keeps its columns.
     assert!(status.contains("n new"), "{status}");
     assert!(lines[0].contains("To Do"), "{}", lines[0]);
@@ -8958,16 +8967,29 @@ fn limits_row_shows_gemini_quota_and_spend() {
     }));
 
     let lines = rendered_lines(&mut app, 120, 28);
-    let row = &lines[lines.len() - 2];
+    let upper = &lines[lines.len() - 3];
+    let lower = &lines[lines.len() - 2];
     assert!(
-        row.contains("✧ gemini pro 12% ↻2h30m · 24h <$0.01 · 30d $4.50"),
-        "{row}"
+        upper.contains("✧ gemini pro 12% ↻2h30m · 24h <$0.01"),
+        "{upper}"
     );
-    let narrow = rendered_lines(&mut app, 30, 20);
-    let narrow_row = &narrow[narrow.len() - 2];
-    assert!(
-        narrow_row.contains("✧ 12% · <$0.01 · $4.50"),
-        "{narrow_row}"
+    assert!(lower.contains("30d $4.50"), "{lower}");
+    let narrow = rendered_lines(&mut app, 20, 20);
+    let narrow_upper = &narrow[narrow.len() - 3];
+    let narrow_lower = &narrow[narrow.len() - 2];
+    assert!(narrow_upper.contains("✧ 12% · <$0.01"), "{narrow_upper}");
+    assert!(narrow_lower.contains("$4.50"), "{narrow_lower}");
+}
+
+#[test]
+fn limits_row_stacks_weekly_windows_under_short_ones_snapshot() {
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(limits_fixture());
+
+    let lines = rendered_lines(&mut app, 100, 20);
+    insta::assert_snapshot!(
+        "limits_row_two_lines",
+        lines[lines.len() - 3..lines.len() - 1].join("\n")
     );
 }
 
@@ -8976,22 +8998,21 @@ fn limits_row_drops_reset_times_then_names_as_the_terminal_narrows() {
     let (_dir, mut app) = populated_app();
     app.limits = Some(limits_fixture());
 
-    // Full needs 95 columns, NoReset 67, Percent 32 (22 without grok, 12 for
-    // claude alone) — 70 keeps the NoReset rung and 18 forces the row to drop
+    // Full needs 79 columns, NoReset 58, Percent 26 (16 without grok, 6 for
+    // claude alone) — 60 keeps the NoReset rung and 12 forces the row to drop
     // providers from the right.
-    let medium = rendered_lines(&mut app, 70, 20);
-    let medium_row = medium[medium.len() - 2].clone();
-    let narrow = rendered_lines(&mut app, 18, 20);
-    let narrow_row = narrow[narrow.len() - 2].clone();
+    let medium = rendered_lines(&mut app, 60, 20);
+    let medium_row = medium[medium.len() - 3..medium.len() - 1].join("\n");
+    let narrow = rendered_lines(&mut app, 12, 20);
+    let narrow_row = narrow[narrow.len() - 3..narrow.len() - 1].join("\n");
 
-    assert!(
-        medium_row.contains("claude 5h 66% · 7d 95%"),
-        "{medium_row}"
-    );
+    assert!(medium_row.contains("claude 5h 66%"), "{medium_row}");
+    assert!(medium_row.contains("7d 95%"), "{medium_row}");
     assert!(!medium_row.contains('↻'), "{medium_row}");
     // Too narrow even for names: icons and percentages only, and the providers
     // that no longer fit are dropped from the right.
-    assert!(narrow_row.contains("✳ 66% · 95%"), "{narrow_row}");
+    assert!(narrow_row.contains("✳ 66%"), "{narrow_row}");
+    assert!(narrow_row.contains("95%"), "{narrow_row}");
     assert!(!narrow_row.contains("claude"), "{narrow_row}");
     assert!(!narrow_row.contains('✺'), "{narrow_row}");
     assert!(!narrow_row.contains('✕'), "{narrow_row}");
@@ -9077,7 +9098,7 @@ fn limits_row_renders_on_the_projects_screen() {
     app.limits = Some(limits_fixture());
 
     let lines = rendered_lines(&mut app, 120, 24);
-    let row = &lines[lines.len() - 2];
+    let row = &lines[lines.len() - 3];
 
     assert_eq!(app.screen, Screen::Projects);
     assert!(row.contains("✳ claude 5h 66%"), "{row}");

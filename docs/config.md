@@ -40,7 +40,8 @@ auto-loaded into every agent session. Read it when you are reading or adding a s
   Legacy `completion_date` values are read as `updated_at_desc`; unknown
   values read as `task_number`.
 - `show_limits`: true - draw the provider subscription-limits row above the
-  status bar on the Board and Projects screens
+  status bar on the Board and Projects screens (two lines when a provider has
+  both a short window and a weekly/monthly one: short above, long below)
 - `hide_kanban_messages`: false - when true, the task-detail thread hides
   messages authored by kanban (audit notes). They stay on the sidecar; this
   is a display filter only. Opening a task pins the first line of the last
