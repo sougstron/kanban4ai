@@ -3154,6 +3154,25 @@ impl Operations {
         Ok(Some(tm.resolve(task_id, msg_id, status)?))
     }
 
+    /// Stash the human's in-progress typed answer on an open question (TUI
+    /// draft persistence so a closed task reopen keeps the text). An empty
+    /// `draft` clears the stored one.
+    pub fn save_question_draft(
+        &self,
+        task_id: &str,
+        msg_id: &str,
+        draft: &str,
+    ) -> Result<Option<Message>> {
+        let _guard = self.storage.lock()?;
+        let Some((_task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
+            return Ok(None);
+        };
+        if tm.get_message(task_id, msg_id)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(tm.set_draft(task_id, msg_id, draft)?))
+    }
+
     pub fn list_open_messages(&self, task_id: &str) -> Result<Vec<Message>> {
         let _guard = self.storage.lock()?;
         let Some((task, tm)) = self.load_task_and_prepare_thread(task_id)? else {

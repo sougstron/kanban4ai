@@ -1200,6 +1200,7 @@ impl App {
             .is_some_and(|deadline| now <= deadline)
         {
             self.ctrl_c_exit_deadline = None;
+            let _ = self.persist_detail_drafts();
             self.should_quit = true;
         } else {
             self.ctrl_c_exit_deadline = Some(now + CTRL_C_EXIT_WINDOW);
@@ -1333,13 +1334,24 @@ impl App {
     }
 
     fn switch_detail_question(&mut self, delta: isize) {
-        let Some(detail) = self.detail.as_mut() else {
+        let Some(detail) = self.detail.as_ref() else {
             return;
         };
         let count = detail.open_questions().len();
         if count == 0 {
             return;
         }
+        // Stash the outgoing question's typed draft before the input is
+        // wiped; best-effort, close_detail persists again later.
+        if let Some(question) = detail.open_questions().get(detail.question_index) {
+            let draft = detail.answer_input.lines().join("\n");
+            if draft != question.draft {
+                let task_id = detail.task_id.clone();
+                let msg_id = question.id.clone();
+                let _ = self.ops.save_question_draft(&task_id, &msg_id, &draft);
+            }
+        }
+        let detail = self.detail.as_mut().expect("detail checked above");
         detail.question_index = if delta.is_negative() {
             detail.question_index.saturating_sub(delta.unsigned_abs())
         } else {
@@ -3276,6 +3288,7 @@ impl App {
     /// Leave the detail screen for wherever it was opened from, refreshing
     /// that list so the closed detail's changes are visible immediately.
     fn close_detail(&mut self) -> Result<()> {
+        self.persist_detail_drafts()?;
         self.detail = None;
         let target = self.return_screen;
         self.return_screen = Screen::Board;
@@ -3290,6 +3303,43 @@ impl App {
             }
             _ => Screen::Board,
         };
+        Ok(())
+    }
+
+    /// Flush the detail screen's in-progress text to disk so closing and
+    /// reopening the task restores it: unsaved review edits (same Review-only
+    /// gate as Ctrl+S) and the typed answer draft of the selected open
+    /// question. Cheap when nothing changed — callers compare first and skip
+    /// the write.
+    fn persist_detail_drafts(&mut self) -> Result<()> {
+        let Some(detail) = self.detail.as_ref() else {
+            return Ok(());
+        };
+        let task_id = detail.task_id.clone();
+        let mut saved = false;
+        if detail.edits_editable() {
+            let text = detail.review_edits.lines().join("\n");
+            let persisted = detail
+                .task
+                .as_ref()
+                .map(|task| task.review_edits.as_str())
+                .unwrap_or_default();
+            if text != persisted {
+                self.ops.set_review_edits(&task_id, &text)?;
+                saved = true;
+            }
+        }
+        if let Some(question) = detail.open_questions().get(detail.question_index) {
+            let draft = detail.answer_input.lines().join("\n");
+            if draft != question.draft {
+                let msg_id = question.id.clone();
+                self.ops.save_question_draft(&task_id, &msg_id, &draft)?;
+                saved = true;
+            }
+        }
+        if saved {
+            self.status = format!("Saved draft for {task_id}");
+        }
         Ok(())
     }
 
@@ -3387,6 +3437,15 @@ impl App {
             detail.answer_input = answer_input;
             detail.question_index = question_index;
             detail.variant_selected = variant_selected.min(variant_count);
+        } else if let Some(draft) = detail
+            .open_questions()
+            .first()
+            .map(|question| question.draft.clone())
+            .filter(|draft| !draft.is_empty())
+        {
+            // No in-session input to preserve: restore the draft persisted
+            // when the detail was last closed.
+            detail.answer_input.insert_str(&draft);
         }
         self.detail = Some(detail);
         Ok(())

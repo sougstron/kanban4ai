@@ -817,6 +817,53 @@ fn ask_question_flags_task_and_answer_clears_it() {
 }
 
 #[test]
+fn question_draft_persists_clears_and_drops_on_answer() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Drafts")).unwrap();
+    ops.ask_question(&task.id, "Which route?", "agent", vec![])
+        .unwrap();
+    let msg_id = ops.list_open_messages(&task.id).unwrap()[0].id.clone();
+
+    // Stash a typed draft and read it back from the stored thread.
+    let saved = ops
+        .save_question_draft(&task.id, &msg_id, "the safe one")
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.draft, "the safe one");
+    let open = ops.list_open_messages(&task.id).unwrap();
+    assert_eq!(open[0].draft, "the safe one");
+
+    // An empty draft clears the stored one.
+    let cleared = ops
+        .save_question_draft(&task.id, &msg_id, "")
+        .unwrap()
+        .unwrap();
+    assert!(cleared.draft.is_empty());
+
+    // Answering drops any leftover draft with the question.
+    ops.save_question_draft(&task.id, &msg_id, "typed earlier")
+        .unwrap();
+    ops.answer_question(&task.id, QuestionRef::MsgId(msg_id.clone()), "fast")
+        .unwrap();
+    let answered = ops.list_open_messages(&task.id).unwrap();
+    assert!(answered.is_empty());
+    let tm = kanban4ai::core::thread::ThreadManager::new(ops.data_root()).unwrap();
+    let message = tm.get_message(&task.id, &msg_id).unwrap().unwrap();
+    assert_eq!(
+        message.status,
+        kanban4ai::core::models::MessageStatus::Answered
+    );
+    assert!(message.draft.is_empty());
+
+    // Unknown message ids are a no-op, not an error.
+    assert!(
+        ops.save_question_draft(&task.id, "MSG-999", "x")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn ask_form_posts_one_question_per_entry_with_variants() {
     let (_dir, ops, _rec) = ops_with_recorder(false);
     let task = ops.create_task(NewTask::titled("Form")).unwrap();
