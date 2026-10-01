@@ -201,12 +201,26 @@ impl ThreadManager {
         message.status = MessageStatus::Answered;
         message.updated_at = now;
         message.resolved_at = Some(now);
+        message.draft.clear();
         if role == MessageRole::Human && message.origin.is_none() {
             message.origin = Some("human".to_string());
         }
         self.save(task_id, &mut thread)?;
         self.get_message(task_id, msg_id)?.ok_or_else(|| {
             KanbanError::Invalid(format!("Failed to answer message {msg_id} for {task_id}"))
+        })
+    }
+
+    /// Stash (or clear, with an empty `draft`) the human's in-progress typed
+    /// answer on a question so the TUI can restore it after a close/reopen.
+    pub fn set_draft(&self, task_id: &str, msg_id: &str, draft: &str) -> Result<Message> {
+        let mut thread = self.load(task_id)?;
+        let message = require_message(&mut thread, msg_id)?;
+        message.draft = draft.to_string();
+        message.updated_at = timefmt::now();
+        self.save(task_id, &mut thread)?;
+        self.get_message(task_id, msg_id)?.ok_or_else(|| {
+            KanbanError::Invalid(format!("Failed to store draft on {msg_id} for {task_id}"))
         })
     }
 

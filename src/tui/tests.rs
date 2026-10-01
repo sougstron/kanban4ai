@@ -3970,6 +3970,63 @@ fn open_focused_review_editor(text: &str) -> (tempfile::TempDir, App) {
 }
 
 #[test]
+fn closing_detail_saves_unsaved_review_edits() {
+    let (_dir, mut app) = open_focused_review_editor("abcdef");
+    app.handle_key(key(KeyCode::End)).unwrap();
+    for c in " xyz".chars() {
+        app.handle_key(key(KeyCode::Char(c))).unwrap();
+    }
+    // Esc leaves the text panel, Esc closes the detail.
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(app.detail.is_none(), "detail closed");
+
+    let task_id = app.ops.get_task("TASK-001").unwrap().unwrap().id;
+    let persisted = app.ops.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(
+        persisted.review_edits, "abcdef xyz",
+        "closing the detail persists unsaved review edits"
+    );
+
+    // Reopen: the text is there as is.
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
+        "abcdef xyz"
+    );
+}
+
+#[test]
+fn closing_detail_saves_typed_answer_draft() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    // Focus order: Thread -> Answer (the card has an open question).
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Answer);
+    let task_id = app.detail.as_ref().unwrap().task_id.clone();
+    for c in "use the safe path".chars() {
+        app.handle_key(key(KeyCode::Char(c))).unwrap();
+    }
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(app.detail.is_none(), "detail closed");
+
+    // The draft landed on the question message in the thread.
+    let open = app.ops.list_open_messages(&task_id).unwrap();
+    assert_eq!(
+        open[0].draft, "use the safe path",
+        "closing the detail persists the typed answer draft"
+    );
+
+    // Reopen: the typed text is back in the answer panel.
+    app.handle_key(key(KeyCode::Enter)).expect("reopen detail");
+    assert_eq!(
+        app.detail.as_ref().unwrap().answer_input.lines().join("\n"),
+        "use the safe path"
+    );
+}
+
+#[test]
 fn review_edits_soft_wraps_like_task_description() {
     let prose = "Soft wrapping keeps normal prose readable in a narrow terminal. ";
     let token = "unbroken".repeat(16);

@@ -177,6 +177,8 @@ pub struct Message {
     pub status: MessageStatus,
     #[serde(default)]
     pub parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub draft: String,
     #[serde(default)]
     pub variants: Vec<String>,
     #[serde(default)]
@@ -214,6 +216,7 @@ impl Message {
             body: body.into(),
             status: MessageStatus::Open,
             parent_id: None,
+            draft: String::new(),
             variants: Vec::new(),
             author: None,
             answer: None,

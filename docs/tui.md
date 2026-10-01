@@ -236,7 +236,11 @@ review_edits, and re-dispatch after resolving is how a conflict gets acted on),
 and the edits panel is retitled `conflict report`. When the task has open questions an inline
 **answer panel** appears between the thread and the review-edits editor:
 `←/→` switch between questions, `↑/↓` pick one of the agent's variants or the
-custom-input row, typing fills the custom answer, `Enter` submits. Cards with
+custom-input row, typing fills the custom answer, `Enter` submits. Closing the
+detail (or switching questions) saves the typed answer as a draft on the
+question message, so reopening the task restores the text as it was left;
+submitting the answer (or clearing the text and closing) drops the draft.
+Cards with
 open questions show the question text as a preview line; clicking it jumps
 straight to the answer panel. Interactive tasks whose agent is blocked on
 `kanban ask --wait` show a `⏳ waiting` badge; tasks in declared wait mode show
@@ -251,7 +255,9 @@ keep the green badge-only card).
 The review-edits editor is
 editable only while the task is in Review (read-only or hidden otherwise), and
 saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
-`Ctrl+R` / action-bar button. Create/edit dialogs expose one `Agent settings`
+`Ctrl+R` / action-bar button. Unsaved editor text is written to the task's
+`review_edits` buffer automatically when the detail closes, so reopening the
+task restores it without an explicit save. Create/edit dialogs expose one `Agent settings`
 row that opens a nested popup for backend, model, effort, and persona; popup
 Save stages those values in the task form and popup Cancel restores the exact
 opening state. They also expose Readonly (investigation and board-side reporting

@@ -8,7 +8,7 @@ auto-loaded into every agent session. Read it when the task/thread file format, 
 - **Session**: id, task_id, started_at, status (active/closed/crashed), last_seen, wait_until, wait_note, wait_exited. `wait_until`/`wait_note` are set by `kanban waiting`; `wait_exited` means the agent process ended during the declared wait — at the deadline the pause is handed back to the queue (or, with the queue off, the agent is relaunched directly) to check the result.
 - **MessageRole** / **MessageKind** / **MessageStatus**: enums for thread message author, type, and lifecycle state. `MessageKind` is one of `system`, `task`, `question`, `suggestion`, `context`, or `review_edit`.
 - New tasks initialize their sidecar thread with `system` and `task` messages: `MSG-001` records creation metadata, `MSG-002` stores the initial user-authored task body so the TUI can render the whole conversation from the thread.
-- **Message**: thread entry with `id` (MSG-NNN), role, kind, status, body, `parent_id`, `variants`, author, timestamps, and resolution metadata. Answered questions also store `answer` and `answered_by_role`.
+- **Message**: thread entry with `id` (MSG-NNN), role, kind, status, body, `parent_id`, `variants`, author, timestamps, and resolution metadata. Answered questions also store `answer` and `answered_by_role`; open questions may carry a `draft` (the human's in-progress typed answer, stashed by the TUI when the detail closes — cleared when the question is answered).
 - **Thread**: sidecar per-task conversation state with `task_id`, `rev`, and ordered `messages`.
 - **BoardConfig**: columns, rules, thresholds (all configurable per-project).
 
