@@ -257,16 +257,18 @@ editable only while the task is in Review (read-only or hidden otherwise), and
 saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
 `Ctrl+R` / action-bar button. Unsaved editor text is written to the task's
 `review_edits` buffer automatically when the detail closes, so reopening the
-task restores it without an explicit save. Create/edit dialogs expose one `Agent settings`
-row that opens a nested popup for backend, model, effort, and persona; popup
-Save stages those values in the task form and popup Cancel restores the exact
-opening state. They also expose Readonly (investigation and board-side reporting
-without project-file writes), Designer and Reviewer checkboxes (per-task opt-in;
-models and agents come from project settings), a "Chain to task"
-selector, and a "Planned launch" checkbox with an HH:MM time field: when the
-checkbox is on the time is required (an empty or invalid value keeps the
-dialog open with an error), and saving stores the next local occurrence of
-that time as `launch_at`, which the queue dispatcher enqueues when it comes
+task restores it without an explicit save. Create/edit dialogs group the form
+as: Title, Description, an `Agent settings` row that opens a nested popup for
+backend, model, effort, and persona, a Readonly checkbox (investigation and
+board-side reporting without project-file writes), a "Chain to task" selector,
+and an `Options` row that opens a second nested popup holding the
+Orchestrator, Designer, and Reviewer checkboxes (per-task opt-in; models and
+agents come from project settings) plus the "Planned launch" checkbox with an
+HH:MM time field. Both popups stage values on Save and restore the exact
+opening state on Cancel. When planned launch is on the time is required (an
+empty or invalid value keeps the dialog open with an error and reopens the
+Options popup on the time field), and saving stores the next local occurrence
+of that time as `launch_at`, which the queue dispatcher enqueues when it comes
 due (see `docs/orchestration.md`). The card shows a `🕐 HH:MM` badge while the
 schedule is pending, and the detail view lists the full timestamp. The TUI no longer exposes the legacy `interactive` switch:
 TUI-created tasks use `interactive: false`, and TUI edits leave an existing

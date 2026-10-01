@@ -94,6 +94,7 @@ pub enum DialogField {
     AgentSettings,
     DesignerAgentSettings,
     ReviewerAgentSettings,
+    TaskOptions,
     Backend,
     Model,
     Effort,
@@ -151,17 +152,26 @@ pub enum DialogField {
     PurgeData,
 }
 
-const TASK_FORM_FIELDS: [DialogField; 10] = [
+const TASK_FORM_FIELDS: [DialogField; 6] = [
     DialogField::Title,
     DialogField::Description,
     DialogField::AgentSettings,
-    DialogField::ChainTo,
-    DialogField::PlannedLaunch,
-    DialogField::LaunchTime,
     DialogField::Readonly,
+    DialogField::ChainTo,
+    DialogField::TaskOptions,
+];
+
+/// The `Options` subpopup of the task form: per-task orchestration opt-ins
+/// and the planned launch, grouped off the parent form like the agent
+/// settings popup.
+const TASK_OPTIONS_FIELDS: [DialogField; 7] = [
     DialogField::UseOrchestrator,
     DialogField::UseDesigner,
     DialogField::UseReviewer,
+    DialogField::PlannedLaunch,
+    DialogField::LaunchTime,
+    DialogField::Confirm,
+    DialogField::Cancel,
 ];
 
 /// Which page of the project settings dialog is showing. One [`ModalState`]
@@ -408,6 +418,76 @@ struct AgentPopupState {
     original: AgentPicker,
 }
 
+/// Opening snapshot of the `Options` subpopup; Cancel restores exactly this.
+struct OptionsSnapshot {
+    use_orchestrator: bool,
+    use_designer: bool,
+    use_reviewer: bool,
+    planned_launch: bool,
+    launch_time: TextArea<'static>,
+}
+
+struct OptionsPopupState {
+    parent_field_index: usize,
+    parent_form_scroll: usize,
+    field_index: usize,
+    form_scroll: usize,
+    original: OptionsSnapshot,
+}
+
+/// The task form's nested popups. While one is open it owns focus, scrolling
+/// and hitboxes; the parent form stays staged underneath.
+enum SubPopup {
+    Agent(Box<AgentPopupState>),
+    Options(Box<OptionsPopupState>),
+}
+
+impl SubPopup {
+    fn field_index(&self) -> usize {
+        match self {
+            SubPopup::Agent(popup) => popup.field_index,
+            SubPopup::Options(popup) => popup.field_index,
+        }
+    }
+
+    fn set_field_index(&mut self, index: usize) {
+        match self {
+            SubPopup::Agent(popup) => popup.field_index = index,
+            SubPopup::Options(popup) => popup.field_index = index,
+        }
+    }
+
+    /// Rows of actual content above the Confirm/Cancel buttons; focus on the
+    /// buttons never scrolls past the last content row.
+    fn content_rows(&self) -> usize {
+        match self {
+            SubPopup::Agent(_) => 4,
+            SubPopup::Options(_) => TASK_OPTIONS_FIELDS.len() - 2,
+        }
+    }
+
+    fn set_form_scroll(&mut self, scroll: usize) {
+        match self {
+            SubPopup::Agent(popup) => popup.form_scroll = scroll,
+            SubPopup::Options(popup) => popup.form_scroll = scroll,
+        }
+    }
+
+    fn fields(&self) -> &'static [DialogField] {
+        match self {
+            SubPopup::Agent(popup) => agent_fields(popup.slot),
+            SubPopup::Options(_) => &TASK_OPTIONS_FIELDS,
+        }
+    }
+
+    fn parent_view(&self) -> (usize, usize) {
+        match self {
+            SubPopup::Agent(popup) => (popup.parent_field_index, popup.parent_form_scroll),
+            SubPopup::Options(popup) => (popup.parent_field_index, popup.parent_form_scroll),
+        }
+    }
+}
+
 impl AgentPicker {
     fn new() -> Self {
         Self {
@@ -527,7 +607,7 @@ pub struct ModalState {
     /// Availability probe for the current project, taken once when the
     /// settings dialog opens (the probe runs git subprocesses).
     pub isolation_status: Option<Availability>,
-    agent_popup: Option<AgentPopupState>,
+    sub_popup: Option<SubPopup>,
 }
 
 impl ModalState {
@@ -619,7 +699,7 @@ impl ModalState {
             reviewer_on_changes_selected: 0,
             reviewer_max_rounds: one_line("3"),
             isolation_status: None,
-            agent_popup: None,
+            sub_popup: None,
         }
     }
 
@@ -648,8 +728,8 @@ impl ModalState {
     }
 
     pub fn fields(&self) -> &'static [DialogField] {
-        if let Some(popup) = &self.agent_popup {
-            return agent_fields(popup.slot);
+        if let Some(popup) = &self.sub_popup {
+            return popup.fields();
         }
         self.parent_fields()
     }
@@ -660,13 +740,9 @@ impl ModalState {
                 DialogField::Title,
                 DialogField::Description,
                 DialogField::AgentSettings,
-                DialogField::ChainTo,
-                DialogField::PlannedLaunch,
-                DialogField::LaunchTime,
                 DialogField::Readonly,
-                DialogField::UseOrchestrator,
-                DialogField::UseDesigner,
-                DialogField::UseReviewer,
+                DialogField::ChainTo,
+                DialogField::TaskOptions,
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
@@ -728,9 +804,9 @@ impl ModalState {
     pub fn active_field(&self) -> DialogField {
         let fields = self.fields();
         let index = self
-            .agent_popup
+            .sub_popup
             .as_ref()
-            .map(|popup| popup.field_index)
+            .map(SubPopup::field_index)
             .unwrap_or(self.field_index);
         fields[index.min(fields.len().saturating_sub(1))]
     }
@@ -741,9 +817,9 @@ impl ModalState {
     /// full list instead of a narrowing the user has since forgotten about.
     fn set_field_index(&mut self, index: usize) {
         let current = self
-            .agent_popup
+            .sub_popup
             .as_ref()
-            .map(|popup| popup.field_index)
+            .map(SubPopup::field_index)
             .unwrap_or(self.field_index);
         if index != current {
             let leaving = self.active_field();
@@ -754,8 +830,8 @@ impl ModalState {
                 self.filter_error = None;
             }
         }
-        if let Some(popup) = self.agent_popup.as_mut() {
-            popup.field_index = index;
+        if let Some(popup) = self.sub_popup.as_mut() {
+            popup.set_field_index(index);
         } else {
             self.field_index = index;
         }
@@ -766,9 +842,9 @@ impl ModalState {
         let len = self.fields().len();
         if len > 0 {
             let current = self
-                .agent_popup
+                .sub_popup
                 .as_ref()
-                .map(|popup| popup.field_index)
+                .map(SubPopup::field_index)
                 .unwrap_or(self.field_index);
             self.set_field_index((current + 1) % len);
         }
@@ -778,9 +854,9 @@ impl ModalState {
         let len = self.fields().len();
         if len > 0 {
             let current = self
-                .agent_popup
+                .sub_popup
                 .as_ref()
-                .map(|popup| popup.field_index)
+                .map(SubPopup::field_index)
                 .unwrap_or(self.field_index);
             let index = if current == 0 { len - 1 } else { current - 1 };
             self.set_field_index(index);
@@ -841,48 +917,87 @@ impl ModalState {
         }
     }
 
+    #[cfg(test)]
     pub fn agent_popup_slot(&self) -> Option<AgentSlot> {
-        self.agent_popup.as_ref().map(|popup| popup.slot)
+        match &self.sub_popup {
+            Some(SubPopup::Agent(popup)) => Some(popup.slot),
+            _ => None,
+        }
+    }
+
+    /// Whether any nested popup (agent settings or task options) owns focus.
+    pub fn popup_open(&self) -> bool {
+        self.sub_popup.is_some()
     }
 
     pub fn open_agent_settings(&mut self, slot: AgentSlot) {
-        if self.agent_popup.is_some() {
+        if self.sub_popup.is_some() {
             return;
         }
         let original = self.picker_snapshot(slot);
-        self.agent_popup = Some(AgentPopupState {
+        self.sub_popup = Some(SubPopup::Agent(Box::new(AgentPopupState {
             slot,
             parent_field_index: self.field_index,
             parent_form_scroll: self.form_scroll,
             field_index: 0,
             form_scroll: 0,
             original,
-        });
+        })));
         self.filter_error = None;
     }
 
-    pub fn save_agent_settings(&mut self) {
+    pub fn open_options(&mut self) {
+        if self.sub_popup.is_some() {
+            return;
+        }
+        self.sub_popup = Some(SubPopup::Options(Box::new(OptionsPopupState {
+            parent_field_index: self.field_index,
+            parent_form_scroll: self.form_scroll,
+            field_index: 0,
+            form_scroll: 0,
+            original: OptionsSnapshot {
+                use_orchestrator: self.use_orchestrator,
+                use_designer: self.use_designer,
+                use_reviewer: self.use_reviewer,
+                planned_launch: self.planned_launch,
+                launch_time: self.launch_time.clone(),
+            },
+        })));
+        self.filter_error = None;
+    }
+
+    pub fn save_popup(&mut self) {
         let field = self.active_field();
         if let Some(filter) = self.field_filter_mut(field) {
             filter.clear();
         }
         self.filter_error = None;
-        self.close_agent_settings(false);
+        self.close_popup(false);
     }
 
-    pub fn cancel_agent_settings(&mut self) {
-        self.close_agent_settings(true);
+    pub fn cancel_popup(&mut self) {
+        self.close_popup(true);
     }
 
-    fn close_agent_settings(&mut self, restore: bool) {
-        let Some(popup) = self.agent_popup.take() else {
+    fn close_popup(&mut self, restore: bool) {
+        let Some(popup) = self.sub_popup.take() else {
             return;
         };
         if restore {
-            self.restore_picker(popup.slot, popup.original);
+            match &popup {
+                SubPopup::Agent(agent) => self.restore_picker(agent.slot, agent.original.clone()),
+                SubPopup::Options(options) => {
+                    self.use_orchestrator = options.original.use_orchestrator;
+                    self.use_designer = options.original.use_designer;
+                    self.use_reviewer = options.original.use_reviewer;
+                    self.planned_launch = options.original.planned_launch;
+                    self.launch_time = options.original.launch_time.clone();
+                }
+            }
         }
-        self.field_index = popup.parent_field_index;
-        self.form_scroll = popup.parent_form_scroll;
+        let (parent_field_index, parent_form_scroll) = popup.parent_view();
+        self.field_index = parent_field_index;
+        self.form_scroll = parent_form_scroll;
         self.filter_error = None;
     }
 
@@ -1263,7 +1378,8 @@ impl ModalState {
             DialogField::Readonly => toggle_on_space(&mut self.readonly, key),
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
-            | DialogField::ReviewerAgentSettings => {}
+            | DialogField::ReviewerAgentSettings
+            | DialogField::TaskOptions => {}
             DialogField::UseOrchestrator => toggle_on_space(&mut self.use_orchestrator, key),
             DialogField::UseDesigner => toggle_on_space(&mut self.use_designer, key),
             DialogField::UseReviewer => toggle_on_space(&mut self.use_reviewer, key),
@@ -1422,6 +1538,7 @@ impl ModalState {
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings
+            | DialogField::TaskOptions
             | DialogField::Readonly
             | DialogField::UseOrchestrator
             | DialogField::UseDesigner
@@ -2027,8 +2144,8 @@ impl ModalState {
     }
 
     fn ensure_active_field_visible(&mut self) {
-        if let Some(popup) = self.agent_popup.as_mut() {
-            popup.form_scroll = popup.field_index.min(3);
+        if let Some(popup) = self.sub_popup.as_mut() {
+            popup.set_form_scroll(popup.field_index().min(popup.content_rows() - 1));
             return;
         }
         let fields = match self.modal {
@@ -2321,29 +2438,41 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
             name, task_count, ..
         } => render_delete_project(frame, app, modal, inner, name, *task_count, &mut hitboxes),
     }
-    if modal.agent_popup.is_some() {
-        hitboxes.clear();
-        render_agent_popup(frame, app, modal, area, &mut hitboxes);
+    match &modal.sub_popup {
+        Some(SubPopup::Agent(_)) => {
+            hitboxes.clear();
+            render_agent_popup(frame, app, modal, area, &mut hitboxes);
+        }
+        Some(SubPopup::Options(_)) => {
+            hitboxes.clear();
+            render_options_popup(frame, app, modal, area, &mut hitboxes);
+        }
+        None => {}
     }
     hitboxes
 }
 
-fn render_agent_popup(
+/// Everything a nested popup render needs beyond the shared chrome.
+struct SubPopupView<'a> {
+    title: String,
+    fields: &'a [DialogField],
+    scroll: usize,
+}
+
+/// Shared layout for the task form's nested popups: a centered panel whose
+/// content rows end above a Save/Cancel button row.
+fn render_sub_popup(
     frame: &mut Frame<'_>,
     app: &App,
     modal: &mut ModalState,
     parent_area: Rect,
+    view: SubPopupView<'_>,
     hitboxes: &mut Vec<Hitbox>,
 ) {
-    let Some(popup) = modal.agent_popup.as_ref() else {
-        return;
-    };
-    let slot = popup.slot;
-    let scroll = popup.form_scroll;
     let area = centered_percent(88, 90, parent_area);
     frame.render_widget(Clear, area);
     let block = Block::default()
-        .title(format!(" {} agent settings ", agent_slot_name(slot)))
+        .title(view.title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.focus))
         .style(Style::default().bg(app.theme.bg).fg(app.theme.fg));
@@ -2361,8 +2490,7 @@ fn render_agent_popup(
         height: button_height.min(inner.height.saturating_sub(content_height)),
         ..inner
     };
-    let fields = &agent_fields(slot)[..4];
-    let rows = selector_form_rows_from_scroll(modal, content.height, fields, scroll);
+    let rows = selector_form_rows_from_scroll(modal, content.height, view.fields, view.scroll);
     let mut y = content.y;
     for (field, height) in rows {
         let row = Rect {
@@ -2377,6 +2505,43 @@ fn render_agent_popup(
         y = y.saturating_add(height);
     }
     render_form_buttons(frame, app, modal, button_area, hitboxes);
+}
+
+fn render_agent_popup(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &mut ModalState,
+    parent_area: Rect,
+    hitboxes: &mut Vec<Hitbox>,
+) {
+    let Some(SubPopup::Agent(popup)) = modal.sub_popup.as_ref() else {
+        return;
+    };
+    let slot = popup.slot;
+    let view = SubPopupView {
+        title: format!(" {} agent settings ", agent_slot_name(slot)),
+        fields: &agent_fields(slot)[..4],
+        scroll: popup.form_scroll,
+    };
+    render_sub_popup(frame, app, modal, parent_area, view, hitboxes);
+}
+
+fn render_options_popup(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &mut ModalState,
+    parent_area: Rect,
+    hitboxes: &mut Vec<Hitbox>,
+) {
+    let Some(SubPopup::Options(popup)) = modal.sub_popup.as_ref() else {
+        return;
+    };
+    let view = SubPopupView {
+        title: " Task options ".to_string(),
+        fields: &TASK_OPTIONS_FIELDS[..5],
+        scroll: popup.form_scroll,
+    };
+    render_sub_popup(frame, app, modal, parent_area, view, hitboxes);
 }
 
 fn agent_slot_name(slot: AgentSlot) -> &'static str {
@@ -2915,6 +3080,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::AgentSettings
         | DialogField::DesignerAgentSettings
         | DialogField::ReviewerAgentSettings
+        | DialogField::TaskOptions
         | DialogField::UseOrchestrator
         | DialogField::UseDesigner
         | DialogField::UseReviewer
@@ -3264,6 +3430,7 @@ fn render_selector_field(
             area,
             "Reviewer agent settings",
         ),
+        DialogField::TaskOptions => render_options_launcher(frame, app, modal, area),
         DialogField::Backend => render_select_filtered(
             frame,
             app,
@@ -3674,6 +3841,38 @@ fn render_selector_field(
     }
 }
 
+/// A launcher row: bordered line summarizing a nested popup's staged values,
+/// opened with Enter or a click.
+fn render_launcher_row(
+    frame: &mut Frame<'_>,
+    app: &App,
+    modal: &ModalState,
+    field: DialogField,
+    area: Rect,
+    title: &str,
+    summary: &str,
+) {
+    let active = modal.active_field() == field || app.is_hovered(HitAction::ModalField(field));
+    let border = if active {
+        app.theme.focus
+    } else {
+        app.theme.border
+    };
+    let suffix = "  › Enter to configure";
+    let summary_width =
+        usize::from(area.width.saturating_sub(2)).saturating_sub(suffix.chars().count());
+    let label = format!("{}{}", truncate_display(summary, summary_width), suffix);
+    frame.render_widget(
+        Paragraph::new(label).block(
+            Block::default()
+                .title(format!(" {title} "))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border)),
+        ),
+        area,
+    );
+}
+
 fn render_agent_launcher(
     frame: &mut Frame<'_>,
     app: &App,
@@ -3686,12 +3885,6 @@ fn render_agent_launcher(
         AgentSlot::Primary => DialogField::AgentSettings,
         AgentSlot::Designer => DialogField::DesignerAgentSettings,
         AgentSlot::Reviewer => DialogField::ReviewerAgentSettings,
-    };
-    let active = modal.active_field() == field || app.is_hovered(HitAction::ModalField(field));
-    let border = if active {
-        app.theme.focus
-    } else {
-        app.theme.border
     };
     let values = [
         modal.backend_text_for(slot),
@@ -3710,18 +3903,41 @@ fn render_agent_launcher(
     } else {
         summary
     };
-    let suffix = "  › Enter to configure";
-    let summary_width =
-        usize::from(area.width.saturating_sub(2)).saturating_sub(suffix.chars().count());
-    let label = format!("{}{}", truncate_display(&summary, summary_width), suffix);
-    frame.render_widget(
-        Paragraph::new(label).block(
-            Block::default()
-                .title(format!(" {title} "))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(border)),
-        ),
+    render_launcher_row(frame, app, modal, field, area, title, &summary);
+}
+
+fn render_options_launcher(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
+    let mut parts = Vec::new();
+    if modal.use_orchestrator {
+        parts.push("orchestrator".to_string());
+    }
+    if modal.use_designer {
+        parts.push("designer".to_string());
+    }
+    if modal.use_reviewer {
+        parts.push("reviewer".to_string());
+    }
+    if modal.planned_launch {
+        let time = sanitize_terminal_text(&textarea_text(&modal.launch_time));
+        parts.push(if time.is_empty() {
+            "planned launch".to_string()
+        } else {
+            format!("launch at {time}")
+        });
+    }
+    let summary = if parts.is_empty() {
+        "off".to_string()
+    } else {
+        parts.join(" · ")
+    };
+    render_launcher_row(
+        frame,
+        app,
+        modal,
+        DialogField::TaskOptions,
         area,
+        "Options",
+        &summary,
     );
 }
 

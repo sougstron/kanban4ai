@@ -2213,6 +2213,8 @@ impl App {
                     modal.focus_field(field);
                     if let Some(slot) = ModalState::launcher_slot(field) {
                         modal.open_agent_settings(slot);
+                    } else if field == DialogField::TaskOptions {
+                        modal.open_options();
                     }
                 }
             }
@@ -5284,8 +5286,8 @@ impl App {
             }
         } else {
             match key.code {
-                KeyCode::Esc if modal.agent_popup_slot().is_some() => {
-                    modal.cancel_agent_settings();
+                KeyCode::Esc if modal.popup_open() => {
+                    modal.cancel_popup();
                     self.modal = Some(modal);
                     return Ok(true);
                 }
@@ -5298,7 +5300,7 @@ impl App {
                 // still reach the Save/Cancel buttons from any field.
                 KeyCode::Left | KeyCode::Right
                     if matches!(modal.modal, Modal::Settings)
-                        && modal.agent_popup_slot().is_none()
+                        && !modal.popup_open()
                         && !field_consumes_horizontal(modal.active_field()) =>
                 {
                     let current = modal.settings_tab;
@@ -5320,11 +5322,11 @@ impl App {
                         modal.focus_field(DialogField::Confirm);
                     }
                 }
-                KeyCode::Enter if modal.submit_on_enter() && modal.agent_popup_slot().is_some() => {
-                    modal.save_agent_settings();
+                KeyCode::Enter if modal.submit_on_enter() && modal.popup_open() => {
+                    modal.save_popup();
                 }
-                KeyCode::Enter if modal.cancel_on_enter() && modal.agent_popup_slot().is_some() => {
-                    modal.cancel_agent_settings();
+                KeyCode::Enter if modal.cancel_on_enter() && modal.popup_open() => {
+                    modal.cancel_popup();
                 }
                 KeyCode::Enter if modal.submit_on_enter() => {
                     return self.submit_modal(modal).map(|_| true);
@@ -5344,6 +5346,9 @@ impl App {
                         .unwrap_or(AgentSlot::Primary);
                     modal.open_agent_settings(slot);
                 }
+                KeyCode::Enter if modal.active_field() == DialogField::TaskOptions => {
+                    modal.open_options();
+                }
                 // Plain Enter commits the focused field and walks to the next
                 // one, exactly like Tab. A filtered selector with no match
                 // keeps focus and turns red instead.
@@ -5353,10 +5358,9 @@ impl App {
                     }
                 }
                 KeyCode::Char('s')
-                    if key.modifiers == KeyModifiers::CONTROL
-                        && modal.agent_popup_slot().is_some() =>
+                    if key.modifiers == KeyModifiers::CONTROL && modal.popup_open() =>
                 {
-                    modal.save_agent_settings();
+                    modal.save_popup();
                 }
                 KeyCode::Char('s')
                     if key.modifiers == KeyModifiers::CONTROL && modal.submit_on_ctrl_s() =>
@@ -5410,10 +5414,10 @@ impl App {
                 }
             };
         }
-        if modal.agent_popup_slot().is_some() {
+        if modal.popup_open() {
             match button {
-                ModalButton::Save | ModalButton::Yes => modal.save_agent_settings(),
-                ModalButton::Cancel | ModalButton::No => modal.cancel_agent_settings(),
+                ModalButton::Save | ModalButton::Yes => modal.save_popup(),
+                ModalButton::Cancel | ModalButton::No => modal.cancel_popup(),
             }
             self.modal = Some(modal);
             return Ok(());
@@ -5598,6 +5602,7 @@ impl App {
                     PlannedLaunchInput::None => None,
                     PlannedLaunchInput::Some(at) => Some(at),
                     PlannedLaunchInput::Invalid => {
+                        modal.open_options();
                         modal.focus_field(DialogField::LaunchTime);
                         modal.error =
                             Some("Launch time must be HH:MM (local time), e.g. 09:30".to_string());
@@ -5647,6 +5652,7 @@ impl App {
                     PlannedLaunchInput::None => Some(None),
                     PlannedLaunchInput::Some(at) => Some(Some(at)),
                     PlannedLaunchInput::Invalid => {
+                        modal.open_options();
                         modal.focus_field(DialogField::LaunchTime);
                         modal.error =
                             Some("Launch time must be HH:MM (local time), e.g. 09:30".to_string());
@@ -6539,6 +6545,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::AgentSettings
         | DialogField::DesignerAgentSettings
         | DialogField::ReviewerAgentSettings
+        | DialogField::TaskOptions
         | DialogField::Readonly
         | DialogField::UseOrchestrator
         | DialogField::UseDesigner
