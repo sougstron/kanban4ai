@@ -5423,6 +5423,11 @@ pub(crate) fn safe_session_component(value: &str) -> String {
 }
 
 pub fn sort_tasks(tasks: &mut [Task], by: &str, order: &str) {
+    if by == "updated_chains" {
+        sort_tasks(tasks, "updated", "desc");
+        sort_todo_chains(tasks);
+        return;
+    }
     if by == "completed" {
         let descending = order == "desc";
         tasks.sort_by(|a, b| {
@@ -5461,6 +5466,123 @@ pub fn sort_tasks(tasks: &mut [Task], by: &str, order: &str) {
     }
     if order == "desc" {
         tasks.reverse();
+    }
+}
+
+/// Group To Do chains using the whole board, including ancestors in other
+/// columns. Parent links group orchestrated siblings but are not run-order
+/// edges: the parent join can itself depend on its children.
+fn sort_todo_chains(tasks: &mut [Task]) {
+    let count = tasks.len();
+    let ids = tasks
+        .iter()
+        .enumerate()
+        .map(|(i, task)| (task.id.as_str(), i))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut neighbors = vec![Vec::new(); count];
+    let mut downstream = vec![Vec::new(); count];
+    let mut pending = vec![0usize; count];
+    for (i, task) in tasks.iter().enumerate() {
+        for id in task
+            .depends_on
+            .iter()
+            .map(String::as_str)
+            .chain(task.chained_to.as_deref())
+            .chain(task.parent_task.as_deref())
+        {
+            if let Some(&other) = ids.get(id) {
+                neighbors[i].push(other);
+                neighbors[other].push(i);
+            }
+        }
+        for id in task
+            .depends_on
+            .iter()
+            .map(String::as_str)
+            .chain(task.chained_to.as_deref())
+        {
+            if let Some(&other) = ids.get(id)
+                && !matches!(tasks[other].status, TaskStatus::Review | TaskStatus::Done)
+                && !matches!(task.status, TaskStatus::Review | TaskStatus::Done)
+            {
+                downstream[other].push(i);
+                pending[i] += 1;
+            }
+        }
+    }
+    let mut groups = vec![usize::MAX; count];
+    let mut newest = Vec::new();
+    let mut sizes = Vec::new();
+    let mut stack = Vec::new();
+    for i in 0..count {
+        if groups[i] != usize::MAX {
+            continue;
+        }
+        let group = newest.len();
+        newest.push(tasks[i].updated_at);
+        sizes.push(0usize);
+        groups[i] = group;
+        stack.push(i);
+        while let Some(node) = stack.pop() {
+            sizes[group] += 1;
+            newest[group] = newest[group].max(tasks[node].updated_at);
+            for &other in &neighbors[node] {
+                if groups[other] == usize::MAX {
+                    groups[other] = group;
+                    stack.push(other);
+                }
+            }
+        }
+    }
+    let mut depth = vec![0usize; count];
+    let mut ready = std::collections::VecDeque::new();
+    for (i, &remaining) in pending.iter().enumerate() {
+        if remaining == 0 {
+            ready.push_back(i);
+        }
+    }
+    while let Some(node) = ready.pop_front() {
+        for &next in &downstream[node] {
+            depth[next] = depth[next].max(depth[node] + 1);
+            pending[next] -= 1;
+            if pending[next] == 0 {
+                ready.push_back(next);
+            }
+        }
+    }
+    // Malformed legacy cycles remain visible, after runnable graph nodes.
+    for (i, &remaining) in pending.iter().enumerate() {
+        if remaining != 0 {
+            depth[i] = usize::MAX;
+        }
+    }
+    let slots = tasks
+        .iter()
+        .enumerate()
+        .filter_map(|(i, task)| (task.status == TaskStatus::Todo).then_some(i))
+        .collect::<Vec<_>>();
+    let mut ordered = slots.clone();
+    ordered.sort_by(|&a, &b| {
+        let ga = groups[a];
+        let gb = groups[b];
+        (sizes[ga] == 1)
+            .cmp(&(sizes[gb] == 1))
+            .then_with(|| newest[gb].cmp(&newest[ga]))
+            .then_with(|| ga.cmp(&gb))
+            .then_with(|| depth[a].cmp(&depth[b]))
+            // Input is already newest-first with a numeric-id tie breaker.
+            .then_with(|| a.cmp(&b))
+    });
+    let mut destinations = (0..count).collect::<Vec<_>>();
+    for (&slot, original) in slots.iter().zip(ordered) {
+        destinations[original] = slot;
+    }
+    for i in 0..count {
+        while destinations[i] != i {
+            let target = destinations[i];
+            tasks.swap(i, target);
+            destinations.swap(i, target);
+        }
     }
 }
 

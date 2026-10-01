@@ -185,6 +185,7 @@ fn task_sort_args(config: &BoardConfig) -> (&'static str, &'static str) {
     match config.tui.get("task_sort").and_then(|v| v.as_str()) {
         Some("updated_at_asc") => ("updated", "asc"),
         Some("updated_at_desc" | "completion_date") => ("updated", "desc"),
+        Some("updated_at_desc_chains") => ("updated", "desc"),
         Some("task_number_desc") => ("id", "desc"),
         _ => ("id", "asc"),
     }

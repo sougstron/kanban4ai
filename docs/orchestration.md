@@ -155,8 +155,10 @@ hold its slot until the `session_heartbeat_timeout` (30 min) — and runs
 **Candidate order is the board's own sort.** `tui.task_sort` is mapped onto the
 same `sort_tasks(by, order)` call the board screen uses (`task_number` →
 id/asc, `task_number_desc` → id/desc, `updated_at_asc`/`updated_at_desc` →
-updated/asc|desc, legacy `completion_date` → updated/desc, anything unknown →
-id/asc). Changing the board sort therefore changes the queue priority. Only
+updated/asc|desc, `updated_at_desc_chains` → updated/desc for the In Progress
+queue, legacy `completion_date` → updated/desc, anything unknown → id/asc).
+The new chain mode groups only To Do cards; it does not change the dispatcher’s
+In Progress newest-first order. Changing the board sort therefore changes the queue priority. Only
 queued tasks with no pending `restart_at` in the future are candidates.
 
 **Caps.** For each candidate the dispatcher resolves the launch settings and

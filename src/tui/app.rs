@@ -69,6 +69,7 @@ const TASK_SORT_NUMBER: &str = "task_number";
 const TASK_SORT_NUMBER_DESC: &str = "task_number_desc";
 const TASK_SORT_UPDATED_ASC: &str = "updated_at_asc";
 const TASK_SORT_UPDATED_DESC: &str = "updated_at_desc";
+const TASK_SORT_UPDATED_CHAINS: &str = "updated_at_desc_chains";
 const TASK_SORT_LEGACY_COMPLETION: &str = "completion_date";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4234,6 +4235,10 @@ impl App {
                 label: "Updated (newest first)".to_string(),
                 value: Some(TASK_SORT_UPDATED_DESC.to_string()),
             },
+            SelectOption {
+                label: "Updated (newest chains first)".to_string(),
+                value: Some(TASK_SORT_UPDATED_CHAINS.to_string()),
+            },
         ]);
         self.refresh_backend_options_with_config(modal, &config);
     }
@@ -5969,6 +5974,7 @@ impl BoardSnapshot {
         let (sort_by, order) = match task_sort {
             TASK_SORT_UPDATED_ASC => ("updated", "asc"),
             TASK_SORT_UPDATED_DESC => ("updated", "desc"),
+            TASK_SORT_UPDATED_CHAINS => ("updated_chains", "desc"),
             TASK_SORT_NUMBER_DESC => ("id", "desc"),
             _ => ("id", "asc"),
         };
@@ -6675,6 +6681,7 @@ pub(super) fn normalize_task_sort(value: &str) -> &'static str {
     match value {
         TASK_SORT_NUMBER_DESC => TASK_SORT_NUMBER_DESC,
         TASK_SORT_UPDATED_ASC => TASK_SORT_UPDATED_ASC,
+        TASK_SORT_UPDATED_CHAINS => TASK_SORT_UPDATED_CHAINS,
         TASK_SORT_UPDATED_DESC | TASK_SORT_LEGACY_COMPLETION => TASK_SORT_UPDATED_DESC,
         _ => TASK_SORT_NUMBER,
     }
