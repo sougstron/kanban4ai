@@ -1,4 +1,67 @@
-# kanban4ai 0.6.14
+# kanban4ai 0.6.15
+
+Chain-aware board sorting, a reworked limits row with Kimi support and
+correct cache freshness, image paste into review edits, and drafts that
+survive closing the task detail.
+
+## Added
+
+- **Chain-aware task sort** (`updated_at_desc_chains`,
+  `core/operations.rs`, `core/scheduler.rs`, `tui/app.rs`,
+  `docs/config.md`, `docs/orchestration.md`). New `task_sort` mode —
+  **Updated (newest chains first)** in Project Settings. Other columns stay
+  newest-first; in To Do, connected chains (`chained_to`,
+  `depends_on` / `parent_task`) come before standalone tasks, each group
+  ordered by its most recently modified member (including members in other
+  columns). Within a group, ready tasks lead, then successive dependency
+  layers; ties fall back to newest-first with numeric task IDs. Invalid
+  cyclic dependencies remain visible after runnable nodes. The dispatcher
+  keeps its own newest-first queue order — the mode groups only To Do cards.
+- **Kimi limits** (`core/limits.rs`, `tui/limits.rs`,
+  `docs/limits.md`). The limits row reads Kimi Code subscription usage from
+  omp/kimi-cli logins alongside the existing providers.
+- **Image paste into review edits** (`src/agent/prompt.rs`,
+  `src/core/operations.rs`, `src/core/thread.rs`, `docs/agent-io.md`).
+  Ctrl+V pastes a screenshot into the review editor. Agent prompts point
+  `.kanban/assets` links at absolute board paths so worktree agents can open
+  pasted images, and task cleanup removes images referenced from review
+  edits and the thread.
+
+## Changed
+
+- **Two-line limits row** (`tui/limits.rs`). Each provider is a block: name
+  and short (5h-style) windows on the upper line, weekly/monthly windows
+  stacked below. Single-kind providers stay level with their name; the row
+  collapses to one line when nobody has both.
+- **Draft persistence on detail close** (`tui/app.rs`,
+  `src/core/models.rs`). Closing the task detail (or switching questions)
+  flushes in-progress text: unsaved review-editor text is written to the
+  task's review_edits buffer under the same Review-only gate as Ctrl+S, and
+  the typed answer is stashed as a `draft` on the open question message
+  (new `Message` field, skipped when empty so Python-format round-trip
+  stays lossless) and restored into the answer panel on reopen.
+
+## Fixed
+
+- **Limits cache freshness** (`core/limits.rs`). Per-provider taps used to
+  stamp `fetched_at = now` while updating a single provider, so frequent
+  codex runs kept the cached snapshot looking fresh and the full fetch never
+  ran — a cache written before gemini existed never gained the gemini row.
+  Partial updates now keep `fetched_at`, and a snapshot missing a known
+  provider counts as stale.
+
+## Verification coverage
+
+- `updated_at_desc_chains_groups_connected_tasks_newest_group_first`
+- `chain_sort_ready_layers_and_cycles`
+- `partial_provider_update_keeps_snapshot_freshness`
+- `snapshot_missing_a_known_provider_counts_as_stale`
+- limits row two-line snapshot tests
+- draft persistence across close_detail, question switching, and the
+  double-Ctrl+C quit path
+- pasted-image prompt links and task cleanup of referenced assets
+
+
 
 The limits row grows a Gemini segment: Code Assist quota when gemini-cli is
 signed in, and the spend pi logged for a Gemini API key.
