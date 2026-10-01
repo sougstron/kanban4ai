@@ -7,7 +7,7 @@ A fast native local-first kanban board CLI and TUI designed for AI coding agents
 - Linux or another Unix-like environment
 - Rust 1.88 or newer when building from source
 - Optional integrations: `tmux`, `notify-send`, `wl-paste` or `xclip`, `curl`
-  (subscription limits for claude, codex, grok, z.ai, and synthetic)
+  (subscription limits for claude, codex, grok, z.ai, synthetic, and Kimi Code)
 - Optional agent backends: opencode, Claude Code, and/or Codex CLI
 
 ## Install
@@ -237,7 +237,7 @@ window and the time until it resets. Providers you are not signed in to are
 left out. The numbers refresh in the background (claude, grok, z.ai, and
 synthetic over HTTPS via `curl`). Clicking any provider segment refreshes that
 provider on the spot — claude force-polls its usage endpoint, the grok CLI
-renews its login token, and z.ai / synthetic re-fetch over HTTPS. A window
+renews its login token, and z.ai / synthetic / kimi re-fetch over HTTPS. A window
 whose reset time has passed is dropped rather than shown frozen (synthetic's
 tick-regenerating quotas keep their seat until the next poll), and a provider
 with nothing current left reads `stale`. `kanban4ai limits` prints the same

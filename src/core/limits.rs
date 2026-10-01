@@ -54,6 +54,14 @@
 //!   `subscription.renewsAt`) and the weekly credit window
 //!   (`weeklyTokenLimit.percentRemaining`); both regenerate in small ticks, so
 //!   the reset time is the next capacity gain, not a hard rollover.
+//! - **kimi**: the Kimi Code subscription. `GET /coding/v1/usages` on
+//!   api.kimi.com with the OAuth access token omp keeps in
+//!   `~/.omp/agent/agent.db` (`auth_credentials`, provider `kimi-code`, read
+//!   through the `sqlite3` CLI) or kimi-cli in
+//!   `~/.kimi/credentials/kimi-code.json`. Reports the 5-hour window and the
+//!   monthly `mon` (total) / `code` quotas. Tokens are never refreshed here —
+//!   rotating them would fight omp — so while the token has expired the
+//!   windows omp itself last polled (`usage_history`) are shown with their age.
 //! - **gemini**: the Code Assist quota (`retrieveUserQuota`) when gemini-cli
 //!   is signed in, plus the spend pi logged for its Gemini API key — the
 //!   Gemini API has no quota endpoint for keys — as `24h` / `30d` spend
@@ -82,7 +90,7 @@
 //! interval the background refresh honors), running the grok CLI renews
 //! the short-lived token in `~/.grok/auth.json` that the billing fetch uses
 //! (the background fetch does the same when `expires_at` has passed or the
-//! endpoint answers 401), and zai / synthetic simply re-fetch over HTTPS
+//! endpoint answers 401), and zai / synthetic / kimi simply re-fetch over HTTPS
 //! (their keys are long-lived, so no renewal step is needed). Each runs on a
 //! background thread and merges into the same cache, so the row updates on
 //! the next tick. Codex re-asks its app-server for the live numbers (see
@@ -110,7 +118,15 @@ use crate::core::storage::atomic_write_text;
 /// Providers rendered on the board and listed by `kanban limits`, in display
 /// order. `codex` is the OpenAI subscription: it covers the codex CLI and
 /// opencode's `openai/*` models alike, since both spend the same quota.
-pub const PROVIDERS: [&str; 6] = ["claude", "codex", "grok", "zai", "synthetic", "gemini"];
+pub const PROVIDERS: [&str; 7] = [
+    "claude",
+    "codex",
+    "grok",
+    "zai",
+    "synthetic",
+    "kimi",
+    "gemini",
+];
 
 /// Fallback refresh interval when no board config is available (the projects
 /// screen has no project, so no `.kanban/config.yaml` to read).
@@ -138,6 +154,8 @@ pub fn provider_for(backend: &str, model: Option<&str>) -> Option<&'static str> 
                 Some("zai")
             } else if model.starts_with("synthetic") {
                 Some("synthetic")
+            } else if model.starts_with("kimi-code") {
+                Some("kimi")
             } else if model.starts_with("xai") || model.starts_with("grok") {
                 Some("grok")
             } else if model.starts_with("google") || model.starts_with("gemini") {
@@ -1658,6 +1676,297 @@ pub fn parse_synthetic_quotas(value: &Value) -> Vec<LimitWindow> {
 }
 
 // ---------------------------------------------------------------------------
+// kimi — the Kimi Code subscription, signed in through omp or kimi-cli.
+// ---------------------------------------------------------------------------
+
+const KIMI_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
+
+/// How long `sqlite3` may take to read omp's credential store.
+const SQLITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// omp's agent directory, whose `agent.db` holds its OAuth logins and the
+/// usage it last polled.
+fn omp_agent_db() -> Option<PathBuf> {
+    Some(home_dir()?.join(".omp").join("agent").join("agent.db"))
+}
+
+/// kimi-cli's stored OAuth login (`$KIMI_SHARE_DIR` respected).
+fn kimi_cli_credentials_path() -> Option<PathBuf> {
+    let share = std::env::var_os("KIMI_SHARE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| Some(home_dir()?.join(".kimi")))?;
+    Some(share.join("credentials").join("kimi-code.json"))
+}
+
+/// Run one read-only query against an SQLite file through the `sqlite3` CLI
+/// (no SQLite is linked into the crate) and return its `-json` rows. `None`
+/// when `sqlite3` is missing, fails, or the query matches nothing.
+fn sqlite_json_rows(db: &Path, query: &str) -> Option<Vec<Value>> {
+    let mut child = Command::new("sqlite3")
+        .arg("-readonly")
+        .arg("-json")
+        .arg(db)
+        .arg(query)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+        text
+    });
+    let status = wait_with_timeout(&mut child, SQLITE_TIMEOUT).ok()??;
+    let text = reader.join().ok()?;
+    if !status.success() || text.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str::<Vec<Value>>(&text)
+        .ok()
+        .filter(|rows| !rows.is_empty())
+}
+
+/// A Kimi Code OAuth access token and its expiry (Unix seconds).
+#[derive(Debug, Clone, PartialEq)]
+struct KimiToken {
+    access: String,
+    expires_at: Option<i64>,
+}
+
+impl KimiToken {
+    fn is_expired(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|at| at <= now + 30)
+    }
+}
+
+/// The `kimi-code` login omp stores in `auth_credentials.data` (`access`,
+/// `expires` in Unix milliseconds).
+fn parse_omp_kimi_credential(data: &Value) -> Option<KimiToken> {
+    let access = data.get("access")?.as_str()?.to_string();
+    (!access.is_empty()).then(|| KimiToken {
+        access,
+        expires_at: data
+            .get("expires")
+            .and_then(Value::as_i64)
+            .map(|millis| millis / 1000),
+    })
+}
+
+/// kimi-cli's `kimi-code.json` (`access_token`, `expires_at` in Unix seconds,
+/// possibly fractional).
+fn parse_kimi_cli_credential(value: &Value) -> Option<KimiToken> {
+    let access = value.get("access_token")?.as_str()?.to_string();
+    (!access.is_empty()).then(|| KimiToken {
+        access,
+        expires_at: value
+            .get("expires_at")
+            .and_then(Value::as_f64)
+            .map(|secs| secs as i64),
+    })
+}
+
+fn omp_kimi_token(db: &Path) -> Option<KimiToken> {
+    let rows = sqlite_json_rows(
+        db,
+        "SELECT data FROM auth_credentials WHERE provider = 'kimi-code' \
+         AND credential_type = 'oauth' AND disabled_cause IS NULL \
+         ORDER BY updated_at DESC LIMIT 1",
+    )?;
+    let data: Value = serde_json::from_str(rows.first()?.get("data")?.as_str()?).ok()?;
+    parse_omp_kimi_credential(&data)
+}
+
+fn kimi_cli_token() -> Option<KimiToken> {
+    let text = fs::read_to_string(kimi_cli_credentials_path()?).ok()?;
+    parse_kimi_cli_credential(&serde_json::from_str(&text).ok()?)
+}
+
+/// The windows omp last polled for its kimi login (`usage_history`, newest
+/// row per limit), and when it polled them. Used when no live token is at
+/// hand: omp refreshes its token itself, and kanban never rotates it behind
+/// omp's back.
+fn omp_kimi_history(db: &Path) -> Option<(Vec<LimitWindow>, i64)> {
+    let rows = sqlite_json_rows(
+        db,
+        "SELECT label, used_fraction, resets_at, recorded_at FROM usage_history \
+         WHERE id IN (SELECT MAX(id) FROM usage_history \
+         WHERE provider = 'kimi-code' GROUP BY limit_id) ORDER BY limit_id",
+    )?;
+    let windows = parse_omp_kimi_history(&rows);
+    let observed = rows
+        .iter()
+        .filter_map(|row| row.get("recorded_at").and_then(Value::as_i64))
+        .max()?
+        / 1000;
+    (!windows.is_empty()).then_some((windows, observed))
+}
+
+/// omp's `usage_history` rows for kimi: `used_fraction` 0..1, `resets_at`
+/// Unix milliseconds, labelled `5h limit` / `Monthly total` / `Monthly code`.
+pub fn parse_omp_kimi_history(rows: &[Value]) -> Vec<LimitWindow> {
+    rows.iter()
+        .filter_map(|row| {
+            let used = row.get("used_fraction")?.as_f64()? * 100.0;
+            let label = row.get("label")?.as_str()?.to_ascii_lowercase();
+            let label = if label.contains("code") {
+                "code".to_string()
+            } else if label.contains("month") || label.contains("total") {
+                "mon".to_string()
+            } else {
+                label
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("window")
+                    .to_string()
+            };
+            let resets_at = row
+                .get("resets_at")
+                .and_then(Value::as_i64)
+                .map(|millis| millis / 1000);
+            Some(LimitWindow::new(label, used, resets_at))
+        })
+        .collect()
+}
+
+fn fetch_kimi() -> ProviderLimits {
+    let now = now_secs();
+    let omp_db = omp_agent_db().filter(|path| path.exists());
+    let token = omp_db
+        .as_deref()
+        .and_then(omp_kimi_token)
+        .filter(|token| !token.is_expired(now))
+        .or_else(|| kimi_cli_token().filter(|token| !token.is_expired(now)));
+    let live = token.map(|token| {
+        let headers = [
+            ("Authorization", format!("Bearer {}", token.access)),
+            ("Accept", "application/json".to_string()),
+        ];
+        http_get_json(KIMI_USAGE_URL, &headers).map(|value| parse_kimi_usage(&value))
+    });
+    let live_error = match live {
+        Some(Ok(windows)) if !windows.is_empty() => {
+            return ProviderLimits {
+                windows,
+                ..ProviderLimits::new("kimi", ProviderState::Ready)
+            };
+        }
+        Some(Err(err)) => Some(err),
+        _ => None,
+    };
+    // No live read: what omp polled last still beats nothing.
+    if let Some(entry) = omp_db.as_deref().and_then(kimi_from_history) {
+        return entry;
+    }
+    if let Some(err) = live_error {
+        return ProviderLimits::new("kimi", err.into_state());
+    }
+    let signed_in = omp_db.as_deref().is_some_and(|db| {
+        sqlite_json_rows(
+            db,
+            "SELECT 1 AS x FROM auth_credentials WHERE provider = 'kimi-code' LIMIT 1",
+        )
+        .is_some()
+    }) || kimi_cli_credentials_path().is_some_and(|path| path.exists());
+    if signed_in {
+        ProviderLimits::new("kimi", ProviderState::Unavailable("no quota".to_string()))
+    } else {
+        ProviderLimits::new("kimi", ProviderState::NotConfigured)
+    }
+}
+
+fn kimi_from_history(db: &Path) -> Option<ProviderLimits> {
+    let (windows, observed_at) = omp_kimi_history(db)?;
+    Some(ProviderLimits {
+        windows,
+        observed_at: Some(observed_at),
+        ..ProviderLimits::new("kimi", ProviderState::Ready)
+    })
+}
+
+/// Read the Kimi Code usage response. `usages` names each window
+/// (`limit_5h`, `limit_month_total`, `limit_month_code`) with a `used_ratio`
+/// and `reset_time`; without it, `limits[]` carries the 5-hour window as
+/// `window.duration`/`timeUnit` plus `detail.limit`/`remaining`/`resetTime`
+/// (string numbers), and `usage` the overall quota.
+pub fn parse_kimi_usage(value: &Value) -> Vec<LimitWindow> {
+    fn number(value: Option<&Value>) -> Option<f64> {
+        let value = value?;
+        value
+            .as_f64()
+            .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+    }
+    fn reset(entry: &Value) -> Option<i64> {
+        ["reset_time", "resetTime", "reset_at", "resetAt"]
+            .iter()
+            .find_map(|key| entry.get(*key)?.as_str().and_then(parse_rfc3339))
+    }
+    fn detail_used(detail: &Value) -> Option<f64> {
+        let limit = number(detail.get("limit")).filter(|limit| *limit > 0.0)?;
+        let used = number(detail.get("used"))
+            .or_else(|| number(detail.get("remaining")).map(|left| limit - left))?;
+        Some(used / limit * 100.0)
+    }
+
+    if let Some(usages) = value.get("usages").and_then(Value::as_object) {
+        let windows: Vec<LimitWindow> = usages
+            .iter()
+            .filter_map(|(key, entry)| {
+                let used = number(entry.get("used_ratio"))? * 100.0;
+                let label = match key.trim_start_matches("limit_") {
+                    "month_total" => "mon".to_string(),
+                    "month_code" => "code".to_string(),
+                    other => other.to_string(),
+                };
+                Some(LimitWindow::new(label, used, reset(entry)))
+            })
+            .collect();
+        if !windows.is_empty() {
+            return windows;
+        }
+    }
+
+    let mut windows = Vec::new();
+    for item in value
+        .get("limits")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let detail = item.get("detail").unwrap_or(item);
+        let Some(used) = detail_used(detail) else {
+            continue;
+        };
+        let window = item.get("window");
+        let duration = number(window.and_then(|w| w.get("duration"))).unwrap_or(0.0) as i64;
+        let unit = window
+            .and_then(|w| w.get("timeUnit"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        let minutes = if unit.contains("MINUTE") {
+            duration
+        } else if unit.contains("HOUR") {
+            duration * 60
+        } else if unit.contains("DAY") {
+            duration * 1_440
+        } else if unit.contains("WEEK") {
+            duration * 10_080
+        } else {
+            0
+        };
+        windows.push(LimitWindow::new(window_label(minutes), used, reset(detail)));
+    }
+    if let Some(summary) = value.get("usage")
+        && let Some(used) = detail_used(summary)
+    {
+        windows.push(LimitWindow::new("7d", used, reset(summary)));
+    }
+    windows
+}
+
+// ---------------------------------------------------------------------------
 // gemini — Code Assist quota when gemini-cli is signed in, plus the spend pi
 // logs for its Gemini API key (which has no server-side quota to read).
 // ---------------------------------------------------------------------------
@@ -2215,6 +2524,7 @@ pub fn refresh_provider_now(provider: &str) {
         "claude" => resolve_claude(cached().as_deref(), true),
         "zai" => fetch_zai(),
         "synthetic" => fetch_synthetic(),
+        "kimi" => fetch_kimi(),
         "gemini" => fetch_gemini(),
         _ => return,
     };
@@ -2270,6 +2580,7 @@ pub fn fetch_all(force: bool) -> LimitsSnapshot {
                 fetch_grok(),
                 fetch_zai(),
                 fetch_synthetic(),
+                fetch_kimi(),
                 fetch_gemini(),
             ],
             now,
@@ -2809,6 +3120,77 @@ mod tests {
         fs::write(&path, r#"{"openai":{"type":"oauth"}}"#).unwrap();
         assert_eq!(synthetic_key_from_store(&path), None);
         assert!(synthetic_key_from_store(&dir.path().join("nope.json")).is_none());
+    }
+
+    #[test]
+    fn kimi_usage_reads_the_named_windows() {
+        let value = json!({
+            "limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                        "detail": {"limit": "100", "remaining": "80",
+                                   "resetTime": "2026-10-01T08:51:23.700Z"}}],
+            "usages": {
+                "limit_5h": {"used_ratio": 0.25, "reset_time": "2026-10-01T08:51:23Z"},
+                "limit_month_total": {"used_ratio": 0.1, "reset_time": "2026-11-02T00:00:00Z"},
+                "limit_month_code": {"used_ratio": 0, "reset_time": "2026-11-02T00:00:00Z"}
+            }
+        });
+        let windows = parse_kimi_usage(&value);
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0].label, "5h");
+        assert_eq!(windows[0].remaining_percent, 75.0);
+        assert_eq!(windows[0].resets_at, parse_rfc3339("2026-10-01T08:51:23Z"));
+        assert_eq!(windows[1].label, "mon");
+        assert!((windows[1].remaining_percent - 90.0).abs() < 1e-9);
+        assert_eq!(windows[2].label, "code");
+        assert_eq!(windows[2].remaining_percent, 100.0);
+    }
+
+    #[test]
+    fn kimi_usage_falls_back_to_the_limits_array() {
+        let value = json!({
+            "usage": {"limit": "1000", "used": "250", "resetTime": "2026-10-05T00:00:00Z"},
+            "limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                        "detail": {"limit": "100", "remaining": "80",
+                                   "resetTime": "2026-10-01T08:51:23.700Z"}}]
+        });
+        let windows = parse_kimi_usage(&value);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "5h");
+        assert!((windows[0].remaining_percent - 80.0).abs() < 1e-9);
+        assert_eq!(windows[1].label, "7d");
+        assert_eq!(windows[1].remaining_percent, 75.0);
+        assert!(parse_kimi_usage(&json!({"error": "unauthorized"})).is_empty());
+    }
+
+    #[test]
+    fn kimi_credentials_read_omp_and_kimi_cli_shapes() {
+        let omp = json!({"access": "tok", "refresh": "r", "expires": 1_790_836_230_591_i64});
+        let token = parse_omp_kimi_credential(&omp).unwrap();
+        assert_eq!(token.access, "tok");
+        assert_eq!(token.expires_at, Some(1_790_836_230));
+        assert!(token.is_expired(1_790_836_230));
+        assert!(!token.is_expired(1_790_836_000));
+        let cli = json!({"access_token": "abc", "expires_at": 1_790_836_230.5});
+        assert_eq!(
+            parse_kimi_cli_credential(&cli).unwrap().expires_at,
+            Some(1_790_836_230)
+        );
+        assert!(parse_omp_kimi_credential(&json!({"access": ""})).is_none());
+    }
+
+    #[test]
+    fn kimi_history_rows_map_to_board_labels() {
+        let rows = vec![
+            json!({"label": "5h limit", "used_fraction": 0.4, "resets_at": 1_790_844_683_700_i64, "recorded_at": 1}),
+            json!({"label": "Monthly total", "used_fraction": 0.0, "resets_at": 1_793_577_600_000_i64, "recorded_at": 2}),
+            json!({"label": "Monthly code", "used_fraction": null, "resets_at": null, "recorded_at": 2}),
+        ];
+        let windows = parse_omp_kimi_history(&rows);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "5h");
+        assert!((windows[0].remaining_percent - 60.0).abs() < 1e-9);
+        assert_eq!(windows[0].resets_at, Some(1_790_844_683));
+        assert_eq!(windows[1].label, "mon");
     }
 
     #[test]
@@ -3597,6 +3979,15 @@ mod tests {
         assert_eq!(
             provider_for("opencode", Some("synthetic/foo")),
             Some("synthetic")
+        );
+        assert_eq!(
+            provider_for("omp", Some("kimi-code/kimi-for-coding")),
+            Some("kimi")
+        );
+        // opencode-go's kimi models spend opencode's plan, not Kimi Code's.
+        assert_eq!(
+            provider_for("opencode", Some("opencode-go/kimi-k2.7-code")),
+            None
         );
         assert_eq!(
             provider_for("opencode", Some("xai-oauth/grok-4.5")),

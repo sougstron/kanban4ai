@@ -9109,7 +9109,7 @@ fn limits_row_registers_refresh_hitboxes_on_every_provider() {
             .into(),
     }));
 
-    let lines = rendered_lines(&mut app, 120, 28);
+    let lines = rendered_lines(&mut app, 160, 28);
     let row_index = lines.len() - 2;
     let row_y = row_index as u16;
     let row_text = &lines[row_index];
