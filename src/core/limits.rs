@@ -58,8 +58,9 @@
 //!   api.kimi.com with the OAuth access token omp keeps in
 //!   `~/.omp/agent/agent.db` (`auth_credentials`, provider `kimi-code`, read
 //!   through the `sqlite3` CLI) or kimi-cli in
-//!   `~/.kimi/credentials/kimi-code.json`. Reports the 5-hour window and the
-//!   monthly `mon` (total) / `code` quotas. Tokens are never refreshed here —
+//!   `~/.kimi/credentials/kimi-code.json`. The detailed `limits[]` row is
+//!   authoritative for the 5-hour window; `usages` supplies the monthly
+//!   `mon` (total) / `code` quotas. Tokens are never refreshed here —
 //!   rotating them would fight omp — so while the token has expired the
 //!   windows omp itself last polled (`usage_history`) are shown with their age.
 //! - **gemini**: the Code Assist quota (`retrieveUserQuota`) when gemini-cli
@@ -1885,11 +1886,13 @@ fn kimi_from_history(db: &Path) -> Option<ProviderLimits> {
     })
 }
 
-/// Read the Kimi Code usage response. `usages` names each window
-/// (`limit_5h`, `limit_month_total`, `limit_month_code`) with a `used_ratio`
-/// and `reset_time`; without it, `limits[]` carries the 5-hour window as
-/// `window.duration`/`timeUnit` plus `detail.limit`/`remaining`/`resetTime`
-/// (string numbers), and `usage` the overall quota.
+/// Read the Kimi Code usage response. `limits[]` carries the authoritative
+/// five-hour burst window as `window.duration`/`timeUnit` plus
+/// `detail.limit`/`used`/`remaining`/`resetTime` (string numbers). The
+/// duplicate `usages.limit_5h` aggregate can report the subscription window
+/// separately, so it is used only when `limits[]` has no five-hour entry.
+/// Other `usages` entries provide the monthly quotas, and older payloads use
+/// the `usage` summary as `7d`.
 pub fn parse_kimi_usage(value: &Value) -> Vec<LimitWindow> {
     fn number(value: Option<&Value>) -> Option<f64> {
         let value = value?;
@@ -1907,24 +1910,6 @@ pub fn parse_kimi_usage(value: &Value) -> Vec<LimitWindow> {
         let used = number(detail.get("used"))
             .or_else(|| number(detail.get("remaining")).map(|left| limit - left))?;
         Some(used / limit * 100.0)
-    }
-
-    if let Some(usages) = value.get("usages").and_then(Value::as_object) {
-        let windows: Vec<LimitWindow> = usages
-            .iter()
-            .filter_map(|(key, entry)| {
-                let used = number(entry.get("used_ratio"))? * 100.0;
-                let label = match key.trim_start_matches("limit_") {
-                    "month_total" => "mon".to_string(),
-                    "month_code" => "code".to_string(),
-                    other => other.to_string(),
-                };
-                Some(LimitWindow::new(label, used, reset(entry)))
-            })
-            .collect();
-        if !windows.is_empty() {
-            return windows;
-        }
     }
 
     let mut windows = Vec::new();
@@ -1958,6 +1943,25 @@ pub fn parse_kimi_usage(value: &Value) -> Vec<LimitWindow> {
         };
         windows.push(LimitWindow::new(window_label(minutes), used, reset(detail)));
     }
+
+    let has_five_hour_limit = windows.iter().any(|window| window.label == "5h");
+    if let Some(usages) = value.get("usages").and_then(Value::as_object) {
+        for (key, entry) in usages {
+            if key == "limit_5h" && has_five_hour_limit {
+                continue;
+            }
+            let Some(used) = number(entry.get("used_ratio")).map(|ratio| ratio * 100.0) else {
+                continue;
+            };
+            let label = match key.trim_start_matches("limit_") {
+                "month_total" => "mon".to_string(),
+                "month_code" => "code".to_string(),
+                other => other.to_string(),
+            };
+            windows.push(LimitWindow::new(label, used, reset(entry)));
+        }
+    }
+
     if let Some(summary) = value.get("usage")
         && let Some(used) = detail_used(summary)
     {
@@ -3123,24 +3127,32 @@ mod tests {
     }
 
     #[test]
-    fn kimi_usage_reads_the_named_windows() {
+    fn kimi_usage_prefers_authoritative_five_hour_limit() {
         let value = json!({
-            "limits": [{"window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
-                        "detail": {"limit": "100", "remaining": "80",
-                                   "resetTime": "2026-10-01T08:51:23.700Z"}}],
+            "limits": [{
+                "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                "detail": {
+                    "limit": "100",
+                    "used": "100",
+                    "resetTime": "2026-09-22T12:22:15.593402Z"
+                }
+            }],
             "usages": {
-                "limit_5h": {"used_ratio": 0.25, "reset_time": "2026-10-01T08:51:23Z"},
-                "limit_month_total": {"used_ratio": 0.1, "reset_time": "2026-11-02T00:00:00Z"},
-                "limit_month_code": {"used_ratio": 0, "reset_time": "2026-11-02T00:00:00Z"}
+                "limit_5h": {"used_ratio": 0, "reset_time": "2026-09-22T12:22:15Z"},
+                "limit_month_total": {"used_ratio": 0.0795, "reset_time": "2026-10-22T00:00:00Z"},
+                "limit_month_code": {"used_ratio": 0, "reset_time": "2026-10-22T00:00:00Z"}
             }
         });
         let windows = parse_kimi_usage(&value);
         assert_eq!(windows.len(), 3);
         assert_eq!(windows[0].label, "5h");
-        assert_eq!(windows[0].remaining_percent, 75.0);
-        assert_eq!(windows[0].resets_at, parse_rfc3339("2026-10-01T08:51:23Z"));
+        assert_eq!(windows[0].remaining_percent, 0.0);
+        assert_eq!(
+            windows[0].resets_at,
+            parse_rfc3339("2026-09-22T12:22:15.593402Z")
+        );
         assert_eq!(windows[1].label, "mon");
-        assert!((windows[1].remaining_percent - 90.0).abs() < 1e-9);
+        assert!((windows[1].remaining_percent - 92.05).abs() < 1e-9);
         assert_eq!(windows[2].label, "code");
         assert_eq!(windows[2].remaining_percent, 100.0);
     }

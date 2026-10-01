@@ -103,10 +103,12 @@ Sources, all read-only and best effort:
   with the OAuth access token omp stores in `~/.omp/agent/agent.db`
   (`auth_credentials`, provider `kimi-code`, read with the `sqlite3` CLI in
   `-readonly` mode) or kimi-cli in `~/.kimi/credentials/kimi-code.json`
-  (`$KIMI_SHARE_DIR` respected). `usages` yields the `5h` window and the
-  monthly `mon` (total) and `code` quotas from `used_ratio`/`reset_time`;
-  older payloads fall back to `limits[]` (`window.duration`/`timeUnit`,
-  `detail.limit`/`remaining`) and the `usage` summary as `7d`. The token is
+  (`$KIMI_SHARE_DIR` respected). `limits[]` is authoritative for the `5h`
+  burst window (`window.duration`/`timeUnit` plus `detail.limit`/`used` or
+  `remaining`/`resetTime`); `usages.limit_5h` is a duplicate aggregate that is
+  ignored when that detailed row exists. Monthly `mon` (total) and `code` quotas
+  come from the other `usages` entries' `used_ratio`/`reset_time`. Older
+  payloads fall back to the `usage` summary as `7d`. The token is
   never refreshed here — rotating it would race omp's own refresh — so while
   it has expired (or the live call fails) the row shows the windows omp last
   polled itself (`usage_history`), with their age. `kimi-code/*` models
