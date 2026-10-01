@@ -1,0 +1,6 @@
+---
+source: src/tui/tests.rs
+expression: "lines[lines.len() - 3..lines.len() - 1].join(\"\\n\")"
+---
+ ✳ claude 5h 66% ↻3h30m  │  ✺ codex mon 75% ↻18d (7d old)  │  ✕ grok signed out                     
+          7d 95% ↻6d11h  │                                 │
