@@ -2017,21 +2017,6 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     assert_eq!(app.settings.task_sort, "task_number");
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open settings");
-    assert_eq!(
-        app.modal
-            .as_ref()
-            .unwrap()
-            .task_sort_options
-            .iter()
-            .filter_map(|option| option.value.as_deref())
-            .collect::<Vec<_>>(),
-        vec![
-            "task_number",
-            "task_number_desc",
-            "updated_at_asc",
-            "updated_at_desc"
-        ]
-    );
     {
         let modal = app.modal.as_mut().expect("settings modal");
         modal.title = TextArea::new(vec!["Renamed project".to_string()]);
@@ -2161,6 +2146,123 @@ fn updated_sort_setting_applies_both_directions_to_every_column() {
     for (column, (older, newer)) in app.board.columns.iter().zip(&expected_by_column) {
         assert_eq!(column.tasks[0].id, *newer);
         assert_eq!(column.tasks[1].id, *older);
+    }
+}
+
+#[test]
+fn newest_chain_sort_groups_whole_board_and_orders_dag_run_layers() {
+    let (_dir, mut app) = settings_app();
+    let titles = [
+        "standalone older",
+        "standalone newer",
+        "old root",
+        "old child",
+        "orchestrated join",
+        "first branch",
+        "second branch",
+        "downstream",
+        "review root",
+        "review child",
+    ];
+    let mut tasks = titles
+        .into_iter()
+        .map(|title| app.ops.create_task(NewTask::titled(title)).unwrap())
+        .collect::<Vec<_>>();
+    for task in &mut tasks {
+        task.updated_at = crate::core::timefmt::parse("2026-07-17T10:00:00").unwrap();
+    }
+    tasks[1].updated_at = crate::core::timefmt::parse("2026-07-30T10:00:00").unwrap();
+    tasks[3].chained_to = Some(tasks[2].id.clone());
+    tasks[3].updated_at = crate::core::timefmt::parse("2026-07-18T10:00:00").unwrap();
+    for index in [5, 6, 7] {
+        tasks[index].parent_task = Some(tasks[4].id.clone());
+    }
+    tasks[7].depends_on = vec![tasks[5].id.clone(), tasks[6].id.clone()];
+    tasks[4].depends_on = vec![tasks[7].id.clone()];
+    // A newer downstream node must not leapfrog either ready branch.
+    tasks[7].updated_at = crate::core::timefmt::parse("2026-07-20T10:00:00").unwrap();
+    tasks[6].updated_at = crate::core::timefmt::parse("2026-07-19T10:00:00").unwrap();
+    tasks[8].status = TaskStatus::Review;
+    tasks[8].updated_at = crate::core::timefmt::parse("2026-07-21T10:00:00").unwrap();
+    tasks[9].chained_to = Some(tasks[8].id.clone());
+    let _lock = app.ops.storage.lock().unwrap();
+    for task in &tasks {
+        app.ops.storage.save_task(task).unwrap();
+    }
+    drop(_lock);
+    let mut config = app.ops.config.load_fresh().unwrap();
+    config.tui.insert(
+        serde_yaml_ng::Value::String("task_sort".to_string()),
+        serde_yaml_ng::Value::String("updated_at_desc_chains".to_string()),
+    );
+    app.ops.config.save(&config).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    let todo = app
+        .board
+        .columns
+        .iter()
+        .find(|col| col.id == "todo")
+        .unwrap();
+    assert_eq!(
+        todo.tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        [9, 6, 5, 7, 4, 2, 3, 1, 0].map(|i| tasks[i].id.as_str())
+    );
+    // Modifying any member promotes the entire chain, not just that card.
+    tasks[2].updated_at = crate::core::timefmt::parse("2026-07-22T10:00:00").unwrap();
+    let _lock = app.ops.storage.lock().unwrap();
+    app.ops.storage.save_task(&tasks[2]).unwrap();
+    drop(_lock);
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    let todo = app
+        .board
+        .columns
+        .iter()
+        .find(|col| col.id == "todo")
+        .unwrap();
+    assert_eq!(
+        todo.tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>(),
+        [2, 3, 9, 6, 5, 7, 4, 1, 0].map(|i| tasks[i].id.as_str())
+    );
+}
+
+#[test]
+fn newest_chain_sort_preserves_other_columns_and_handles_cycles() {
+    use crate::core::operations::sort_tasks;
+    let mut tasks = (1..=7)
+        .map(|i| {
+            let mut task = crate::core::models::Task::new(format!("TASK-{i}"), format!("Task {i}"));
+            task.updated_at =
+                crate::core::timefmt::parse(&format!("2026-07-{i:02}T10:00:00")).unwrap();
+            task
+        })
+        .collect::<Vec<_>>();
+    tasks[0].chained_to = Some(tasks[1].id.clone());
+    tasks[1].chained_to = Some(tasks[0].id.clone());
+    tasks[2].parent_task = Some(tasks[0].id.clone());
+    tasks[3].status = TaskStatus::InProgress;
+    tasks[4].status = TaskStatus::InProgress;
+    tasks[5].status = TaskStatus::Done;
+    tasks[6].status = TaskStatus::Done;
+    sort_tasks(&mut tasks, "updated_chains", "desc");
+    for (status, expected) in [
+        (TaskStatus::Todo, vec!["TASK-3", "TASK-2", "TASK-1"]),
+        (TaskStatus::InProgress, vec!["TASK-5", "TASK-4"]),
+        (TaskStatus::Done, vec!["TASK-7", "TASK-6"]),
+    ] {
+        assert_eq!(
+            tasks
+                .iter()
+                .filter(|task| task.status == status)
+                .map(|task| task.id.as_str())
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 }
 

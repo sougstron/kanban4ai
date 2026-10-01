@@ -36,7 +36,17 @@ auto-loaded into every agent session. Read it when you are reading or adding a s
 - `task_sort`: `task_number` (default, ascending TASK id), `task_number_desc`
   (descending TASK id — highest task number first; doubles as the
   queue-priority control for the dispatcher), `updated_at_asc` (least recently
-  modified first), or `updated_at_desc` (most recently modified first).
+  modified first), `updated_at_desc` (most recently modified first), or
+  `updated_at_desc_chains` (**Updated (newest chains first)** in Project Settings).
+  The chain mode keeps other columns newest-first. In To Do, connected chains
+  (`chained_to`) and orchestrated families (`depends_on` / `parent_task`) come
+  before standalone tasks. Each group is ordered by its most recently modified
+  member, including members in other columns. Within a group, ready tasks come
+  first, then successive dependency layers; equally ready tasks use newest-first
+  order with numeric task IDs breaking timestamp ties. Review/Done prerequisites
+  are already satisfied; parent links group siblings without imposing run order.
+  Invalid cyclic dependencies remain visible after runnable nodes. Standalone
+  tasks below the groups retain newest-first order.
   Legacy `completion_date` values are read as `updated_at_desc`; unknown
   values read as `task_number`.
 - `show_limits`: true - draw the provider subscription-limits row above the
