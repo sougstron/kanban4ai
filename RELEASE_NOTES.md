@@ -1,3 +1,22 @@
+# kanban4ai 0.6.16
+
+The new/edit task form is regrouped: the parent dialog keeps Title,
+Description, Agent settings, Readonly and Chain to, while Orchestrator,
+Designer, Reviewer and the planned launch move into a dedicated Options
+popup.
+
+## Changed
+
+- **New/edit task form layout** (`src/tui/dialogs.rs`, `src/tui/app.rs`,
+  `docs/tui.md`, `README.md`). The parent form now shows Title,
+  Description, an Agent settings launcher, Readonly, Chain to, and an
+  Options launcher. The new Options sub-popup follows the same
+  staging/cancel contract as the Agent settings popup and holds the
+  Orchestrator, Designer and Reviewer toggles plus the planned launch
+  time. `SubPopup` generalizes the nested-popup machinery shared by both
+  popups, and invalid launch-time validation now reopens the popup on the
+  time field instead of losing the staged values.
+
 # kanban4ai 0.6.15
 
 Chain-aware board sorting, a reworked limits row with Kimi support and
