@@ -12,7 +12,7 @@
 //!
 //! Every provider segment is clickable: a click refreshes that provider on
 //! the spot (claude force-polls the usage endpoint; grok renews its token via
-//! the grok CLI; zai, synthetic, and gemini re-fetch — see
+//! the grok CLI; zai, synthetic, kimi, and gemini re-fetch — see
 //! [`crate::core::limits::refresh_provider_async`]).
 
 use ratatui::Frame;
@@ -51,6 +51,7 @@ fn provider_color(app: &App, provider: &str) -> Color {
         "codex" => Color::Rgb(90, 190, 160),
         "zai" => Color::Rgb(112, 145, 219),
         "synthetic" => Color::Rgb(178, 142, 212),
+        "kimi" => Color::Rgb(232, 196, 104),
         "gemini" => Color::Rgb(96, 156, 250),
         _ => app.theme.fg,
     }
@@ -63,6 +64,7 @@ pub fn provider_icon(provider: &str) -> &'static str {
         "grok" => "✕",
         "zai" => "◆",
         "synthetic" => "✦",
+        "kimi" => "☾",
         "gemini" => "✧",
         _ => "•",
     }

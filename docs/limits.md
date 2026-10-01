@@ -99,6 +99,19 @@ Sources, all read-only and best effort:
   at `nextRegenAt`). Both quotas regenerate in small ticks rather than resetting
   on a timer, so the reset time is the next capacity gain. The key never
   expires, so the segment needs no CLI-driven click refresh.
+- **kimi**: the Kimi Code subscription. `GET https://api.kimi.com/coding/v1/usages`
+  with the OAuth access token omp stores in `~/.omp/agent/agent.db`
+  (`auth_credentials`, provider `kimi-code`, read with the `sqlite3` CLI in
+  `-readonly` mode) or kimi-cli in `~/.kimi/credentials/kimi-code.json`
+  (`$KIMI_SHARE_DIR` respected). `usages` yields the `5h` window and the
+  monthly `mon` (total) and `code` quotas from `used_ratio`/`reset_time`;
+  older payloads fall back to `limits[]` (`window.duration`/`timeUnit`,
+  `detail.limit`/`remaining`) and the `usage` summary as `7d`. The token is
+  never refreshed here — rotating it would race omp's own refresh — so while
+  it has expired (or the live call fails) the row shows the windows omp last
+  polled itself (`usage_history`), with their age. `kimi-code/*` models
+  resolve to this provider; `opencode-go/kimi-*` do not (that is opencode's
+  plan).
 - **gemini**: two sources, both shown. When gemini-cli is signed in
   (`~/.gemini/oauth_creds.json`, the login Google AI Plus/Pro/Ultra use),
   `POST cloudcode-pa.googleapis.com/v1internal:loadCodeAssist` names the
@@ -120,7 +133,7 @@ Sources, all read-only and best effort:
 HTTPS goes through `curl -K -`, with the request config (URL and headers) piped
 on stdin: no TLS dependency is linked into the crate, and bearer tokens never
 appear in a command line where `ps` would expose them. `curl` is an optional
-dependency — without it claude, grok, zai, synthetic, and gemini's quota degrade to `n/a`.
+dependency — without it claude, grok, zai, synthetic, kimi, and gemini's quota degrade to `n/a`.
 
 A provider with no credentials on the machine reports `not_configured` and is
 omitted from the row entirely; `401`/`403` becomes `signed out`. Fetches run on
@@ -155,7 +168,7 @@ the result with whatever the statusline bridge still holds, and running
 `grok models` renews the short-lived
 OIDC token in `~/.grok/auth.json` before the billing fetch — the background
 refresh does the same once `expires_at` has passed, so grok does not sit on
-`n/a` between clicks — while zai / synthetic re-fetch over HTTPS (their keys
+`n/a` between clicks — while zai / synthetic / kimi re-fetch over HTTPS (their keys
 are long-lived, so no renewal step is needed). The CLIs run in
 the scratch cwd `<store>/limits-refresh-cwd` so stray session state never
 lands in a project. A 429 from the
@@ -176,7 +189,7 @@ providers: `claude` → `claude`, `codex` → `codex`, `grok` → `grok` (the Gr
 Build CLI spends that subscription directly); the catalog backends
 (`opencode`/`omp`/`pi`) resolve by model-id prefix — `openai/*` → `codex`
 (the OpenAI subscription backs those runs), `anthropic/*` → `claude`,
-`zai*`/`glm*` → `zai`, `synthetic/*` → `synthetic`,
+`zai*`/`glm*` → `zai`, `synthetic/*` → `synthetic`, `kimi-code/*` → `kimi`,
 `xai/*`/`grok*` → `grok`. Anything else returns `None` — a pair no
 subscription covers, such as a purely local model.
 
