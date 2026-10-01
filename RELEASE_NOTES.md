@@ -1,3 +1,17 @@
+# kanban4ai 0.6.17
+
+The Kimi limits row now uses the detailed five-hour burst quota when Kimi's
+usage response includes both a detailed `limits[]` entry and the duplicate
+`usages.limit_5h` aggregate.
+
+## Fixed
+
+- **Kimi five-hour quota precedence** (`src/core/limits.rs`, `docs/limits.md`).
+  The detailed `limits[]` row is authoritative for the `5h` window; the
+  duplicate aggregate is used only when no detailed five-hour row exists.
+  Monthly total/code quotas and the legacy summary fallback remain available.
+  Regression coverage verifies the detailed row's usage and reset time win.
+
 # kanban4ai 0.6.16
 
 The new/edit task form is regrouped: the parent dialog keeps Title,
