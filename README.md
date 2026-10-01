@@ -206,8 +206,10 @@ it fits. `Ctrl+T` remains the quick theme toggle. All action keys work from
 the board and from the detail view, which also offers clickable action buttons
 and an inline panel for answering agent questions.
 
-Task create/edit dialogs use the same nested `Agent settings` popup and keep
-Designer, Reviewer, and Chain-to controls on the parent form. Interactive mode
+Task create/edit dialogs group the form as Title, Description, a nested
+`Agent settings` popup, a Readonly checkbox, a Chain-to selector, and a nested
+`Options` popup holding the Orchestrator, Designer, and Reviewer opt-ins plus
+the planned launch. Interactive mode
 is intentionally not exposed in the TUI: new TUI tasks are non-interactive and
 editing does not change an existing value. The CLI `--interactive` option and
 stored YAML field remain supported.

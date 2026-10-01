@@ -995,13 +995,9 @@ fn task_parent_form_opens_nested_agent_settings_without_interactive_field() {
             DialogField::Title,
             DialogField::Description,
             DialogField::AgentSettings,
-            DialogField::ChainTo,
-            DialogField::PlannedLaunch,
-            DialogField::LaunchTime,
             DialogField::Readonly,
-            DialogField::UseOrchestrator,
-            DialogField::UseDesigner,
-            DialogField::UseReviewer,
+            DialogField::ChainTo,
+            DialogField::TaskOptions,
             DialogField::Confirm,
             DialogField::Cancel,
         ]
@@ -1230,6 +1226,107 @@ fn agent_popup_render_exposes_only_popup_hitboxes() {
             .iter()
             .any(|hitbox| { hitbox.action == HitAction::ModalField(DialogField::AgentSettings) })
     );
+}
+
+#[test]
+fn options_popup_save_stages_toggles_and_esc_restores() {
+    // Given a new-task form with the Options launcher focused.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::TaskOptions);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+    let modal = app.modal.as_ref().expect("modal");
+    assert!(modal.popup_open());
+    assert_eq!(modal.active_field(), DialogField::UseOrchestrator);
+
+    // Toggling then cancelling restores the exact opening state.
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("toggle orchestrator");
+    app.handle_key(key(KeyCode::Esc)).expect("cancel popup");
+    let modal = app.modal.as_ref().expect("parent remains open");
+    assert!(!modal.popup_open());
+    assert_eq!(modal.active_field(), DialogField::TaskOptions);
+    assert!(!modal.use_orchestrator, "cancel must roll the toggle back");
+
+    // Toggling then saving stages the value on the parent form.
+    app.handle_key(key(KeyCode::Enter)).expect("reopen popup");
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("toggle orchestrator");
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("save popup");
+    let modal = app.modal.as_ref().expect("parent remains open");
+    assert!(!modal.popup_open());
+    assert_eq!(modal.active_field(), DialogField::TaskOptions);
+    assert!(modal.use_orchestrator, "save must stage the toggle");
+}
+
+#[test]
+fn options_popup_render_exposes_only_popup_hitboxes() {
+    // Given a rendered parent form and then its nested options popup.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::TaskOptions);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+
+    // When the frame registers hitboxes.
+    let rendered = render_at(&mut app, 100, 40);
+
+    // Then popup controls are clickable and the dimmed parent is not.
+    assert!(rendered.contains("Task options"), "{rendered}");
+    insta::assert_snapshot!("options_popup", rendered);
+    assert!(
+        app.hitboxes
+            .iter()
+            .any(|hitbox| { hitbox.action == HitAction::ModalField(DialogField::UseDesigner) })
+    );
+    assert!(
+        !app.hitboxes
+            .iter()
+            .any(|hitbox| { hitbox.action == HitAction::ModalField(DialogField::TaskOptions) })
+    );
+}
+
+#[test]
+fn invalid_launch_time_validation_opens_the_options_popup() {
+    // Given a task with planned launch enabled but no usable time.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    type_text(&mut app, "Scheduled");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::TaskOptions);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+    app.modal
+        .as_mut()
+        .expect("popup")
+        .focus_field(DialogField::PlannedLaunch);
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("enable planned launch");
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("save popup");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::Confirm);
+
+    // When the form is submitted.
+    app.handle_key(key(KeyCode::Enter)).expect("submit");
+
+    // Then validation reopens the Options popup on the offending field.
+    let modal = app.modal.as_ref().expect("modal remains open");
+    assert_eq!(
+        modal.error.as_deref(),
+        Some("Launch time must be HH:MM (local time), e.g. 09:30")
+    );
+    assert!(modal.popup_open());
+    assert_eq!(modal.active_field(), DialogField::LaunchTime);
 }
 
 #[test]
@@ -5745,6 +5842,11 @@ fn new_task_dialog_planned_launch_round_trips_to_the_task() {
     {
         let modal = app.modal.as_mut().expect("new task modal");
         modal.title.insert_str("Scheduled work");
+        modal.focus_field(DialogField::TaskOptions);
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("open options");
+    {
+        let modal = app.modal.as_mut().expect("modal");
         modal.focus_field(DialogField::PlannedLaunch);
     }
     app.handle_key(key(KeyCode::Char(' ')))
@@ -5754,6 +5856,11 @@ fn new_task_dialog_planned_launch_round_trips_to_the_task() {
         assert!(modal.planned_launch);
         modal.focus_field(DialogField::LaunchTime);
         modal.launch_time.insert_str("09:30");
+    }
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("save options");
+    {
+        let modal = app.modal.as_mut().expect("modal");
         modal.focus_field(DialogField::Confirm);
     }
     app.handle_key(key(KeyCode::Enter)).expect("create task");
@@ -5806,22 +5913,41 @@ fn new_task_dialog_rejects_an_invalid_launch_time_and_stays_open() {
     // Garbage value: refused the same way.
     {
         let modal = app.modal.as_mut().expect("modal");
-        modal.launch_time.insert_str("25:99");
-        modal.focus_field(DialogField::Confirm);
+        modal.launch_time = TextArea::new(vec!["25:99".to_string()]);
     }
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("save options popup");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::Confirm);
     app.handle_key(key(KeyCode::Enter))
         .expect("confirm with garbage time");
+    let modal = app
+        .modal
+        .as_ref()
+        .expect("invalid time keeps the dialog open");
     assert!(
-        app.modal.is_some(),
-        "invalid time must keep the dialog open"
+        modal
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("HH:MM")),
+        "error: {:?}",
+        modal.error
     );
+    assert_eq!(modal.active_field(), DialogField::LaunchTime);
 
     // A valid value goes through.
     {
         let modal = app.modal.as_mut().expect("modal");
         modal.launch_time = TextArea::new(vec!["08:15".to_string()]);
-        modal.focus_field(DialogField::Confirm);
     }
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("save options popup");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::Confirm);
     app.handle_key(key(KeyCode::Enter))
         .expect("confirm with valid time");
     assert!(app.modal.is_none());
@@ -5865,10 +5991,17 @@ fn edit_task_dialog_prefills_and_clears_planned_launch() {
     // Unchecking and saving clears the pending schedule.
     {
         let modal = app.modal.as_mut().expect("edit modal");
+        modal.focus_field(DialogField::TaskOptions);
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("open options");
+    {
+        let modal = app.modal.as_mut().expect("edit modal");
         modal.focus_field(DialogField::PlannedLaunch);
     }
     app.handle_key(key(KeyCode::Char(' ')))
         .expect("disable planned launch");
+    app.handle_key(ctrl_key(KeyCode::Char('s')))
+        .expect("save options popup");
     {
         app.modal
             .as_mut()
@@ -9423,10 +9556,10 @@ fn limits_progress_status_does_not_expire_while_refreshing() {
     crate::core::limits::force_provider_refresh_in_flight(false);
 }
 
-/// Tab six times from the Title field lands on Chain to in the task form.
+/// Tab four times from the Title field lands on Chain to in the task form.
 fn open_new_task_on_chain(app: &mut App) {
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
-    for _ in 0..3 {
+    for _ in 0..4 {
         app.handle_key(key(KeyCode::Tab)).expect("tab");
     }
     assert_eq!(
@@ -9485,7 +9618,7 @@ fn enter_on_a_single_filter_match_selects_it_and_advances() {
     assert_eq!(modal.chain_text().as_deref(), Some("TASK-002"));
     assert_eq!(
         modal.active_field(),
-        DialogField::PlannedLaunch,
+        DialogField::TaskOptions,
         "Enter moves on like Tab"
     );
     assert_eq!(modal.filter_error, None);
@@ -9717,7 +9850,8 @@ fn new_task_mode_toggles_save_on_the_task() {
         .expect("modal")
         .title
         .insert_str("Per-task bots");
-    for _ in 0..6 {
+    // Title → Description → AgentSettings → Readonly.
+    for _ in 0..3 {
         app.handle_key(key(KeyCode::Tab)).expect("tab");
     }
     assert_eq!(
@@ -9728,22 +9862,43 @@ fn new_task_mode_toggles_save_on_the_task() {
     app.handle_key(key(KeyCode::Enter)).expect("enter");
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
-        DialogField::UseOrchestrator
+        DialogField::ChainTo
     );
-    app.handle_key(key(KeyCode::Char(' '))).expect("space");
-    app.handle_key(key(KeyCode::Enter)).expect("enter");
+
+    // The orchestration opt-ins live in the nested Options popup.
+    app.handle_key(key(KeyCode::Tab)).expect("tab to options");
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
-        DialogField::UseDesigner
+        DialogField::TaskOptions
     );
-    app.handle_key(key(KeyCode::Char(' '))).expect("space");
-    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    app.handle_key(key(KeyCode::Enter)).expect("open options");
+    assert!(app.modal.as_ref().expect("modal").popup_open());
+    for (field, toggle) in [
+        (DialogField::UseOrchestrator, true),
+        (DialogField::UseDesigner, true),
+        (DialogField::UseReviewer, true),
+        (DialogField::PlannedLaunch, false),
+        (DialogField::LaunchTime, false),
+    ] {
+        assert_eq!(app.modal.as_ref().expect("modal").active_field(), field);
+        if toggle {
+            app.handle_key(key(KeyCode::Char(' '))).expect("space");
+        }
+        app.handle_key(key(KeyCode::Enter)).expect("enter");
+    }
+    // Focus landed on the popup's Save button; Enter stages the options.
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
-        DialogField::UseReviewer
+        DialogField::Confirm
     );
-    app.handle_key(key(KeyCode::Char(' '))).expect("space");
-    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    app.handle_key(key(KeyCode::Enter)).expect("save popup");
+    assert!(!app.modal.as_ref().expect("modal").popup_open());
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::TaskOptions
+    );
+
+    app.handle_key(key(KeyCode::Tab)).expect("tab to save");
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
         DialogField::Confirm
