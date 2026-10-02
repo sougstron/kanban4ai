@@ -98,7 +98,11 @@ tip). Resolving in the worktree without ever touching the work folder is
 therefore the supported path, exactly as the conflict report instructs.
 
 **Cleanup and GC.** `cleanup: on_land` (default) removes the worktree and
-deletes the branch once the branch has landed. Done and abandon always clear
+deletes the branch once the branch has landed. When `kanban done` (or a
+reviewer's `kanban verdict`) runs from inside the worktree — the agent's own
+shell — removal is deferred to the session's `agent-exit`, so the caller's cwd
+is never deleted under it. A repeated agent `done` from the session that
+already finished the task is a no-op success. Done and abandon always clear
 them regardless of `cleanup` — Done is terminal, and an abandon is an
 explicit discard, so an unmerged branch goes too — except a `conflict`
 task's worktree, the one place unmerged agent work lives, which survives

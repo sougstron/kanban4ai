@@ -545,9 +545,16 @@ fn agent_done_requires_context_then_moves_to_review() {
     assert_eq!(reviewed.session.as_deref(), Some("ses-flow"));
     assert!(!SessionManager::new(dir.path()).is_session_active("ses-flow"));
 
-    // a second agent done from Review is refused
+    // a repeated done from the finishing session is a no-op success
+    let again = ops
+        .complete_task(&task.id, "ses-flow", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(again.status, TaskStatus::Review);
+    assert_eq!(again.completed_at, reviewed.completed_at);
+    // ...but a session that never worked the task is still refused
     assert!(
-        ops.complete_task(&task.id, "ses-flow", true)
+        ops.complete_task(&task.id, "ses-other", true)
             .unwrap()
             .is_none()
     );
