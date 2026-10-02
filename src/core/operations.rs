@@ -4063,19 +4063,57 @@ impl Operations {
         let Ok(Some(mut task)) = self.storage.load_task(task_id) else {
             return;
         };
-        if task.integration != IntegrationState::Landed
-            || task.worktree.is_none()
-            || task
-                .session
-                .as_deref()
-                .is_some_and(|s| self.session_manager().is_session_active(s))
-        {
+        if !self.awaits_deferred_cleanup(&task) {
             return;
         }
         self.cleanup_after_land(&mut task, &orch.isolation, false);
         if task.worktree.is_none() {
             let _ = self.storage.save_task(&task);
         }
+    }
+
+    /// A Landed task that still holds its worktree and has no active
+    /// session: the shape a deferred post-landing cleanup leaves behind.
+    fn awaits_deferred_cleanup(&self, task: &Task) -> bool {
+        task.integration == IntegrationState::Landed
+            && task.worktree.is_some()
+            && !task
+                .session
+                .as_deref()
+                .is_some_and(|s| self.session_manager().is_session_active(s))
+    }
+
+    /// Daemon-tick sweep for deferred post-landing cleanups that no
+    /// `agent-exit` will finish (a session not started through the launch
+    /// wrapper). `kanban done` closes the session before its shell exits, so
+    /// a closed session alone does not prove the checkout is free: a
+    /// worktree is only removed once no process has its cwd inside it.
+    /// Where that cannot be checked (no `/proc`), the sweep does nothing and
+    /// the Done move still clears the worktree. Returns the swept task ids.
+    pub fn sweep_deferred_cleanups(&self) -> Result<Vec<String>> {
+        let orch = self.config.get_orchestration()?;
+        if orch.isolation.cleanup != IsolationCleanup::OnLand {
+            return Ok(Vec::new());
+        }
+        let _guard = self.storage.lock()?;
+        let mut swept = Vec::new();
+        for mut task in self.storage.list_tasks(None)? {
+            if !self.awaits_deferred_cleanup(&task) {
+                continue;
+            }
+            let Some(rel) = task.worktree.clone() else {
+                continue;
+            };
+            if any_process_cwd_within(&self.storage.worktrees_dir.join(rel)) != Some(false) {
+                continue;
+            }
+            self.cleanup_after_land(&mut task, &orch.isolation, false);
+            if task.worktree.is_none() {
+                self.storage.save_task(&task)?;
+                swept.push(task.id);
+            }
+        }
+        Ok(swept)
     }
 
     /// `kanban integrate <TASK-ID>`: re-run the landing after a conflict was
@@ -5786,6 +5824,34 @@ fn cwd_within(dir: &Path) -> bool {
     let inside = |cwd: PathBuf| cwd.starts_with(dir) || cwd.starts_with(&canonical);
     std::env::current_dir().is_ok_and(inside)
         || std::env::var_os("PWD").is_some_and(|pwd| inside(PathBuf::from(pwd)))
+}
+
+/// Whether any visible process has its cwd inside `dir`, read from
+/// `/proc/<pid>/cwd`. `None` when `/proc` is unavailable (non-Linux), so the
+/// caller can stay conservative. Unreadable entries (other users'
+/// processes, races with exits) are skipped.
+fn any_process_cwd_within(dir: &Path) -> Option<bool> {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let entries = fs::read_dir("/proc").ok()?;
+    let mut saw_self = false;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        let Ok(cwd) = fs::read_link(entry.path().join("cwd")) else {
+            continue;
+        };
+        saw_self |= name.to_str() == Some(&std::process::id().to_string());
+        if cwd.starts_with(dir) || cwd.starts_with(&canonical) {
+            return Some(true);
+        }
+    }
+    // Not even our own cwd was readable: `/proc` is not usable here.
+    saw_self.then_some(false)
 }
 
 fn dir_has_files(dir: &Path) -> bool {

@@ -101,7 +101,11 @@ therefore the supported path, exactly as the conflict report instructs.
 deletes the branch once the branch has landed. When `kanban done` (or a
 reviewer's `kanban verdict`) runs from inside the worktree — the agent's own
 shell — removal is deferred to the session's `agent-exit`, so the caller's cwd
-is never deleted under it. A repeated agent `done` from the session that
+is never deleted under it. For sessions not started through the launch
+wrapper (no `agent-exit`), each daemon tick sweeps Landed tasks that still
+hold a worktree, have no active session, and have no process with its cwd
+inside the worktree (checked via `/proc`; skipped where unavailable, leaving
+the Done move to clear it). A repeated agent `done` from the session that
 already finished the task is a no-op success. Done and abandon always clear
 them regardless of `cleanup` — Done is terminal, and an abandon is an
 explicit discard, so an unmerged branch goes too — except a `conflict`
