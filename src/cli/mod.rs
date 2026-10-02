@@ -848,7 +848,15 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             agent,
         } => {
             let session_id = env_session(session);
+            let repeat = agent
+                && ops
+                    .get_task(&task_id)?
+                    .is_some_and(|task| ops.already_completed_by(&task, &session_id));
             match ops.complete_task(&task_id, &session_id, agent) {
+                Ok(Some(task)) if repeat => println!(
+                    "Task {task_id} was already completed by this session ({}); nothing to do",
+                    task.status
+                ),
                 Ok(Some(task)) => println!("Task {task_id} marked as {}", task.status),
                 Ok(None) => eprintln!("Failed to complete task {task_id}"),
                 Err(err) => eprintln!("Error: {err}"),

@@ -1389,6 +1389,13 @@ impl Operations {
                 return Ok(None);
             };
 
+            // A repeated `done` from the session that already finished the
+            // task (the agent saw a non-zero exit from its own shell and
+            // retried) is a no-op success, not a failure.
+            if is_agent && self.already_completed_by(&task, session_id) {
+                return Ok(Some(task));
+            }
+
             if is_agent && task.run_phase == Some(RunPhase::Orchestrate) {
                 drop(_guard);
                 return self.complete_orchestrate_phase(task_id, session_id);
@@ -3073,6 +3080,28 @@ impl Operations {
         candidate
     }
 
+    /// True when `session_id` is a closed session of this task and the task
+    /// has already moved past it: landed in Review/Done, or handed to the
+    /// bot reviewer (which runs on its own session). A revoked session whose
+    /// successor still holds the task In Progress does not qualify.
+    pub fn already_completed_by(&self, task: &Task, session_id: &str) -> bool {
+        let finished = match task.status {
+            TaskStatus::Review | TaskStatus::Done => true,
+            TaskStatus::InProgress => {
+                task.run_phase == Some(RunPhase::Review)
+                    && task.session.as_deref() != Some(session_id)
+            }
+            _ => false,
+        };
+        finished
+            && self
+                .session_manager()
+                .load_session(session_id)
+                .is_some_and(|session| {
+                    session.task_id == task.id && session.status != SessionStatus::Active
+                })
+    }
+
     fn require_current_agent_session(&self, task: &Task, session_id: &str) -> Result<()> {
         let valid = task.status == TaskStatus::InProgress
             && task.session.as_deref() == Some(session_id)
@@ -3865,7 +3894,7 @@ impl Operations {
                         changed.len()
                     ),
                 );
-                self.cleanup_after_land(task, &iso);
+                self.cleanup_after_land(task, &iso, true);
                 Ok(LandOutcome::Landed { changed })
             }
             vcs::Preflight::Conflict { paths, stages } => {
@@ -3990,8 +4019,23 @@ impl Operations {
     /// [`Self::clear_task_worktree`], keeping the landed gate — the branch
     /// was just merged into the integration ref, so the gate passing is the
     /// sanity check.
-    fn cleanup_after_land(&self, task: &mut Task, iso: &IsolationSettings) {
+    fn cleanup_after_land(&self, task: &mut Task, iso: &IsolationSettings, defer_in_cwd: bool) {
         if iso.cleanup != IsolationCleanup::OnLand {
+            return;
+        }
+        // `kanban done` run by the agent's own shell from inside the
+        // worktree: deleting it now would pull the cwd out from under that
+        // shell (`getcwd: No such file or directory`, a spurious non-zero
+        // exit after a successful landing). The task stays Landed with its
+        // worktree set; `agent-exit` finishes the cleanup.
+        if defer_in_cwd
+            && let Some(rel) = &task.worktree
+            && cwd_within(&self.storage.worktrees_dir.join(rel))
+        {
+            self.post_queue_note(
+                &task.id,
+                "🧹 landed — worktree removal deferred until the agent session exits",
+            );
             return;
         }
         let had_isolation = task.worktree.is_some() || task.branch.is_some();
@@ -4003,6 +4047,34 @@ impl Operations {
             );
         } else if had_isolation && task.worktree.is_none() {
             self.post_queue_note(&task.id, "🧹 landed — isolated worktree and branch removed");
+        }
+    }
+
+    /// Finish a post-landing cleanup that `kanban done` deferred because it
+    /// ran from inside the worktree. Called once the agent process exited, so
+    /// nothing is left standing in the checkout. Best effort.
+    fn finish_deferred_cleanup(&self, task_id: &str) {
+        let Ok(orch) = self.config.get_orchestration() else {
+            return;
+        };
+        let Ok(_guard) = self.storage.lock() else {
+            return;
+        };
+        let Ok(Some(mut task)) = self.storage.load_task(task_id) else {
+            return;
+        };
+        if task.integration != IntegrationState::Landed
+            || task.worktree.is_none()
+            || task
+                .session
+                .as_deref()
+                .is_some_and(|s| self.session_manager().is_session_active(s))
+        {
+            return;
+        }
+        self.cleanup_after_land(&mut task, &orch.isolation, false);
+        if task.worktree.is_none() {
+            let _ = self.storage.save_task(&task);
         }
     }
 
@@ -4427,6 +4499,9 @@ impl Operations {
             self.record_agent_reply(task_id, session_id);
         }
         let outcome = self.reconcile_agent_exit_inner(task_id, session_id, exit_status)?;
+        if session_matched_task {
+            self.finish_deferred_cleanup(task_id);
+        }
         if session_matched_task {
             self.log_exit_step(
                 task_id,
@@ -5701,6 +5776,16 @@ fn remove_empty_asset_dirs(mut directory: &Path, assets_dir: &Path) {
             None => return,
         }
     }
+}
+
+/// True when this process's working directory is `dir` or below it. Checks
+/// both the resolved cwd and `$PWD`, since the worktree path may be reached
+/// through a symlink.
+fn cwd_within(dir: &Path) -> bool {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let inside = |cwd: PathBuf| cwd.starts_with(dir) || cwd.starts_with(&canonical);
+    std::env::current_dir().is_ok_and(inside)
+        || std::env::var_os("PWD").is_some_and(|pwd| inside(PathBuf::from(pwd)))
 }
 
 fn dir_has_files(dir: &Path) -> bool {
