@@ -22,7 +22,10 @@ use crate::agent::{
     warm_backend_catalog,
 };
 use crate::core::config::RoleCandidate;
-use crate::core::config::{BoardConfig, OnChangesRequested, OrchestrationSettings};
+use crate::core::config::{
+    BoardConfig, InheritFlags, InheritGroup, OnChangesRequested, OrchestrationSettings, copy_group,
+    resolve_inherited,
+};
 use crate::core::context::ContextManager;
 use crate::core::daemon;
 use crate::core::error::{KanbanError, Result};
@@ -441,6 +444,9 @@ pub struct App {
     last_wait_resume: Option<Instant>,
     /// Last time the tick pumped the orchestration queue.
     last_queue_dispatch: Option<Instant>,
+    /// Global config mtime the open board last resolved its inherited
+    /// settings against; `None` until the first check.
+    global_config_stamp: Option<Option<std::time::SystemTime>>,
     /// Last time the TUI advanced every registered board's orchestration.
     last_store_pump: Option<Instant>,
     /// Store-wide warnings already shown during this TUI run.
@@ -775,6 +781,7 @@ impl App {
             ctrl_c_exit_deadline: None,
             last_wait_resume: None,
             last_queue_dispatch: None,
+            global_config_stamp: None,
             last_store_pump: None,
             store_pump_warnings: Arc::new(Mutex::new(HashSet::new())),
             catalog_ready,
@@ -875,6 +882,7 @@ impl App {
             ctrl_c_exit_deadline: None,
             last_wait_resume: None,
             last_queue_dispatch: None,
+            global_config_stamp: None,
             last_store_pump: None,
             store_pump_warnings: Arc::new(Mutex::new(HashSet::new())),
             catalog_ready: HashSet::new(),
@@ -2247,7 +2255,7 @@ impl App {
                         DialogField::Model
                             | DialogField::DesignerModel
                             | DialogField::ReviewerModel
-                    ) && let Ok(config) = self.ops.config.load()
+                    ) && let Some(config) = self.modal_config(&modal)
                     {
                         self.refresh_effort_options_for_slot(&mut modal, &config, slot);
                     }
@@ -2379,8 +2387,19 @@ impl App {
         if !self.has_board {
             return self.refresh_projects();
         }
+        // Inherited settings follow the global config, so an edit there
+        // (another board, the Projects screen) reloads this board too.
+        let stamp = self.ops.config.global_stamp();
+        let global_changed = self
+            .global_config_stamp
+            .replace(stamp)
+            .is_some_and(|previous| previous != stamp);
+        if global_changed && let Ok(effective) = load_settings(&self.ops) {
+            self.settings.task_sort = effective.task_sort;
+            self.settings.hide_kanban_messages = effective.hide_kanban_messages;
+        }
         let fingerprint = self.ops.storage.tui_fingerprint();
-        if fingerprint != self.board.fingerprint {
+        if global_changed || fingerprint != self.board.fingerprint {
             self.board = BoardSnapshot::load(&self.ops)?;
             self.refresh_archived_tasks()?;
             if self.screen == Screen::Sessions {
@@ -2502,10 +2521,14 @@ impl App {
         let should_refresh = self.modal.as_ref().is_some_and(|modal| {
             matches!(
                 modal.modal,
-                Modal::NewTask { .. } | Modal::EditTask { .. } | Modal::Settings
+                Modal::NewTask { .. }
+                    | Modal::EditTask { .. }
+                    | Modal::Settings
+                    | Modal::GlobalSettings
             )
         });
         if should_refresh && let Some(mut modal) = self.modal.take() {
+            let config = self.modal_config(&modal).unwrap_or(config);
             self.refresh_backend_options_with_config(&mut modal, &config);
             self.modal = Some(modal);
         }
@@ -3640,13 +3663,24 @@ impl App {
     }
 
     fn open_settings_dialog(&mut self) {
-        let config = match self.ops.config.load_fresh() {
-            Ok(config) => config,
+        let loaded = (|| -> Result<_> {
+            let config = self.ops.config.load_fresh()?;
+            let raw = self.ops.config.load_raw()?;
+            let inherit = self.ops.config.inherit_flags()?;
+            Ok((config, raw, inherit))
+        })();
+        let (config, raw, inherit) = match loaded {
+            Ok(loaded) => loaded,
             Err(err) => {
                 self.status = format!("Could not load project settings: {err}");
                 return;
             }
         };
+        // What every group looks like when inherited: shown in place of the
+        // project values while its checkbox is ticked.
+        let (global, _) = self.ops.config.load_global();
+        let global_view =
+            resolve_inherited(&raw, &InheritFlags::all(true), &global, &mut Vec::new());
         let mut modal = ModalState::new(Modal::Settings);
         modal.isolation_status = Some(crate::core::vcs::availability(self.ops.work_path()));
         modal.title = TextArea::new(vec![sanitize_terminal_text(&tui_string(
@@ -3654,95 +3688,75 @@ impl App {
             "name",
             "Kanban",
         ))]);
-        modal.backend = TextArea::new(vec![
-            mapping_str(Some(&config.auto_launch), "default_agent")
-                .unwrap_or_else(|| "opencode".to_string()),
-        ]);
         modal.theme = TextArea::new(vec![
             Theme::normalize_name(&tui_string(&config.tui, "theme", "dark")).to_string(),
         ]);
-        modal.task_sort = TextArea::new(vec![
-            normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
-                .to_string(),
-        ]);
-        modal.hide_kanban_messages = tui_bool(&config.tui, "hide_kanban_messages", false);
-        let orch = OrchestrationSettings::from_mapping(&config.orchestration);
-        modal.queue_enabled = orch.queue_enabled;
-        modal.max_running_total = TextArea::new(vec![orch.max_running_total.to_string()]);
-        modal.max_running_designer = TextArea::new(vec![role_cap(&orch, "designer").to_string()]);
-        modal.max_running_reviewer = TextArea::new(vec![role_cap(&orch, "reviewer").to_string()]);
-        modal.max_running_executor = TextArea::new(vec![role_cap(&orch, "executor").to_string()]);
-        modal.max_running_per_backend = TextArea::new(lines_or_blank(&format_backend_cap_map(
-            &orch.max_running_per_backend,
-        )));
-        modal.max_running_per_backend_model = TextArea::new(lines_or_blank(
-            &format_sorted_cap_map(&orch.max_running_per_backend_model),
-        ));
-        modal.auto_restart_enabled = orch.auto_restart_enabled;
-        modal.auto_restart_delays =
-            TextArea::new(vec![format_delays(&orch.auto_restart_delays_minutes)]);
-        modal.designer_enabled = orch.designer.enabled;
-        modal.set_backend_text_for(
-            AgentSlot::Designer,
-            orch.designer.backend.as_deref().unwrap_or(""),
-        );
-        modal.set_model_text_for(
-            AgentSlot::Designer,
-            orch.designer.model.as_deref().unwrap_or(""),
-        );
-        modal.set_effort_text_for(
-            AgentSlot::Designer,
-            orch.designer.effort.as_deref().unwrap_or(""),
-        );
-        modal.set_agent_text_for(
-            AgentSlot::Designer,
-            orch.designer.agent.as_deref().unwrap_or(""),
-        );
-        modal.reviewer_enabled = orch.reviewer.enabled;
-        modal.set_backend_text_for(
-            AgentSlot::Reviewer,
-            orch.reviewer.backend.as_deref().unwrap_or(""),
-        );
-        modal.set_model_text_for(
-            AgentSlot::Reviewer,
-            orch.reviewer.model.as_deref().unwrap_or(""),
-        );
-        modal.set_effort_text_for(
-            AgentSlot::Reviewer,
-            orch.reviewer.effort.as_deref().unwrap_or(""),
-        );
-        modal.set_agent_text_for(
-            AgentSlot::Reviewer,
-            orch.reviewer.agent.as_deref().unwrap_or(""),
-        );
-        modal.reviewer_on_changes = TextArea::new(vec![match orch.reviewer.on_changes_requested {
-            OnChangesRequested::InProgress => "in_progress".to_string(),
-            OnChangesRequested::Todo => "todo".to_string(),
-        }]);
-        modal.reviewer_max_rounds = TextArea::new(vec![orch.reviewer.max_rounds.to_string()]);
-        modal.executor_week_threshold =
-            TextArea::new(vec![format!("{}", orch.executors.thresholds.week_percent)]);
-        modal.executor_five_hour_threshold = TextArea::new(vec![format!(
-            "{}",
-            orch.executors.thresholds.five_hour_percent
-        )]);
-        self.populate_settings_form_options(&mut modal);
-        // Slot selections need the option list, so they are set after the
-        // population above.
-        for slot in 0..3usize {
-            if let Some(candidate) = orch.executors.middle.get(slot) {
-                modal.executor_selected[slot] =
-                    executor_option_index(&modal, &candidate_key(candidate));
-            }
-        }
-        for slot in 3..6usize {
-            if let Some(candidate) = orch.executors.cheap.get(slot - 3) {
-                modal.executor_selected[slot] =
-                    executor_option_index(&modal, &candidate_key(candidate));
-            }
-        }
+        modal.inherit = inherit;
+        modal.global_view = Some(Box::new(global_view));
+        modal.settings_base = Some(Box::new(config.clone()));
+        self.fill_settings_form(&mut modal, &config);
         modal.capture_initial_values();
         self.modal = Some(modal);
+    }
+
+    /// Load every inheritable group of `config` into the settings form, then
+    /// the option lists (which pick their selection from the loaded text).
+    fn fill_settings_form(&self, modal: &mut ModalState, config: &BoardConfig) {
+        for group in InheritGroup::ALL {
+            fill_settings_group(modal, config, group);
+        }
+        self.populate_settings_form_options(modal);
+        // Slot selections need the option list, so they are set after the
+        // population above.
+        fill_executor_slots(modal, config);
+    }
+
+    /// Ticking a group's "Inherit from global" box shows the global values in
+    /// its (now read-only) fields. Unticking keeps whatever is shown, so the
+    /// global values become the project's starting point.
+    fn sync_inherit_checkboxes(&self, modal: &mut ModalState, before: InheritFlags) {
+        if !matches!(modal.modal, Modal::Settings) || modal.inherit == before {
+            return;
+        }
+        let Some(view) = modal.global_view.as_deref().cloned() else {
+            return;
+        };
+        let mut refill = false;
+        for group in InheritGroup::ALL {
+            if modal.inherit.get(group) && !before.get(group) {
+                fill_settings_group(modal, &view, group);
+                refill = true;
+            }
+        }
+        if refill {
+            self.populate_settings_form_options(modal);
+            if modal.inherit.get(InheritGroup::Executor) && !before.get(InheritGroup::Executor) {
+                fill_executor_slots(modal, &view);
+            }
+        }
+    }
+
+    /// The config a settings dialog's option lists and status lines read:
+    /// the edited global sections for Global Settings; for project settings
+    /// the config it opened with, with the agent catalog following the
+    /// "Inherit default agent" box; the board's effective config otherwise.
+    fn modal_config(&self, modal: &ModalState) -> Option<BoardConfig> {
+        match modal.modal {
+            Modal::GlobalSettings => modal.global_view.as_deref().cloned(),
+            Modal::Settings => {
+                let Some(base) = modal.settings_base.as_deref() else {
+                    return self.ops.config.load().ok();
+                };
+                let mut config = base.clone();
+                if modal.inherit.get(InheritGroup::Agent)
+                    && let Some(view) = modal.global_view.as_deref()
+                {
+                    copy_group(&mut config, view, InheritGroup::Agent);
+                }
+                Some(config)
+            }
+            _ => self.ops.config.load().ok(),
+        }
     }
 
     fn open_global_settings_dialog(&mut self) {
@@ -3757,7 +3771,9 @@ impl App {
                 return;
             }
         };
+        let view = global_board_view(&config);
         let mut modal = ModalState::new(Modal::GlobalSettings);
+        modal.global_view = Some(Box::new(view.clone()));
         modal.escape_to_projects = config.escape_to_projects();
         modal.project_sort = super::dialogs::one_line(config.project_sort());
         modal.update_check_on_open = config.update_check_on_open();
@@ -3787,6 +3803,7 @@ impl App {
                 value: Some(crate::core::global::PROJECT_SORT_SMART_NAME.to_string()),
             },
         ]);
+        self.fill_settings_form(&mut modal, &view);
         modal.capture_initial_values();
         self.modal = Some(modal);
     }
@@ -4141,10 +4158,11 @@ impl App {
 
     /// The resolved cheap-pool order the board would run right now, shown on
     /// the Executor tab: `next: claude/haiku` or the park horizon.
-    pub(crate) fn executor_pool_status_line(&self) -> String {
-        let Ok(orch) = self.ops.config.get_orchestration() else {
+    pub(crate) fn executor_pool_status_line(&self, modal: &ModalState) -> String {
+        let Some(config) = self.modal_config(modal) else {
             return String::new();
         };
+        let orch = OrchestrationSettings::from_mapping(&config.orchestration);
         let snapshot = crate::core::limits::cached();
         let now = chrono::Utc::now().timestamp();
         match executors::select(&orch.executors, Pool::Cheap, snapshot.as_deref(), now) {
@@ -4168,7 +4186,7 @@ impl App {
     }
 
     fn populate_settings_form_options(&self, modal: &mut ModalState) {
-        let Ok(config) = self.ops.config.load() else {
+        let Some(config) = self.modal_config(modal) else {
             return;
         };
         let backend_options = config
@@ -5072,7 +5090,7 @@ impl App {
     }
 
     fn refresh_backend_options_for(&self, modal: &mut ModalState, slot: AgentSlot) {
-        let Ok(config) = self.ops.config.load() else {
+        let Some(config) = self.modal_config(modal) else {
             return;
         };
         self.refresh_slot_options_with_config(modal, &config, slot);
@@ -5080,7 +5098,7 @@ impl App {
 
     fn refresh_backend_options_with_config(&self, modal: &mut ModalState, config: &BoardConfig) {
         self.refresh_slot_options_with_config(modal, config, AgentSlot::Primary);
-        if matches!(modal.modal, Modal::Settings) {
+        if modal.is_settings_form() {
             self.refresh_slot_options_with_config(modal, config, AgentSlot::Designer);
             self.refresh_slot_options_with_config(modal, config, AgentSlot::Reviewer);
         }
@@ -5097,7 +5115,7 @@ impl App {
             .agents
             .get(Value::String(backend.clone()))
             .and_then(Value::as_mapping);
-        let settings_primary = matches!(modal.modal, Modal::Settings) && slot == AgentSlot::Primary;
+        let settings_primary = modal.is_settings_form() && slot == AgentSlot::Primary;
         if settings_primary {
             modal.model = TextArea::new(vec![
                 mapping_str(backend_settings, "model").unwrap_or_default(),
@@ -5119,7 +5137,7 @@ impl App {
             .chain(self.backend_model_options(&backend, backend_settings, &config.auto_launch))
             .collect::<Vec<_>>();
         let mut models = models;
-        if matches!(modal.modal, Modal::Settings) {
+        if modal.is_settings_form() {
             add_missing_option(&mut models, modal.model_text_for(slot));
         }
         modal.set_model_options_for(slot, models);
@@ -5133,7 +5151,7 @@ impl App {
             .chain(options_from_sequence(backend_settings, "agent_options").unwrap_or_default())
             .collect::<Vec<_>>();
         let mut agents = agents;
-        if matches!(modal.modal, Modal::Settings) {
+        if modal.is_settings_form() {
             add_missing_option(&mut agents, modal.agent_text_for(slot));
         }
         modal.set_agent_options_for(slot, agents);
@@ -5218,7 +5236,7 @@ impl App {
                 })
                 .collect();
         }
-        let settings_primary = matches!(modal.modal, Modal::Settings) && slot == AgentSlot::Primary;
+        let settings_primary = modal.is_settings_form() && slot == AgentSlot::Primary;
         let empty_effort = if settings_primary {
             "No default effort"
         } else {
@@ -5229,7 +5247,7 @@ impl App {
             .chain(efforts)
             .collect::<Vec<_>>();
         let mut options = options;
-        if matches!(modal.modal, Modal::Settings) {
+        if modal.is_settings_form() {
             add_missing_option(&mut options, modal.effort_text_for(slot));
         }
         modal.set_effort_options_for(slot, options);
@@ -5241,6 +5259,7 @@ impl App {
         };
         let field_before = modal.active_field();
         let slot_before = slot_selection_snapshot(&modal, field_before);
+        let inherit_before = modal.inherit;
         let command = normalize_command_key(key);
         if modal.discard_confirm {
             match command.code {
@@ -5299,7 +5318,7 @@ impl App {
                 // selectors), and while an agent popup is open. Tab/BackTab
                 // still reach the Save/Cancel buttons from any field.
                 KeyCode::Left | KeyCode::Right
-                    if matches!(modal.modal, Modal::Settings)
+                    if modal.is_settings_form()
                         && !modal.popup_open()
                         && !field_consumes_horizontal(modal.active_field()) =>
                 {
@@ -5380,14 +5399,15 @@ impl App {
                 _ => modal.input(key),
             }
         }
+        self.sync_inherit_checkboxes(&mut modal, inherit_before);
         if let Some(slot) = ModalState::agent_slot(field_before) {
             let after = slot_selection_snapshot(&modal, field_before);
             if after.backend != slot_before.backend
-                && let Ok(config) = self.ops.config.load()
+                && let Some(config) = self.modal_config(&modal)
             {
                 self.refresh_slot_options_with_config(&mut modal, &config, slot);
             } else if after.model != slot_before.model
-                && let Ok(config) = self.ops.config.load()
+                && let Some(config) = self.modal_config(&modal)
             {
                 self.refresh_effort_options_for_slot(&mut modal, &config, slot);
             }
@@ -5452,6 +5472,15 @@ impl App {
     fn submit_modal(&mut self, mut modal: ModalState) -> Result<()> {
         match modal.modal.clone() {
             Modal::GlobalSettings => {
+                let draft = match parse_settings_groups(&modal) {
+                    Ok(draft) => draft,
+                    Err((field, message)) => {
+                        modal.focus_field(field);
+                        modal.error = Some(message);
+                        self.modal = Some(modal);
+                        return Ok(());
+                    }
+                };
                 let save_result = (|| -> Result<()> {
                     let Some(store) = &self.store else {
                         return Err(KanbanError::Invalid(
@@ -5460,6 +5489,9 @@ impl App {
                     };
                     let _lock = store.lock()?;
                     let mut config = store.load_global_config()?;
+                    let mut edited = global_board_view(&config);
+                    apply_settings_groups(&mut edited, &modal, &draft)?;
+                    config.store_board_sections(&edited);
                     config.set_escape_to_projects(modal.escape_to_projects);
                     config.set_update_check_on_open(modal.update_check_on_open);
                     config.set_project_sort(
@@ -5487,27 +5519,13 @@ impl App {
             }
             Modal::Settings => {
                 let project_name = modal.title_text();
-                let Some(backend) = modal.backend_text() else {
-                    modal.focus_field(DialogField::AgentSettings);
-                    modal.error = Some("Default backend must be selected".to_string());
-                    self.modal = Some(modal);
-                    return Ok(());
-                };
                 if project_name.trim().is_empty() {
                     modal.focus_field(DialogField::Title);
                     modal.error = Some("Project name cannot be empty".to_string());
                     self.modal = Some(modal);
                     return Ok(());
                 }
-                let theme_name =
-                    Theme::normalize_name(&modal.theme_text().unwrap_or_default()).to_string();
-                let task_sort = normalize_task_sort(
-                    &modal
-                        .task_sort_text()
-                        .unwrap_or_else(|| TASK_SORT_NUMBER.to_string()),
-                )
-                .to_string();
-                let orch_draft = match parse_orchestration_modal(&modal) {
+                let draft = match parse_settings_groups(&modal) {
                     Ok(draft) => draft,
                     Err((field, message)) => {
                         modal.focus_field(field);
@@ -5516,18 +5534,33 @@ impl App {
                         return Ok(());
                     }
                 };
+                let theme_name =
+                    Theme::normalize_name(&modal.theme_text().unwrap_or_default()).to_string();
+                let shown = self.modal_config(&modal);
                 let save_result = (|| -> Result<()> {
                     ensure_config_write_target_is_safe(&self.ops.config)?;
                     let _lock = self.ops.storage.lock()?;
                     ensure_config_write_target_is_safe(&self.ops.config)?;
-                    let mut config = self.ops.config.load_fresh()?;
-                    let Some(Value::Mapping(backend_config)) =
-                        config.agents.get_mut(Value::String(backend.clone()))
-                    else {
-                        return Err(KanbanError::Invalid(
-                            "Selected backend is not configured".to_string(),
-                        ));
-                    };
+                    // The project file alone: inherited groups keep their
+                    // dormant on-disk values untouched.
+                    let mut config = self.ops.config.load_raw_fresh()?;
+                    let on_disk = self.ops.config.inherit_flags()?;
+                    let mut edited = config.clone();
+                    // A group unticked in this dialog starts from the global
+                    // values it was showing, not the dormant project keys.
+                    if let Some(shown) = &shown {
+                        for group in InheritGroup::ALL {
+                            if on_disk.get(group) && !modal.inherit.get(group) {
+                                copy_group(&mut edited, shown, group);
+                            }
+                        }
+                    }
+                    apply_settings_groups(&mut edited, &modal, &draft)?;
+                    for group in InheritGroup::ALL {
+                        if !modal.inherit.get(group) {
+                            copy_group(&mut config, &edited, group);
+                        }
+                    }
                     config.tui.insert(
                         Value::String("name".to_string()),
                         Value::String(project_name.clone()),
@@ -5536,33 +5569,11 @@ impl App {
                         Value::String("theme".to_string()),
                         Value::String(theme_name.clone()),
                     );
-                    config.tui.insert(
-                        Value::String("task_sort".to_string()),
-                        Value::String(task_sort.clone()),
-                    );
-                    config.tui.insert(
-                        Value::String("hide_kanban_messages".to_string()),
-                        Value::Bool(modal.hide_kanban_messages),
-                    );
-                    config.auto_launch.insert(
-                        Value::String("default_agent".to_string()),
-                        Value::String(backend.clone()),
-                    );
-                    for (key, value) in [
-                        ("model", modal.model_text()),
-                        ("effort", modal.effort_text()),
-                        ("agent", modal.agent_text()),
-                    ] {
-                        backend_config.insert(
-                            Value::String(key.to_string()),
-                            value.map(Value::String).unwrap_or(Value::Null),
-                        );
-                    }
+                    config.inherit = modal.inherit.to_mapping();
                     retain_source_legacy_auto_launch_keys(
                         &self.ops.config.config_file,
                         &mut config,
                     )?;
-                    apply_orchestration_draft(&mut config.orchestration, &orch_draft);
                     self.ops.config.save(&config)
                 })();
                 if let Err(err) = save_result {
@@ -5584,8 +5595,12 @@ impl App {
                 }
                 self.settings.project_name = project_name;
                 self.settings.theme_name = theme_name.clone();
-                self.settings.task_sort = task_sort;
-                self.settings.hide_kanban_messages = modal.hide_kanban_messages;
+                // Inherited groups resolve against the global config, so the
+                // effective values are read back rather than taken from the form.
+                if let Ok(effective) = load_settings(&self.ops) {
+                    self.settings.task_sort = effective.task_sort;
+                    self.settings.hide_kanban_messages = effective.hide_kanban_messages;
+                }
                 self.theme = Theme::named(&theme_name);
                 self.refresh_after_action()?;
                 self.status = "Project settings saved".to_string();
@@ -5921,7 +5936,7 @@ impl App {
             ensure_config_write_target_is_safe(&self.ops.config)?;
             let _lock = self.ops.storage.lock()?;
             ensure_config_write_target_is_safe(&self.ops.config)?;
-            let mut config = self.ops.config.load_fresh()?;
+            let mut config = self.ops.config.load_raw_fresh()?;
             config.tui.insert(
                 Value::String("theme".to_string()),
                 Value::String(next.clone()),
@@ -6516,7 +6531,14 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::Agent => Some(modal.agent_selected),
         DialogField::Theme => Some(modal.theme_selected),
         DialogField::TaskSort => Some(modal.task_sort_selected),
-        DialogField::HideKanbanMessages => None,
+        DialogField::HideKanbanMessages
+        | DialogField::InheritAgent
+        | DialogField::InheritLimits
+        | DialogField::InheritCommon
+        | DialogField::InheritTaskSort
+        | DialogField::InheritDesigner
+        | DialogField::InheritReviewer
+        | DialogField::InheritExecutor => None,
         DialogField::ProjectSort => Some(modal.project_sort_selected),
         DialogField::ChainTo => Some(modal.chain_selected),
         DialogField::TargetStatus => Some(modal.status_selected),
@@ -6656,6 +6678,104 @@ fn default_project_settings() -> TuiSettings {
         show_limits: true,
         hide_kanban_messages: false,
         limits_refresh_interval: crate::core::limits::DEFAULT_REFRESH_INTERVAL,
+    }
+}
+
+/// Every inheritable group at its global value, built-in defaults filling
+/// whatever the global file leaves out — what Global Settings edits.
+pub(crate) fn global_board_view(global: &crate::core::global::GlobalConfig) -> BoardConfig {
+    resolve_inherited(
+        &BoardConfig::default(),
+        &InheritFlags::all(true),
+        global,
+        &mut Vec::new(),
+    )
+}
+
+/// Load one inheritable group's values from `config` into the settings form.
+/// Selector selections follow from the text once the option lists are
+/// (re)populated; the executor slots are set by [`fill_executor_slots`].
+fn fill_settings_group(modal: &mut ModalState, config: &BoardConfig, group: InheritGroup) {
+    let orch = OrchestrationSettings::from_mapping(&config.orchestration);
+    match group {
+        InheritGroup::Agent => {
+            modal.backend = TextArea::new(vec![
+                mapping_str(Some(&config.auto_launch), "default_agent")
+                    .unwrap_or_else(|| "opencode".to_string()),
+            ]);
+        }
+        InheritGroup::TaskSort => {
+            modal.task_sort = TextArea::new(vec![
+                normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
+                    .to_string(),
+            ]);
+        }
+        InheritGroup::Common => {
+            modal.hide_kanban_messages = tui_bool(&config.tui, "hide_kanban_messages", false);
+            modal.auto_restart_enabled = orch.auto_restart_enabled;
+            modal.auto_restart_delays =
+                TextArea::new(vec![format_delays(&orch.auto_restart_delays_minutes)]);
+        }
+        InheritGroup::Limits => {
+            modal.queue_enabled = orch.queue_enabled;
+            modal.max_running_total = TextArea::new(vec![orch.max_running_total.to_string()]);
+            modal.max_running_designer =
+                TextArea::new(vec![role_cap(&orch, "designer").to_string()]);
+            modal.max_running_reviewer =
+                TextArea::new(vec![role_cap(&orch, "reviewer").to_string()]);
+            modal.max_running_executor =
+                TextArea::new(vec![role_cap(&orch, "executor").to_string()]);
+            modal.max_running_per_backend = TextArea::new(lines_or_blank(&format_backend_cap_map(
+                &orch.max_running_per_backend,
+            )));
+            modal.max_running_per_backend_model = TextArea::new(lines_or_blank(
+                &format_sorted_cap_map(&orch.max_running_per_backend_model),
+            ));
+        }
+        InheritGroup::Designer => {
+            let bot = &orch.designer;
+            modal.designer_enabled = bot.enabled;
+            modal.set_backend_text_for(AgentSlot::Designer, bot.backend.as_deref().unwrap_or(""));
+            modal.set_model_text_for(AgentSlot::Designer, bot.model.as_deref().unwrap_or(""));
+            modal.set_effort_text_for(AgentSlot::Designer, bot.effort.as_deref().unwrap_or(""));
+            modal.set_agent_text_for(AgentSlot::Designer, bot.agent.as_deref().unwrap_or(""));
+        }
+        InheritGroup::Reviewer => {
+            let bot = &orch.reviewer;
+            modal.reviewer_enabled = bot.enabled;
+            modal.set_backend_text_for(AgentSlot::Reviewer, bot.backend.as_deref().unwrap_or(""));
+            modal.set_model_text_for(AgentSlot::Reviewer, bot.model.as_deref().unwrap_or(""));
+            modal.set_effort_text_for(AgentSlot::Reviewer, bot.effort.as_deref().unwrap_or(""));
+            modal.set_agent_text_for(AgentSlot::Reviewer, bot.agent.as_deref().unwrap_or(""));
+            modal.reviewer_on_changes = TextArea::new(vec![match bot.on_changes_requested {
+                OnChangesRequested::InProgress => "in_progress".to_string(),
+                OnChangesRequested::Todo => "todo".to_string(),
+            }]);
+            modal.reviewer_max_rounds = TextArea::new(vec![bot.max_rounds.to_string()]);
+        }
+        InheritGroup::Executor => {
+            let thresholds = orch.executors.thresholds;
+            modal.executor_week_threshold =
+                TextArea::new(vec![format!("{}", thresholds.week_percent)]);
+            modal.executor_five_hour_threshold =
+                TextArea::new(vec![format!("{}", thresholds.five_hour_percent)]);
+        }
+    }
+}
+
+/// Point the six executor-pool slot selectors at `config`'s pools. Needs the
+/// slot option list populated first.
+fn fill_executor_slots(modal: &mut ModalState, config: &BoardConfig) {
+    let orch = OrchestrationSettings::from_mapping(&config.orchestration);
+    for slot in 0..6usize {
+        let candidate = if slot < 3 {
+            orch.executors.middle.get(slot)
+        } else {
+            orch.executors.cheap.get(slot - 3)
+        };
+        modal.executor_selected[slot] = candidate
+            .map(|candidate| executor_option_index(modal, &candidate_key(candidate)))
+            .unwrap_or(0);
     }
 }
 
@@ -7177,6 +7297,103 @@ fn pool_entry(previous: Option<&Value>, candidate: &RoleCandidate) -> Value {
         }
     }
     Value::Mapping(mapping)
+}
+
+/// The validated inheritable groups of a settings form (project or global).
+struct SettingsDraft {
+    backend: String,
+    task_sort: String,
+    orchestration: OrchestrationDraft,
+}
+
+fn parse_settings_groups(
+    modal: &ModalState,
+) -> std::result::Result<SettingsDraft, (DialogField, String)> {
+    let Some(backend) = modal.backend_text() else {
+        return Err((
+            DialogField::AgentSettings,
+            "Default backend must be selected".to_string(),
+        ));
+    };
+    let task_sort = normalize_task_sort(
+        &modal
+            .task_sort_text()
+            .unwrap_or_else(|| TASK_SORT_NUMBER.to_string()),
+    )
+    .to_string();
+    Ok(SettingsDraft {
+        backend,
+        task_sort,
+        orchestration: parse_orchestration_modal(modal)?,
+    })
+}
+
+/// Write the form's value of every group the dialog edits into `config`.
+/// Inherited groups are skipped: their fields only display global values.
+fn apply_settings_groups(
+    config: &mut BoardConfig,
+    modal: &ModalState,
+    draft: &SettingsDraft,
+) -> Result<()> {
+    let edits = |group: InheritGroup| !modal.inherit.get(group);
+    if edits(InheritGroup::Agent) {
+        let Some(Value::Mapping(backend_config)) =
+            config.agents.get_mut(Value::String(draft.backend.clone()))
+        else {
+            return Err(KanbanError::Invalid(
+                "Selected backend is not configured".to_string(),
+            ));
+        };
+        for (key, value) in [
+            ("model", modal.model_text()),
+            ("effort", modal.effort_text()),
+            ("agent", modal.agent_text()),
+        ] {
+            backend_config.insert(
+                Value::String(key.to_string()),
+                value.map(Value::String).unwrap_or(Value::Null),
+            );
+        }
+        config.auto_launch.insert(
+            Value::String("default_agent".to_string()),
+            Value::String(draft.backend.clone()),
+        );
+    }
+    if edits(InheritGroup::TaskSort) {
+        config.tui.insert(
+            Value::String("task_sort".to_string()),
+            Value::String(draft.task_sort.clone()),
+        );
+    }
+    if edits(InheritGroup::Common) {
+        config.tui.insert(
+            Value::String("hide_kanban_messages".to_string()),
+            Value::Bool(modal.hide_kanban_messages),
+        );
+    }
+    // The orchestration draft spans four groups; apply it to a copy and take
+    // only the edited groups' keys from it.
+    let mut orchestrated = config.clone();
+    apply_orchestration_draft(&mut orchestrated.orchestration, &draft.orchestration);
+    for group in [
+        InheritGroup::Limits,
+        InheritGroup::Designer,
+        InheritGroup::Reviewer,
+        InheritGroup::Executor,
+    ] {
+        if edits(group) {
+            copy_group(config, &orchestrated, group);
+        }
+    }
+    if edits(InheritGroup::Common) {
+        let auto_restart = orchestrated.orchestration.get("auto_restart").cloned();
+        if let Some(auto_restart) = auto_restart {
+            config
+                .orchestration
+                .insert(Value::String("auto_restart".to_string()), auto_restart);
+        }
+    }
+    Ok(())
 }
 
 fn apply_orchestration_draft(orch: &mut Mapping, draft: &OrchestrationDraft) {

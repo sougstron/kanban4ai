@@ -224,8 +224,11 @@ settings name, work folder, per-column counts, live agents, and last
 opened; `Enter` opens one, `n` adds, `d` unregisters (Space
 toggles deleting board data), `o` opens the selected board's work folder in
 your desktop's file manager, and `s` opens Global Settings (Esc-from-board,
-project-list sorting, and the file-manager override), which apply to every
-board. The row under the mouse is preselected with a faint background so you
+project-list sorting, update checks, plus the global default agent, limits,
+task sorting, and designer/reviewer/executor settings), which apply to every
+board. Project Settings has an "Inherit from global" checkbox per group —
+ticked by default on new boards — so a project follows those global values
+until you untick a group and set its own. The row under the mouse is preselected with a faint background so you
 can see where a click will land. `q` quits the TUI; `Esc` returns to
 the board you came from, or quits when the list is the entry screen.
 The status bar shows the shortcuts for the current screen and its hints are
