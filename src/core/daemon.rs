@@ -147,6 +147,12 @@ fn pump_project(project: &Project, warned_once: &mut HashSet<String>) -> Result<
             lines.push(format!("{ts} warning: project {}: {warning}", project.id));
         }
     }
+    // Deferred post-landing cleanups no `agent-exit` will finish. Unrelated
+    // to the queue, so it runs even when the queue is off.
+    // Best effort: a failed sweep must not stall dispatch.
+    for task_id in ops.sweep_deferred_cleanups().unwrap_or_default() {
+        lines.push(format!("{ts} {} cleanup {task_id}", project.id));
+    }
     if !orchestration.queue_enabled {
         return Ok(lines);
     }
