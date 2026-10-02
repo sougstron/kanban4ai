@@ -11,9 +11,12 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::core::error::{KanbanError, Result};
+use crate::core::global::{GLOBAL_CONFIG_FILE, GlobalConfig};
 use crate::core::models::{Role, Task};
+use crate::core::project::PROJECTS_DIR;
 use crate::core::storage::atomic_write_text;
 
 /// Written verbatim by `kanban init`; also the source of per-key fallbacks.
@@ -250,6 +253,14 @@ orchestration:
     on_conflict: review
     cleanup: on_land
     commit_message: "kanban: {task_id} {title}"
+inherit:
+  agent: true
+  limits: true
+  common: true
+  task_sort: true
+  designer: true
+  reviewer: true
+  executor: true
 "#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +283,10 @@ pub struct BoardConfig {
     pub verification: Mapping,
     #[serde(default)]
     pub orchestration: Mapping,
+    /// Which setting groups follow the machine-wide config (see
+    /// [`InheritFlags`]). Absent on boards written before global configs.
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub inherit: Mapping,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
@@ -296,6 +311,233 @@ impl BoardConfig {
             .filter_map(|c| c.get("name").and_then(Value::as_str).map(str::to_owned))
             .collect()
     }
+}
+
+/// The orchestration keys owned by [`InheritGroup::Limits`].
+const LIMIT_KEYS: [&str; 5] = [
+    "queue_enabled",
+    "max_running_total",
+    "max_running_per_backend",
+    "max_running_per_backend_model",
+    "max_running_per_role",
+];
+
+/// A group of project settings that can follow the machine-wide config
+/// (`<store>/config.yaml`). Project name, theme and everything not listed
+/// here are always per project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InheritGroup {
+    /// `auto_launch:` and `agents:` — they move together because
+    /// `default_agent` names a backend defined under `agents:`.
+    Agent,
+    /// Queue toggle and every `max_running_*` cap.
+    Limits,
+    /// `orchestration.auto_restart` and `tui.hide_kanban_messages`.
+    Common,
+    /// `tui.task_sort`.
+    TaskSort,
+    Designer,
+    Reviewer,
+    Executor,
+}
+
+impl InheritGroup {
+    pub const ALL: [InheritGroup; 7] = [
+        InheritGroup::Agent,
+        InheritGroup::Limits,
+        InheritGroup::Common,
+        InheritGroup::TaskSort,
+        InheritGroup::Designer,
+        InheritGroup::Reviewer,
+        InheritGroup::Executor,
+    ];
+
+    /// The key under the project's `inherit:` section.
+    pub fn key(self) -> &'static str {
+        match self {
+            InheritGroup::Agent => "agent",
+            InheritGroup::Limits => "limits",
+            InheritGroup::Common => "common",
+            InheritGroup::TaskSort => "task_sort",
+            InheritGroup::Designer => "designer",
+            InheritGroup::Reviewer => "reviewer",
+            InheritGroup::Executor => "executor",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|group| *group == self)
+            .unwrap_or(0)
+    }
+
+    /// The `orchestration` sub-mapping a bot/pool group owns outright.
+    fn orchestration_section(self) -> Option<&'static str> {
+        match self {
+            InheritGroup::Designer => Some("designer"),
+            InheritGroup::Reviewer => Some("reviewer"),
+            InheritGroup::Executor => Some("executors"),
+            _ => None,
+        }
+    }
+
+    /// Whether an unmerged (as-read) project file sets any key of this group.
+    fn defined_in(self, config: &BoardConfig) -> bool {
+        let orch_has = |key: &str| config.orchestration.contains_key(key);
+        match self {
+            InheritGroup::Agent => !config.auto_launch.is_empty() || !config.agents.is_empty(),
+            InheritGroup::Limits => LIMIT_KEYS.iter().any(|key| orch_has(key)),
+            InheritGroup::Common => {
+                orch_has("auto_restart") || config.tui.contains_key("hide_kanban_messages")
+            }
+            InheritGroup::TaskSort => config.tui.contains_key("task_sort"),
+            InheritGroup::Designer | InheritGroup::Reviewer | InheritGroup::Executor => {
+                self.orchestration_section().is_some_and(orch_has)
+            }
+        }
+    }
+}
+
+/// Per-group "take this from the global config" switches (`inherit:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InheritFlags([bool; 7]);
+
+impl InheritFlags {
+    pub fn all(inherit: bool) -> Self {
+        Self([inherit; 7])
+    }
+
+    pub fn get(&self, group: InheritGroup) -> bool {
+        self.0[group.index()]
+    }
+
+    pub fn set(&mut self, group: InheritGroup, inherit: bool) {
+        self.0[group.index()] = inherit;
+    }
+
+    /// Flags for a project file as read from disk, before defaults are
+    /// merged in. With an `inherit:` section a missing group key means
+    /// "inherit". Without one (every board written before global configs)
+    /// a group inherits only when the file leaves it out entirely, so an
+    /// upgraded board keeps the values it already had.
+    pub fn from_unmerged(config: &BoardConfig) -> Self {
+        let mut flags = Self::all(true);
+        for group in InheritGroup::ALL {
+            let inherit = if config.inherit.is_empty() {
+                !group.defined_in(config)
+            } else {
+                config
+                    .inherit
+                    .get(group.key())
+                    .and_then(as_bool)
+                    .unwrap_or(true)
+            };
+            flags.set(group, inherit);
+        }
+        flags
+    }
+
+    pub fn to_mapping(&self) -> Mapping {
+        InheritGroup::ALL
+            .iter()
+            .map(|group| {
+                (
+                    Value::String(group.key().to_owned()),
+                    Value::Bool(self.get(*group)),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Copy `key` from `src` into `dst`, or drop it from `dst` when `src` lacks
+/// it so the defaults merge refills the built-in value.
+fn copy_key(dst: &mut Mapping, src: &Mapping, key: &str) {
+    match src.get(key) {
+        Some(value) => {
+            dst.insert(Value::String(key.to_owned()), value.clone());
+        }
+        None => {
+            dst.remove(key);
+        }
+    }
+}
+
+/// Replace every key `group` owns in `dst` with the one in `src`. Keys `src`
+/// does not define are removed from `dst`; run the result through
+/// validation (which merges defaults) before reading it.
+pub fn copy_group(dst: &mut BoardConfig, src: &BoardConfig, group: InheritGroup) {
+    match group {
+        InheritGroup::Agent => {
+            dst.auto_launch = src.auto_launch.clone();
+            dst.agents = src.agents.clone();
+        }
+        InheritGroup::Limits => {
+            for key in LIMIT_KEYS {
+                copy_key(&mut dst.orchestration, &src.orchestration, key);
+            }
+        }
+        InheritGroup::Common => {
+            copy_key(&mut dst.orchestration, &src.orchestration, "auto_restart");
+            copy_key(&mut dst.tui, &src.tui, "hide_kanban_messages");
+        }
+        InheritGroup::TaskSort => copy_key(&mut dst.tui, &src.tui, "task_sort"),
+        InheritGroup::Designer | InheritGroup::Reviewer | InheritGroup::Executor => {
+            if let Some(section) = group.orchestration_section() {
+                copy_key(&mut dst.orchestration, &src.orchestration, section);
+            }
+        }
+    }
+}
+
+/// The effective config: `raw` (a validated project config) with every
+/// inherited group replaced by the global one. A global group that does not
+/// validate degrades to the built-in defaults with a warning instead of an
+/// error — the global file is shared by every board, so a hard error there
+/// would make all of them unloadable at once.
+pub fn resolve_inherited(
+    raw: &BoardConfig,
+    flags: &InheritFlags,
+    global: &GlobalConfig,
+    warnings: &mut Vec<String>,
+) -> BoardConfig {
+    let source = global.board_sections();
+    let mut effective = raw.clone();
+    let mut problems = Vec::new();
+    for group in InheritGroup::ALL {
+        if !flags.get(group) {
+            continue;
+        }
+        let mut candidate = effective.clone();
+        copy_group(&mut candidate, &source, group);
+        let err = match Config::validate(&mut candidate, &mut Vec::new()) {
+            Ok(()) => {
+                effective = candidate;
+                continue;
+            }
+            Err(err) => err,
+        };
+        let mut fallback = effective.clone();
+        copy_group(&mut fallback, &BoardConfig::default(), group);
+        if Config::validate(&mut fallback, &mut Vec::new()).is_ok() {
+            problems.push(format!(
+                "global {} settings are invalid ({err}); using built-in defaults",
+                group.key()
+            ));
+            effective = fallback;
+        } else {
+            problems.push(format!(
+                "global {} settings are invalid ({err}); keeping this project's values",
+                group.key()
+            ));
+        }
+    }
+    // Inherited groups were validated above, so this only collects the
+    // non-fatal warnings of the combined result.
+    let _ = Config::validate(&mut effective, warnings);
+    warnings.extend(problems);
+    effective
 }
 
 /// Typed view of one role bot's launch settings (`orchestration.designer` /
@@ -1452,6 +1694,16 @@ impl OrchestrationSettings {
     }
 }
 
+/// `<store>/config.yaml` for a board whose data root is
+/// `<store>/projects/<id>`; `None` for a board used in place.
+fn store_global_file(data_root: &Path) -> Option<PathBuf> {
+    let projects = data_root.parent()?;
+    if projects.file_name()? != PROJECTS_DIR {
+        return None;
+    }
+    Some(projects.parent()?.join(GLOBAL_CONFIG_FILE))
+}
+
 impl Default for OrchestrationSettings {
     fn default() -> Self {
         Self::from_mapping(&BoardConfig::default().orchestration)
@@ -1462,11 +1714,26 @@ pub struct Config {
     pub project_path: PathBuf,
     pub kanban_dir: PathBuf,
     pub config_file: PathBuf,
-    cache: RefCell<Option<BoardConfig>>,
+    /// The machine-wide config inherited groups come from. `None` for a
+    /// board outside the store (used in place), which inherits the
+    /// built-in defaults.
+    global_file: Option<PathBuf>,
+    cache: RefCell<Option<LoadedConfig>>,
     /// Non-fatal problems found while validating the loaded config — a setting
     /// that is merely ineffective rather than wrong (see [`Self::warnings`]).
     /// Filled by the load that populated `cache`, so a cache hit keeps them.
     warnings: RefCell<Vec<String>>,
+}
+
+/// One load of both files. `global_stamp` is the global file's mtime at load
+/// time; a later change invalidates the entry, so a long-lived process picks
+/// up global edits on its next read.
+#[derive(Clone)]
+struct LoadedConfig {
+    raw: BoardConfig,
+    effective: BoardConfig,
+    inherit: InheritFlags,
+    global_stamp: Option<SystemTime>,
 }
 
 impl Config {
@@ -1474,12 +1741,53 @@ impl Config {
         let project_path = project_path.as_ref().to_path_buf();
         let kanban_dir = project_path.join(".kanban");
         let config_file = kanban_dir.join("config.yaml");
+        let global_file = store_global_file(&project_path);
         Config {
             project_path,
             kanban_dir,
             config_file,
+            global_file,
             cache: RefCell::new(None),
             warnings: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Point inheritance at another global config file (tests, tools).
+    pub fn with_global_file(mut self, global_file: Option<PathBuf>) -> Self {
+        self.global_file = global_file;
+        *self.cache.borrow_mut() = None;
+        self
+    }
+
+    pub fn global_file(&self) -> Option<&Path> {
+        self.global_file.as_deref()
+    }
+
+    /// The global file's mtime, `None` when it is absent. Cheap enough for a
+    /// per-tick change check.
+    pub fn global_stamp(&self) -> Option<SystemTime> {
+        self.global_file
+            .as_ref()
+            .and_then(|path| fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok())
+    }
+
+    /// The machine-wide config this board inherits from. An unreadable or
+    /// unparseable file reads as defaults: it is shared by every board, so
+    /// it must never make one unloadable.
+    pub fn load_global(&self) -> (GlobalConfig, Option<String>) {
+        let Some(path) = &self.global_file else {
+            return (GlobalConfig::default(), None);
+        };
+        match crate::core::global::read_global_config(path) {
+            Ok(global) => (global, None),
+            Err(err) => (
+                GlobalConfig::default(),
+                Some(format!(
+                    "global config {} is unreadable ({err}); inherited settings use built-in defaults",
+                    path.display()
+                )),
+            ),
         }
     }
 
@@ -1504,8 +1812,30 @@ impl Config {
         Ok(())
     }
 
+    /// The effective config: the project file with every inherited group
+    /// taken from the global config. Everything that *reads* settings uses
+    /// this; anything that writes the project file back must start from
+    /// [`Self::load_raw`] instead, or global values would be baked in.
     pub fn load(&self) -> Result<BoardConfig> {
-        if let Some(cached) = self.cache.borrow().as_ref() {
+        Ok(self.loaded()?.effective)
+    }
+
+    /// The project file alone (defaults merged, nothing inherited) — the
+    /// base for every read-modify-write of `.kanban/config.yaml`.
+    pub fn load_raw(&self) -> Result<BoardConfig> {
+        Ok(self.loaded()?.raw)
+    }
+
+    /// Which groups currently follow the global config.
+    pub fn inherit_flags(&self) -> Result<InheritFlags> {
+        Ok(self.loaded()?.inherit)
+    }
+
+    fn loaded(&self) -> Result<LoadedConfig> {
+        let stamp = self.global_stamp();
+        if let Some(cached) = self.cache.borrow().as_ref()
+            && cached.global_stamp == stamp
+        {
             return Ok(cached.clone());
         }
         if !self.exists() {
@@ -1517,28 +1847,52 @@ impl Config {
         } else {
             serde_yaml_ng::from_str(&raw)?
         };
+        let inherit = InheritFlags::from_unmerged(&config);
         if config.columns.is_empty() {
             config.columns = BoardConfig::default().columns;
         }
         let mut warnings = Vec::new();
         Self::validate(&mut config, &mut warnings)?;
+        let effective = if InheritGroup::ALL.iter().any(|group| inherit.get(*group)) {
+            let (global, problem) = self.load_global();
+            warnings.clear();
+            let effective = resolve_inherited(&config, &inherit, &global, &mut warnings);
+            warnings.extend(problem);
+            effective
+        } else {
+            config.clone()
+        };
+        let loaded = LoadedConfig {
+            raw: config,
+            effective,
+            inherit,
+            global_stamp: stamp,
+        };
         *self.warnings.borrow_mut() = warnings;
-        *self.cache.borrow_mut() = Some(config.clone());
-        Ok(config)
+        *self.cache.borrow_mut() = Some(loaded.clone());
+        Ok(loaded)
     }
 
-    /// Discard this instance's cached view and reload the current file.
-    /// Callers that perform a locked read-modify-write use this to avoid
-    /// overwriting changes made by another process after an earlier read.
+    /// Discard this instance's cached view and reload the current files.
+    /// Callers that perform a locked read-modify-write use
+    /// [`Self::load_raw_fresh`] to avoid overwriting changes made by another
+    /// process after an earlier read.
     pub fn load_fresh(&self) -> Result<BoardConfig> {
         *self.cache.borrow_mut() = None;
         self.load()
     }
 
+    pub fn load_raw_fresh(&self) -> Result<BoardConfig> {
+        *self.cache.borrow_mut() = None;
+        self.load_raw()
+    }
+
+    /// Write the project file. `config` must come from [`Self::load_raw`]
+    /// (or be built for the project file), never from the effective view.
     pub fn save(&self, config: &BoardConfig) -> Result<()> {
         fs::create_dir_all(&self.kanban_dir)?;
         atomic_write_text(&self.config_file, &serde_yaml_ng::to_string(config)?)?;
-        *self.cache.borrow_mut() = Some(config.clone());
+        *self.cache.borrow_mut() = None;
         Ok(())
     }
 

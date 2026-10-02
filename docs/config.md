@@ -97,6 +97,46 @@ they are edited: press `s` on the Projects screen. Saved under the store
   fresh before the next on-open check runs.
 - `updates.notify`: false - reserved for firing a desktop notification on a
   newly seen version; the status-line banner is the only surface for now.
+- `auto_launch:`, `agents:`, the group keys of `orchestration:`, and
+  `tui.task_sort` / `tui.hide_kanban_messages`: the global half of the
+  inheritable groups below, same shapes as in the project file. Absent keys
+  read as the built-in defaults. Edited on the Global Settings tabs.
+
+### Inheriting settings from the global config
+Project settings come in seven groups, each of which either follows the
+global config or uses the project's own keys. The project file records the
+choice in a top-level `inherit:` section:
+
+| `inherit:` key | Project keys the group owns |
+|---|---|
+| `agent` | `auto_launch:` and `agents:` (they move together: `default_agent` names a backend under `agents:`) |
+| `limits` | `orchestration.queue_enabled`, `max_running_total`, `max_running_per_backend`, `max_running_per_backend_model`, `max_running_per_role` |
+| `common` | `orchestration.auto_restart`, `tui.hide_kanban_messages` |
+| `task_sort` | `tui.task_sort` |
+| `designer` | `orchestration.designer` |
+| `reviewer` | `orchestration.reviewer` |
+| `executor` | `orchestration.executors` |
+
+Everything else — `tui.name`, `tui.theme`, the other `tui:` keys, `columns`,
+`rules`, `thresholds`, `notifications`, `verification`, and
+`orchestration.isolation` / `orchestrator` / `roles` — is always per project.
+
+- `true` (the default for every group on a new board): every read takes the
+  group from `<store>/config.yaml`, so a global edit applies on the next use
+  (an open TUI notices the file's mtime). The project's own keys for that group
+  stay in the file untouched but ignored, so switching back is lossless.
+- `false`: the project's keys win. Unticking a group in Project Settings
+  saves the values it was showing — the global ones — as the project's.
+- A group key missing from an existing `inherit:` section means `true`. A file
+  with no `inherit:` section at all (written before global configs) inherits
+  exactly the groups it does not define, so upgraded boards keep their values.
+- Inherited groups are validated on their own; an invalid global group falls
+  back to the built-in defaults with a warning (and an unparseable global file
+  to all defaults) instead of making every board unloadable.
+- Only boards in the store (`<store>/projects/<id>`) read the global file; a
+  board used in place inherits the built-in defaults.
+- Code that rewrites the project file starts from `Config::load_raw` (project
+  file only); `Config::load` is the effective view every reader uses.
 
 ## Notification Settings (.kanban/config.yaml `notifications:`)
 - `enabled`: true - master switch for desktop notifications
@@ -122,8 +162,10 @@ Controls how delegating a task spawns a background agent job (shared across all 
 
 ## Orchestration Settings (.kanban/config.yaml `orchestration:`)
 
-Per-project — nothing here lives in the global store config. Edited in Project
-Settings (`s`) or in the file. Unlike every other section, `orchestration` is
+Per-project, except the keys of the `limits`, `common`, `designer`,
+`reviewer` and `executor` groups, which follow the global config while
+inherited (see "Inheriting settings from the global config"). Edited in Project
+Settings (`s`), Global Settings, or the file. Unlike every other section, `orchestration` is
 merged with `merge_missing_deep`, so a board that sets only
 `orchestration.designer.enabled` still gets all the sibling defaults; the other
 sections keep their long-standing shallow `merge_missing` semantics.

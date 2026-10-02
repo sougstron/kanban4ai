@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui_textarea::{TextArea, WrapMode};
 
+use crate::core::config::{BoardConfig, InheritFlags, InheritGroup};
 use crate::core::models::Task;
 use crate::core::operations::QuestionRef;
 use crate::core::update;
@@ -147,6 +148,13 @@ pub enum DialogField {
     ExecutorWeekThreshold,
     ExecutorFiveHourThreshold,
     IsolationStatus,
+    InheritAgent,
+    InheritLimits,
+    InheritCommon,
+    InheritTaskSort,
+    InheritDesigner,
+    InheritReviewer,
+    InheritExecutor,
     Confirm,
     Cancel,
     PurgeData,
@@ -230,13 +238,20 @@ impl SettingsTab {
 }
 
 /// One settings tab's field page, Save/Cancel inclusive: the buttons render
-/// under every tab and save the whole dialog, not just the visible one.
-const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 17] = [
+/// under every tab and save the whole dialog, not just the visible one. Each
+/// inheritable group leads with its "Inherit from global" checkbox.
+const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 21] = [
     DialogField::Title,
-    DialogField::AgentSettings,
     DialogField::Theme,
+    DialogField::InheritAgent,
+    DialogField::AgentSettings,
+    DialogField::InheritTaskSort,
     DialogField::TaskSort,
+    DialogField::InheritCommon,
     DialogField::HideKanbanMessages,
+    DialogField::AutoRestartEnabled,
+    DialogField::AutoRestartDelays,
+    DialogField::InheritLimits,
     DialogField::QueueEnabled,
     DialogField::MaxRunningTotal,
     DialogField::MaxRunningDesigner,
@@ -244,21 +259,21 @@ const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 17] = [
     DialogField::MaxRunningExecutor,
     DialogField::MaxRunningPerBackend,
     DialogField::MaxRunningPerBackendModel,
-    DialogField::AutoRestartEnabled,
-    DialogField::AutoRestartDelays,
     DialogField::IsolationStatus,
     DialogField::Confirm,
     DialogField::Cancel,
 ];
 
-const SETTINGS_PAGE_DESIGNER_FIELDS: [DialogField; 4] = [
+const SETTINGS_PAGE_DESIGNER_FIELDS: [DialogField; 5] = [
+    DialogField::InheritDesigner,
     DialogField::DesignerEnabled,
     DialogField::DesignerAgentSettings,
     DialogField::Confirm,
     DialogField::Cancel,
 ];
 
-const SETTINGS_PAGE_REVIEWER_FIELDS: [DialogField; 6] = [
+const SETTINGS_PAGE_REVIEWER_FIELDS: [DialogField; 7] = [
+    DialogField::InheritReviewer,
     DialogField::ReviewerEnabled,
     DialogField::ReviewerAgentSettings,
     DialogField::ReviewerOnChanges,
@@ -267,7 +282,8 @@ const SETTINGS_PAGE_REVIEWER_FIELDS: [DialogField; 6] = [
     DialogField::Cancel,
 ];
 
-const SETTINGS_PAGE_EXECUTOR_FIELDS: [DialogField; 10] = [
+const SETTINGS_PAGE_EXECUTOR_FIELDS: [DialogField; 11] = [
+    DialogField::InheritExecutor,
     DialogField::ExecutorMiddle1,
     DialogField::ExecutorMiddle2,
     DialogField::ExecutorMiddle3,
@@ -276,6 +292,29 @@ const SETTINGS_PAGE_EXECUTOR_FIELDS: [DialogField; 10] = [
     DialogField::ExecutorCheap3,
     DialogField::ExecutorWeekThreshold,
     DialogField::ExecutorFiveHourThreshold,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
+/// The Global Settings Common page: the machine-only settings first, then
+/// the global half of every inheritable group on that tab. The other tabs
+/// are the project pages minus their inherit checkbox.
+const GLOBAL_SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 17] = [
+    DialogField::EscapeToProjects,
+    DialogField::ProjectSort,
+    DialogField::UpdateCheckOnOpen,
+    DialogField::AgentSettings,
+    DialogField::TaskSort,
+    DialogField::HideKanbanMessages,
+    DialogField::AutoRestartEnabled,
+    DialogField::AutoRestartDelays,
+    DialogField::QueueEnabled,
+    DialogField::MaxRunningTotal,
+    DialogField::MaxRunningDesigner,
+    DialogField::MaxRunningReviewer,
+    DialogField::MaxRunningExecutor,
+    DialogField::MaxRunningPerBackend,
+    DialogField::MaxRunningPerBackendModel,
     DialogField::Confirm,
     DialogField::Cancel,
 ];
@@ -290,14 +329,18 @@ pub(crate) fn settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
     }
 }
 
-/// The fields visible on one settings tab (Save/Cancel excluded — they sit
-/// under every tab).
-pub(crate) fn settings_fields(tab: SettingsTab) -> &'static [DialogField] {
-    let page = settings_page_fields(tab);
-    &page[..page.len() - 2]
+/// The Global Settings page of one tab, buttons included.
+pub(crate) fn global_settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
+    match tab {
+        SettingsTab::Common => &GLOBAL_SETTINGS_PAGE_COMMON_FIELDS,
+        SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS[1..],
+        SettingsTab::Reviewer => &SETTINGS_PAGE_REVIEWER_FIELDS[1..],
+        SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS[1..],
+    }
 }
 
-/// The tab a settings field lives on — the inverse of [`settings_fields`].
+/// The tab a settings field lives on — the inverse of
+/// [`settings_page_fields`] / [`global_settings_page_fields`].
 /// A validation error focuses its own tab through this map.
 pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
     match field {
@@ -315,15 +358,24 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::MaxRunningPerBackendModel
         | DialogField::AutoRestartEnabled
         | DialogField::AutoRestartDelays
-        | DialogField::IsolationStatus => Some(SettingsTab::Common),
-        DialogField::DesignerEnabled | DialogField::DesignerAgentSettings => {
-            Some(SettingsTab::Designer)
-        }
-        DialogField::ReviewerEnabled
+        | DialogField::IsolationStatus
+        | DialogField::InheritAgent
+        | DialogField::InheritLimits
+        | DialogField::InheritCommon
+        | DialogField::InheritTaskSort
+        | DialogField::EscapeToProjects
+        | DialogField::ProjectSort
+        | DialogField::UpdateCheckOnOpen => Some(SettingsTab::Common),
+        DialogField::InheritDesigner
+        | DialogField::DesignerEnabled
+        | DialogField::DesignerAgentSettings => Some(SettingsTab::Designer),
+        DialogField::InheritReviewer
+        | DialogField::ReviewerEnabled
         | DialogField::ReviewerAgentSettings
         | DialogField::ReviewerOnChanges
         | DialogField::ReviewerMaxRounds => Some(SettingsTab::Reviewer),
-        DialogField::ExecutorMiddle1
+        DialogField::InheritExecutor
+        | DialogField::ExecutorMiddle1
         | DialogField::ExecutorMiddle2
         | DialogField::ExecutorMiddle3
         | DialogField::ExecutorCheap1
@@ -331,6 +383,66 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::ExecutorCheap3
         | DialogField::ExecutorWeekThreshold
         | DialogField::ExecutorFiveHourThreshold => Some(SettingsTab::Executor),
+        _ => None,
+    }
+}
+
+/// The group an "Inherit from global" checkbox switches.
+pub(crate) fn inherit_checkbox_group(field: DialogField) -> Option<InheritGroup> {
+    match field {
+        DialogField::InheritAgent => Some(InheritGroup::Agent),
+        DialogField::InheritLimits => Some(InheritGroup::Limits),
+        DialogField::InheritCommon => Some(InheritGroup::Common),
+        DialogField::InheritTaskSort => Some(InheritGroup::TaskSort),
+        DialogField::InheritDesigner => Some(InheritGroup::Designer),
+        DialogField::InheritReviewer => Some(InheritGroup::Reviewer),
+        DialogField::InheritExecutor => Some(InheritGroup::Executor),
+        _ => None,
+    }
+}
+
+/// The inheritable group a settings field edits, `None` for project-only
+/// fields (name, theme, isolation) and the checkboxes themselves.
+pub(crate) fn field_group(field: DialogField) -> Option<InheritGroup> {
+    match field {
+        DialogField::AgentSettings
+        | DialogField::Backend
+        | DialogField::Model
+        | DialogField::Effort
+        | DialogField::Agent => Some(InheritGroup::Agent),
+        DialogField::QueueEnabled
+        | DialogField::MaxRunningTotal
+        | DialogField::MaxRunningDesigner
+        | DialogField::MaxRunningReviewer
+        | DialogField::MaxRunningExecutor
+        | DialogField::MaxRunningPerBackend
+        | DialogField::MaxRunningPerBackendModel => Some(InheritGroup::Limits),
+        DialogField::HideKanbanMessages
+        | DialogField::AutoRestartEnabled
+        | DialogField::AutoRestartDelays => Some(InheritGroup::Common),
+        DialogField::TaskSort => Some(InheritGroup::TaskSort),
+        DialogField::DesignerEnabled
+        | DialogField::DesignerAgentSettings
+        | DialogField::DesignerBackend
+        | DialogField::DesignerModel
+        | DialogField::DesignerEffort
+        | DialogField::DesignerAgent => Some(InheritGroup::Designer),
+        DialogField::ReviewerEnabled
+        | DialogField::ReviewerAgentSettings
+        | DialogField::ReviewerBackend
+        | DialogField::ReviewerModel
+        | DialogField::ReviewerEffort
+        | DialogField::ReviewerAgent
+        | DialogField::ReviewerOnChanges
+        | DialogField::ReviewerMaxRounds => Some(InheritGroup::Reviewer),
+        DialogField::ExecutorMiddle1
+        | DialogField::ExecutorMiddle2
+        | DialogField::ExecutorMiddle3
+        | DialogField::ExecutorCheap1
+        | DialogField::ExecutorCheap2
+        | DialogField::ExecutorCheap3
+        | DialogField::ExecutorWeekThreshold
+        | DialogField::ExecutorFiveHourThreshold => Some(InheritGroup::Executor),
         _ => None,
     }
 }
@@ -360,12 +472,6 @@ const REVIEWER_AGENT_FIELDS: [DialogField; 6] = [
     DialogField::ReviewerAgent,
     DialogField::Confirm,
     DialogField::Cancel,
-];
-
-const GLOBAL_SETTINGS_FORM_FIELDS: [DialogField; 3] = [
-    DialogField::EscapeToProjects,
-    DialogField::ProjectSort,
-    DialogField::UpdateCheckOnOpen,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,6 +713,15 @@ pub struct ModalState {
     /// Availability probe for the current project, taken once when the
     /// settings dialog opens (the probe runs git subprocesses).
     pub isolation_status: Option<Availability>,
+    /// Project settings only: which groups follow the global config. An
+    /// inherited group's fields show the global values and are disabled.
+    pub inherit: InheritFlags,
+    /// Every inheritable group at its global value — what a group shows
+    /// when its checkbox is ticked (project settings), or the edited global
+    /// sections themselves (global settings).
+    pub(crate) global_view: Option<Box<BoardConfig>>,
+    /// Project settings only: the effective config the dialog opened with.
+    pub(crate) settings_base: Option<Box<BoardConfig>>,
     sub_popup: Option<SubPopup>,
 }
 
@@ -699,6 +814,9 @@ impl ModalState {
             reviewer_on_changes_selected: 0,
             reviewer_max_rounds: one_line("3"),
             isolation_status: None,
+            inherit: InheritFlags::all(false),
+            global_view: None,
+            settings_base: None,
             sub_popup: None,
         }
     }
@@ -734,7 +852,7 @@ impl ModalState {
         self.parent_fields()
     }
 
-    fn parent_fields(&self) -> &'static [DialogField] {
+    pub(crate) fn parent_fields(&self) -> &'static [DialogField] {
         match self.modal {
             Modal::NewTask { .. } | Modal::EditTask { .. } => &[
                 DialogField::Title,
@@ -770,13 +888,7 @@ impl ModalState {
                 DialogField::Cancel,
             ],
             Modal::Settings => settings_page_fields(self.settings_tab),
-            Modal::GlobalSettings => &[
-                DialogField::EscapeToProjects,
-                DialogField::ProjectSort,
-                DialogField::UpdateCheckOnOpen,
-                DialogField::Confirm,
-                DialogField::Cancel,
-            ],
+            Modal::GlobalSettings => global_settings_page_fields(self.settings_tab),
             Modal::NewProject => &[
                 DialogField::Description,
                 DialogField::Title,
@@ -839,28 +951,46 @@ impl ModalState {
     }
 
     pub fn next_field(&mut self) {
-        let len = self.fields().len();
-        if len > 0 {
-            let current = self
-                .sub_popup
-                .as_ref()
-                .map(SubPopup::field_index)
-                .unwrap_or(self.field_index);
-            self.set_field_index((current + 1) % len);
-        }
+        self.step_field(1);
     }
 
     pub fn prev_field(&mut self) {
-        let len = self.fields().len();
-        if len > 0 {
-            let current = self
-                .sub_popup
-                .as_ref()
-                .map(SubPopup::field_index)
-                .unwrap_or(self.field_index);
-            let index = if current == 0 { len - 1 } else { current - 1 };
-            self.set_field_index(index);
+        self.step_field(-1);
+    }
+
+    /// Walk focus by one, skipping fields disabled by inheritance.
+    fn step_field(&mut self, delta: isize) {
+        let fields = self.fields();
+        let len = fields.len();
+        if len == 0 {
+            return;
         }
+        let mut index = self
+            .sub_popup
+            .as_ref()
+            .map(SubPopup::field_index)
+            .unwrap_or(self.field_index);
+        for _ in 0..len {
+            index = (index as isize + delta).rem_euclid(len as isize) as usize;
+            if self.field_enabled(fields[index]) {
+                break;
+            }
+        }
+        self.set_field_index(index);
+    }
+
+    /// Project or global settings — the two dialogs sharing the tabbed form.
+    pub fn is_settings_form(&self) -> bool {
+        matches!(self.modal, Modal::Settings | Modal::GlobalSettings)
+    }
+
+    /// Whether a field can be focused and edited. In project settings a
+    /// field of an inherited group is read-only: it shows the global value.
+    pub fn field_enabled(&self, field: DialogField) -> bool {
+        if !matches!(self.modal, Modal::Settings) {
+            return true;
+        }
+        field_group(field).is_none_or(|group| !self.inherit.get(group))
     }
 
     pub fn submit_on_enter(&self) -> bool {
@@ -1161,7 +1291,10 @@ impl ModalState {
     pub fn focus_field(&mut self, field: DialogField) {
         // A validation error may name a field on a hidden tab; surface its
         // tab first so the focus below can actually land on it.
-        if matches!(self.modal, Modal::Settings)
+        if !self.field_enabled(field) {
+            return;
+        }
+        if self.is_settings_form()
             && let Some(tab) = tab_for_field(field)
         {
             self.set_settings_tab(tab);
@@ -1178,7 +1311,7 @@ impl ModalState {
     /// Show another settings tab. Field values are never touched — one
     /// [`ModalState`] holds every tab's state and Save writes them all.
     pub fn set_settings_tab(&mut self, tab: SettingsTab) {
-        if !matches!(self.modal, Modal::Settings) || tab == self.settings_tab {
+        if !self.is_settings_form() || tab == self.settings_tab {
             return;
         }
         // Leaving a selector drops its filter, exactly as leaving the field
@@ -1361,6 +1494,9 @@ impl ModalState {
     pub fn input(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         let before = self.editable_signature();
         let field = self.active_field();
+        if !self.field_enabled(field) {
+            return;
+        }
         match field {
             DialogField::Title => input_single_line(&mut self.title, key),
             DialogField::Description => {
@@ -1456,6 +1592,19 @@ impl ModalState {
                 input_single_line(&mut self.executor_five_hour_threshold, key)
             }
             DialogField::IsolationStatus => {}
+            DialogField::InheritAgent
+            | DialogField::InheritLimits
+            | DialogField::InheritCommon
+            | DialogField::InheritTaskSort
+            | DialogField::InheritDesigner
+            | DialogField::InheritReviewer
+            | DialogField::InheritExecutor => {
+                if key.code == ratatui::crossterm::event::KeyCode::Char(' ')
+                    && let Some(group) = inherit_checkbox_group(field)
+                {
+                    self.inherit.set(group, !self.inherit.get(group));
+                }
+            }
             DialogField::Confirm | DialogField::Cancel => {}
         }
         if self.editable_signature() != before {
@@ -1586,7 +1735,14 @@ impl ModalState {
             | DialogField::AutoRestartEnabled
             | DialogField::DesignerEnabled
             | DialogField::ReviewerEnabled
-            | DialogField::IsolationStatus => &mut self.answer,
+            | DialogField::IsolationStatus
+            | DialogField::InheritAgent
+            | DialogField::InheritLimits
+            | DialogField::InheritCommon
+            | DialogField::InheritTaskSort
+            | DialogField::InheritDesigner
+            | DialogField::InheritReviewer
+            | DialogField::InheritExecutor => &mut self.answer,
         }
     }
 
@@ -2151,7 +2307,7 @@ impl ModalState {
         let fields = match self.modal {
             Modal::NewTask { .. } | Modal::EditTask { .. } => Some(&TASK_FORM_FIELDS[..]),
             Modal::Settings => Some(settings_page_fields(self.settings_tab)),
-            Modal::GlobalSettings => Some(&GLOBAL_SETTINGS_FORM_FIELDS[..]),
+            Modal::GlobalSettings => Some(global_settings_page_fields(self.settings_tab)),
             _ => None,
         };
         if let Some(fields) = fields {
@@ -2234,6 +2390,7 @@ impl ModalState {
             self.executor_filters.join("\u{1f}"),
             raw_textarea_text(&self.executor_week_threshold),
             raw_textarea_text(&self.executor_five_hour_threshold),
+            format!("{:?}", self.inherit),
         ]
         .join("\u{1f}")
     }
@@ -2409,9 +2566,8 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
         Modal::AnswerQuestion { task_id, questions } => {
             render_answer(frame, app, modal, inner, task_id, questions, &mut hitboxes)
         }
-        Modal::Settings => render_settings_form(frame, app, modal, inner, &mut hitboxes),
-        Modal::GlobalSettings => {
-            render_global_settings_form(frame, app, modal, inner, &mut hitboxes)
+        Modal::Settings | Modal::GlobalSettings => {
+            render_settings_form(frame, app, modal, inner, &mut hitboxes)
         }
         Modal::NewProject => render_project_form(
             frame,
@@ -2500,8 +2656,18 @@ fn render_sub_popup(
             height,
         };
         render_selector_field(frame, app, modal, field, row);
-        register_field(hitboxes, row, field);
-        register_task_options(hitboxes, modal, field, row);
+        if modal.field_enabled(field) {
+            register_field(hitboxes, row, field);
+            register_task_options(hitboxes, modal, field, row);
+        } else {
+            // Inherited: the global value stays readable but reads as inert.
+            frame.buffer_mut().set_style(
+                row,
+                Style::default()
+                    .fg(app.theme.muted)
+                    .add_modifier(Modifier::DIM),
+            );
+        }
         y = y.saturating_add(height);
     }
     render_form_buttons(frame, app, modal, button_area, hitboxes);
@@ -2583,7 +2749,7 @@ fn render_settings_form(
     // The Executor tab opens with the resolved order the board would run
     // right now, so the priority slots read as live data, not labels.
     let status_line = match tab {
-        SettingsTab::Executor => app.executor_pool_status_line(),
+        SettingsTab::Executor => app.executor_pool_status_line(modal),
         _ => String::new(),
     };
     let strip_height = if status_line.is_empty() {
@@ -2612,7 +2778,13 @@ fn render_settings_form(
     } else {
         area
     };
-    render_selector_form(frame, app, modal, form_area, hitboxes, settings_fields(tab));
+    let page = modal.parent_fields();
+    let fields = &page[..page.len() - 2];
+    if matches!(modal.modal, Modal::GlobalSettings) && tab == SettingsTab::Common {
+        render_global_settings_common(frame, app, modal, form_area, hitboxes, fields);
+    } else {
+        render_selector_form(frame, app, modal, form_area, hitboxes, fields);
+    }
 }
 
 /// The ` Common │ Designer │ Reviewer │ Executor ` header. Labels degrade to
@@ -2714,12 +2886,13 @@ fn render_settings_tab_strip(
     );
 }
 
-fn render_global_settings_form(
+fn render_global_settings_common(
     frame: &mut Frame<'_>,
     app: &App,
     modal: &mut ModalState,
     area: Rect,
     hitboxes: &mut Vec<Hitbox>,
+    fields: &[DialogField],
 ) {
     // The Updates section (status + action buttons) sits above the standard
     // form; update state is machine-wide, so it lives only in this dialog.
@@ -2734,14 +2907,7 @@ fn render_global_settings_form(
         (Rect::default(), area)
     };
     render_updates_section(frame, app, modal, updates_area, hitboxes);
-    render_selector_form(
-        frame,
-        app,
-        modal,
-        form_area,
-        hitboxes,
-        &GLOBAL_SETTINGS_FORM_FIELDS,
-    );
+    render_selector_form(frame, app, modal, form_area, hitboxes, fields);
 }
 
 fn render_updates_section(
@@ -3013,8 +3179,18 @@ fn render_selector_form(
             height,
         };
         render_selector_field(frame, app, modal, field, row);
-        register_field(hitboxes, row, field);
-        register_task_options(hitboxes, modal, field, row);
+        if modal.field_enabled(field) {
+            register_field(hitboxes, row, field);
+            register_task_options(hitboxes, modal, field, row);
+        } else {
+            // Inherited: the global value stays readable but reads as inert.
+            frame.buffer_mut().set_style(
+                row,
+                Style::default()
+                    .fg(app.theme.muted)
+                    .add_modifier(Modifier::DIM),
+            );
+        }
         y = y.saturating_add(height);
     }
     render_form_buttons(frame, app, modal, button_area, hitboxes);
@@ -3102,6 +3278,13 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::ExecutorWeekThreshold
         | DialogField::ExecutorFiveHourThreshold
         | DialogField::IsolationStatus => 3,
+        DialogField::InheritAgent
+        | DialogField::InheritLimits
+        | DialogField::InheritCommon
+        | DialogField::InheritTaskSort
+        | DialogField::InheritDesigner
+        | DialogField::InheritReviewer
+        | DialogField::InheritExecutor => 1,
         DialogField::Description => 5,
         DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel => 5,
         // The chain selector always shows its filter and the "No chain"
@@ -3837,8 +4020,61 @@ fn render_selector_field(
             "Executor · 5h quota floor % (out of quota below)",
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
+        DialogField::InheritAgent
+        | DialogField::InheritLimits
+        | DialogField::InheritCommon
+        | DialogField::InheritTaskSort
+        | DialogField::InheritDesigner
+        | DialogField::InheritReviewer
+        | DialogField::InheritExecutor => {
+            let Some(group) = inherit_checkbox_group(field) else {
+                return;
+            };
+            render_inherit_checkbox(
+                frame,
+                app,
+                area,
+                group,
+                modal.inherit.get(group),
+                modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            );
+        }
         _ => {}
     }
+}
+
+/// One borderless row: `☑ Inherit <group> from global` (Space toggles, like
+/// every checkbox). Ticked, the group's fields below show the global values
+/// and cannot be edited.
+fn render_inherit_checkbox(
+    frame: &mut Frame<'_>,
+    app: &App,
+    area: Rect,
+    group: InheritGroup,
+    checked: bool,
+    active: bool,
+) {
+    let label = match group {
+        InheritGroup::Agent => "agent",
+        InheritGroup::Limits => "limits",
+        InheritGroup::Common => "thread & restarts",
+        InheritGroup::TaskSort => "task sorting",
+        InheritGroup::Designer => "designer",
+        InheritGroup::Reviewer => "reviewer",
+        InheritGroup::Executor => "executors",
+    };
+    let mark = if checked { "☑" } else { "☐" };
+    let style = if active {
+        Style::default()
+            .fg(app.theme.focus)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(app.theme.fg)
+    };
+    frame.render_widget(
+        Paragraph::new(format!(" {mark} Inherit {label} from global")).style(style),
+        area,
+    );
 }
 
 /// A launcher row: bordered line summarizing a nested popup's staged values,

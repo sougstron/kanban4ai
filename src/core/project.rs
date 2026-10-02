@@ -42,7 +42,7 @@ pub const PROJECT_ENV: &str = "KANBAN_PROJECT";
 const XDG_DATA_HOME_ENV: &str = "XDG_DATA_HOME";
 const HOME_ENV: &str = "HOME";
 const STORE_DIR_NAME: &str = "kanban4ai";
-const PROJECTS_DIR: &str = "projects";
+pub(crate) const PROJECTS_DIR: &str = "projects";
 const PROJECT_FILE: &str = "project.yaml";
 /// An unregistered-but-kept project: `remove` without `purge_data` renames
 /// `project.yaml` to this, so re-adding the same folder picks its board back up.

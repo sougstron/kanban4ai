@@ -48,9 +48,15 @@ Action hotkeys work on both the board (focused card) and the open detail view.
   mouse. Each tab shows only its own page, but Save/Cancel sit under every
   tab and persist the **whole** dialog, so switching tabs never loses an
   edit; a validation error flips to the tab owning the offending field.
-  - **Common**: project name, default agent (nested launcher), theme, task
-    sorting, queue switch, the four cap groups, crash-restart schedule, and
-    the read-only Worktree isolation row (`available`, or
+  Each inheritable group opens with a one-row `☑ Inherit <group> from global`
+  checkbox (Space toggles; ticked by default on new boards). While ticked the
+  group's fields show the global values dimmed, and Tab, the mouse and Save
+  skip them; unticking makes them editable, starting from those global
+  values. See `docs/config.md` ("Inheriting settings from the global config").
+  - **Common**: project name, theme, then the agent group (default agent
+    launcher), task sorting, the thread/restart group (hide kanban messages,
+    crash-restart schedule), the limits group (queue switch, the four cap
+    groups), and the read-only Worktree isolation row (`available`, or
     `unavailable — <reason>`; probed once when the dialog opens, since the
     probe runs git)
   - **Designer**: enable-for-all toggle and the designer bot's nested
@@ -64,7 +70,10 @@ Action hotkeys work on both the board (focused card) and the open detail view.
     `docs/config.md` (`orchestration.executors`) and `docs/orchestration.md`
     (Executor Pools).
   On the Projects screen `s` instead opens Global Settings (see "Global
-  Settings").
+  Settings"): the same four tabs without the inherit checkboxes, project
+  name, theme and isolation row — they edit the global values the projects
+  inherit. Its Common tab adds the machine-only settings (Updates section,
+  Esc-from-board, project sorting, update check on open).
 - `e`: Edit task
 - `d` / `Ctrl+d` / `Delete` / `Backspace`: Delete task
 - `m`: Move task

@@ -208,6 +208,14 @@ agents:
     effort: medium
     efforts: [low, medium, high]
     agent: null
+inherit:
+  agent: false
+  limits: false
+  common: false
+  task_sort: false
+  designer: false
+  reviewer: false
+  executor: false
 "#,
     )
     .expect("settings config");
@@ -1506,7 +1514,7 @@ fn settings_tab_arrows_wrap_and_tab_stays_in_page() {
     // Tab walks the Executor page to its own Cancel, then wraps within it.
     let modal = app.modal.as_mut().unwrap();
     modal.set_settings_tab(SettingsTab::Executor);
-    assert_eq!(modal.active_field(), DialogField::ExecutorMiddle1);
+    assert_eq!(modal.active_field(), DialogField::InheritExecutor);
     for _ in 0..(modal.fields().len() - 1) {
         app.handle_key(key(KeyCode::Tab)).expect("next field");
     }
@@ -1521,7 +1529,7 @@ fn settings_tab_arrows_wrap_and_tab_stays_in_page() {
     app.handle_key(key(KeyCode::Tab)).expect("wrap in page");
     assert_eq!(
         app.modal.as_ref().unwrap().active_field(),
-        DialogField::ExecutorMiddle1
+        DialogField::InheritExecutor
     );
 }
 
@@ -1720,6 +1728,7 @@ fn settings_executor_tab_annotates_slots_with_live_quota() {
         .expect("open settings");
     let modal = app.modal.as_mut().expect("settings");
     modal.set_settings_tab(SettingsTab::Executor);
+    modal.focus_field(DialogField::ExecutorMiddle1);
     // Only the first slot's first options fit the frame; filter it down to
     // the claude pairs so their annotations are on screen.
     app.handle_key(key(KeyCode::Char('c'))).expect("filter");
@@ -2024,7 +2033,14 @@ fn settings_hotkey_navigates_fields_and_reloads_backend_defaults() {
     assert_eq!(modal.title_text(), "Existing project");
     assert_eq!(modal.backend_text().as_deref(), Some("opencode"));
 
-    app.handle_key(key(KeyCode::Tab)).expect("agent settings");
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Tab))
+            .expect("theme, inherit box, agent settings");
+    }
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::AgentSettings
+    );
     app.handle_key(key(KeyCode::Enter))
         .expect("open agent settings");
     app.handle_key(key(KeyCode::Down)).expect("choose claude");
@@ -2117,8 +2133,8 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     {
         let modal = app.modal.as_mut().expect("settings modal");
         modal.title = TextArea::new(vec!["Renamed project".to_string()]);
+        modal.focus_field(DialogField::AgentSettings);
     }
-    app.handle_key(key(KeyCode::Tab)).expect("agent settings");
     app.handle_key(key(KeyCode::Enter))
         .expect("open agent settings");
     app.handle_key(key(KeyCode::Down)).expect("claude");
@@ -2131,9 +2147,12 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     app.handle_key(key(KeyCode::Tab)).expect("agent");
     app.handle_key(ctrl_key(KeyCode::Char('s')))
         .expect("stage agent settings");
-    app.handle_key(key(KeyCode::Tab)).expect("theme");
+    app.modal.as_mut().unwrap().focus_field(DialogField::Theme);
     app.handle_key(key(KeyCode::Up)).expect("dark theme");
-    app.handle_key(key(KeyCode::Tab)).expect("task sorting");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::TaskSort);
     app.handle_key(key(KeyCode::Down))
         .expect("task number down");
     app.handle_key(key(KeyCode::Down))
@@ -2646,10 +2665,8 @@ fn settings_modal_remains_navigable_at_constrained_height() {
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open settings");
     assert!(render_at(&mut app, 80, 16).contains("Project settings"));
-    for _ in 0..2 {
-        app.handle_key(key(KeyCode::Tab))
-            .expect("next settings field");
-    }
+    app.handle_key(key(KeyCode::Tab))
+        .expect("next settings field");
     assert_eq!(
         app.modal.as_ref().unwrap().active_field(),
         DialogField::Theme
@@ -8793,7 +8810,10 @@ fn projects_screen_global_settings_toggle_persists_to_the_store() {
     app.handle_key(key(KeyCode::Tab)).expect("focus sort");
     app.handle_key(key(KeyCode::Tab))
         .expect("focus updates checkbox");
-    app.handle_key(key(KeyCode::Tab)).expect("save");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
 
     assert!(app.modal.is_none());
@@ -9091,7 +9111,10 @@ fn projects_screen_global_settings_project_sort_persists_to_the_store() {
     );
     app.handle_key(key(KeyCode::Tab))
         .expect("focus updates checkbox");
-    app.handle_key(key(KeyCode::Tab)).expect("save");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
 
     assert!(app.modal.is_none());
@@ -10519,7 +10542,7 @@ fn global_settings_updates_rows_snapshot() {
     force_update_cache(Some("9.9.9"));
     let (_dir, mut app) = global_settings_app();
     open_global_settings(&mut app);
-    let rendered = render_at(&mut app, 96, 28);
+    let rendered = render_at(&mut app, 96, 36);
     assert!(
         rendered.contains("kanban4ai 9.9.9 available (released 20d ago)"),
         "{rendered}"
@@ -10737,4 +10760,229 @@ fn answer_preview_windows_to_keep_the_cursor_visible() {
         !rendered.contains("headmark"),
         "the overflowed head must be scrolled off: {rendered}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Global configs: "Inherit from global" checkboxes.
+// ---------------------------------------------------------------------------
+
+const INHERIT_TEST_GLOBAL: &str = r#"tui:
+  task_sort: updated_at_desc
+agents:
+  opencode:
+    command: /nonexistent/opencode-disabled-for-tests
+orchestration:
+  max_running_total: 7
+  designer:
+    enabled: true
+    backend: claude
+"#;
+
+/// A board inside a store layout so it inherits from `<store>/config.yaml`.
+/// The project file holds dormant values that differ from the global ones.
+fn inherit_settings_app(inherit: bool) -> (tempfile::TempDir, App) {
+    let store = tempfile::tempdir().expect("store");
+    let data_root = store.path().join("projects").join("demo");
+    Storage::new(&data_root).init_board().expect("init board");
+    std::fs::write(store.path().join("config.yaml"), INHERIT_TEST_GLOBAL).expect("global");
+    std::fs::write(
+        data_root.join(".kanban/config.yaml"),
+        format!(
+            "tui:\n  name: Inheriting\n  task_sort: task_number\nauto_launch:\n  enabled: false\n\
+             agents:\n  opencode:\n    command: /nonexistent/opencode-disabled-for-tests\n\
+             orchestration:\n  max_running_total: 2\n  designer:\n    enabled: false\n\
+             inherit:\n  agent: {inherit}\n  limits: {inherit}\n  common: {inherit}\n  \
+             task_sort: {inherit}\n  designer: {inherit}\n  reviewer: {inherit}\n  \
+             executor: {inherit}\n"
+        ),
+    )
+    .expect("project config");
+    let app = App::new(&data_root).expect("create app");
+    (store, app)
+}
+
+fn raw_project_config(app: &App) -> serde_yaml_ng::Value {
+    serde_yaml_ng::from_str(&std::fs::read_to_string(&app.ops.config.config_file).unwrap()).unwrap()
+}
+
+#[test]
+fn inherited_groups_show_global_values_and_cannot_be_focused() {
+    let (_store, mut app) = inherit_settings_app(true);
+    assert_eq!(
+        app.settings.task_sort, "updated_at_desc",
+        "board sorts by global"
+    );
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let modal = app.modal.as_ref().expect("settings");
+    assert_eq!(modal.max_running_total.lines()[0], "7");
+    assert!(modal.designer_enabled);
+    assert_eq!(modal.task_sort_text().as_deref(), Some("updated_at_desc"));
+    assert!(!modal.field_enabled(DialogField::AgentSettings));
+    assert!(modal.field_enabled(DialogField::InheritAgent));
+    assert!(modal.field_enabled(DialogField::Theme));
+
+    // Tab walks Title → Theme → the checkboxes, skipping every inherited field.
+    let mut visited = Vec::new();
+    for _ in 0..5 {
+        app.handle_key(key(KeyCode::Tab)).expect("next field");
+        visited.push(app.modal.as_ref().unwrap().active_field());
+    }
+    assert_eq!(
+        visited,
+        [
+            DialogField::Theme,
+            DialogField::InheritAgent,
+            DialogField::InheritTaskSort,
+            DialogField::InheritCommon,
+            DialogField::InheritLimits,
+        ]
+    );
+
+    // Disabled rows are not clickable.
+    let _ = render_at(&mut app, 120, 60);
+    assert!(
+        !app.hitboxes
+            .iter()
+            .any(|hitbox| hitbox.action == HitAction::ModalField(DialogField::MaxRunningTotal))
+    );
+    assert!(
+        app.hitboxes
+            .iter()
+            .any(|hitbox| hitbox.action == HitAction::ModalField(DialogField::InheritLimits))
+    );
+}
+
+#[test]
+fn inherited_settings_tab_renders_dimmed_global_values() {
+    let (_store, mut app) = inherit_settings_app(true);
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .set_settings_tab(SettingsTab::Designer);
+    insta::assert_snapshot!(
+        "settings_tab_designer_inherited",
+        render_at(&mut app, 80, 24)
+    );
+}
+
+#[test]
+fn unticking_a_group_saves_its_shown_values_and_leaves_inherited_groups_alone() {
+    let (_store, mut app) = inherit_settings_app(true);
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().unwrap();
+        modal.focus_field(DialogField::InheritLimits);
+    }
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("untick limits");
+    {
+        let modal = app.modal.as_mut().unwrap();
+        assert!(modal.field_enabled(DialogField::MaxRunningTotal));
+        // Unticking keeps the global value as the project's starting point.
+        assert_eq!(modal.max_running_total.lines()[0], "7");
+        modal.focus_field(DialogField::Confirm);
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("save");
+    assert!(app.modal.is_none(), "{:?}", app.status);
+
+    let raw = raw_project_config(&app);
+    assert_eq!(raw["inherit"]["limits"].as_bool(), Some(false));
+    assert_eq!(raw["inherit"]["designer"].as_bool(), Some(true));
+    assert_eq!(raw["orchestration"]["max_running_total"].as_i64(), Some(7));
+    // Inherited groups keep their dormant project values on disk.
+    assert_eq!(
+        raw["orchestration"]["designer"]["enabled"].as_bool(),
+        Some(false)
+    );
+    assert_eq!(raw["tui"]["task_sort"].as_str(), Some("task_number"));
+    // ...while the board keeps reading the global ones.
+    let orch = app.ops.config.get_orchestration().unwrap();
+    assert!(orch.designer.enabled);
+    assert_eq!(orch.max_running_total, 7);
+    assert_eq!(app.settings.task_sort, "updated_at_desc");
+}
+
+#[test]
+fn ticking_a_group_shows_global_values_and_save_keeps_the_project_keys() {
+    let (_store, mut app) = inherit_settings_app(false);
+    assert_eq!(app.settings.task_sort, "task_number");
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().unwrap();
+        assert!(!modal.designer_enabled);
+        modal.focus_field(DialogField::InheritDesigner);
+    }
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("tick designer");
+    {
+        let modal = app.modal.as_mut().unwrap();
+        assert!(modal.designer_enabled, "the global value is shown");
+        assert_eq!(
+            modal.backend_text_for(AgentSlot::Designer).as_deref(),
+            Some("claude")
+        );
+        assert!(!modal.field_enabled(DialogField::DesignerEnabled));
+        modal.focus_field(DialogField::InheritTaskSort);
+    }
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("tick task sort");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save");
+    assert!(app.modal.is_none(), "{:?}", app.status);
+
+    let raw = raw_project_config(&app);
+    assert_eq!(raw["inherit"]["designer"].as_bool(), Some(true));
+    assert_eq!(raw["inherit"]["limits"].as_bool(), Some(false));
+    assert_eq!(
+        raw["orchestration"]["designer"]["enabled"].as_bool(),
+        Some(false),
+        "ticking never overwrites the project's own values"
+    );
+    assert!(app.ops.config.get_orchestration().unwrap().designer.enabled);
+    assert_eq!(app.settings.task_sort, "updated_at_desc");
+}
+
+#[test]
+fn global_settings_edit_and_save_the_inheritable_groups() {
+    let (dir, mut app) = global_settings_app();
+    open_global_settings(&mut app);
+    {
+        let modal = app.modal.as_mut().unwrap();
+        assert!(modal.fields().contains(&DialogField::MaxRunningTotal));
+        assert!(!modal.fields().contains(&DialogField::InheritLimits));
+        assert!(!modal.fields().contains(&DialogField::Title));
+        modal.max_running_total = TextArea::new(vec!["9".to_string()]);
+        modal.set_settings_tab(SettingsTab::Designer);
+        assert_eq!(modal.active_field(), DialogField::DesignerEnabled);
+    }
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("enable designer");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save");
+    assert!(app.modal.is_none(), "{:?}", app.status);
+
+    let saved = ProjectStore::at(dir.path()).load_global_config().unwrap();
+    assert_eq!(saved.orchestration["max_running_total"].as_i64(), Some(9));
+    assert_eq!(
+        saved.orchestration["designer"]["enabled"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        saved.auto_launch["default_agent"].as_str(),
+        Some("opencode")
+    );
+    // Project-only orchestration never lands in the global file.
+    assert!(!saved.orchestration.contains_key("isolation"));
+    assert!(!saved.orchestration.contains_key("orchestrator"));
 }

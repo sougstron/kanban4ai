@@ -5,8 +5,8 @@ mod common;
 use std::fs;
 
 use kanban4ai::core::config::{
-    Config, IsolationCleanup, IsolationLand, IsolationMode, IsolationOnConflict, IsolationSeed,
-    OnChangesRequested, OrchestrationSettings,
+    Config, InheritFlags, InheritGroup, IsolationCleanup, IsolationLand, IsolationMode,
+    IsolationOnConflict, IsolationSeed, OnChangesRequested, OrchestrationSettings,
 };
 
 fn write_config(dir: &tempfile::TempDir, content: &str) -> Config {
@@ -858,4 +858,287 @@ fn executor_pools_round_trip_preserves_unknown_keys_and_effort() {
     assert!(raw.contains("custom_note: keep-me"), "{raw}");
     assert!(raw.contains("effort: max"), "{raw}");
     assert!(raw.contains("agent: builder"), "{raw}");
+}
+
+// ---------------------------------------------------------------------------
+// Global configs: per-group inheritance from `<store>/config.yaml`.
+// ---------------------------------------------------------------------------
+
+/// A board inside a store layout (`<store>/projects/demo`), so `Config::new`
+/// finds `<store>/config.yaml` on its own.
+fn store_board(project: &str, global: Option<&str>) -> (tempfile::TempDir, Config) {
+    let store = tempfile::tempdir().unwrap();
+    let data_root = store.path().join("projects").join("demo");
+    fs::create_dir_all(data_root.join(".kanban")).unwrap();
+    fs::write(data_root.join(".kanban/config.yaml"), project).unwrap();
+    if let Some(global) = global {
+        fs::write(store.path().join("config.yaml"), global).unwrap();
+    }
+    let config = Config::new(&data_root);
+    (store, config)
+}
+
+const GLOBAL_GROUPS: &str = r#"tui:
+  escape_to_projects: true
+  task_sort: updated_at_desc
+  hide_kanban_messages: true
+auto_launch:
+  default_agent: claude
+agents:
+  claude:
+    model: opus
+orchestration:
+  max_running_total: 7
+  auto_restart:
+    enabled: false
+  designer:
+    enabled: true
+    backend: codex
+  reviewer:
+    enabled: true
+    max_rounds: 9
+  executors:
+    cheap: [claude/haiku]
+"#;
+
+fn all_inherit(value: bool) -> String {
+    format!(
+        "inherit:\n  agent: {value}\n  limits: {value}\n  common: {value}\n  task_sort: {value}\n  \
+         designer: {value}\n  reviewer: {value}\n  executor: {value}\n"
+    )
+}
+
+#[test]
+fn store_board_finds_the_global_config_and_in_place_boards_do_not() {
+    let (store, config) = store_board("", None);
+    assert_eq!(
+        config.global_file(),
+        Some(store.path().join("config.yaml").as_path())
+    );
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(Config::new(dir.path()).global_file(), None);
+}
+
+#[test]
+fn inherited_groups_take_every_value_from_the_global_config() {
+    let (_store, config) = store_board(&all_inherit(true), Some(GLOBAL_GROUPS));
+    let effective = config.load().unwrap();
+    assert_eq!(effective.tui["task_sort"].as_str(), Some("updated_at_desc"));
+    assert_eq!(effective.tui["hide_kanban_messages"].as_bool(), Some(true));
+    assert_eq!(
+        effective.auto_launch["default_agent"].as_str(),
+        Some("claude")
+    );
+    assert_eq!(effective.agents["claude"]["model"].as_str(), Some("opus"));
+    // Missing per-backend keys still come from the built-in defaults.
+    assert_eq!(
+        effective.agents["claude"]["command"].as_str(),
+        Some("claude")
+    );
+    let orch = config.get_orchestration().unwrap();
+    assert_eq!(orch.max_running_total, 7);
+    assert_eq!(orch.max_running_per_role.get("executor"), Some(&3));
+    assert!(!orch.auto_restart_enabled);
+    assert_eq!(orch.auto_restart_delays_minutes, vec![1, 30, 270]);
+    assert!(orch.designer.enabled);
+    assert_eq!(orch.designer.backend.as_deref(), Some("codex"));
+    assert!(orch.reviewer.enabled);
+    assert_eq!(orch.reviewer.max_rounds, 9);
+    assert_eq!(orch.executors.cheap[0].label(), "claude/haiku");
+    // Project-only settings never inherit.
+    assert_eq!(effective.tui["name"].as_str(), Some("Kanban"));
+    assert!(config.inherit_flags().unwrap().get(InheritGroup::Designer));
+}
+
+#[test]
+fn unchecked_groups_keep_the_project_values() {
+    let project = format!(
+        "tui:\n  task_sort: task_number_desc\norchestration:\n  max_running_total: 2\n  \
+         designer:\n    enabled: false\n{}",
+        all_inherit(false)
+    );
+    let (_store, config) = store_board(&project, Some(GLOBAL_GROUPS));
+    let effective = config.load().unwrap();
+    assert_eq!(
+        effective.tui["task_sort"].as_str(),
+        Some("task_number_desc")
+    );
+    assert_eq!(
+        effective.auto_launch["default_agent"].as_str(),
+        Some("opencode")
+    );
+    let orch = config.get_orchestration().unwrap();
+    assert_eq!(orch.max_running_total, 2);
+    assert!(!orch.designer.enabled);
+}
+
+#[test]
+fn a_missing_group_key_in_an_inherit_section_means_inherit() {
+    let project = "orchestration:\n  max_running_total: 2\ninherit:\n  limits: false\n";
+    let (_store, config) = store_board(project, Some(GLOBAL_GROUPS));
+    let flags = config.inherit_flags().unwrap();
+    assert!(!flags.get(InheritGroup::Limits));
+    assert!(flags.get(InheritGroup::Designer));
+    let orch = config.get_orchestration().unwrap();
+    assert_eq!(orch.max_running_total, 2);
+    assert!(orch.designer.enabled);
+}
+
+#[test]
+fn legacy_boards_without_markers_inherit_only_the_groups_they_omit() {
+    // Written before global configs: no `inherit:` section. Every group the
+    // file sets stays the project's; the omitted task sort follows global.
+    let project = "tui:\n  hide_kanban_messages: false\nauto_launch:\n  enabled: false\n\
+                   orchestration:\n  queue_enabled: true\n  designer:\n    enabled: false\n";
+    let (_store, config) = store_board(project, Some(GLOBAL_GROUPS));
+    let flags = config.inherit_flags().unwrap();
+    for group in [
+        InheritGroup::Agent,
+        InheritGroup::Limits,
+        InheritGroup::Common,
+        InheritGroup::Designer,
+    ] {
+        assert!(!flags.get(group), "{group:?} is defined by the board");
+    }
+    for group in [
+        InheritGroup::TaskSort,
+        InheritGroup::Reviewer,
+        InheritGroup::Executor,
+    ] {
+        assert!(flags.get(group), "{group:?} is omitted by the board");
+    }
+    let effective = config.load().unwrap();
+    assert_eq!(effective.tui["task_sort"].as_str(), Some("updated_at_desc"));
+    assert_eq!(effective.tui["hide_kanban_messages"].as_bool(), Some(false));
+    assert!(!config.get_orchestration().unwrap().designer.enabled);
+}
+
+#[test]
+fn a_full_legacy_board_is_unchanged_by_a_global_config() {
+    // Every board written before this feature carries every section.
+    let mut legacy: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(kanban4ai::core::config::DEFAULT_CONFIG_YAML).unwrap();
+    legacy.as_mapping_mut().unwrap().remove("inherit");
+    let project = serde_yaml_ng::to_string(&legacy).unwrap();
+    let (_store, config) = store_board(&project, Some(GLOBAL_GROUPS));
+    assert_eq!(config.inherit_flags().unwrap(), InheritFlags::all(false));
+    let raw = config.load_raw().unwrap();
+    let effective = config.load().unwrap();
+    assert_eq!(
+        serde_yaml_ng::to_string(&effective).unwrap(),
+        serde_yaml_ng::to_string(&raw).unwrap()
+    );
+}
+
+#[test]
+fn new_boards_inherit_every_group() {
+    let store = tempfile::tempdir().unwrap();
+    fs::write(store.path().join("config.yaml"), GLOBAL_GROUPS).unwrap();
+    let config = Config::new(store.path().join("projects").join("fresh"));
+    config.init().unwrap();
+    assert_eq!(config.inherit_flags().unwrap(), InheritFlags::all(true));
+    assert!(config.get_orchestration().unwrap().designer.enabled);
+}
+
+#[test]
+fn an_invalid_global_group_falls_back_to_defaults_with_a_warning() {
+    let global =
+        "orchestration:\n  max_running_total: 5\n  reviewer:\n    on_changes_requested: bogus\n";
+    let (_store, config) = store_board(&all_inherit(true), Some(global));
+    let orch = config.get_orchestration().unwrap();
+    assert_eq!(
+        orch.reviewer.on_changes_requested,
+        OnChangesRequested::InProgress
+    );
+    assert!(!orch.reviewer.enabled);
+    // The valid groups still inherit.
+    assert_eq!(orch.max_running_total, 5);
+    assert!(
+        config
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("global reviewer settings are invalid")),
+        "{:?}",
+        config.warnings()
+    );
+}
+
+#[test]
+fn an_unparseable_global_file_never_breaks_the_board() {
+    let (_store, config) = store_board(&all_inherit(true), Some("tui: [not, a, mapping"));
+    let orch = config.get_orchestration().unwrap();
+    assert_eq!(orch.max_running_total, 3);
+    assert!(
+        config
+            .warnings()
+            .iter()
+            .any(|warning| warning.contains("global config")),
+        "{:?}",
+        config.warnings()
+    );
+}
+
+#[test]
+fn saving_the_raw_config_never_bakes_in_global_values() {
+    let project = format!(
+        "orchestration:\n  max_running_total: 2\n{}",
+        all_inherit(true)
+    );
+    let (_store, config) = store_board(&project, Some(GLOBAL_GROUPS));
+    assert_eq!(config.get_orchestration().unwrap().max_running_total, 7);
+    let mut raw = config.load_raw().unwrap();
+    raw.tui.insert("theme".into(), "dark".into());
+    config.save(&raw).unwrap();
+    let on_disk = fs::read_to_string(&config.config_file).unwrap();
+    assert!(on_disk.contains("max_running_total: 2"), "{on_disk}");
+    assert!(!on_disk.contains("updated_at_desc"), "{on_disk}");
+    assert!(on_disk.contains("inherit:"), "{on_disk}");
+    // Unticking later restores the dormant project value.
+    let mut raw = config.load_raw().unwrap();
+    raw.inherit = InheritFlags::all(false).to_mapping();
+    config.save(&raw).unwrap();
+    assert_eq!(config.get_orchestration().unwrap().max_running_total, 2);
+}
+
+#[test]
+fn a_changed_global_file_invalidates_the_cached_effective_config() {
+    let (store, config) = store_board(
+        &all_inherit(true),
+        Some("orchestration:\n  max_running_total: 4\n"),
+    );
+    assert_eq!(config.get_orchestration().unwrap().max_running_total, 4);
+    let path = store.path().join("config.yaml");
+    fs::write(&path, "orchestration:\n  max_running_total: 6\n").unwrap();
+    // Force a distinct mtime regardless of filesystem timestamp granularity.
+    let file = fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+        .unwrap();
+    assert_eq!(config.get_orchestration().unwrap().max_running_total, 6);
+}
+
+#[test]
+fn global_group_sections_round_trip_and_unknown_keys_survive() {
+    let store = tempfile::tempdir().unwrap();
+    let projects = kanban4ai::core::project::ProjectStore::at(store.path());
+    fs::write(
+        projects.global_config_path(),
+        format!("{GLOBAL_GROUPS}future:\n  keep: me\n"),
+    )
+    .unwrap();
+    let mut global = projects.load_global_config().unwrap();
+    let mut board = global.board_sections();
+    board
+        .orchestration
+        .insert("max_running_total".into(), 11.into());
+    global.store_board_sections(&board);
+    projects.save_global_config(&global).unwrap();
+    let saved = fs::read_to_string(projects.global_config_path()).unwrap();
+    assert!(saved.contains("keep: me"), "{saved}");
+    assert!(saved.contains("escape_to_projects: true"), "{saved}");
+    let reloaded = projects.load_global_config().unwrap();
+    assert_eq!(
+        reloaded.orchestration["max_running_total"].as_i64(),
+        Some(11)
+    );
+    assert_eq!(reloaded.tui["task_sort"].as_str(), Some("updated_at_desc"));
 }

@@ -7,12 +7,12 @@
 //! load/save round trip.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value};
 
-use super::config::as_bool;
+use super::config::{BoardConfig, InheritGroup, as_bool, copy_group};
 use super::error::{KanbanError, Result};
 use super::project::ProjectStore;
 use super::storage::atomic_write_text;
@@ -61,11 +61,68 @@ pub struct GlobalConfig {
     /// state is per install, not per board.
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
     pub updates: Mapping,
+    /// Global halves of the inheritable project groups (see
+    /// [`InheritGroup`]): same shapes as the project file's sections. Only
+    /// the group-owned keys of `orchestration:` and `tui:` are read.
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub auto_launch: Mapping,
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub agents: Mapping,
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub orchestration: Mapping,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
 
 impl GlobalConfig {
+    /// The inheritable sections shaped as a project config, for
+    /// [`copy_group`]. Everything not set here reads as the built-in default
+    /// once validated.
+    pub fn board_sections(&self) -> BoardConfig {
+        let mut tui = Mapping::new();
+        for key in ["task_sort", "hide_kanban_messages"] {
+            if let Some(value) = self.tui.get(key) {
+                tui.insert(Value::String(key.to_owned()), value.clone());
+            }
+        }
+        BoardConfig {
+            columns: Vec::new(),
+            rules: Mapping::new(),
+            thresholds: Mapping::new(),
+            tui,
+            auto_launch: self.auto_launch.clone(),
+            notifications: Mapping::new(),
+            agents: self.agents.clone(),
+            verification: Mapping::new(),
+            orchestration: self.orchestration.clone(),
+            inherit: Mapping::new(),
+            extras: Mapping::new(),
+        }
+    }
+
+    /// Store every inheritable group of `board` as the global value. Keys
+    /// outside the groups (machine settings, unknown keys) are kept.
+    pub fn store_board_sections(&mut self, board: &BoardConfig) {
+        let mut sections = self.board_sections();
+        for group in InheritGroup::ALL {
+            copy_group(&mut sections, board, group);
+        }
+        self.auto_launch = sections.auto_launch;
+        self.agents = sections.agents;
+        self.orchestration = sections.orchestration;
+        for key in ["task_sort", "hide_kanban_messages"] {
+            match sections.tui.get(key) {
+                Some(value) => {
+                    self.tui
+                        .insert(Value::String(key.to_owned()), value.clone());
+                }
+                None => {
+                    self.tui.remove(key);
+                }
+            }
+        }
+    }
+
     /// Whatever its storage shape, the effective default is off.
     pub fn escape_to_projects(&self) -> bool {
         self.tui
@@ -168,6 +225,20 @@ impl GlobalConfig {
     }
 }
 
+/// Parse a global config file; a missing or blank file yields defaults.
+pub fn read_global_config(path: &Path) -> Result<GlobalConfig> {
+    match fs::read_to_string(path) {
+        Ok(raw) => {
+            if raw.trim().is_empty() {
+                return Ok(GlobalConfig::default());
+            }
+            Ok(serde_yaml_ng::from_str(&raw)?)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(GlobalConfig::default()),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn positive_u64(value: &Value) -> Option<u64> {
     let parsed = match value {
         Value::Number(n) => n
@@ -186,16 +257,7 @@ impl ProjectStore {
 
     /// Load the machine-wide settings; a missing file yields defaults.
     pub fn load_global_config(&self) -> Result<GlobalConfig> {
-        match fs::read_to_string(self.global_config_path()) {
-            Ok(raw) => {
-                if raw.trim().is_empty() {
-                    return Ok(GlobalConfig::default());
-                }
-                Ok(serde_yaml_ng::from_str(&raw)?)
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(GlobalConfig::default()),
-            Err(err) => Err(err.into()),
-        }
+        read_global_config(&self.global_config_path())
     }
 
     /// Persist machine-wide settings atomically. Callers that merge into the
