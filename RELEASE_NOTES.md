@@ -1,3 +1,29 @@
+# kanban4ai 0.6.18
+
+Project settings can now inherit selected groups from the machine-wide
+configuration, while global settings provide shared defaults for agent,
+limits, task sorting, restart, designer, reviewer, and executor behavior.
+
+## Added
+
+- **Per-group global configuration inheritance** (`src/core/config.rs`,
+  `src/core/global.rs`, `src/core/project.rs`, `src/tui/app.rs`,
+  `src/tui/dialogs.rs`, `docs/config.md`, `docs/tui.md`). Store-backed
+  projects can follow global values independently for each supported group,
+  preserve project overrides when inheritance is disabled, and fall back
+  safely when global settings are invalid.
+- **Global settings editors** (`src/tui/app.rs`, `src/tui/dialogs.rs`,
+  `src/core/global.rs`). The Projects screen exposes the shared agent,
+  limits, task sorting, restart, role, and update settings without copying
+  global values into project files.
+
+## Verification coverage
+
+- Configuration inheritance, legacy-board defaults, invalid-global fallback,
+  and persistence behavior.
+- TUI settings and inheritance controls, including inherited designer,
+  reviewer, and executor groups.
+
 # kanban4ai 0.6.17
 
 The Kimi limits row now uses the detailed five-hour burst quota when Kimi's
