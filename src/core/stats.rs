@@ -53,6 +53,7 @@ use crate::core::error::Result;
 use crate::core::limits::format_span;
 use crate::core::models::Task;
 use crate::core::project::ProjectStore;
+use crate::core::telemetry::{self, TokenBreakdown};
 use crate::core::timefmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -134,6 +135,16 @@ enum Record {
         effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
+        /// Input/output/cache split (see [`TokenBreakdown`]); absent on
+        /// records written before the per-task analytics existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_read: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_write: Option<i64>,
     },
 }
 
@@ -206,6 +217,7 @@ pub fn record_usage(
     task_id: &str,
     session_id: &str,
     tokens: i64,
+    breakdown: Option<&TokenBreakdown>,
     tags: &Tags,
 ) {
     if tokens <= 0 {
@@ -222,6 +234,10 @@ pub fn record_usage(
             model: tags.model.clone(),
             effort: tags.effort.clone(),
             agent: tags.agent.clone(),
+            input: breakdown.map(|b| b.input),
+            output: breakdown.map(|b| b.output),
+            cache_read: breakdown.map(|b| b.cache_read),
+            cache_write: breakdown.map(|b| b.cache_write),
         },
     );
 }
@@ -258,8 +274,10 @@ impl Span {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Usage {
     pub task_id: String,
+    pub session_id: Option<String>,
     pub ts: NaiveDateTime,
     pub tokens: i64,
+    pub breakdown: Option<TokenBreakdown>,
     pub backend: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -310,16 +328,27 @@ fn pair_records(records: Vec<Record>) -> ProjectStats {
             Record::Usage {
                 ts,
                 task_id,
+                session_id,
                 tokens,
                 backend,
                 model,
                 effort,
                 agent,
-                ..
+                input,
+                output,
+                cache_read,
+                cache_write,
             } => usage.push(Usage {
                 task_id,
+                session_id,
                 ts,
                 tokens,
+                breakdown: (input.is_some() || output.is_some()).then(|| TokenBreakdown {
+                    input: input.unwrap_or(0),
+                    output: output.unwrap_or(0),
+                    cache_read: cache_read.unwrap_or(0),
+                    cache_write: cache_write.unwrap_or(0),
+                }),
                 backend,
                 model,
                 effort,
@@ -361,6 +390,135 @@ fn pair_records(records: Vec<Record>) -> ProjectStats {
         }
     }
     ProjectStats { spans, usage }
+}
+
+/// Per-task totals behind the TUI detail's Analytics panel: every agent
+/// session the task ever ran (first run, review passes, reruns and crash
+/// restarts alike), read from the same events file as the store report.
+/// Closed sessions only — the caller adds the live session on top (its
+/// running span via [`Self::running_since`], its tokens from live telemetry
+/// unless [`Self::counted_sessions`] already has it).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TaskAnalytics {
+    /// Agent sessions started (`Running` enters).
+    pub runs: usize,
+    /// Sum of closed `Running` spans.
+    pub running_seconds: i64,
+    /// Start of the `Running` span still open, if any.
+    pub running_since: Option<NaiveDateTime>,
+    /// Sum of closed declared-wait (`Waiting`) spans.
+    pub waiting_seconds: i64,
+    /// Token split summed over closed sessions.
+    pub breakdown: TokenBreakdown,
+    /// Tokens of closed sessions with no split on record and no transcript
+    /// left to recover one from.
+    pub unsplit_tokens: i64,
+    /// Sessions whose usage is already in the totals above.
+    pub counted_sessions: HashSet<String>,
+}
+
+/// Aggregate one task's analytics. Only events at or after `since` (the
+/// task's `created_at`) count, so a recycled task id does not inherit the
+/// history of the abandoned task that held it before.
+pub fn task_analytics(project_path: &Path, task_id: &str, since: NaiveDateTime) -> TaskAnalytics {
+    let mut analytics = TaskAnalytics::default();
+    let mut edges = Vec::new();
+    for record in load_records(project_path) {
+        match record {
+            Record::Phase {
+                ts,
+                task_id: id,
+                phase,
+                edge,
+                ..
+            } if id == task_id && ts >= since => edges.push((ts, phase, edge)),
+            Record::Usage {
+                ts,
+                task_id: id,
+                session_id,
+                tokens,
+                backend,
+                input,
+                output,
+                cache_read,
+                cache_write,
+                ..
+            } if id == task_id && ts >= since => {
+                if let Some(session_id) = &session_id
+                    && !analytics.counted_sessions.insert(session_id.clone())
+                {
+                    continue;
+                }
+                let recorded = (input.is_some() || output.is_some()).then(|| TokenBreakdown {
+                    input: input.unwrap_or(0),
+                    output: output.unwrap_or(0),
+                    cache_read: cache_read.unwrap_or(0),
+                    cache_write: cache_write.unwrap_or(0),
+                });
+                let breakdown = recorded.or_else(|| {
+                    session_id.as_deref().and_then(|session_id| {
+                        transcript_breakdown(
+                            project_path,
+                            session_id,
+                            backend.as_deref().unwrap_or("claude"),
+                        )
+                    })
+                });
+                match breakdown {
+                    Some(breakdown) => analytics.breakdown.add(&breakdown),
+                    None => analytics.unsplit_tokens += tokens,
+                }
+            }
+            _ => {}
+        }
+    }
+    edges.sort_by_key(|edge| edge.0);
+    let mut open_waiting = None;
+    for (ts, phase, edge) in edges {
+        match (phase, edge) {
+            (Phase::Running, Edge::Enter) => {
+                analytics.runs += 1;
+                analytics.running_since = Some(ts);
+            }
+            (Phase::Running, Edge::Exit) => {
+                if let Some(start) = analytics.running_since.take() {
+                    analytics.running_seconds += (ts - start).num_seconds().max(0);
+                }
+            }
+            (Phase::Waiting, Edge::Enter) => open_waiting = Some(ts),
+            (Phase::Waiting, Edge::Exit) => {
+                if let Some(start) = open_waiting.take() {
+                    analytics.waiting_seconds += (ts - start).num_seconds().max(0);
+                }
+            }
+            _ => {}
+        }
+    }
+    analytics
+}
+
+/// Recover the token split of a closed session recorded before splits were
+/// stored, from its transcript if it is still on disk. A closed session's
+/// transcript never changes, so the answer is memoized per process — the
+/// detail view reloads on every board change.
+fn transcript_breakdown(
+    project_path: &Path,
+    session_id: &str,
+    backend: &str,
+) -> Option<TokenBreakdown> {
+    use std::sync::{Mutex, OnceLock};
+    type Cache = Mutex<HashMap<(PathBuf, String), Option<TokenBreakdown>>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    let key = (project_path.to_path_buf(), session_id.to_string());
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(found) = cache.lock().ok().and_then(|map| map.get(&key).copied()) {
+        return found;
+    }
+    let found = telemetry::read_session_progress(project_path, session_id, backend).breakdown;
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, found);
+    }
+    found
 }
 
 /// Reporting time window. "This month"/"This week" reset on the calendar
@@ -934,6 +1092,67 @@ mod tests {
     }
 
     #[test]
+    fn task_analytics_sums_every_run_and_skips_a_recycled_ids_past() {
+        let dir = tempfile::tempdir().unwrap();
+        let ts = |s: &str| timefmt::parse(s).unwrap();
+        let tag = Tags::default();
+        let lines = [
+            // An abandoned task that held TASK-7 before it was recycled.
+            r#"{"kind":"phase","ts":"2026-01-01T09:00:00","task_id":"TASK-7","phase":"running","edge":"enter"}"#,
+            r#"{"kind":"phase","ts":"2026-01-01T09:30:00","task_id":"TASK-7","phase":"running","edge":"exit"}"#,
+            r#"{"kind":"usage","ts":"2026-01-01T09:30:00","task_id":"TASK-7","session_id":"ses-old","tokens":99,"input":99,"output":1}"#,
+            // First run, then a declared wait.
+            r#"{"kind":"phase","ts":"2026-02-01T10:00:00","task_id":"TASK-7","phase":"running","edge":"enter"}"#,
+            r#"{"kind":"phase","ts":"2026-02-01T10:10:00","task_id":"TASK-7","phase":"running","edge":"exit"}"#,
+            r#"{"kind":"phase","ts":"2026-02-01T10:10:00","task_id":"TASK-7","phase":"waiting","edge":"enter"}"#,
+            r#"{"kind":"phase","ts":"2026-02-01T10:15:00","task_id":"TASK-7","phase":"waiting","edge":"exit"}"#,
+            r#"{"kind":"usage","ts":"2026-02-01T10:15:00","task_id":"TASK-7","session_id":"ses-a","tokens":500,"input":1000,"output":100,"cache_read":800,"cache_write":100}"#,
+            // Review pass with a legacy record carrying no split.
+            r#"{"kind":"phase","ts":"2026-02-01T11:00:00","task_id":"TASK-7","phase":"running","edge":"enter"}"#,
+            r#"{"kind":"phase","ts":"2026-02-01T11:05:00","task_id":"TASK-7","phase":"running","edge":"exit"}"#,
+            r#"{"kind":"usage","ts":"2026-02-01T11:05:00","task_id":"TASK-7","session_id":"ses-b","tokens":300}"#,
+            // Another task, and a still-running restart.
+            r#"{"kind":"phase","ts":"2026-02-01T11:00:00","task_id":"TASK-8","phase":"running","edge":"enter"}"#,
+            r#"{"kind":"phase","ts":"2026-02-01T12:00:00","task_id":"TASK-7","phase":"running","edge":"enter"}"#,
+        ];
+        let path = events_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+        // A fresh record goes through the recorder with its split.
+        record_usage(
+            dir.path(),
+            "TASK-7",
+            "ses-c",
+            10,
+            Some(&TokenBreakdown {
+                input: 200,
+                output: 20,
+                cache_read: 200,
+                cache_write: 0,
+            }),
+            &tag,
+        );
+
+        let analytics = task_analytics(dir.path(), "TASK-7", ts("2026-01-15T00:00:00"));
+        assert_eq!(analytics.runs, 3);
+        assert_eq!(analytics.running_seconds, 15 * 60);
+        assert_eq!(analytics.waiting_seconds, 5 * 60);
+        assert_eq!(analytics.running_since, Some(ts("2026-02-01T12:00:00")));
+        assert_eq!(
+            analytics.breakdown,
+            TokenBreakdown {
+                input: 1200,
+                output: 120,
+                cache_read: 1000,
+                cache_write: 100,
+            }
+        );
+        assert_eq!(analytics.unsplit_tokens, 300);
+        assert!(analytics.counted_sessions.contains("ses-c"));
+        assert!(!analytics.counted_sessions.contains("ses-old"));
+    }
+
+    #[test]
     fn record_and_load_round_trips_through_the_events_file() {
         let dir = tempfile::tempdir().unwrap();
         record_enter(
@@ -948,6 +1167,7 @@ mod tests {
             "TASK-001",
             "ses-1",
             1500,
+            None,
             &tags("claude", "anthropic/opus"),
         );
         // A zero/negative reading is dropped rather than recorded as a free run.
@@ -956,6 +1176,7 @@ mod tests {
             "TASK-001",
             "ses-1",
             0,
+            None,
             &tags("claude", "anthropic/opus"),
         );
 
@@ -1130,6 +1351,8 @@ mod tests {
         let mut stats_a = ProjectStats::default();
         stats_a.usage.push(Usage {
             task_id: "TASK-1".to_string(),
+            session_id: None,
+            breakdown: None,
             ts: at(2026, 6, 1, 10, 0),
             tokens: 100,
             backend: Some("claude".to_string()),
@@ -1140,6 +1363,8 @@ mod tests {
         let mut stats_b = ProjectStats::default();
         stats_b.usage.push(Usage {
             task_id: "TASK-1".to_string(),
+            session_id: None,
+            breakdown: None,
             ts: at(2026, 6, 1, 10, 0),
             tokens: 200,
             backend: Some("claude".to_string()),
@@ -1179,6 +1404,7 @@ mod tests {
             "TASK-1",
             "ses-1",
             42,
+            None,
             &tags("claude", "anthropic/opus"),
         );
         record_enter(dir.path(), "TASK-1", Phase::Queued, &Tags::default());

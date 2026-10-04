@@ -10,7 +10,9 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `↑/↓/←/→`: Move focus between tasks/columns
 - `Tab` / `Shift+Tab`: Next/previous column (board) · cycle
   thread/answer/editor panels (detail)
-- `Enter`: Show task detail
+- `Enter`: Show task detail. Between the Task and Thread panels an
+  Analytics row shows cumulative agent run time, run count, and
+  input/output tokens with the cache hit rate (`docs/stats.md`)
 - `r`: **Run (= queue) / Revoke** — put the task into the orchestration queue
   (To Do moves to In Progress with phase `queued`; Review folds its edits and
   joins the queue) and pump the queue once, so on an idle board the task starts

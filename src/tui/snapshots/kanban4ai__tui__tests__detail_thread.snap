@@ -1,5 +1,6 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 865
 expression: render_snapshot(&mut app)
 ---
 ┌ Task ────────────────────────────────────────────────────────────────────────────── ▸ Kanban ┐
@@ -10,12 +11,12 @@ expression: render_snapshot(&mut app)
 │Description:                                                                                  │
 │Needs an answer                                                                               │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
+┌ Analytics ───────────────────────────────────────────────────────────────────────────────────┐
+│No agent runs recorded yet                                                                    │
+└──────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Thread ──────────────────────────────────────────────────────────────────────────────────────▲
-│Created at: <timestamp>                                                        ║               
-│                                                                                              █
-│MSG-002 · task · open                                                                         █
-│Needs an answer                                                                               █
-│                                                                                              █
+│Needs an answer                                                                               ║
+│                                                                                              ║
 │MSG-003 · question · open                                                                     █
 │Choose a route?                                                                               █
 │Variants: Fast path | Safe path                                                               █
@@ -57,17 +58,13 @@ expression: render_snapshot(&mut app)
 6:1-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 7:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-8:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-9:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-9:1-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-9:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-10:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-10:1-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-10:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-11:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-11:1-22 Style::new().fg(Color::Rgb(100, 210, 140)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-11:22-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-11:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+8:0-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+9:0-1 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+9:1-27 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+9:27-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+9:95-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+10:0-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+11:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 12:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 12:1-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 12:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

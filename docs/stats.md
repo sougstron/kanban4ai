@@ -23,8 +23,11 @@ One JSON object per line, one of two shapes:
   Tags are only ever present on a `running` `enter` — the other phases carry
   no backend/model breakdown in the report, so recording them there would be
   dead weight.
-- **Usage**: `{"kind":"usage","ts":...,"task_id":...,"session_id":...,"tokens":N, backend?, model?, effort?, agent?}` —
+- **Usage**: `{"kind":"usage","ts":...,"task_id":...,"session_id":...,"tokens":N, backend?, model?, effort?, agent?, input?, output?, cache_read?, cache_write?}` —
   one session's final token tally, recorded once when the session closes.
+  `input`/`output`/`cache_*` are the transcript's `TokenBreakdown`
+  (`core/telemetry.rs`); `input` is the whole prompt side including cached
+  tokens. Records written before the split existed simply lack them.
 
 A call site never has to know when the *previous* edge happened; it only
 records the edge in front of it. Pairing `enter`/`exit` per `(task_id, phase)`
@@ -119,6 +122,21 @@ projects are shown in full.
 before its first slash (`openai/gpt-5.5` → `openai`, `zai/glm-4.7` → `zai`);
 a bare model id has no provider and lands in `unknown`. Nothing new is stored
 in the events file — existing logs report providers without re-recording.
+
+## Per-task analytics (TUI detail)
+
+`task_analytics(project, task_id, since)` feeds the detail view's
+**Analytics** panel (between Task and Thread): run time, run count, declared
+wait time, and input/output tokens with the cache hit rate
+(`cache_read / input`), cumulative over every session of the task — first
+run, review passes, reruns and crash restarts. Only events at or after the
+task's `created_at` count, so a recycled id does not inherit an abandoned
+task's history. A `Usage` record with no split is backfilled from its
+session's transcript when that is still in `.kanban/logs/` (memoized per
+process); otherwise its total shows as "without split". The live session is
+added at render time: its open `Running` span (`running_since`) while the
+session is Live, and its tokens from `App::session_progress` unless its
+`Usage` is already counted. Nothing involves the agent.
 
 ## Two accepted approximations
 

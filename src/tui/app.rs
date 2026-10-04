@@ -39,7 +39,7 @@ use crate::core::operations::{Operations, QuestionRef, TaskPatch, WaitWake};
 use crate::core::project::{Project, ProjectStore};
 use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
-use crate::core::stats;
+use crate::core::stats::{self, TaskAnalytics};
 use crate::core::storage::{NewTask, Storage};
 use crate::core::telemetry::{self, SessionProgress};
 use crate::core::thread::ThreadManager;
@@ -289,6 +289,10 @@ pub struct DetailState {
     /// a section above the thread, sourced from the manifests — never mixed
     /// into the conversation messages.
     pub provenance: Vec<InputManifest>,
+    /// Cumulative run time and token usage of the task's closed agent
+    /// sessions, from `.kanban/stats/events.jsonl`; the renderer adds the
+    /// live session on top.
+    pub analytics: TaskAnalytics,
 }
 
 impl DetailState {
@@ -3430,6 +3434,10 @@ impl App {
         let provenance =
             provenance::collect_for_thread(&self.ops.storage.provenance_dir, &messages);
         let has_provenance = !provenance.is_empty();
+        let analytics = task
+            .as_ref()
+            .map(|task| stats::task_analytics(self.ops.data_root(), &task.id, task.created_at))
+            .unwrap_or_default();
         let mut detail = DetailState {
             task_id: task_id.to_string(),
             task,
@@ -3452,6 +3460,7 @@ impl App {
             has_prompt,
             has_provenance,
             provenance,
+            analytics,
         };
         if let Some((question_id, answer_input, variant_selected)) = preserved_answer
             && let Some(question_index) = detail

@@ -456,7 +456,7 @@ fn progress_bar(done: usize, total: usize, width: usize) -> String {
 }
 
 /// Compact token count: `842`, `12.4k`, `1.2M`.
-fn format_tokens(tokens: i64) -> String {
+pub(crate) fn format_tokens(tokens: i64) -> String {
     match tokens {
         n if n < 1_000 => n.to_string(),
         n if n < 1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),

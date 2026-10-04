@@ -7,15 +7,18 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::core::limits::format_span;
 use crate::core::models::{
     IntegrationState, Message, MessageKind, MessageStatus, Task, TaskStatus,
 };
 use crate::core::session::SessionState;
+use crate::core::stats::TaskAnalytics;
+use crate::core::telemetry::SessionProgress;
 use crate::core::timefmt;
 
 use super::app::{App, DetailFocus, HitAction, Hitbox, UiAction};
 use super::board;
-use super::card::{sanitize_terminal_text, truncate_display};
+use super::card::{format_tokens, sanitize_terminal_text, truncate_display};
 use super::projects::shorten_path;
 use super::theme::Theme;
 use super::thread_view::{pin_last_message_scroll, visible_thread_messages};
@@ -24,6 +27,8 @@ use super::thread_view::{pin_last_message_scroll, visible_thread_messages};
 /// on the same border row.
 const META_TITLE: &str = " Task ";
 const META_TITLE_WIDTH: u16 = META_TITLE.len() as u16;
+/// The Analytics panel is a single bordered row.
+const ANALYTICS_HEIGHT: u16 = 3;
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let Some(detail) = app.detail.as_ref() else {
@@ -73,6 +78,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let switch_rows = if open_questions.len() > 1 { 2 } else { 0 };
         let desired = 4 + question.variants.len() as u16 + 1 + switch_rows;
         let reserved = meta_height
+            .saturating_add(ANALYTICS_HEIGHT)
             .saturating_add(if show_edits { 6 } else { 0 })
             .saturating_add(1)
             .saturating_add(3);
@@ -82,13 +88,14 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let mut constraints = vec![
         Constraint::Length(meta_height),
+        Constraint::Length(ANALYTICS_HEIGHT),
         Constraint::Min(5),
         Constraint::Length(answer_height),
         Constraint::Length(if show_edits { 6 } else { 0 }),
         Constraint::Length(1),
     ];
     if !show_answer {
-        constraints[2] = Constraint::Length(0);
+        constraints[3] = Constraint::Length(0);
     }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -109,11 +116,21 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if let Some(hitbox) = board::render_project_badge(frame, app, chunks[0], META_TITLE_WIDTH) {
         app.hitboxes.push(hitbox);
     }
+    let live_progress = app.session_progress.get(&task.id);
+    render_analytics(
+        frame,
+        &theme,
+        &task,
+        &app.detail.as_ref().unwrap().analytics,
+        live_progress,
+        session_state,
+        chunks[1],
+    );
 
     // Thread panel with a clamped scroll and a scrollbar. Input-provenance
     // (what the agent actually consumed) is telemetry, not conversation, so it
     // is kept out of the thread entirely and shown only in the `v` popup.
-    let inner_width = chunks[1].width.saturating_sub(2);
+    let inner_width = chunks[2].width.saturating_sub(2);
     let hide_kanban = app.settings.hide_kanban_messages;
     let (panel_lines, last_start) = {
         let detail_ref = app.detail.as_ref().unwrap();
@@ -141,7 +158,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // stop the scroll short of the thread's last row. The block is attached
     // after measuring so `line_count` sees the inner width only.
     let content_height = u16::try_from(thread.line_count(inner_width)).unwrap_or(u16::MAX);
-    let visible_height = chunks[1].height.saturating_sub(2);
+    let visible_height = chunks[2].height.saturating_sub(2);
     let max_scroll = content_height.saturating_sub(visible_height);
     let scroll = {
         let detail = app.detail.as_mut().unwrap();
@@ -155,7 +172,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         detail.scroll
     };
     app.hitboxes.push(Hitbox {
-        area: chunks[1],
+        area: chunks[2],
         action: HitAction::DetailThread,
     });
     frame.render_widget(
@@ -171,27 +188,27 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     })),
             )
             .scroll((scroll, 0)),
-        chunks[1],
+        chunks[2],
     );
     if max_scroll > 0 {
         let mut scrollbar_state =
             ScrollbarState::new(max_scroll as usize).position(scroll as usize);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            chunks[1],
+            chunks[2],
             &mut scrollbar_state,
         );
     }
 
     if show_answer {
-        render_answer_panel(frame, app, &theme, &open_questions, chunks[2]);
+        render_answer_panel(frame, app, &theme, &open_questions, chunks[3]);
     }
 
     if show_edits {
-        render_edits_panel(frame, app, &theme, edits_editable, chunks[3]);
+        render_edits_panel(frame, app, &theme, edits_editable, chunks[4]);
     }
 
-    render_action_bar(frame, app, &theme, &task, show_answer, chunks[4]);
+    render_action_bar(frame, app, &theme, &task, show_answer, chunks[5]);
 }
 
 fn task_description_lines(task: &Task) -> u16 {
@@ -385,6 +402,94 @@ fn render_meta(
                     .title(META_TITLE)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.focus)),
+            )
+            .style(Style::default().bg(theme.bg).fg(theme.fg)),
+        area,
+    );
+}
+
+/// One-row summary of everything the task's agent runs cost so far — run
+/// time and tokens, cumulative over the first run, review passes, reruns and
+/// crash restarts. Purely programmatic: closed sessions come from the stats
+/// events file ([`TaskAnalytics`]), the live one from transcript telemetry.
+fn render_analytics(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    task: &Task,
+    analytics: &TaskAnalytics,
+    live: Option<&SessionProgress>,
+    session_state: Option<SessionState>,
+    area: Rect,
+) {
+    let mut running_seconds = analytics.running_seconds;
+    if session_state == Some(SessionState::Live)
+        && let Some(since) = analytics.running_since
+    {
+        running_seconds += (timefmt::now() - since).num_seconds().max(0);
+    }
+    let mut tokens = analytics.breakdown;
+    let live_session_counted = task
+        .session
+        .as_ref()
+        .is_some_and(|session| analytics.counted_sessions.contains(session));
+    if !live_session_counted && let Some(breakdown) = live.and_then(|live| live.breakdown) {
+        tokens.add(&breakdown);
+    }
+
+    let muted = Style::default().fg(theme.muted);
+    let value = Style::default().add_modifier(Modifier::BOLD);
+    let line = if analytics.runs == 0 && tokens.is_empty() && analytics.unsplit_tokens == 0 {
+        Line::from(Span::styled("No agent runs recorded yet", muted))
+    } else {
+        let mut spans = vec![
+            Span::styled("Time ", muted),
+            Span::styled(format_span(running_seconds), value),
+            Span::styled(
+                format!(
+                    " · {} run{}",
+                    analytics.runs,
+                    if analytics.runs == 1 { "" } else { "s" }
+                ),
+                muted,
+            ),
+        ];
+        if analytics.waiting_seconds > 0 {
+            spans.push(Span::styled(
+                format!(" · waited {}", format_span(analytics.waiting_seconds)),
+                muted,
+            ));
+        }
+        spans.push(Span::styled(" │ ", Style::default().fg(theme.border)));
+        spans.push(Span::styled("Input ", muted));
+        spans.push(Span::styled(format_tokens(tokens.input), value));
+        spans.push(Span::styled(" · Output ", muted));
+        spans.push(Span::styled(format_tokens(tokens.output), value));
+        spans.push(Span::styled(" · Cache hit ", muted));
+        spans.push(Span::styled(
+            tokens
+                .cache_hit_rate()
+                .map(|rate| format!("{rate:.1}%"))
+                .unwrap_or_else(|| "-".to_string()),
+            value,
+        ));
+        if analytics.unsplit_tokens > 0 {
+            spans.push(Span::styled(
+                format!(
+                    " · +{} tok without split",
+                    format_tokens(analytics.unsplit_tokens)
+                ),
+                muted,
+            ));
+        }
+        Line::from(spans)
+    };
+    frame.render_widget(
+        Paragraph::new(line)
+            .block(
+                Block::default()
+                    .title(" Analytics ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.border)),
             )
             .style(Style::default().bg(theme.bg).fg(theme.fg)),
         area,

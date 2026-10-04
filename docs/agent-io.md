@@ -78,6 +78,13 @@ truth, so no new on-disk record or fixture surface is introduced.
 - Tool summaries reuse the provenance harvesters' helpers so both stay in
   lock-step on backend event shapes. Invalid session ids are rejected before any
   filesystem access.
+- `breakdown` (`TokenBreakdown`) normalizes input (uncached + cache read +
+  cache write), output and cache read/write across backends for the per-task
+  Analytics panel: claude/grok keep the last usage per message id (one API
+  call streams as several events) and prefer the cumulative `result` usage;
+  opencode sums `step-finish` parts (output includes reasoning); pi/omp sum
+  `message_end` usages; codex reads `cached_input_tokens`, already inside
+  its `input_tokens`. It is persisted on the session's stats `Usage` record.
 - A backend with no parseable transcript, or a run whose transcript reported no
   usage, falls back to the log-scraping token estimate parsed from
   `.kanban/logs/<session>.log`.

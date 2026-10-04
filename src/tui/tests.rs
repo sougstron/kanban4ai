@@ -10986,3 +10986,59 @@ fn global_settings_edit_and_save_the_inheritable_groups() {
     assert!(!saved.orchestration.contains_key("isolation"));
     assert!(!saved.orchestration.contains_key("orchestrator"));
 }
+
+#[test]
+fn detail_analytics_panel_sums_runs_and_tokens() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new(dir.path()).unwrap();
+    let task = app
+        .ops
+        .create_task(NewTask {
+            title: "Analytics card".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    let at = |minutes: i64| {
+        crate::core::timefmt::format(&(task.created_at + chrono::Duration::minutes(minutes)))
+    };
+    let events = [
+        format!(
+            r#"{{"kind":"phase","ts":"{}","task_id":"{}","phase":"running","edge":"enter"}}"#,
+            at(1),
+            task.id
+        ),
+        format!(
+            r#"{{"kind":"phase","ts":"{}","task_id":"{}","phase":"running","edge":"exit"}}"#,
+            at(41),
+            task.id
+        ),
+        format!(
+            r#"{{"kind":"usage","ts":"{}","task_id":"{}","session_id":"ses-a","tokens":1,"input":1200000,"output":45600,"cache_read":1080000,"cache_write":0}}"#,
+            at(41),
+            task.id
+        ),
+        format!(
+            r#"{{"kind":"phase","ts":"{}","task_id":"{}","phase":"running","edge":"enter"}}"#,
+            at(50),
+            task.id
+        ),
+        format!(
+            r#"{{"kind":"phase","ts":"{}","task_id":"{}","phase":"running","edge":"exit"}}"#,
+            at(55),
+            task.id
+        ),
+    ];
+    let stats_dir = dir.path().join(".kanban/stats");
+    std::fs::create_dir_all(&stats_dir).unwrap();
+    std::fs::write(stats_dir.join("events.jsonl"), events.join("\n")).unwrap();
+
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    let rendered = render_snapshot(&mut app);
+    assert!(
+        rendered.contains("│Time 45m · 2 runs │ Input 1.2M · Output 45.6k · Cache hit 90.0%"),
+        "analytics row missing:\n{rendered}"
+    );
+}
