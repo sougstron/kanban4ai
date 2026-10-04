@@ -10,7 +10,7 @@
 //! provenance harvesters and reuses their tool-summary helpers so the two stay
 //! in lock-step on backend event shapes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::Value;
@@ -40,6 +40,67 @@ pub struct SessionProgress {
     pub todos_total: usize,
     /// Human-readable summary of the last tool call (`Edit src/x.rs`, …).
     pub last_activity: Option<String>,
+    /// Cumulative input/output/cache split for the per-task analytics panel.
+    /// Unlike [`Self::tokens`] it counts cached prompt tokens too, so the cache
+    /// hit rate can be derived. `None` when the transcript carried no usage.
+    pub breakdown: Option<TokenBreakdown>,
+}
+
+/// Cumulative token usage of one or more runs, normalized across backends.
+/// `input` is the *whole* prompt side — uncached, cache reads and cache writes
+/// alike — so `cache_read / input` is the cache hit rate whichever convention
+/// the backend reports in (claude/pi split the cached part out of `input`,
+/// codex folds it in).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenBreakdown {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+}
+
+impl TokenBreakdown {
+    /// Build from a split where `uncached` excludes both cache fields.
+    fn from_split(uncached: i64, output: i64, cache_read: i64, cache_write: i64) -> Self {
+        TokenBreakdown {
+            input: uncached + cache_read + cache_write,
+            output,
+            cache_read,
+            cache_write,
+        }
+    }
+
+    pub fn add(&mut self, other: &TokenBreakdown) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input == 0 && self.output == 0
+    }
+
+    /// Share of prompt tokens served from cache, in percent; `None` with no
+    /// input to divide by.
+    pub fn cache_hit_rate(&self) -> Option<f64> {
+        (self.input > 0).then(|| self.cache_read as f64 * 100.0 / self.input as f64)
+    }
+}
+
+fn int_field(value: &Value, key: &str) -> i64 {
+    value.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
+/// claude/grok `usage` object (Messages API: `input_tokens` excludes the
+/// `cache_*_input_tokens` fields).
+fn claude_breakdown(usage: &Value) -> TokenBreakdown {
+    TokenBreakdown::from_split(
+        int_field(usage, "input_tokens"),
+        int_field(usage, "output_tokens"),
+        int_field(usage, "cache_read_input_tokens"),
+        int_field(usage, "cache_creation_input_tokens"),
+    )
 }
 
 impl SessionProgress {
@@ -122,6 +183,12 @@ fn parse_claude(raw: &str, progress: &mut SessionProgress) {
     let mut last_input: i64 = 0;
     let mut saw_assistant_usage = false;
     let mut result_tokens: Option<i64> = None;
+    // One API call streams as several `assistant` events (one per content
+    // block) repeating the same message id and usage, so the breakdown keeps
+    // the last usage per id instead of summing every event.
+    let mut message_usage: HashMap<String, TokenBreakdown> = HashMap::new();
+    let mut anonymous_usage = TokenBreakdown::default();
+    let mut result_breakdown: Option<TokenBreakdown> = None;
 
     for line in raw.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
@@ -140,6 +207,13 @@ fn parse_claude(raw: &str, progress: &mut SessionProgress) {
                         .and_then(Value::as_i64)
                         .unwrap_or(0);
                     saw_assistant_usage = true;
+                    let breakdown = claude_breakdown(usage);
+                    match message.and_then(|m| m.get("id")).and_then(Value::as_str) {
+                        Some(id) => {
+                            message_usage.insert(id.to_string(), breakdown);
+                        }
+                        None => anonymous_usage.add(&breakdown),
+                    }
                 }
                 if let Some(content) = message
                     .and_then(|m| m.get("content"))
@@ -164,8 +238,12 @@ fn parse_claude(raw: &str, progress: &mut SessionProgress) {
                 }
             }
             Some("result") => {
-                if let Some(tokens) = value.get("usage").and_then(usage_input_output) {
-                    result_tokens = Some(tokens);
+                if let Some(usage) = value.get("usage") {
+                    if let Some(tokens) = usage_input_output(usage) {
+                        result_tokens = Some(tokens);
+                    }
+                    // The closing event's usage is cumulative for the run.
+                    result_breakdown = Some(claude_breakdown(usage));
                 }
                 if let Some(cost) = value.get("total_cost_usd").and_then(Value::as_f64) {
                     progress.cost_usd = Some(cost);
@@ -177,6 +255,15 @@ fn parse_claude(raw: &str, progress: &mut SessionProgress) {
 
     progress.tokens =
         result_tokens.or_else(|| saw_assistant_usage.then_some(last_input + sum_output));
+    progress.breakdown = result_breakdown.or_else(|| {
+        saw_assistant_usage.then(|| {
+            let mut total = anonymous_usage;
+            for breakdown in message_usage.values() {
+                total.add(breakdown);
+            }
+            total
+        })
+    });
 }
 
 /// Sum opencode's `tokens` object (`{input, output, ...}` — its keys drop the
@@ -195,6 +282,9 @@ fn opencode_tokens(tokens: &Value) -> Option<i64> {
 /// each event's `part` (last seen wins); when absent the caller falls back to
 /// the log scraper.
 fn parse_opencode(raw: &str, progress: &mut SessionProgress) {
+    // `tokens` on a `step-finish` part is that one step's usage; the breakdown
+    // sums steps, keyed by part id so a re-emitted part is not counted twice.
+    let mut step_usage: HashMap<String, TokenBreakdown> = HashMap::new();
     for line in raw.lines() {
         let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
@@ -204,6 +294,21 @@ fn parse_opencode(raw: &str, progress: &mut SessionProgress) {
         };
         if let Some(tokens) = part.get("tokens").and_then(opencode_tokens) {
             progress.tokens = Some(tokens);
+        }
+        if let Some(tokens) = part.get("tokens") {
+            let cache = tokens.get("cache").unwrap_or(&Value::Null);
+            let breakdown = TokenBreakdown::from_split(
+                int_field(tokens, "input"),
+                int_field(tokens, "output") + int_field(tokens, "reasoning"),
+                int_field(cache, "read"),
+                int_field(cache, "write"),
+            );
+            let key = part
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("#{}", step_usage.len()));
+            step_usage.insert(key, breakdown);
         }
         if value.get("type").and_then(Value::as_str) == Some("tool_use") {
             let tool = part.get("tool").and_then(Value::as_str).unwrap_or("");
@@ -218,6 +323,13 @@ fn parse_opencode(raw: &str, progress: &mut SessionProgress) {
             }
             progress.last_activity = Some(opencode_tool_summary(part));
         }
+    }
+    if !step_usage.is_empty() {
+        let mut total = TokenBreakdown::default();
+        for breakdown in step_usage.values() {
+            total.add(breakdown);
+        }
+        progress.breakdown = Some(total);
     }
 }
 
@@ -245,6 +357,17 @@ fn parse_codex(raw: &str, progress: &mut SessionProgress) {
                             });
                     if total.is_some() {
                         progress.tokens = total;
+                    }
+                    // OpenAI convention: `input_tokens` already includes the
+                    // cached part.
+                    if input.is_some() || output.is_some() {
+                        let cached = int_field(usage, "cached_input_tokens");
+                        progress.breakdown = Some(TokenBreakdown {
+                            input: input.unwrap_or(0),
+                            output: output.unwrap_or(0),
+                            cache_read: cached,
+                            cache_write: 0,
+                        });
                     }
                 }
                 if let Some(cost) = value
@@ -331,6 +454,7 @@ fn parse_pi_family(raw: &str, progress: &mut SessionProgress) {
     let mut saw_usage = false;
     let mut total_cost = 0.0_f64;
     let mut saw_cost = false;
+    let mut breakdown = TokenBreakdown::default();
     let mut todo_items: Vec<String> = Vec::new();
     let mut todo_done: HashSet<String> = HashSet::new();
 
@@ -354,6 +478,14 @@ fn parse_pi_family(raw: &str, progress: &mut SessionProgress) {
                 .unwrap_or(last_input);
             sum_output += usage.get("output").and_then(Value::as_i64).unwrap_or(0);
             saw_usage = true;
+            // Each `message_end` is one turn's own usage; `input` excludes
+            // the cache fields.
+            breakdown.add(&TokenBreakdown::from_split(
+                int_field(usage, "input"),
+                int_field(usage, "output"),
+                int_field(usage, "cacheRead"),
+                int_field(usage, "cacheWrite"),
+            ));
             if let Some(cost) = usage
                 .get("cost")
                 .and_then(|cost| cost.get("total"))
@@ -379,6 +511,7 @@ fn parse_pi_family(raw: &str, progress: &mut SessionProgress) {
 
     if saw_usage {
         progress.tokens = Some(last_input + sum_output);
+        progress.breakdown = Some(breakdown);
     }
     if saw_cost {
         progress.cost_usd = Some(total_cost);
@@ -507,6 +640,80 @@ mod tests {
         assert_eq!(progress.cost_usd, Some(0.05));
         assert_eq!(progress.todos(), None);
         assert_eq!(progress.last_activity.as_deref(), Some("read Cargo.toml"));
+    }
+
+    #[test]
+    fn claude_breakdown_dedupes_streamed_blocks_and_prefers_result() {
+        // Two content blocks of one API call repeat its id and usage.
+        let transcript = r#"
+{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":900,"cache_creation_input_tokens":90},"content":[]}}
+{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":900,"cache_creation_input_tokens":90},"content":[]}}
+{"type":"assistant","message":{"id":"m2","usage":{"input_tokens":20,"output_tokens":7,"cache_read_input_tokens":980},"content":[]}}
+"#;
+        let mut progress = SessionProgress::default();
+        parse_claude(transcript, &mut progress);
+        let live = progress.breakdown.expect("live breakdown");
+        assert_eq!(
+            live,
+            TokenBreakdown {
+                input: 10 + 900 + 90 + 20 + 980,
+                output: 12,
+                cache_read: 1880,
+                cache_write: 90,
+            }
+        );
+        assert_eq!(live.cache_hit_rate(), Some(1880.0 * 100.0 / 2000.0));
+
+        let finished = format!(
+            "{transcript}{}\n",
+            r#"{"type":"result","usage":{"input_tokens":34,"cache_creation_input_tokens":66,"cache_read_input_tokens":900,"output_tokens":50}}"#
+        );
+        let mut progress = SessionProgress::default();
+        parse_claude(&finished, &mut progress);
+        let total = progress.breakdown.expect("result breakdown");
+        assert_eq!(
+            (total.input, total.output, total.cache_read),
+            (1000, 50, 900)
+        );
+    }
+
+    #[test]
+    fn breakdown_for_codex_opencode_and_pi() {
+        let mut progress = SessionProgress::default();
+        parse_codex(
+            r#"{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":800,"output_tokens":40}}"#,
+            &mut progress,
+        );
+        let codex = progress.breakdown.expect("codex");
+        assert_eq!(
+            (codex.input, codex.output, codex.cache_read),
+            (1000, 40, 800)
+        );
+
+        let mut progress = SessionProgress::default();
+        parse_opencode(
+            r#"
+{"type":"step_finish","part":{"id":"p1","type":"step-finish","tokens":{"input":100,"output":10,"reasoning":5,"cache":{"read":300,"write":0}}}}
+{"type":"step_finish","part":{"id":"p2","type":"step-finish","tokens":{"input":50,"output":20,"reasoning":0,"cache":{"read":350,"write":10}}}}
+"#,
+            &mut progress,
+        );
+        let opencode = progress.breakdown.expect("opencode");
+        assert_eq!(
+            (opencode.input, opencode.output, opencode.cache_read),
+            (810, 35, 650)
+        );
+
+        let mut progress = SessionProgress::default();
+        parse_pi_family(
+            r#"
+{"type":"message_end","message":{"role":"assistant","usage":{"input":600,"output":70,"cacheRead":16000,"cacheWrite":0}}}
+{"type":"message_end","message":{"role":"assistant","usage":{"input":200,"output":30,"cacheRead":17000,"cacheWrite":200}}}
+"#,
+            &mut progress,
+        );
+        let pi = progress.breakdown.expect("pi");
+        assert_eq!((pi.input, pi.output, pi.cache_read), (34_000, 100, 33_000));
     }
 
     #[test]

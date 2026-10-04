@@ -145,6 +145,7 @@ impl SessionManager {
                 &session.task_id,
                 &session.id,
                 tokens,
+                progress.breakdown.as_ref(),
                 &stats::Tags::from_task(&task),
             );
         }
