@@ -1,3 +1,25 @@
+# kanban4ai 0.6.19
+
+Per-task analytics now expose cumulative agent runtime and token usage in the
+task detail view, and deferred isolated-worktree cleanup is completed safely
+after an agent exits.
+
+## Added
+
+- **Per-task analytics** (`src/core/stats.rs`, `src/core/telemetry.rs`,
+  `src/tui/detail.rs`, `src/tui/app.rs`, `docs/stats.md`, `docs/tui.md`).
+  Task details now show cumulative run time, run count, wait time, and
+  input/output token totals with cache hit rate across agent sessions.
+  Transcript parsing normalizes token breakdowns for Claude/Grok, opencode,
+  Codex, and pi/omp sessions.
+
+## Fixed
+
+- **Deferred isolated-worktree cleanup** (`src/core/operations.rs`,
+  `src/core/daemon.rs`, `docs/worktrees.md`). Completion from inside an agent
+  worktree no longer removes the current working directory before the agent
+  exits; deferred cleanup is finalized on agent exit or by a daemon sweep.
+
 # kanban4ai 0.6.18
 
 Project settings can now inherit selected groups from the machine-wide
