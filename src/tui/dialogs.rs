@@ -3352,6 +3352,7 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         DialogField::ReviewerEffort => modal.reviewer.effort_options.len(),
         DialogField::ReviewerAgent => modal.reviewer.agent_options.len(),
         DialogField::ReviewerOnChanges => modal.reviewer_on_changes_options.len(),
+        DialogField::TargetStatus => modal.status_options.len(),
         _ => return task_field_min_height(field),
     };
     task_field_min_height(field)
@@ -3366,11 +3367,13 @@ fn render_move(
     task_id: &str,
     hitboxes: &mut Vec<Hitbox>,
 ) {
+    // The status list shows every option at once — boards adding a custom
+    // column must not bury it behind a scroll.
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
-            Constraint::Length(4),
+            Constraint::Length(task_selector_max_height(modal, DialogField::TargetStatus)),
             Constraint::Length(4),
             Constraint::Length(4),
         ])
