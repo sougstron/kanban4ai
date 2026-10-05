@@ -3122,6 +3122,123 @@ fn mouse_drag_selects_rendered_text_and_marks_it_for_copy() {
     assert_eq!(app.take_pending_copy().as_deref(), Some("select me"));
 }
 
+fn drag_select(app: &mut App, from: (u16, u16), to: (u16, u16)) -> Option<String> {
+    for (kind, (column, row)) in [
+        (MouseEventKind::Down(MouseButton::Left), from),
+        (MouseEventKind::Drag(MouseButton::Left), to),
+        (MouseEventKind::Up(MouseButton::Left), to),
+    ] {
+        app.handle_mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("drag select");
+    }
+    app.take_pending_copy()
+}
+
+fn find_on_screen(screen: &str, needle: &str) -> (u16, u16) {
+    screen
+        .lines()
+        .enumerate()
+        .find_map(|(row, line)| {
+            let byte = line.find(needle)?;
+            let column = line[..byte].chars().count();
+            Some((column as u16, row as u16))
+        })
+        .unwrap_or_else(|| panic!("{needle:?} not on screen:\n{screen}"))
+}
+
+#[test]
+fn copying_thread_paragraphs_drops_frames_and_rejoins_wrapped_lines() {
+    let (dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Copy me")).unwrap();
+    let first = format!("Alpha {}omega.", "lorem ipsum dolor sit amet ".repeat(8));
+    let body = format!("{first}\n\nSecond paragraph stays apart.\n- list item one");
+    ThreadManager::new(dir.path())
+        .unwrap()
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            &body,
+            None,
+            Vec::new(),
+            Some("agent".to_string()),
+        )
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    let screen = render_at(&mut app, 60, 40);
+    let start = find_on_screen(&screen, "Alpha");
+    let end = find_on_screen(&screen, "list item one");
+    // Drag past the pane's right edge, as a sweep over whole lines does.
+    let copied = drag_select(&mut app, start, (59, end.1)).expect("copied text");
+
+    assert_eq!(
+        copied,
+        format!("{first}\n\nSecond paragraph stays apart.\n- list item one")
+    );
+}
+
+#[test]
+fn copying_a_scrolled_thread_skips_the_scrollbar_column() {
+    let (dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Scrolled")).unwrap();
+    let body = (0..30)
+        .map(|index| format!("line number {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    ThreadManager::new(dir.path())
+        .unwrap()
+        .post(
+            &task.id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            &body,
+            None,
+            Vec::new(),
+            Some("agent".to_string()),
+        )
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+
+    let screen = render_at(&mut app, 60, 24);
+    assert!(app.detail.as_ref().unwrap().max_scroll > 0, "{screen}");
+    let start = find_on_screen(&screen, "line number 0");
+    let end = find_on_screen(&screen, "line number 2");
+    let copied = drag_select(&mut app, start, (59, end.1)).expect("copied text");
+
+    assert_eq!(copied, "line number 0\nline number 1\nline number 2");
+}
+
+#[test]
+fn copying_several_card_rows_keeps_only_the_card_text() {
+    let (_dir, mut app) = populated_app();
+    let _ = render_snapshot(&mut app);
+    let (_, _, area) = card_hits(&app)[0];
+    let copied = drag_select(
+        &mut app,
+        (area.x + 1, area.y + 1),
+        (area.x + area.width - 1, area.y + area.height - 2),
+    )
+    .expect("copied card text");
+
+    assert!(copied.lines().count() > 1, "copied: {copied:?}");
+    for glyph in ['│', '─', '┌', '┐', '└', '┘', '╭', '╮', '╰', '╯'] {
+        assert!(
+            !copied.contains(glyph),
+            "frame {glyph:?} leaked: {copied:?}"
+        );
+    }
+}
+
 #[test]
 fn selected_text_keeps_wide_unicode_cells_once() {
     let (_dir, mut app) = app_with_board();
