@@ -21,6 +21,7 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(Clear, area);
     // Renderers re-register their regions on every frame.
     app.hitboxes.clear();
+    app.text_regions.clear();
     // Content, the optional provider-limits row, then the status bar. The
     // limits row is zero-height (and skipped) until a snapshot exists, so the
     // layout is unchanged on screens and runs that have no limits to show.

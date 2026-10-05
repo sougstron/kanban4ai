@@ -16,7 +16,7 @@ use crate::core::stats::TaskAnalytics;
 use crate::core::telemetry::SessionProgress;
 use crate::core::timefmt;
 
-use super::app::{App, DetailFocus, HitAction, Hitbox, UiAction};
+use super::app::{App, DetailFocus, HitAction, Hitbox, TextRegion, UiAction};
 use super::board;
 use super::card::{format_tokens, sanitize_terminal_text, truncate_display};
 use super::projects::shorten_path;
@@ -150,6 +150,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         };
         (panel_lines, last_start)
     };
+    let mut thread_region = wrapped_text_region(&panel_lines, inner_width);
     let thread = Paragraph::new(panel_lines)
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .wrap(Wrap { trim: false });
@@ -175,6 +176,19 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         area: chunks[2],
         action: HitAction::DetailThread,
     });
+    thread_region.area = Rect::new(
+        chunks[2].x.saturating_add(1),
+        chunks[2].y.saturating_add(1),
+        inner_width,
+        visible_height,
+    );
+    thread_region.rows = thread_region
+        .rows
+        .into_iter()
+        .skip(usize::from(scroll))
+        .take(usize::from(visible_height))
+        .collect();
+    app.text_regions.push(thread_region);
     frame.render_widget(
         thread
             .block(
@@ -935,6 +949,26 @@ fn wrapped_row_count(lines: &[Line<'static>], width: u16) -> u16 {
             .line_count(width),
     )
     .unwrap_or(u16::MAX)
+}
+
+/// Which logical line every wrapped row of `lines` comes from at `width`, so
+/// copying several rows can rejoin a paragraph the wrap split. The caller sets
+/// the on-screen area and trims `rows` to the scrolled viewport.
+fn wrapped_text_region(lines: &[Line<'static>], width: u16) -> TextRegion {
+    let mut region = TextRegion::default();
+    for (index, line) in lines.iter().enumerate() {
+        let rows = wrapped_row_count(std::slice::from_ref(line), width).max(1);
+        region
+            .rows
+            .extend(std::iter::repeat_n(index, usize::from(rows)));
+        region.lines.push(
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect(),
+        );
+    }
+    region
 }
 
 fn thread_lines(

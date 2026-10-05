@@ -414,6 +414,9 @@ pub struct App {
     hovered: Option<HitAction>,
     pub dragging: Option<DragState>,
     rendered_screen: RenderedScreen,
+    /// Wrapped paragraphs drawn this frame; handed to the captured screen so a
+    /// multi-line copy rejoins soft-wrapped rows.
+    pub(crate) text_regions: Vec<TextRegion>,
     text_selection: Option<TextSelection>,
     pending_copy: Option<String>,
     copy_notice_deadline: Option<Instant>,
@@ -586,18 +589,44 @@ pub struct DragState {
 struct RenderedScreen {
     area: Rect,
     cells: Vec<String>,
+    text_regions: Vec<TextRegion>,
+}
+
+/// A wrapped paragraph as it was drawn: `rows[i]` names the logical line that
+/// screen row `area.y + i` belongs to, so a copy can undo the soft wrap.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TextRegion {
+    pub area: Rect,
+    pub rows: Vec<usize>,
+    pub lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TextSelection {
     anchor: (u16, u16),
     head: (u16, u16),
+    /// Inside of the bordered pane the selection started in; rows never reach
+    /// past it, so frames, scrollbars and neighbouring panes stay out of a copy.
+    bounds: Rect,
     dragged: bool,
 }
 
+const VERTICAL_BORDERS: &str = "│┃║╎╏┆┇┊┋├┤┣┫╟╢╠╣";
+const CORNER_BORDERS: &str = "┌┐└┘╭╮╰╯┏┓┗┛╔╗╚╝╒╓╕╖╘╙╛╜├┤┬┴┼┣┫┳┻╋╟╢╠╣╤╥╦╧╨╩╪╫╬";
+/// Glyphs a right-hand scrollbar paints over its pane's border column.
+const SCROLLBAR_SYMBOLS: &str = "║█↑↓▲▼";
+
+fn is_glyph(symbol: Option<&str>, set: &str) -> bool {
+    symbol.is_some_and(|symbol| {
+        let mut chars = symbol.chars();
+        matches!((chars.next(), chars.next()), (Some(ch), None) if set.contains(ch))
+    })
+}
+
 impl RenderedScreen {
-    fn capture(&mut self, buffer: &Buffer) {
+    fn capture(&mut self, buffer: &Buffer, text_regions: Vec<TextRegion>) {
         self.area = buffer.area;
+        self.text_regions = text_regions;
         self.cells.clear();
         self.cells
             .reserve(usize::from(self.area.width).saturating_mul(usize::from(self.area.height)));
@@ -618,30 +647,58 @@ impl RenderedScreen {
     }
 
     fn clamp(&self, x: u16, y: u16) -> (u16, u16) {
-        let right = self
-            .area
-            .x
-            .saturating_add(self.area.width.saturating_sub(1));
-        let bottom = self
-            .area
-            .y
-            .saturating_add(self.area.height.saturating_sub(1));
-        (x.clamp(self.area.x, right), y.clamp(self.area.y, bottom))
+        clamp_to(self.area, x, y)
+    }
+
+    /// The inside of the innermost box drawn around `(x, y)`, or the whole
+    /// screen when the point is not framed. A box is a left border column that
+    /// runs between two corners plus a right column whose ends are corners too
+    /// (or a scrollbar painted over them), so `│` inside text is not a frame.
+    fn pane_at(&self, x: u16, y: u16) -> Rect {
+        let vertical = |x, y| is_glyph(self.cell(x, y), VERTICAL_BORDERS);
+        let corner = |x, y| is_glyph(self.cell(x, y), CORNER_BORDERS);
+        let right_end = |x, y| corner(x, y) || is_glyph(self.cell(x, y), SCROLLBAR_SYMBOLS);
+        let screen_right = self.area.right();
+        for left in (self.area.x..x).rev() {
+            if !vertical(left, y) {
+                continue;
+            }
+            let Some(top) = (self.area.y..y)
+                .rev()
+                .find(|&row| !vertical(left, row) || corner(left, row))
+                .filter(|&row| corner(left, row))
+            else {
+                continue;
+            };
+            let Some(bottom) = (y + 1..self.area.bottom())
+                .find(|&row| !vertical(left, row) || corner(left, row))
+                .filter(|&row| corner(left, row))
+            else {
+                continue;
+            };
+            let right = (x + 1..screen_right).find(|&column| {
+                (vertical(column, y) || is_glyph(self.cell(column, y), SCROLLBAR_SYMBOLS))
+                    && right_end(column, top)
+                    && right_end(column, bottom)
+            });
+            if let Some(right) = right {
+                return Rect::new(left + 1, top + 1, right - left - 1, bottom - top - 1);
+            }
+        }
+        self.area
     }
 
     fn positions(&self, selection: TextSelection) -> Vec<(u16, u16)> {
-        if self.area.is_empty() {
+        let bounds = selection.bounds.intersection(self.area);
+        if bounds.is_empty() {
             return Vec::new();
         }
         let (start, end) = ordered_points(
-            self.clamp(selection.anchor.0, selection.anchor.1),
-            self.clamp(selection.head.0, selection.head.1),
+            clamp_to(bounds, selection.anchor.0, selection.anchor.1),
+            clamp_to(bounds, selection.head.0, selection.head.1),
         );
-        let left = self.area.x;
-        let right = self
-            .area
-            .x
-            .saturating_add(self.area.width.saturating_sub(1));
+        let left = bounds.x;
+        let right = bounds.right() - 1;
         let mut positions = Vec::new();
         for y in start.1..=end.1 {
             let row_start = if y == start.1 { start.0 } else { left };
@@ -652,17 +709,11 @@ impl RenderedScreen {
     }
 
     fn selected_text(&self, selection: TextSelection) -> String {
-        let mut lines = Vec::new();
-        let mut current_y = None;
-        let mut line = String::new();
+        let mut rows: Vec<(u16, String)> = Vec::new();
         let mut skip_cells = 0usize;
         for (x, y) in self.positions(selection) {
-            if current_y != Some(y) {
-                if current_y.is_some() {
-                    lines.push(line.trim_end().to_string());
-                    line.clear();
-                }
-                current_y = Some(y);
+            if rows.last().is_none_or(|(row, _)| *row != y) {
+                rows.push((y, String::new()));
                 skip_cells = 0;
             }
             if skip_cells > 0 {
@@ -672,13 +723,55 @@ impl RenderedScreen {
             let Some(symbol) = self.cell(x, y) else {
                 continue;
             };
-            line.push_str(symbol);
+            rows.last_mut()
+                .expect("row pushed above")
+                .1
+                .push_str(symbol);
             skip_cells = UnicodeWidthStr::width(symbol).saturating_sub(1);
         }
-        if current_y.is_some() {
-            lines.push(line.trim_end().to_string());
+        let mut text = String::new();
+        let mut previous: Option<(u16, String)> = None;
+        for (y, row) in rows {
+            let row = row.trim_end().to_string();
+            if let Some((previous_y, previous_row)) = &previous {
+                match self.wrapped_source(*previous_y, y) {
+                    // A soft wrap ate either nothing (a word split mid-way) or
+                    // the whitespace between two words.
+                    Some(line) if line.contains(&format!("{previous_row}{}", row.trim_start())) => {
+                        text.push_str(row.trim_start())
+                    }
+                    Some(_) => {
+                        text.push(' ');
+                        text.push_str(row.trim_start());
+                    }
+                    None => {
+                        text.push('\n');
+                        text.push_str(&row);
+                    }
+                }
+            } else {
+                text.push_str(&row);
+            }
+            previous = Some((y, row));
         }
-        lines.join("\n").trim_matches('\n').to_string()
+        text.trim_matches('\n').to_string()
+    }
+
+    /// The logical line two adjacent screen rows were wrapped from, if both
+    /// rows are pieces of the same one.
+    fn wrapped_source(&self, upper: u16, lower: u16) -> Option<&str> {
+        self.text_regions.iter().find_map(|region| {
+            let row = |y: u16| {
+                y.checked_sub(region.area.y)
+                    .and_then(|offset| region.rows.get(usize::from(offset)))
+            };
+            match (row(upper), row(lower)) {
+                (Some(a), Some(b)) if a == b && lower == upper + 1 => {
+                    region.lines.get(*a).map(String::as_str)
+                }
+                _ => None,
+            }
+        })
     }
 
     fn cell(&self, x: u16, y: u16) -> Option<&str> {
@@ -692,6 +785,12 @@ impl RenderedScreen {
             .checked_add(column)?;
         self.cells.get(index).map(String::as_str)
     }
+}
+
+fn clamp_to(area: Rect, x: u16, y: u16) -> (u16, u16) {
+    let right = area.x.saturating_add(area.width.saturating_sub(1));
+    let bottom = area.y.saturating_add(area.height.saturating_sub(1));
+    (x.clamp(area.x, right), y.clamp(area.y, bottom))
 }
 
 fn ordered_points(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
@@ -763,6 +862,7 @@ impl App {
             hovered: None,
             dragging: None,
             rendered_screen: RenderedScreen::default(),
+            text_regions: Vec::new(),
             text_selection: None,
             pending_copy: None,
             copy_notice_deadline: None,
@@ -864,6 +964,7 @@ impl App {
             hovered: None,
             dragging: None,
             rendered_screen: RenderedScreen::default(),
+            text_regions: Vec::new(),
             text_selection: None,
             pending_copy: None,
             copy_notice_deadline: None,
@@ -1737,6 +1838,7 @@ impl App {
                 self.text_selection = Some(TextSelection {
                     anchor: (mouse.column, mouse.row),
                     head: (mouse.column, mouse.row),
+                    bounds: self.rendered_screen.pane_at(mouse.column, mouse.row),
                     dragged: false,
                 });
                 // Shift explicitly chooses text selection over an otherwise
@@ -1813,7 +1915,8 @@ impl App {
     }
 
     pub(crate) fn capture_and_highlight(&mut self, buffer: &mut Buffer) {
-        self.rendered_screen.capture(buffer);
+        let text_regions = std::mem::take(&mut self.text_regions);
+        self.rendered_screen.capture(buffer, text_regions);
         let Some(selection) = self.text_selection.filter(|selection| selection.dragged) else {
             return;
         };
