@@ -4,10 +4,11 @@ use std::fs;
 
 use kanban4ai::agent::{
     build_agent_prompt, build_launch_plan, cached_opencode_catalog, load_pi_catalog,
-    load_pi_catalog_from_dir, parse_grok_models_cache, parse_grok_models_text,
-    parse_omp_models_json, parse_opencode_agent_list, parse_opencode_models_verbose,
-    parse_pi_builtin_catalog, parse_pi_models_json, parse_pi_models_store, pi_builtin_data_dir,
-    recent_models, record_recent_model, sort_efforts, sort_opencode_models,
+    load_pi_catalog_from_dir, parse_codex_models_json, parse_grok_models_cache,
+    parse_grok_models_text, parse_omp_models_json, parse_opencode_agent_list,
+    parse_opencode_models_verbose, parse_pi_builtin_catalog, parse_pi_models_json,
+    parse_pi_models_store, pi_builtin_data_dir, recent_models, record_recent_model, sort_efforts,
+    sort_opencode_models,
 };
 use kanban4ai::core::models::{MessageKind, MessageRole, Role, RunPhase, Task};
 use kanban4ai::core::project::Roots;
@@ -1111,6 +1112,29 @@ Available models:\n\
         ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]
     );
     assert!(parse_grok_models_text("not a listing").models.is_empty());
+}
+
+#[test]
+fn codex_models_json_skips_hidden_and_orders_by_priority() {
+    let text = r#"{
+      "fetched_at": "2026-10-06T00:00:00Z",
+      "models": [
+        {"slug": "gpt-5.6-terra", "visibility": "list", "priority": 8,
+         "supported_reasoning_levels": [{"effort": "ultra"}, {"effort": "low"}, {"effort": "max"}]},
+        {"slug": "gpt-5.5", "visibility": "hide", "priority": 13,
+         "supported_reasoning_levels": [{"effort": "low"}]},
+        {"slug": "gpt-6-astra", "visibility": "list", "priority": 2,
+         "supported_reasoning_levels": [{"effort": "medium"}, {"effort": "xhigh"}]}
+      ]
+    }"#;
+    let catalog = parse_codex_models_json(text);
+    assert_eq!(catalog.models, ["gpt-6-astra", "gpt-5.6-terra"]);
+    assert_eq!(catalog.variants_for("gpt-6-astra"), ["medium", "xhigh"]);
+    assert_eq!(
+        catalog.variants_for("gpt-5.6-terra"),
+        ["low", "max", "ultra"]
+    );
+    assert!(parse_codex_models_json("not json").models.is_empty());
 }
 
 #[test]

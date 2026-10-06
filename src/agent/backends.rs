@@ -591,7 +591,8 @@ pub fn resolve_opencode_agent(command: &str, requested: &str) -> String {
 /// listed in `auth.json` (e.g. OpenRouter from the installed `pi-ai` package).
 /// Grok's text listing is enriched with per-model efforts from
 /// `$GROK_HOME/models_cache.json` (default `~/.grok`), which `grok models`
-/// refreshes.
+/// refreshes. Codex comes from `codex debug models`, falling back to the
+/// `$CODEX_HOME/models_cache.json` (default `~/.codex`) the CLI keeps fresh.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackendCatalog {
     pub models: Vec<String>,
@@ -611,7 +612,7 @@ impl BackendCatalog {
 /// pi's on-disk store + custom providers) instead of relying solely on the
 /// configured `models` list.
 pub fn backend_has_catalog(backend: &str) -> bool {
-    matches!(backend, "opencode" | "omp" | "pi" | "grok")
+    matches!(backend, "opencode" | "omp" | "pi" | "grok" | "codex")
 }
 
 static CATALOG_CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<BackendCatalog>>>>> =
@@ -676,6 +677,13 @@ fn fetch_backend_catalog(backend: &str, command: &str) -> Option<BackendCatalog>
             }
             (!catalog.models.is_empty()).then_some(catalog)
         }
+        // `codex debug models` renders the catalog the CLI fetched from the
+        // backend; its on-disk cache has the same shape and covers an older
+        // or failing CLI.
+        "codex" => run_capture(command, &["debug", "models"])
+            .map(|text| parse_codex_models_json(&text))
+            .filter(|catalog| !catalog.models.is_empty())
+            .or_else(|| read_codex_models_cache().map(|text| parse_codex_models_json(&text))),
         _ => None,
     }
 }
@@ -787,6 +795,75 @@ fn grok_home() -> Option<PathBuf> {
 
 fn read_grok_models_cache() -> Option<String> {
     fs::read_to_string(grok_home()?.join("models_cache.json")).ok()
+}
+
+/// Parse `codex debug models` or `~/.codex/models_cache.json`:
+/// `{ "models": [ { "slug", "visibility", "priority",
+/// "supported_reasoning_levels": [{ "effort" }] } ] }`. Models Codex hides
+/// from its own picker (`visibility: "hide"`) are omitted; the rest keep
+/// Codex's priority order and their reasoning levels become the effort menu.
+pub fn parse_codex_models_json(text: &str) -> BackendCatalog {
+    let mut catalog = BackendCatalog::default();
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(text) else {
+        return catalog;
+    };
+    let Some(models) = root.get("models").and_then(serde_json::Value::as_array) else {
+        return catalog;
+    };
+    let mut listed = models
+        .iter()
+        .filter(|entry| entry.get("visibility").and_then(serde_json::Value::as_str) != Some("hide"))
+        .filter_map(|entry| {
+            let slug = entry
+                .get("slug")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|slug| !slug.is_empty())?;
+            let priority = entry
+                .get("priority")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(i64::MAX);
+            Some((priority, slug, entry))
+        })
+        .collect::<Vec<_>>();
+    listed.sort_by_key(|(priority, _, _)| *priority);
+    for (_, slug, entry) in listed {
+        if catalog.models.iter().any(|model| model == slug) {
+            continue;
+        }
+        let efforts = entry
+            .get("supported_reasoning_levels")
+            .and_then(serde_json::Value::as_array)
+            .map(|levels| {
+                sort_efforts(
+                    levels
+                        .iter()
+                        .filter_map(|level| level.get("effort").and_then(serde_json::Value::as_str))
+                        .map(str::to_string)
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
+        catalog.models.push(slug.to_string());
+        if !efforts.is_empty() {
+            catalog.variants.insert(slug.to_string(), efforts);
+        }
+    }
+    catalog
+}
+
+/// Codex's config directory (`CODEX_HOME`, default `~/.codex`).
+fn codex_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("CODEX_HOME")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home));
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex"))
+}
+
+fn read_codex_models_cache() -> Option<String> {
+    fs::read_to_string(codex_home()?.join("models_cache.json")).ok()
 }
 
 /// pi's agent config directory (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`).
@@ -1170,8 +1247,8 @@ fn json_string_array(values: &[serde_json::Value]) -> Vec<String> {
 
 /// Reasoning efforts ordered weakest to strongest; unknown names go last,
 /// alphabetically.
-const EFFORT_ORDER: [&str; 8] = [
-    "off", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+const EFFORT_ORDER: [&str; 9] = [
+    "off", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
 
 pub fn sort_efforts(mut efforts: Vec<String>) -> Vec<String> {

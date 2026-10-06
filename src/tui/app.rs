@@ -5271,7 +5271,7 @@ impl App {
     }
 
     /// Model choices for a backend. Catalog-backed backends (opencode, omp,
-    /// and pi) come from their live catalogs ordered default-first, then
+    /// pi, grok, and codex) come from their live catalogs ordered default-first, then
     /// recently used, then alphabetical; other backends (and an unavailable
     /// catalog CLI) use the configured `models` list as-is.
     fn backend_model_options(
@@ -5312,7 +5312,7 @@ impl App {
     }
 
     /// Effort choices depend on the backend and, for catalog-backed backends,
-    /// on the model: claude/codex list their config `efforts`; opencode/omp/pi/grok
+    /// on the model: claude lists its config `efforts`; opencode/omp/pi/grok/codex
     /// offer the variants their catalogs report for the selected model.
     fn refresh_effort_options_for_slot(
         &self,
