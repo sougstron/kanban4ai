@@ -1,3 +1,33 @@
+# kanban4ai 0.6.20
+
+Codex joins the live-catalog backends, and TUI text copies now respect pane
+boundaries and paragraph wraps.
+
+## Added
+
+- **Codex live model catalog** (`src/agent/backends.rs`, `src/agent/mod.rs`,
+  `src/core/config.rs`, `docs/config.md`, `docs/data-model.md`). The codex
+  backend now polls `codex debug models`, falling back to the
+  `$CODEX_HOME/models_cache.json` the CLI keeps fresh, so the TUI model and
+  effort selectors list the live catalog: models Codex hides from its own
+  picker are skipped, Codex's priority order is kept, and each model's
+  `supported_reasoning_levels` become the effort menu (including `max` and,
+  where a model supports it, `ultra`). Codex models are tracked in
+  `.kanban/recent_models` like the other catalog backends, and the shipped
+  default codex model list was refreshed (gpt-6-astra, gpt-5.6-sol,
+  gpt-5.6-terra, gpt-5.6-luna, gpt-5.5).
+
+## Fixed
+
+- **Pane-scoped text copy** (`src/tui/app.rs`, `src/tui/detail.rs`,
+  `src/tui/board.rs`). Drag selections are clamped to the bordered pane they
+  start in, so frames, right-hand scrollbars, and neighbouring panes no
+  longer leak into a copy; copying the task thread rejoins soft-wrapped rows
+  into the paragraphs they came from.
+- **Move-task dialog status list** (`src/tui/dialogs.rs`). The target-status
+  list sizes itself to every status option, so boards with custom columns no
+  longer bury choices behind a scroll.
+
 # kanban4ai 0.6.19
 
 Per-task analytics now expose cumulative agent runtime and token usage in the
