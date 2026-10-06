@@ -9632,10 +9632,36 @@ fn limits_refresh_status_returns_to_ready_after_update() {
 
     crate::core::limits::force_provider_refresh_in_flight(false);
     app.tick().expect("tick after refresh");
-    assert_eq!(app.status, "grok limits updated");
+    assert_eq!(app.status, "grok limits not refreshed: signed out");
 
     app.expire_limits_status_at(Instant::now() + Duration::from_secs(4));
     assert_eq!(app.status, "TUI ready");
+}
+
+/// "updated" only when the provider now holds live numbers: a refresh that
+/// leaves days-old data on the row says so instead.
+#[test]
+fn limits_refresh_status_reports_stale_data_honestly() {
+    crate::core::limits::force_provider_refresh_in_flight(false);
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(limits_fixture());
+    let _ = render_at(&mut app, 120, 28);
+
+    for (provider, expected) in [
+        ("claude", "claude limits updated"),
+        (
+            "codex",
+            "codex limits not refreshed: showing data from 7d ago",
+        ),
+    ] {
+        crate::core::limits::force_provider_refresh_in_flight(true);
+        click_limits_segment(&mut app, provider);
+        crate::core::limits::force_provider_refresh_in_flight(false);
+        app.tick().expect("tick after refresh");
+        assert_eq!(app.status, expected);
+        app.expire_limits_status_at(Instant::now() + Duration::from_secs(4));
+        assert_eq!(app.status, "TUI ready");
+    }
 }
 
 #[test]
