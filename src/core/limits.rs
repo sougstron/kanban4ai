@@ -60,9 +60,10 @@
 //!   through the `sqlite3` CLI) or kimi-cli in
 //!   `~/.kimi/credentials/kimi-code.json`. The detailed `limits[]` row is
 //!   authoritative for the 5-hour window; `usages` supplies the monthly
-//!   `mon` (total) / `code` quotas. Tokens are never refreshed here —
-//!   rotating them would fight omp — so while the token has expired the
-//!   windows omp itself last polled (`usage_history`) are shown with their age.
+//!   `mon` (total) / `code` quotas. An expired omp token is renewed with its
+//!   refresh token and written back to omp's store (omp only renews while it
+//!   runs); when no live read succeeds, the windows omp itself last polled
+//!   (`usage_history`) are shown with their age.
 //! - **gemini**: the Code Assist quota (`retrieveUserQuota`) when gemini-cli
 //!   is signed in, plus the spend pi logged for its Gemini API key — the
 //!   Gemini API has no quota endpoint for keys — as `24h` / `30d` spend
@@ -1682,6 +1683,16 @@ pub fn parse_synthetic_quotas(value: &Value) -> Vec<LimitWindow> {
 
 const KIMI_USAGE_URL: &str = "https://api.kimi.com/coding/v1/usages";
 
+/// Where a Kimi Code access token is renewed from its refresh token.
+const KIMI_TOKEN_URL: &str = "https://auth.kimi.com/api/oauth/token";
+
+/// Kimi Code's public OAuth client id — the one kimi-cli and omp log in with.
+const KIMI_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
+
+/// omp stores `expires` this much ahead of the real expiry; kanban matches it
+/// so both agree on when the token is due.
+const KIMI_EXPIRY_SKEW_SECS: i64 = 300;
+
 /// How long `sqlite3` may take to read omp's credential store.
 const SQLITE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1768,15 +1779,138 @@ fn parse_kimi_cli_credential(value: &Value) -> Option<KimiToken> {
     })
 }
 
-fn omp_kimi_token(db: &Path) -> Option<KimiToken> {
+/// omp's active kimi login: its `auth_credentials` row id and `data` blob.
+fn omp_kimi_login(db: &Path) -> Option<(i64, Value)> {
     let rows = sqlite_json_rows(
         db,
-        "SELECT data FROM auth_credentials WHERE provider = 'kimi-code' \
+        "SELECT id, data FROM auth_credentials WHERE provider = 'kimi-code' \
          AND credential_type = 'oauth' AND disabled_cause IS NULL \
          ORDER BY updated_at DESC LIMIT 1",
     )?;
-    let data: Value = serde_json::from_str(rows.first()?.get("data")?.as_str()?).ok()?;
-    parse_omp_kimi_credential(&data)
+    let row = rows.first()?;
+    let id = row.get("id")?.as_i64()?;
+    let data: Value = serde_json::from_str(row.get("data")?.as_str()?).ok()?;
+    Some((id, data))
+}
+
+/// The login omp stores after a refresh grant: the new access token, the
+/// rotated refresh token (or the old one when the server keeps it), and the
+/// skewed expiry in Unix milliseconds. Other fields (`accountId`, …) carry
+/// over. `None` when the response holds no usable token.
+pub fn renewed_omp_kimi_login(previous: &Value, response: &Value, now: i64) -> Option<Value> {
+    let access = response.get("access_token")?.as_str()?;
+    let lifetime = response.get("expires_in")?.as_i64()?;
+    if access.is_empty() {
+        return None;
+    }
+    let mut data = previous.clone();
+    let object = data.as_object_mut()?;
+    object.insert("access".to_string(), json!(access));
+    if let Some(refresh) = response
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|refresh| !refresh.is_empty())
+    {
+        object.insert("refresh".to_string(), json!(refresh));
+    }
+    object.insert(
+        "expires".to_string(),
+        json!((now + lifetime - KIMI_EXPIRY_SKEW_SECS) * 1000),
+    );
+    Some(data)
+}
+
+/// Headers kimi-cli identifies itself with; omp sends the same set and the
+/// token endpoint ties a login to its device id.
+fn kimi_client_headers() -> Vec<(&'static str, String)> {
+    let device_id = home_dir()
+        .and_then(|home| fs::read_to_string(home.join(".omp/agent/kimi-device-id")).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|id| !id.is_empty());
+    let mut headers = vec![
+        ("User-Agent", "KimiCLI/kanban4ai".to_string()),
+        ("X-Msh-Platform", "kimi_cli".to_string()),
+    ];
+    if let Some(device_id) = device_id {
+        headers.push(("X-Msh-Device-Id", device_id));
+    }
+    headers
+}
+
+/// Renew omp's expired kimi login with its refresh token and write the result
+/// back into omp's store, so omp keeps working with the token the server now
+/// expects (the refresh token may rotate). omp only renews while it runs; a
+/// board left open for hours would otherwise read days-old usage history.
+fn refresh_omp_kimi_token(db: &Path, now: i64) -> std::result::Result<KimiToken, HttpError> {
+    let (id, data) = omp_kimi_login(db).ok_or(HttpError::Status(401))?;
+    let refresh = data
+        .get("refresh")
+        .and_then(Value::as_str)
+        .filter(|refresh| !refresh.is_empty())
+        .ok_or(HttpError::Status(401))?
+        .to_string();
+    let form = format!(
+        "grant_type=refresh_token&refresh_token={}&client_id={}",
+        form_encode(&refresh),
+        form_encode(KIMI_CLIENT_ID)
+    );
+    let mut headers = kimi_client_headers();
+    headers.push((
+        "Content-Type",
+        "application/x-www-form-urlencoded".to_string(),
+    ));
+    headers.push(("Accept", "application/json".to_string()));
+    let response = http_request_json(KIMI_TOKEN_URL, &headers, Some(&form)).map_err(|err| {
+        // A revoked refresh token answers 400/401 invalid_grant: signed out.
+        match err {
+            HttpError::Status(400) => HttpError::Status(401),
+            other => other,
+        }
+    })?;
+    let renewed = renewed_omp_kimi_login(&data, &response, now)
+        .ok_or_else(|| HttpError::Transport("no kimi access token".to_string()))?;
+    // Compare-and-swap on the old refresh token: if omp renewed meanwhile,
+    // its own write wins and this fetch still uses the token it got.
+    let quote = |text: &str| text.replace('\'', "''");
+    let _ = sqlite_exec(
+        db,
+        &format!(
+            "UPDATE auth_credentials SET data = '{}', updated_at = {now} \
+             WHERE id = {id} AND json_extract(data, '$.refresh') = '{}'",
+            quote(&renewed.to_string()),
+            quote(&refresh)
+        ),
+    );
+    parse_omp_kimi_credential(&renewed)
+        .ok_or_else(|| HttpError::Transport("no kimi access token".to_string()))
+}
+
+/// Run one write statement against an SQLite file through the `sqlite3` CLI,
+/// waiting briefly for a lock held by a running omp.
+fn sqlite_exec(db: &Path, statement: &str) -> bool {
+    let Ok(mut child) = Command::new("sqlite3")
+        .arg("-cmd")
+        .arg(".timeout 3000")
+        .arg(db)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    // The statement goes over stdin: it holds tokens that must stay out of
+    // `ps` output.
+    if let Some(mut stdin) = child.stdin.take()
+        && stdin.write_all(statement.as_bytes()).is_err()
+    {
+        let _ = child.kill();
+        return false;
+    }
+    matches!(
+        wait_with_timeout(&mut child, SQLITE_TIMEOUT),
+        Ok(Some(status)) if status.success()
+    )
 }
 
 fn kimi_cli_token() -> Option<KimiToken> {
@@ -1785,9 +1919,8 @@ fn kimi_cli_token() -> Option<KimiToken> {
 }
 
 /// The windows omp last polled for its kimi login (`usage_history`, newest
-/// row per limit), and when it polled them. Used when no live token is at
-/// hand: omp refreshes its token itself, and kanban never rotates it behind
-/// omp's back.
+/// row per limit), and when it polled them. Used only when no live read
+/// succeeds (offline, refresh rejected); the board marks its age.
 fn omp_kimi_history(db: &Path) -> Option<(Vec<LimitWindow>, i64)> {
     let rows = sqlite_json_rows(
         db,
@@ -1834,11 +1967,18 @@ pub fn parse_omp_kimi_history(rows: &[Value]) -> Vec<LimitWindow> {
 fn fetch_kimi() -> ProviderLimits {
     let now = now_secs();
     let omp_db = omp_agent_db().filter(|path| path.exists());
-    let token = omp_db
-        .as_deref()
-        .and_then(omp_kimi_token)
-        .filter(|token| !token.is_expired(now))
-        .or_else(|| kimi_cli_token().filter(|token| !token.is_expired(now)));
+    let mut refresh_error = None;
+    let omp_token = omp_db.as_deref().and_then(|db| {
+        let (_, data) = omp_kimi_login(db)?;
+        let token = parse_omp_kimi_credential(&data)?;
+        if !token.is_expired(now) {
+            return Some(token);
+        }
+        refresh_omp_kimi_token(db, now)
+            .map_err(|err| refresh_error = Some(err))
+            .ok()
+    });
+    let token = omp_token.or_else(|| kimi_cli_token().filter(|token| !token.is_expired(now)));
     let live = token.map(|token| {
         let headers = [
             ("Authorization", format!("Bearer {}", token.access)),
@@ -1854,7 +1994,7 @@ fn fetch_kimi() -> ProviderLimits {
             };
         }
         Some(Err(err)) => Some(err),
-        _ => None,
+        _ => refresh_error,
     };
     // No live read: what omp polled last still beats nothing.
     if let Some(entry) = omp_db.as_deref().and_then(kimi_from_history) {
@@ -3188,6 +3328,30 @@ mod tests {
             Some(1_790_836_230)
         );
         assert!(parse_omp_kimi_credential(&json!({"access": ""})).is_none());
+    }
+
+    #[test]
+    fn kimi_refresh_keeps_omp_login_shape() {
+        let previous = json!({"access": "old", "refresh": "r1", "expires": 1, "accountId": "u"});
+        let response = json!({"access_token": "new", "refresh_token": "r2", "expires_in": 900});
+        let renewed = renewed_omp_kimi_login(&previous, &response, 1_000).unwrap();
+        assert_eq!(
+            renewed,
+            json!({"access": "new", "refresh": "r2", "expires": 1_600_000, "accountId": "u"})
+        );
+        let token = parse_omp_kimi_credential(&renewed).unwrap();
+        assert!(!token.is_expired(1_000));
+        // A server that keeps the refresh token leaves the stored one.
+        let kept = renewed_omp_kimi_login(
+            &previous,
+            &json!({"access_token": "new", "expires_in": 900}),
+            1_000,
+        )
+        .unwrap();
+        assert_eq!(kept["refresh"], "r1");
+        assert!(
+            renewed_omp_kimi_login(&previous, &json!({"error": "invalid_grant"}), 1_000).is_none()
+        );
     }
 
     #[test]

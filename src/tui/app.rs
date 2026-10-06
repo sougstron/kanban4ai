@@ -423,6 +423,8 @@ pub struct App {
     status_before_copy: Option<String>,
     limits_refresh_provider: Option<&'static str>,
     limits_status_deadline: Option<Instant>,
+    /// The refresh outcome shown until `limits_status_deadline`.
+    limits_notice: Option<String>,
     status_before_limits: Option<String>,
     transient_status: Option<(String, Instant)>,
 
@@ -869,6 +871,7 @@ impl App {
             status_before_copy: None,
             limits_refresh_provider: None,
             limits_status_deadline: None,
+            limits_notice: None,
             status_before_limits: None,
             transient_status: None,
             log_view: None,
@@ -971,6 +974,7 @@ impl App {
             status_before_copy: None,
             limits_refresh_provider: None,
             limits_status_deadline: None,
+            limits_notice: None,
             status_before_limits: None,
             transient_status: None,
             log_view: None,
@@ -2677,7 +2681,19 @@ impl App {
         }
         self.limits_refresh_provider = None;
         if is_limits_progress_status(&self.status) {
-            self.status = updated_limits_status(provider);
+            // The refresh merged into the shared cache; tests keep their
+            // fixture snapshot.
+            if !cfg!(test)
+                && let Some(fresh) = crate::core::limits::cached()
+            {
+                self.limits = Some(fresh);
+            }
+            let entry = self
+                .limits
+                .as_deref()
+                .and_then(|limits| limits.get(provider));
+            self.status = limits_refresh_outcome(provider, entry, chrono::Utc::now().timestamp());
+            self.limits_notice = Some(self.status.clone());
             self.limits_status_deadline = Some(Instant::now() + LIMITS_STATUS_WINDOW);
         }
     }
@@ -2694,7 +2710,7 @@ impl App {
             .status_before_limits
             .take()
             .unwrap_or_else(|| DEFAULT_STATUS.to_string());
-        if self.status.ends_with(" limits updated") {
+        if self.limits_notice.take().as_deref() == Some(self.status.as_str()) {
             self.status = previous;
         }
     }
@@ -6270,8 +6286,29 @@ fn already_refreshing_limits_status(provider: &str) -> String {
     format!("{provider} limits are already refreshing")
 }
 
-fn updated_limits_status(provider: &str) -> String {
-    format!("{provider} limits updated")
+/// What a click-driven refresh actually achieved. "updated" only when the
+/// provider now holds live numbers; a fallback to older data or a failure
+/// says so instead of claiming success.
+fn limits_refresh_outcome(
+    provider: &str,
+    entry: Option<&crate::core::limits::ProviderLimits>,
+    now: i64,
+) -> String {
+    use crate::core::limits::{ProviderState, format_span};
+    let Some(entry) = entry else {
+        return format!("{provider} limits not refreshed: no data");
+    };
+    let reason = match &entry.state {
+        ProviderState::Ready if entry.windows.is_empty() => "no data".to_string(),
+        ProviderState::Ready => match entry.data_age(now).filter(|age| *age >= 60) {
+            Some(age) => format!("showing data from {} ago", format_span(age)),
+            None => return format!("{provider} limits updated"),
+        },
+        ProviderState::SignedOut => "signed out".to_string(),
+        ProviderState::NotConfigured => "not configured".to_string(),
+        ProviderState::Unavailable(detail) => detail.clone(),
+    };
+    format!("{provider} limits not refreshed: {reason}")
 }
 
 fn is_limits_progress_status(status: &str) -> bool {
