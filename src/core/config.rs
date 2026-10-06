@@ -133,6 +133,10 @@ agents:
     command: codex
     model: gpt-5.5
     models:
+    - gpt-6-astra
+    - gpt-5.6-sol
+    - gpt-5.6-terra
+    - gpt-5.6-luna
     - gpt-5.5
     effort: null
     efforts:
@@ -140,6 +144,7 @@ agents:
     - medium
     - high
     - xhigh
+    - max
     agent: null
     extra_args:
     - --dangerously-bypass-approvals-and-sandbox
