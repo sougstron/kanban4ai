@@ -1007,7 +1007,13 @@ fn thread_lines(
             MessageStatus::Rejected => "rejected",
         };
         let marker = if selected { "» " } else { "" };
-        let mut header = format!("{marker}{} · {} · {}", message.id, message.kind, status);
+        let mut header = format!(
+            "{marker}{} · {} · {} · {}",
+            message.id,
+            timefmt::human(&message.created_at),
+            message.kind,
+            status
+        );
         if let Some(origin) = message
             .origin
             .as_deref()

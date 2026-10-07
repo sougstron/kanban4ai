@@ -11,6 +11,11 @@ pub fn format(dt: &NaiveDateTime) -> String {
     dt.format(FMT).to_string()
 }
 
+/// Human-readable `DD.MM.YYYY - HH:MM` stamp for display (thread headers).
+pub fn human(dt: &NaiveDateTime) -> String {
+    dt.format("%d.%m.%Y - %H:%M").to_string()
+}
+
 pub fn parse(s: &str) -> Result<NaiveDateTime, chrono::ParseError> {
     NaiveDateTime::parse_from_str(s, FMT).or_else(|_| NaiveDateTime::parse_from_str(s, FMT_NO_FRAC))
 }
@@ -119,6 +124,12 @@ mod tests {
     fn parses_python_isoformat_with_microseconds() {
         let dt = parse("2026-07-01T10:13:22.036493").unwrap();
         assert_eq!(format(&dt), "2026-07-01T10:13:22.036493");
+    }
+
+    #[test]
+    fn human_formats_day_month_year_hour_minute() {
+        let dt = parse("2026-10-07T08:05:59.123456").unwrap();
+        assert_eq!(human(&dt), "07.10.2026 - 08:05");
     }
 
     #[test]

@@ -475,8 +475,10 @@ fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
 }
 
 fn normalize_elapsed(line: String) -> String {
-    let timestamp = regex::Regex::new(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?")
-        .expect("static timestamp regex");
+    let timestamp = regex::Regex::new(
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?|\d{2}\.\d{2}\.\d{4} - \d{2}:\d{2}",
+    )
+    .expect("static timestamp regex");
     if !timestamp.is_match(&line) {
         return line;
     }
