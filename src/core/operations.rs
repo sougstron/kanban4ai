@@ -10,6 +10,17 @@ pub const EXECUTOR_POOL_QUESTION_SOURCE: &str = "kanban:executor-pool";
 /// switching providers.
 pub const WAIT_FOR_QUOTA_VARIANT: &str = "Wait for the quota window";
 
+/// The launch fields a human can pick on a task (backend, model, effort,
+/// agent), compared to tell a real reassignment from a no-op save.
+fn launch_assignment(task: &Task) -> [Option<String>; 4] {
+    [
+        task.agent_backend.clone(),
+        task.ai_model.clone(),
+        task.ai_effort.clone(),
+        task.agent_name.clone(),
+    ]
+}
+
 /// What [`Operations::apply_executor_pool`] decided for one task.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PoolOutcome {
@@ -508,6 +519,8 @@ impl Operations {
         let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(None);
         };
+        let assignment_before = launch_assignment(&task);
+        let profile_patched = patch.role_profile.is_some();
         if let Some(title) = patch.title {
             task.title = title;
         }
@@ -575,6 +588,14 @@ impl Operations {
             task.session = session;
         }
         self.materialize_task_defaults(&mut task)?;
+        // A human pick of backend/model/effort/agent replaces whatever a
+        // role roster or executor pool materialized. Keeping the stale
+        // profile would let the next dispatch re-walk the pool and silently
+        // swap the chosen model for a pool candidate.
+        if !profile_patched && launch_assignment(&task) != assignment_before {
+            task.role_profile = None;
+            task.roster_index = 0;
+        }
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         Ok(Some(task))

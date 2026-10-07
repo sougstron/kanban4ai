@@ -4666,6 +4666,53 @@ fn executor_pool_never_overrides_an_explicit_assignment() {
 }
 
 #[test]
+fn editing_a_pooled_task_model_drops_the_pool_profile() {
+    install_pool_snapshot();
+    let (_dir, ops, _recorder) = pool_board();
+    let task = ops.create_task(NewTask::titled("Repicked")).unwrap();
+    ops.queue_run(&task.id).unwrap();
+    ops.dispatch_queue().unwrap();
+    let pooled = ops.storage.load_task(&task.id).unwrap().unwrap();
+    assert_eq!(pooled.role_profile.as_deref(), Some("cheap"));
+
+    // A save that keeps the pool's assignment must not detach the task.
+    let same = ops
+        .update_task(
+            &task.id,
+            TaskPatch {
+                agent_backend: Some(pooled.agent_backend.clone()),
+                ai_model: Some(pooled.ai_model.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(same.role_profile.as_deref(), Some("cheap"));
+    assert_eq!(same.roster_index, 1);
+
+    let picked = ops
+        .update_task(
+            &task.id,
+            TaskPatch {
+                agent_backend: Some(Some("claude".to_string())),
+                ai_model: Some(Some("haiku".to_string())),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(picked.role_profile, None, "a human pick leaves the pool");
+    assert_eq!(picked.roster_index, 0);
+
+    // The relaunch keeps the picked model instead of re-walking the pool.
+    let mut relaunch = picked.clone();
+    relaunch.run_phase = Some(RunPhase::Queued);
+    ops.apply_executor_pool(&mut relaunch).unwrap();
+    assert_eq!(relaunch.agent_backend.as_deref(), Some("claude"));
+    assert_eq!(relaunch.ai_model.as_deref(), Some("haiku"));
+}
+
+#[test]
 fn executor_pool_parks_blocked_task_with_question_and_no_crash_cost() {
     install_pool_snapshot();
     // A pool whose only candidate is the blocked provider.
