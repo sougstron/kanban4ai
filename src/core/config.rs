@@ -201,6 +201,20 @@ agents:
     extra_args:
     - --permission-mode
     - bypassPermissions
+  kimi:
+    command: kimi
+    model: kimi-code/kimi-for-coding
+    models:
+    - kimi-code/kimi-for-coding
+    - kimi-code/kimi-for-coding-highspeed
+    - kimi-code/k3
+    - kimi-code/k3-256k
+    effort: null
+    efforts:
+    - thinking
+    - no-thinking
+    agent: null
+    extra_args: []
 orchestration:
   queue_enabled: true
   max_running_total: 3
@@ -211,6 +225,7 @@ orchestration:
     omp: 2
     pi: 2
     grok: 2
+    kimi: 2
   max_running_per_backend_model: {}
   max_running_per_role:
     orchestrator: 1
@@ -2026,16 +2041,17 @@ impl Config {
     fn validate_orchestration(config: &mut BoardConfig, warnings: &mut Vec<String>) -> Result<()> {
         // Known backends for `<backend>/<model>` key checks: the built-ins
         // plus anything the user configured under `agents:`.
-        let known_backends: Vec<String> = ["opencode", "claude", "codex", "omp", "pi", "grok"]
-            .into_iter()
-            .map(str::to_owned)
-            .chain(
-                config
-                    .agents
-                    .keys()
-                    .filter_map(|k| k.as_str().map(str::to_owned)),
-            )
-            .collect();
+        let known_backends: Vec<String> =
+            ["opencode", "claude", "codex", "omp", "pi", "grok", "kimi"]
+                .into_iter()
+                .map(str::to_owned)
+                .chain(
+                    config
+                        .agents
+                        .keys()
+                        .filter_map(|k| k.as_str().map(str::to_owned)),
+                )
+                .collect();
         let orch = &mut config.orchestration;
 
         coerce_bool_field(orch, "queue_enabled", "orchestration")?;

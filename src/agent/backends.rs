@@ -251,7 +251,7 @@ pub fn build_launch_plan<'a>(
         None
     };
     let role = Role::from_phase(task.run_phase);
-    let resume = (!revert && matches!(backend.as_str(), "codex" | "pi" | "omp" | "grok"))
+    let resume = (!revert && matches!(backend.as_str(), "codex" | "pi" | "omp" | "grok" | "kimi"))
         .then(|| native_resume_candidate(roots.data_root, task, session_id, &backend))
         .flatten();
     let prompt = if let Some((previous_session, _)) = &resume {
@@ -274,12 +274,13 @@ pub fn build_launch_plan<'a>(
     let prompt_file = logs_dir.join(format!("{session_id}.prompt.txt"));
     atomic_write_text(&prompt_file, &prompt)?;
 
-    // claude, codex, opencode, the pi family (pi/omp, via `--mode json`), and
-    // grok (`--output-format streaming-messages-json`) all emit a parseable
-    // JSONL transcript on stdout.
+    // claude, codex, opencode, the pi family (pi/omp, via `--mode json`),
+    // grok (`--output-format streaming-messages-json`), and kimi
+    // (`--output-format stream-json`) all emit a parseable JSONL transcript
+    // on stdout.
     let transcript_file = matches!(
         backend.as_str(),
-        "claude" | "codex" | "opencode" | "pi" | "omp" | "grok"
+        "claude" | "codex" | "opencode" | "pi" | "omp" | "grok" | "kimi"
     )
     .then(|| logs_dir.join(format!("{session_id}.transcript.jsonl")));
     // Grok's headless mode is `--prompt-file`, not a trailing positional.
@@ -438,6 +439,16 @@ fn backend_args(
             "streaming-messages-json".to_string(),
             "--verbatim".to_string(),
         ],
+        // Kimi Code CLI (`kimi`) runs headlessly under `--print`, which also
+        // auto-approves tool calls. `stream-json` emits one OpenAI-style
+        // message per line (`role`, `content`, `tool_calls`). The prompt is
+        // taken by `--prompt`, appended last so the wrapper's trailing
+        // `prompt_file` positional becomes its value.
+        "kimi" => vec![
+            "--print".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+        ],
         _ => vec!["run".to_string()],
     };
     if let Some(session) = resume_session {
@@ -467,6 +478,13 @@ fn backend_args(
                 args.push("--resume".to_string());
                 args.push(session.to_string());
             }
+            "kimi" => {
+                // `kimi --session <id>` resumes that session; without an id
+                // it opens an interactive picker, so only a harvested id is
+                // passed.
+                args.push("--session".to_string());
+                args.push(session.to_string());
+            }
             _ => {}
         }
     }
@@ -480,8 +498,14 @@ fn backend_args(
         // per-model variants selected with --variant; the pi family (omp/pi)
         // uses --thinking; Grok Build uses --reasoning-effort. Codex stores
         // this setting under its config key and accepts it through the
-        // generic `-c key=value` override.
+        // generic `-c key=value` override. Kimi only toggles thinking, so its
+        // efforts are the flags themselves (`thinking` / `no-thinking`).
         match backend {
+            "kimi" => {
+                if matches!(effort, "thinking" | "no-thinking") {
+                    args.push(format!("--{effort}"));
+                }
+            }
             "codex" => {
                 args.push("-c".to_string());
                 args.push(format!("model_reasoning_effort={effort}"));
@@ -507,6 +531,9 @@ fn backend_args(
     if backend == "opencode" {
         args.push("--title".to_string());
         args.push(prompt_title(prompt));
+    }
+    if backend == "kimi" {
+        args.push("--prompt".to_string());
     }
     args
 }
@@ -593,6 +620,9 @@ pub fn resolve_opencode_agent(command: &str, requested: &str) -> String {
 /// `$GROK_HOME/models_cache.json` (default `~/.grok`), which `grok models`
 /// refreshes. Codex comes from `codex debug models`, falling back to the
 /// `$CODEX_HOME/models_cache.json` (default `~/.codex`) the CLI keeps fresh.
+/// Kimi lists the `[models."<id>"]` tables of `$KIMI_SHARE_DIR/config.toml`
+/// (default `~/.kimi`), which `kimi login` populates with every model the
+/// subscription offers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BackendCatalog {
     pub models: Vec<String>,
@@ -612,7 +642,10 @@ impl BackendCatalog {
 /// pi's on-disk store + custom providers) instead of relying solely on the
 /// configured `models` list.
 pub fn backend_has_catalog(backend: &str) -> bool {
-    matches!(backend, "opencode" | "omp" | "pi" | "grok" | "codex")
+    matches!(
+        backend,
+        "opencode" | "omp" | "pi" | "grok" | "codex" | "kimi"
+    )
 }
 
 static CATALOG_CACHE: OnceLock<Mutex<HashMap<String, Option<Arc<BackendCatalog>>>>> =
@@ -684,6 +717,8 @@ fn fetch_backend_catalog(backend: &str, command: &str) -> Option<BackendCatalog>
             .map(|text| parse_codex_models_json(&text))
             .filter(|catalog| !catalog.models.is_empty())
             .or_else(|| read_codex_models_cache().map(|text| parse_codex_models_json(&text))),
+        // kimi-cli has no listing command; its config file is the catalog.
+        "kimi" => read_kimi_config().map(|text| parse_kimi_config_models(&text)),
         _ => None,
     }
 }
@@ -864,6 +899,82 @@ fn codex_home() -> Option<PathBuf> {
 
 fn read_codex_models_cache() -> Option<String> {
     fs::read_to_string(codex_home()?.join("models_cache.json")).ok()
+}
+
+/// kimi-cli's share directory (`KIMI_SHARE_DIR`, default `~/.kimi`).
+fn kimi_share_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("KIMI_SHARE_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".kimi"))
+}
+
+fn read_kimi_config() -> Option<String> {
+    fs::read_to_string(kimi_share_dir()?.join("config.toml")).ok()
+}
+
+/// Parse the model catalog out of kimi-cli's `config.toml`: every
+/// `[models."<id>"]` table is a launchable `--model` id, `default_model`
+/// leads the list, and a model whose `capabilities` include `thinking` (but
+/// not `always_thinking`) can be switched with `thinking` / `no-thinking`.
+/// Only the few keys needed are read, line by line, so no TOML parser is
+/// pulled in.
+pub fn parse_kimi_config_models(text: &str) -> BackendCatalog {
+    let unquote = |value: &str| value.trim().trim_matches('"').to_string();
+    let mut catalog = BackendCatalog::default();
+    let mut default_model = None;
+    let mut current: Option<String> = None;
+    let mut in_root = true;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_root = false;
+            current = line
+                .strip_prefix("[models.")
+                .and_then(|rest| rest.strip_suffix(']'))
+                .map(unquote)
+                .filter(|id| !id.is_empty());
+            if let Some(id) = &current
+                && !catalog.models.contains(id)
+            {
+                catalog.models.push(id.clone());
+            }
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match (key.trim(), &current) {
+            ("default_model", None) if in_root => default_model = Some(unquote(value)),
+            ("capabilities", Some(id)) => {
+                let capabilities: Vec<String> = value
+                    .trim()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .split(',')
+                    .map(unquote)
+                    .collect();
+                if capabilities.iter().any(|cap| cap == "thinking")
+                    && !capabilities.iter().any(|cap| cap == "always_thinking")
+                {
+                    catalog.variants.insert(
+                        id.clone(),
+                        vec!["thinking".to_string(), "no-thinking".to_string()],
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(default) = default_model
+        && let Some(index) = catalog.models.iter().position(|model| *model == default)
+    {
+        let model = catalog.models.remove(index);
+        catalog.models.insert(0, model);
+    }
+    catalog
 }
 
 /// pi's agent config directory (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`).

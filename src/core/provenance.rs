@@ -14,9 +14,11 @@
 //! Every supported backend emits a parseable JSONL transcript on stdout —
 //! claude via `--output-format stream-json`, grok via `--output-format
 //! streaming-messages-json` (the same Messages API shape), codex via `exec --json`, opencode
-//! via `run --format json`, and the pi family (pi/omp) via `--mode json` — captured to
+//! via `run --format json`, the pi family (pi/omp) via `--mode json`, and kimi via
+//! `--print --output-format stream-json` — captured to
 //! `.kanban/logs/<session>.transcript.jsonl` by the launch wrapper. Their event
-//! shapes differ but never collide on the top-level `type`, so one
+//! shapes differ but never collide on the top-level `type` (kimi's bare
+//! OpenAI-style messages carry none at all), so one
 //! [`render_stream_event`] renders all of them and each backend has its own
 //! harvester. A backend with no parseable transcript simply gets no manifest.
 
@@ -279,6 +281,60 @@ impl TranscriptHarvester for PiFamilyHarvester {
         canonicalize_paths(&mut manifest.writes, &self.root);
         Ok(manifest)
     }
+}
+
+/// Harvester for kimi-cli's `--print --output-format stream-json` transcript:
+/// one OpenAI-style message per line, assistant `tool_calls` carrying each
+/// call's JSON-encoded `function.arguments`. The stream itself has no session
+/// id; kimi prints `To resume this session: kimi -r <id>` on stderr, which the
+/// wrapper merges into the same file, so that line supplies it.
+pub struct KimiHarvester {
+    pub session_id: String,
+    pub prompt_dump: Option<String>,
+    /// Repo root, used to canonicalize recorded paths to repo-relative form.
+    pub root: PathBuf,
+}
+
+impl TranscriptHarvester for KimiHarvester {
+    fn harvest(&self, transcript: &Path) -> Result<InputManifest> {
+        let raw = std::fs::read_to_string(transcript)?;
+        let mut manifest = InputManifest {
+            session_id: self.session_id.clone(),
+            backend: "kimi".to_string(),
+            prompt_dump: self.prompt_dump.clone(),
+            generated_at: timefmt::format(&timefmt::now()),
+            ..InputManifest::default()
+        };
+        for line in raw.lines() {
+            let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+                if let Some(id) = kimi_resume_id(line) {
+                    manifest.backend_session_id = Some(id);
+                }
+                continue;
+            };
+            if value.get("role").and_then(Value::as_str) != Some("assistant") {
+                continue;
+            }
+            for call in value
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                record_kimi_tool_call(&mut manifest, call);
+            }
+        }
+        canonicalize_paths(&mut manifest.reads, &self.root);
+        canonicalize_paths(&mut manifest.writes, &self.root);
+        Ok(manifest)
+    }
+}
+
+/// The session id in kimi's `To resume this session: kimi -r <id>` hint.
+fn kimi_resume_id(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("kimi -r ")?;
+    let id = rest.split_whitespace().next()?;
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// Persist a manifest to `provenance_dir/<session>.yaml`.
@@ -554,6 +610,10 @@ fn error_event_retryable(value: &Value) -> bool {
 /// JSON events. The backends' `type` values are disjoint, so a single match
 /// handles all of them.
 pub fn render_stream_event(value: &Value) -> Option<String> {
+    // kimi (`stream-json`) lines are bare messages keyed by `role`.
+    if value.get("type").is_none() && value.get("role").is_some() {
+        return render_kimi_message(value);
+    }
     match value.get("type").and_then(Value::as_str)? {
         // claude
         "assistant" => {
@@ -636,6 +696,80 @@ pub fn render_stream_event(value: &Value) -> Option<String> {
             (!out.is_empty()).then(|| out.to_string())
         }
         _ => None,
+    }
+}
+
+/// A kimi assistant message: its text, then one `→` line per tool call. Tool
+/// results (`role: tool`) are not rendered, matching the other backends.
+fn render_kimi_message(value: &Value) -> Option<String> {
+    if value.get("role").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let mut out = String::new();
+    if let Some(text) = kimi_message_text(value) {
+        out.push_str(&text);
+        out.push('\n');
+    }
+    for call in value
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        out.push_str("  → ");
+        out.push_str(&kimi_tool_summary(call));
+        out.push('\n');
+    }
+    let out = out.trim_end();
+    (!out.is_empty()).then(|| out.to_string())
+}
+
+/// Visible text of a kimi message. `content` is a string or an array of
+/// parts, of which only `text` parts are shown (`think` parts are skipped).
+pub(crate) fn kimi_message_text(value: &Value) -> Option<String> {
+    let text = match value.get("content")? {
+        Value::String(text) => text.trim().to_string(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// A kimi tool call's name and decoded arguments (`function.arguments` is a
+/// JSON string).
+fn kimi_tool_call(call: &Value) -> (&str, Value) {
+    let function = call.get("function");
+    let name = function
+        .and_then(|function| function.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let args = function
+        .and_then(|function| function.get("arguments"))
+        .map(|args| match args {
+            Value::String(text) => serde_json::from_str(text).unwrap_or(Value::Null),
+            other => other.clone(),
+        })
+        .unwrap_or(Value::Null);
+    (name, args)
+}
+
+/// `ReadFile src/x.rs`, `Shell cargo test`, `FetchURL https://…`, …
+pub(crate) fn kimi_tool_summary(call: &Value) -> String {
+    let (name, args) = kimi_tool_call(call);
+    let name = if name.is_empty() { "tool" } else { name };
+    match str_field(
+        &args,
+        &["path", "file_path", "url", "query", "command", "pattern"],
+    ) {
+        Some(detail) => format!("{name} {detail}"),
+        None => name.to_string(),
     }
 }
 
@@ -955,6 +1089,52 @@ fn record_pi_tool_use(manifest: &mut InputManifest, block: &Value) {
     }
 }
 
+/// kimi-cli's built-in tools: `ReadFile`, `WriteFile`, `StrReplaceFile`,
+/// `Glob`, `Grep`, `Shell`, `SearchWeb`, `FetchURL`, … Anything else is an
+/// MCP or plugin tool.
+fn record_kimi_tool_call(manifest: &mut InputManifest, call: &Value) {
+    let (name, input) = kimi_tool_call(call);
+    match name {
+        "ReadFile" | "ReadMediaFile" => {
+            if let Some(path) = str_field(&input, &["path", "file_path"]) {
+                push_unique(&mut manifest.reads, path);
+            }
+        }
+        "WriteFile" | "StrReplaceFile" => {
+            if let Some(path) = str_field(&input, &["path", "file_path"]) {
+                push_unique(&mut manifest.writes, path);
+            }
+        }
+        "Glob" | "Grep" => {
+            if let Some(path) = str_field(&input, &["path", "directory"]) {
+                push_unique(&mut manifest.reads, path);
+            } else if let Some(pattern) = str_field(&input, &["pattern"]) {
+                push_unique(&mut manifest.reads, format!("pattern:{pattern}"));
+            }
+        }
+        "SearchWeb" => {
+            if let Some(query) = str_field(&input, &["query"]) {
+                push_unique(&mut manifest.urls, format!("search:{query}"));
+            }
+        }
+        "FetchURL" => {
+            if let Some(url) = str_field(&input, &["url"]) {
+                push_unique(&mut manifest.urls, url);
+            }
+        }
+        "Shell" => {
+            if let Some(command) = str_field(&input, &["command"]) {
+                record_bash_files(manifest, &command);
+            }
+        }
+        // Built-in tools with no external supply-chain input.
+        "Think" | "SetTodoList" | "Task" | "Agent" | "AskUserQuestion" | "EnterPlanMode"
+        | "ExitPlanMode" => {}
+        other if !other.is_empty() => push_unique(&mut manifest.mcp, other.to_string()),
+        _ => {}
+    }
+}
+
 /// Shell commands whose file operands enter the model's context. The named
 /// files are recorded as `reads`, putting Bash-driven file access on the same
 /// footing as the structured `Read` tool.
@@ -1182,6 +1362,53 @@ not json at all
         assert_eq!(manifest.reads, vec!["src/main.rs", "README.md"]);
         assert_eq!(manifest.writes, vec!["src/lib.rs"]);
         assert_eq!(manifest.urls, vec!["search:grok build"]);
+    }
+
+    const KIMI_TRANSCRIPT: &str = r#"
+{"role":"assistant","content":"Looking.","tool_calls":[{"type":"function","id":"tc_1","function":{"name":"ReadFile","arguments":"{\"path\":\"src/main.rs\"}"}},{"type":"function","id":"tc_2","function":{"name":"Shell","arguments":"{\"command\":\"cat README.md\"}"}}]}
+{"role":"tool","tool_call_id":"tc_1","content":"fn main() {}"}
+{"role":"assistant","content":"","tool_calls":[{"type":"function","id":"tc_3","function":{"name":"StrReplaceFile","arguments":"{\"path\":\"src/lib.rs\",\"edit\":{}}"}},{"type":"function","id":"tc_4","function":{"name":"FetchURL","arguments":"{\"url\":\"https://example.com\"}"}},{"type":"function","id":"tc_5","function":{"name":"github_list_prs","arguments":"{}"}}]}
+{"role":"assistant","content":"Done."}
+
+To resume this session: kimi -r 8aea524a-1ebe-48ea-9a41-e872f227e249
+"#;
+
+    #[test]
+    fn kimi_tool_calls_and_resume_id_are_harvested() {
+        let dir = write_transcript(KIMI_TRANSCRIPT);
+        let manifest = KimiHarvester {
+            session_id: "ses-kimi".to_string(),
+            prompt_dump: None,
+            root: PathBuf::from("/repo"),
+        }
+        .harvest(&dir.path().join("ses.transcript.jsonl"))
+        .unwrap();
+        assert_eq!(manifest.backend, "kimi");
+        assert_eq!(
+            manifest.backend_session_id.as_deref(),
+            Some("8aea524a-1ebe-48ea-9a41-e872f227e249")
+        );
+        assert_eq!(manifest.reads, vec!["src/main.rs", "README.md"]);
+        assert_eq!(manifest.writes, vec!["src/lib.rs"]);
+        assert_eq!(manifest.urls, vec!["https://example.com"]);
+        assert_eq!(manifest.mcp, vec!["github_list_prs"]);
+    }
+
+    #[test]
+    fn kimi_messages_render_text_and_tool_calls() {
+        let rendered: Vec<String> = KIMI_TRANSCRIPT
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter_map(|value| render_stream_event(&value))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "Looking.\n  → ReadFile src/main.rs\n  → Shell cat README.md",
+                "  → StrReplaceFile src/lib.rs\n  → FetchURL https://example.com\n  → github_list_prs",
+                "Done.",
+            ]
+        );
     }
 
     const CODEX_TRANSCRIPT: &str = r#"
