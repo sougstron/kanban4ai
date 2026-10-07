@@ -1,3 +1,39 @@
+# kanban4ai 0.6.23
+
+Three TUI quality-of-life fixes: thread messages show when they were written,
+dialog fields and detail panels walk with the arrow keys, and dictation tools
+can paste transcripts with Ctrl+V.
+
+## Added
+
+- **Thread message timestamps** (`src/core/timefmt.rs`,
+  `src/tui/detail.rs`, `docs/`). Thread messages in the task detail render
+  their creation time as `DD.MM.YYYY - HH:MM` in the message header, next to
+  the author, instead of a bare time.
+
+- **Arrow-key navigation** (`src/tui/app.rs`, `src/tui/dialogs.rs`,
+  `docs/tui.md`). Up/Down walk the dialog fields (no wrapping; Confirm/Cancel
+  count as one row). In a text field Down first moves the caret down and then
+  to the very end, Up to the very top; only from that edge (or in an empty
+  field) does the arrow leave for the next/previous field. Selectors and
+  lists keep Up/Down for their selection. In the task detail, Up from the top
+  of the review editor climbs to the answer panel (or thread), and the answer
+  panel's variant list hands off to the thread above and the review editor
+  below.
+
+- **Ctrl+V text paste** (`src/tui/app.rs`, `src/tui/image.rs`,
+  `src/tui/event.rs`, `docs/tui.md`, `docs/agent-io.md`). `Ctrl+V`,
+  `Ctrl+Shift+V`, and `Shift+Insert` reach the board as keys when the
+  terminal does not turn them into a paste — notably the synthetic `Ctrl+V`
+  that dictation tools such as Handy send after placing a transcript on the
+  clipboard. With a text field focused the board reads the clipboard itself
+  (`pbpaste`, `wl-paste`, `xclip`/`xsel`) on the input thread the instant the
+  key arrives, because those tools restore the old clipboard moments later,
+  and inserts the text like a bracketed paste. Description and Review edits
+  attach a clipboard image instead when there is no text (or the text is an
+  image file path). With no text field focused the keys keep their normal
+  meaning.
+
 # kanban4ai 0.6.22
 
 The Kimi Code CLI becomes a first-class agent backend, and the Global
