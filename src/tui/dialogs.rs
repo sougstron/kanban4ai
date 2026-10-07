@@ -1843,6 +1843,26 @@ impl ModalState {
     /// Bracketed paste keeps the terminal from replaying the clipboard as
     /// keystrokes, where embedded tabs would hop between fields and newlines
     /// could trigger the focused button.
+    /// Whether `paste` would insert into the focused field.
+    pub fn accepts_paste(&self) -> bool {
+        matches!(
+            self.active_field(),
+            DialogField::Title
+                | DialogField::Description
+                | DialogField::Answer
+                | DialogField::MaxRunningTotal
+                | DialogField::MaxRunningDesigner
+                | DialogField::MaxRunningReviewer
+                | DialogField::MaxRunningExecutor
+                | DialogField::MaxRunningPerBackend
+                | DialogField::MaxRunningPerBackendModel
+                | DialogField::AutoRestartDelays
+                | DialogField::ReviewerMaxRounds
+                | DialogField::ExecutorWeekThreshold
+                | DialogField::ExecutorFiveHourThreshold
+        )
+    }
+
     pub fn paste(&mut self, text: &str) -> bool {
         let before = self.editable_signature();
         let text = sanitize_paste_text(text);
@@ -5180,7 +5200,7 @@ fn render_description_textarea(
             // Enter, Shift+Enter, and Alt+Enter all insert a newline. The
             // title names Enter because that is the key every terminal can
             // deliver; the modifiers are accepted too.
-            .title(" Description (Ctrl+V image paste, Enter newline) ")
+            .title(" Description (Ctrl+V paste, Enter newline) ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border)),
     );

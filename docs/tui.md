@@ -114,8 +114,17 @@ paste as key events, so tabs jump between dialog fields, newlines press the
 focused button, and a paste on the board fires one shortcut per character — the
 way earlier boards ended up with tasks whose title and description were random
 fragments of the pasted text. A paste with no text field focused is dropped
-with a status hint instead of being executed. `Ctrl+V` (image paste from the
-clipboard) is unaffected.
+with a status hint instead of being executed.
+
+`Ctrl+V`, `Ctrl+Shift+V`, and `Shift+Insert` reach the board as keys when the
+terminal does not turn them into a paste — notably the synthetic `Ctrl+V` that
+dictation tools such as Handy send after placing a transcript on the clipboard.
+With a text field focused the board reads the clipboard itself (`pbpaste`,
+`wl-paste`, `xclip`/`xsel`) on the input thread the instant the key arrives,
+because those tools restore the old clipboard moments later, and inserts the
+text like a bracketed paste. Description and Review edits attach a clipboard
+image instead when there is no text (or the text is an image file path). With
+no text field focused the keys keep their normal meaning.
 
 Copying (drag across text on the board, then release) puts the selection on the
 system clipboard through a native helper first — `pbcopy` on macOS, `wl-copy`

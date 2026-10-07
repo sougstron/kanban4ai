@@ -7,7 +7,7 @@ use std::time::Duration;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use ratatui::crossterm::event::{self, Event as CrosstermEvent};
+use ratatui::crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
 
 use crate::core::error::Result;
 use crate::core::project::Project;
@@ -18,6 +18,8 @@ use super::board;
 #[derive(Debug)]
 pub enum AppEvent {
     Input(CrosstermEvent),
+    /// A paste key press with the clipboard text captured when it arrived.
+    PasteShortcut(KeyEvent, Option<String>),
     InputError(String),
     FsChanged,
     FsDebounced(u64),
@@ -72,6 +74,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
         };
         match event {
             AppEvent::Input(input) => handle_input(app, input)?,
+            AppEvent::PasteShortcut(key, clipboard) => app.handle_paste_shortcut(key, clipboard)?,
             AppEvent::InputError(message) => app.stop_after_input_error(message),
             AppEvent::FsChanged => {
                 let generation = app.note_fs_changed();
@@ -167,7 +170,7 @@ fn spawn_input_thread(tx: Sender<AppEvent>, input_gate: Arc<Mutex<()>>) {
             };
             match input {
                 Ok(event) => {
-                    if tx.send(AppEvent::Input(event)).is_err() {
+                    if tx.send(input_event(event)).is_err() {
                         break;
                     }
                 }
@@ -180,6 +183,19 @@ fn spawn_input_thread(tx: Sender<AppEvent>, input_gate: Arc<Mutex<()>>) {
             }
         }
     });
+}
+
+/// Read the clipboard right when a paste shortcut arrives: dictation tools
+/// restore the previous clipboard shortly after sending the key.
+fn input_event(event: CrosstermEvent) -> AppEvent {
+    match event {
+        CrosstermEvent::Key(key)
+            if key.kind == KeyEventKind::Press && super::app::is_paste_shortcut(key) =>
+        {
+            AppEvent::PasteShortcut(key, super::image::clipboard_text())
+        }
+        event => AppEvent::Input(event),
+    }
 }
 
 fn spawn_tick_thread(interval: Duration, tx: Sender<AppEvent>) {

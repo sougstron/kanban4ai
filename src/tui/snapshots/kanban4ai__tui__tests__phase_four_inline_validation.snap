@@ -10,7 +10,7 @@ expression: "render_at(&mut app, 80, 24)"
 │└──────────│┌ Title ─────────────────────────────────────────────┐│           │
 │           ││                                                    ││           │
 │           │└────────────────────────────────────────────────────┘│           │
-│           │┌ Description (Ctrl+V image paste, Enter newline) ───┐│           │
+│           │┌ Description (Ctrl+V paste, Enter newline) ─────────┐│           │
 │           ││                                                    ││           │
 │           ││                                                    ││           │
 │           ││                                                    ││           │
