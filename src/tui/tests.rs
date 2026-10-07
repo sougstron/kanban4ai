@@ -813,15 +813,25 @@ fn startup_warms_live_opencode_catalog_without_blocking_dialogs() {
 
     app.handle_key(key(KeyCode::Char('n')))
         .expect("open new task");
-    app.tick().expect("refresh warm catalog");
-    let values = app
-        .modal
-        .as_ref()
-        .expect("modal")
-        .model_options
-        .iter()
-        .map(|option| option.value.as_deref())
-        .collect::<Vec<_>>();
+    // The marker only proves the warm subprocess started; keep ticking
+    // until the harvested catalog reaches the open dialog instead of
+    // assuming one tick is enough on a loaded machine.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let values = loop {
+        app.tick().expect("refresh warm catalog");
+        let values = app
+            .modal
+            .as_ref()
+            .expect("modal")
+            .model_options
+            .iter()
+            .map(|option| option.value.as_deref())
+            .collect::<Vec<_>>();
+        if values.contains(&Some("opencode-go/minimax-m3")) || Instant::now() >= deadline {
+            break values;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
 
     assert!(values.contains(&Some("openai/gpt-5.5")));
     assert!(values.contains(&Some("opencode-go/minimax-m3")));
