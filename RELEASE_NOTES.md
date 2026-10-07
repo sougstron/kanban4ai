@@ -1,3 +1,40 @@
+# kanban4ai 0.6.24
+
+The task detail becomes type-to-edit, and tmux attach is gone: a Review task
+opens straight into the review editor, plain letters always type instead of
+firing hotkeys, and every action moves to `Alt+letter`.
+
+## Changed
+
+- **Detail type-to-edit** (`src/tui/app.rs`, `src/tui/detail.rs`,
+  `src/tui/board.rs`, `docs/tui.md`). A Review task now opens with the review
+  editor focused, so the first keystrokes type feedback instead of firing
+  hotkeys. While the detail has a text panel (the review editor, or the
+  answer box of an open question), a plain printable key never fires an
+  action: from the thread it first moves focus into that panel (review editor
+  first) and is typed there. Actions live on `Alt+letter` from every panel
+  (`Alt+y` approve, `Alt+r` run, `Alt+Shift+f` run now, `Alt+x` reject,
+  `Alt+q` close, …), shown as `M-y` on the action buttons, board status
+  hints, and help; buttons stay clickable. `Esc` leaves a text panel, then
+  closes the detail; `[`/`]`, arrows, PgUp/PgDn and the wheel still drive the
+  thread. Because every `Alt+letter` is a hotkey in the detail, the
+  textarea's own Alt bindings (`Alt+b/f/d/v`) are unavailable there — use
+  `Ctrl+←/→`, `Ctrl+Delete` and PgUp instead. A detail with no text panel
+  keeps the plain-letter hotkeys.
+
+## Removed
+
+- **`kanban attach` and the TUI attach action** (`src/cli/mod.rs`,
+  `src/agent/tmux.rs`, `src/tui/`). The `kanban attach <id>` CLI command, the
+  detail `t` key and Attach button, and the underlying terminal
+  suspend/restore machinery (`TerminalAction`, tmux `attach-session`,
+  foreground `--resume` runs, and the input-gate mutex that guarded them)
+  are removed — tmux now only hosts agent sessions, and the sessions view's
+  `Enter` or `v` opens the scrollable session log pager instead. Running
+  agents were always watched through the board's log/telemetry; the attach
+  path duplicated that with a second input thread and is no longer worth its
+  complexity.
+
 # kanban4ai 0.6.23
 
 Three TUI quality-of-life fixes: thread messages show when they were written,
