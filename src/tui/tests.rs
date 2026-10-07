@@ -9725,7 +9725,9 @@ fn limits_row_drops_windows_that_have_already_reset() {
                 state: ProviderState::Ready,
                 windows: vec![
                     window("5h", 1.0, now - 3_600),
-                    window("7d", 95.0, now + 6 * 86_400),
+                    // +12h keeps `format_span` on the "6d…" rung however far
+                    // the render's clock drifts from the fixture's `now`.
+                    window("7d", 95.0, now + 6 * 86_400 + 12 * 3_600),
                 ],
                 observed_at: None,
             },
@@ -9852,6 +9854,18 @@ fn click_limits_segment(app: &mut App, provider: &'static str) {
     .expect("click");
 }
 
+/// The click-refresh in-flight flag (`CLI_REFRESHING`) is one process-wide
+/// static shared by every test in the binary. Tests that force it around
+/// their ticks hold this lock, so a parallel test cannot flip it between a
+/// `force_provider_refresh_in_flight` call and the `tick` that reads it.
+static LIMITS_REFRESH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn limits_refresh_lock() -> std::sync::MutexGuard<'static, ()> {
+    LIMITS_REFRESH_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn clicking_claude_limits_segment_reports_a_refresh_in_the_status() {
     let (_dir, mut app) = populated_app();
@@ -9869,6 +9883,7 @@ fn clicking_claude_limits_segment_reports_a_refresh_in_the_status() {
 
 #[test]
 fn limits_refresh_status_returns_to_ready_after_update() {
+    let _refresh = limits_refresh_lock();
     crate::core::limits::force_provider_refresh_in_flight(false);
     let (_dir, mut app) = populated_app();
     app.limits = Some(limits_fixture());
@@ -9893,6 +9908,7 @@ fn limits_refresh_status_returns_to_ready_after_update() {
 /// leaves days-old data on the row says so instead.
 #[test]
 fn limits_refresh_status_reports_stale_data_honestly() {
+    let _refresh = limits_refresh_lock();
     crate::core::limits::force_provider_refresh_in_flight(false);
     let (_dir, mut app) = populated_app();
     app.limits = Some(limits_fixture());
@@ -9962,6 +9978,7 @@ fn projects_idle_status_does_not_expire() {
 
 #[test]
 fn limits_progress_status_does_not_expire_while_refreshing() {
+    let _refresh = limits_refresh_lock();
     crate::core::limits::force_provider_refresh_in_flight(true);
     let (_dir, mut app) = populated_app();
     app.limits = Some(limits_fixture());
