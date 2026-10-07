@@ -118,6 +118,7 @@ pub enum DialogField {
     EscapeToProjects,
     ProjectSort,
     UpdateCheckOnOpen,
+    ProjectVisibility,
     QueueEnabled,
     MaxRunningTotal,
     MaxRunningDesigner,
@@ -191,6 +192,8 @@ pub enum SettingsTab {
     Designer,
     Reviewer,
     Executor,
+    /// Global Settings only: which registered projects the list shows.
+    Projects,
 }
 
 impl SettingsTab {
@@ -201,9 +204,14 @@ impl SettingsTab {
         SettingsTab::Executor,
     ];
 
-    fn index(self) -> usize {
-        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
-    }
+    /// The Global Settings strip: every project tab plus Projects.
+    pub const GLOBAL: [SettingsTab; 5] = [
+        SettingsTab::Common,
+        SettingsTab::Designer,
+        SettingsTab::Reviewer,
+        SettingsTab::Executor,
+        SettingsTab::Projects,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -211,6 +219,7 @@ impl SettingsTab {
             SettingsTab::Designer => "Designer",
             SettingsTab::Reviewer => "Reviewer",
             SettingsTab::Executor => "Executor",
+            SettingsTab::Projects => "Projects",
         }
     }
 
@@ -221,19 +230,20 @@ impl SettingsTab {
             SettingsTab::Designer => "Des",
             SettingsTab::Reviewer => "Rev",
             SettingsTab::Executor => "Exe",
+            SettingsTab::Projects => "Prj",
         }
     }
 
-    /// Arrow keys walk the tabs and wrap around.
-    pub fn next(self) -> Self {
-        let index = self.index();
-        Self::ALL[(index + 1) % Self::ALL.len()]
+    /// Arrow keys walk the dialog's own tabs and wrap around.
+    pub fn next(self, tabs: &[SettingsTab]) -> Self {
+        let index = tabs.iter().position(|tab| *tab == self).unwrap_or(0);
+        tabs[(index + 1) % tabs.len()]
     }
 
-    pub fn prev(self) -> Self {
-        let index = self.index();
-        let len = Self::ALL.len();
-        Self::ALL[(index + len - 1) % len]
+    pub fn prev(self, tabs: &[SettingsTab]) -> Self {
+        let index = tabs.iter().position(|tab| *tab == self).unwrap_or(0);
+        let len = tabs.len();
+        tabs[(index + len - 1) % len]
     }
 }
 
@@ -319,10 +329,19 @@ const GLOBAL_SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 17] = [
     DialogField::Cancel,
 ];
 
-/// The whole field page of one settings tab, buttons included.
+/// The Global Settings Projects page: one checklist of every registered
+/// project, ticked when the projects list shows it.
+const GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS: [DialogField; 3] = [
+    DialogField::ProjectVisibility,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
+/// The whole field page of one settings tab, buttons included. Project
+/// settings never show the Projects tab; it falls back to Common.
 pub(crate) fn settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
     match tab {
-        SettingsTab::Common => &SETTINGS_PAGE_COMMON_FIELDS,
+        SettingsTab::Common | SettingsTab::Projects => &SETTINGS_PAGE_COMMON_FIELDS,
         SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS,
         SettingsTab::Reviewer => &SETTINGS_PAGE_REVIEWER_FIELDS,
         SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS,
@@ -336,6 +355,7 @@ pub(crate) fn global_settings_page_fields(tab: SettingsTab) -> &'static [DialogF
         SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS[1..],
         SettingsTab::Reviewer => &SETTINGS_PAGE_REVIEWER_FIELDS[1..],
         SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS[1..],
+        SettingsTab::Projects => &GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS,
     }
 }
 
@@ -383,6 +403,7 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::ExecutorCheap3
         | DialogField::ExecutorWeekThreshold
         | DialogField::ExecutorFiveHourThreshold => Some(SettingsTab::Executor),
+        DialogField::ProjectVisibility => Some(SettingsTab::Projects),
         _ => None,
     }
 }
@@ -615,6 +636,14 @@ impl AgentPicker {
     }
 }
 
+/// One row of the Global Settings Projects checklist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectVisibility {
+    pub id: String,
+    pub label: String,
+    pub visible: bool,
+}
+
 pub struct ModalState {
     pub settings_tab: SettingsTab,
     pub modal: Modal,
@@ -682,6 +711,10 @@ pub struct ModalState {
     pub hide_kanban_messages: bool,
     pub project_sort_options: Vec<SelectOption>,
     pub project_sort_selected: usize,
+    /// Global Settings Projects tab: every registered project with whether
+    /// the projects list shows it, and the row the cursor sits on.
+    pub project_visibility: Vec<ProjectVisibility>,
+    pub project_visibility_selected: usize,
     pub purge_data: bool,
     pub queue_enabled: bool,
     pub max_running_total: TextArea<'static>,
@@ -790,6 +823,8 @@ impl ModalState {
             hide_kanban_messages: false,
             project_sort_options: Vec::new(),
             project_sort_selected: 0,
+            project_visibility: Vec::new(),
+            project_visibility_selected: 0,
             purge_data: false,
             queue_enabled: true,
             max_running_total: one_line("3"),
@@ -1329,6 +1364,44 @@ impl ModalState {
         self.ensure_active_field_visible();
     }
 
+    /// The tab strip this dialog shows: Projects is Global Settings only.
+    pub fn settings_tabs(&self) -> &'static [SettingsTab] {
+        match self.modal {
+            Modal::GlobalSettings => &SettingsTab::GLOBAL,
+            _ => &SettingsTab::ALL,
+        }
+    }
+
+    /// Up/Down walk the project checklist, Space flips the focused row.
+    fn input_project_visibility(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        use ratatui::crossterm::event::KeyCode;
+        let len = self.project_visibility.len();
+        if len == 0 {
+            return;
+        }
+        let selected = self.project_visibility_selected.min(len - 1);
+        match key.code {
+            KeyCode::Up => self.project_visibility_selected = selected.saturating_sub(1),
+            KeyCode::Down => self.project_visibility_selected = (selected + 1).min(len - 1),
+            KeyCode::Home => self.project_visibility_selected = 0,
+            KeyCode::End => self.project_visibility_selected = len - 1,
+            KeyCode::Char(' ') => {
+                let row = &mut self.project_visibility[selected];
+                row.visible = !row.visible;
+            }
+            _ => {}
+        }
+    }
+
+    /// Ids of the projects the checklist leaves unticked.
+    pub fn hidden_project_ids(&self) -> Vec<String> {
+        self.project_visibility
+            .iter()
+            .filter(|row| !row.visible)
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
     pub fn capture_initial_values(&mut self) {
         self.initial_values = Some(self.editable_signature());
     }
@@ -1340,6 +1413,13 @@ impl ModalState {
     }
 
     pub fn select_option(&mut self, field: DialogField, index: usize) {
+        if field == DialogField::ProjectVisibility {
+            if let Some(row) = self.project_visibility.get_mut(index) {
+                row.visible = !row.visible;
+                self.project_visibility_selected = index;
+            }
+            return;
+        }
         if let Some(kind) = selector_kind(field) {
             let len = self.selection_len_for(field, kind);
             if len > 0 {
@@ -1530,6 +1610,7 @@ impl ModalState {
                 }
             }
             DialogField::ProjectSort => self.input_select(key, SelectorKind::ProjectSort),
+            DialogField::ProjectVisibility => self.input_project_visibility(key),
             DialogField::PurgeData => {
                 if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
                     self.purge_data = !self.purge_data;
@@ -1694,7 +1775,8 @@ impl ModalState {
             | DialogField::UseReviewer
             | DialogField::PlannedLaunch
             | DialogField::EscapeToProjects
-            | DialogField::UpdateCheckOnOpen => &mut self.answer,
+            | DialogField::UpdateCheckOnOpen
+            | DialogField::ProjectVisibility => &mut self.answer,
             DialogField::ProjectSort => &mut self.project_sort,
             DialogField::TargetStatus => &mut self.target_status,
             DialogField::MessageKind => &mut self.description,
@@ -2351,6 +2433,10 @@ impl ModalState {
             self.update_check_on_open.to_string(),
             raw_textarea_text(&self.project_sort),
             self.project_sort_selected.to_string(),
+            self.project_visibility
+                .iter()
+                .map(|row| if row.visible { '1' } else { '0' })
+                .collect(),
             self.purge_data.to_string(),
             self.queue_enabled.to_string(),
             raw_textarea_text(&self.max_running_total),
@@ -2802,8 +2888,9 @@ fn render_settings_tab_strip(
         return;
     }
     let active = modal.settings_tab;
+    let tabs = modal.settings_tabs();
     let fit = |short: bool| -> Option<u16> {
-        let width: usize = SettingsTab::ALL
+        let width: usize = tabs
             .iter()
             .map(|tab| {
                 let label = if short {
@@ -2814,7 +2901,7 @@ fn render_settings_tab_strip(
                 label.chars().count() + 2 // one leading and trailing space
             })
             .sum::<usize>()
-            + SettingsTab::ALL.len()
+            + tabs.len()
             - 1; // dividers between labels
         u16::try_from(width)
             .ok()
@@ -2829,7 +2916,7 @@ fn render_settings_tab_strip(
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut x = area.x;
     let mut widths: Vec<(SettingsTab, u16)> = Vec::new();
-    for (index, tab) in SettingsTab::ALL.into_iter().enumerate() {
+    for (index, tab) in tabs.iter().copied().enumerate() {
         let label = if short {
             tab.short_label()
         } else {
@@ -3286,6 +3373,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor => 1,
         DialogField::Description => 5,
+        DialogField::ProjectVisibility => 4,
         DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel => 5,
         // The chain selector always shows its filter and the "No chain"
         // entry, so two content rows already cover an empty board.
@@ -3337,6 +3425,7 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         DialogField::Theme => modal.theme_options.len(),
         DialogField::TaskSort => modal.task_sort_options.len(),
         DialogField::ProjectSort => modal.project_sort_options.len(),
+        DialogField::ProjectVisibility => modal.project_visibility.len(),
         DialogField::ChainTo => modal.chain_options.len(),
         DialogField::DesignerBackend => modal.designer.backend_options.len(),
         DialogField::DesignerModel => modal.designer.model_options.len(),
@@ -3739,6 +3828,7 @@ fn render_selector_field(
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::EscapeToProjects => render_escape_to_projects(frame, app, modal, area),
+        DialogField::ProjectVisibility => render_project_visibility(frame, app, modal, area),
         DialogField::UpdateCheckOnOpen => render_checkbox(
             frame,
             app,
@@ -4223,6 +4313,10 @@ fn register_task_options(
         DialogField::ProjectSort => (
             modal.project_sort_options.len(),
             modal.project_sort_selected,
+        ),
+        DialogField::ProjectVisibility => (
+            modal.project_visibility.len(),
+            modal.project_visibility_selected,
         ),
         DialogField::ChainTo => (modal.chain_options.len(), modal.chain_selected),
         DialogField::DesignerBackend => (
@@ -4799,6 +4893,40 @@ fn render_checkbox(
                 .border_style(Style::default().fg(border)),
         ),
         area,
+    );
+}
+
+/// The Projects tab checklist: a ticked row is shown in the projects list.
+fn render_project_visibility(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
+    let field = DialogField::ProjectVisibility;
+    let active = modal.active_field() == field || app.is_hovered(HitAction::ModalField(field));
+    let items = if modal.project_visibility.is_empty() {
+        vec![ListItem::new("No registered projects").style(Style::default().fg(app.theme.muted))]
+    } else {
+        modal
+            .project_visibility
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                let mark = if row.visible { "☑" } else { "☐" };
+                ListItem::new(format!("{mark} {}", sanitize_terminal_text(&row.label))).style(
+                    option_hover_style(app, HitAction::ModalOption { field, index }),
+                )
+            })
+            .collect()
+    };
+    let block = Block::default()
+        .title(" Show in projects list (Space toggles) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(select_border(app, active, false)));
+    render_list_in(
+        frame,
+        app,
+        items,
+        modal.project_visibility_selected,
+        area,
+        Some(block),
+        true,
     );
 }
 

@@ -304,15 +304,23 @@ fn column_rects(columns: &[Column], area: Rect) -> Vec<Rect> {
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let items = app.visible_project_items();
-    let block = Block::default()
+    let hidden = app.hidden_project_count();
+    let mut block = Block::default()
         .title(TITLE)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.focus));
+    // Hidden projects are only filtered out of the view; say so, and where
+    // to bring them back, so a short list never reads as lost projects.
+    if hidden > 0 {
+        block = block.title_bottom(format!(" {hidden} hidden · s → Projects to show "));
+    }
     if items.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No projects. Press n to add this folder or another path.").block(block),
-            area,
-        );
+        let message = if hidden > 0 {
+            "All projects are hidden. Press s and open the Projects tab to show them."
+        } else {
+            "No projects. Press n to add this folder or another path."
+        };
+        frame.render_widget(Paragraph::new(message).block(block), area);
         return;
     }
     let inner = block.inner(area);
