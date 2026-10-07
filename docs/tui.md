@@ -7,6 +7,19 @@ auto-loaded into every agent session. Read it when you are changing TUI key hand
 
 Action hotkeys work on both the board (focused card) and the open detail view.
 
+Detail type-to-edit: a Review task opens with the review editor focused. While
+the detail has a text panel (the Review editor, or the answer box of an open
+question), a plain printable key never fires an action: on the thread it moves
+focus into that panel (Review editor first) and is typed there. Actions then
+live on `Alt+letter` from every panel (`Alt+y` approve, `Alt+r` run,
+`Alt+Shift+f` run now, `Alt+x` reject, `Alt+q` close, …), shown as `M-y` on the
+action buttons and status hints; buttons stay clickable. `Esc` leaves a text
+panel, then closes the detail; `[`/`]`, arrows, PgUp/PgDn and the wheel still
+drive the thread. Because every `Alt+letter` is a hotkey in the detail, the
+textarea's own Alt bindings (`Alt+b/f/d/v`) are unavailable there — use
+`Ctrl+←/→`, `Ctrl+Delete` and PgUp instead. A detail with no text panel keeps
+the plain-letter hotkeys.
+
 - `↑/↓/←/→`: Move focus between tasks/columns
 - `Tab` / `Shift+Tab`: Next/previous column (board) · cycle
   thread/answer/editor panels (detail)
@@ -81,10 +94,6 @@ Action hotkeys work on both the board (focused card) and the open detail view.
 - `m`: Move task
 - `w`: Open the answer-question dialog
 - `y`: Approve — move a Review task to Done
-- `t`: Open the task's agent session — attach when it is a live tmux session,
-  follow the log when the agent runs in the background (no terminal to attach
-  to), or reopen the recorded conversation with its backend-specific resume
-  command when its session has stopped
 - `c`: Add a context/suggestion message to the task thread
 - `u`: Recover crashed task (restore to To Do); on an archived task (Archive
   list or its detail) the same key restores it to To Do after a confirmation
@@ -143,7 +152,7 @@ pipes open; a helper still resident after the handoff counts as success.
 Sessions view: each row shows the session state (`▶` live heartbeat, `⏳`
 declared wait, `✖` crashed), its task, the token count, the agent's todo
 progress and its last activity; waiting rows also show the relaunch deadline.
-`Enter` opens the session (attach / follow / resume, as for `t` above), `i`
+`Enter` opens the session log (same as `v`), `i`
 opens a read-only session-info panel (elapsed time, tokens, cost, todos, last
 activity, and the input provenance harvested so far) in the text pager, `v`
 opens a scrollable pager over the tail (last 64 KB) of `.kanban/logs/<id>.log`
@@ -246,7 +255,7 @@ dropped in the rewrite — it never worked reliably; `u` now means recover.
 
 The detail view renders the thread (open questions, variants, suggestions,
 resolved entries) plus the task's `chained_to` target, and a bottom action bar
-with clickable, context-sensitive buttons (Run/Stop/Answer/Approve/Re-run/Attach/
+with clickable, context-sensitive buttons (Run/Stop/Answer/Approve/Re-run/
 Edit/Move/+Ctx/Revert/Del). An isolated task gets a meta line with the worktree
 path (home-shortened), the branch, the `base_commit` short sha, and
 `Integration: <state>` when set; a Conflict task also shows a bold

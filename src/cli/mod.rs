@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 
 use project::ProjectCommand;
 
-use crate::agent::{attach_to_session, resolve_opencode_agent};
+use crate::agent::resolve_opencode_agent;
 use crate::core::ask_form::AskForm;
 use crate::core::compaction::{CompactionManager, CompactionStatus};
 use crate::core::config::Config;
@@ -428,8 +428,6 @@ enum Command {
     },
     /// Launch the TUI kanban board.
     Tui,
-    /// Attach to a running agent session for a task.
-    Attach { task_id: String },
     /// Internal command used by the agent runtime wrapper to reconcile process exit.
     #[command(name = "agent-exit", hide = true)]
     AgentExit {
@@ -1428,28 +1426,6 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         | Command::StatuslineBridge
         | Command::Daemon { .. } => {
             unreachable!("handled before resolve")
-        }
-        Command::Attach { task_id } => {
-            let Some(task) = ops.storage.load_task(&task_id)? else {
-                eprintln!("Task {task_id} not found");
-                return Ok(ExitCode::FAILURE);
-            };
-            // A task keeps its last session id after that session ends, so
-            // presence alone does not mean there is anything to attach to.
-            let session_mgr = SessionManager::new(ops.data_root());
-            let Some(session_id) = task
-                .session
-                .as_deref()
-                .filter(|session_id| session_mgr.is_session_active(session_id))
-            else {
-                eprintln!("Task {task_id} has no active session");
-                return Ok(ExitCode::FAILURE);
-            };
-            return Ok(if attach_to_session(session_id)? {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            });
         }
         Command::AgentExit {
             task_id,

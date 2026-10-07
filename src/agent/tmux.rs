@@ -96,30 +96,6 @@ pub fn session_exists(session_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-pub fn attach_to_session(session_id: &str) -> Result<bool> {
-    if !command_available("tmux") {
-        eprintln!("tmux is not available; cannot attach to session {session_id}");
-        return Ok(false);
-    }
-    let status = Command::new("tmux")
-        .args(["attach-session", "-t", session_id])
-        .status()?;
-    Ok(status.success())
-}
-
-/// Run a command in the foreground, inheriting the terminal, and wait for it to
-/// exit. Used to reopen a stopped background agent's conversation
-/// (`claude --resume <id>`) after the TUI has suspended itself. Returns whether
-/// the child exited successfully.
-pub fn run_foreground(command: &str, args: &[String], cwd: Option<&Path>) -> Result<bool> {
-    let mut cmd = Command::new(command);
-    cmd.args(args);
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-    Ok(cmd.status()?.success())
-}
-
 fn spawn_tmux(roots: Roots<'_>, plan: &LaunchPlan) -> Result<bool> {
     let script = wrapper_script(roots, plan);
     let work_path = roots.work_path.display().to_string();

@@ -399,12 +399,15 @@ fn card_capacity_with_indicators(
 /// disappear first when the bar overflows. The bar is an informational
 /// hotkey panel and registers no hitboxes.
 struct StatusSegment {
-    label: &'static str,
+    label: String,
     priority: u8,
 }
 
-fn seg(label: &'static str, priority: u8) -> StatusSegment {
-    StatusSegment { label, priority }
+fn seg(label: impl Into<String>, priority: u8) -> StatusSegment {
+    StatusSegment {
+        label: label.into(),
+        priority,
+    }
 }
 
 /// The `Q` hint for the current task, when it applies: a queued card offers
@@ -469,16 +472,26 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
             if let Some(queue) = queue_segment(app) {
                 segments.insert(1, queue);
             }
+            // Letters type into the text panel, so every hotkey hint shows
+            // its Alt form (`M-y approve`).
+            let typing = app
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.type_target().is_some());
+            if typing {
+                for segment in &mut segments {
+                    segment.label = format!("M-{}", segment.label);
+                }
+            }
             if show_tab {
                 segments.push(seg("Tab editor", 4));
                 segments.push(seg("Ctrl+S save", 4));
             }
-            segments.push(seg("q/Esc back", 2));
+            segments.push(seg(if typing { "Esc back" } else { "q/Esc back" }, 2));
             segments
         }
         Screen::Sessions => vec![
-            seg("Enter attach", 1),
-            seg("v log", 2),
+            seg("Enter/v log", 1),
             seg("x kill", 2),
             seg("o task", 3),
             seg("/ filter", 4),
@@ -522,7 +535,8 @@ fn fit_segments(segments: Vec<StatusSegment>, available: u16) -> Vec<StatusSegme
             .iter()
             .enumerate()
             .map(|(index, segment)| {
-                UnicodeWidthStr::width(segment.label) as u16 + if index == 0 { 2 } else { 3 }
+                UnicodeWidthStr::width(segment.label.as_str()) as u16
+                    + if index == 0 { 2 } else { 3 }
             })
             .sum::<u16>();
         if width <= available || kept.is_empty() {
@@ -655,7 +669,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  Q: same as r for idle cards · take a queued task back out"),
         Line::from("  n: new task in focused column · e/m/d: edit, move, delete permanently"),
         Line::from("  w: answer question · y: approve Review → Done"),
-        Line::from("  t: attach to the task's agent · c: add context/suggestion"),
+        Line::from("  c: add context/suggestion"),
         Line::from("  u: recover a crashed task · Ctrl+R: fold edits and re-queue"),
         Line::from("  A: archive all Done · b: mark all Review tasks Done (R also works)"),
         Line::from("  a/l: archive and sessions views"),
@@ -665,6 +679,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  Esc: projects list when enabled in global settings"),
         Line::from(""),
         Line::from("Detail"),
+        Line::from("  Review opens in the editor; with an editor or open question, letters"),
+        Line::from("  type there and actions move to Alt (M-y approve, M-x reject, M-q back)"),
         Line::from("  Tab: cycle thread/answer/editor panels when present"),
         Line::from("  Enter: queue To Do tasks · r/buttons: run now (F) or revoke live/paused"),
         Line::from("  k: stop a live or waiting session without starting a new one"),
@@ -676,7 +692,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from(""),
         Line::from("Sessions"),
         Line::from("  ▶ live · ⏳ declared wait · ✖ crashed heartbeats"),
-        Line::from("  Enter: attach · v: view log · x: kill session · o: open task"),
+        Line::from("  Enter/v: view log · x: kill session · o: open task"),
         Line::from(""),
         Line::from("Archive"),
         Line::from("  Enter: detail · u: restore the task to To Do"),

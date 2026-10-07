@@ -806,7 +806,7 @@ fn render_edits_panel(
     } else if hovered {
         " Review edits [click to focus] · Ctrl+S save · Ctrl+R re-run ".to_string()
     } else {
-        " Review edits · Tab to edit · Ctrl+S save · Ctrl+R re-run ".to_string()
+        " Review edits · type or Tab to edit · Ctrl+S save · Ctrl+R re-run ".to_string()
     };
     app.hitboxes.push(Hitbox {
         area,
@@ -868,9 +868,6 @@ fn render_action_bar(
             // button is painted in the alarm color below.
             buttons.push(("Re-run ^R".to_string(), UiAction::Rerun));
         }
-        if task.session.is_some() {
-            buttons.push(("Attach t".to_string(), UiAction::Attach));
-        }
         if app.board.session_states.get(&task.id) == Some(&SessionState::Crashed) {
             buttons.push(("Recover u".to_string(), UiAction::Recover));
         }
@@ -896,11 +893,21 @@ fn render_action_bar(
         buttons
     };
 
+    // While letters type into a text panel the hotkeys live on Alt, so the
+    // trailing key of each label is shown as `M-y`.
+    let typing = app
+        .detail
+        .as_ref()
+        .is_some_and(|detail| detail.type_target().is_some());
     let mut spans = Vec::new();
     let mut x = area.x;
     let rerun_urgent =
         task.integration == IntegrationState::Conflict && task.status == TaskStatus::Review;
     for (label, action) in buttons {
+        let label = match label.rsplit_once(' ') {
+            Some((name, key)) if typing && key.chars().count() == 1 => format!("{name} M-{key}"),
+            _ => label,
+        };
         let text = format!("[ {label} ]");
         let width = text.chars().count() as u16;
         if x + width > area.x + area.width {

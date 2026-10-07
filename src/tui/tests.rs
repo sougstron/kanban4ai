@@ -611,7 +611,7 @@ fn opening_review_detail_clears_the_unseen_notifier() {
         !app.ops.get_task(&task_id).unwrap().unwrap().review_unseen,
         "opening detail is the human-read signal"
     );
-    app.handle_key(key(KeyCode::Char('q')))
+    app.handle_key(alt_key(KeyCode::Char('q')))
         .expect("close detail");
     app.focused_column = 0;
     app.focused_card = 0;
@@ -876,7 +876,7 @@ fn renders_detail_search_and_every_modal() {
     app.handle_key(key(KeyCode::Enter)).expect("detail");
     insta::assert_snapshot!("detail_thread", render_snapshot(&mut app));
 
-    app.handle_key(key(KeyCode::Char('q'))).expect("back");
+    app.handle_key(key(KeyCode::Esc)).expect("back");
     app.handle_key(key(KeyCode::Char('/')))
         .expect("search open");
     app.handle_key(key(KeyCode::Char('Q')))
@@ -2003,7 +2003,6 @@ fn review_editor_up_down_reach_line_edges_too() {
     app.focused_column = review_column(&app);
     app.focused_card = 0;
     app.handle_key(key(KeyCode::Enter)).expect("open detail");
-    app.handle_key(key(KeyCode::Tab)).expect("focus editor");
     app.handle_key(key(KeyCode::End))
         .expect("end of first line");
     let cursor = app.detail.as_ref().expect("detail").review_edits.cursor();
@@ -3659,15 +3658,16 @@ fn review_editor_navigation_and_thread_focus_are_distinct() {
     app.focused_card = 0;
     app.handle_key(key(KeyCode::Enter)).unwrap();
 
-    // Thread is focused by default: plain typing must not reach the editor.
+    // Review opens in the editor; Esc hands navigation keys to the thread.
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+    app.handle_key(key(KeyCode::Esc)).unwrap();
     assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
-    app.handle_key(key(KeyCode::Char('х'))).unwrap();
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().scroll, 1);
     assert_eq!(
         app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
         "abcdef"
     );
-    app.handle_key(key(KeyCode::Down)).unwrap();
-    assert_eq!(app.detail.as_ref().unwrap().scroll, 1);
 
     // Tab focuses the editor (task is in Review, no open questions).
     app.handle_key(key(KeyCode::Tab)).unwrap();
@@ -3789,10 +3789,11 @@ fn clicking_review_editor_focuses_it_and_highlights_panel() {
     app.focused_column = review_column(&app);
     app.focused_card = 0;
     app.handle_key(key(KeyCode::Enter)).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
 
     let initial = render_at(&mut app, 96, 28);
     assert!(
-        initial.contains("Review edits · Tab to edit"),
+        initial.contains("Review edits · type or Tab to edit"),
         "initial render should advertise keyboard focus path:\n{initial}"
     );
     let edits = app
@@ -4309,7 +4310,7 @@ fn open_focused_review_editor(text: &str) -> (tempfile::TempDir, App) {
     app.focused_column = review_column(&app);
     app.focused_card = 0;
     app.handle_key(key(KeyCode::Enter)).expect("open detail");
-    app.handle_key(key(KeyCode::Tab)).expect("focus editor");
+    // A Review detail opens with the editor already focused.
     assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
     (dir, app)
 }
@@ -5109,8 +5110,8 @@ fn detail_hotkeys_operate_on_open_task() {
     app.handle_key(key(KeyCode::Enter)).expect("open detail");
     let task_id = app.detail.as_ref().unwrap().task_id.clone();
 
-    // Edit opens the form for the detail task.
-    app.handle_key(key(KeyCode::Char('e'))).expect("edit");
+    // Review hotkeys live on Alt; Alt+e opens the form for the detail task.
+    app.handle_key(alt_key(KeyCode::Char('e'))).expect("edit");
     assert_eq!(
         app.modal.as_ref().expect("edit modal").modal,
         Modal::EditTask {
@@ -5120,16 +5121,54 @@ fn detail_hotkeys_operate_on_open_task() {
     app.handle_key(key(KeyCode::Esc)).expect("discard prompt");
     app.handle_key(key(KeyCode::Char('y'))).expect("discard");
 
-    // Approve moves the Review task to Done without leaving the detail.
-    app.handle_key(key(KeyCode::Char('y'))).expect("approve");
+    // Alt+y approves straight from the focused editor, staying in the detail.
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+    app.handle_key(alt_key(KeyCode::Char('y')))
+        .expect("approve");
     assert_eq!(app.screen, Screen::Detail);
     let approved = app.ops.get_task(&task_id).unwrap().unwrap();
     assert_eq!(approved.status.as_str(), "done");
 
     // Approving again reports the task is no longer in Review.
-    app.handle_key(key(KeyCode::Char('y')))
+    app.handle_key(alt_key(KeyCode::Char('y')))
         .expect("approve again");
     assert!(app.status.contains("not in Review"), "{}", app.status);
+}
+
+/// A stray letter on a Review detail can never fire an action: from the
+/// thread it jumps into the editor and is typed there, Cyrillic included.
+#[test]
+fn review_detail_plain_letters_type_instead_of_firing_hotkeys() {
+    let (_dir, mut app) = populated_app();
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    let task_id = app.detail.as_ref().unwrap().task_id.clone();
+    let before = app.detail.as_ref().unwrap().review_edits.lines().join("\n");
+
+    app.handle_key(key(KeyCode::Esc)).expect("leave editor");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+    for ch in ['y', 'н', 'Q', 'q'] {
+        app.handle_key(key(KeyCode::Char(ch))).expect("type");
+    }
+    let detail = app.detail.as_ref().expect("detail stays open");
+    assert_eq!(app.screen, Screen::Detail);
+    assert_eq!(detail.focus, DetailFocus::Edits);
+    assert!(app.modal.is_none());
+    assert_eq!(
+        detail.review_edits.lines().join("\n"),
+        format!("yнQq{before}")
+    );
+    let task = app.ops.get_task(&task_id).unwrap().unwrap();
+    assert_eq!(task.status.as_str(), "review");
+
+    // `[`/`]` still pick thread messages, and Alt+q closes the detail.
+    app.handle_key(key(KeyCode::Esc)).expect("leave editor");
+    app.handle_key(key(KeyCode::Char('[')))
+        .expect("select message");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+    app.handle_key(alt_key(KeyCode::Char('q'))).expect("close");
+    assert_eq!(app.screen, Screen::Board);
 }
 
 #[test]
@@ -5232,7 +5271,6 @@ fn fs_reload_preserves_unsaved_review_edits() {
     app.focused_column = review_column(&app);
     app.focused_card = 0;
     app.handle_key(key(KeyCode::Enter)).expect("open detail");
-    app.handle_key(key(KeyCode::Tab)).expect("focus edits");
     app.detail
         .as_mut()
         .expect("detail")
@@ -5343,10 +5381,8 @@ fn sessions_render_and_controls_use_cached_sessions() {
     assert!(render_snapshot(&mut app).contains("ses-tmux-live"));
     app.handle_key(key(KeyCode::Down))
         .expect("navigate cached sessions");
-    app.handle_key(key(KeyCode::Enter)).expect("open session");
-    // The unified open finds no tmux host (and the record was unlinked), so it
-    // falls back to following the session's log rather than queueing an attach.
-    assert!(app.take_terminal_action().is_none());
+    app.handle_key(key(KeyCode::Enter))
+        .expect("open session log");
     assert_eq!(app.screen, Screen::LogView);
 }
 
@@ -7919,7 +7955,6 @@ fn review_editor_shift_and_alt_enter_break_lines() {
     app.focused_column = review_column(&app);
     app.focused_card = 0;
     app.handle_key(key(KeyCode::Enter)).unwrap();
-    app.handle_key(key(KeyCode::Tab)).expect("focus editor");
     assert_eq!(
         app.detail.as_ref().expect("detail").focus,
         DetailFocus::Edits
@@ -9890,6 +9925,7 @@ fn review_editor_focus_status_returns_to_ready() {
     app.focused_column = review_column(&app);
     app.focused_card = 0;
     app.handle_key(key(KeyCode::Enter)).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
     app.handle_key(key(KeyCode::Tab)).unwrap();
 
     assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
