@@ -100,6 +100,8 @@ pub struct TuiSettings {
     pub escape_to_projects: bool,
     /// Projects-list ordering (name/newest/smart), a machine-wide setting.
     pub project_sort: String,
+    /// Registry ids the projects list leaves out (Global Settings → Projects).
+    pub hidden_projects: Vec<String>,
     /// Draw the provider subscription-limits row above the status bar.
     pub show_limits: bool,
     /// Hide thread messages authored by kanban (audit notes). Display filter only.
@@ -1015,6 +1017,7 @@ impl App {
         {
             app.settings.escape_to_projects = config.escape_to_projects();
             app.settings.project_sort = config.project_sort().to_string();
+            app.settings.hidden_projects = config.hidden_projects();
         }
         // The projects list is an entry screen too (bare `kanban4ai` with no
         // resolvable project), so its open runs the same on-open check.
@@ -1060,6 +1063,7 @@ impl App {
         let mut rows: Vec<ProjectRow> = self
             .projects
             .iter()
+            .filter(|row| !self.settings.hidden_projects.contains(&row.project.id))
             .filter(|row| {
                 filter.is_empty()
                     || case_insensitive_match(&row.display_name, &filter)
@@ -3905,6 +3909,17 @@ impl App {
         modal.escape_to_projects = config.escape_to_projects();
         modal.project_sort = super::dialogs::one_line(config.project_sort());
         modal.update_check_on_open = config.update_check_on_open();
+        let hidden = config.hidden_projects();
+        let mut rows: Vec<&ProjectRow> = self.projects.iter().collect();
+        rows.sort_by_key(|row| row.display_name.to_lowercase());
+        modal.project_visibility = rows
+            .into_iter()
+            .map(|row| super::dialogs::ProjectVisibility {
+                id: row.project.id.clone(),
+                label: format!("{}  {}", row.display_name, row.project.work_path.display()),
+                visible: !hidden.contains(&row.project.id),
+            })
+            .collect();
         // One probe per dialog open, never per frame: the probe shells out to
         // pacman. `Some` means the package manager owns the binary and the
         // dialog shows its upgrade command instead of an "Update now" button.
@@ -3946,6 +3961,7 @@ impl App {
         {
             self.settings.escape_to_projects = config.escape_to_projects();
             self.settings.project_sort = config.project_sort().to_string();
+            self.settings.hidden_projects = config.hidden_projects();
         }
     }
 
@@ -4111,13 +4127,25 @@ impl App {
         if let Ok(cwd) = std::env::current_dir() {
             self.create_cwd = projects::cwd_create_path(store, &cwd);
         }
+        self.clamp_project_selection();
+        Ok(())
+    }
+
+    fn clamp_project_selection(&mut self) {
         let len = self.visible_project_items().len();
         if len == 0 {
             self.project_selected = 0;
         } else {
             self.project_selected = self.project_selected.min(len - 1);
         }
-        Ok(())
+    }
+
+    /// Registered projects the list currently leaves out.
+    pub fn hidden_project_count(&self) -> usize {
+        self.projects
+            .iter()
+            .filter(|row| self.settings.hidden_projects.contains(&row.project.id))
+            .count()
     }
 
     fn open_answer_dialog(&mut self) -> Result<()> {
@@ -5451,10 +5479,11 @@ impl App {
                         && !field_consumes_horizontal(modal.active_field()) =>
                 {
                     let current = modal.settings_tab;
+                    let tabs = modal.settings_tabs();
                     modal.set_settings_tab(if key.code == KeyCode::Left {
-                        current.prev()
+                        current.prev(tabs)
                     } else {
-                        current.next()
+                        current.next(tabs)
                     });
                 }
                 KeyCode::Left | KeyCode::Right
@@ -5622,6 +5651,7 @@ impl App {
                     config.store_board_sections(&edited);
                     config.set_escape_to_projects(modal.escape_to_projects);
                     config.set_update_check_on_open(modal.update_check_on_open);
+                    config.set_hidden_projects(&modal.hidden_project_ids());
                     config.set_project_sort(
                         &modal
                             .project_sort_text()
@@ -5643,6 +5673,8 @@ impl App {
                         .unwrap_or_else(|| crate::core::global::PROJECT_SORT_NAME.to_string()),
                 )
                 .to_string();
+                self.settings.hidden_projects = modal.hidden_project_ids();
+                self.clamp_project_selection();
                 self.status = "Global settings saved".to_string();
             }
             Modal::Settings => {
@@ -6687,7 +6719,8 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::InheritTaskSort
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
-        | DialogField::InheritExecutor => None,
+        | DialogField::InheritExecutor
+        | DialogField::ProjectVisibility => None,
         DialogField::ProjectSort => Some(modal.project_sort_selected),
         DialogField::ChainTo => Some(modal.chain_selected),
         DialogField::TargetStatus => Some(modal.status_selected),
@@ -6824,6 +6857,7 @@ fn default_project_settings() -> TuiSettings {
         task_sort: TASK_SORT_NUMBER.to_string(),
         escape_to_projects: false,
         project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
+        hidden_projects: Vec::new(),
         show_limits: true,
         hide_kanban_messages: false,
         limits_refresh_interval: crate::core::limits::DEFAULT_REFRESH_INTERVAL,
@@ -6943,6 +6977,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
             .to_string(),
         escape_to_projects: false,
         project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
+        hidden_projects: Vec::new(),
         show_limits: tui_bool(&config.tui, "show_limits", true),
         hide_kanban_messages: tui_bool(&config.tui, "hide_kanban_messages", false),
         limits_refresh_interval: ops

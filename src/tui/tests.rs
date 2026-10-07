@@ -8944,6 +8944,80 @@ fn projects_screen_global_settings_toggle_persists_to_the_store() {
 }
 
 #[test]
+fn global_settings_projects_tab_hides_and_restores_a_project() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-glob-hide");
+    let _ = std::fs::remove_dir_all(&work);
+    let (store_dir, mut app) = projects_app(&work, None);
+    let project_rows = |app: &App| {
+        app.visible_project_items()
+            .iter()
+            .filter(|item| matches!(item, super::projects::ProjectListItem::Project(_)))
+            .count()
+    };
+    assert_eq!(project_rows(&app), 1);
+
+    // Left from Common wraps onto the Projects tab, Global Settings only.
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open global settings");
+    app.handle_key(key(KeyCode::Left)).expect("projects tab");
+    let modal = app.modal.as_ref().expect("global settings modal");
+    assert_eq!(modal.settings_tab, SettingsTab::Projects);
+    assert_eq!(modal.active_field(), DialogField::ProjectVisibility);
+    assert!(modal.project_visibility[0].visible);
+    app.handle_key(key(KeyCode::Char(' '))).expect("untick");
+    insta::assert_snapshot!("global_settings_projects_tab", render_at(&mut app, 80, 24));
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+
+    assert!(app.modal.is_none());
+    assert_eq!(project_rows(&app), 0);
+    let store = ProjectStore::at(store_dir.path());
+    let hidden = store.load_global_config().unwrap().hidden_projects();
+    assert_eq!(hidden.len(), 1);
+    assert!(
+        store.list().unwrap().iter().any(|p| p.id == hidden[0]),
+        "project kept"
+    );
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("All projects are hidden"), "{rendered}");
+    assert!(rendered.contains("1 hidden"), "{rendered}");
+
+    // Ticking it again brings the row back.
+    app.handle_key(key(KeyCode::Char('s'))).expect("reopen");
+    app.handle_key(key(KeyCode::Left)).expect("projects tab");
+    assert!(!app.modal.as_ref().unwrap().project_visibility[0].visible);
+    app.handle_key(key(KeyCode::Char(' '))).expect("tick");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+    assert_eq!(project_rows(&app), 1);
+    assert!(
+        store
+            .load_global_config()
+            .unwrap()
+            .hidden_projects()
+            .is_empty()
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn project_settings_never_show_the_projects_tab() {
+    let modal = ModalState::new(Modal::Settings);
+    assert!(!modal.settings_tabs().contains(&SettingsTab::Projects));
+    assert_eq!(
+        SettingsTab::Executor.next(modal.settings_tabs()),
+        SettingsTab::Common
+    );
+}
+
+#[test]
 fn projects_screen_reflects_the_saved_global_escape_setting() {
     let work = std::path::PathBuf::from("/tmp/k4ai-glob-preload");
     let _ = std::fs::remove_dir_all(&work);

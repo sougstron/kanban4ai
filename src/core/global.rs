@@ -167,6 +167,37 @@ impl GlobalConfig {
         );
     }
 
+    /// Registry ids of projects the Projects screen leaves out. A display
+    /// filter only: the projects themselves are untouched and the Global
+    /// Settings Projects tab shows them again.
+    pub fn hidden_projects(&self) -> Vec<String> {
+        self.tui
+            .get(Value::String("hidden_projects".to_string()))
+            .and_then(Value::as_sequence)
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// An empty list drops the key so an untouched file stays untouched.
+    pub fn set_hidden_projects(&mut self, ids: &[String]) {
+        let key = Value::String("hidden_projects".to_string());
+        if ids.is_empty() {
+            self.tui.remove(&key);
+        } else {
+            self.tui.insert(
+                key,
+                Value::Sequence(ids.iter().cloned().map(Value::String).collect()),
+            );
+        }
+    }
+
     /// Seconds between daemon ticks. Missing, zero, or unparseable values
     /// read as 60 so a hand-edited file still yields a usable cadence.
     pub fn daemon_interval(&self) -> u64 {
@@ -337,6 +368,33 @@ mod tests {
         config.set_project_sort("bogus");
         store.save_global_config(&config).expect("save");
         assert_eq!(store.load_global_config().unwrap().project_sort(), "name");
+    }
+
+    #[test]
+    fn hidden_projects_round_trip_and_empty_drops_key() {
+        let dir = tempfile::tempdir().expect("store");
+        let store = ProjectStore::at(dir.path());
+        assert!(
+            store
+                .load_global_config()
+                .unwrap()
+                .hidden_projects()
+                .is_empty()
+        );
+
+        let mut config = store.load_global_config().unwrap();
+        config.set_hidden_projects(&["a1".to_string(), "b2".to_string()]);
+        store.save_global_config(&config).expect("save");
+        assert_eq!(
+            store.load_global_config().unwrap().hidden_projects(),
+            vec!["a1".to_string(), "b2".to_string()]
+        );
+
+        let mut config = store.load_global_config().unwrap();
+        config.set_hidden_projects(&[]);
+        store.save_global_config(&config).expect("save");
+        let raw = std::fs::read_to_string(store.global_config_path()).expect("raw");
+        assert!(!raw.contains("hidden_projects"), "{raw}");
     }
 
     #[test]

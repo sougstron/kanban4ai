@@ -74,6 +74,11 @@ they are edited: press `s` on the Projects screen. Saved under the store
   then most recently opened), or `smart_name` (the same tiers, but
   alphabetical by display name within each). Unknown values read as `name`.
   Edited from Global Settings (`s` on the Projects screen).
+- `tui.hidden_projects`: unset - registry ids of projects the Projects
+  screen leaves out. A display filter only: the projects, their boards and
+  `kanban` commands are untouched. Edited on the Global Settings Projects tab
+  (one checkbox per registered project, ticked = shown); ticking every row
+  and saving drops the key. The list footer counts hidden projects.
 - `daemon.interval`: 60 - seconds between `kanban daemon` ticks. `--interval` on the command line overrides. This is the only orchestration cadence that lives in the store config, because the daemon spans projects.
 - `tui.file_manager`: unset - command the Projects screen's `o folder` button
   hands the work folder to (the folder is appended as the last argument;
