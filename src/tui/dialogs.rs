@@ -1036,6 +1036,81 @@ impl ModalState {
         self.set_field_index(index);
     }
 
+    /// Plain Up/Down as field navigation. Text fields first walk the caret
+    /// to their top (Up) or very end (Down) and only leave from there; an
+    /// empty field is already at both edges. Selectors and lists keep the
+    /// arrows for their own selection. Returns `true` when the key was used.
+    pub fn vertical_arrow(&mut self, key: ratatui::crossterm::event::KeyEvent) -> bool {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        let up = match key.code {
+            KeyCode::Up => true,
+            KeyCode::Down => false,
+            _ => return false,
+        };
+        if key.modifiers != KeyModifiers::NONE {
+            return false;
+        }
+        let field = self.active_field();
+        if field_owns_vertical_arrows(field) {
+            return false;
+        }
+        if let Some(textarea) = self.text_field_mut(field) {
+            if !super::app::textarea_at_vertical_edge(textarea, up) {
+                super::app::input_multiline(textarea, key);
+                return true;
+            }
+        }
+        self.arrow_field(if up { -1 } else { 1 });
+        true
+    }
+
+    /// Walk focus one field up or down without wrapping, skipping fields
+    /// disabled by inheritance. Confirm and Cancel share a row, so the
+    /// arrows never step between them.
+    fn arrow_field(&mut self, delta: isize) {
+        let fields = self.fields();
+        let current = self
+            .sub_popup
+            .as_ref()
+            .map(SubPopup::field_index)
+            .unwrap_or(self.field_index)
+            .min(fields.len().saturating_sub(1));
+        let is_button =
+            |field: DialogField| matches!(field, DialogField::Confirm | DialogField::Cancel);
+        let mut index = current as isize;
+        loop {
+            index += delta;
+            let Some(&field) = usize::try_from(index).ok().and_then(|i| fields.get(i)) else {
+                return;
+            };
+            if self.field_enabled(field) && !(is_button(field) && is_button(fields[current])) {
+                self.set_field_index(index as usize);
+                return;
+            }
+        }
+    }
+
+    /// The caret-bearing textarea behind a text field, if `field` is one.
+    fn text_field_mut(&mut self, field: DialogField) -> Option<&mut TextArea<'static>> {
+        Some(match field {
+            DialogField::Title => &mut self.title,
+            DialogField::Description => &mut self.description,
+            DialogField::Answer => &mut self.answer,
+            DialogField::LaunchTime => &mut self.launch_time,
+            DialogField::MaxRunningTotal => &mut self.max_running_total,
+            DialogField::MaxRunningDesigner => &mut self.max_running_designer,
+            DialogField::MaxRunningReviewer => &mut self.max_running_reviewer,
+            DialogField::MaxRunningExecutor => &mut self.max_running_executor,
+            DialogField::MaxRunningPerBackend => &mut self.max_running_per_backend,
+            DialogField::MaxRunningPerBackendModel => &mut self.max_running_per_backend_model,
+            DialogField::AutoRestartDelays => &mut self.auto_restart_delays,
+            DialogField::ReviewerMaxRounds => &mut self.reviewer_max_rounds,
+            DialogField::ExecutorWeekThreshold => &mut self.executor_week_threshold,
+            DialogField::ExecutorFiveHourThreshold => &mut self.executor_five_hour_threshold,
+            _ => return None,
+        })
+    }
+
     /// Project or global settings — the two dialogs sharing the tabbed form.
     pub fn is_settings_form(&self) -> bool {
         matches!(self.modal, Modal::Settings | Modal::GlobalSettings)
@@ -5303,6 +5378,43 @@ fn wrapped_description(lines: Vec<String>) -> TextArea<'static> {
     let mut textarea = TextArea::new(lines);
     textarea.set_wrap_mode(WrapMode::WordOrGlyph);
     textarea
+}
+
+/// Fields whose Up/Down already move a selection (selectors and lists), so
+/// the arrows cannot double as field navigation there.
+fn field_owns_vertical_arrows(field: DialogField) -> bool {
+    matches!(
+        field,
+        DialogField::Backend
+            | DialogField::Model
+            | DialogField::Effort
+            | DialogField::Agent
+            | DialogField::ChainTo
+            | DialogField::ProjectSort
+            | DialogField::ProjectVisibility
+            | DialogField::BackendOrder
+            | DialogField::TargetStatus
+            | DialogField::MessageKind
+            | DialogField::Question
+            | DialogField::Variant
+            | DialogField::Theme
+            | DialogField::TaskSort
+            | DialogField::DesignerBackend
+            | DialogField::DesignerModel
+            | DialogField::DesignerEffort
+            | DialogField::DesignerAgent
+            | DialogField::ReviewerBackend
+            | DialogField::ReviewerModel
+            | DialogField::ReviewerEffort
+            | DialogField::ReviewerAgent
+            | DialogField::ReviewerOnChanges
+            | DialogField::ExecutorMiddle1
+            | DialogField::ExecutorMiddle2
+            | DialogField::ExecutorMiddle3
+            | DialogField::ExecutorCheap1
+            | DialogField::ExecutorCheap2
+            | DialogField::ExecutorCheap3
+    )
 }
 
 fn input_single_line(textarea: &mut TextArea<'static>, key: ratatui::crossterm::event::KeyEvent) {

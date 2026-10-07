@@ -1374,6 +1374,19 @@ impl App {
                     self.set_detail_focus(DetailFocus::Thread);
                     return Ok(true);
                 }
+                // Up from the very start of the editor climbs to the panel
+                // above it: the answer panel when a question is open.
+                if key.code == KeyCode::Up
+                    && key.modifiers == KeyModifiers::NONE
+                    && textarea_at_vertical_edge(&detail.review_edits, true)
+                {
+                    self.set_detail_focus(if detail.focus_available(DetailFocus::Answer) {
+                        DetailFocus::Answer
+                    } else {
+                        DetailFocus::Thread
+                    });
+                    return Ok(true);
+                }
                 // Alt+Enter matches the dialogs' newline key here too:
                 // `is_text_input_key` rejects ALT, so route it explicitly
                 // (Shift+Enter already passes through unmodified).
@@ -1442,6 +1455,20 @@ impl App {
                 }
             }
             KeyCode::Enter => self.submit_detail_answer()?,
+            // Past either end of the variant list the arrows leave the
+            // panel: up to the thread, down to the review editor.
+            KeyCode::Up if self.detail_variant_at_edge(true) => {
+                self.set_detail_focus(DetailFocus::Thread)
+            }
+            KeyCode::Down if self.detail_variant_at_edge(false) => {
+                if self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.focus_available(DetailFocus::Edits))
+                {
+                    self.set_detail_focus(DetailFocus::Edits);
+                }
+            }
             KeyCode::Up => self.move_detail_variant(-1),
             KeyCode::Down => self.move_detail_variant(1),
             _ => {
@@ -1487,6 +1514,23 @@ impl App {
         };
         detail.variant_selected = 0;
         detail.answer_input = TextArea::default();
+    }
+
+    /// Whether the answer panel's selection sits on its first row (the
+    /// custom answer, `up`) or its last variant.
+    fn detail_variant_at_edge(&self, up: bool) -> bool {
+        let Some(detail) = self.detail.as_ref() else {
+            return false;
+        };
+        if up {
+            return detail.variant_selected == 0;
+        }
+        let variant_count = detail
+            .open_questions()
+            .get(detail.question_index)
+            .map(|question| question.variants.len())
+            .unwrap_or(0);
+        detail.variant_selected >= variant_count
     }
 
     fn move_detail_variant(&mut self, delta: isize) {
@@ -5490,6 +5534,7 @@ impl App {
                 KeyCode::Esc => return self.request_modal_close(modal),
                 KeyCode::Tab => modal.next_field(),
                 KeyCode::BackTab => modal.prev_field(),
+                KeyCode::Up | KeyCode::Down if modal.vertical_arrow(key) => {}
                 // In the settings dialog the arrows walk the tab strip —
                 // except where a field owns them (text carets, filtered
                 // selectors), and while an agent popup is open. Tab/BackTab
@@ -6489,6 +6534,18 @@ pub(super) fn input_multiline(textarea: &mut TextArea<'static>, key: KeyEvent) {
             _ => {}
         }
     }
+}
+
+/// Whether the caret sits where Up (the very start) or Down (the very end)
+/// should leave the textarea for the neighbouring block.
+pub(super) fn textarea_at_vertical_edge(textarea: &TextArea<'static>, up: bool) -> bool {
+    let ratatui_textarea::DataCursor(row, col) = textarea.cursor();
+    if up {
+        return row == 0 && col == 0;
+    }
+    let lines = textarea.lines();
+    let last = lines.len().saturating_sub(1);
+    row >= last && col >= lines.get(last).map_or(0, |line| line.chars().count())
 }
 
 /// Keys that belong to a focused textarea (typing and cursor movement),
