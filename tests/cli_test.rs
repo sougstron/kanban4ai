@@ -938,7 +938,7 @@ fn version_flag_works() {
 }
 
 #[test]
-fn tui_requires_interactive_terminal_and_attach_reports_missing_task() {
+fn tui_requires_interactive_terminal() {
     let dir = board();
     kanban(&dir)
         .arg("tui")
@@ -950,12 +950,6 @@ fn tui_requires_interactive_terminal_and_attach_reports_missing_task() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("interactive terminal"));
-
-    kanban(&dir)
-        .args(["attach", "TASK-404"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("Task TASK-404 not found"));
 }
 
 #[test]

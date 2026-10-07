@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -40,15 +39,13 @@ pub enum LoopOutcome {
 pub struct EventThreads {
     pub tx: Sender<AppEvent>,
     pub rx: Receiver<AppEvent>,
-    pub input_gate: Arc<Mutex<()>>,
 }
 
 pub fn spawn_shared_threads(tick: Duration) -> EventThreads {
     let (tx, rx) = mpsc::channel();
-    let input_gate = Arc::new(Mutex::new(()));
-    spawn_input_thread(tx.clone(), Arc::clone(&input_gate));
+    spawn_input_thread(tx.clone());
     spawn_tick_thread(tick, tx.clone());
-    EventThreads { tx, rx, input_gate }
+    EventThreads { tx, rx }
 }
 
 pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
@@ -90,14 +87,6 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
         }
         if let Some(text) = app.take_pending_copy() {
             app.finish_copy(super::image::copy_text(&text));
-        }
-        if let Some(action) = app.take_terminal_action() {
-            let _input_guard = threads.input_gate.lock().map_err(|_| {
-                crate::core::error::KanbanError::Invalid("terminal input lock poisoned".to_string())
-            })?;
-            let ok = super::run_terminal_action(&action, &window_title)?;
-            app.finish_terminal_action(&action, ok);
-            terminal.clear()?;
         }
         if app.take_full_redraw() {
             terminal.clear()?;
@@ -155,18 +144,13 @@ fn handle_input(app: &mut App, input: CrosstermEvent) -> Result<()> {
     }
 }
 
-fn spawn_input_thread(tx: Sender<AppEvent>, input_gate: Arc<Mutex<()>>) {
+fn spawn_input_thread(tx: Sender<AppEvent>) {
     thread::spawn(move || {
         loop {
-            let input = {
-                let Ok(_guard) = input_gate.lock() else {
-                    break;
-                };
-                match event::poll(Duration::from_millis(50)) {
-                    Ok(true) => event::read(),
-                    Ok(false) => continue,
-                    Err(err) => Err(err),
-                }
+            let input = match event::poll(Duration::from_millis(50)) {
+                Ok(true) => event::read(),
+                Ok(false) => continue,
+                Err(err) => Err(err),
             };
             match input {
                 Ok(event) => {

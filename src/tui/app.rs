@@ -218,7 +218,6 @@ pub enum UiAction {
     AnswerQuestion,
     Recover,
     Approve,
-    Attach,
     AddContext,
     Rerun,
     Revert,
@@ -254,8 +253,9 @@ pub enum UiAction {
     ApplyUpdate,
 }
 
-/// Which detail panel receives keyboard input. `Thread` is the neutral state
-/// where action hotkeys work; the other two are text-entry panels.
+/// Which detail panel receives keyboard input. `Thread` is the neutral state;
+/// the other two are text-entry panels. While a text panel exists, plain
+/// letters type into it from any focus and actions live on Alt+letter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailFocus {
     Thread,
@@ -319,35 +319,21 @@ impl DetailState {
         self.edits_editable() || !self.review_edits.lines().join("").trim().is_empty()
     }
 
+    /// The text panel a plain letter typed on the thread lands in: the review
+    /// editor in Review, else the answer box of an open question. `None`
+    /// means the detail has nothing to type into, so plain letters stay
+    /// action hotkeys.
+    pub fn type_target(&self) -> Option<DetailFocus> {
+        [DetailFocus::Edits, DetailFocus::Answer]
+            .into_iter()
+            .find(|focus| self.focus_available(*focus))
+    }
+
     fn focus_available(&self, focus: DetailFocus) -> bool {
         match focus {
             DetailFocus::Thread => true,
             DetailFocus::Answer => !self.open_questions().is_empty(),
             DetailFocus::Edits => self.edits_editable(),
-        }
-    }
-}
-
-/// A terminal-taking action the event loop runs after suspending the TUI.
-/// `Attach` re-enters a live tmux session; `Foreground` runs an arbitrary
-/// command to completion (e.g. `claude --resume <id>` for a stopped agent).
-#[derive(Clone, Debug, PartialEq)]
-pub enum TerminalAction {
-    Attach(String),
-    Foreground {
-        command: String,
-        args: Vec<String>,
-        cwd: PathBuf,
-        label: String,
-    },
-}
-
-impl TerminalAction {
-    /// Human-readable target for the post-run status line.
-    pub fn label(&self) -> String {
-        match self {
-            TerminalAction::Attach(session_id) => session_id.clone(),
-            TerminalAction::Foreground { label, .. } => label.clone(),
         }
     }
 }
@@ -443,7 +429,6 @@ pub struct App {
     pub help_scroll: u16,
     /// Upper help scroll bound, set by the renderer from the overlay height.
     pub help_max_scroll: u16,
-    pending_terminal: Option<TerminalAction>,
     /// Set after a TUI-initiated launch so the event loop can `terminal.clear()`
     /// and fully redraw. Launch used to `eprintln` (and tmux used to inherit
     /// the raw TTY); ratatui then diffed against a buffer that no longer
@@ -884,7 +869,6 @@ impl App {
             return_screen: Screen::Board,
             help_scroll: 0,
             help_max_scroll: 0,
-            pending_terminal: None,
             pending_full_redraw: false,
             pending_fs_reload: false,
             fs_change_generation: 0,
@@ -987,7 +971,6 @@ impl App {
             return_screen: Screen::Projects,
             help_scroll: 0,
             help_max_scroll: 0,
-            pending_terminal: None,
             pending_full_redraw: false,
             pending_fs_reload: false,
             fs_change_generation: 0,
@@ -1260,8 +1243,13 @@ impl App {
             }
             return Ok(());
         }
-        if self.screen == Screen::Detail && self.handle_detail_key(key)? {
-            return Ok(());
+        let mut key = key;
+        if self.screen == Screen::Detail {
+            if let Some(hotkey) = detail_alt_hotkey(key) {
+                key = hotkey;
+            } else if self.handle_detail_key(key)? {
+                return Ok(());
+            }
         }
         let key = normalize_command_key(key);
         if self.screen == Screen::LogView {
@@ -1345,7 +1333,6 @@ impl App {
             (KeyCode::Char('F'), _) if action_screen => self.dispatch(UiAction::RunNow)?,
             (KeyCode::Char('w'), _) if action_screen => self.dispatch(UiAction::AnswerQuestion)?,
             (KeyCode::Char('y'), _) if action_screen => self.dispatch(UiAction::Approve)?,
-            (KeyCode::Char('t'), _) if action_screen => self.dispatch(UiAction::Attach)?,
             (KeyCode::Char('c'), _) if action_screen => self.dispatch(UiAction::AddContext)?,
             (KeyCode::Char('u'), _) if action_screen => self.dispatch(UiAction::Recover)?,
             (KeyCode::Char('k'), _) if action_screen => self.dispatch(UiAction::Stop)?,
@@ -1420,8 +1407,10 @@ impl App {
 
     /// Detail-screen key routing for the text-entry panels. Returns `true`
     /// when the key was consumed; `Thread` focus falls through to the main
-    /// hotkey match. Receives the raw (non-normalized) key so Cyrillic input
-    /// reaches the textareas untouched.
+    /// hotkey match unless a printable key has a text panel to land in — then
+    /// it focuses that panel and types there, so a stray letter can never
+    /// approve, run or stop anything. Receives the raw (non-normalized) key so
+    /// Cyrillic input reaches the textareas untouched.
     fn handle_detail_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(detail) = self.detail.as_ref() else {
             return Ok(false);
@@ -1431,7 +1420,18 @@ impl App {
             return Ok(true);
         }
         match detail.focus {
-            DetailFocus::Thread => Ok(false),
+            DetailFocus::Thread => {
+                let Some(target) = detail.type_target().filter(|_| is_type_to_edit_key(key)) else {
+                    return Ok(false);
+                };
+                self.set_detail_focus(target);
+                if target == DetailFocus::Answer {
+                    self.handle_answer_key(key)?;
+                } else {
+                    self.input_review_edits(key);
+                }
+                Ok(true)
+            }
             DetailFocus::Answer => {
                 self.handle_answer_key(key)?;
                 Ok(true)
@@ -1814,7 +1814,6 @@ impl App {
             UiAction::AnswerQuestion => self.open_answer_dialog()?,
             UiAction::Recover => self.recover_current_task()?,
             UiAction::Approve => self.approve_current_task()?,
-            UiAction::Attach => self.attach_current_task()?,
             UiAction::Enqueue => self.queue_current_task(true)?,
             UiAction::Dequeue => self.queue_current_task(false)?,
             UiAction::AddContext => self.open_add_message_dialog(),
@@ -3528,22 +3527,7 @@ impl App {
 
     fn open_focused_detail(&mut self) -> Result<()> {
         if self.screen == Screen::Sessions {
-            let selected = self
-                .filtered_active_sessions()
-                .get(self.session_selected)
-                .map(|active| (active.session.id.clone(), active.session.task_id.clone()));
-            if let Some((session_id, task_id)) = selected {
-                let backend = self
-                    .ops
-                    .get_task(&task_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|task| task.agent_backend)
-                    .unwrap_or_else(|| "claude".to_string());
-                self.open_session(&session_id, &backend)?;
-            } else {
-                self.status = "No active session selected".to_string();
-            }
+            self.open_log_view();
             return Ok(());
         }
         if self.screen == Screen::Archive {
@@ -3659,6 +3643,10 @@ impl App {
                 .and_then(|index| detail.messages.get(index))
                 .map(|message| message.id.clone())
         });
+        let preserved_focus = self
+            .detail
+            .as_ref()
+            .and_then(|detail| (detail.task_id == task_id).then_some(detail.focus));
         let preserved_scroll = self.detail.as_ref().and_then(|detail| {
             (detail.task_id == task_id).then_some((detail.scroll, detail.pin_last_message))
         });
@@ -3713,6 +3701,14 @@ impl App {
             has_provenance,
             provenance,
             analytics,
+        };
+        // A fresh open of a Review task lands in the review editor, so the
+        // first keystrokes type feedback instead of firing hotkeys.
+        detail.focus = match preserved_focus {
+            Some(focus) if detail.focus_available(focus) => focus,
+            Some(_) => DetailFocus::Thread,
+            None if detail.focus_available(DetailFocus::Edits) => DetailFocus::Edits,
+            None => DetailFocus::Thread,
         };
         if let Some((question_id, answer_input, variant_selected)) = preserved_answer
             && let Some(question_index) = detail
@@ -4741,90 +4737,6 @@ impl App {
         Ok(())
     }
 
-    fn attach_current_task(&mut self) -> Result<()> {
-        let Some(task) = self.current_task() else {
-            self.status = "No task selected".to_string();
-            return Ok(());
-        };
-        let Some(session_id) = task.session.clone() else {
-            self.status = format!("{} has no session", task.id);
-            return Ok(());
-        };
-        let backend = task
-            .agent_backend
-            .clone()
-            .unwrap_or_else(|| "claude".to_string());
-        self.open_session(&session_id, &backend)
-    }
-
-    /// Decide how to "open" a session for the user and act on it. tmux-hosted
-    /// live sessions are attached (interactive); a running background agent has
-    /// no live terminal, so its log is followed instead; a stopped agent with a
-    /// recorded backend session id is reopened with the backend's resume command.
-    fn open_session(&mut self, session_id: &str, backend: &str) -> Result<()> {
-        if crate::agent::session_exists(session_id) {
-            self.pending_terminal = Some(TerminalAction::Attach(session_id.to_string()));
-            self.status = format!("Attaching to {session_id}");
-            return Ok(());
-        }
-        let heartbeat_timeout = self.ops.config.get_threshold("session_heartbeat_timeout")?;
-        let state =
-            SessionManager::new(self.ops.data_root()).session_state(session_id, heartbeat_timeout);
-        if matches!(state, Some(SessionState::Live | SessionState::Waiting)) {
-            self.open_log_view_for(session_id.to_string());
-            self.status =
-                format!("Following {session_id} log (background agent, no terminal to attach)");
-            return Ok(());
-        }
-        if let Some(action) = self.resume_action(session_id, backend)? {
-            self.pending_terminal = Some(action);
-            self.status = format!("Resuming conversation for {session_id}");
-            return Ok(());
-        }
-        // Nothing live and no resumable conversation: fall back to the log.
-        self.open_log_view_for(session_id.to_string());
-        Ok(())
-    }
-
-    /// Build the backend-specific interactive resume action for a stopped
-    /// session, or `None` when the backend has no known resume flag or the
-    /// backend session id was never captured.
-    fn resume_action(&self, session_id: &str, backend: &str) -> Result<Option<TerminalAction>> {
-        if !matches!(backend, "claude" | "codex" | "grok" | "kimi") {
-            return Ok(None);
-        }
-        let Some(backend_session_id) =
-            provenance::load_manifest(&self.ops.storage.provenance_dir, session_id)
-                .and_then(|manifest| manifest.backend_session_id)
-        else {
-            return Ok(None);
-        };
-        let config = self.ops.config.load()?;
-        let command = crate::agent::backend_config(&config, backend)?.command;
-        let args = if backend == "codex" {
-            // `exec` sessions are non-interactive, so Codex needs the explicit
-            // opt-in when reopening one in its interactive TUI.
-            vec![
-                "resume".to_string(),
-                backend_session_id,
-                "--include-non-interactive".to_string(),
-            ]
-        } else if backend == "kimi" {
-            vec!["--session".to_string(), backend_session_id]
-        } else {
-            // claude and grok both reopen a captured session with `--resume`.
-            vec!["--resume".to_string(), backend_session_id]
-        };
-        Ok(Some(TerminalAction::Foreground {
-            command,
-            args,
-            // Resuming a conversation re-runs the backend the way the agent
-            // ran it: in the code folder, not in the board's data root.
-            cwd: self.ops.work_path().to_path_buf(),
-            label: format!("resume {session_id}"),
-        }))
-    }
-
     fn rerun_current_task(&mut self) -> Result<()> {
         let Some(task) = self.current_task() else {
             self.status = "No task selected".to_string();
@@ -5370,26 +5282,12 @@ impl App {
         Ok(())
     }
 
-    pub fn take_terminal_action(&mut self) -> Option<TerminalAction> {
-        self.pending_terminal.take()
-    }
-
     fn request_full_redraw(&mut self) {
         self.pending_full_redraw = true;
     }
 
     pub fn take_full_redraw(&mut self) -> bool {
         std::mem::take(&mut self.pending_full_redraw)
-    }
-
-    pub fn finish_terminal_action(&mut self, action: &TerminalAction, ok: bool) {
-        let target = action.label();
-        self.status = match (action, ok) {
-            (TerminalAction::Attach(_), true) => format!("Detached from {target}"),
-            (TerminalAction::Attach(_), false) => format!("Could not attach to {target}"),
-            (TerminalAction::Foreground { .. }, true) => format!("Closed {target}"),
-            (TerminalAction::Foreground { .. }, false) => format!("Could not run {target}"),
-        };
     }
 
     fn refresh_backend_options_for(&self, modal: &mut ModalState, slot: AgentSlot) {
@@ -6639,6 +6537,34 @@ pub(super) fn textarea_at_vertical_edge(textarea: &TextArea<'static>, up: bool) 
 /// Flatten pasted text for fields that hold a single line (Enter submits them).
 fn one_line_paste(text: &str) -> String {
     sanitize_paste_text(text).replace('\n', " ")
+}
+
+/// Detail actions are reachable as Alt+letter from every panel, so `Alt+y`
+/// approves even from inside the review editor. Returns the bare key for the
+/// hotkey match; Shift survives as an uppercase letter (`Alt+Shift+f` → `F`).
+/// Ctrl+Alt is left alone: AltGr arrives that way on some layouts.
+fn detail_alt_hotkey(key: KeyEvent) -> Option<KeyEvent> {
+    let KeyCode::Char(ch) = key.code else {
+        return None;
+    };
+    if !key.modifiers.contains(KeyModifiers::ALT)
+        || !(key.modifiers - KeyModifiers::ALT - KeyModifiers::SHIFT).is_empty()
+    {
+        return None;
+    }
+    let ch = if key.modifiers.contains(KeyModifiers::SHIFT) {
+        ch.to_uppercase().next().unwrap_or(ch)
+    } else {
+        ch
+    };
+    Some(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+}
+
+/// A printable key that moves thread focus into the detail's text panel.
+/// `[`/`]` stay thread-message selection.
+fn is_type_to_edit_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(ch) if ch != '[' && ch != ']')
+        && (key.modifiers - KeyModifiers::SHIFT).is_empty()
 }
 
 fn is_text_input_key(key: KeyEvent) -> bool {

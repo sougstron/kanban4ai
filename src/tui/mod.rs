@@ -299,57 +299,6 @@ impl Drop for PanicHookGuard {
     }
 }
 
-/// Suspend the TUI, hand the real terminal to a foreground process, then
-/// restore. Shared by tmux attach and `<backend> --resume`: both need the
-/// alternate screen, raw mode, and capture modes torn down while the child owns
-/// the terminal, and rebuilt afterwards regardless of how the child exited.
-fn run_terminal_action(action: &app::TerminalAction, window_title: &str) -> Result<bool> {
-    let mut stdout = io::stdout();
-    let suspended = (|| -> Result<()> {
-        stdout.execute(Show)?;
-        // The child process gets the terminal back in its default key mode.
-        let _ = stdout.execute(PopKeyboardEnhancementFlags);
-        write_escape(&mut stdout, RESET_MODIFY_OTHER_KEYS);
-        stdout.execute(DisableBracketedPaste)?;
-        stdout.execute(DisableMouseCapture)?;
-        stdout.execute(LeaveAlternateScreen)?;
-        disable_raw_mode()?;
-        Ok(())
-    })();
-    if let Err(err) = suspended {
-        let _ = restore_terminal();
-        set_window_title(window_title);
-        return Err(err);
-    }
-
-    let result = match action {
-        app::TerminalAction::Attach(session_id) => crate::agent::attach_to_session(session_id),
-        app::TerminalAction::Foreground {
-            command, args, cwd, ..
-        } => crate::agent::run_foreground(command, args, Some(cwd)),
-    };
-    let restore_result = restore_terminal();
-    // The child owned the terminal and may well have renamed it (an agent CLI
-    // usually does), so the board's own title has to be re-asserted.
-    set_window_title(window_title);
-    match (result, restore_result) {
-        (Ok(ok), Ok(())) => Ok(ok),
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-    }
-}
-
-fn restore_terminal() -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    stdout.execute(EnterAlternateScreen)?;
-    stdout.execute(EnableMouseCapture)?;
-    stdout.execute(EnableBracketedPaste)?;
-    let _ = push_key_disambiguation(&mut stdout) || push_tmux_key_disambiguation(&mut stdout);
-    stdout.execute(Hide)?;
-    Ok(())
-}
-
 /// How the TUI should open: a registered project, a legacy in-place board, or
 /// the projects list (unknown cwd).
 #[derive(Debug, Clone)]

@@ -1,5 +1,5 @@
 //! Phase 3 agent runtime: backend command construction, prompt generation,
-//! tmux/background process launch, log wiring, and attach support.
+//! tmux/background process launch and log wiring.
 
 mod backends;
 mod launcher;
@@ -21,4 +21,4 @@ pub use backends::{
 };
 pub use launcher::KanbanLauncher;
 pub use prompt::build_agent_prompt;
-pub use tmux::{attach_to_session, kill_session, run_foreground, session_exists};
+pub use tmux::{kill_session, session_exists};

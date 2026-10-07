@@ -110,8 +110,8 @@ configured backend when auto-launch is enabled. The TUI is easier for most
 users: select a To Do task and press `r` — the agent starts immediately, with
 no confirmation. The selected task's backend must be installed and
 authenticated separately, for example by signing in to opencode, Claude Code,
-or Codex CLI before running a task. `tmux` is optional, but enables an attachable agent
-session when configured.
+or Codex CLI before running a task. `tmux` is optional, and hosts the agent session
+when configured.
 
 An agent can record work context and ask a question with:
 
@@ -192,7 +192,6 @@ Use `↑`/`↓`/`←`/`→` to move focus, `Tab` or `Shift+Tab` to change column
 it when it is already In Progress), `n` to create in the focused column, `A` to
 archive all Done tasks, `b` to mark all Review tasks Done (`R` also works), `e`
 to edit, `m` to move, `w` to answer a question, `y` to approve Review → Done,
-`t` to attach to the task's agent,
 `c` to add context or a suggestion, `u` to recover a crashed task, `a` to view
 archived tasks, `l` to view running sessions, `P` to open the projects list,
 `/` to search, `?` for help, and `Ctrl+C` to copy the selected task with a
@@ -204,7 +203,10 @@ agent settings through a nested backend/model/effort/persona popup, theme, and t
 status-bar hint is clickable when
 it fits. `Ctrl+T` remains the quick theme toggle. All action keys work from
 the board and from the detail view, which also offers clickable action buttons
-and an inline panel for answering agent questions.
+and an inline panel for answering agent questions. A Review task opens with the
+review editor focused; while the detail has a text panel, plain letters type
+into it and actions move to `Alt+letter` (`Alt+y` approves), so a stray key
+cannot approve or run anything.
 
 Task create/edit dialogs group the form as Title, Description, a nested
 `Agent settings` popup, a Readonly checkbox, a Chain-to selector, and a nested
@@ -215,7 +217,7 @@ editing does not change an existing value. The CLI `--interactive` option and
 stored YAML field remain supported.
 
 The sessions view marks each session `▶` live, `⏳` in a declared wait, or `✖`
-crashed; there `Enter` attaches, `v` opens a scrollable pager over the session
+crashed; there `Enter` or `v` opens a scrollable pager over the session
 log, `x` kills the session after a confirmation, and `o` jumps to the session's
 task. Waiting rows and cards show the deadline (`until HH:MM`), while stuck
 cards show the `u recover` hint. In the archive view `Enter` opens an archived
@@ -254,7 +256,6 @@ Useful maintenance commands are:
 
 ```sh
 kanban4ai sessions
-kanban4ai attach TASK-002
 kanban4ai archive
 kanban4ai archive-done
 kanban4ai project list
@@ -262,7 +263,6 @@ kanban4ai project path
 kanban4ai limits
 ```
 
-`attach` connects to a running agent's tmux session when one exists.
 `archive-done` moves all Done tasks to Archive, while `archive` lists archived
 tasks. `project list` shows every registered board; `project path` prints this
 folder's work path. Point a command at another board with
