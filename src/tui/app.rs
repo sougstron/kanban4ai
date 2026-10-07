@@ -102,6 +102,8 @@ pub struct TuiSettings {
     pub project_sort: String,
     /// Registry ids the projects list leaves out (Global Settings → Projects).
     pub hidden_projects: Vec<String>,
+    /// Machine-wide backend picker order (Global Settings → Backends).
+    pub backend_order: Vec<String>,
     /// Draw the provider subscription-limits row above the status bar.
     pub show_limits: bool,
     /// Hide thread messages authored by kanban (audit notes). Display filter only.
@@ -1018,6 +1020,7 @@ impl App {
             app.settings.escape_to_projects = config.escape_to_projects();
             app.settings.project_sort = config.project_sort().to_string();
             app.settings.hidden_projects = config.hidden_projects();
+            app.settings.backend_order = config.backend_order();
         }
         // The projects list is an entry screen too (bare `kanban4ai` with no
         // resolvable project), so its open runs the same on-open check.
@@ -2512,6 +2515,7 @@ impl App {
         if global_changed && let Ok(effective) = load_settings(&self.ops) {
             self.settings.task_sort = effective.task_sort;
             self.settings.hide_kanban_messages = effective.hide_kanban_messages;
+            self.settings.backend_order = self.ops.config.load_global().0.backend_order();
         }
         let fingerprint = self.ops.storage.tui_fingerprint();
         if global_changed || fingerprint != self.board.fingerprint {
@@ -3920,6 +3924,15 @@ impl App {
                 visible: !hidden.contains(&row.project.id),
             })
             .collect();
+        // Saved order first (kept even for a backend only some project
+        // defines), then every other backend the global view knows.
+        let mut backends = config.backend_order();
+        for name in view.agents.keys().filter_map(Value::as_str) {
+            if !backends.iter().any(|known| known == name) {
+                backends.push(name.to_string());
+            }
+        }
+        modal.backend_order = backends;
         // One probe per dialog open, never per frame: the probe shells out to
         // pacman. `Some` means the package manager owns the binary and the
         // dialog shows its upgrade command instead of an "Update now" button.
@@ -3962,6 +3975,7 @@ impl App {
             self.settings.escape_to_projects = config.escape_to_projects();
             self.settings.project_sort = config.project_sort().to_string();
             self.settings.hidden_projects = config.hidden_projects();
+            self.settings.backend_order = config.backend_order();
         }
     }
 
@@ -4188,13 +4202,11 @@ impl App {
             value: None,
         })
         .chain(
-            config
-                .agents
-                .keys()
-                .filter_map(|key| key.as_str())
+            self.ordered_backends(&config)
+                .into_iter()
                 .map(|backend| SelectOption {
-                    label: backend.to_string(),
-                    value: Some(backend.to_string()),
+                    label: backend.clone(),
+                    value: Some(backend),
                 }),
         )
         .collect::<Vec<_>>();
@@ -4223,6 +4235,19 @@ impl App {
         modal.set_chain_options(chain_options);
     }
 
+    /// Configured backend names in the machine-wide picker order
+    /// (`tui.backend_order`); backends it does not list keep config order.
+    fn ordered_backends(&self, config: &BoardConfig) -> Vec<String> {
+        let mut names = config
+            .agents
+            .keys()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        crate::core::global::order_backends(&mut names, &self.settings.backend_order);
+        names
+    }
+
     /// The `— none —` + `backend/model` option list shared by the six
     /// executor-pool slot selectors. Every configured backend × its models,
     /// annotated with the live provider numbers from the cached limits
@@ -4237,11 +4262,12 @@ impl App {
             label: "— none —".to_string(),
             value: None,
         }];
-        for (backend_value, _) in config.agents.iter() {
-            let Some(backend) = backend_value.as_str() else {
-                continue;
-            };
-            let backend_settings = config.agents.get(backend_value).and_then(Value::as_mapping);
+        for backend in self.ordered_backends(config) {
+            let backend = backend.as_str();
+            let backend_settings = config
+                .agents
+                .get(Value::String(backend.to_string()))
+                .and_then(Value::as_mapping);
             for model_option in
                 self.backend_model_options(backend, backend_settings, &config.auto_launch)
             {
@@ -4345,13 +4371,12 @@ impl App {
         let Some(config) = self.modal_config(modal) else {
             return;
         };
-        let backend_options = config
-            .agents
-            .keys()
-            .filter_map(Value::as_str)
+        let backends = self.ordered_backends(&config);
+        let backend_options = backends
+            .iter()
             .map(|backend| SelectOption {
-                label: backend.to_string(),
-                value: Some(backend.to_string()),
+                label: backend.clone(),
+                value: Some(backend.clone()),
             })
             .collect::<Vec<_>>();
         modal.set_backend_options(backend_options);
@@ -4361,16 +4386,10 @@ impl App {
             label: format!("Default backend ({default_agent})"),
             value: None,
         })
-        .chain(
-            config
-                .agents
-                .keys()
-                .filter_map(Value::as_str)
-                .map(|backend| SelectOption {
-                    label: backend.to_string(),
-                    value: Some(backend.to_string()),
-                }),
-        )
+        .chain(backends.iter().map(|backend| SelectOption {
+            label: backend.clone(),
+            value: Some(backend.clone()),
+        }))
         .collect::<Vec<_>>();
         modal.set_backend_options_for(AgentSlot::Designer, role_backends.clone());
         modal.set_backend_options_for(AgentSlot::Reviewer, role_backends);
@@ -5654,6 +5673,7 @@ impl App {
                     config.set_escape_to_projects(modal.escape_to_projects);
                     config.set_update_check_on_open(modal.update_check_on_open);
                     config.set_hidden_projects(&modal.hidden_project_ids());
+                    config.set_backend_order(&modal.backend_order);
                     config.set_project_sort(
                         &modal
                             .project_sort_text()
@@ -5676,6 +5696,7 @@ impl App {
                 )
                 .to_string();
                 self.settings.hidden_projects = modal.hidden_project_ids();
+                self.settings.backend_order = modal.backend_order.clone();
                 self.clamp_project_selection();
                 self.status = "Global settings saved".to_string();
             }
@@ -6722,7 +6743,8 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor
-        | DialogField::ProjectVisibility => None,
+        | DialogField::ProjectVisibility
+        | DialogField::BackendOrder => None,
         DialogField::ProjectSort => Some(modal.project_sort_selected),
         DialogField::ChainTo => Some(modal.chain_selected),
         DialogField::TargetStatus => Some(modal.status_selected),
@@ -6860,6 +6882,7 @@ fn default_project_settings() -> TuiSettings {
         escape_to_projects: false,
         project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
         hidden_projects: Vec::new(),
+        backend_order: Vec::new(),
         show_limits: true,
         hide_kanban_messages: false,
         limits_refresh_interval: crate::core::limits::DEFAULT_REFRESH_INTERVAL,
@@ -6980,6 +7003,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
         escape_to_projects: false,
         project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
         hidden_projects: Vec::new(),
+        backend_order: Vec::new(),
         show_limits: tui_bool(&config.tui, "show_limits", true),
         hide_kanban_messages: tui_bool(&config.tui, "hide_kanban_messages", false),
         limits_refresh_interval: ops

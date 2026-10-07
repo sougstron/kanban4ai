@@ -9008,9 +9008,79 @@ fn global_settings_projects_tab_hides_and_restores_a_project() {
 }
 
 #[test]
+fn global_settings_backends_tab_reorders_backend_pickers() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-glob-backends");
+    let _ = std::fs::remove_dir_all(&work);
+    let (store_dir, mut app) = projects_app(&work, None);
+
+    // Left from Common wraps onto Projects, then Backends.
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open global settings");
+    app.handle_key(key(KeyCode::Left)).expect("projects tab");
+    app.handle_key(key(KeyCode::Left)).expect("backends tab");
+    let modal = app.modal.as_ref().expect("global settings modal");
+    assert_eq!(modal.settings_tab, SettingsTab::Backends);
+    assert_eq!(modal.active_field(), DialogField::BackendOrder);
+    let before = modal.backend_order.clone();
+    assert!(before.len() >= 2, "{before:?}");
+
+    // Carry the first backend down one place, then the (new) last one up.
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+        .expect("move down");
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.backend_order[0], before[1]);
+    assert_eq!(modal.backend_order[1], before[0]);
+    assert_eq!(modal.backend_order_selected, 1);
+    app.handle_key(key(KeyCode::End)).expect("last");
+    app.handle_key(key(KeyCode::Char('K'))).expect("move up");
+    let expected = app.modal.as_ref().unwrap().backend_order.clone();
+    assert_eq!(expected[expected.len() - 2], before[before.len() - 1]);
+    insta::assert_snapshot!("global_settings_backends_tab", render_at(&mut app, 80, 24));
+
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+    assert!(app.modal.is_none());
+    assert_eq!(app.settings.backend_order, expected);
+    let store = ProjectStore::at(store_dir.path());
+    assert_eq!(
+        store.load_global_config().unwrap().backend_order(),
+        expected
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn task_form_backend_picker_follows_the_global_backend_order() {
+    let (_dir, mut app) = populated_app();
+    app.settings.backend_order = vec!["codex".to_string(), "claude".to_string()];
+    app.handle_key(key(KeyCode::Char('n'))).expect("new");
+    let values = app
+        .modal
+        .as_ref()
+        .expect("modal")
+        .backend_options
+        .iter()
+        .map(|option| option.value.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(values[0], None, "default entry stays first");
+    assert_eq!(values[1].as_deref(), Some("codex"));
+    assert_eq!(values[2].as_deref(), Some("claude"));
+    assert!(
+        values
+            .iter()
+            .any(|value| value.as_deref() == Some("opencode"))
+    );
+}
+
+#[test]
 fn project_settings_never_show_the_projects_tab() {
     let modal = ModalState::new(Modal::Settings);
     assert!(!modal.settings_tabs().contains(&SettingsTab::Projects));
+    assert!(!modal.settings_tabs().contains(&SettingsTab::Backends));
     assert_eq!(
         SettingsTab::Executor.next(modal.settings_tabs()),
         SettingsTab::Common
