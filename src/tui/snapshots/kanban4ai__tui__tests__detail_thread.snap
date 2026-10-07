@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 865
 expression: render_snapshot(&mut app)
 ---
 ┌ Task ────────────────────────────────────────────────────────────────────────────── ▸ Kanban ┐
@@ -17,7 +16,7 @@ expression: render_snapshot(&mut app)
 ┌ Thread ──────────────────────────────────────────────────────────────────────────────────────▲
 │Needs an answer                                                                               ║
 │                                                                                              ║
-│MSG-003 · question · open                                                                     █
+│MSG-003 · <timestamp> · question · open                                                       █
 │Choose a route?                                                                               █
 │Variants: Fast path | Safe path                                                               █
 │                                                                                              █
@@ -72,8 +71,8 @@ expression: render_snapshot(&mut app)
 13:1-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 14:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-14:1-26 Style::new().fg(Color::Rgb(245, 190, 80)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
-14:26-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+14:1-47 Style::new().fg(Color::Rgb(245, 190, 80)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
+14:47-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 14:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 15:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 15:1-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
