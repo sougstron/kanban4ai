@@ -1134,8 +1134,13 @@ impl App {
                     detail.variant_selected = 0;
                     return Ok(());
                 }
-                DetailFocus::Edits => {
+                DetailFocus::Edits if detail.edits_editable() => {
                     detail.review_edits.insert_str(sanitize_paste_text(text));
+                    return Ok(());
+                }
+                DetailFocus::Edits => {
+                    self.status =
+                        "Review edits can be changed only while the task is in Review".to_string();
                     return Ok(());
                 }
                 DetailFocus::Thread => {}
@@ -1145,7 +1150,87 @@ impl App {
         Ok(())
     }
 
+    /// `Ctrl+V`, `Ctrl+Shift+V`, or `Shift+Insert` with `clipboard` already
+    /// read by the input thread.
+    ///
+    /// Dictation tools (Handy and friends) put the transcript on the
+    /// clipboard, send one of these keys, and restore the old clipboard a few
+    /// dozen milliseconds later, so the text is captured the moment the key
+    /// arrives rather than after the event queue drains. Fields that take
+    /// images still attach a clipboard image when there is no text. With no
+    /// text field focused the key keeps its ordinary meaning.
+    pub fn handle_paste_shortcut(
+        &mut self,
+        key: KeyEvent,
+        clipboard: Option<String>,
+    ) -> Result<()> {
+        let Some(accepts_image) = self.paste_target() else {
+            return self.handle_key_inner(key);
+        };
+        let text = clipboard.filter(|text| !text.is_empty());
+        if accepts_image && text.as_deref().is_none_or(image::is_image_path) {
+            self.paste_clipboard_image();
+            return Ok(());
+        }
+        match text {
+            Some(text) => self.handle_paste(&text),
+            None => {
+                self.status = "Nothing pasted: the clipboard has no text".to_string();
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether a text field that `handle_paste` fills has focus, and whether
+    /// that field also takes clipboard images.
+    fn paste_target(&self) -> Option<bool> {
+        if let Some(modal) = self.modal.as_ref() {
+            if modal.discard_confirm
+                || is_confirmation_modal(&modal.modal)
+                || !modal.accepts_paste()
+            {
+                return None;
+            }
+            return Some(modal.active_field() == DialogField::Description);
+        }
+        if self.search.active {
+            return Some(false);
+        }
+        if self.screen != Screen::Detail {
+            return None;
+        }
+        match self.detail.as_ref()?.focus {
+            DetailFocus::Answer => Some(false),
+            DetailFocus::Edits => Some(true),
+            DetailFocus::Thread => None,
+        }
+    }
+
+    /// Attach a clipboard image to the Description field or the review
+    /// editor, whichever has focus.
+    fn paste_clipboard_image(&mut self) {
+        if self.modal.is_none() {
+            self.paste_review_image();
+            return;
+        }
+        match image::paste_image_markdown(self.ops.data_root()) {
+            Ok(markdown) => {
+                if let Some(modal) = self.modal.as_mut() {
+                    modal.active_textarea_mut().insert_str(&markdown);
+                }
+            }
+            Err(err) => self.status = format!("Image paste failed: {err}"),
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if is_paste_shortcut(key) && self.paste_target().is_some() {
+            return self.handle_paste_shortcut(key, image::clipboard_text());
+        }
+        self.handle_key_inner(key)
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> Result<()> {
         if is_ctrl_c(key) {
             if self.modal.is_none()
                 && matches!(self.screen, Screen::Board | Screen::Detail)
@@ -1361,10 +1446,6 @@ impl App {
                         }
                         KeyCode::Char('r') => {
                             self.dispatch(UiAction::Rerun)?;
-                            return Ok(true);
-                        }
-                        KeyCode::Char('v') => {
-                            self.paste_review_image();
                             return Ok(true);
                         }
                         _ => {}
@@ -5246,8 +5327,9 @@ impl App {
         input_multiline(&mut detail.review_edits, key);
     }
 
-    /// Ctrl+V in the review editor: attach a clipboard image the same way the
-    /// Description field does, so screenshots reach the re-run as feedback.
+    /// Ctrl+V in the review editor with an image on the clipboard: attach it
+    /// the same way the Description field does, so screenshots reach the
+    /// re-run as feedback.
     fn paste_review_image(&mut self) {
         let Some(detail) = self.detail.as_ref() else {
             return;
@@ -5608,16 +5690,6 @@ impl App {
                     if key.modifiers == KeyModifiers::CONTROL && modal.submit_on_ctrl_s() =>
                 {
                     return self.submit_modal(modal).map(|_| true);
-                }
-                KeyCode::Char('v') if key.modifiers == KeyModifiers::CONTROL => {
-                    if modal.active_field() == DialogField::Description {
-                        match image::paste_image_markdown(self.ops.data_root()) {
-                            Ok(markdown) => {
-                                modal.active_textarea_mut().insert_str(&markdown);
-                            }
-                            Err(err) => self.status = format!("Image paste failed: {err}"),
-                        }
-                    }
                 }
                 _ => modal.input(key),
             }
@@ -6458,6 +6530,20 @@ pub(super) fn normalize_command_key(mut key: KeyEvent) -> KeyEvent {
     };
     key.code = KeyCode::Char(normalized);
     key
+}
+
+/// The keys terminals and dictation tools use to paste: `Ctrl+V`,
+/// `Ctrl+Shift+V`, and `Shift+Insert`.
+pub(super) fn is_paste_shortcut(key: KeyEvent) -> bool {
+    let key = normalize_command_key(key);
+    match key.code {
+        KeyCode::Char('v' | 'V') => {
+            key.modifiers == KeyModifiers::CONTROL
+                || key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        }
+        KeyCode::Insert => key.modifiers == KeyModifiers::SHIFT,
+        _ => false,
+    }
 }
 
 fn is_ctrl_c(key: KeyEvent) -> bool {

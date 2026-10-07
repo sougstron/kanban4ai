@@ -7793,6 +7793,66 @@ fn paste_sanitizes_control_sequences() {
     assert_eq!(modal.description.lines(), ["safe\u{fffd}[31mred"]);
 }
 
+/// Dictation tools such as Handy paste with a synthetic Ctrl+V, which the
+/// terminal forwards as a key; the captured clipboard text lands in the field.
+#[test]
+fn ctrl_v_pastes_clipboard_text_into_focused_field() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("new task modal")
+        .focus_field(DialogField::Title);
+
+    app.handle_paste_shortcut(ctrl_key(KeyCode::Char('v')), Some("dictated text".into()))
+        .expect("paste");
+    app.handle_paste_shortcut(
+        KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT),
+        Some(" again".into()),
+    )
+    .expect("paste");
+
+    let modal = app.modal.as_ref().expect("modal still open");
+    assert_eq!(modal.title.lines(), ["dictated text again"]);
+}
+
+/// Text on the clipboard wins over the image fallback in Description.
+#[test]
+fn ctrl_v_pastes_text_into_description() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .expect("new task modal")
+        .focus_field(DialogField::Description);
+
+    app.handle_paste_shortcut(
+        KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ),
+        Some("line one\nline two".into()),
+    )
+    .expect("paste");
+
+    let modal = app.modal.as_ref().expect("modal still open");
+    assert_eq!(modal.description.lines(), ["line one", "line two"]);
+}
+
+/// With no text field focused the paste key keeps its board meaning and the
+/// clipboard is not typed out as shortcuts.
+#[test]
+fn ctrl_v_without_a_text_field_is_not_a_paste() {
+    let (_dir, mut app) = app_with_board();
+
+    app.handle_paste_shortcut(ctrl_key(KeyCode::Char('v')), Some("nnnq".into()))
+        .expect("key");
+
+    assert!(app.modal.is_none());
+    assert_eq!(app.screen, Screen::Board);
+    assert!(!app.status.contains("Nothing pasted"));
+}
+
 /// On the board a paste is dropped instead of being replayed as shortcuts.
 #[test]
 fn paste_without_a_text_field_is_ignored() {

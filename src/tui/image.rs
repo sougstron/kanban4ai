@@ -194,6 +194,58 @@ fn base64(bytes: &[u8]) -> String {
     encoded
 }
 
+/// Read the clipboard as text for a `Ctrl+V`-style paste shortcut.
+///
+/// Terminals forward a synthetic `Ctrl+V` (dictation tools such as Handy send
+/// one after placing their transcript on the clipboard) as a plain key, not as
+/// a bracketed paste, so the board has to fetch the text itself. Returns `None`
+/// when no helper is available or the clipboard holds no text (an image only).
+pub fn clipboard_text() -> Option<String> {
+    for (command, args) in text_reader_commands(has_env("WAYLAND_DISPLAY"), has_env("DISPLAY")) {
+        let Ok(output) = Command::new(command)
+            .args(args)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() && !output.stdout.is_empty() {
+            return String::from_utf8(output.stdout).ok();
+        }
+    }
+    None
+}
+
+fn text_reader_commands(wayland: bool, x11: bool) -> Vec<(&'static str, Vec<&'static str>)> {
+    let mut commands = Vec::new();
+    if cfg!(target_os = "macos") {
+        commands.push(("pbpaste", Vec::new()));
+    }
+    if wayland {
+        commands.push(("wl-paste", vec!["--no-newline", "--type", "text"]));
+    }
+    if x11 {
+        commands.push(("xclip", vec!["-selection", "clipboard", "-out"]));
+        commands.push(("xsel", vec!["--clipboard", "--output"]));
+    }
+    commands
+}
+
+/// Clipboard text that names an existing image file (a file manager copy)
+/// should attach the image rather than paste its path.
+pub fn is_image_path(text: &str) -> bool {
+    clipboard_path(text.as_bytes())
+        .and_then(|path| {
+            let mut header = [0u8; 12];
+            let read = fs::File::open(path)
+                .and_then(|mut file| std::io::Read::read(&mut file, &mut header))
+                .ok()?;
+            sniff_extension(&header[..read])
+        })
+        .is_some()
+}
+
 pub fn paste_image_markdown(project_path: &Path) -> Result<String> {
     let bytes = clipboard_bytes()?;
     let image_bytes = if let Some(path) = clipboard_path(&bytes) {
