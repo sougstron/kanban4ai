@@ -1,3 +1,31 @@
+# kanban4ai 0.6.22
+
+The Kimi Code CLI becomes a first-class agent backend, and the Global
+Settings Backends tab can reorder every project's backend pickers.
+
+## Added
+
+- **Kimi Code CLI backend** (`src/agent/backends.rs`, `src/core/limits.rs`,
+  `src/core/provenance.rs`, `src/core/reply.rs`, `docs/config.md`). Delegate
+  to the `kimi` CLI with `--print --output-format stream-json`: one
+  OpenAI-style message per line, rendered to the log and harvested for
+  replies and provenance (`ReadFile`, `WriteFile`, `StrReplaceFile`,
+  `Shell`, `FetchURL`, …; other tool names count as MCP). The stream
+  carries no session id, so the harvester reads it from kimi's stderr hint
+  (`To resume this session: kimi -r <id>`) and automatic relaunches resume
+  with `--session`. `ai_effort` maps to `--thinking`/`--no-thinking`, the
+  effort picker offers those two values for models with the `thinking`
+  capability, and the per-backend slot cap covers `kimi` like the other
+  catalog backends.
+
+- **Backend picker ordering** (`src/core/global.rs`, `src/tui/app.rs`,
+  `src/tui/dialogs.rs`, `docs/config.md`). New global `tui.backend_order`
+  key: the order backend names appear in every project's backend pickers
+  (task form, settings, executor-pool slots). Backends it does not name
+  follow in config order. Display only — launch resolution and defaults
+  ignore it. Edited on the Global Settings Backends tab with Shift+↑/↓ or
+  K/J moving the focused backend.
+
 # kanban4ai 0.6.21
 
 Kimi limits renew an expired omp token instead of replaying old usage, a
