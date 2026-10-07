@@ -11341,3 +11341,91 @@ fn detail_analytics_panel_sums_runs_and_tokens() {
         "analytics row missing:\n{rendered}"
     );
 }
+
+/// Up/Down walk the dialog fields like BackTab/Tab, but a text field first
+/// carries the caret to its top or very end and only leaves from there.
+#[test]
+fn arrows_walk_dialog_fields_through_text_edges() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let active = |app: &App| app.modal.as_ref().expect("modal").active_field();
+    assert_eq!(active(&app), DialogField::Title);
+
+    // Empty title: already at the end, so Down leaves at once; Up at the
+    // first field has nowhere to go.
+    app.handle_key(key(KeyCode::Up)).expect("up on first");
+    assert_eq!(active(&app), DialogField::Title);
+    type_text(&mut app, "Title");
+    app.handle_key(key(KeyCode::Home)).expect("home");
+    app.handle_key(key(KeyCode::Down)).expect("caret to end");
+    assert_eq!(active(&app), DialogField::Title);
+    assert_eq!(
+        app.modal.as_ref().unwrap().title.cursor(),
+        ratatui_textarea::DataCursor(0, 5)
+    );
+    app.handle_key(key(KeyCode::Down)).expect("leave title");
+    assert_eq!(active(&app), DialogField::Description);
+
+    // Two lines: Down steps a row, then to the end, then out.
+    type_text(&mut app, "ab");
+    app.handle_key(key(KeyCode::Enter)).expect("newline");
+    type_text(&mut app, "cd");
+    app.handle_key(key(KeyCode::Up)).expect("row up");
+    app.handle_key(key(KeyCode::Home)).expect("home");
+    app.handle_key(key(KeyCode::Down)).expect("row down");
+    assert_eq!(active(&app), DialogField::Description);
+    app.handle_key(key(KeyCode::Down)).expect("to end");
+    assert_eq!(active(&app), DialogField::Description);
+    assert_eq!(
+        app.modal.as_ref().unwrap().description.cursor(),
+        ratatui_textarea::DataCursor(1, 2)
+    );
+    app.handle_key(key(KeyCode::Down))
+        .expect("leave description");
+    assert_eq!(active(&app), DialogField::AgentSettings);
+
+    // Back up: the caret re-enters at the end, climbs to the top, leaves.
+    app.handle_key(key(KeyCode::Up)).expect("into description");
+    assert_eq!(active(&app), DialogField::Description);
+    app.handle_key(key(KeyCode::Up)).expect("row up");
+    app.handle_key(key(KeyCode::Up)).expect("to top");
+    assert_eq!(active(&app), DialogField::Description);
+    assert_eq!(
+        app.modal.as_ref().unwrap().description.cursor(),
+        ratatui_textarea::DataCursor(0, 0)
+    );
+    app.handle_key(key(KeyCode::Up)).expect("leave description");
+    assert_eq!(active(&app), DialogField::Title);
+
+    // Confirm and Cancel share a row: Up from Cancel skips Confirm, Down
+    // from the buttons stays put.
+    app.modal.as_mut().unwrap().focus_field(DialogField::Cancel);
+    app.handle_key(key(KeyCode::Down)).expect("down on buttons");
+    assert_eq!(active(&app), DialogField::Cancel);
+    app.handle_key(key(KeyCode::Up)).expect("leave buttons");
+    assert_eq!(active(&app), DialogField::TaskOptions);
+}
+
+/// Selectors keep Up/Down for their own selection.
+#[test]
+fn arrows_stay_inside_selector_fields() {
+    let (_dir, mut app) = populated_app();
+    open_new_task_on_chain(&mut app);
+    app.handle_key(key(KeyCode::Down)).expect("select next");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::ChainTo
+    );
+}
+
+/// Up from the top of the review editor climbs back to the thread.
+#[test]
+fn up_from_review_editor_top_returns_to_thread() {
+    let (_dir, mut app) = open_focused_review_editor("ab\ncd");
+    app.handle_key(key(KeyCode::Down)).expect("second row");
+    app.handle_key(key(KeyCode::Up)).expect("caret moves");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+    app.handle_key(key(KeyCode::Home)).expect("home");
+    app.handle_key(key(KeyCode::Up)).expect("leave editor");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+}

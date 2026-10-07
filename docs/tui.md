@@ -297,7 +297,15 @@ newline on Enter, Shift+Enter, and Alt+Enter. Many terminals — and tmux
 without `extended-keys` — deliver Shift+Enter as a bare Enter, so the field
 must treat that the same as the modified chords. Tab still leaves the field.
 Enter only submits once focus has reached the Save button (`Ctrl+S` submits
-from anywhere). Checkboxes toggle on Space only. The TUI requests
+from anywhere). Checkboxes toggle on Space only.
+
+Up/Down also walk the dialog fields (without wrapping; Confirm/Cancel count
+as one row). In a text field Down first moves the caret down and then to the
+very end, Up to the very top; only from that edge (or in an empty field) does
+the arrow leave for the next/previous field. Selectors and lists keep Up/Down
+for their selection. In the task detail, Up from the top of the review editor
+climbs to the answer panel (or thread), and the answer panel's variant list
+hands off to the thread above and the review editor below. The TUI requests
 `DISAMBIGUATE_ESCAPE_CODES` at startup where the terminal supports it
 and pops the flag again for foreground children and on every teardown path.
 
