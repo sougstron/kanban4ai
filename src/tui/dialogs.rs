@@ -119,6 +119,7 @@ pub enum DialogField {
     ProjectSort,
     UpdateCheckOnOpen,
     ProjectVisibility,
+    BackendOrder,
     QueueEnabled,
     MaxRunningTotal,
     MaxRunningDesigner,
@@ -192,6 +193,8 @@ pub enum SettingsTab {
     Designer,
     Reviewer,
     Executor,
+    /// Global Settings only: the order backend pickers list backends in.
+    Backends,
     /// Global Settings only: which registered projects the list shows.
     Projects,
 }
@@ -204,12 +207,13 @@ impl SettingsTab {
         SettingsTab::Executor,
     ];
 
-    /// The Global Settings strip: every project tab plus Projects.
-    pub const GLOBAL: [SettingsTab; 5] = [
+    /// The Global Settings strip: every project tab plus Backends and Projects.
+    pub const GLOBAL: [SettingsTab; 6] = [
         SettingsTab::Common,
         SettingsTab::Designer,
         SettingsTab::Reviewer,
         SettingsTab::Executor,
+        SettingsTab::Backends,
         SettingsTab::Projects,
     ];
 
@@ -219,6 +223,7 @@ impl SettingsTab {
             SettingsTab::Designer => "Designer",
             SettingsTab::Reviewer => "Reviewer",
             SettingsTab::Executor => "Executor",
+            SettingsTab::Backends => "Backends",
             SettingsTab::Projects => "Projects",
         }
     }
@@ -230,6 +235,7 @@ impl SettingsTab {
             SettingsTab::Designer => "Des",
             SettingsTab::Reviewer => "Rev",
             SettingsTab::Executor => "Exe",
+            SettingsTab::Backends => "Bck",
             SettingsTab::Projects => "Prj",
         }
     }
@@ -329,6 +335,13 @@ const GLOBAL_SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 17] = [
     DialogField::Cancel,
 ];
 
+/// The Global Settings Backends page: one reorderable list of backends.
+const GLOBAL_SETTINGS_PAGE_BACKENDS_FIELDS: [DialogField; 3] = [
+    DialogField::BackendOrder,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
 /// The Global Settings Projects page: one checklist of every registered
 /// project, ticked when the projects list shows it.
 const GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS: [DialogField; 3] = [
@@ -338,10 +351,12 @@ const GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS: [DialogField; 3] = [
 ];
 
 /// The whole field page of one settings tab, buttons included. Project
-/// settings never show the Projects tab; it falls back to Common.
+/// settings never show the Backends or Projects tab; they fall back to Common.
 pub(crate) fn settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
     match tab {
-        SettingsTab::Common | SettingsTab::Projects => &SETTINGS_PAGE_COMMON_FIELDS,
+        SettingsTab::Common | SettingsTab::Backends | SettingsTab::Projects => {
+            &SETTINGS_PAGE_COMMON_FIELDS
+        }
         SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS,
         SettingsTab::Reviewer => &SETTINGS_PAGE_REVIEWER_FIELDS,
         SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS,
@@ -355,6 +370,7 @@ pub(crate) fn global_settings_page_fields(tab: SettingsTab) -> &'static [DialogF
         SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS[1..],
         SettingsTab::Reviewer => &SETTINGS_PAGE_REVIEWER_FIELDS[1..],
         SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS[1..],
+        SettingsTab::Backends => &GLOBAL_SETTINGS_PAGE_BACKENDS_FIELDS,
         SettingsTab::Projects => &GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS,
     }
 }
@@ -403,6 +419,7 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::ExecutorCheap3
         | DialogField::ExecutorWeekThreshold
         | DialogField::ExecutorFiveHourThreshold => Some(SettingsTab::Executor),
+        DialogField::BackendOrder => Some(SettingsTab::Backends),
         DialogField::ProjectVisibility => Some(SettingsTab::Projects),
         _ => None,
     }
@@ -715,6 +732,9 @@ pub struct ModalState {
     /// the projects list shows it, and the row the cursor sits on.
     pub project_visibility: Vec<ProjectVisibility>,
     pub project_visibility_selected: usize,
+    /// Global Settings Backends tab: every backend in picker order.
+    pub backend_order: Vec<String>,
+    pub backend_order_selected: usize,
     pub purge_data: bool,
     pub queue_enabled: bool,
     pub max_running_total: TextArea<'static>,
@@ -825,6 +845,8 @@ impl ModalState {
             project_sort_selected: 0,
             project_visibility: Vec::new(),
             project_visibility_selected: 0,
+            backend_order: Vec::new(),
+            backend_order_selected: 0,
             purge_data: false,
             queue_enabled: true,
             max_running_total: one_line("3"),
@@ -1393,6 +1415,47 @@ impl ModalState {
         }
     }
 
+    /// Up/Down walk the backend list; Shift/Ctrl+Up/Down (or K/J) carry the
+    /// focused backend one place up or down.
+    fn input_backend_order(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        let len = self.backend_order.len();
+        if len == 0 {
+            return;
+        }
+        let selected = self.backend_order_selected.min(len - 1);
+        let carry = key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::CONTROL);
+        let target = match key.code {
+            KeyCode::Up if carry => selected.checked_sub(1),
+            KeyCode::Char('K') => selected.checked_sub(1),
+            KeyCode::Down if carry => Some(selected + 1).filter(|next| *next < len),
+            KeyCode::Char('J') => Some(selected + 1).filter(|next| *next < len),
+            KeyCode::Up => {
+                self.backend_order_selected = selected.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down => {
+                self.backend_order_selected = (selected + 1).min(len - 1);
+                return;
+            }
+            KeyCode::Home => {
+                self.backend_order_selected = 0;
+                return;
+            }
+            KeyCode::End => {
+                self.backend_order_selected = len - 1;
+                return;
+            }
+            _ => None,
+        };
+        if let Some(target) = target {
+            self.backend_order.swap(selected, target);
+            self.backend_order_selected = target;
+        }
+    }
+
     /// Ids of the projects the checklist leaves unticked.
     pub fn hidden_project_ids(&self) -> Vec<String> {
         self.project_visibility
@@ -1417,6 +1480,12 @@ impl ModalState {
             if let Some(row) = self.project_visibility.get_mut(index) {
                 row.visible = !row.visible;
                 self.project_visibility_selected = index;
+            }
+            return;
+        }
+        if field == DialogField::BackendOrder {
+            if index < self.backend_order.len() {
+                self.backend_order_selected = index;
             }
             return;
         }
@@ -1611,6 +1680,7 @@ impl ModalState {
             }
             DialogField::ProjectSort => self.input_select(key, SelectorKind::ProjectSort),
             DialogField::ProjectVisibility => self.input_project_visibility(key),
+            DialogField::BackendOrder => self.input_backend_order(key),
             DialogField::PurgeData => {
                 if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
                     self.purge_data = !self.purge_data;
@@ -1776,7 +1846,8 @@ impl ModalState {
             | DialogField::PlannedLaunch
             | DialogField::EscapeToProjects
             | DialogField::UpdateCheckOnOpen
-            | DialogField::ProjectVisibility => &mut self.answer,
+            | DialogField::ProjectVisibility
+            | DialogField::BackendOrder => &mut self.answer,
             DialogField::ProjectSort => &mut self.project_sort,
             DialogField::TargetStatus => &mut self.target_status,
             DialogField::MessageKind => &mut self.description,
@@ -2437,6 +2508,7 @@ impl ModalState {
                 .iter()
                 .map(|row| if row.visible { '1' } else { '0' })
                 .collect(),
+            self.backend_order.join(","),
             self.purge_data.to_string(),
             self.queue_enabled.to_string(),
             raw_textarea_text(&self.max_running_total),
@@ -3373,7 +3445,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor => 1,
         DialogField::Description => 5,
-        DialogField::ProjectVisibility => 4,
+        DialogField::ProjectVisibility | DialogField::BackendOrder => 4,
         DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel => 5,
         // The chain selector always shows its filter and the "No chain"
         // entry, so two content rows already cover an empty board.
@@ -3426,6 +3498,7 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         DialogField::TaskSort => modal.task_sort_options.len(),
         DialogField::ProjectSort => modal.project_sort_options.len(),
         DialogField::ProjectVisibility => modal.project_visibility.len(),
+        DialogField::BackendOrder => modal.backend_order.len(),
         DialogField::ChainTo => modal.chain_options.len(),
         DialogField::DesignerBackend => modal.designer.backend_options.len(),
         DialogField::DesignerModel => modal.designer.model_options.len(),
@@ -3829,6 +3902,7 @@ fn render_selector_field(
         ),
         DialogField::EscapeToProjects => render_escape_to_projects(frame, app, modal, area),
         DialogField::ProjectVisibility => render_project_visibility(frame, app, modal, area),
+        DialogField::BackendOrder => render_backend_order(frame, app, modal, area),
         DialogField::UpdateCheckOnOpen => render_checkbox(
             frame,
             app,
@@ -4318,6 +4392,7 @@ fn register_task_options(
             modal.project_visibility.len(),
             modal.project_visibility_selected,
         ),
+        DialogField::BackendOrder => (modal.backend_order.len(), modal.backend_order_selected),
         DialogField::ChainTo => (modal.chain_options.len(), modal.chain_selected),
         DialogField::DesignerBackend => (
             modal.designer.backend_options.len(),
@@ -4924,6 +4999,39 @@ fn render_project_visibility(frame: &mut Frame<'_>, app: &App, modal: &ModalStat
         app,
         items,
         modal.project_visibility_selected,
+        area,
+        Some(block),
+        true,
+    );
+}
+
+/// The Backends tab list: backend pickers in every project follow this order.
+fn render_backend_order(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
+    let field = DialogField::BackendOrder;
+    let active = modal.active_field() == field || app.is_hovered(HitAction::ModalField(field));
+    let items = if modal.backend_order.is_empty() {
+        vec![ListItem::new("No configured backends").style(Style::default().fg(app.theme.muted))]
+    } else {
+        modal
+            .backend_order
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                ListItem::new(format!("{}. {}", index + 1, sanitize_terminal_text(name))).style(
+                    option_hover_style(app, HitAction::ModalOption { field, index }),
+                )
+            })
+            .collect()
+    };
+    let block = Block::default()
+        .title(" Backend order (Shift+↑/↓ or K/J moves) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(select_border(app, active, false)));
+    render_list_in(
+        frame,
+        app,
+        items,
+        modal.backend_order_selected,
         area,
         Some(block),
         true,

@@ -8,7 +8,7 @@ expression: rendered
 │                                                                                              │
 │                                                                                              │
 │             ┌ Global settings ─────────────────────────────────────────────────┐             │
-│             │ Common │ Designer │ Reviewer │ Executor │ Projects               │             │
+│             │ Common │ Designer │ Reviewer │ Executor │ Backends │ Projects    │             │
 │             │──────────────────────────────────────────────────────────────────│             │
 │             │┌ Updates ───────────────────────────────────────────────────────┐│             │
 │             ││kanban4ai 9.9.9 available (released 20d ago)                    ││             │
@@ -70,7 +70,9 @@ expression: rendered
 6:46-56 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:56-57 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:57-67 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-6:67-81 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+6:67-68 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+6:68-78 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+6:78-81 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:81-82 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:82-95 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 6:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
