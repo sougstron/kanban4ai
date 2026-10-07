@@ -29,6 +29,8 @@ as the session rendered it:
 - opencode: every `text` event, grouped by `part.messageID`.
 - pi / omp: every assistant `message_end` carrying text (`turn_end`
   duplicates it and is skipped).
+- kimi (`--output-format stream-json`): every `role: assistant` message's
+  `content` text (string or `text` parts; `think` parts are skipped).
 - Backends with no parseable transcript, and runs that ended without printing
   text, record nothing. Text identical to an existing `context` message is not
   posted again (agents commonly repeat their summary through `kanban context`).

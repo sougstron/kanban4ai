@@ -36,6 +36,8 @@
 //!   `messageID` they belong to.
 //! * the pi family (pi/omp, `--mode json`) finalizes each assistant turn in one
 //!   `message_end`.
+//! * kimi (`--print --output-format stream-json`) writes each message as a
+//!   bare OpenAI-style object; assistant ones carry the text in `content`.
 
 use std::path::Path;
 
@@ -55,6 +57,7 @@ pub fn session_messages(backend: &str, transcript: &Path) -> Option<Vec<String>>
         "codex" => codex_session_messages(&raw),
         "opencode" => opencode_session_messages(&raw),
         "pi" | "omp" => pi_family_session_messages(&raw),
+        "kimi" => kimi_session_messages(&raw),
         _ => None,
     }?;
     let messages: Vec<String> = messages
@@ -338,6 +341,16 @@ fn pi_family_session_messages(raw: &str) -> Option<Vec<String>> {
     (!messages.is_empty()).then_some(messages)
 }
 
+/// kimi: every assistant message with visible text, in order. Tool-call-only
+/// messages and `role: tool` results carry no prose.
+fn kimi_session_messages(raw: &str) -> Option<Vec<String>> {
+    let messages: Vec<String> = json_lines(raw)
+        .filter(|value| value.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|value| crate::core::provenance::kimi_message_text(&value))
+        .collect();
+    (!messages.is_empty()).then_some(messages)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +385,20 @@ mod tests {
             joined("grok", &path).as_deref(),
             Some("Planning.\n\nSummary line.")
         );
+    }
+
+    #[test]
+    fn kimi_gathers_assistant_text_and_skips_tool_turns() {
+        let (_dir, path) = transcript(concat!(
+            r#"{"role":"assistant","content":"Checking.","tool_calls":[{"type":"function","id":"tc_1","function":{"name":"Shell","arguments":"{\"command\":\"ls\"}"}}]}"#,
+            "\n",
+            r#"{"role":"tool","tool_call_id":"tc_1","content":"a.rs"}"#,
+            "\n",
+            r#"{"role":"assistant","content":[{"type":"think","think":"hm"},{"type":"text","text":"Done."}]}"#,
+            "\n",
+            "To resume this session: kimi -r 8aea524a\n",
+        ));
+        assert_eq!(joined("kimi", &path).as_deref(), Some("Checking.\n\nDone."));
     }
 
     /// Without any assistant text the closing `result` event is the fallback,

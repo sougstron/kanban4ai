@@ -4646,7 +4646,7 @@ impl App {
     /// session, or `None` when the backend has no known resume flag or the
     /// backend session id was never captured.
     fn resume_action(&self, session_id: &str, backend: &str) -> Result<Option<TerminalAction>> {
-        if !matches!(backend, "claude" | "codex" | "grok") {
+        if !matches!(backend, "claude" | "codex" | "grok" | "kimi") {
             return Ok(None);
         }
         let Some(backend_session_id) =
@@ -4665,6 +4665,8 @@ impl App {
                 backend_session_id,
                 "--include-non-interactive".to_string(),
             ]
+        } else if backend == "kimi" {
+            vec!["--session".to_string(), backend_session_id]
         } else {
             // claude and grok both reopen a captured session with `--resume`.
             vec!["--resume".to_string(), backend_session_id]
@@ -5315,7 +5317,7 @@ impl App {
     }
 
     /// Model choices for a backend. Catalog-backed backends (opencode, omp,
-    /// pi, grok, and codex) come from their live catalogs ordered default-first, then
+    /// pi, grok, codex, and kimi) come from their live catalogs ordered default-first, then
     /// recently used, then alphabetical; other backends (and an unavailable
     /// catalog CLI) use the configured `models` list as-is.
     fn backend_model_options(
@@ -5356,7 +5358,7 @@ impl App {
     }
 
     /// Effort choices depend on the backend and, for catalog-backed backends,
-    /// on the model: claude lists its config `efforts`; opencode/omp/pi/grok/codex
+    /// on the model: claude lists its config `efforts`; opencode/omp/pi/grok/codex/kimi
     /// offer the variants their catalogs report for the selected model.
     fn refresh_effort_options_for_slot(
         &self,
@@ -7034,7 +7036,7 @@ fn role_cap(orch: &OrchestrationSettings, role: &str) -> i64 {
     orch.max_running_per_role.get(role).copied().unwrap_or(0)
 }
 
-const BACKEND_CAP_ORDER: [&str; 6] = ["claude", "codex", "opencode", "omp", "pi", "grok"];
+const BACKEND_CAP_ORDER: [&str; 7] = ["claude", "codex", "opencode", "omp", "pi", "grok", "kimi"];
 
 fn format_backend_cap_map(map: &HashMap<String, i64>) -> String {
     let mut keys: Vec<&String> = map.keys().collect();
@@ -7351,7 +7353,7 @@ fn parse_cap_lines(
 fn is_known_settings_backend(modal: &ModalState, backend: &str) -> bool {
     matches!(
         backend,
-        "opencode" | "claude" | "codex" | "omp" | "pi" | "grok"
+        "opencode" | "claude" | "codex" | "omp" | "pi" | "grok" | "kimi"
     ) || modal
         .backend_options
         .iter()

@@ -135,7 +135,7 @@ pub const PROVIDERS: [&str; 7] = [
 pub const DEFAULT_REFRESH_INTERVAL: i64 = 120;
 
 /// Which tracked provider a backend/model pair spends quota on. `claude`,
-/// `codex`, and `grok` are their own subscriptions; catalog backends
+/// `codex`, `grok`, and `kimi` are their own subscriptions; catalog backends
 /// (`opencode`, `omp`, `pi`) resolve by model-id prefix — the OpenAI
 /// subscription backs both the codex CLI and `openai/*` models, `anthropic/*`
 /// spends Claude's, and so on. `None` = unknown, which the executor-pool gate
@@ -146,6 +146,7 @@ pub fn provider_for(backend: &str, model: Option<&str>) -> Option<&'static str> 
         "claude" => Some("claude"),
         "codex" => Some("codex"),
         "grok" => Some("grok"),
+        "kimi" => Some("kimi"),
         "opencode" | "omp" | "pi" => {
             let model = model?;
             if model.starts_with("openai") {

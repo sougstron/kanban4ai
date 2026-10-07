@@ -5,10 +5,10 @@ use std::fs;
 use kanban4ai::agent::{
     build_agent_prompt, build_launch_plan, cached_opencode_catalog, load_pi_catalog,
     load_pi_catalog_from_dir, parse_codex_models_json, parse_grok_models_cache,
-    parse_grok_models_text, parse_omp_models_json, parse_opencode_agent_list,
-    parse_opencode_models_verbose, parse_pi_builtin_catalog, parse_pi_models_json,
-    parse_pi_models_store, pi_builtin_data_dir, recent_models, record_recent_model, sort_efforts,
-    sort_opencode_models,
+    parse_grok_models_text, parse_kimi_config_models, parse_omp_models_json,
+    parse_opencode_agent_list, parse_opencode_models_verbose, parse_pi_builtin_catalog,
+    parse_pi_models_json, parse_pi_models_store, pi_builtin_data_dir, recent_models,
+    record_recent_model, sort_efforts, sort_opencode_models,
 };
 use kanban4ai::core::models::{MessageKind, MessageRole, Role, RunPhase, Task};
 use kanban4ai::core::project::Roots;
@@ -767,6 +767,125 @@ fn grok_auto_relaunch_resumes_native_session() {
         Some("11111111-1111-1111-1111-111111111111")
     );
     assert!(plan.prompt.contains("KANBAN_SESSION=ses-current"));
+}
+
+#[test]
+fn kimi_launch_plan_runs_print_mode_with_prompt_last() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    write_agent_config(
+        dir.path(),
+        "auto_launch:\n  enabled: true\n  use_tmux: false\n  default_agent: kimi\nnotifications:\n  enabled: false\nagents:\n  kimi:\n    command: kimi\n    model: kimi-code/kimi-for-coding\n",
+    );
+    let task = storage
+        .create_task(NewTask {
+            title: "Kimi task".into(),
+            ai_model: Some("kimi-code/k3".into()),
+            ai_effort: Some("no-thinking".into()),
+            agent_name: Some("ignored-persona".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+    let plan = build_launch_plan(dir.path(), &task, "ses-kimi-test", false).unwrap();
+
+    assert_eq!(plan.backend, "kimi");
+    assert_eq!(plan.command, "kimi");
+    assert!(plan.args.iter().any(|arg| arg == "--print"));
+    assert!(has_arg_pair(&plan.args, "--output-format", "stream-json"));
+    assert!(has_arg_pair(&plan.args, "--model", "kimi-code/k3"));
+    assert!(plan.args.iter().any(|arg| arg == "--no-thinking"));
+    assert!(!plan.args.contains(&"--agent".to_string()));
+    // The wrapper appends the prompt file's contents as the value of the
+    // trailing `--prompt`.
+    assert_eq!(plan.args.last().map(String::as_str), Some("--prompt"));
+    assert!(plan.prompt_file.is_some());
+    assert!(plan.transcript_file.is_some());
+}
+
+#[test]
+fn kimi_auto_relaunch_resumes_native_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    write_agent_config(
+        dir.path(),
+        "auto_launch:\n  enabled: true\n  default_agent: kimi\nnotifications:\n  enabled: false\nagents:\n  kimi:\n    command: kimi\n",
+    );
+    let mut task = storage.create_task(NewTask::titled("Resume kimi")).unwrap();
+    task.agent_backend = Some("kimi".to_string());
+    task.auto_resumes = 1;
+    storage.save_task(&task).unwrap();
+
+    let sessions = SessionManager::new(dir.path());
+    let mut previous = sessions
+        .link_named_session(&task.id, "ses-previous", "old")
+        .unwrap();
+    previous.status = kanban4ai::core::models::SessionStatus::Closed;
+    previous.ended_at = Some(previous.last_seen);
+    sessions.save_session(&previous).unwrap();
+    provenance::write_manifest(
+        &storage.provenance_dir,
+        &InputManifest {
+            session_id: previous.id.clone(),
+            backend: "kimi".to_string(),
+            backend_session_id: Some("8aea524a-1ebe-48ea-9a41-e872f227e249".to_string()),
+            ..InputManifest::default()
+        },
+    )
+    .unwrap();
+
+    let plan = build_launch_plan(dir.path(), &task, "ses-current", false).unwrap();
+    assert!(has_arg_pair(
+        &plan.args,
+        "--session",
+        "8aea524a-1ebe-48ea-9a41-e872f227e249"
+    ));
+    assert_eq!(plan.args.last().map(String::as_str), Some("--prompt"));
+    assert_eq!(
+        plan.resumed_backend_session.as_deref(),
+        Some("8aea524a-1ebe-48ea-9a41-e872f227e249")
+    );
+}
+
+#[test]
+fn kimi_config_lists_models_default_first_with_thinking_toggle() {
+    let text = r#"default_model = "kimi-code/kimi-for-coding"
+default_thinking = true
+
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+model = "k3"
+capabilities = ["thinking", "video_in", "image_in"]
+
+[models."kimi-code/kimi-for-coding"]
+provider = "managed:kimi-code"
+capabilities = ["thinking", "image_in"]
+
+[models."kimi-code/always"]
+capabilities = ["always_thinking"]
+
+[providers."managed:kimi-code"]
+type = "kimi"
+
+[services.moonshot_search]
+base_url = "https://api.kimi.com/coding/v1/search"
+"#;
+    let catalog = parse_kimi_config_models(text);
+    assert_eq!(
+        catalog.models,
+        [
+            "kimi-code/kimi-for-coding",
+            "kimi-code/k3",
+            "kimi-code/always"
+        ]
+    );
+    assert_eq!(
+        catalog.variants_for("kimi-code/k3"),
+        ["thinking", "no-thinking"]
+    );
+    assert!(catalog.variants_for("kimi-code/always").is_empty());
 }
 
 #[test]

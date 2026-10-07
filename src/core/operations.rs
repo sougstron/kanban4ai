@@ -70,8 +70,8 @@ use crate::core::models::{
 use crate::core::notifier::{DesktopNotifier, NotificationConfig};
 use crate::core::project::{Project, Roots};
 use crate::core::provenance::{
-    self, ClaudeHarvester, CodexHarvester, InputManifest, OpencodeHarvester, PiFamilyHarvester,
-    TranscriptHarvester,
+    self, ClaudeHarvester, CodexHarvester, InputManifest, KimiHarvester, OpencodeHarvester,
+    PiFamilyHarvester, TranscriptHarvester,
 };
 use crate::core::reply;
 use crate::core::scheduler::{Slots, role_for_phase};
@@ -4581,7 +4581,7 @@ impl Operations {
     /// manifest (`.kanban/provenance/<session>.yaml`) recording what the run
     /// actually consumed — files read into context (including via Bash), files
     /// written, URLs, MCP calls. Best-effort and backend-gated: claude,
-    /// codex, opencode, the pi family, and grok emit parseable transcripts, and
+    /// codex, opencode, the pi family, grok, and kimi emit parseable transcripts, and
     /// any failure is a soft warning
     /// that never disturbs the reconciled exit.
     fn harvest_provenance(&self, task_id: &str, session_id: &str) -> Option<InputManifest> {
@@ -4636,6 +4636,11 @@ impl Operations {
             "pi" | "omp" => Box::new(PiFamilyHarvester {
                 session_id: session,
                 backend: backend.clone(),
+                prompt_dump,
+                root: repo_root,
+            }),
+            "kimi" => Box::new(KimiHarvester {
+                session_id: session,
                 prompt_dump,
                 root: repo_root,
             }),
