@@ -1,3 +1,34 @@
+# kanban4ai 0.6.21
+
+Kimi limits renew an expired omp token instead of replaying old usage, a
+human model pick is kept, and the Projects screen can hide projects.
+
+## Added
+
+- **Hidden projects** (`src/core/global.rs`, `src/tui/app.rs`,
+  `src/tui/dialogs.rs`, `src/tui/projects.rs`, `docs/config.md`). Global
+  Settings gains a Projects tab: one checkbox per registered project
+  (ticked = shown), stored as `tui.hidden_projects` in the store config.
+  The filter is display-only. Projects, their boards, and `kanban`
+  commands stay available, and the list footer counts hidden projects.
+  Saving with every project shown drops the key.
+
+## Fixed
+
+- **Kimi token refresh** (`src/core/limits.rs`, `src/tui/app.rs`). omp only
+  renews its kimi-code OAuth token while it runs, so a board left open
+  fell back to omp's usage history and still reported "kimi limits
+  updated". A refresh now renews an expired login with its refresh token
+  and writes the rotated credentials back to omp's `agent.db`, using a
+  compare-and-swap on the previous refresh token. The click-refresh status
+  says "updated" only for live numbers. Otherwise it reports signed out,
+  not configured, unavailable, no data, or the age of the data on screen.
+
+- **Stale executor-pool profile** (`src/core/operations.rs`). Editing a
+  task's backend, model, effort, or agent clears a materialized
+  `role_profile` and resets `roster_index`, unless that edit set the
+  profile itself. The next dispatch keeps the human pick.
+
 # kanban4ai 0.6.20
 
 Codex joins the live-catalog backends, and TUI text copies now respect pane
