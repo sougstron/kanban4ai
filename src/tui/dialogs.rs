@@ -1066,8 +1066,10 @@ impl ModalState {
 
     /// Walk focus one field up or down without wrapping, skipping fields
     /// disabled by inheritance. Confirm and Cancel share a row, so the
-    /// arrows never step between them.
-    fn arrow_field(&mut self, delta: isize) {
+    /// arrows never step between them. `Alt+Up/Down` lands here from
+    /// `App::handle_modal_key` — the chord bypasses the caret/selection
+    /// ownership the plain arrows respect.
+    pub(crate) fn arrow_field(&mut self, delta: isize) {
         let fields = self.fields();
         let current = self
             .sub_popup
