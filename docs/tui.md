@@ -317,7 +317,11 @@ board-side reporting without project-file writes), a "Chain to task" selector,
 and an `Options` row that opens a second nested popup holding the
 Orchestrator, Designer, and Reviewer checkboxes (per-task opt-in; models and
 agents come from project settings) plus the "Planned launch" checkbox with an
-HH:MM time field. When the selected backend exposes no personas (no
+HH:MM time field. The Description box sizes itself from its own text the way
+the option selectors size from their option count: 5 rows for an empty field,
+growing with the soft-wrapped text up to 20 rows and shrinking again on
+delete, so window size no longer stretches it — spare rows go to the
+selectors below instead. When the selected backend exposes no personas (no
 `agent_options`), the agent selector would offer only "Default agent", so the
 `Agent settings` launcher is hidden entirely — in the task form and for the
 default/designer/reviewer launchers in settings alike. Both popups stage

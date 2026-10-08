@@ -7,7 +7,7 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::style::{Modifier, Style};
-use ratatui_textarea::{TextArea, WrapMode};
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::core::models::{IntegrationState, RunPhase, TaskStatus};
 use crate::core::operations::Operations;
@@ -117,12 +117,13 @@ fn task_description_soft_wraps_and_preserves_data_cursor_after_resize() {
 fn task_description_height_is_bounded_and_other_editors_remain_unwrapped() {
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
-    // Tall enough that the description can reach its cap even after the
+    // Tall enough that the description could reach its cap even after the
     // filterable Model and Chain-to selectors claim their filter rows.
     let _ = render_at(&mut app, 120, 80);
 
+    // The empty field sits at its minimum: window size no longer stretches it.
     let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
-    assert_eq!(description.height, 15);
+    assert_eq!(description.height, 5);
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.description.wrap_mode(), WrapMode::WordOrGlyph);
     assert_eq!(modal.title.wrap_mode(), WrapMode::None);
@@ -155,7 +156,8 @@ fn constrained_task_form_keeps_description_and_buttons_separate() {
 }
 
 /// The chain selector stays compact (filter + "No chain" minimum, hard cap
-/// of 8) while the description takes the spare rows up to 15.
+/// of 8) while the description keeps its content-driven height and spare
+/// rows go to the selectors instead.
 #[test]
 fn chain_selector_height_clamps_and_description_grows_taller() {
     let (_dir, mut app) = app_with_board();
@@ -175,8 +177,79 @@ fn chain_selector_height_clamps_and_description_grows_taller() {
     assert_eq!(chain.height, 8, "many chain candidates must cap at 8 rows");
     let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
     assert_eq!(
-        description.height, 15,
-        "spare rows must grow the description to its cap"
+        description.height, 5,
+        "an empty description keeps its minimum; spare rows feed the selectors"
+    );
+}
+
+/// The description follows its own text: soft wrap at the current width sets
+/// the height (wider window, fewer rows), edits grow it up to the 20-row cap,
+/// deleting shrinks it back to the 5-row minimum, and the caret survives the
+/// measurement.
+#[test]
+fn task_description_height_follows_its_text() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    {
+        let modal = app.modal.as_mut().expect("new task modal");
+        modal.focus_field(DialogField::Description);
+    }
+    let description_height =
+        |app: &App| modal_hitbox(app, HitAction::ModalField(DialogField::Description)).height;
+
+    let _ = render_at(&mut app, 120, 80);
+    assert_eq!(
+        description_height(&app),
+        5,
+        "empty field sits at the minimum"
+    );
+
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        let paragraph = "word ".repeat(200); // wraps to well over 5 rows at 120 columns
+        modal.description.insert_str(&paragraph);
+        modal.description.move_cursor(CursorMove::Jump(0, 0));
+    }
+    let _ = render_at(&mut app, 120, 80);
+    let wide = description_height(&app);
+    assert!(wide > 5, "wrapped prose must grow the field");
+    let _ = render_at(&mut app, 60, 80);
+    let narrow = description_height(&app);
+    assert!(
+        narrow > wide,
+        "the same text must wrap taller in a narrower window"
+    );
+
+    // Past five lines the height tracks the line count; 30 lines hit the cap.
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        modal.description.delete_str(10_000);
+        for _ in 0..30 {
+            modal.description.insert_char('x');
+            modal.description.insert_newline();
+        }
+    }
+    let _ = render_at(&mut app, 120, 80);
+    assert_eq!(
+        description_height(&app),
+        20,
+        "31 lines must clamp at the 20-row cap"
+    );
+
+    let caret;
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        modal.description.move_cursor(CursorMove::Jump(0, 0));
+        modal.description.delete_str(10_000);
+        caret = modal.description.cursor();
+    }
+    let _ = render_at(&mut app, 120, 80);
+    assert_eq!(description_height(&app), 5, "clearing shrinks back");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(
+        modal.description.cursor(),
+        caret,
+        "the caret must survive the height measurement"
     );
 }
 
