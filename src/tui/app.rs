@@ -408,6 +408,9 @@ pub struct App {
     /// multi-line copy rejoins soft-wrapped rows.
     pub(crate) text_regions: Vec<TextRegion>,
     text_selection: Option<TextSelection>,
+    /// A press-and-drag that started inside an editable text field: it moves
+    /// that field's caret and selection instead of selecting screen text.
+    text_input_drag: Option<TextInputDrag>,
     pending_copy: Option<String>,
     copy_notice_deadline: Option<Instant>,
     status_before_copy: Option<String>,
@@ -599,6 +602,22 @@ struct TextSelection {
     /// Inside of the bordered pane the selection started in; rows never reach
     /// past it, so frames, scrollbars and neighbouring panes stay out of a copy.
     bounds: Rect,
+    dragged: bool,
+}
+
+/// An editable textarea the mouse can steer: a caret-bearing dialog field or
+/// the detail view's review editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextInput {
+    Modal(DialogField),
+    ReviewEdits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextInputDrag {
+    input: TextInput,
+    /// Bordered rectangle the field was drawn in last frame.
+    area: Rect,
     dragged: bool,
 }
 
@@ -855,6 +874,7 @@ impl App {
             rendered_screen: RenderedScreen::default(),
             text_regions: Vec::new(),
             text_selection: None,
+            text_input_drag: None,
             pending_copy: None,
             copy_notice_deadline: None,
             status_before_copy: None,
@@ -957,6 +977,7 @@ impl App {
             rendered_screen: RenderedScreen::default(),
             text_regions: Vec::new(),
             text_selection: None,
+            text_input_drag: None,
             pending_copy: None,
             copy_notice_deadline: None,
             status_before_copy: None,
@@ -1973,6 +1994,9 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        if self.handle_text_input_mouse(mouse)? {
+            return Ok(());
+        }
         if self.handle_text_selection(mouse) {
             return Ok(());
         }
@@ -2012,6 +2036,111 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Mouse editing inside a text field: a press places the caret where it
+    /// lands, a drag selects (copied on release, like any screen selection),
+    /// and the wheel scrolls the field's own viewport. Shift keeps the plain
+    /// screen-text selection. Returns `true` when the event was consumed.
+    fn handle_text_input_mouse(&mut self, mouse: MouseEvent) -> Result<bool> {
+        let (x, y) = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left)
+                if !mouse.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                let Some((input, area)) = self.text_input_at(x, y) else {
+                    return Ok(false);
+                };
+                self.update_hover(x, y);
+                match input {
+                    TextInput::Modal(_) => self.handle_modal_click(x, y)?,
+                    TextInput::ReviewEdits => self.set_detail_focus(DetailFocus::Edits),
+                }
+                let Some(textarea) = self.text_input_mut(input) else {
+                    return Ok(true);
+                };
+                textarea.cancel_selection();
+                place_textarea_caret(textarea, area, x, y);
+                self.text_input_drag = Some(TextInputDrag {
+                    input,
+                    area,
+                    dragged: false,
+                });
+                Ok(true)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(drag) = self.text_input_drag.as_mut() else {
+                    return Ok(false);
+                };
+                let first_move = !drag.dragged;
+                drag.dragged = true;
+                let TextInputDrag { input, area, .. } = *drag;
+                if let Some(textarea) = self.text_input_mut(input) {
+                    if first_move {
+                        textarea.start_selection();
+                    }
+                    place_textarea_caret(textarea, area, x, y);
+                }
+                Ok(true)
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(drag) = self.text_input_drag.take() else {
+                    return Ok(false);
+                };
+                let selected = self
+                    .text_input_mut(drag.input)
+                    .and_then(|textarea| textarea_selected_text(textarea));
+                if let Some(text) = selected {
+                    self.pending_copy = Some(text);
+                }
+                Ok(true)
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let Some((input, area)) = self.text_input_at(x, y) else {
+                    return Ok(false);
+                };
+                let rows = if mouse.kind == MouseEventKind::ScrollUp {
+                    -1
+                } else {
+                    1
+                };
+                if let Some(textarea) = self.text_input_mut(input) {
+                    sync_textarea_viewport(textarea, area);
+                    textarea.scroll((rows, 0));
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// The editable text field under a point and the area it was drawn in.
+    fn text_input_at(&mut self, x: u16, y: u16) -> Option<(TextInput, Rect)> {
+        let hitbox = self
+            .hitboxes
+            .iter()
+            .find(|hitbox| contains(hitbox.area, x, y))
+            .copied()?;
+        let input = match hitbox.action {
+            HitAction::ModalField(field) => TextInput::Modal(field),
+            HitAction::DetailEdits if self.modal.is_none() && self.screen == Screen::Detail => {
+                TextInput::ReviewEdits
+            }
+            _ => return None,
+        };
+        self.text_input_mut(input)?;
+        Some((input, hitbox.area))
+    }
+
+    fn text_input_mut(&mut self, input: TextInput) -> Option<&mut TextArea<'static>> {
+        match input {
+            TextInput::Modal(field) => self.modal.as_mut()?.text_field_mut(field),
+            TextInput::ReviewEdits => self
+                .detail
+                .as_mut()
+                .filter(|detail| detail.edits_editable())
+                .map(|detail| &mut detail.review_edits),
+        }
     }
 
     fn handle_text_selection(&mut self, mouse: MouseEvent) -> bool {
@@ -6597,6 +6726,115 @@ pub(super) fn load_log_tail(project_path: &Path, session_id: &str) -> Vec<String
         lines.push("(log is empty)".to_string());
     }
     lines
+}
+
+/// Re-run the last frame's layout of `textarea` in `area` (its bordered
+/// rectangle) on a scratch buffer. Fields drawn from a clone never write their
+/// scroll position back, so this makes the stored viewport match the screen
+/// before the mouse reads or moves it.
+fn sync_textarea_viewport(textarea: &TextArea<'static>, area: Rect) {
+    let area = if textarea.block().is_some() {
+        area
+    } else {
+        inner_rect(area)
+    };
+    let mut scratch = Buffer::empty(area);
+    ratatui::widgets::Widget::render(textarea, area, &mut scratch);
+}
+
+fn inner_rect(area: Rect) -> Rect {
+    area.inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 1,
+    })
+}
+
+/// First visible screen row and column of a just-rendered textarea, probed
+/// through the public cursor API: `InViewport` clamps a caret parked at the
+/// top-left corner of the text onto the viewport's top-left corner.
+fn textarea_scroll_top(textarea: &TextArea<'static>) -> (usize, usize) {
+    let mut probe = textarea.clone();
+    probe.cancel_selection();
+    let col = if textarea.wrap_mode() == WrapMode::None {
+        // Without soft wrap a data line is one screen row, and the row that
+        // holds the caret is on screen with its own line long enough to reach
+        // the horizontal scroll offset.
+        probe.move_cursor(CursorMove::Head);
+        probe.move_cursor(CursorMove::InViewport);
+        probe.screen_cursor().col
+    } else {
+        0
+    };
+    probe.move_cursor(CursorMove::Jump(0, 0));
+    probe.move_cursor(CursorMove::InViewport);
+    (probe.screen_cursor().row, col)
+}
+
+/// Move the caret of `textarea`, drawn in the bordered `area`, to the
+/// terminal cell `(x, y)`. Points past an edge land on the nearest text, one
+/// row/column beyond the viewport, so a drag past the border scrolls. An
+/// ongoing selection keeps its anchor and extends to the new caret.
+fn place_textarea_caret(textarea: &mut TextArea<'static>, area: Rect, x: u16, y: u16) {
+    sync_textarea_viewport(textarea, area);
+    let inner = inner_rect(area);
+    let (top_row, top_col) = textarea_scroll_top(textarea);
+    let offset =
+        |pos: u16, start: u16, top: usize| (top + usize::from(pos)).saturating_sub(start.into());
+    let row = offset(y, inner.y, top_row);
+    let col = offset(x, inner.x, top_col);
+    textarea.move_cursor(CursorMove::Jump(0, 0));
+    for _ in 0..row {
+        let before = textarea.cursor();
+        textarea.move_cursor(CursorMove::Down);
+        if textarea.cursor() == before {
+            break;
+        }
+    }
+    // Walk right along the screen row; a wide glyph straddling the click
+    // keeps the caret before it.
+    loop {
+        let here = textarea.screen_cursor();
+        if here.col >= col {
+            break;
+        }
+        let before = textarea.cursor();
+        textarea.move_cursor(CursorMove::Forward);
+        let next = textarea.screen_cursor();
+        if textarea.cursor() == before {
+            break;
+        }
+        if next.row != here.row || next.col > col {
+            let ratatui_textarea::DataCursor(line, offset) = before;
+            textarea.move_cursor(CursorMove::Jump(
+                u16::try_from(line).unwrap_or(u16::MAX),
+                u16::try_from(offset).unwrap_or(u16::MAX),
+            ));
+            break;
+        }
+    }
+}
+
+/// The text a textarea's selection covers, if it covers any.
+fn textarea_selected_text(textarea: &TextArea<'static>) -> Option<String> {
+    let ((start_row, start_col), (end_row, end_col)) = textarea.selection_range()?;
+    if (start_row, start_col) == (end_row, end_col) {
+        return None;
+    }
+    let lines = textarea.lines();
+    let slice = |row: usize, from: usize, to: Option<usize>| {
+        let chars = lines[row].chars().skip(from);
+        match to {
+            Some(to) => chars.take(to.saturating_sub(from)).collect::<String>(),
+            None => chars.collect(),
+        }
+    };
+    if start_row == end_row {
+        return Some(slice(start_row, start_col, Some(end_col)));
+    }
+    let mut parts = vec![slice(start_row, start_col, None)];
+    parts.extend(lines[start_row + 1..end_row].iter().cloned());
+    parts.push(slice(end_row, 0, Some(end_col)));
+    Some(parts.join("\n"))
 }
 
 fn input_single_line(textarea: &mut TextArea<'static>, key: KeyEvent) {

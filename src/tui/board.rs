@@ -725,6 +725,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  click: open a card, press a button, or pick a dialog field"),
         Line::from("  wheel: scrolls the column under the cursor"),
         Line::from("  drag across text: copy it · hold Shift to select interactive text"),
+        Line::from("  in a text field: click places the caret · drag selects and"),
+        Line::from("    copies · wheel scrolls the field"),
         Line::from("  drag a card: it rides the cursor, its slot keeps a dashed"),
         Line::from("    outline, and the column under the pointer highlights green"),
         Line::from("  drop on In Progress: queue it · on To Do/Done: move and stop"),
