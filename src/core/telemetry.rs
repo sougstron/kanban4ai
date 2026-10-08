@@ -11,7 +11,9 @@
 //! in lock-step on backend event shapes.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -122,6 +124,10 @@ impl SessionProgress {
 /// `codex`, `opencode`, the pi family (`pi`/`omp`), or claude (the default for
 /// anything else). Falls back to the log-scraping [`estimate_session_tokens`] for the
 /// token count when the transcript is absent or reported no usage.
+///
+/// The TUI calls this on every tick for each live agent, and pi-family
+/// transcripts grow to tens of megabytes of streaming deltas, so the parse is
+/// incremental: see [`TranscriptCache`].
 pub fn read_session_progress(
     project_path: &Path,
     session_id: &str,
@@ -135,20 +141,185 @@ pub fn read_session_progress(
         .join(".kanban")
         .join("logs")
         .join(format!("{session_id}.transcript.jsonl"));
-    if let Ok(raw) = std::fs::read_to_string(&transcript) {
-        match backend {
-            "codex" => parse_codex(&raw, &mut progress),
-            "opencode" => parse_opencode(&raw, &mut progress),
-            "pi" | "omp" => parse_pi_family(&raw, &mut progress),
-            // Grok Build's streaming-messages-json is the claude stream shape.
-            "claude" | "grok" => parse_claude(&raw, &mut progress),
-            _ => parse_claude(&raw, &mut progress),
-        }
+    if let Some(found) = TranscriptCache::read(&transcript, Dialect::of(backend)) {
+        progress = found;
     }
     if progress.tokens.is_none() {
         progress.tokens = estimate_session_tokens(project_path, session_id);
     }
     progress
+}
+
+/// Process-wide memo of each transcript's parser state and how far into the
+/// file it has read. Transcripts are append-only, so a re-read only parses the
+/// bytes written since the last one. A file that shrank or whose already-read
+/// tail no longer matches was rewritten, and is parsed again from the start.
+struct TranscriptCache;
+
+/// Bytes before the read offset compared on every re-read to detect a rewrite.
+const TAIL_PROBE: usize = 64;
+
+struct CachedTranscript {
+    dialect: Dialect,
+    /// Offset just past the last complete line fed to `parser`.
+    offset: u64,
+    /// The file's bytes right before `offset` (up to [`TAIL_PROBE`]).
+    tail: Vec<u8>,
+    parser: Parser,
+}
+
+impl TranscriptCache {
+    fn read(path: &Path, dialect: Dialect) -> Option<SessionProgress> {
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedTranscript>>> = OnceLock::new();
+        let mut file = File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        let mut cache = CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let reusable = cache
+            .get(path)
+            .is_some_and(|entry| entry.dialect == dialect && entry.still_prefix_of(&mut file, len));
+        if !reusable {
+            cache.insert(
+                path.to_path_buf(),
+                CachedTranscript {
+                    dialect,
+                    offset: 0,
+                    tail: Vec::new(),
+                    parser: Parser::new(dialect),
+                },
+            );
+        }
+        let entry = cache.get_mut(path)?;
+        let mut fresh = Vec::new();
+        file.seek(SeekFrom::Start(entry.offset)).ok()?;
+        file.read_to_end(&mut fresh).ok()?;
+        let complete = fresh
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        for line in fresh[..complete].split(|byte| *byte == b'\n') {
+            entry.parser.feed_line(line);
+        }
+        if complete > 0 {
+            entry.offset += complete as u64;
+            let mut tail = std::mem::take(&mut entry.tail);
+            tail.extend_from_slice(&fresh[..complete]);
+            let keep = tail.len().saturating_sub(TAIL_PROBE);
+            entry.tail = tail.split_off(keep);
+        }
+        // A trailing line without its newline yet is either still being
+        // written (and fails to parse) or the file's unterminated last line;
+        // fold it into this answer only, so it is re-read once complete.
+        let partial = &fresh[complete..];
+        if partial.iter().all(u8::is_ascii_whitespace) {
+            Some(entry.parser.snapshot())
+        } else {
+            let mut parser = entry.parser.clone();
+            parser.feed_line(partial);
+            Some(parser.snapshot())
+        }
+    }
+}
+
+impl CachedTranscript {
+    /// Whether the file still begins with the bytes this entry already parsed.
+    fn still_prefix_of(&self, file: &mut File, len: u64) -> bool {
+        if len < self.offset {
+            return false;
+        }
+        let start = self.offset - self.tail.len() as u64;
+        let mut probe = vec![0; self.tail.len()];
+        file.seek(SeekFrom::Start(start)).is_ok()
+            && file.read_exact(&mut probe).is_ok()
+            && probe == self.tail
+    }
+}
+
+/// Transcript format, chosen by backend name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    Claude,
+    Codex,
+    Opencode,
+    PiFamily,
+}
+
+impl Dialect {
+    fn of(backend: &str) -> Self {
+        match backend {
+            "codex" => Dialect::Codex,
+            "opencode" => Dialect::Opencode,
+            "pi" | "omp" => Dialect::PiFamily,
+            // Grok Build's streaming-messages-json is the claude stream shape.
+            _ => Dialect::Claude,
+        }
+    }
+}
+
+/// Running parse of one transcript, fed a line at a time.
+#[derive(Debug, Clone)]
+enum Parser {
+    Claude(ClaudeParser),
+    Codex(SessionProgress),
+    Opencode(OpencodeParser),
+    PiFamily(PiParser),
+}
+
+impl Parser {
+    fn new(dialect: Dialect) -> Self {
+        match dialect {
+            Dialect::Claude => Parser::Claude(ClaudeParser::default()),
+            Dialect::Codex => Parser::Codex(SessionProgress::default()),
+            Dialect::Opencode => Parser::Opencode(OpencodeParser::default()),
+            Dialect::PiFamily => Parser::PiFamily(PiParser::default()),
+        }
+    }
+
+    #[cfg(test)]
+    fn feed_str(&mut self, raw: &str) {
+        for line in raw.lines() {
+            self.feed_line(line.as_bytes());
+        }
+    }
+
+    /// Parse one line. A line that cannot carry an event this dialect reads
+    /// is skipped before JSON decoding: streaming deltas (pi's
+    /// `message_update`) are the bulk of a transcript and never count.
+    fn feed_line(&mut self, line: &[u8]) {
+        let Ok(line) = std::str::from_utf8(line) else {
+            return;
+        };
+        let relevant = match self {
+            Parser::Claude(_) => line.contains("\"assistant\"") || line.contains("\"result\""),
+            Parser::Codex(_) => line.contains("turn.completed") || line.contains("item.completed"),
+            Parser::Opencode(_) => line.contains("\"part\""),
+            Parser::PiFamily(_) => line.contains("\"message_end\""),
+        };
+        if !relevant {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
+            return;
+        };
+        match self {
+            Parser::Claude(parser) => parser.feed(&value),
+            Parser::Codex(progress) => feed_codex(&value, progress),
+            Parser::Opencode(parser) => parser.feed(&value),
+            Parser::PiFamily(parser) => parser.feed(&value),
+        }
+    }
+
+    fn snapshot(&self) -> SessionProgress {
+        match self {
+            Parser::Claude(parser) => parser.snapshot(),
+            Parser::Codex(progress) => progress.clone(),
+            Parser::Opencode(parser) => parser.snapshot(),
+            Parser::PiFamily(parser) => parser.snapshot(),
+        }
+    }
 }
 
 /// Apply a `TodoWrite`/`todowrite` `todos` array (last write wins).
@@ -173,46 +344,55 @@ fn usage_input_output(usage: &Value) -> Option<i64> {
 }
 
 /// Parse claude's `--output-format stream-json` transcript.
+#[cfg(test)]
+fn parse_claude(raw: &str, progress: &mut SessionProgress) {
+    let mut parser = Parser::new(Dialect::Claude);
+    parser.feed_str(raw);
+    *progress = parser.snapshot();
+}
+
+/// Running state of a claude stream-json parse.
 ///
 /// Mid-run there is no cumulative total, so tokens are approximated as
 /// `last_input + Σ output`: output tokens are per-turn and never overlap, while
 /// the input count is the (growing) context of the latest turn. Once the final
 /// `result` event arrives its cumulative `usage` supersedes the estimate.
-fn parse_claude(raw: &str, progress: &mut SessionProgress) {
-    let mut sum_output: i64 = 0;
-    let mut last_input: i64 = 0;
-    let mut saw_assistant_usage = false;
-    let mut result_tokens: Option<i64> = None;
+#[derive(Debug, Clone, Default)]
+struct ClaudeParser {
+    progress: SessionProgress,
+    sum_output: i64,
+    last_input: i64,
+    saw_assistant_usage: bool,
+    result_tokens: Option<i64>,
     // One API call streams as several `assistant` events (one per content
     // block) repeating the same message id and usage, so the breakdown keeps
     // the last usage per id instead of summing every event.
-    let mut message_usage: HashMap<String, TokenBreakdown> = HashMap::new();
-    let mut anonymous_usage = TokenBreakdown::default();
-    let mut result_breakdown: Option<TokenBreakdown> = None;
+    message_usage: HashMap<String, TokenBreakdown>,
+    anonymous_usage: TokenBreakdown,
+    result_breakdown: Option<TokenBreakdown>,
+}
 
-    for line in raw.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
+impl ClaudeParser {
+    fn feed(&mut self, value: &Value) {
         match value.get("type").and_then(Value::as_str) {
             Some("assistant") => {
                 let message = value.get("message");
                 if let Some(usage) = message.and_then(|m| m.get("usage")) {
-                    last_input = usage
+                    self.last_input = usage
                         .get("input_tokens")
                         .and_then(Value::as_i64)
-                        .unwrap_or(last_input);
-                    sum_output += usage
+                        .unwrap_or(self.last_input);
+                    self.sum_output += usage
                         .get("output_tokens")
                         .and_then(Value::as_i64)
                         .unwrap_or(0);
-                    saw_assistant_usage = true;
+                    self.saw_assistant_usage = true;
                     let breakdown = claude_breakdown(usage);
                     match message.and_then(|m| m.get("id")).and_then(Value::as_str) {
                         Some(id) => {
-                            message_usage.insert(id.to_string(), breakdown);
+                            self.message_usage.insert(id.to_string(), breakdown);
                         }
-                        None => anonymous_usage.add(&breakdown),
+                        None => self.anonymous_usage.add(&breakdown),
                     }
                 }
                 if let Some(content) = message
@@ -231,39 +411,45 @@ fn parse_claude(raw: &str, progress: &mut SessionProgress) {
                             .and_then(|input| input.get("todos"))
                             .and_then(Value::as_array)
                         {
-                            apply_todos(todos, progress);
+                            apply_todos(todos, &mut self.progress);
                         }
-                        progress.last_activity = Some(claude_tool_summary(block));
+                        self.progress.last_activity = Some(claude_tool_summary(block));
                     }
                 }
             }
             Some("result") => {
                 if let Some(usage) = value.get("usage") {
                     if let Some(tokens) = usage_input_output(usage) {
-                        result_tokens = Some(tokens);
+                        self.result_tokens = Some(tokens);
                     }
                     // The closing event's usage is cumulative for the run.
-                    result_breakdown = Some(claude_breakdown(usage));
+                    self.result_breakdown = Some(claude_breakdown(usage));
                 }
                 if let Some(cost) = value.get("total_cost_usd").and_then(Value::as_f64) {
-                    progress.cost_usd = Some(cost);
+                    self.progress.cost_usd = Some(cost);
                 }
             }
             _ => {}
         }
     }
 
-    progress.tokens =
-        result_tokens.or_else(|| saw_assistant_usage.then_some(last_input + sum_output));
-    progress.breakdown = result_breakdown.or_else(|| {
-        saw_assistant_usage.then(|| {
-            let mut total = anonymous_usage;
-            for breakdown in message_usage.values() {
-                total.add(breakdown);
-            }
-            total
-        })
-    });
+    fn snapshot(&self) -> SessionProgress {
+        let mut progress = self.progress.clone();
+        progress.tokens = self.result_tokens.or_else(|| {
+            self.saw_assistant_usage
+                .then_some(self.last_input + self.sum_output)
+        });
+        progress.breakdown = self.result_breakdown.or_else(|| {
+            self.saw_assistant_usage.then(|| {
+                let mut total = self.anonymous_usage;
+                for breakdown in self.message_usage.values() {
+                    total.add(breakdown);
+                }
+                total
+            })
+        });
+        progress
+    }
 }
 
 /// Sum opencode's `tokens` object (`{input, output, ...}` — its keys drop the
@@ -277,23 +463,33 @@ fn opencode_tokens(tokens: &Value) -> Option<i64> {
     }
 }
 
-/// Parse opencode's `run --format json` transcript. Token usage placement is not
-/// stable across versions, so it is read best-effort from a `tokens` object on
-/// each event's `part` (last seen wins); when absent the caller falls back to
-/// the log scraper.
+/// Parse opencode's `run --format json` transcript.
+#[cfg(test)]
 fn parse_opencode(raw: &str, progress: &mut SessionProgress) {
+    let mut parser = Parser::new(Dialect::Opencode);
+    parser.feed_str(raw);
+    *progress = parser.snapshot();
+}
+
+/// Running state of an opencode parse. Token usage placement is not stable
+/// across versions, so it is read best-effort from a `tokens` object on each
+/// event's `part` (last seen wins); when absent the caller falls back to the
+/// log scraper.
+#[derive(Debug, Clone, Default)]
+struct OpencodeParser {
+    progress: SessionProgress,
     // `tokens` on a `step-finish` part is that one step's usage; the breakdown
     // sums steps, keyed by part id so a re-emitted part is not counted twice.
-    let mut step_usage: HashMap<String, TokenBreakdown> = HashMap::new();
-    for line in raw.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
+    step_usage: HashMap<String, TokenBreakdown>,
+}
+
+impl OpencodeParser {
+    fn feed(&mut self, value: &Value) {
         let Some(part) = value.get("part") else {
-            continue;
+            return;
         };
         if let Some(tokens) = part.get("tokens").and_then(opencode_tokens) {
-            progress.tokens = Some(tokens);
+            self.progress.tokens = Some(tokens);
         }
         if let Some(tokens) = part.get("tokens") {
             let cache = tokens.get("cache").unwrap_or(&Value::Null);
@@ -307,8 +503,8 @@ fn parse_opencode(raw: &str, progress: &mut SessionProgress) {
                 .get("id")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .unwrap_or_else(|| format!("#{}", step_usage.len()));
-            step_usage.insert(key, breakdown);
+                .unwrap_or_else(|| format!("#{}", self.step_usage.len()));
+            self.step_usage.insert(key, breakdown);
         }
         if value.get("type").and_then(Value::as_str) == Some("tool_use") {
             let tool = part.get("tool").and_then(Value::as_str).unwrap_or("");
@@ -319,83 +515,89 @@ fn parse_opencode(raw: &str, progress: &mut SessionProgress) {
                     .and_then(|input| input.get("todos"))
                     .and_then(Value::as_array)
             {
-                apply_todos(todos, progress);
+                apply_todos(todos, &mut self.progress);
             }
-            progress.last_activity = Some(opencode_tool_summary(part));
+            self.progress.last_activity = Some(opencode_tool_summary(part));
         }
     }
-    if !step_usage.is_empty() {
-        let mut total = TokenBreakdown::default();
-        for breakdown in step_usage.values() {
-            total.add(breakdown);
+
+    fn snapshot(&self) -> SessionProgress {
+        let mut progress = self.progress.clone();
+        if !self.step_usage.is_empty() {
+            let mut total = TokenBreakdown::default();
+            for breakdown in self.step_usage.values() {
+                total.add(breakdown);
+            }
+            progress.breakdown = Some(total);
         }
-        progress.breakdown = Some(total);
+        progress
     }
 }
 
-/// Parse Codex's `exec --json` transcript. Codex reports cumulative usage on
-/// `turn.completed` and finalized commands/file changes as `item.completed`.
-/// The stream has no native todo tool, so only tokens, cost, and last activity
-/// are populated here.
+/// Parse Codex's `exec --json` transcript.
+#[cfg(test)]
 fn parse_codex(raw: &str, progress: &mut SessionProgress) {
-    for line in raw.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
-        match value.get("type").and_then(Value::as_str) {
-            Some("turn.completed") => {
-                if let Some(usage) = value.get("usage") {
-                    let input = usage.get("input_tokens").and_then(Value::as_i64);
-                    let output = usage.get("output_tokens").and_then(Value::as_i64);
-                    let total =
-                        usage
-                            .get("total_tokens")
-                            .and_then(Value::as_i64)
-                            .or_else(|| match (input, output) {
-                                (None, None) => None,
-                                _ => Some(input.unwrap_or(0) + output.unwrap_or(0)),
-                            });
-                    if total.is_some() {
-                        progress.tokens = total;
-                    }
-                    // OpenAI convention: `input_tokens` already includes the
-                    // cached part.
-                    if input.is_some() || output.is_some() {
-                        let cached = int_field(usage, "cached_input_tokens");
-                        progress.breakdown = Some(TokenBreakdown {
-                            input: input.unwrap_or(0),
-                            output: output.unwrap_or(0),
-                            cache_read: cached,
-                            cache_write: 0,
-                        });
-                    }
+    let mut parser = Parser::new(Dialect::Codex);
+    parser.feed_str(raw);
+    *progress = parser.snapshot();
+}
+
+/// Feed one Codex event. Codex reports cumulative usage on `turn.completed`
+/// and finalized commands/file changes as `item.completed`. The stream has no
+/// native todo tool, so only tokens, cost, and last activity are populated.
+fn feed_codex(value: &Value, progress: &mut SessionProgress) {
+    match value.get("type").and_then(Value::as_str) {
+        Some("turn.completed") => {
+            if let Some(usage) = value.get("usage") {
+                let input = usage.get("input_tokens").and_then(Value::as_i64);
+                let output = usage.get("output_tokens").and_then(Value::as_i64);
+                let total = usage
+                    .get("total_tokens")
+                    .and_then(Value::as_i64)
+                    .or_else(|| match (input, output) {
+                        (None, None) => None,
+                        _ => Some(input.unwrap_or(0) + output.unwrap_or(0)),
+                    });
+                if total.is_some() {
+                    progress.tokens = total;
                 }
-                if let Some(cost) = value
-                    .get("usage")
-                    .and_then(|usage| usage.get("cost_usd"))
-                    .and_then(Value::as_f64)
-                    .or_else(|| value.get("cost_usd").and_then(Value::as_f64))
-                {
-                    progress.cost_usd = Some(cost);
+                // OpenAI convention: `input_tokens` already includes the
+                // cached part.
+                if input.is_some() || output.is_some() {
+                    let cached = int_field(usage, "cached_input_tokens");
+                    progress.breakdown = Some(TokenBreakdown {
+                        input: input.unwrap_or(0),
+                        output: output.unwrap_or(0),
+                        cache_read: cached,
+                        cache_write: 0,
+                    });
                 }
             }
-            Some("item.completed") => {
-                let Some(item) = value.get("item") else {
-                    continue;
-                };
-                if matches!(
-                    item.get("type").and_then(Value::as_str),
-                    Some("command_execution")
-                        | Some("file_change")
-                        | Some("mcp_tool_call")
-                        | Some("web_search")
-                        | Some("web_search_call")
-                ) {
-                    progress.last_activity = Some(codex_tool_summary(item));
-                }
+            if let Some(cost) = value
+                .get("usage")
+                .and_then(|usage| usage.get("cost_usd"))
+                .and_then(Value::as_f64)
+                .or_else(|| value.get("cost_usd").and_then(Value::as_f64))
+            {
+                progress.cost_usd = Some(cost);
             }
-            _ => {}
         }
+        Some("item.completed") => {
+            let Some(item) = value.get("item") else {
+                return;
+            };
+            if matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("command_execution")
+                    | Some("file_change")
+                    | Some("mcp_tool_call")
+                    | Some("web_search")
+                    | Some("web_search_call")
+            ) {
+                progress.last_activity = Some(codex_tool_summary(item));
+            }
+        }
+        _ => {}
     }
 }
 
@@ -440,47 +642,56 @@ fn apply_pi_todo(args: &Value, items: &mut Vec<String>, done: &mut HashSet<Strin
     }
 }
 
-/// Parse the pi family (pi/omp) `--mode json` NDJSON stream. Each assistant turn
-/// is finalized in one `message_end` carrying cumulative-per-message `usage`
-/// (`input`/`output`, and `cost.total`) and that turn's tool calls;
-/// `message_start` is a zeroed placeholder and `turn_end` duplicates the last
-/// message, so both are skipped to avoid double counting. Tokens follow the same
-/// live accounting as claude (`last_input + Σ output`); cost sums each turn's
-/// `cost.total`. omp's `todo` tool is replayed into the progress counts, while
-/// pi (no todo tool) simply reports none.
+/// Parse the pi family (pi/omp) `--mode json` NDJSON stream.
+#[cfg(test)]
 fn parse_pi_family(raw: &str, progress: &mut SessionProgress) {
-    let mut sum_output: i64 = 0;
-    let mut last_input: i64 = 0;
-    let mut saw_usage = false;
-    let mut total_cost = 0.0_f64;
-    let mut saw_cost = false;
-    let mut breakdown = TokenBreakdown::default();
-    let mut todo_items: Vec<String> = Vec::new();
-    let mut todo_done: HashSet<String> = HashSet::new();
+    let mut parser = Parser::new(Dialect::PiFamily);
+    parser.feed_str(raw);
+    *progress = parser.snapshot();
+}
 
-    for line in raw.lines() {
-        let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
-            continue;
-        };
+/// Running state of a pi-family parse. Each assistant turn is finalized in one
+/// `message_end` carrying cumulative-per-message `usage` (`input`/`output`,
+/// and `cost.total`) and that turn's tool calls; `message_start` is a zeroed
+/// placeholder and `turn_end` duplicates the last message, so both are skipped
+/// to avoid double counting. Tokens follow the same live accounting as claude
+/// (`last_input + Σ output`); cost sums each turn's `cost.total`. omp's `todo`
+/// tool is replayed into the progress counts, while pi (no todo tool) simply
+/// reports none.
+#[derive(Debug, Clone, Default)]
+struct PiParser {
+    progress: SessionProgress,
+    sum_output: i64,
+    last_input: i64,
+    saw_usage: bool,
+    total_cost: f64,
+    saw_cost: bool,
+    breakdown: TokenBreakdown,
+    todo_items: Vec<String>,
+    todo_done: HashSet<String>,
+}
+
+impl PiParser {
+    fn feed(&mut self, value: &Value) {
         if value.get("type").and_then(Value::as_str) != Some("message_end") {
-            continue;
+            return;
         }
         let Some(message) = value.get("message") else {
-            continue;
+            return;
         };
         if message.get("role").and_then(Value::as_str) != Some("assistant") {
-            continue;
+            return;
         }
         if let Some(usage) = message.get("usage") {
-            last_input = usage
+            self.last_input = usage
                 .get("input")
                 .and_then(Value::as_i64)
-                .unwrap_or(last_input);
-            sum_output += usage.get("output").and_then(Value::as_i64).unwrap_or(0);
-            saw_usage = true;
+                .unwrap_or(self.last_input);
+            self.sum_output += usage.get("output").and_then(Value::as_i64).unwrap_or(0);
+            self.saw_usage = true;
             // Each `message_end` is one turn's own usage; `input` excludes
             // the cache fields.
-            breakdown.add(&TokenBreakdown::from_split(
+            self.breakdown.add(&TokenBreakdown::from_split(
                 int_field(usage, "input"),
                 int_field(usage, "output"),
                 int_field(usage, "cacheRead"),
@@ -491,8 +702,8 @@ fn parse_pi_family(raw: &str, progress: &mut SessionProgress) {
                 .and_then(|cost| cost.get("total"))
                 .and_then(Value::as_f64)
             {
-                total_cost += cost;
-                saw_cost = true;
+                self.total_cost += cost;
+                self.saw_cost = true;
             }
         }
         if let Some(content) = message.get("content").and_then(Value::as_array) {
@@ -502,26 +713,31 @@ fn parse_pi_family(raw: &str, progress: &mut SessionProgress) {
                 }
                 if block.get("name").and_then(Value::as_str) == Some("todo") {
                     let args = block.get("arguments").cloned().unwrap_or(Value::Null);
-                    apply_pi_todo(&args, &mut todo_items, &mut todo_done);
+                    apply_pi_todo(&args, &mut self.todo_items, &mut self.todo_done);
                 }
-                progress.last_activity = Some(pi_tool_summary(block));
+                self.progress.last_activity = Some(pi_tool_summary(block));
             }
         }
     }
 
-    if saw_usage {
-        progress.tokens = Some(last_input + sum_output);
-        progress.breakdown = Some(breakdown);
-    }
-    if saw_cost {
-        progress.cost_usd = Some(total_cost);
-    }
-    if !todo_items.is_empty() {
-        progress.todos_total = todo_items.len();
-        progress.todos_done = todo_items
-            .iter()
-            .filter(|item| todo_done.contains(*item))
-            .count();
+    fn snapshot(&self) -> SessionProgress {
+        let mut progress = self.progress.clone();
+        if self.saw_usage {
+            progress.tokens = Some(self.last_input + self.sum_output);
+            progress.breakdown = Some(self.breakdown);
+        }
+        if self.saw_cost {
+            progress.cost_usd = Some(self.total_cost);
+        }
+        if !self.todo_items.is_empty() {
+            progress.todos_total = self.todo_items.len();
+            progress.todos_done = self
+                .todo_items
+                .iter()
+                .filter(|item| self.todo_done.contains(*item))
+                .count();
+        }
+        progress
     }
 }
 
@@ -736,5 +952,59 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let progress = read_session_progress(dir.path(), "../etc/passwd", "claude");
         assert_eq!(progress, SessionProgress::default());
+    }
+
+    fn omp_turn(input: i64, output: i64, tool: &str) -> String {
+        format!(
+            r#"{{"type":"message_end","message":{{"role":"assistant","content":[{{"type":"toolCall","name":"{tool}","arguments":{{"path":"x"}}}}],"usage":{{"input":{input},"output":{output}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn incremental_reads_parse_only_appended_lines() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join(".kanban").join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("ses-omp-1.transcript.jsonl");
+        let read = || read_session_progress(dir.path(), "ses-omp-1", "omp");
+
+        std::fs::write(&path, format!("{}\n", omp_turn(100, 10, "read"))).unwrap();
+        assert_eq!(read().tokens, Some(110));
+
+        // A delta line and a turn still being written: the partial line is
+        // counted once it parses, and not double-counted after its newline.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        let turn = omp_turn(200, 20, "edit");
+        let (head, rest) = turn.split_at(turn.len() / 2);
+        write!(file, "{{\"type\":\"message_update\"}}\n{head}").unwrap();
+        assert_eq!(read().tokens, Some(110));
+        write!(file, "{rest}").unwrap();
+        assert_eq!(read().tokens, Some(230));
+        writeln!(file).unwrap();
+        let progress = read();
+        assert_eq!(progress.tokens, Some(230));
+        assert_eq!(progress.last_activity.as_deref(), Some("edit x"));
+
+        // A rewrite (not an append) is parsed from scratch.
+        std::fs::write(&path, format!("{}\n", omp_turn(5, 1, "read"))).unwrap();
+        assert_eq!(read().tokens, Some(6));
+        let same_len = format!("{}\n", omp_turn(7, 1, "read"));
+        std::fs::write(&path, same_len).unwrap();
+        assert_eq!(read().tokens, Some(8));
+    }
+
+    #[test]
+    fn prefilter_keeps_events_and_skips_streaming_deltas() {
+        let delta = r#"{"type":"message_update","message":{"role":"assistant","usage":{"input":9,"output":9}}}"#;
+        let mut progress = SessionProgress::default();
+        parse_pi_family(
+            &format!("{delta}\n{}\n", omp_turn(1, 2, "read")),
+            &mut progress,
+        );
+        assert_eq!(progress.tokens, Some(3));
     }
 }

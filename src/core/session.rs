@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use regex::Regex;
 
@@ -389,28 +390,33 @@ pub fn estimate_session_tokens(project_path: &Path, session_id: &str) -> Option<
         .join(format!("{session_id}.log"));
     let text = fs::read_to_string(&log_file).ok()?;
 
-    let patterns = [
-        r"(?i)(?:total\s+)?tokens(?:\s+used)?\s*[:=]\s*([\d,]+)",
-        r"(?i)([\d,]+)\s+(?:total\s+)?tokens\b",
-    ];
-    for pattern in patterns {
+    // Called on every TUI tick for a live agent whose transcript reports no
+    // usage, so the patterns are compiled once per process.
+    static PATTERNS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
+        [
+            r"(?i)(?:total\s+)?tokens(?:\s+used)?\s*[:=]\s*([\d,]+)",
+            r"(?i)([\d,]+)\s+(?:total\s+)?tokens\b",
+            r"(?i)input\s+tokens\s*[:=]\s*([\d,]+)",
+            r"(?i)output\s+tokens\s*[:=]\s*([\d,]+)",
+        ]
+        .map(|pattern| Regex::new(pattern).expect("valid token pattern"))
+    });
+    let [total, trailing, input, output] = &*PATTERNS;
+    for pattern in [total, trailing] {
         if let Some(value) = last_capture(&text, pattern) {
             return parse_int(&value);
         }
     }
 
-    let input =
-        last_capture(&text, r"(?i)input\s+tokens\s*[:=]\s*([\d,]+)").and_then(|v| parse_int(&v));
-    let output =
-        last_capture(&text, r"(?i)output\s+tokens\s*[:=]\s*([\d,]+)").and_then(|v| parse_int(&v));
+    let input = last_capture(&text, input).and_then(|v| parse_int(&v));
+    let output = last_capture(&text, output).and_then(|v| parse_int(&v));
     if input.is_some() || output.is_some() {
         return Some(input.unwrap_or(0) + output.unwrap_or(0));
     }
     None
 }
 
-fn last_capture(text: &str, pattern: &str) -> Option<String> {
-    let re = Regex::new(pattern).ok()?;
+fn last_capture(text: &str, re: &Regex) -> Option<String> {
     re.captures_iter(text)
         .last()
         .and_then(|c| c.get(1))
