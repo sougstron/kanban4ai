@@ -1173,6 +1173,15 @@ fn agent_settings_save_clears_visit_filter() {
 fn role_agent_options_show_hover_feedback() {
     // Given the designer popup rendered with clickable options.
     let (_dir, mut app) = settings_app();
+    {
+        // The designer bot defaults to a backend without agent personas,
+        // which now hides its launcher; point it at opencode so the popup
+        // can open.
+        let path = _dir.path().join(".kanban/config.yaml");
+        let mut config = std::fs::read_to_string(&path).expect("read config");
+        config.push_str("orchestration:\n  designer:\n    backend: opencode\n");
+        std::fs::write(&path, config).expect("rewrite config");
+    }
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open settings");
     app.modal
@@ -2097,18 +2106,47 @@ fn task_form_default_backend_inherits_settings_agent() {
     assert_eq!(task.agent_backend.as_deref(), Some("opencode"));
     assert_eq!(task.ai_model.as_deref(), Some("openai/gpt-5.5"));
 
-    // A task with a pinned backend can be switched back to Default, which
-    // snapshots the current default agent instead of leaving the field empty.
+    // A task pinned to a backend without configured agents shows no agent
+    // settings block at all: the selector would offer only "Default agent",
+    // which is no choice.
     app.focused_column = 2;
     app.focused_card = 0;
     app.handle_key(key(KeyCode::Char('e')))
         .expect("edit claude task");
     let modal = app.modal.as_ref().expect("edit modal");
     assert_eq!(modal.backend_text().as_deref(), Some("claude"));
+    assert!(!modal.field_enabled(DialogField::AgentSettings));
+    drop(app);
+
+    // With agents configured for the backend, a pinned task can be switched
+    // back to Default, which snapshots the current default agent instead of
+    // leaving the field empty.
+    let dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(dir.path()).init_board().expect("init board");
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "notifications:\n  enabled: false\nauto_launch:\n  enabled: false\n  default_agent: opencode\n  model: openai/gpt-5.5\nagents:\n  opencode:\n    command: /nonexistent/opencode-disabled-for-tests\n    model: openai/gpt-5.5\n    models: [openai/gpt-5.5]\n    agent_options: [sisyphus]\n",
+    )
+    .expect("config");
+    let mut app = App::new(dir.path()).expect("create app");
+    let ops = Operations::new(dir.path());
+    ops.create_task(NewTask {
+        title: "Pinned opencode".to_string(),
+        agent_backend: Some("opencode".to_string()),
+        ai_model: Some("openai/gpt-5.5".to_string()),
+        ..Default::default()
+    })
+    .expect("create pinned task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.focused_column = 0;
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Char('e')))
+        .expect("edit pinned task");
+    let modal = app.modal.as_ref().expect("edit modal");
+    assert_eq!(modal.backend_text().as_deref(), Some("opencode"));
     app.handle_key(key(KeyCode::Tab)).expect("description");
     app.handle_key(key(KeyCode::Tab)).expect("agent settings");
     app.handle_key(key(KeyCode::Enter)).expect("open popup");
-    app.handle_key(key(KeyCode::Up)).expect("to opencode");
     app.handle_key(key(KeyCode::Up)).expect("to default");
     assert_eq!(app.modal.as_ref().expect("modal").backend_text(), None);
     app.handle_key(ctrl_key(KeyCode::Char('s')))
@@ -2116,8 +2154,19 @@ fn task_form_default_backend_inherits_settings_agent() {
     let modal = app.modal.as_mut().expect("edit modal");
     modal.field_index = modal.fields().len() - 2;
     app.handle_key(key(KeyCode::Enter)).expect("save edit");
-    let task = app.ops.get_task("TASK-002").expect("reload").expect("task");
-    assert_eq!(task.agent_backend.as_deref(), Some("opencode"));
+    let tasks = app.board.columns[0].tasks.clone();
+    let reloaded = app
+        .ops
+        .get_task(
+            tasks
+                .iter()
+                .find(|task| task.title == "Pinned opencode")
+                .map(|task| task.id.as_str())
+                .expect("pinned task"),
+        )
+        .expect("reload")
+        .expect("task");
+    assert_eq!(reloaded.agent_backend.as_deref(), Some("opencode"));
 }
 
 /// Enter, Shift+Enter, and Alt+Enter all break lines inside the description.
@@ -3231,8 +3280,28 @@ fn mouse_backend_selection_refreshes_each_role_popup() {
         ),
     ] {
         let (_dir, mut app) = settings_app();
+        if slot != AgentSlot::Primary {
+            // The designer and reviewer bots default to a backend without
+            // agent personas, which now hides their agent launchers; point
+            // them at opencode so the popup has a choice to click.
+            let path = _dir.path().join(".kanban/config.yaml");
+            let mut config = std::fs::read_to_string(&path).expect("read config");
+            config.push_str(
+                "orchestration:\n  designer:\n    backend: opencode\n  reviewer:\n    backend: opencode\n",
+            );
+            std::fs::write(&path, config).expect("rewrite config");
+        }
         app.handle_key(key(KeyCode::Char('s')))
             .expect("open settings");
+        {
+            let modal = app.modal.as_ref().expect("settings");
+            eprintln!(
+                "PROBE slot={slot:?} show={:?} enabled={:?} active={:?}",
+                modal.should_show_agents_for(slot),
+                modal.field_enabled(launcher),
+                modal.active_field(),
+            );
+        }
         app.modal.as_mut().expect("settings").focus_field(launcher);
         app.handle_key(key(KeyCode::Enter)).expect("open popup");
         let current = app.modal.as_ref().expect("popup").backend_text_for(slot);

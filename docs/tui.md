@@ -304,7 +304,11 @@ board-side reporting without project-file writes), a "Chain to task" selector,
 and an `Options` row that opens a second nested popup holding the
 Orchestrator, Designer, and Reviewer checkboxes (per-task opt-in; models and
 agents come from project settings) plus the "Planned launch" checkbox with an
-HH:MM time field. Both popups stage values on Save and restore the exact
+HH:MM time field. When the selected backend exposes no personas (no
+`agent_options`), the agent selector would offer only "Default agent", so the
+`Agent settings` launcher is hidden entirely — in the task form and for the
+default/designer/reviewer launchers in settings alike. Both popups stage
+values on Save and restore the exact
 opening state on Cancel. When planned launch is on the time is required (an
 empty or invalid value keeps the dialog open with an error and reopens the
 Options popup on the time field), and saving stores the next local occurrence
