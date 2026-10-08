@@ -11871,3 +11871,144 @@ fn up_from_review_editor_top_returns_to_thread() {
     app.handle_key(key(KeyCode::Up)).expect("leave editor");
     assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
 }
+
+/// Terminal cell where `needle` starts inside `area`, for ASCII-only rows.
+fn find_text_in(
+    buffer: &ratatui::buffer::Buffer,
+    area: ratatui::layout::Rect,
+    needle: &str,
+) -> (u16, u16) {
+    (area.y..area.bottom())
+        .find_map(|y| {
+            let row: String = (area.x..area.right())
+                .map(|x| symbol_at(buffer, x, y))
+                .collect();
+            row.find(needle)
+                .map(|byte| (area.x + row[..byte].chars().count() as u16, y))
+        })
+        .unwrap_or_else(|| panic!("{needle:?} not drawn in {area:?}"))
+}
+
+#[test]
+fn clicking_a_text_field_places_the_caret_under_the_pointer() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        modal
+            .description
+            .insert_str("first line\nsecond words here\nthird");
+        modal
+            .description
+            .move_cursor(ratatui_textarea::CursorMove::Top);
+        modal
+            .description
+            .move_cursor(ratatui_textarea::CursorMove::Head);
+    }
+    let buffer = rendered_buffer(&mut app, 120, 40);
+    let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
+    let (x, y) = find_text_in(&buffer, description, "words");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x + 2, y))
+        .expect("click description");
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x + 2, y))
+        .expect("release");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.active_field(), DialogField::Description);
+    assert_eq!(modal.description.cursor(), (1, "second wo".len()));
+    assert!(modal.description.selection_range().is_none());
+    assert!(
+        app.take_pending_copy().is_none(),
+        "a plain click copies nothing"
+    );
+
+    // Past the end of a short line the caret lands at that line's end.
+    let (x, y) = find_text_in(&buffer, description, "third");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x + 30, y))
+        .expect("click after text");
+    assert_eq!(
+        app.modal.as_ref().unwrap().description.cursor(),
+        (2, "third".len())
+    );
+}
+
+#[test]
+fn clicking_a_horizontally_scrolled_field_accounts_for_the_scroll() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let title = format!("{}MARK-tail", "x".repeat(200));
+    app.modal.as_mut().expect("modal").title.insert_str(&title);
+    let buffer = rendered_buffer(&mut app, 120, 40);
+    let field = modal_hitbox(&app, HitAction::ModalField(DialogField::Title));
+    let (x, y) = find_text_in(&buffer, field, "MARK");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x + 1, y))
+        .expect("click title");
+    assert_eq!(
+        app.modal.as_ref().unwrap().title.cursor(),
+        (0, title.find("MARK").unwrap() + 1)
+    );
+}
+
+#[test]
+fn dragging_inside_a_text_field_selects_and_copies() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        modal.description.insert_str("alpha beta\ngamma delta");
+    }
+    let buffer = rendered_buffer(&mut app, 120, 40);
+    let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
+    let (from_x, from_y) = find_text_in(&buffer, description, "beta");
+    let (to_x, to_y) = find_text_in(&buffer, description, "delta");
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        from_x,
+        from_y,
+    ))
+    .expect("press");
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        to_x + 3,
+        to_y,
+    ))
+    .expect("drag");
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), to_x + 3, to_y))
+        .expect("release");
+    assert_eq!(app.take_pending_copy().as_deref(), Some("beta\ngamma del"));
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.description.selection_range(), Some(((0, 6), (1, 9))));
+    assert_eq!(modal.description.lines(), ["alpha beta", "gamma delta"]);
+}
+
+#[test]
+fn wheel_scrolls_the_text_field_under_the_pointer() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    {
+        let modal = app.modal.as_mut().expect("modal");
+        let lines: Vec<String> = (0..60).map(|n| format!("line {n:02}")).collect();
+        modal.description.insert_str(lines.join("\n"));
+        modal
+            .description
+            .move_cursor(ratatui_textarea::CursorMove::Jump(0, 0));
+    }
+    let _ = rendered_buffer(&mut app, 120, 40);
+    let description = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
+    let (x, y) = (description.x + 3, description.y + 2);
+    for _ in 0..5 {
+        app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, y))
+            .expect("wheel down");
+    }
+    let buffer = rendered_buffer(&mut app, 120, 40);
+    let first_row: String = (description.x + 1..description.right() - 1)
+        .map(|x| symbol_at(&buffer, x, description.y + 1))
+        .collect();
+    assert!(first_row.starts_with("line 05"), "{first_row:?}");
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, x, y))
+        .expect("wheel up");
+    let buffer = rendered_buffer(&mut app, 120, 40);
+    let first_row: String = (description.x + 1..description.right() - 1)
+        .map(|x| symbol_at(&buffer, x, description.y + 1))
+        .collect();
+    assert!(first_row.starts_with("line 04"), "{first_row:?}");
+}

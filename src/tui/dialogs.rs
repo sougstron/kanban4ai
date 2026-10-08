@@ -1093,7 +1093,7 @@ impl ModalState {
     }
 
     /// The caret-bearing textarea behind a text field, if `field` is one.
-    fn text_field_mut(&mut self, field: DialogField) -> Option<&mut TextArea<'static>> {
+    pub(crate) fn text_field_mut(&mut self, field: DialogField) -> Option<&mut TextArea<'static>> {
         Some(match field {
             DialogField::Title => &mut self.title,
             DialogField::Description => &mut self.description,

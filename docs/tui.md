@@ -146,6 +146,12 @@ text like a bracketed paste. Description and Review edits attach a clipboard
 image instead when there is no text (or the text is an image file path). With
 no text field focused the keys keep their normal meaning.
 
+The mouse edits text fields (dialog text fields and the Review edits editor) in
+place: a click puts the caret on the clicked character (or the end of a shorter
+line), a drag selects inside the field and copies the selection on release, and
+the wheel scrolls the field under the pointer. Shift+drag keeps the plain
+screen-text selection.
+
 Copying (drag across text on the board, then release) puts the selection on the
 system clipboard through a native helper first — `pbcopy` on macOS, `wl-copy`
 when `WAYLAND_DISPLAY` is set, `xclip`/`xsel` when `DISPLAY` is set, `clip.exe`
