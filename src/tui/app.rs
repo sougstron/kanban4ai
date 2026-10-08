@@ -4602,12 +4602,16 @@ impl App {
             label: "No chain".to_string(),
             value: None,
         }];
+        // A chain target must still be able to reach Review, so only To Do
+        // and In Progress cards are offered: Review/Done/Archive targets have
+        // already fired (or never will) and would only invite dead chains.
         let mut tasks = self
             .board
             .columns
             .iter()
             .flat_map(|column| column.tasks.iter())
             .filter(|task| Some(task.id.as_str()) != edited_task_id)
+            .filter(|task| matches!(task.status, TaskStatus::Todo | TaskStatus::InProgress))
             .collect::<Vec<_>>();
         tasks.sort_by_key(|task| Reverse(task.created_at));
         chain_options.extend(tasks.into_iter().map(|task| SelectOption {
