@@ -17,7 +17,8 @@ action buttons and status hints; buttons stay clickable. `Esc` leaves a text
 panel, then closes the detail; `[`/`]`, arrows, PgUp/PgDn and the wheel still
 drive the thread. Because every `Alt+letter` is a hotkey in the detail, the
 textarea's own Alt bindings (`Alt+b/f/d/v`) are unavailable there — use
-`Ctrl+←/→`, `Ctrl+Delete` and PgUp instead. A detail with no text panel keeps
+`Ctrl+←/→` to jump by word and `Alt+←/→`, `Ctrl/Alt+Backspace` or
+`Ctrl/Alt+Delete` to delete a word. A detail with no text panel keeps
 the plain-letter hotkeys.
 
 - `↑/↓/←/→`: Move focus between tasks/columns
@@ -27,9 +28,11 @@ the plain-letter hotkeys.
   a selector/card selection, where the plain arrows keep their local
   meaning. No wrapping: `Tab` stays the wrapping cycle
 - `Alt+←/→`: switch the settings dialog's tabs from any field (text inputs
-  and filtered selectors included). On a screen without tabs the chord does
-  nothing: the board keeps its columns (plain arrows only), and Yes/No
-  confirmation prompts ignore it. As with `Alt+letter`, `Ctrl+Alt` is left
+  and filtered selectors included). Where no tabs own the chord it deletes a
+  word: in the detail's text panels and in every dialog text field `Alt+←`
+  removes the word before the caret and `Alt+→` the one after it (the board
+  keeps its columns plain-arrow only, and Yes/No confirmation prompts ignore
+  the chord). As with `Alt+letter`, `Ctrl+Alt` is left
   alone — that is AltGr on some layouts
 - `Tab` / `Shift+Tab`: Next/previous column (board) · cycle
   thread/answer/editor panels (detail)
@@ -142,15 +145,19 @@ dictation tools such as Handy send after placing a transcript on the clipboard.
 With a text field focused the board reads the clipboard itself (`pbpaste`,
 `wl-paste`, `xclip`/`xsel`) on the input thread the instant the key arrives,
 because those tools restore the old clipboard moments later, and inserts the
-text like a bracketed paste. Description and Review edits attach a clipboard
-image instead when there is no text (or the text is an image file path). With
-no text field focused the keys keep their normal meaning.
+text like a bracketed paste. Description, Review edits, and the answer
+surfaces — the detail's answer panel and the answer dialog's custom field —
+attach a clipboard image instead when there is no text (or the text is an
+image file path). With no text field focused the keys keep their normal
+meaning.
 
-The mouse edits text fields (dialog text fields and the Review edits editor) in
-place: a click puts the caret on the clicked character (or the end of a shorter
-line), a drag selects inside the field and copies the selection on release, and
-the wheel scrolls the field under the pointer. Shift+drag keeps the plain
-screen-text selection.
+The mouse edits text fields (dialog text fields, the Review edits editor, and
+the detail's custom-answer row) in place: a click puts the caret on the
+clicked character (or the end of a shorter line), a drag selects inside the
+field and copies the selection on release, and the wheel scrolls the field
+under the pointer. Shift+drag keeps the plain screen-text selection. On the
+answer panel the wheel has nothing to scroll — the preview is one row — so it
+steps the variant list instead, exactly like the panel's ↑/↓ keys.
 
 Copying (drag across text on the board, then release) puts the selection on the
 system clipboard through a native helper first — `pbcopy` on macOS, `wl-copy`

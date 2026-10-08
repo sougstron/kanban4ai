@@ -27,6 +27,10 @@ use super::thread_view::{pin_last_message_scroll, visible_thread_messages};
 /// on the same border row.
 const META_TITLE: &str = " Task ";
 const META_TITLE_WIDTH: u16 = META_TITLE.len() as u16;
+/// Prefix of the custom-answer option row; the answer text starts right
+/// after the `› ` marker and this label, and `render_answer_panel` plus the
+/// mouse caret mapping both measure it.
+pub(super) const ANSWER_LABEL: &str = "Custom answer: ";
 /// The Analytics panel is a single bordered row.
 const ANALYTICS_HEIGHT: u16 = 3;
 
@@ -562,15 +566,16 @@ fn render_answer_panel(
     let window_start = cursor_col.saturating_sub(content_width.saturating_sub(1));
     let display_text = width_slice_from(&input_text, window_start);
     let custom_label = if input_text.is_empty() {
-        "Custom answer: (type to fill)".to_string()
+        format!("{ANSWER_LABEL}(type to fill)")
     } else {
-        format!("Custom answer: {display_text}")
+        format!("{ANSWER_LABEL}{display_text}")
     };
     let mut options = vec![option_line(
         &custom_label,
         selected == 0,
         focused,
-        app.is_hovered(HitAction::DetailAnswerOption { index: 0 }),
+        app.is_hovered(HitAction::DetailAnswerInput)
+            || app.is_hovered(HitAction::DetailAnswerOption { index: 0 }),
         theme,
     )];
     for (variant_index, variant) in variants.iter().enumerate() {
@@ -615,6 +620,17 @@ fn render_answer_panel(
         .take(take)
         .enumerate()
     {
+        // The custom-answer row is an editable text field as well as an
+        // option: the mouse places the caret there (see
+        // `App::handle_text_input_mouse`), so it registers the dedicated
+        // input hitbox instead of a plain option one.
+        let action = if option_index == 0 {
+            HitAction::DetailAnswerInput
+        } else {
+            HitAction::DetailAnswerOption {
+                index: option_index,
+            }
+        };
         app.hitboxes.push(Hitbox {
             area: Rect {
                 x: area.x.saturating_add(1),
@@ -624,9 +640,7 @@ fn render_answer_panel(
                 width: area.width.saturating_sub(2),
                 height: 1,
             },
-            action: HitAction::DetailAnswerOption {
-                index: option_index,
-            },
+            action,
         });
         lines.push(line.clone());
     }
@@ -658,7 +672,7 @@ fn render_answer_panel(
         let cursor_x = area
             .x
             .saturating_add(3)
-            .saturating_add(UnicodeWidthStr::width("Custom answer: ") as u16)
+            .saturating_add(UnicodeWidthStr::width(ANSWER_LABEL) as u16)
             .saturating_add((cursor_col - window_start) as u16);
         frame.set_cursor_position((
             cursor_x.min(area.x.saturating_add(area.width.saturating_sub(2))),

@@ -1798,7 +1798,11 @@ impl ModalState {
             DialogField::MessageKind => self.input_select(key, SelectorKind::MessageKind),
             DialogField::Question => self.input_select(key, SelectorKind::Question),
             DialogField::Variant => self.input_select(key, SelectorKind::Variant),
-            DialogField::Answer => super::app::input_multiline(&mut self.answer, key),
+            DialogField::Answer => {
+                if !super::app::apply_word_edit(&mut self.answer, key) {
+                    super::app::input_multiline(&mut self.answer, key);
+                }
+            }
             DialogField::Theme => self.input_select(key, SelectorKind::Theme),
             DialogField::TaskSort => self.input_select(key, SelectorKind::TaskSort),
             DialogField::HideKanbanMessages => toggle_on_space(&mut self.hide_kanban_messages, key),

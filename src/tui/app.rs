@@ -177,6 +177,9 @@ pub enum HitAction {
     DetailAnswerOption {
         index: usize,
     },
+    /// The custom-answer row of the detail's answer panel: an option that is
+    /// also a text field, so a plain click steers that field's caret.
+    DetailAnswerInput,
     DetailPrevQuestion,
     DetailNextQuestion,
     DetailThread,
@@ -605,12 +608,13 @@ struct TextSelection {
     dragged: bool,
 }
 
-/// An editable textarea the mouse can steer: a caret-bearing dialog field or
-/// the detail view's review editor.
+/// An editable textarea the mouse can steer: a caret-bearing dialog field,
+/// the detail view's review editor, or the detail's custom-answer row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextInput {
     Modal(DialogField),
     ReviewEdits,
+    DetailAnswer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1195,7 +1199,10 @@ impl App {
             {
                 return None;
             }
-            return Some(modal.active_field() == DialogField::Description);
+            return Some(matches!(
+                modal.active_field(),
+                DialogField::Description | DialogField::Answer
+            ));
         }
         if self.search.active {
             return Some(false);
@@ -1204,17 +1211,17 @@ impl App {
             return None;
         }
         match self.detail.as_ref()?.focus {
-            DetailFocus::Answer => Some(false),
-            DetailFocus::Edits => Some(true),
+            DetailFocus::Answer | DetailFocus::Edits => Some(true),
             DetailFocus::Thread => None,
         }
     }
 
-    /// Attach a clipboard image to the Description field or the review
-    /// editor, whichever has focus.
+    /// Attach a clipboard image to whatever text target accepts one: the
+    /// Description or Answer field of a dialog, the detail's answer input, or
+    /// the review editor.
     fn paste_clipboard_image(&mut self) {
         if self.modal.is_none() {
-            self.paste_review_image();
+            self.paste_detail_image();
             return;
         }
         match image::paste_image_markdown(self.ops.data_root()) {
@@ -1225,6 +1232,30 @@ impl App {
             }
             Err(err) => self.status = format!("Image paste failed: {err}"),
         }
+    }
+
+    /// Ctrl+V with an image on the clipboard while an answer panel or the
+    /// review editor has focus: attach it the same way the Description field
+    /// does, so screenshots reach the agent as part of the reply or feedback.
+    fn paste_detail_image(&mut self) {
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
+        if detail.focus == DetailFocus::Answer {
+            match image::paste_image_markdown(self.ops.data_root()) {
+                Ok(markdown) => {
+                    if let Some(detail) = self.detail.as_mut() {
+                        detail.answer_input.insert_str(&markdown);
+                        // An attached image is custom-input content.
+                        detail.variant_selected = 0;
+                    }
+                    self.status = "Image attached to the answer".to_string();
+                }
+                Err(err) => self.status = format!("Image paste failed: {err}"),
+            }
+            return;
+        }
+        self.paste_review_image();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -1445,7 +1476,8 @@ impl App {
         // Alt+arrows are global block navigation: up/down jump straight to
         // the panel above/below (thread → answer → review editor) from any
         // caret or variant position, without first walking to a panel edge.
-        // The detail has no tabs, so left/right is deliberately a no-op.
+        // Left/right are not navigation (the detail has no tabs), so they
+        // reach the focused panel, where Alt+←/→ delete a word.
         if key.modifiers.contains(KeyModifiers::ALT)
             && !key.modifiers.contains(KeyModifiers::CONTROL)
         {
@@ -1458,7 +1490,6 @@ impl App {
                     self.move_detail_block(1);
                     return Ok(true);
                 }
-                KeyCode::Left | KeyCode::Right => return Ok(true),
                 _ => {}
             }
         }
@@ -1627,13 +1658,20 @@ impl App {
             KeyCode::Up => self.move_detail_variant(-1),
             KeyCode::Down => self.move_detail_variant(1),
             _ => {
-                if is_text_input_key(key)
-                    && let Some(detail) = self.detail.as_mut()
-                {
-                    detail.answer_input.input(key);
-                    // Typing switches the submission source back to the
-                    // custom input.
-                    detail.variant_selected = 0;
+                if let Some(detail) = self.detail.as_mut() {
+                    // Word chords first (Ctrl+←/→ jump by word, Alt+←/→ and
+                    // Ctrl/Alt+Backspace/Delete delete one); other text keys
+                    // fall through to the plain textarea handling.
+                    let mut handled = apply_word_edit(&mut detail.answer_input, key);
+                    if !handled && is_text_input_key(key) {
+                        detail.answer_input.input(key);
+                        handled = true;
+                    }
+                    if handled {
+                        // Editing the draft switches the submission source
+                        // back to the custom input.
+                        detail.variant_selected = 0;
+                    }
                 }
             }
         }
@@ -2055,12 +2093,16 @@ impl App {
                 match input {
                     TextInput::Modal(_) => self.handle_modal_click(x, y)?,
                     TextInput::ReviewEdits => self.set_detail_focus(DetailFocus::Edits),
+                    // The answer row is an option too: selecting the custom
+                    // answer and focusing the panel is the click's meaning,
+                    // the caret placement below only adds to it.
+                    TextInput::DetailAnswer => self.click_at(x, y)?,
                 }
                 let Some(textarea) = self.text_input_mut(input) else {
                     return Ok(true);
                 };
                 textarea.cancel_selection();
-                place_textarea_caret(textarea, area, x, y);
+                place_input_caret(input, textarea, area, x, y);
                 self.text_input_drag = Some(TextInputDrag {
                     input,
                     area,
@@ -2079,7 +2121,7 @@ impl App {
                     if first_move {
                         textarea.start_selection();
                     }
-                    place_textarea_caret(textarea, area, x, y);
+                    place_input_caret(input, textarea, area, x, y);
                 }
                 Ok(true)
             }
@@ -2099,6 +2141,12 @@ impl App {
                 let Some((input, area)) = self.text_input_at(x, y) else {
                     return Ok(false);
                 };
+                // The answer preview is one row with nothing to scroll; the
+                // wheel over it scrolls the variant list instead (see
+                // `scroll_at`).
+                if input == TextInput::DetailAnswer {
+                    return Ok(false);
+                }
                 let rows = if mouse.kind == MouseEventKind::ScrollUp {
                     -1
                 } else {
@@ -2126,6 +2174,11 @@ impl App {
             HitAction::DetailEdits if self.modal.is_none() && self.screen == Screen::Detail => {
                 TextInput::ReviewEdits
             }
+            HitAction::DetailAnswerInput
+                if self.modal.is_none() && self.screen == Screen::Detail =>
+            {
+                TextInput::DetailAnswer
+            }
             _ => return None,
         };
         self.text_input_mut(input)?;
@@ -2140,6 +2193,11 @@ impl App {
                 .as_mut()
                 .filter(|detail| detail.edits_editable())
                 .map(|detail| &mut detail.review_edits),
+            TextInput::DetailAnswer => self
+                .detail
+                .as_mut()
+                .filter(|detail| !detail.open_questions().is_empty())
+                .map(|detail| &mut detail.answer_input),
         }
     }
 
@@ -2218,6 +2276,7 @@ impl App {
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
                 | HitAction::DetailAnswerOption { .. }
+                | HitAction::DetailAnswerInput
                 | HitAction::DetailPrevQuestion
                 | HitAction::DetailNextQuestion
                 | HitAction::DetailEdits,
@@ -2544,6 +2603,7 @@ impl App {
                 | HitAction::ModalButton(_)
                 | HitAction::ModalTab(_)
                 | HitAction::DetailAnswerOption { .. }
+                | HitAction::DetailAnswerInput
                 | HitAction::DetailPrevQuestion
                 | HitAction::DetailNextQuestion
                 | HitAction::DetailEdits
@@ -2596,6 +2656,15 @@ impl App {
             Some(HitAction::DetailAnswerOption { index }) => {
                 if let Some(detail) = self.detail.as_mut() {
                     detail.variant_selected = index;
+                }
+                self.set_detail_focus(DetailFocus::Answer);
+                Ok(())
+            }
+            // The custom-answer row: picking it is the click, caret steering
+            // happens in `handle_text_input_mouse` on top of this.
+            Some(HitAction::DetailAnswerInput) => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.variant_selected = 0;
                 }
                 self.set_detail_focus(DetailFocus::Answer);
                 Ok(())
@@ -2710,9 +2779,22 @@ impl App {
 
     fn scroll_at(&mut self, x: u16, y: u16, delta: isize) {
         if self.screen != Screen::Board {
-            if self.screen == Screen::Detail && self.hit_at(x, y) == Some(HitAction::DetailThread) {
-                self.scroll_detail(delta);
-                return;
+            if self.screen == Screen::Detail {
+                match self.hit_at(x, y) {
+                    Some(HitAction::DetailThread) => {
+                        self.scroll_detail(delta);
+                        return;
+                    }
+                    // The answer panel's scrollable window is its variant
+                    // list: the wheel steps the selection, exactly like the
+                    // panel's ↑/↓ keys, and the visible options follow.
+                    Some(HitAction::DetailAnswerInput)
+                    | Some(HitAction::DetailAnswerOption { .. }) => {
+                        self.move_detail_variant(delta);
+                        return;
+                    }
+                    _ => {}
+                }
             }
             if delta < 0 {
                 self.page_up();
@@ -2734,6 +2816,7 @@ impl App {
                 | HitAction::ModalButton(_)
                 | HitAction::ModalTab(_)
                 | HitAction::DetailAnswerOption { .. }
+                | HitAction::DetailAnswerInput
                 | HitAction::DetailPrevQuestion
                 | HitAction::DetailNextQuestion
                 | HitAction::DetailEdits
@@ -6814,6 +6897,91 @@ fn place_textarea_caret(textarea: &mut TextArea<'static>, area: Rect, x: u16, y:
     }
 }
 
+/// Move the caret of the text field `input` — `textarea` drawn in `area` —
+/// to the terminal cell `(x, y)`, dispatching on the field kind: the detail's
+/// answer preview is a joined single row with its own window math.
+fn place_input_caret(
+    input: TextInput,
+    textarea: &mut TextArea<'static>,
+    area: Rect,
+    x: u16,
+    y: u16,
+) {
+    match input {
+        TextInput::DetailAnswer => place_answer_caret(textarea, area, x),
+        _ => place_textarea_caret(textarea, area, x, y),
+    }
+}
+
+/// Move the caret of the detail's custom-answer preview to the terminal
+/// column `x`. The panel draws `lines.join(" ")` into one row from
+/// `hitbox.x + 2 + width(ANSWER_LABEL)` (marker + label) with a window that
+/// keeps the caret visible (see `render_answer_panel`), so the clicked
+/// display column is mapped back through that window to a data position.
+/// `y` is ignored: the preview is one row.
+fn place_answer_caret(textarea: &mut TextArea<'static>, area: Rect, x: u16) {
+    use unicode_width::UnicodeWidthChar;
+    let lines: Vec<&str> = textarea.lines().iter().map(String::as_str).collect();
+    let ratatui_textarea::DataCursor(row, col) = textarea.cursor();
+    // Display column of the caret inside the joined text: every preceding
+    // line contributes its width plus the ` ` joiner.
+    let cursor_col = lines
+        .iter()
+        .take(row)
+        .map(|line| UnicodeWidthStr::width(*line) + 1)
+        .sum::<usize>()
+        + lines
+            .get(row)
+            .map(|line| {
+                line.chars()
+                    .take(col)
+                    .map(|ch| ch.width().unwrap_or(0))
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+    // `area` is the hitbox row (the panel inset by the border): the visible
+    // window is `width - 2 - 19` columns wide, the text starts after the
+    // `› ` marker and the label.
+    let content_width = area.width.saturating_sub(17).max(1) as usize;
+    let window_start = cursor_col.saturating_sub(content_width.saturating_sub(1));
+    let clicked = usize::from(x)
+        .saturating_sub(usize::from(area.x.saturating_add(2)))
+        .saturating_sub(UnicodeWidthStr::width(super::detail::ANSWER_LABEL))
+        + window_start;
+    // Walk the joined lines to the (row, column) under `clicked` display
+    // columns; a click inside a wide glyph parks the caret before it.
+    let mut remaining = clicked;
+    for (row, line) in lines.iter().enumerate() {
+        let line_width = UnicodeWidthStr::width(*line);
+        if remaining <= line_width {
+            let mut col = 0usize;
+            for ch in line.chars() {
+                if remaining == 0 {
+                    break;
+                }
+                let width = ch.width().unwrap_or(0);
+                if remaining < width {
+                    break;
+                }
+                remaining -= width;
+                col += 1;
+            }
+            textarea.move_cursor(CursorMove::Jump(
+                u16::try_from(row).unwrap_or(u16::MAX),
+                u16::try_from(col).unwrap_or(u16::MAX),
+            ));
+            return;
+        }
+        remaining -= line_width + 1;
+    }
+    // Past the end: park the caret on the final character.
+    let last = lines.len().saturating_sub(1);
+    textarea.move_cursor(CursorMove::Jump(
+        u16::try_from(last).unwrap_or(u16::MAX),
+        u16::try_from(lines[last].chars().count()).unwrap_or(u16::MAX),
+    ));
+}
+
 /// The text a textarea's selection covers, if it covers any.
 fn textarea_selected_text(textarea: &TextArea<'static>) -> Option<String> {
     let ((start_row, start_col), (end_row, end_col)) = textarea.selection_range()?;
@@ -6931,7 +7099,10 @@ fn is_word_edit_key(key: KeyEvent) -> bool {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Backspace | KeyCode::Delete => ctrl || alt,
-        KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => ctrl && !alt,
+        // Ctrl+arrows jump by word; Alt+arrows (without Ctrl — that is AltGr
+        // on some layouts) delete the word in the arrow's direction.
+        KeyCode::Left | KeyCode::Right => (ctrl && !alt) || (alt && !ctrl),
+        KeyCode::Up | KeyCode::Down => ctrl && !alt,
         _ => false,
     }
 }
@@ -6940,11 +7111,18 @@ pub(super) fn apply_word_edit(textarea: &mut TextArea<'static>, key: KeyEvent) -
     if !is_word_edit_key(key) {
         return false;
     }
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
         KeyCode::Backspace => {
             textarea.delete_word();
         }
         KeyCode::Delete => {
+            textarea.delete_next_word();
+        }
+        KeyCode::Left if alt => {
+            textarea.delete_word();
+        }
+        KeyCode::Right if alt => {
             textarea.delete_next_word();
         }
         _ => {
