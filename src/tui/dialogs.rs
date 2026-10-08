@@ -1393,11 +1393,16 @@ impl ModalState {
         }
     }
 
+    /// Whether the agent selector for `slot` offers a real choice. The option
+    /// list always leads with a "Default …" placeholder (`value: None`), so
+    /// placeholder-only means no choice: the agent settings block hides.
     pub fn should_show_agents_for(&self, slot: AgentSlot) -> bool {
+        let has_choice =
+            |options: &[SelectOption]| options.iter().any(|option| option.value.is_some());
         match slot {
-            AgentSlot::Primary => !self.agent_options.is_empty(),
-            AgentSlot::Designer => !self.designer.agent_options.is_empty(),
-            AgentSlot::Reviewer => !self.reviewer.agent_options.is_empty(),
+            AgentSlot::Primary => has_choice(&self.agent_options),
+            AgentSlot::Designer => has_choice(&self.designer.agent_options),
+            AgentSlot::Reviewer => has_choice(&self.reviewer.agent_options),
         }
     }
 
@@ -3650,6 +3655,7 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         | DialogField::ExecutorCheap1
         | DialogField::ExecutorCheap2
         | DialogField::ExecutorCheap3 => modal.executor_slot_options.len(),
+        DialogField::ReviewerBackend => modal.reviewer.backend_options.len(),
         DialogField::ReviewerModel => modal.reviewer.model_options.len(),
         DialogField::ReviewerEffort => modal.reviewer.effort_options.len(),
         DialogField::ReviewerAgent => modal.reviewer.agent_options.len(),
