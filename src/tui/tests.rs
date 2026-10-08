@@ -3111,6 +3111,54 @@ fn settings_dialog_loads_orchestration_defaults() {
 }
 
 #[test]
+fn form_scrolls_only_as_far_as_the_focused_block_needs() {
+    // Given project settings on a short terminal.
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    render_at(&mut app, 80, 24);
+    app.handle_key(key(KeyCode::Tab)).expect("next field");
+    render_at(&mut app, 80, 24);
+    assert_eq!(
+        app.modal.as_ref().unwrap().form_scroll,
+        0,
+        "visible focus never scrolls"
+    );
+
+    // When focus lands on a block below the fold.
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::MaxRunningTotal);
+    let below = render_at(&mut app, 80, 24);
+    let scrolled = app.modal.as_ref().unwrap().form_scroll;
+
+    // Then the form scrolls just until that block fits at the bottom, keeping
+    // the block above it on screen instead of pinning focus to the top.
+    assert!(scrolled > 0);
+    assert!(below.contains("Max running total"), "{below}");
+    assert!(below.contains("queue enabled"), "{below}");
+
+    // Stepping back onto a visible block leaves the view alone.
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::QueueEnabled);
+    render_at(&mut app, 80, 24);
+    assert_eq!(app.modal.as_ref().unwrap().form_scroll, scrolled);
+
+    // A taller window re-fits on the next frame and gives hidden rows back.
+    render_at(&mut app, 80, 60);
+    assert!(app.modal.as_ref().unwrap().form_scroll < scrolled);
+
+    // Focus above the view scrolls up exactly to it.
+    render_at(&mut app, 80, 24);
+    app.modal.as_mut().unwrap().focus_field(DialogField::Title);
+    render_at(&mut app, 80, 24);
+    assert_eq!(app.modal.as_ref().unwrap().form_scroll, 0);
+}
+
+#[test]
 fn settings_orchestration_snapshots_are_grouped() {
     let (_dir, mut app) = settings_app();
     app.handle_key(key(KeyCode::Char('s')))
@@ -3120,7 +3168,7 @@ fn settings_orchestration_snapshots_are_grouped() {
     app.modal
         .as_mut()
         .unwrap()
-        .focus_field(DialogField::QueueEnabled);
+        .focus_field(DialogField::MaxRunningTotal);
     let limits = render_at(&mut app, 80, 24);
     assert!(limits.contains("queue enabled"));
     assert!(limits.contains("Max running total"));

@@ -602,15 +602,6 @@ impl SubPopup {
         }
     }
 
-    /// Rows of actual content above the Confirm/Cancel buttons; focus on the
-    /// buttons never scrolls past the last content row.
-    fn content_rows(&self) -> usize {
-        match self {
-            SubPopup::Agent(_) => 4,
-            SubPopup::Options(_) => TASK_OPTIONS_FIELDS.len() - 2,
-        }
-    }
-
     fn set_form_scroll(&mut self, scroll: usize) {
         match self {
             SubPopup::Agent(popup) => popup.form_scroll = scroll,
@@ -1005,7 +996,6 @@ impl ModalState {
         } else {
             self.field_index = index;
         }
-        self.ensure_active_field_visible();
     }
 
     pub fn next_field(&mut self) {
@@ -1492,7 +1482,6 @@ impl ModalState {
         self.settings_tab = tab;
         self.field_index = 0;
         self.form_scroll = 0;
-        self.ensure_active_field_visible();
     }
 
     /// The tab strip this dialog shows: Projects is Global Settings only.
@@ -2585,22 +2574,6 @@ impl ModalState {
         self.current_variants().get(selected - 1).cloned()
     }
 
-    fn ensure_active_field_visible(&mut self) {
-        if let Some(popup) = self.sub_popup.as_mut() {
-            popup.set_form_scroll(popup.field_index().min(popup.content_rows() - 1));
-            return;
-        }
-        let fields = match self.modal {
-            Modal::NewTask { .. } | Modal::EditTask { .. } => Some(&TASK_FORM_FIELDS[..]),
-            Modal::Settings => Some(settings_page_fields(self.settings_tab)),
-            Modal::GlobalSettings => Some(global_settings_page_fields(self.settings_tab)),
-            _ => None,
-        };
-        if let Some(fields) = fields {
-            self.form_scroll = self.field_index.min(fields.len() - 1);
-        }
-    }
-
     fn editable_signature(&self) -> String {
         [
             raw_textarea_text(&self.title),
@@ -2937,7 +2910,12 @@ fn render_sub_popup(
         height: button_height.min(inner.height.saturating_sub(content_height)),
         ..inner
     };
-    let rows = selector_form_rows_from_scroll(modal, content, view.fields, view.scroll);
+    let focused = modal.active_field();
+    let scroll = fit_form_scroll(modal, content, view.fields, view.scroll, focused);
+    if let Some(popup) = modal.sub_popup.as_mut() {
+        popup.set_form_scroll(scroll);
+    }
+    let rows = selector_form_rows_from_scroll(modal, content, view.fields, scroll);
     let mut y = content.y;
     for (field, height) in rows {
         let row = Rect {
@@ -3461,6 +3439,10 @@ fn render_selector_form(
         height: button_height.min(area.height.saturating_sub(content_height)),
         ..area
     };
+    // The parent's own focus, even while a nested popup draws over it.
+    if let Some(&focused) = modal.parent_fields().get(modal.field_index) {
+        modal.form_scroll = fit_form_scroll(modal, content, fields, modal.form_scroll, focused);
+    }
     let rows = selector_form_rows(modal, content, fields);
     let mut y = content.y;
     for (field, height) in rows {
@@ -3525,6 +3507,50 @@ fn description_content_height(modal: &ModalState, row_width: u16) -> u16 {
     let rows =
         u16::try_from(probe.screen_cursor().row.saturating_add(1)).unwrap_or(DESCRIPTION_MAX_ROWS);
     rows.clamp(DESCRIPTION_MIN_ROWS, DESCRIPTION_MAX_ROWS)
+}
+
+/// The first visible field to draw so the focused one sits fully inside
+/// `content`, moving `scroll` as little as possible: focus above the view
+/// scrolls up to it, a focused block crossing the bottom edge scrolls down
+/// only until its last row fits, and a view taller than the rest of the form
+/// scrolls back so no rows stay empty below the last field. Renders call it
+/// every frame, so a resized terminal re-fits without a key press. Focus
+/// outside `fields` (the buttons) leaves the view where it is.
+fn fit_form_scroll(
+    modal: &ModalState,
+    content: Rect,
+    fields: &[DialogField],
+    scroll: usize,
+    focused: DialogField,
+) -> usize {
+    let visible: Vec<DialogField> = fields
+        .iter()
+        .copied()
+        .filter(|field| !should_skip_field(modal, *field))
+        .collect();
+    if visible.is_empty() {
+        return 0;
+    }
+    let heights: Vec<u32> = visible
+        .iter()
+        .map(|field| match field {
+            DialogField::Description => u32::from(description_content_height(modal, content.width)),
+            _ => u32::from(task_field_min_height(*field)),
+        })
+        .collect();
+    let fits = |range: &[u32]| range.iter().sum::<u32>() <= u32::from(content.height);
+
+    let mut scroll = scroll.min(visible.len() - 1);
+    while scroll > 0 && fits(&heights[scroll - 1..]) {
+        scroll -= 1;
+    }
+    if let Some(focus) = visible.iter().position(|field| *field == focused) {
+        scroll = scroll.min(focus);
+        while scroll < focus && !fits(&heights[scroll..=focus]) {
+            scroll += 1;
+        }
+    }
+    scroll
 }
 
 fn selector_form_rows_from_scroll(
