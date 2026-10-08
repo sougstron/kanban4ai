@@ -10463,8 +10463,9 @@ fn type_text(app: &mut App, text: &str) {
 fn chain_filter_narrows_options_and_keeps_selection_on_a_match() {
     let (_dir, mut app) = populated_app();
     open_new_task_on_chain(&mut app);
+    // TASK-002 sits in Review, so only TASK-001 is offered as a chain target.
     let modal = app.modal.as_ref().expect("modal");
-    assert_eq!(modal.visible_options(DialogField::ChainTo).len(), 3);
+    assert_eq!(modal.visible_options(DialogField::ChainTo).len(), 2);
 
     type_text(&mut app, "question");
     let modal = app.modal.as_ref().expect("modal");
@@ -10479,7 +10480,7 @@ fn chain_filter_narrows_options_and_keeps_selection_on_a_match() {
     }
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.chain_filter, "");
-    assert_eq!(modal.visible_options(DialogField::ChainTo).len(), 3);
+    assert_eq!(modal.visible_options(DialogField::ChainTo).len(), 2);
 }
 
 #[test]
@@ -10496,11 +10497,11 @@ fn chain_filter_matches_the_default_entry_too() {
 fn enter_on_a_single_filter_match_selects_it_and_advances() {
     let (_dir, mut app) = populated_app();
     open_new_task_on_chain(&mut app);
-    type_text(&mut app, "implement");
+    type_text(&mut app, "question");
     app.handle_key(key(KeyCode::Enter)).expect("enter");
 
     let modal = app.modal.as_ref().expect("modal");
-    assert_eq!(modal.chain_text().as_deref(), Some("TASK-002"));
+    assert_eq!(modal.chain_text().as_deref(), Some("TASK-001"));
     assert_eq!(
         modal.active_field(),
         DialogField::TaskOptions,
@@ -10567,7 +10568,7 @@ fn selecting_an_option_clears_the_filter_error() {
 fn leaving_a_selector_clears_its_filter() {
     let (_dir, mut app) = populated_app();
     open_new_task_on_chain(&mut app);
-    type_text(&mut app, "implement");
+    type_text(&mut app, "question");
     let selected = app.modal.as_ref().expect("modal").chain_selected;
     assert_eq!(
         app.modal
@@ -10586,7 +10587,7 @@ fn leaving_a_selector_clears_its_filter() {
         modal.chain_filter, "",
         "the filter does not outlive a visit"
     );
-    assert_eq!(modal.visible_options(DialogField::ChainTo).len(), 3);
+    assert_eq!(modal.visible_options(DialogField::ChainTo).len(), 2);
     assert_eq!(modal.chain_selected, selected, "the pick itself survives");
 }
 
@@ -10655,7 +10656,9 @@ fn filtered_selector_click_resolves_to_the_unfiltered_option_index() {
     open_new_task_on_chain(&mut app);
     type_text(&mut app, "task-");
     let _ = render_at(&mut app, 100, 60);
-    let expected = app.modal.as_ref().expect("modal").chain_options[2]
+    // "task-" matches only the To Do TASK-001; TASK-002 sits in Review and is
+    // not offered.
+    let expected = app.modal.as_ref().expect("modal").chain_options[1]
         .value
         .clone();
 
@@ -10663,7 +10666,7 @@ fn filtered_selector_click_resolves_to_the_unfiltered_option_index() {
         &app,
         HitAction::ModalOption {
             field: DialogField::ChainTo,
-            index: 2,
+            index: 1,
         },
     );
     app.handle_mouse(MouseEvent {
@@ -10674,7 +10677,7 @@ fn filtered_selector_click_resolves_to_the_unfiltered_option_index() {
     })
     .expect("click option");
     let modal = app.modal.as_ref().expect("modal");
-    assert_eq!(modal.chain_selected, 2);
+    assert_eq!(modal.chain_selected, 1);
     assert_eq!(modal.chain_text(), expected);
     assert!(
         !app.hitboxes.iter().any(|hitbox| hitbox.action
