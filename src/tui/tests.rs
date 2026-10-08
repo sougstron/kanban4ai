@@ -1601,6 +1601,266 @@ fn settings_validation_error_focuses_the_field_tab() {
     assert!(modal.error.is_some(), "{:?}", modal.error);
 }
 
+/// `Alt+Left/Right` switch the settings tabs from fields that own the plain
+/// arrows — a text caret, a per-backend cap textarea, a filtered selector.
+#[test]
+fn settings_alt_arrows_switch_tabs_from_owning_fields() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+
+    // From Title (text caret): Alt+Right switches tabs, Alt+Left returns.
+    app.handle_key(alt_key(KeyCode::Right)).expect("alt right");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Designer
+    );
+    app.handle_key(alt_key(KeyCode::Left)).expect("alt left");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Common
+    );
+
+    // From the per-backend cap textarea (owns the plain arrows).
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::MaxRunningPerBackend);
+    app.handle_key(alt_key(KeyCode::Right)).expect("alt right");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Designer
+    );
+
+    // From a filtered selector (owns both arrows).
+    let modal = app.modal.as_mut().unwrap();
+    modal.set_settings_tab(SettingsTab::Designer);
+    modal.focus_field(DialogField::DesignerBackend);
+    app.handle_key(alt_key(KeyCode::Left)).expect("alt left");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Common
+    );
+}
+
+/// `Alt+Up/Down` walk a dialog's fields from anywhere — out of a text caret
+/// and out of a selector that owns the plain arrows — without wrapping;
+/// Tab remains the wrapping cycle and the button row is not stepped over.
+#[test]
+fn dialog_alt_up_down_walk_fields_from_text_and_selectors() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    // NewTask fields: Title, Description, AgentSettings, Readonly, ChainTo,
+    // TaskOptions, Confirm, Cancel.
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Title
+    );
+
+    // Park the caret inside a multi-line description: the plain arrows stay
+    // local, Alt+Up leaves the field.
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Description
+    );
+    for c in "first line\nsecond line".chars() {
+        let k = if c == '\n' {
+            key(KeyCode::Enter)
+        } else {
+            key(KeyCode::Char(c))
+        };
+        app.handle_key(k).unwrap();
+    }
+    app.handle_key(key(KeyCode::Up)).unwrap();
+    assert_eq!(
+        app.modal.as_ref().unwrap().description.cursor(),
+        (0, 10),
+        "plain Up stays inside the text"
+    );
+    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Title
+    );
+
+    // From the ChainTo selector (owns the plain arrows) Alt walks the
+    // ladder one field at a time without wrapping; Confirm and Cancel
+    // share a row.
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::ChainTo);
+    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Readonly
+    );
+    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::ChainTo
+    );
+    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::TaskOptions
+    );
+    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Confirm
+    );
+    app.handle_key(alt_key(KeyCode::Down))
+        .expect("no step onto Cancel");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Confirm
+    );
+    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::TaskOptions
+    );
+    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::ChainTo
+    );
+    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Readonly
+    );
+    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::AgentSettings
+    );
+    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Description
+    );
+    app.handle_key(alt_key(KeyCode::Up))
+        .expect("stops at the first field");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Title
+    );
+    app.handle_key(alt_key(KeyCode::Up))
+        .expect("no wrap above Title");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Title
+    );
+}
+
+/// Without tabs `Alt+Left/Right` does nothing: not on the board's columns,
+/// not inside a plain dialog, not on a Yes/No confirmation.
+#[test]
+fn alt_left_right_is_a_noop_without_tabs() {
+    let (_dir, mut app) = populated_app();
+    let start = (app.focused_column, app.focused_card);
+    app.handle_key(alt_key(KeyCode::Left)).unwrap();
+    app.handle_key(alt_key(KeyCode::Right)).unwrap();
+    assert_eq!((app.focused_column, app.focused_card), start);
+
+    // The plain arrows keep moving columns.
+    app.handle_key(key(KeyCode::Right)).unwrap();
+    assert_eq!(app.focused_column, start.0 + 1);
+    app.handle_key(key(KeyCode::Left)).unwrap();
+    assert_eq!(app.focused_column, start.0);
+
+    // A dialog without tabs: field focus and text unchanged.
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    let field_before = app.modal.as_ref().unwrap().active_field();
+    let title_before = app.modal.as_ref().unwrap().title.lines().join("\n");
+    app.handle_key(alt_key(KeyCode::Left)).unwrap();
+    app.handle_key(alt_key(KeyCode::Right)).unwrap();
+    assert_eq!(app.modal.as_ref().unwrap().active_field(), field_before);
+    assert_eq!(
+        app.modal.as_ref().unwrap().title.lines().join("\n"),
+        title_before
+    );
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(app.modal.is_none(), "clean dialog closed");
+
+    // A Yes/No confirmation: Alt+Left does not flip the selection.
+    app.handle_key(key(KeyCode::Char('d')))
+        .expect("delete dialog");
+    assert!(matches!(
+        app.modal.as_ref().unwrap().modal,
+        Modal::DeleteConfirm { .. }
+    ));
+    assert!(!app.modal.as_ref().unwrap().confirm_yes_selected);
+    app.handle_key(alt_key(KeyCode::Left)).unwrap();
+    assert!(!app.modal.as_ref().unwrap().confirm_yes_selected);
+    app.handle_key(key(KeyCode::Left)).unwrap();
+    assert!(app.modal.as_ref().unwrap().confirm_yes_selected);
+}
+
+/// `Alt+Up/Down` jump between the detail's panels from any caret position
+/// (no walking to a panel edge first), and `Alt+Left/Right` — the detail
+/// has no tabs — change neither focus nor text. With an open question the
+/// answer panel joins the ladder, even from a mid-list variant selection.
+#[test]
+fn detail_alt_arrows_jump_blocks_and_ignore_left_right() {
+    let (_dir, mut app) = open_focused_review_editor("abcdef");
+    // Park the caret mid-text: plain Up/Down stay in the editor.
+    app.handle_key(key(KeyCode::Home)).unwrap();
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Right)).unwrap();
+    }
+    app.handle_key(key(KeyCode::Up)).unwrap();
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.cursor(),
+        (0, 0),
+        "plain Up stays inside the text"
+    );
+
+    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+    // The ends do not wrap.
+    app.handle_key(alt_key(KeyCode::Up))
+        .expect("no wrap above the thread");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+    app.handle_key(alt_key(KeyCode::Down))
+        .expect("editor is the last block");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+
+    // No tabs in the detail: Alt+Left/Right change neither focus nor text.
+    app.handle_key(alt_key(KeyCode::Left)).unwrap();
+    app.handle_key(alt_key(KeyCode::Right)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.cursor(),
+        (0, 0),
+        "the caret never moved"
+    );
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert_eq!(app.screen, Screen::Board);
+
+    // The answer panel of an open question sits between thread and editor.
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Answer);
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().variant_selected, 1);
+    app.handle_key(alt_key(KeyCode::Up))
+        .expect("out of the variant list");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Answer);
+}
+
 /// Edits made on different tabs all live in the one dialog state: they
 /// survive a tab round-trip and a single Save persists them together.
 #[test]

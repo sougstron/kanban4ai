@@ -21,6 +21,16 @@ textarea's own Alt bindings (`Alt+b/f/d/v`) are unavailable there — use
 the plain-letter hotkeys.
 
 - `↑/↓/←/→`: Move focus between tasks/columns
+- `Alt+↑/↓`: jump to the block above/below from anywhere — the detail's
+  thread/answer/editor panels, a dialog's form fields (the nested
+  agent-settings and Options popups included) — even out of a text caret or
+  a selector/card selection, where the plain arrows keep their local
+  meaning. No wrapping: `Tab` stays the wrapping cycle
+- `Alt+←/→`: switch the settings dialog's tabs from any field (text inputs
+  and filtered selectors included). On a screen without tabs the chord does
+  nothing: the board keeps its columns (plain arrows only), and Yes/No
+  confirmation prompts ignore it. As with `Alt+letter`, `Ctrl+Alt` is left
+  alone — that is AltGr on some layouts
 - `Tab` / `Shift+Tab`: Next/previous column (board) · cycle
   thread/answer/editor panels (detail)
 - `Enter`: Show task detail. Between the Task and Thread panels an
@@ -58,7 +68,8 @@ the plain-letter hotkeys.
   labelled strip with a rule under it. **Left/Right switch tabs** (wrapping at
   the ends) whenever the focused field does not own those arrows — i.e.
   everywhere except text inputs, the per-backend cap lists, and the filtered
-  selectors (backend/model/chain-to and the Executor slots); Tab/BackTab keep
+  selectors (backend/model/chain-to and the Executor slots); **`Alt+←/→`
+  switch tabs from those fields too**; Tab/BackTab keep
   cycling inside the active tab, and a tab label is also clickable with the
   mouse. Each tab shows only its own page, but Save/Cancel sit under every
   tab and persist the **whole** dialog, so switching tabs never loses an

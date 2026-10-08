@@ -1373,10 +1373,16 @@ impl App {
             }
             (KeyCode::Char('a'), _) => self.dispatch(UiAction::OpenArchive)?,
             (KeyCode::Char('l'), _) => self.dispatch(UiAction::OpenSessions)?,
-            (KeyCode::Left, _) | (KeyCode::BackTab, _) if self.screen == Screen::Board => {
+            // Board columns are not tabs: with Alt held (the reserved
+            // block/tab navigation) left/right does nothing here.
+            (KeyCode::Left, m) | (KeyCode::BackTab, m)
+                if self.screen == Screen::Board && !m.contains(KeyModifiers::ALT) =>
+            {
                 self.focus_prev_column()
             }
-            (KeyCode::Right, _) | (KeyCode::Tab, _) if self.screen == Screen::Board => {
+            (KeyCode::Right, m) | (KeyCode::Tab, m)
+                if self.screen == Screen::Board && !m.contains(KeyModifiers::ALT) =>
+            {
                 self.focus_next_column()
             }
             (KeyCode::Up, _) => self.focus_up(),
@@ -1415,6 +1421,26 @@ impl App {
         let Some(detail) = self.detail.as_ref() else {
             return Ok(false);
         };
+        // Alt+arrows are global block navigation: up/down jump straight to
+        // the panel above/below (thread → answer → review editor) from any
+        // caret or variant position, without first walking to a panel edge.
+        // The detail has no tabs, so left/right is deliberately a no-op.
+        if key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            match key.code {
+                KeyCode::Up => {
+                    self.move_detail_block(-1);
+                    return Ok(true);
+                }
+                KeyCode::Down => {
+                    self.move_detail_block(1);
+                    return Ok(true);
+                }
+                KeyCode::Left | KeyCode::Right => return Ok(true),
+                _ => {}
+            }
+        }
         if key.code == KeyCode::Tab {
             self.cycle_detail_focus();
             return Ok(true);
@@ -1501,6 +1527,33 @@ impl App {
                 return;
             }
         }
+    }
+
+    /// `Alt+Up`/`Alt+Down`: walk the detail's block ladder (thread → answer
+    /// → review editor) one block up or down, skipping unavailable panels
+    /// and stopping at the ends instead of wrapping — `Tab` remains the
+    /// wrapping cycle. Works from any caret or variant position.
+    fn move_detail_block(&mut self, delta: isize) {
+        let order = [DetailFocus::Thread, DetailFocus::Answer, DetailFocus::Edits];
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
+        let current = order
+            .iter()
+            .position(|focus| *focus == detail.focus)
+            .unwrap_or(0);
+        let mut index = current as isize + delta;
+        let target = loop {
+            if !(0..order.len() as isize).contains(&index) {
+                return;
+            }
+            let candidate = order[index as usize];
+            if detail.focus_available(candidate) {
+                break candidate;
+            }
+            index += delta;
+        };
+        self.set_detail_focus(target);
     }
 
     fn set_detail_focus(&mut self, focus: DetailFocus) {
@@ -5468,7 +5521,12 @@ impl App {
                 KeyCode::Char('n') | KeyCode::Esc => {
                     modal.discard_confirm = false;
                 }
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                // No tabs and no field ladder here: Alt+Left/Right must stay
+                // a no-op (arrows without Alt still flip Yes/No).
+                KeyCode::Left | KeyCode::Right if !key.modifiers.contains(KeyModifiers::ALT) => {
+                    modal.confirm_yes_selected = !modal.confirm_yes_selected;
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
                     modal.confirm_yes_selected = !modal.confirm_yes_selected;
                 }
                 KeyCode::Enter if modal.confirm_yes_selected => return self.discard_modal(modal),
@@ -5492,7 +5550,12 @@ impl App {
                     self.status = "Dialog cancelled".to_string();
                     return Ok(true);
                 }
-                KeyCode::Left | KeyCode::Right | KeyCode::Tab | KeyCode::BackTab => {
+                // Same rule as the discard prompt: Alt+Left/Right is a
+                // reserved no-op on tab-less screens.
+                KeyCode::Left | KeyCode::Right if !key.modifiers.contains(KeyModifiers::ALT) => {
+                    modal.confirm_yes_selected = !modal.confirm_yes_selected;
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
                     modal.confirm_yes_selected = !modal.confirm_yes_selected;
                 }
                 KeyCode::Enter if modal.confirm_yes_selected => {
@@ -5512,13 +5575,41 @@ impl App {
                     return Ok(true);
                 }
                 KeyCode::Esc => return self.request_modal_close(modal),
+                // Alt+Up/Down walk the form fields from anywhere — text
+                // carets and selector lists included — where the plain
+                // arrows keep their field-level meaning. Without wrapping:
+                // Tab stays the wrapping cycle. Ctrl+Alt is left alone
+                // (AltGr arrives that way on some layouts).
+                KeyCode::Up | KeyCode::Down
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    modal.arrow_field(if key.code == KeyCode::Up { -1 } else { 1 });
+                }
                 KeyCode::Tab => modal.next_field(),
                 KeyCode::BackTab => modal.prev_field(),
                 KeyCode::Up | KeyCode::Down if modal.vertical_arrow(key) => {}
                 // In the settings dialog the arrows walk the tab strip —
                 // except where a field owns them (text carets, filtered
-                // selectors), and while an agent popup is open. Tab/BackTab
+                // selectors), and while an agent popup is open. Alt+Left/
+                // Right switch tabs from any field, owning ones included,
+                // while a popup is open only its own window is in play.
+                // Forms without tabs leave the chord unused. Tab/BackTab
                 // still reach the Save/Cancel buttons from any field.
+                KeyCode::Left | KeyCode::Right
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && modal.is_settings_form()
+                        && !modal.popup_open() =>
+                {
+                    let current = modal.settings_tab;
+                    let tabs = modal.settings_tabs();
+                    modal.set_settings_tab(if key.code == KeyCode::Left {
+                        current.prev(tabs)
+                    } else {
+                        current.next(tabs)
+                    });
+                }
                 KeyCode::Left | KeyCode::Right
                     if modal.is_settings_form()
                         && !modal.popup_open()
@@ -5533,10 +5624,11 @@ impl App {
                     });
                 }
                 KeyCode::Left | KeyCode::Right
-                    if matches!(
-                        modal.active_field(),
-                        DialogField::Confirm | DialogField::Cancel
-                    ) =>
+                    if !key.modifiers.contains(KeyModifiers::ALT)
+                        && matches!(
+                            modal.active_field(),
+                            DialogField::Confirm | DialogField::Cancel
+                        ) =>
                 {
                     if modal.active_field() == DialogField::Confirm {
                         modal.focus_field(DialogField::Cancel);
