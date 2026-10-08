@@ -12012,3 +12012,246 @@ fn wheel_scrolls_the_text_field_under_the_pointer() {
         .collect();
     assert!(first_row.starts_with("line 04"), "{first_row:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Answer UX: word-wise chords, mouse caret/selection on the answer row, the
+// variant wheel, and Ctrl+V image targeting.
+// ---------------------------------------------------------------------------
+
+/// A board whose focused card has one open question, ready for the answer
+/// surfaces (press `w` for the dialog, `Enter`+`Tab` for the detail panel).
+fn question_app(question: &str, variants: &[&str]) -> (tempfile::TempDir, App, String) {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Answer UX holder"))
+        .expect("create task");
+    app.ops
+        .ask_question(
+            &task.id,
+            question,
+            "agent",
+            variants.iter().map(|variant| variant.to_string()).collect(),
+        )
+        .expect("ask question");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    (_dir, app, task.id)
+}
+
+fn open_answer_panel(app: &mut App) {
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.handle_key(key(KeyCode::Tab)).expect("focus answer");
+    assert_eq!(
+        app.detail.as_ref().expect("detail state").focus,
+        DetailFocus::Answer
+    );
+}
+
+#[test]
+fn detail_answer_word_keys_jump_and_delete_by_word() {
+    let (_dir, mut app, _task) = question_app("Which one?", &[]);
+    open_answer_panel(&mut app);
+    for character in "alpha beta gamma".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("type answer");
+    }
+    app.handle_key(key(KeyCode::Home)).expect("to start");
+
+    app.handle_key(ctrl_key(KeyCode::Right))
+        .expect("word forward");
+    assert_eq!(
+        app.detail.as_ref().unwrap().answer_input.cursor(),
+        (0, 6),
+        "Ctrl+→ lands after `alpha `"
+    );
+    app.handle_key(ctrl_key(KeyCode::Right))
+        .expect("word forward");
+    assert_eq!(
+        app.detail.as_ref().unwrap().answer_input.cursor(),
+        (0, 11),
+        "Ctrl+→ lands after `beta `"
+    );
+    app.handle_key(ctrl_key(KeyCode::Left)).expect("word back");
+    assert_eq!(
+        app.detail.as_ref().unwrap().answer_input.cursor(),
+        (0, 6),
+        "Ctrl+← walks back to the word start"
+    );
+
+    app.handle_key(ctrl_key(KeyCode::Delete))
+        .expect("delete word");
+    let detail = app.detail.as_ref().unwrap();
+    assert_eq!(detail.answer_input.lines(), ["alpha  gamma"]);
+    assert_eq!(detail.answer_input.cursor(), (0, 6));
+
+    app.handle_key(alt_key(KeyCode::Left))
+        .expect("delete word back");
+    let detail = app.detail.as_ref().unwrap();
+    assert_eq!(detail.answer_input.lines(), [" gamma"]);
+    assert_eq!(detail.answer_input.cursor(), (0, 0));
+
+    app.handle_key(alt_key(KeyCode::Right))
+        .expect("delete word forward");
+    let detail = app.detail.as_ref().unwrap();
+    assert_eq!(detail.answer_input.lines(), [""]);
+    assert_eq!(detail.answer_input.cursor(), (0, 0));
+}
+
+#[test]
+fn answer_dialog_field_jumps_and_deletes_by_word() {
+    let (_dir, mut app, _task) = question_app("Which one?", &["First", "Second"]);
+    app.handle_key(key(KeyCode::Char('w')))
+        .expect("answer dialog");
+    app.modal
+        .as_mut()
+        .expect("modal")
+        .focus_field(DialogField::Answer);
+    for character in "alpha beta".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("type answer");
+    }
+    app.handle_key(key(KeyCode::Home)).expect("to start");
+
+    app.handle_key(ctrl_key(KeyCode::Right))
+        .expect("word forward");
+    assert_eq!(
+        app.modal.as_ref().unwrap().answer.cursor(),
+        (0, 6),
+        "Ctrl+→ lands after `alpha `"
+    );
+
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT))
+        .expect("alt+backspace deletes the word");
+    assert_eq!(
+        app.modal.as_ref().unwrap().answer.lines(),
+        ["beta"],
+        "Alt+Backspace removes `alpha ` before the caret"
+    );
+    assert_eq!(app.modal.as_ref().unwrap().answer.cursor(), (0, 0));
+}
+
+#[test]
+fn clicking_the_detail_answer_row_places_the_caret() {
+    let (_dir, mut app, _task) = question_app("Which one?", &["One", "Two"]);
+    open_answer_panel(&mut app);
+    // Park the selection on a variant: the click must return it to the
+    // custom input before steering the caret.
+    app.handle_key(key(KeyCode::Down)).expect("pick variant");
+    assert_eq!(app.detail.as_ref().unwrap().variant_selected, 1);
+    for character in "hello world".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("type answer");
+    }
+    let buffer = rendered_buffer(&mut app, 120, 40);
+    let row = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::DetailAnswerInput)
+        .expect("answer input hitbox")
+        .area;
+    let (x, y) = find_text_in(&buffer, row, "world");
+
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x + 2, y))
+        .expect("press answer row");
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), x + 2, y))
+        .expect("release");
+    let detail = app.detail.as_ref().expect("detail state");
+    assert_eq!(detail.focus, DetailFocus::Answer);
+    assert_eq!(detail.variant_selected, 0, "the click reselects the input");
+    assert_eq!(
+        detail.answer_input.cursor(),
+        (0, 8),
+        "the caret lands on the clicked character"
+    );
+    assert!(
+        app.take_pending_copy().is_none(),
+        "a plain click copies nothing"
+    );
+}
+
+#[test]
+fn dragging_in_the_answer_row_selects_and_copies() {
+    let (_dir, mut app, _task) = question_app("Which one?", &[]);
+    open_answer_panel(&mut app);
+    for character in "hello world".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("type answer");
+    }
+    let buffer = rendered_buffer(&mut app, 120, 40);
+    let row = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::DetailAnswerInput)
+        .expect("answer input hitbox")
+        .area;
+    let (from_x, from_y) = find_text_in(&buffer, row, "world");
+    let (to_x, to_y) = find_text_in(&buffer, row, "d");
+
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        from_x,
+        from_y,
+    ))
+    .expect("press");
+    app.handle_mouse(mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        to_x + 1,
+        to_y,
+    ))
+    .expect("drag");
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), to_x + 1, to_y))
+        .expect("release");
+    assert_eq!(app.take_pending_copy().as_deref(), Some("world"));
+    assert_eq!(
+        app.detail.as_ref().unwrap().answer_input.selection_range(),
+        Some(((0, 6), (0, 11)))
+    );
+}
+
+#[test]
+fn wheel_over_the_answer_panel_steps_the_variants() {
+    let (_dir, mut app, _task) = question_app("Which one?", &["One", "Two", "Three"]);
+    open_answer_panel(&mut app);
+    let _ = rendered_buffer(&mut app, 120, 40);
+    let row = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::DetailAnswerInput)
+        .expect("answer input hitbox")
+        .area;
+    let (x, y) = (row.x + 2, row.y);
+
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, y))
+        .expect("wheel down");
+    assert_eq!(app.detail.as_ref().unwrap().variant_selected, 1);
+    app.handle_mouse(mouse(MouseEventKind::ScrollDown, x, y))
+        .expect("wheel down");
+    assert_eq!(app.detail.as_ref().unwrap().variant_selected, 2);
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, x, y))
+        .expect("wheel up");
+    assert_eq!(app.detail.as_ref().unwrap().variant_selected, 1);
+}
+
+#[test]
+fn ctrl_v_in_the_answer_panel_keeps_the_draft_and_never_types_v() {
+    let (_dir, mut app, _task) = question_app("Pics?", &[]);
+    open_answer_panel(&mut app);
+    for character in "keep".chars() {
+        app.handle_key(key(KeyCode::Char(character)))
+            .expect("type answer");
+    }
+
+    // The panel is an image target now, but text on the clipboard (as here —
+    // the test cannot control it) still pastes as text, and an image-only
+    // clipboard attaches a markdown link or fails gracefully. Either way the
+    // draft stays at the head and the chord never leaks a `v` keystroke.
+    app.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .expect("ctrl+v");
+
+    let detail = app.detail.as_ref().expect("detail state");
+    let text = detail.answer_input.lines().join("\n");
+    assert!(
+        text.starts_with("keep"),
+        "Ctrl+V must not clobber the draft or type v: {text:?}"
+    );
+}
