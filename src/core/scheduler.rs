@@ -177,6 +177,15 @@ pub struct Dispatched {
     pub role: &'static str,
 }
 
+/// A queued task claimed for launch, after the executor-pool walk. The
+/// backend and model are the ones the walk left on the task, which can
+/// differ from the assignment the dispatcher measured before the lock.
+struct ClaimedRun {
+    session_id: String,
+    backend: String,
+    model: Option<String>,
+}
+
 /// Map the board's `tui.task_sort` value onto [`sort_tasks`] arguments — the
 /// same mapping the board screen applies, so the queue drains in board order
 /// and changing the sort changes the queue priority. Unknown and legacy
@@ -262,19 +271,13 @@ impl Operations {
                 DispatchDecision::Skip => continue,
                 DispatchDecision::Launch => {}
             }
-            let Some(session_id) = self.claim_queued_task(
-                &candidate.id,
-                &settings.backend,
-                settings.model.as_deref(),
-                role.as_str(),
-                next_phase,
-            )?
+            let Some(claimed) = self.claim_queued_task(&candidate.id, role.as_str(), next_phase)?
             else {
                 continue;
             };
             match self.finish_launch(
-                &session_id,
-                self.launch_agent(&candidate.id, &session_id, false),
+                &claimed.session_id,
+                self.launch_agent(&candidate.id, &claimed.session_id, false),
             ) {
                 Ok(true) => {}
                 Ok(false) | Err(_) => {
@@ -285,11 +288,11 @@ impl Operations {
                     continue;
                 }
             }
-            slots.bump(&settings.backend, settings.model.as_deref(), role.as_str());
+            slots.bump(&claimed.backend, claimed.model.as_deref(), role.as_str());
             dispatched.push(Dispatched {
                 task_id: candidate.id.clone(),
-                session_id,
-                backend: settings.backend.clone(),
+                session_id: claimed.session_id,
+                backend: claimed.backend,
                 role: role.as_str(),
             });
         }
@@ -305,13 +308,11 @@ impl Operations {
     fn claim_queued_task(
         &self,
         task_id: &str,
-        backend: &str,
-        model: Option<&str>,
         role: &str,
         phase: RunPhase,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<ClaimedRun>> {
         let session_mgr = self.session_manager();
-        let new_session_id = {
+        let claimed_run = {
             let _guard = self.storage.lock()?;
             let Some(task) = self.storage.load_task(task_id)? else {
                 return Ok(None);
@@ -340,18 +341,24 @@ impl Operations {
                 return Ok(None);
             }
             let mut task = claimed;
-            // Concurrent pumps (TUI tick + daemon) serialize here: re-measure
-            // so a claim that just filled the last slot is visible.
+            // Resolve against the phase this claim is about to start. The
+            // task is still `queued` here; leaving it that way would report
+            // the executor backend for a launch that is actually the designer
+            // or the reviewer. The pool may also have just replaced the
+            // executor assignment, and the session id has to follow that
+            // backend — otherwise a grok task the pool moved to opencode is
+            // recorded as `ses-grok-…` and counted against grok's cap.
+            task.run_phase = Some(phase);
+            let settings = resolve_launch_settings(&self.config.load()?, &task)?;
             let orch = self.config.get_orchestration()?;
             if Slots::measure(self)?
-                .blocking_cap(&orch, backend, model, role)
+                .blocking_cap(&orch, &settings.backend, settings.model.as_deref(), role)
                 .is_some()
             {
                 return Ok(None);
             }
-            let new_session_id = self.fresh_session_id(&safe_session_component(backend));
+            let new_session_id = self.fresh_session_id(&safe_session_component(&settings.backend));
             stats::record_exit(&self.storage.project_path, &task.id, stats::Phase::Queued);
-            task.run_phase = Some(phase);
             task.session = Some(new_session_id.clone());
             task.updated_at = timefmt::now();
             session_mgr.link_named_session(&task.id, &new_session_id, &task.title)?;
@@ -365,9 +372,13 @@ impl Operations {
                     "▶ dispatcher started session {new_session_id} ({role}) — a slot freed up"
                 ),
             );
-            new_session_id
+            ClaimedRun {
+                session_id: new_session_id,
+                backend: settings.backend,
+                model: settings.model,
+            }
         };
-        Ok(Some(new_session_id))
+        Ok(Some(claimed_run))
     }
 
     /// Whether the dispatcher could actually start a queued task: the queue

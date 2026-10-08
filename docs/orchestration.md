@@ -387,7 +387,13 @@ walks the task's pool in priority order:
    stats and the detail view all describe what will really run. A task with
    default launch settings resolves through the **cheap** pool; `role_profile:
    middle` opts into the **middle** ("smart") pool. An explicit per-task
-   assignment always wins.
+   assignment always wins, including a pick that equals the board's current
+   defaults. Create/save materializes a blank "Default" onto the launch
+   fields, so the pool tells the two apart by `explicit_assignment` (set when
+   the human named a backend, model, effort, or agent) rather than by
+   comparing the stored values with the defaults. The session id is minted
+   from the backend the pool left on the task, so a pool swap cannot leave a
+   `ses-grok-…` id on an opencode launch.
 2. Every candidate blocked → the task **parks**: `restart_at` = earliest
    blocking reset + `ask_grace_secs`, phase `queued`, no session — this is not
    a crash, so `crash_restarts` is untouched and no crash notification fires.

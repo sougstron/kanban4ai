@@ -4665,6 +4665,71 @@ fn executor_pool_never_overrides_an_explicit_assignment() {
     assert_eq!(recorder.calls().len(), 1);
 }
 
+/// The board default is grok/grok-4.7/medium, and that same combination is
+/// also a later cheap-pool candidate. Picking it on the task must not be
+/// treated as "left on Default": glm (claude here) is blocked, and the next
+/// candidate is opencode/luna, which is what used to launch instead.
+#[test]
+fn executor_pool_keeps_an_explicit_pick_that_equals_the_board_default() {
+    install_pool_snapshot();
+    let (dir, _storage) = common::quiet_board(false);
+    fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "notifications:\n  enabled: false\n\
+         auto_launch:\n  enabled: true\n  default_agent: grok\n\
+         agents:\n  grok:\n    command: grok\n    model: grok-4.7\n    effort: medium\n\
+         orchestration:\n  queue_enabled: true\n  executors:\n    cheap:\n      \
+         - claude/haiku\n      - opencode/openai/gpt-6-luna\n      - grok/grok-4.7\n",
+    )
+    .unwrap();
+    let recorder = common::RecordingLauncher::new();
+    let ops = Operations::with_launcher(dir.path(), Box::new(recorder.clone()));
+
+    let pinned = ops
+        .create_task(NewTask {
+            title: "Pinned grok".into(),
+            agent_backend: Some("grok".into()),
+            ai_model: Some("grok-4.7".into()),
+            ai_effort: Some("medium".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(pinned.explicit_assignment);
+    ops.queue_run(&pinned.id).unwrap();
+    let dispatched = ops.dispatch_queue().unwrap();
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(dispatched[0].backend, "grok");
+    assert!(
+        dispatched[0].session_id.starts_with("ses-grok-"),
+        "{}",
+        dispatched[0].session_id
+    );
+    let pinned = ops.storage.load_task(&pinned.id).unwrap().unwrap();
+    assert_eq!(pinned.agent_backend.as_deref(), Some("grok"));
+    assert_eq!(pinned.ai_model.as_deref(), Some("grok-4.7"));
+    assert_eq!(pinned.ai_effort.as_deref(), Some("medium"));
+    assert_eq!(pinned.role_profile, None);
+
+    // The same stored values, with no pin, are the form's "Default" and the
+    // pool may replace them. The session id follows the backend that runs.
+    let open = ops.create_task(NewTask::titled("Left on default")).unwrap();
+    assert!(!open.explicit_assignment);
+    assert_eq!(open.agent_backend.as_deref(), Some("grok"));
+    assert_eq!(open.ai_model.as_deref(), Some("grok-4.7"));
+    ops.queue_run(&open.id).unwrap();
+    let dispatched = ops.dispatch_queue().unwrap();
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(dispatched[0].backend, "opencode");
+    assert!(
+        dispatched[0].session_id.starts_with("ses-opencode-"),
+        "{}",
+        dispatched[0].session_id
+    );
+    let open = ops.storage.load_task(&open.id).unwrap().unwrap();
+    assert_eq!(open.agent_backend.as_deref(), Some("opencode"));
+    assert_eq!(open.ai_model.as_deref(), Some("openai/gpt-6-luna"));
+}
+
 #[test]
 fn editing_a_pooled_task_model_drops_the_pool_profile() {
     install_pool_snapshot();
