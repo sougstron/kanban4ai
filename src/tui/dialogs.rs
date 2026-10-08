@@ -1,9 +1,10 @@
 use ratatui::Frame;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
-use ratatui_textarea::{TextArea, WrapMode};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::core::config::{BoardConfig, InheritFlags, InheritGroup};
 use crate::core::models::Task;
@@ -2936,7 +2937,7 @@ fn render_sub_popup(
         height: button_height.min(inner.height.saturating_sub(content_height)),
         ..inner
     };
-    let rows = selector_form_rows_from_scroll(modal, content.height, view.fields, view.scroll);
+    let rows = selector_form_rows_from_scroll(modal, content, view.fields, view.scroll);
     let mut y = content.y;
     for (field, height) in rows {
         let row = Rect {
@@ -3460,7 +3461,7 @@ fn render_selector_form(
         height: button_height.min(area.height.saturating_sub(content_height)),
         ..area
     };
-    let rows = selector_form_rows(modal, content.height, fields);
+    let rows = selector_form_rows(modal, content, fields);
     let mut y = content.y;
     for (field, height) in rows {
         let row = Rect {
@@ -3498,18 +3499,46 @@ fn should_skip_field(modal: &ModalState, field: DialogField) -> bool {
 
 fn selector_form_rows(
     modal: &ModalState,
-    content_height: u16,
+    content: Rect,
     fields: &[DialogField],
 ) -> Vec<(DialogField, u16)> {
-    selector_form_rows_from_scroll(modal, content_height, fields, modal.form_scroll)
+    selector_form_rows_from_scroll(modal, content, fields, modal.form_scroll)
+}
+
+/// Rows the description textarea claims at `row_width`: its soft-wrapped text
+/// measured with the widget's own wrap map, clamped to
+/// [`DESCRIPTION_MIN_ROWS`]..[`DESCRIPTION_MAX_ROWS`] — the same
+/// content-driven sizing the option selectors get from their option count.
+fn description_content_height(modal: &ModalState, row_width: u16) -> u16 {
+    // Measure on a throwaway copy: parking the caret on the last visual row
+    // mutates the widget's cursor and remembered scroll, and the live field
+    // must keep both.
+    let mut probe = modal.description.clone();
+    probe.cancel_selection();
+    probe.move_cursor(CursorMove::Bottom);
+    probe.move_cursor(CursorMove::End);
+    let area = Rect::new(0, 0, row_width.max(1), 1);
+    let mut scratch = Buffer::empty(area);
+    // A scratch render loads the wrap map at this width; nothing reaches the
+    // screen.
+    (&probe).render(area, &mut scratch);
+    let rows =
+        u16::try_from(probe.screen_cursor().row.saturating_add(1)).unwrap_or(DESCRIPTION_MAX_ROWS);
+    rows.clamp(DESCRIPTION_MIN_ROWS, DESCRIPTION_MAX_ROWS)
 }
 
 fn selector_form_rows_from_scroll(
     modal: &ModalState,
-    content_height: u16,
+    content: Rect,
     fields: &[DialogField],
     scroll: usize,
 ) -> Vec<(DialogField, u16)> {
+    // Measured once per frame at this width; `None` when the form has no
+    // description field at all.
+    let description_height = fields
+        .contains(&DialogField::Description)
+        .then(|| description_content_height(modal, content.width));
+
     let mut rows = Vec::new();
     let mut used: u16 = 0;
     let mut visible_count = 0;
@@ -3521,26 +3550,32 @@ fn selector_form_rows_from_scroll(
             visible_count += 1;
             continue;
         }
-        let height = task_field_min_height(field);
-        if used.saturating_add(height) > content_height {
+        let remaining = content.height.saturating_sub(used);
+        let height = match field {
+            // The description follows its text, not the spare space: it grows
+            // and shrinks with edits, and on a short terminal it takes what
+            // is left instead of vanishing below the fold.
+            DialogField::Description => description_height
+                .unwrap_or(DESCRIPTION_MIN_ROWS)
+                .min(remaining),
+            _ => task_field_min_height(field),
+        };
+        if height == 0 || used.saturating_add(height) > content.height {
             break;
         }
         rows.push((field, height));
         used = used.saturating_add(height);
     }
 
-    let mut surplus = content_height.saturating_sub(used);
-    if let Some((_, height)) = rows
-        .iter_mut()
-        .find(|(field, _)| *field == DialogField::Description)
-    {
-        let growth = (15 - *height).min(surplus);
-        *height += growth;
-        surplus -= growth;
-    }
+    let mut surplus = content.height.saturating_sub(used);
     while surplus > 0 {
         let mut grew = false;
         for (field, height) in &mut rows {
+            // The description keeps its content-driven height; spare rows go
+            // to the selectors and toggles below it.
+            if *field == DialogField::Description {
+                continue;
+            }
             let max_height = task_selector_max_height(modal, *field);
             if *height < max_height {
                 *height += 1;
@@ -3557,6 +3592,13 @@ fn selector_form_rows_from_scroll(
     }
     rows
 }
+
+/// The description field starts at this many rows and follows its text from
+/// there; empty text still gets the full minimum.
+const DESCRIPTION_MIN_ROWS: u16 = 5;
+/// Hard cap for the content-driven description height so a huge description
+/// cannot crowd the rest of the form off the screen.
+const DESCRIPTION_MAX_ROWS: u16 = 20;
 
 fn task_field_min_height(field: DialogField) -> u16 {
     match field {
@@ -3593,7 +3635,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor => 1,
-        DialogField::Description => 5,
+        DialogField::Description => DESCRIPTION_MIN_ROWS,
         DialogField::ProjectVisibility | DialogField::BackendOrder => 4,
         DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel => 5,
         // The chain selector always shows its filter and the "No chain"
@@ -3618,9 +3660,9 @@ fn task_field_min_height(field: DialogField) -> u16 {
 }
 
 fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
-    if field == DialogField::Description {
-        return 15;
-    }
+    // The description is sized from its own text (see
+    // `description_content_height`), never from spare space, so it takes no
+    // part in the surplus growth below.
     if matches!(
         field,
         DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel
