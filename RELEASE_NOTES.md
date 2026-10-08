@@ -1,3 +1,18 @@
+# kanban4ai 0.6.26
+
+Limits fix: the kimi provider row no longer shows a monthly `code` window.
+Kimi's `month_code` usage entry only splits the monthly spend by channel
+(code vs web) — it is not a separate quota — so it no longer renders as a
+limit.
+
+## Fixed
+
+- **Drop the code window from the kimi limits row** (`src/core/limits.rs`,
+  `docs/limits.md`). `parse_kimi_usage` skips the `limit_month_code` entry
+  instead of mapping it to a `code` window, and `parse_omp_kimi_history`
+  drops the "Monthly code" history row. The `5h` burst window and the
+  monthly total window are unchanged.
+
 # kanban4ai 0.6.25
 
 Three TUI refinements: Alt+Up/Down walk the detail's panel stack without
