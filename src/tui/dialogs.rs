@@ -1121,6 +1121,24 @@ impl ModalState {
     /// Whether a field can be focused and edited. In project settings a
     /// field of an inherited group is read-only: it shows the global value.
     pub fn field_enabled(&self, field: DialogField) -> bool {
+        match field {
+            DialogField::AgentSettings => {
+                if !self.should_show_agents_for(AgentSlot::Primary) {
+                    return false;
+                }
+            }
+            DialogField::DesignerAgentSettings => {
+                if !self.should_show_agents_for(AgentSlot::Designer) {
+                    return false;
+                }
+            }
+            DialogField::ReviewerAgentSettings => {
+                if !self.should_show_agents_for(AgentSlot::Reviewer) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
         if !matches!(self.modal, Modal::Settings) {
             return true;
         }
@@ -1372,6 +1390,14 @@ impl ModalState {
             AgentSlot::Primary => self.agent_text(),
             AgentSlot::Designer => non_empty(textarea_text(&self.designer.agent)),
             AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.agent)),
+        }
+    }
+
+    pub fn should_show_agents_for(&self, slot: AgentSlot) -> bool {
+        match slot {
+            AgentSlot::Primary => !self.agent_options.is_empty(),
+            AgentSlot::Designer => !self.designer.agent_options.is_empty(),
+            AgentSlot::Reviewer => !self.reviewer.agent_options.is_empty(),
         }
     }
 
@@ -3452,6 +3478,15 @@ fn render_selector_form(
     render_form_buttons(frame, app, modal, button_area, hitboxes);
 }
 
+fn should_skip_field(modal: &ModalState, field: DialogField) -> bool {
+    match field {
+        DialogField::AgentSettings => !modal.should_show_agents_for(AgentSlot::Primary),
+        DialogField::DesignerAgentSettings => !modal.should_show_agents_for(AgentSlot::Designer),
+        DialogField::ReviewerAgentSettings => !modal.should_show_agents_for(AgentSlot::Reviewer),
+        _ => false,
+    }
+}
+
 fn selector_form_rows(
     modal: &ModalState,
     content_height: u16,
@@ -3468,7 +3503,15 @@ fn selector_form_rows_from_scroll(
 ) -> Vec<(DialogField, u16)> {
     let mut rows = Vec::new();
     let mut used: u16 = 0;
-    for field in fields.iter().copied().skip(scroll.min(fields.len() - 1)) {
+    let mut visible_count = 0;
+    for field in fields.iter().copied() {
+        if should_skip_field(modal, field) {
+            continue;
+        }
+        if visible_count < scroll {
+            visible_count += 1;
+            continue;
+        }
         let height = task_field_min_height(field);
         if used.saturating_add(height) > content_height {
             break;
