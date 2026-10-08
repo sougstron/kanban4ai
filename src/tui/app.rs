@@ -5381,12 +5381,19 @@ impl App {
                 mapping_str(backend_settings, "agent").unwrap_or_default(),
             ]);
         }
+        let default_model = mapping_str(backend_settings, "model").or_else(|| {
+            (backend == "opencode")
+                .then(|| mapping_str(Some(&config.auto_launch), "model"))
+                .flatten()
+        });
         let empty_model = if settings_primary {
-            "No default model"
+            "No default model".to_string()
+        } else if let Some(model) = default_model {
+            format!("Default model ({model})")
         } else {
-            "Default model"
+            "Default model".to_string()
         };
-        let models = optional_empty(empty_model)
+        let models = optional_empty(&empty_model)
             .into_iter()
             .chain(self.backend_model_options(&backend, backend_settings, &config.auto_launch))
             .collect::<Vec<_>>();
@@ -5491,12 +5498,15 @@ impl App {
                 .collect();
         }
         let settings_primary = modal.is_settings_form() && slot == AgentSlot::Primary;
+        let default_effort = mapping_str(backend_settings, "effort");
         let empty_effort = if settings_primary {
-            "No default effort"
+            "No default effort".to_string()
+        } else if let Some(effort) = default_effort {
+            format!("Default effort ({effort})")
         } else {
-            "Default effort"
+            "Default effort".to_string()
         };
-        let options = optional_empty(empty_effort)
+        let options = optional_empty(&empty_effort)
             .into_iter()
             .chain(efforts)
             .collect::<Vec<_>>();
