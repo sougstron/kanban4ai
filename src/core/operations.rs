@@ -21,6 +21,19 @@ fn launch_assignment(task: &Task) -> [Option<String>; 4] {
     ]
 }
 
+fn launch_field_set(value: &Option<String>) -> bool {
+    value.as_deref().is_some_and(|text| !text.trim().is_empty())
+}
+
+/// Whether the human named at least one launch field before defaults were
+/// filled in. A pick that equals the board default is still a pick.
+fn launch_fields_pinned(task: &Task) -> bool {
+    launch_field_set(&task.agent_backend)
+        || launch_field_set(&task.ai_model)
+        || launch_field_set(&task.ai_effort)
+        || launch_field_set(&task.agent_name)
+}
+
 /// What [`Operations::apply_executor_pool`] decided for one task.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PoolOutcome {
@@ -521,6 +534,10 @@ impl Operations {
         };
         let assignment_before = launch_assignment(&task);
         let profile_patched = patch.role_profile.is_some();
+        let launch_patched = patch.ai_model.is_some()
+            || patch.ai_effort.is_some()
+            || patch.agent_backend.is_some()
+            || patch.agent_name.is_some();
         if let Some(title) = patch.title {
             task.title = title;
         }
@@ -587,6 +604,12 @@ impl Operations {
         if let Some(session) = patch.session {
             task.session = session;
         }
+        // Pin from the fields the human sent, before defaults fill the blanks.
+        // Saving "Default" clears the pin; saving grok/grok-4.7/medium keeps
+        // it even when that is also the board default.
+        if launch_patched {
+            task.explicit_assignment = launch_fields_pinned(&task);
+        }
         self.materialize_task_defaults(&mut task)?;
         // A human pick of backend/model/effort/agent replaces whatever a
         // role roster or executor pool materialized. Keeping the stale
@@ -613,12 +636,17 @@ impl Operations {
         task.ai_effort = new_task.ai_effort;
         task.agent_backend = new_task.agent_backend;
         task.agent_name = new_task.agent_name;
+        // A caller can force the pin (a roster candidate whose fields are
+        // blank still names an assignment). Otherwise any field the human
+        // filled in is a pin, judged before defaults are written over it.
+        let explicit_assignment = new_task.explicit_assignment || launch_fields_pinned(&task);
         self.materialize_task_defaults(&mut task)?;
         Ok(NewTask {
             title: new_task.title,
             description: new_task.description,
             ai_model: task.ai_model,
             ai_effort: task.ai_effort,
+            explicit_assignment,
             agent_backend: task.agent_backend,
             agent_name: task.agent_name,
             interactive: new_task.interactive,
@@ -2152,6 +2180,11 @@ impl Operations {
             let candidate = profile
                 .as_deref()
                 .and_then(|profile| orch.role_candidate(profile, 0));
+            // An unpinned parent stored materialized defaults. Copying those
+            // fields would look like the node named them. Leave them blank so
+            // the cheap pool can still decide; an explicit parent assignment
+            // is copied and stays pinned.
+            let inherit_explicit = candidate.is_none() && parent.explicit_assignment;
             let new_task = NewTask {
                 title: node.title.trim().to_string(),
                 description: node.description.trim().to_string(),
@@ -2159,23 +2192,29 @@ impl Operations {
                 // leaves unset means "that backend's default", never the
                 // planner's value, or a `claude/haiku` node would inherit an
                 // `opus`-sized effort. Only a node with no profile at all
-                // falls back to the orchestrated task's own settings.
+                // falls back to the orchestrated task's own settings, and
+                // only when that assignment was itself explicit.
                 ai_model: match candidate {
                     Some(candidate) => candidate.model.clone(),
-                    None => parent.ai_model.clone(),
+                    None if inherit_explicit => parent.ai_model.clone(),
+                    None => None,
                 },
                 ai_effort: match candidate {
                     Some(candidate) => candidate.effort.clone(),
-                    None => parent.ai_effort.clone(),
+                    None if inherit_explicit => parent.ai_effort.clone(),
+                    None => None,
                 },
                 agent_backend: match candidate {
                     Some(candidate) => candidate.backend.clone(),
-                    None => parent.agent_backend.clone(),
+                    None if inherit_explicit => parent.agent_backend.clone(),
+                    None => None,
                 },
                 agent_name: match candidate {
                     Some(candidate) => candidate.agent.clone(),
-                    None => parent.agent_name.clone(),
+                    None if inherit_explicit => parent.agent_name.clone(),
+                    None => None,
                 },
+                explicit_assignment: candidate.is_some() || inherit_explicit,
                 interactive: false,
                 readonly: false,
                 use_designer: node.designer,
@@ -2467,6 +2506,12 @@ impl Operations {
         config: &crate::core::config::BoardConfig,
         task: &Task,
     ) -> Result<bool> {
+        // A human pick wins even when it names the same backend, model, and
+        // effort the board would have filled in. Legacy tasks have no flag;
+        // for those, equality with the resolved default is still the signal.
+        if task.explicit_assignment {
+            return Ok(false);
+        }
         let probe = Task::new(String::new(), String::new());
         let default = resolve_task_launch_settings(config, &probe)?;
         let actual = resolve_task_launch_settings(config, task)?;
@@ -2633,6 +2678,7 @@ impl Operations {
         task.ai_model = model;
         task.ai_effort = None;
         task.agent_name = None;
+        task.explicit_assignment = true;
         task.role_profile = None;
         task.roster_index = 0;
         task.restart_at = None;

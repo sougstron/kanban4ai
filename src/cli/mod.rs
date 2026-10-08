@@ -775,6 +775,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 use_reviewer: reviewer,
                 use_orchestrator: orchestrator,
                 chained_to: chained_to.filter(|c| !c.is_empty()),
+                explicit_assignment: false,
                 launch_at,
                 depends_on: depends_on
                     .into_iter()

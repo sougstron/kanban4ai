@@ -229,6 +229,7 @@ impl Storage {
         task.description = new_task.description;
         task.ai_model = new_task.ai_model;
         task.ai_effort = new_task.ai_effort;
+        task.explicit_assignment = new_task.explicit_assignment;
         task.agent_backend = new_task.agent_backend;
         task.agent_name = new_task.agent_name;
         task.interactive = new_task.interactive;
@@ -443,6 +444,10 @@ pub struct NewTask {
     pub description: String,
     pub ai_model: Option<String>,
     pub ai_effort: Option<String>,
+    /// See [`crate::core::models::Task::explicit_assignment`]. Set by
+    /// [`crate::core::operations::Operations`] from the pre-materialize
+    /// fields; stored here so `create_task` can persist it.
+    pub explicit_assignment: bool,
     pub agent_backend: Option<String>,
     pub agent_name: Option<String>,
     pub interactive: bool,

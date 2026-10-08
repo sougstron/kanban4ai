@@ -5938,6 +5938,7 @@ impl App {
                     use_reviewer: modal.use_reviewer,
                     use_orchestrator: modal.use_orchestrator,
                     chained_to: modal.chain_text(),
+                    explicit_assignment: false,
                     launch_at,
                     depends_on: Vec::new(),
                     needs: None,
