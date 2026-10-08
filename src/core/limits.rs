@@ -60,10 +60,12 @@
 //!   through the `sqlite3` CLI) or kimi-cli in
 //!   `~/.kimi/credentials/kimi-code.json`. The detailed `limits[]` row is
 //!   authoritative for the 5-hour window; `usages` supplies the monthly
-//!   `mon` (total) / `code` quotas. An expired omp token is renewed with its
-//!   refresh token and written back to omp's store (omp only renews while it
-//!   runs); when no live read succeeds, the windows omp itself last polled
-//!   (`usage_history`) are shown with their age.
+//!   `mon` (total) quota — its `month_code` entry only splits the spend by
+//!   channel (code vs web), so it is not a limit and is ignored. An expired
+//!   omp token is renewed with its refresh token and written back to omp's
+//!   store (omp only renews while it runs); when no live read succeeds, the
+//!   windows omp itself last polled (`usage_history`) are shown with their
+//!   age.
 //! - **gemini**: the Code Assist quota (`retrieveUserQuota`) when gemini-cli
 //!   is signed in, plus the spend pi logged for its Gemini API key — the
 //!   Gemini API has no quota endpoint for keys — as `24h` / `30d` spend
@@ -1939,15 +1941,17 @@ fn omp_kimi_history(db: &Path) -> Option<(Vec<LimitWindow>, i64)> {
 }
 
 /// omp's `usage_history` rows for kimi: `used_fraction` 0..1, `resets_at`
-/// Unix milliseconds, labelled `5h limit` / `Monthly total` / `Monthly code`.
+/// Unix milliseconds, labelled `5h limit` / `Monthly total` / `Monthly code`
+/// (the code row only splits the spend by channel, so it is dropped).
 pub fn parse_omp_kimi_history(rows: &[Value]) -> Vec<LimitWindow> {
     rows.iter()
         .filter_map(|row| {
             let used = row.get("used_fraction")?.as_f64()? * 100.0;
             let label = row.get("label")?.as_str()?.to_ascii_lowercase();
-            let label = if label.contains("code") {
-                "code".to_string()
-            } else if label.contains("month") || label.contains("total") {
+            if label.contains("code") {
+                return None;
+            }
+            let label = if label.contains("month") || label.contains("total") {
                 "mon".to_string()
             } else {
                 label
@@ -2094,9 +2098,13 @@ pub fn parse_kimi_usage(value: &Value) -> Vec<LimitWindow> {
             let Some(used) = number(entry.get("used_ratio")).map(|ratio| ratio * 100.0) else {
                 continue;
             };
+            // `month_code` only splits the monthly spend by channel (code vs
+            // web); it is not a separate quota, so it never becomes a window.
+            if key.trim_start_matches("limit_") == "month_code" {
+                continue;
+            }
             let label = match key.trim_start_matches("limit_") {
                 "month_total" => "mon".to_string(),
-                "month_code" => "code".to_string(),
                 other => other.to_string(),
             };
             windows.push(LimitWindow::new(label, used, reset(entry)));
@@ -3285,7 +3293,8 @@ mod tests {
             }
         });
         let windows = parse_kimi_usage(&value);
-        assert_eq!(windows.len(), 3);
+        // `limit_month_code` only splits the spend by channel, so no window.
+        assert_eq!(windows.len(), 2);
         assert_eq!(windows[0].label, "5h");
         assert_eq!(windows[0].remaining_percent, 0.0);
         assert_eq!(
@@ -3294,8 +3303,6 @@ mod tests {
         );
         assert_eq!(windows[1].label, "mon");
         assert!((windows[1].remaining_percent - 92.05).abs() < 1e-9);
-        assert_eq!(windows[2].label, "code");
-        assert_eq!(windows[2].remaining_percent, 100.0);
     }
 
     #[test]
@@ -3360,7 +3367,7 @@ mod tests {
         let rows = vec![
             json!({"label": "5h limit", "used_fraction": 0.4, "resets_at": 1_790_844_683_700_i64, "recorded_at": 1}),
             json!({"label": "Monthly total", "used_fraction": 0.0, "resets_at": 1_793_577_600_000_i64, "recorded_at": 2}),
-            json!({"label": "Monthly code", "used_fraction": null, "resets_at": null, "recorded_at": 2}),
+            json!({"label": "Monthly code", "used_fraction": 0.5, "resets_at": 1_793_577_600_000_i64, "recorded_at": 2}),
         ];
         let windows = parse_omp_kimi_history(&rows);
         assert_eq!(windows.len(), 2);

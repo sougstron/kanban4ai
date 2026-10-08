@@ -106,9 +106,11 @@ Sources, all read-only and best effort:
   (`$KIMI_SHARE_DIR` respected). `limits[]` is authoritative for the `5h`
   burst window (`window.duration`/`timeUnit` plus `detail.limit`/`used` or
   `remaining`/`resetTime`); `usages.limit_5h` is a duplicate aggregate that is
-  ignored when that detailed row exists. Monthly `mon` (total) and `code` quotas
-  come from the other `usages` entries' `used_ratio`/`reset_time`. Older
-  payloads fall back to the `usage` summary as `7d`. The token is
+  ignored when that detailed row exists. Monthly `mon` (total) comes from the
+  other `usages` entries' `used_ratio`/`reset_time`; the `month_code` entry only
+  splits the monthly spend by channel (code vs web) — it is not a separate
+  quota, so it is never shown. Older payloads fall back to the `usage` summary
+  as `7d`. The token is
   never refreshed here — rotating it would race omp's own refresh — so while
   it has expired (or the live call fails) the row shows the windows omp last
   polled itself (`usage_history`), with their age. `kimi-code/*` models
