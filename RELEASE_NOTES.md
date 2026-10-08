@@ -1,3 +1,40 @@
+# kanban4ai 0.7.0
+
+Text editing and task forms become more predictable, explicit agent assignments
+survive executor-pool selection, and live transcript parsing is incremental.
+
+## Changed
+
+- **Mouse editing in text fields.** Click to place the caret, drag to select
+  and copy, and use the wheel to scroll dialog fields and review edits.
+  Shift+drag keeps screen-text selection. The detail's custom-answer row also
+  supports caret placement and selection; its wheel steps answer variants.
+- **Answer editing and image paste.** The detail answer panel and answer
+  dialog support word-navigation/deletion keys and clipboard image attachments.
+  Ctrl+Left/Right jumps by word; Alt+Left/Right deletes a word where no settings
+  tab owns the chord.
+- **Content-sized task descriptions.** New/edit task forms size the description
+  from its soft-wrapped text, between 5 and 20 rows, instead of stretching it
+  into spare terminal space. Form scrolling moves only as far as needed to
+  keep the focused block visible.
+- **Less noise in agent settings.** Agent settings launchers are hidden when
+  the selected backend offers no persona beyond the Default entry.
+- **Useful chain targets.** The task form offers only To Do and In Progress
+  tasks as chain targets, excluding the task being edited.
+- **Incremental live telemetry.** Live agent transcripts are parsed from the
+  last complete line instead of rereading the whole transcript each tick.
+  Streaming deltas are skipped before JSON decoding; partial lines and
+  detected rewrites are handled without counting completed lines twice.
+
+## Fixed
+
+- **Explicit assignments win over the cheap executor pool.** A human-selected
+  backend, model, effort, or agent remains pinned even when it matches the
+  board defaults. Default assignments remain eligible for pool selection.
+- **Queued launch accounting follows the resolved assignment.** Session IDs
+  and slot accounting use the backend/model selected after the pool walk and
+  the run phase being launched, rather than stale pre-claim settings.
+
 # kanban4ai 0.6.26
 
 Limits fix: the kimi provider row no longer shows a monthly `code` window.
