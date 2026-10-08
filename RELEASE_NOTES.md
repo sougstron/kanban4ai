@@ -1,3 +1,34 @@
+# kanban4ai 0.6.25
+
+Three TUI refinements: Alt+Up/Down walk the detail's panel stack without
+stopping at edges, the settings view shows current default model and effort
+values, and the agent settings block hides when no agents are configured.
+
+## Changed
+
+- **Alt+arrows block navigation** (`src/tui/app.rs`). When in the task detail
+  with an open question or review editor, `Alt+Up` and `Alt+Down` now jump
+  directly between panels (thread → answer → review editor) from any caret
+  position, without first walking to a panel edge. This complements the global
+  `Alt+letter` hotkey set and makes block navigation more predictable.
+
+- **Display default model and effort in settings** (`src/tui/app.rs`,
+  `docs/tui.md`). The settings tab now displays the active default model and
+  effort values when they are inherited from configuration (e.g.,
+  `Default model (claude-3-5-sonnet)`), and shows "No default model" only
+  when no default is set at all. This makes configuration state visible
+  without opening separate config files.
+
+- **Hide agent settings when no agents available** (`src/tui/app.rs`). The
+  agent settings block no longer appears in the settings view if no agents are
+  configured, reducing noise and clarifying that the field is optional.
+
+## Fixed
+
+- **Tests: deflake limits row tests** (`src/tui/tests.rs`). Removed timing
+  dependencies and race conditions from snapshot tests for the task limits row
+  rendering.
+
 # kanban4ai 0.6.24
 
 The task detail becomes type-to-edit, and tmux attach is gone: a Review task
