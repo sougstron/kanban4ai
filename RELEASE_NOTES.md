@@ -1,3 +1,19 @@
+# kanban4ai 0.7.2
+
+Agent settings blocks are always rendered again: the task form and the
+settings tabs show the Agent, Designer, and Reviewer launchers on every
+setup, including default ones.
+
+## Changed
+
+- **Always render agent settings blocks** (`src/tui/dialogs.rs`). 0.7.0
+  hid an agent settings block whenever the selected backend's agent list
+  was placeholder-only (no real personas beyond the Default entry), which
+  blanked it entirely for default setups — the block vanished from both
+  the task dialog and the settings tabs. The gating is dropped and the
+  blocks always render; picking Default remains valid and explicit
+  per-role assignments stay pinned.
+
 # kanban4ai 0.7.1
 
 Stuck post-landing worktree cleanups no longer spin on every pump tick or flood
