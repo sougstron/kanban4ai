@@ -35,12 +35,14 @@ use crate::core::models::{
     Message, MessageKind, MessageStatus, RunMode, RunPhase, Session, SessionStatus, Task,
     TaskStatus,
 };
-use crate::core::operations::{Operations, QuestionRef, SuggestionCount, TaskPatch, WaitWake};
+use crate::core::operations::{
+    Operations, QuestionRef, SuggestionCount, TaskPatch, WaitWake, sort_tasks,
+};
 use crate::core::project::{Project, ProjectStore};
 use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
 use crate::core::stats::{self, TaskAnalytics};
-use crate::core::storage::{NewTask, Storage};
+use crate::core::storage::{BoardStamps, NewTask, Storage, TaskCache};
 use crate::core::telemetry::{self, SessionProgress};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
@@ -146,7 +148,11 @@ pub struct BoardSnapshot {
     /// Project-wide reviewer bot on; drives the pending `⚖ review` card mark
     /// (a task's own `use_reviewer` ORs in).
     pub reviewer_bot: bool,
-    pub fingerprint: crate::core::storage::Fingerprint,
+    pub stamps: BoardStamps,
+    /// Archived tasks, newest update first, read with the board.
+    pub archived: Vec<Task>,
+    /// Parsed task files, so a rebuild only parses what changed.
+    pub task_cache: TaskCache,
 }
 
 /// A clickable region registered by the renderers on every frame. Searched
@@ -304,6 +310,9 @@ pub struct DetailState {
     /// sessions, from `.kanban/stats/events.jsonl`; the renderer adds the
     /// live session on top.
     pub analytics: TaskAnalytics,
+    /// Stamp of the thread file `messages` were read from; a board reload
+    /// that leaves it unchanged does not re-read the detail.
+    pub thread_stamp: Option<(u128, u64)>,
 }
 
 impl DetailState {
@@ -824,8 +833,8 @@ impl App {
         let ops = Operations::new(project_path);
         let settings = load_settings(&ops)?;
         let theme = Theme::named(&settings.theme_name);
-        let board = BoardSnapshot::load(&ops)?;
-        let archived_tasks = ops.list_archived_tasks(None)?;
+        let mut board = BoardSnapshot::load(&ops)?;
+        let archived_tasks = std::mem::take(&mut board.archived);
         let recent_models = recent_models(project_path);
         let catalog_backends = ops
             .config
@@ -2910,28 +2919,51 @@ impl App {
             self.settings.hide_kanban_messages = effective.hide_kanban_messages;
             self.settings.backend_order = self.ops.config.load_global().0.backend_order();
         }
-        let fingerprint = self.ops.storage.tui_fingerprint();
-        if global_changed || fingerprint != self.board.fingerprint {
-            self.board = BoardSnapshot::load_reusing(&self.ops, Some(&self.board))?;
-            self.refresh_archived_tasks()?;
-            if self.screen == Screen::Sessions {
-                self.refresh_active_sessions()?;
-            }
-            if let Some(detail) = self.detail.as_ref() {
-                let task_id = detail.task_id.clone();
-                let focus = detail.focus;
-                let scroll = detail.scroll;
-                self.load_detail(&task_id)?;
-                if let Some(detail) = self.detail.as_mut() {
-                    detail.scroll = scroll.min(detail.max_scroll);
-                    if detail.focus_available(focus) {
-                        detail.focus = focus;
-                    }
+        let stamps = self.ops.storage.board_stamps();
+        if stamps == self.board.stamps && !global_changed {
+            return Ok(());
+        }
+        let tasks_changed = global_changed || stamps.tasks != self.board.stamps.tasks;
+        let sessions_changed = stamps.sessions != self.board.stamps.sessions;
+        let detail_session = |app: &Self| {
+            let detail = app.detail.as_ref()?;
+            app.board.session_states.get(&detail.task_id).copied()
+        };
+        let session_before = detail_session(self);
+        if tasks_changed {
+            self.reload_board()?;
+        } else {
+            // A heartbeat or a thread post: tasks are unchanged, so only the
+            // session and thread derived parts of the board are refreshed.
+            self.board.refresh_sidecars(&self.ops, stamps)?;
+        }
+        if self.screen == Screen::Sessions && (tasks_changed || sessions_changed) {
+            self.refresh_active_sessions()?;
+        }
+        // The open detail is re-read only when something it shows
+        // changed: its task, its thread, or its session's state.
+        let detail_stale = self.detail.as_ref().is_some_and(|detail| {
+            tasks_changed
+                || detail_session(self) != session_before
+                || ThreadManager::new(self.ops.data_root())
+                    .map(|tm| tm.stamp(&detail.task_id))
+                    .ok()
+                    != Some(detail.thread_stamp)
+        });
+        if detail_stale && let Some(detail) = self.detail.as_ref() {
+            let task_id = detail.task_id.clone();
+            let focus = detail.focus;
+            let scroll = detail.scroll;
+            self.load_detail(&task_id)?;
+            if let Some(detail) = self.detail.as_mut() {
+                detail.scroll = scroll.min(detail.max_scroll);
+                if detail.focus_available(focus) {
+                    detail.focus = focus;
                 }
             }
-            self.clamp_focus();
-            self.status = "Board updated from disk".to_string();
         }
+        self.clamp_focus();
+        self.status = "Board updated from disk".to_string();
         Ok(())
     }
 
@@ -3743,8 +3775,7 @@ impl App {
     /// Reload the board and, when the detail screen is open, its task —
     /// preserving scroll position and panel focus where still valid.
     fn refresh_after_action(&mut self) -> Result<()> {
-        self.board = BoardSnapshot::load_reusing(&self.ops, Some(&self.board))?;
-        self.refresh_archived_tasks()?;
+        self.reload_board()?;
         self.clamp_focus();
         if let Some(detail) = self.detail.as_ref() {
             let task_id = detail.task_id.clone();
@@ -3922,9 +3953,9 @@ impl App {
         });
         let hide_kanban = self.settings.hide_kanban_messages;
         let task = self.ops.get_task(task_id)?;
-        let messages = ThreadManager::new(self.ops.data_root())?
-            .load(task_id)?
-            .messages;
+        let threads = ThreadManager::new(self.ops.data_root())?;
+        let thread_stamp = threads.stamp(task_id);
+        let messages = threads.load(task_id)?.messages;
         let thread_selected = preserved_selected_msg_id
             .and_then(|msg_id| messages.iter().position(|message| message.id == msg_id))
             .filter(|&index| !hide_kanban || !is_kanban_authored(&messages[index]));
@@ -3970,6 +4001,7 @@ impl App {
             has_provenance,
             provenance,
             analytics,
+            thread_stamp,
         };
         // A fresh open of a Review task lands in the review editor, so the
         // first keystrokes type feedback instead of firing hotkeys.
@@ -5454,6 +5486,15 @@ impl App {
         Ok(())
     }
 
+    /// Rebuild the board snapshot (reusing unchanged task files) and take
+    /// the archive from the same read.
+    fn reload_board(&mut self) -> Result<()> {
+        self.board = BoardSnapshot::load_reusing(&self.ops, Some(&self.board))?;
+        self.archived_tasks = std::mem::take(&mut self.board.archived);
+        self.clamp_archive_selection();
+        Ok(())
+    }
+
     pub fn refresh_archived_tasks(&mut self) -> Result<()> {
         self.archived_tasks = self.ops.list_archived_tasks(None)?;
         self.clamp_archive_selection();
@@ -6242,8 +6283,7 @@ impl App {
                 {
                     self.close_detail()?;
                 }
-                self.board = BoardSnapshot::load_reusing(&self.ops, Some(&self.board))?;
-                self.refresh_archived_tasks()?;
+                self.reload_board()?;
                 self.clamp_focus();
                 self.status = format!("Deleted {task_id}");
             }
@@ -6499,7 +6539,9 @@ impl BoardSnapshot {
             suggestions: HashMap::new(),
             designer_bot: false,
             reviewer_bot: false,
-            fingerprint: (0, 0, 0),
+            stamps: BoardStamps::default(),
+            archived: Vec::new(),
+            task_cache: TaskCache::default(),
         }
     }
 
@@ -6507,9 +6549,12 @@ impl BoardSnapshot {
         Self::load_reusing(ops, None)
     }
 
-    /// [`Self::load`], reusing `previous` suggestion counts for threads whose
-    /// file has not changed since.
+    /// [`Self::load`], reusing `previous` parsed tasks and suggestion counts
+    /// for files that have not changed since.
     pub fn load_reusing(ops: &Operations, previous: Option<&Self>) -> Result<Self> {
+        // Stamped before reading, so a write racing the read shows up as a
+        // change on the next check instead of being absorbed.
+        let stamps = ops.storage.board_stamps();
         let config = ops.config.load()?;
         let orch = OrchestrationSettings::from_mapping(&config.orchestration);
         let ids = config.column_ids();
@@ -6527,86 +6572,21 @@ impl BoardSnapshot {
             TASK_SORT_NUMBER_DESC => ("id", "desc"),
             _ => ("id", "asc"),
         };
-        let tasks = ops.list_tasks(None, None, sort_by, order)?;
-        let heartbeat_timeout = ops.config.get_threshold("session_heartbeat_timeout")?;
-        let session_mgr = SessionManager::new(&ops.storage.project_path);
-        let sessions_by_id = session_mgr
-            .list_sessions_with_state(heartbeat_timeout)
+        let mut task_cache = previous
+            .map(|board| board.task_cache.clone())
+            .unwrap_or_default();
+        let all_tasks = ops.storage.list_tasks_cached(&mut task_cache);
+        // The archive has no column of its own; it feeds the Archive screen
+        // from this same read instead of a second parse.
+        let archive_column = ids.iter().any(|id| id == TaskStatus::Archive.as_str());
+        let (mut archived, mut tasks): (Vec<Task>, Vec<Task>) = all_tasks
             .into_iter()
-            .map(|(session, state)| {
-                let deadline = match state {
-                    SessionState::Live => (session.status == SessionStatus::Active)
-                        .then(|| session.last_seen + chrono::Duration::seconds(heartbeat_timeout)),
-                    // A waiting card flips to crashed when the declared
-                    // deadline passes; the resume relaunch then reloads it.
-                    SessionState::Waiting => session.wait_until,
-                    SessionState::Crashed => None,
-                };
-                (
-                    session.id,
-                    (session.task_id, state, deadline, session.wait_note),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let mut session_states = tasks
-            .iter()
-            .filter_map(|task| {
-                let session_id = task.session.as_ref()?;
-                let (session_task_id, state, _, _) = sessions_by_id.get(session_id)?;
-                if session_task_id != &task.id {
-                    return None;
-                }
-                Some((task.id.clone(), *state))
-            })
-            .collect::<HashMap<_, _>>();
-        // A missing session file on In Progress is stranded. A Closed record
-        // is the last agent finishing cleanly — leave the card idle so `r`
-        // is Run. Painting Closed as Crashed was the Idle Racer lie.
-        for task in &tasks {
-            if task.status == TaskStatus::InProgress
-                && task.run_phase != Some(RunPhase::Queued)
-                && let Some(session_id) = task.session.as_deref()
-                && !session_states.contains_key(&task.id)
-                && !(task.has_questions && ops.first_open_question(&task.id)?.is_some())
-                && session_mgr.load_session(session_id).is_none()
-            {
-                session_states.insert(task.id.clone(), SessionState::Crashed);
-            }
-        }
-        let session_deadlines = tasks
-            .iter()
-            .filter_map(|task| {
-                let session_id = task.session.as_ref()?;
-                let (session_task_id, _, deadline, _) = sessions_by_id.get(session_id)?;
-                if session_task_id != &task.id {
-                    return None;
-                }
-                Some((task.id.clone(), (*deadline)?))
-            })
-            .collect::<HashMap<_, _>>();
-        let session_wait_notes = tasks
-            .iter()
-            .filter_map(|task| {
-                let session_id = task.session.as_ref()?;
-                let (session_task_id, state, _, note) = sessions_by_id.get(session_id)?;
-                if session_task_id != &task.id || *state != SessionState::Waiting {
-                    return None;
-                }
-                note.as_ref().map(|note| (task.id.clone(), note.clone()))
-            })
-            .collect::<HashMap<_, _>>();
-        let session_wait_deadlines = tasks
-            .iter()
-            .filter_map(|task| {
-                let session_id = task.session.as_ref()?;
-                let (session_task_id, state, deadline, _) = sessions_by_id.get(session_id)?;
-                if session_task_id != &task.id || *state != SessionState::Waiting {
-                    return None;
-                }
-                Some((task.id.clone(), (*deadline)?))
-            })
-            .collect::<HashMap<_, _>>();
-        let extras = Self::load_extras(ops, &tasks, &session_states)?;
+            .partition(|task| task.status == TaskStatus::Archive && !archive_column);
+        sort_tasks(&mut tasks, sort_by, order);
+        sort_tasks(&mut archived, "updated", "desc");
+        let task_refs: Vec<&Task> = tasks.iter().collect();
+        let sessions = SessionView::load(ops, &task_refs)?;
+        let extras = Self::load_extras(ops, &task_refs, &sessions.states)?;
         let mut suggestions = HashMap::new();
         for task in &tasks {
             let cached = previous.and_then(|board| board.suggestions.get(&task.id).copied());
@@ -6630,30 +6610,61 @@ impl BoardSnapshot {
         Ok(Self {
             columns,
             extras,
-            session_states,
-            session_deadlines,
-            session_wait_deadlines,
-            session_wait_notes,
+            session_states: sessions.states,
+            session_deadlines: sessions.deadlines,
+            session_wait_deadlines: sessions.wait_deadlines,
+            session_wait_notes: sessions.wait_notes,
             suggestions,
             designer_bot: orch.designer.enabled,
             reviewer_bot: orch.reviewer.enabled,
-            fingerprint: ops.storage.tui_fingerprint(),
+            stamps,
+            archived,
+            task_cache,
         })
+    }
+
+    /// Bring the snapshot up to `stamps` when only sidecar files changed:
+    /// sessions (heartbeats, waits, exits) and threads (posts, answers).
+    /// Tasks did not change, so they are not read again.
+    pub fn refresh_sidecars(&mut self, ops: &Operations, stamps: BoardStamps) -> Result<()> {
+        let sessions_changed = stamps.sessions != self.stamps.sessions;
+        let threads_changed = stamps.threads != self.stamps.threads;
+        let tasks: Vec<&Task> = self
+            .columns
+            .iter()
+            .flat_map(|column| column.tasks.iter())
+            .collect();
+        // The stranded-session check consults open questions, so a thread
+        // change can flip a card's state as well.
+        if sessions_changed || threads_changed {
+            let sessions = SessionView::load(ops, &tasks)?;
+            self.extras = Self::load_extras(ops, &tasks, &sessions.states)?;
+            self.session_states = sessions.states;
+            self.session_deadlines = sessions.deadlines;
+            self.session_wait_deadlines = sessions.wait_deadlines;
+            self.session_wait_notes = sessions.wait_notes;
+        }
+        if threads_changed {
+            let mut suggestions = HashMap::new();
+            for task in &tasks {
+                let cached = self.suggestions.get(&task.id).copied();
+                suggestions.insert(task.id.clone(), ops.suggestion_count(&task.id, cached)?);
+            }
+            self.suggestions = suggestions;
+        }
+        self.stamps = stamps;
+        Ok(())
     }
 
     /// Question previews and waiting-agent flags for questioned tasks only,
     /// so a snapshot rebuild stays cheap for ordinary boards.
     fn load_extras(
         ops: &Operations,
-        tasks: &[Task],
+        tasks: &[&Task],
         session_states: &HashMap<String, SessionState>,
     ) -> Result<HashMap<String, CardExtra>> {
         let mut extras = HashMap::new();
-        let questioned = tasks.iter().filter(|task| task.has_questions);
-        if questioned.clone().next().is_none() {
-            return Ok(extras);
-        }
-        for task in questioned {
+        for task in tasks.iter().filter(|task| task.has_questions) {
             let question_preview = ops
                 .first_open_question(&task.id)?
                 .map(|message| message.body.lines().next().unwrap_or_default().to_string());
@@ -6669,6 +6680,82 @@ impl BoardSnapshot {
             );
         }
         Ok(extras)
+    }
+}
+
+/// Per-task session state, liveness deadlines and wait notes of a board.
+struct SessionView {
+    states: HashMap<String, SessionState>,
+    deadlines: HashMap<String, chrono::NaiveDateTime>,
+    wait_deadlines: HashMap<String, chrono::NaiveDateTime>,
+    wait_notes: HashMap<String, String>,
+}
+
+impl SessionView {
+    fn load(ops: &Operations, tasks: &[&Task]) -> Result<Self> {
+        let heartbeat_timeout = ops.config.get_threshold("session_heartbeat_timeout")?;
+        let session_mgr = SessionManager::new(&ops.storage.project_path);
+        let sessions_by_id = session_mgr
+            .list_sessions_with_state(heartbeat_timeout)
+            .into_iter()
+            .map(|(session, state)| {
+                let deadline = match state {
+                    SessionState::Live => (session.status == SessionStatus::Active)
+                        .then(|| session.last_seen + chrono::Duration::seconds(heartbeat_timeout)),
+                    // A waiting card flips to crashed when the declared
+                    // deadline passes; the resume relaunch then reloads it.
+                    SessionState::Waiting => session.wait_until,
+                    SessionState::Crashed => None,
+                };
+                (
+                    session.id,
+                    (session.task_id, state, deadline, session.wait_note),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let own_session = |task: &Task| {
+            let session_id = task.session.as_ref()?;
+            let entry = sessions_by_id.get(session_id)?;
+            (entry.0 == task.id).then_some(entry)
+        };
+        let mut view = SessionView {
+            states: HashMap::new(),
+            deadlines: HashMap::new(),
+            wait_deadlines: HashMap::new(),
+            wait_notes: HashMap::new(),
+        };
+        for task in tasks {
+            let Some((_, state, deadline, note)) = own_session(task) else {
+                continue;
+            };
+            view.states.insert(task.id.clone(), *state);
+            if let Some(deadline) = deadline {
+                view.deadlines.insert(task.id.clone(), *deadline);
+            }
+            if *state == SessionState::Waiting {
+                if let Some(deadline) = deadline {
+                    view.wait_deadlines.insert(task.id.clone(), *deadline);
+                }
+                if let Some(note) = note {
+                    view.wait_notes.insert(task.id.clone(), note.clone());
+                }
+            }
+        }
+        // A missing session file on In Progress is stranded. A Closed record
+        // is the last agent finishing cleanly — leave the card idle so `r`
+        // is Run. Painting Closed as Crashed was the Idle Racer lie.
+        for task in tasks {
+            if task.status == TaskStatus::InProgress
+                && task.run_phase != Some(RunPhase::Queued)
+                && let Some(session_id) = task.session.as_deref()
+                && !view.states.contains_key(&task.id)
+                && !(task.has_questions && ops.first_open_question(&task.id)?.is_some())
+                && session_mgr.load_session(session_id).is_none()
+            {
+                view.states.insert(task.id.clone(), SessionState::Crashed);
+            }
+        }
+        Ok(view)
     }
 }
 

@@ -459,6 +459,98 @@ impl Storage {
     pub fn sessions_fingerprint(&self) -> Fingerprint {
         dir_fingerprint(&self.sessions_dir)
     }
+
+    /// [`Self::tui_fingerprint`] split by source, so a reader can tell a
+    /// heartbeat or a thread post apart from a task change and refresh only
+    /// what depends on it.
+    pub fn board_stamps(&self) -> BoardStamps {
+        BoardStamps {
+            tasks: self.tasks_fingerprint(),
+            threads: dir_fingerprint(&self.threads_dir),
+            sessions: dir_fingerprint(&self.sessions_dir),
+        }
+    }
+
+    /// Every task (archive included), parsing only files whose
+    /// `(mtime, size)` changed since `cache` last saw them. Files written
+    /// within [`RACY_WINDOW_NS`] of their parse are parsed again, since a
+    /// coarse mtime can hide a same-size rewrite in that window (the
+    /// "racily clean" rule git uses for its index).
+    pub fn list_tasks_cached(&self, cache: &mut TaskCache) -> Vec<Task> {
+        let now = now_ns();
+        let mut tasks = Vec::new();
+        let mut seen = HashMap::with_capacity(cache.entries.len());
+        for status_dir in self.status_dirs() {
+            for path in task_files_in(&status_dir) {
+                let Some(stamp) = stat_ns(&path) else {
+                    continue;
+                };
+                let entry = match cache.entries.remove(&path) {
+                    Some(entry)
+                        if entry.stamp == stamp
+                            && stamp.0.saturating_add(RACY_WINDOW_NS) < entry.parsed_at =>
+                    {
+                        entry
+                    }
+                    _ => match self.parse_task_file(&path) {
+                        Ok(task) => CachedTask {
+                            stamp,
+                            parsed_at: now,
+                            task,
+                        },
+                        Err(_) => continue,
+                    },
+                };
+                tasks.push(entry.task.clone());
+                seen.insert(path, entry);
+            }
+        }
+        cache.entries = seen;
+        tasks
+    }
+}
+
+/// Change signatures of the file sources the TUI renders; see
+/// [`Storage::board_stamps`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoardStamps {
+    pub tasks: Fingerprint,
+    pub threads: Fingerprint,
+    pub sessions: Fingerprint,
+}
+
+/// Parsed task files keyed by path; see [`Storage::list_tasks_cached`].
+#[derive(Debug, Clone, Default)]
+pub struct TaskCache {
+    entries: HashMap<PathBuf, CachedTask>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedTask {
+    stamp: (u128, u64),
+    parsed_at: u128,
+    task: Task,
+}
+
+/// A file whose mtime is this close to the moment it was parsed may have
+/// been rewritten since without its stamp changing.
+const RACY_WINDOW_NS: u128 = 2_000_000_000;
+
+fn now_ns() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos())
+}
+
+/// Whether a directory entry is a regular file. `DirEntry::file_type` comes
+/// from the directory listing itself on Linux, so this needs no `stat`;
+/// only a symlink is followed.
+fn is_file_entry(entry: &fs::DirEntry) -> bool {
+    match entry.file_type() {
+        Ok(kind) if kind.is_symlink() => entry.path().is_file(),
+        Ok(kind) => kind.is_file(),
+        Err(_) => false,
+    }
 }
 
 /// `(file_count, max_mtime_ns, total_bytes)` over the plain files directly
@@ -471,10 +563,11 @@ fn dir_fingerprint(directory: &Path) -> Fingerprint {
     let Ok(entries) = fs::read_dir(directory) else {
         return (count, max_mtime, total_size);
     };
-    for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
-        if !path.is_file() {
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        if !is_file_entry(&entry) {
             continue;
         }
+        let path = entry.path();
         count += 1;
         if let Some((mtime, size)) = stat_ns(&path) {
             max_mtime = max_mtime.max(mtime);
@@ -527,8 +620,9 @@ fn task_files_in(status_dir: &Path) -> Vec<PathBuf> {
     };
     entries
         .filter_map(|e| e.ok())
+        .filter(is_file_entry)
         .map(|e| e.path())
-        .filter(|p| p.is_file() && task_number(p).is_some())
+        .filter(|p| task_number(p).is_some())
         .collect()
 }
 

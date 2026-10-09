@@ -462,3 +462,51 @@ fn fingerprint_changes_when_tasks_change() {
     assert_ne!(empty, one);
     assert_eq!(one.0, 1);
 }
+
+#[test]
+fn task_cache_reparses_only_changed_task_files() {
+    let (dir, storage) = temp_board();
+    let task = storage.create_task(NewTask::titled("Cached")).unwrap();
+    let file = dir
+        .path()
+        .join(".kanban/tasks/todo")
+        .join(format!("{}.md", task.id));
+    let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let pin = |path: &std::path::Path| {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(an_hour_ago)
+            .unwrap();
+    };
+    pin(&file);
+    let mut cache = kanban4ai::core::storage::TaskCache::default();
+    assert_eq!(storage.list_tasks_cached(&mut cache)[0].title, "Cached");
+
+    // Same size, same (old) mtime: the parsed copy is reused, not re-read.
+    let original = fs::read_to_string(&file).unwrap();
+    fs::write(&file, original.replace("Cached", "Cachee")).unwrap();
+    pin(&file);
+    assert_eq!(storage.list_tasks_cached(&mut cache)[0].title, "Cached");
+
+    // Any stamp change parses the file again; removed files drop out.
+    fs::write(&file, original.replace("Cached", "Renamed")).unwrap();
+    assert_eq!(storage.list_tasks_cached(&mut cache)[0].title, "Renamed");
+    fs::remove_file(&file).unwrap();
+    assert!(storage.list_tasks_cached(&mut cache).is_empty());
+}
+
+#[test]
+fn board_stamps_tell_sessions_and_threads_apart_from_tasks() {
+    let (dir, storage) = temp_board();
+    let task = storage.create_task(NewTask::titled("Stamped")).unwrap();
+    let initial = storage.board_stamps();
+    SessionManager::new(dir.path())
+        .link_session(&task.id, "ses-stamp")
+        .unwrap();
+    let after_session = storage.board_stamps();
+    assert_eq!(after_session.tasks, initial.tasks);
+    assert_eq!(after_session.threads, initial.threads);
+    assert_ne!(after_session.sessions, initial.sessions);
+}

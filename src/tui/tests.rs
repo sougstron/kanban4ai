@@ -12377,3 +12377,54 @@ fn card_shows_suggestion_count_in_top_right_corner_on_done() {
         super::app::BoardSnapshot::load_reusing(&app.ops, Some(&app.board)).expect("reload");
     assert_eq!(app.board.suggestions[&task.id].count, 3);
 }
+
+#[test]
+fn session_change_refreshes_card_state_without_rereading_tasks() {
+    let (dir, mut app) = app_with_board();
+    let ops = Operations::new(dir.path());
+    let task = ops
+        .create_task(NewTask::titled("Running"))
+        .expect("create task");
+    ops.take_task(&task.id, "ses-live", true)
+        .expect("take")
+        .expect("task");
+    app.reload_if_changed().expect("reload");
+    assert_eq!(
+        app.board.session_states.get(&task.id),
+        Some(&crate::core::session::SessionState::Live)
+    );
+    let tasks_stamp = app.board.stamps.tasks;
+
+    SessionManager::new(dir.path())
+        .crash_session("ses-live")
+        .expect("crash");
+    app.reload_if_changed().expect("reload");
+    assert_eq!(
+        app.board.stamps.tasks, tasks_stamp,
+        "tasks were not touched"
+    );
+    assert_eq!(
+        app.board.session_states.get(&task.id),
+        Some(&crate::core::session::SessionState::Crashed)
+    );
+}
+
+#[test]
+fn archive_list_comes_from_the_board_snapshot() {
+    let (dir, mut app) = app_with_board();
+    let ops = Operations::new(dir.path());
+    let task = ops
+        .create_task(NewTask::titled("Old news"))
+        .expect("create task");
+    ops.move_task(&task.id, "archive", false).expect("archive");
+    app.reload_if_changed().expect("reload");
+    assert_eq!(app.archived_tasks.len(), 1);
+    assert_eq!(app.archived_tasks[0].id, task.id);
+    assert!(
+        app.board
+            .columns
+            .iter()
+            .all(|column| column.tasks.is_empty()),
+        "archived tasks have no board column"
+    );
+}
