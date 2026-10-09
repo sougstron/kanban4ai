@@ -384,16 +384,16 @@ walks the task's pool in priority order:
    only — see `docs/limits.md`) is materialized onto the task exactly like
    `advance_role_roster` does: `agent_backend` / `ai_model` / `ai_effort` /
    `agent_name` plus `role_profile` / `roster_index`, so the census, the caps,
-   stats and the detail view all describe what will really run. A task with
-   default launch settings resolves through the **cheap** pool; `role_profile:
-   middle` opts into the **middle** ("smart") pool. An explicit per-task
-   assignment always wins, including a pick that equals the board's current
-   defaults. Create/save materializes a blank "Default" onto the launch
-   fields, so the pool tells the two apart by `explicit_assignment` (set when
-   the human named a backend, model, effort, or agent) rather than by
-   comparing the stored values with the defaults. The session id is minted
-   from the backend the pool left on the task, so a pool swap cannot leave a
-   `ses-grok-…` id on an opencode launch.
+   stats and the detail view all describe what will really run. The pools
+   are the orchestrator's alone: only a plan node (`parent_task` set) whose
+   `role_profile` is `cheap` or `middle` walks them. A hand-made task —
+   explicit pick or "Default" — always runs its own assignment, and a failure
+   goes through the crash restarts on that same model; `advance_role_roster`
+   never switches it either. A hand-made task an earlier build already swapped
+   onto a pool drops the pool profile and, unless pinned, returns to the board
+   default on its next launch. The session id is minted from the backend the
+   pool left on the task, so a pool swap cannot leave a `ses-grok-…` id on an
+   opencode launch.
 2. Every candidate blocked → the task **parks**: `restart_at` = earliest
    blocking reset + `ask_grace_secs`, phase `queued`, no session — this is not
    a crash, so `crash_restarts` is untouched and no crash notification fires.

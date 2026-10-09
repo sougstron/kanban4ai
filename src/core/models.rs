@@ -300,13 +300,11 @@ pub struct Task {
     pub ai_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_effort: Option<String>,
-    /// The human named a backend, model, effort, or agent. The cheap executor
-    /// pool may replace only an unpinned assignment — the form's "Default" —
-    /// and must not replace a pick that merely equals the board's current
+    /// The human named a backend, model, effort, or agent, as opposed to the
+    /// form's "Default" — even when the pick equals the board's current
     /// defaults. Create/save still materialize those defaults onto the launch
     /// fields, so equality with the default is not itself a signal. Omitted
-    /// while false so legacy boards round-trip byte-identically; a missing
-    /// flag keeps the old equality check.
+    /// while false so legacy boards round-trip byte-identically.
     #[serde(default, skip_serializing_if = "is_false")]
     pub explicit_assignment: bool,
     #[serde(default)]

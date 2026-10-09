@@ -20,7 +20,7 @@ pub enum Pool {
     /// The "smart" pool: reviews, designers, and tasks with
     /// `role_profile: middle`.
     Middle,
-    /// The working pool: the default executor assignment.
+    /// The working pool: the default role for orchestrator plan nodes.
     Cheap,
 }
 

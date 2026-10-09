@@ -2347,6 +2347,11 @@ impl Operations {
         if task.status != TaskStatus::InProgress || task.restart_at.is_some() {
             return Ok(false);
         }
+        // Rosters are the orchestrator's: a hand-made task keeps its model
+        // and goes through the crash restarts instead.
+        if task.parent_task.is_none() {
+            return Ok(false);
+        }
         let Some(profile) = task.role_profile.clone() else {
             return Ok(false);
         };
@@ -2432,13 +2437,17 @@ impl Operations {
             return Ok(PoolOutcome::Unchanged);
         }
         let config = self.config.load()?;
+        // The pools belong to the orchestrator: only a node it planned with a
+        // pool role walks them. A hand-made task runs the model it names —
+        // or the board default — and a failure goes through the crash
+        // restarts on that same model, never through a pool swap.
+        if task.parent_task.is_none() {
+            self.drop_stray_pool_assignment(&config, task)?;
+            return Ok(PoolOutcome::Unchanged);
+        }
         let pool = match task.role_profile.as_deref() {
             Some("middle") => Pool::Middle,
             Some("cheap") => Pool::Cheap,
-            // An explicit per-task assignment always wins: the pool only
-            // replaces the *default* resolution, never a model the user
-            // picked on the task.
-            _ if self.task_assignment_is_default(&config, task)? => Pool::Cheap,
             _ => return Ok(PoolOutcome::Unchanged),
         };
         if pool.roster(pools).is_empty() {
@@ -2498,24 +2507,27 @@ impl Operations {
         }
     }
 
-    /// Whether the task's launch settings are indistinguishable from the
-    /// board defaults — i.e. the human left the task on "Default" rather
-    /// than picking a backend/model, so the cheap pool may decide.
-    fn task_assignment_is_default(
+    /// Undo a pool assignment an earlier build materialized onto a
+    /// hand-made task left on "Default": the stored backend/model is the
+    /// pool's pick, not the human's, so it goes back to the board default.
+    fn drop_stray_pool_assignment(
         &self,
         config: &crate::core::config::BoardConfig,
-        task: &Task,
-    ) -> Result<bool> {
-        // A human pick wins even when it names the same backend, model, and
-        // effort the board would have filled in. Legacy tasks have no flag;
-        // for those, equality with the resolved default is still the signal.
-        if task.explicit_assignment {
-            return Ok(false);
+        task: &mut Task,
+    ) -> Result<()> {
+        if !matches!(task.role_profile.as_deref(), Some("middle" | "cheap")) {
+            return Ok(());
         }
-        let probe = Task::new(String::new(), String::new());
-        let default = resolve_task_launch_settings(config, &probe)?;
-        let actual = resolve_task_launch_settings(config, task)?;
-        Ok(actual == default)
+        task.role_profile = None;
+        task.roster_index = 0;
+        if !task.explicit_assignment {
+            task.agent_backend = None;
+            task.ai_model = None;
+            task.ai_effort = None;
+            task.agent_name = None;
+            materialize_task_launch_settings(config, task)?;
+        }
+        Ok(())
     }
 
     /// The one open `kanban:executor-pool` question on the task, if any.

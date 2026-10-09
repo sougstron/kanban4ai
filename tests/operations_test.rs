@@ -4626,11 +4626,23 @@ fn pool_board() -> (tempfile::TempDir, Operations, common::RecordingLauncher) {
     )
 }
 
+/// A node the orchestrator planned onto the cheap pool — the only kind of
+/// task the executor pools may reassign.
+fn cheap_node(ops: &Operations, title: &str) -> Task {
+    let parent = ops.create_task(NewTask::titled("Orchestrated")).unwrap();
+    ops.create_task(NewTask {
+        parent_task: Some(parent.id),
+        role_profile: Some("cheap".to_string()),
+        ..NewTask::titled(title)
+    })
+    .unwrap()
+}
+
 #[test]
 fn executor_pool_skips_blocked_candidate_and_materializes_next() {
     install_pool_snapshot();
     let (_dir, ops, _recorder) = pool_board();
-    let task = ops.create_task(NewTask::titled("Pooled")).unwrap();
+    let task = cheap_node(&ops, "Pooled");
     ops.queue_run(&task.id).unwrap();
 
     let dispatched = ops.dispatch_queue().unwrap();
@@ -4666,11 +4678,11 @@ fn executor_pool_never_overrides_an_explicit_assignment() {
 }
 
 /// The board default is grok/grok-4.7/medium, and that same combination is
-/// also a later cheap-pool candidate. Picking it on the task must not be
-/// treated as "left on Default": glm (claude here) is blocked, and the next
-/// candidate is opencode/luna, which is what used to launch instead.
+/// also a later cheap-pool candidate. Neither an explicit pick nor "Default"
+/// on a hand-made task may be swapped for opencode/luna, the first candidate
+/// with headroom: the pools are the orchestrator's alone.
 #[test]
-fn executor_pool_keeps_an_explicit_pick_that_equals_the_board_default() {
+fn executor_pool_never_touches_a_hand_made_task() {
     install_pool_snapshot();
     let (dir, _storage) = common::quiet_board(false);
     fs::write(
@@ -4710,8 +4722,9 @@ fn executor_pool_keeps_an_explicit_pick_that_equals_the_board_default() {
     assert_eq!(pinned.ai_effort.as_deref(), Some("medium"));
     assert_eq!(pinned.role_profile, None);
 
-    // The same stored values, with no pin, are the form's "Default" and the
-    // pool may replace them. The session id follows the backend that runs.
+    // The same stored values, with no pin, are the form's "Default". The
+    // pools belong to the orchestrator: a hand-made task runs the board
+    // default instead of being swapped onto a pool candidate.
     let open = ops.create_task(NewTask::titled("Left on default")).unwrap();
     assert!(!open.explicit_assignment);
     assert_eq!(open.agent_backend.as_deref(), Some("grok"));
@@ -4719,22 +4732,33 @@ fn executor_pool_keeps_an_explicit_pick_that_equals_the_board_default() {
     ops.queue_run(&open.id).unwrap();
     let dispatched = ops.dispatch_queue().unwrap();
     assert_eq!(dispatched.len(), 1);
-    assert_eq!(dispatched[0].backend, "opencode");
-    assert!(
-        dispatched[0].session_id.starts_with("ses-opencode-"),
-        "{}",
-        dispatched[0].session_id
-    );
+    assert_eq!(dispatched[0].backend, "grok");
     let open = ops.storage.load_task(&open.id).unwrap().unwrap();
-    assert_eq!(open.agent_backend.as_deref(), Some("opencode"));
-    assert_eq!(open.ai_model.as_deref(), Some("openai/gpt-6-luna"));
+    assert_eq!(open.agent_backend.as_deref(), Some("grok"));
+    assert_eq!(open.ai_model.as_deref(), Some("grok-4.7"));
+    assert_eq!(open.role_profile, None);
+
+    // A task an earlier build already swapped onto the pool goes back to the
+    // board default on its next launch.
+    let mut stray = ops.create_task(NewTask::titled("Swapped earlier")).unwrap();
+    stray.role_profile = Some("cheap".to_string());
+    stray.roster_index = 1;
+    stray.agent_backend = Some("opencode".to_string());
+    stray.ai_model = Some("openai/gpt-6-luna".to_string());
+    stray.ai_effort = None;
+    stray.run_phase = Some(RunPhase::Queued);
+    ops.apply_executor_pool(&mut stray).unwrap();
+    assert_eq!(stray.agent_backend.as_deref(), Some("grok"));
+    assert_eq!(stray.ai_model.as_deref(), Some("grok-4.7"));
+    assert_eq!(stray.role_profile, None);
+    assert_eq!(stray.roster_index, 0);
 }
 
 #[test]
 fn editing_a_pooled_task_model_drops_the_pool_profile() {
     install_pool_snapshot();
     let (_dir, ops, _recorder) = pool_board();
-    let task = ops.create_task(NewTask::titled("Repicked")).unwrap();
+    let task = cheap_node(&ops, "Repicked");
     ops.queue_run(&task.id).unwrap();
     ops.dispatch_queue().unwrap();
     let pooled = ops.storage.load_task(&task.id).unwrap().unwrap();
@@ -4782,7 +4806,7 @@ fn executor_pool_parks_blocked_task_with_question_and_no_crash_cost() {
     install_pool_snapshot();
     // A pool whose only candidate is the blocked provider.
     let (dir, ops, recorder) = queue_board("  executors:\n    cheap:\n      - claude/haiku\n");
-    let task = ops.create_task(NewTask::titled("Blocked")).unwrap();
+    let task = cheap_node(&ops, "Blocked");
     ops.queue_run(&task.id).unwrap();
 
     let dispatched = ops.dispatch_queue().unwrap();
@@ -4859,7 +4883,7 @@ fn executor_pool_parks_blocked_task_with_question_and_no_crash_cost() {
 fn executor_pool_answer_materializes_provider_and_clears_the_park() {
     install_pool_snapshot();
     let (dir, ops, _recorder) = queue_board("  executors:\n    cheap:\n      - claude/haiku\n");
-    let task = ops.create_task(NewTask::titled("Blocked")).unwrap();
+    let task = cheap_node(&ops, "Blocked");
     ops.queue_run(&task.id).unwrap();
     assert!(ops.dispatch_queue().unwrap().is_empty());
 
@@ -4893,7 +4917,7 @@ fn executor_pool_answer_materializes_provider_and_clears_the_park() {
 fn executor_pool_wait_answer_keeps_the_deadline() {
     install_pool_snapshot();
     let (dir, ops, _recorder) = queue_board("  executors:\n    cheap:\n      - claude/haiku\n");
-    let task = ops.create_task(NewTask::titled("Blocked")).unwrap();
+    let task = cheap_node(&ops, "Blocked");
     ops.queue_run(&task.id).unwrap();
     assert!(ops.dispatch_queue().unwrap().is_empty());
     let parked = ops.storage.load_task(&task.id).unwrap().unwrap();
@@ -4928,7 +4952,7 @@ fn executor_pool_wait_answer_keeps_the_deadline() {
 fn executor_pool_deadline_wins_and_withdraws_the_question() {
     install_pool_snapshot();
     let (dir, ops, _recorder) = queue_board("  executors:\n    cheap:\n      - claude/haiku\n");
-    let task = ops.create_task(NewTask::titled("Blocked")).unwrap();
+    let task = cheap_node(&ops, "Blocked");
     ops.queue_run(&task.id).unwrap();
     assert!(ops.dispatch_queue().unwrap().is_empty());
 
