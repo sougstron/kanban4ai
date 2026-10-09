@@ -1,3 +1,20 @@
+# kanban4ai 0.7.1
+
+Stuck post-landing worktree cleanups no longer spin on every pump tick or flood
+task threads with repeated failure notes.
+
+## Fixed
+
+- **Stuck deferred cleanups back off.** A Landed task whose worktree cleanup
+  fails is retried by the deferred-cleanup sweep at most every 10 minutes per
+  process instead of on every store pump in every open TUI and the daemon.
+  An identical failure note is posted only once, so threads no longer grow to
+  tens of thousands of duplicate notes and boards with such tasks load without
+  the constant rewrite load.
+- **Leftover worktree residue is swept.** A worktree directory without `.git`
+  (a tool cache recreated after git removed the checkout) is deleted and the
+  worktree list pruned, instead of failing forever with "not a working tree".
+
 # kanban4ai 0.7.0
 
 Text editing and task forms become more predictable, explicit agent assignments

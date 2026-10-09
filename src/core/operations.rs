@@ -5932,10 +5932,6 @@ fn cwd_within(dir: &Path) -> bool {
         || std::env::var_os("PWD").is_some_and(|pwd| inside(PathBuf::from(pwd)))
 }
 
-/// Whether any visible process has its cwd inside `dir`, read from
-/// `/proc/<pid>/cwd`. `None` when `/proc` is unavailable (non-Linux), so the
-/// caller can stay conservative. Unreadable entries (other users'
-/// processes, races with exits) are skipped.
 /// How long the deferred-cleanup sweep leaves a task alone after its cleanup
 /// failed in this process.
 const DEFERRED_CLEANUP_RETRY: Duration = Duration::from_secs(600);
@@ -5949,6 +5945,10 @@ fn cleanup_failures() -> &'static CleanupFailures {
     FAILURES.get_or_init(Default::default)
 }
 
+/// Whether any visible process has its cwd inside `dir`, read from
+/// `/proc/<pid>/cwd`. `None` when `/proc` is unavailable (non-Linux), so the
+/// caller can stay conservative. Unreadable entries (other users'
+/// processes, races with exits) are skipped.
 fn any_process_cwd_within(dir: &Path) -> Option<bool> {
     let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let entries = fs::read_dir("/proc").ok()?;
