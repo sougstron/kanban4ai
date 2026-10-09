@@ -114,7 +114,7 @@ expression: "render_at(&mut app, 80, 24)"
 11:1-12 Style::new().fg(Color::Rgb(100, 105, 118)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 11:12-13 Style::new().fg(Color::Rgb(30, 100, 210)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 11:13-14 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
-11:14-15 Style::new().fg(Color::Rgb(28, 31, 38)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset).reversed()
+11:14-15 Style::new().fg(Color::Rgb(28, 31, 38)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 11:15-24 Style::new().fg(Color::Rgb(28, 31, 38)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset).underlined()
 11:24-66 Style::new().fg(Color::Rgb(28, 31, 38)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)
 11:66-67 Style::new().fg(Color::Rgb(184, 190, 202)).bg(Color::Rgb(248, 248, 250)).underline_color(Color::Reset)

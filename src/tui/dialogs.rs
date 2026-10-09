@@ -3372,8 +3372,8 @@ fn render_add_message(
         &modal.description,
         rows[2],
         "Text",
-        modal.active_field() == DialogField::Description
-            || app.is_hovered(HitAction::ModalField(DialogField::Description)),
+        modal.active_field() == DialogField::Description,
+        app.is_hovered(HitAction::ModalField(DialogField::Description)),
     );
     register_field(hitboxes, rows[2], DialogField::Description);
     render_form_buttons(frame, app, modal, rows[3], hitboxes);
@@ -3869,8 +3869,8 @@ fn render_answer(
         &modal.answer,
         rows[3],
         "Custom answer / selected variant",
-        modal.active_field() == DialogField::Answer
-            || app.is_hovered(HitAction::ModalField(DialogField::Answer)),
+        modal.active_field() == DialogField::Answer,
+        app.is_hovered(HitAction::ModalField(DialogField::Answer)),
     );
     register_field(hitboxes, rows[1], DialogField::Question);
     register_options(
@@ -3910,14 +3910,16 @@ fn render_selector_field(
             } else {
                 "Title"
             },
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::Description => render_description_textarea(
             frame,
             app,
             modal,
             area,
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::AgentSettings => render_agent_launcher(
             frame,
@@ -4030,7 +4032,8 @@ fn render_selector_field(
                     &modal.launch_time,
                     area,
                     "Launch at (HH:MM, local time)",
-                    modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+                    modal.active_field() == field,
+                    app.is_hovered(HitAction::ModalField(field)),
                 );
             } else {
                 // Disabled while the checkbox is off: a dimmed placeholder
@@ -4128,7 +4131,8 @@ fn render_selector_field(
             &modal.max_running_total,
             area,
             "Limits · Max running total (0 = unlimited)",
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::MaxRunningDesigner => render_textarea(
             frame,
@@ -4136,7 +4140,8 @@ fn render_selector_field(
             &modal.max_running_designer,
             area,
             "Limits · Max designer tasks",
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::MaxRunningReviewer => render_textarea(
             frame,
@@ -4144,7 +4149,8 @@ fn render_selector_field(
             &modal.max_running_reviewer,
             area,
             "Limits · Max reviewer tasks",
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::MaxRunningExecutor => render_textarea(
             frame,
@@ -4152,7 +4158,8 @@ fn render_selector_field(
             &modal.max_running_executor,
             area,
             "Limits · Max executor tasks",
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::MaxRunningPerBackend => render_textarea(
             frame,
@@ -4160,7 +4167,8 @@ fn render_selector_field(
             &modal.max_running_per_backend,
             area,
             "Limits · Max tasks per backend (one `backend: N` line)",
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::MaxRunningPerBackendModel => {
             let hint = modal
@@ -4177,7 +4185,8 @@ fn render_selector_field(
                 &modal.max_running_per_backend_model,
                 area,
                 &hint,
-                modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+                modal.active_field() == field,
+                app.is_hovered(HitAction::ModalField(field)),
             );
         }
         DialogField::AutoRestartEnabled => render_checkbox(
@@ -4195,7 +4204,8 @@ fn render_selector_field(
             &modal.auto_restart_delays,
             area,
             "Restarts · Delay minutes (e.g. 1, 30, 270)",
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::DesignerEnabled => render_checkbox(
             frame,
@@ -4310,7 +4320,8 @@ fn render_selector_field(
             &modal.reviewer_max_rounds,
             area,
             "Reviewer · Max bounce rounds (0 = unlimited)",
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::IsolationStatus => render_isolation_status(frame, app, modal, area),
         DialogField::ExecutorMiddle1
@@ -4342,7 +4353,8 @@ fn render_selector_field(
             &modal.executor_week_threshold,
             area,
             "Executor · Week quota floor % (out of quota below)",
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::ExecutorFiveHourThreshold => render_textarea(
             frame,
@@ -4350,7 +4362,8 @@ fn render_selector_field(
             &modal.executor_five_hour_threshold,
             area,
             "Executor · 5h quota floor % (out of quota below)",
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::InheritAgent
         | DialogField::InheritLimits
@@ -5230,20 +5243,31 @@ fn render_escape_to_projects(frame: &mut Frame<'_>, app: &App, modal: &ModalStat
     );
 }
 
+/// Only the focused text field draws its cursor; every other field hides it.
+pub(super) fn set_cursor_visible(textarea: &mut TextArea<'static>, visible: bool) {
+    textarea.set_cursor_style(if visible {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default()
+    });
+}
+
 fn render_textarea(
     frame: &mut Frame<'_>,
     app: &App,
     textarea: &TextArea<'static>,
     area: Rect,
     title: &str,
-    active: bool,
+    focused: bool,
+    hovered: bool,
 ) {
-    let border = if active {
+    let border = if focused || hovered {
         app.theme.focus
     } else {
         app.theme.border
     };
     let mut widget = textarea.clone();
+    set_cursor_visible(&mut widget, focused);
     widget.set_block(
         Block::default()
             .title(format!(" {title} "))
@@ -5258,13 +5282,15 @@ fn render_description_textarea(
     app: &App,
     modal: &mut ModalState,
     area: Rect,
-    active: bool,
+    focused: bool,
+    hovered: bool,
 ) {
-    let border = if active {
+    let border = if focused || hovered {
         app.theme.focus
     } else {
         app.theme.border
     };
+    set_cursor_visible(&mut modal.description, focused);
     modal.description.set_block(
         Block::default()
             // Enter, Shift+Enter, and Alt+Enter all insert a newline. The
@@ -5304,10 +5330,10 @@ fn render_project_form(
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(area);
-    let path_active = modal.active_field() == DialogField::Description
-        || app.is_hovered(HitAction::ModalField(DialogField::Description));
-    let name_active = modal.active_field() == DialogField::Title
-        || app.is_hovered(HitAction::ModalField(DialogField::Title));
+    let path_focused = modal.active_field() == DialogField::Description;
+    let path_hovered = app.is_hovered(HitAction::ModalField(DialogField::Description));
+    let name_focused = modal.active_field() == DialogField::Title;
+    let name_hovered = app.is_hovered(HitAction::ModalField(DialogField::Title));
     let mut row = 0;
     if show_path {
         render_labeled_textarea(
@@ -5316,7 +5342,8 @@ fn render_project_form(
             &mut modal.description,
             rows[row],
             path_label,
-            path_active,
+            path_focused,
+            path_hovered,
         );
         hitboxes.push(Hitbox {
             area: rows[row],
@@ -5326,7 +5353,15 @@ fn render_project_form(
     }
     if show_name {
         let label = name_label.unwrap_or("Display name");
-        render_labeled_textarea(frame, app, &mut modal.title, rows[row], label, name_active);
+        render_labeled_textarea(
+            frame,
+            app,
+            &mut modal.title,
+            rows[row],
+            label,
+            name_focused,
+            name_hovered,
+        );
         hitboxes.push(Hitbox {
             area: rows[row],
             action: HitAction::ModalField(DialogField::Title),
@@ -5421,13 +5456,15 @@ fn render_labeled_textarea(
     textarea: &mut TextArea<'static>,
     area: Rect,
     title: &str,
-    active: bool,
+    focused: bool,
+    hovered: bool,
 ) {
-    let border = if active {
+    let border = if focused || hovered {
         app.theme.focus
     } else {
         app.theme.border
     };
+    set_cursor_visible(textarea, focused);
     textarea.set_block(
         Block::default()
             .title(format!(" {title} "))
