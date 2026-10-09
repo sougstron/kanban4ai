@@ -1,13 +1,12 @@
 //! `kanban daemon` — foreground loop that pumps every registered project.
 
-use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-use crate::core::daemon::{self, try_lock};
+use crate::core::daemon::{self, PumpState, try_lock};
 use crate::core::error::{KanbanError, Result};
 use crate::core::project::ProjectStore;
 
@@ -37,9 +36,17 @@ pub fn run(once: bool, interval: Option<u64>, project: Option<&str>) -> Result<E
             .unwrap_or(daemon::DEFAULT_INTERVAL_SECS)
     });
 
-    let mut warned_once = HashSet::new();
+    let mut state = PumpState::default();
     loop {
-        let lines = daemon::tick(&store, project, &mut warned_once)?;
+        // The whole store goes through the shared pump, so an open TUI that
+        // pumps more often leaves the daemon idle instead of doubling the
+        // work; `--project` is an explicit request and always runs.
+        let lines = if project.is_some() {
+            daemon::tick(&store, project, &mut state)?
+        } else {
+            daemon::shared_tick(&store, Duration::from_secs(interval), &mut state)?
+                .unwrap_or_default()
+        };
         for line in &lines {
             println!("{line}");
             append_log(&store, line);
