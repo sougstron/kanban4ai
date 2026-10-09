@@ -1112,24 +1112,6 @@ impl ModalState {
     /// Whether a field can be focused and edited. In project settings a
     /// field of an inherited group is read-only: it shows the global value.
     pub fn field_enabled(&self, field: DialogField) -> bool {
-        match field {
-            DialogField::AgentSettings => {
-                if !self.should_show_agents_for(AgentSlot::Primary) {
-                    return false;
-                }
-            }
-            DialogField::DesignerAgentSettings => {
-                if !self.should_show_agents_for(AgentSlot::Designer) {
-                    return false;
-                }
-            }
-            DialogField::ReviewerAgentSettings => {
-                if !self.should_show_agents_for(AgentSlot::Reviewer) {
-                    return false;
-                }
-            }
-            _ => {}
-        }
         if !matches!(self.modal, Modal::Settings) {
             return true;
         }
@@ -1381,19 +1363,6 @@ impl ModalState {
             AgentSlot::Primary => self.agent_text(),
             AgentSlot::Designer => non_empty(textarea_text(&self.designer.agent)),
             AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.agent)),
-        }
-    }
-
-    /// Whether the agent selector for `slot` offers a real choice. The option
-    /// list always leads with a "Default …" placeholder (`value: None`), so
-    /// placeholder-only means no choice: the agent settings block hides.
-    pub fn should_show_agents_for(&self, slot: AgentSlot) -> bool {
-        let has_choice =
-            |options: &[SelectOption]| options.iter().any(|option| option.value.is_some());
-        match slot {
-            AgentSlot::Primary => has_choice(&self.agent_options),
-            AgentSlot::Designer => has_choice(&self.designer.agent_options),
-            AgentSlot::Reviewer => has_choice(&self.reviewer.agent_options),
         }
     }
 
@@ -3470,15 +3439,6 @@ fn render_selector_form(
     render_form_buttons(frame, app, modal, button_area, hitboxes);
 }
 
-fn should_skip_field(modal: &ModalState, field: DialogField) -> bool {
-    match field {
-        DialogField::AgentSettings => !modal.should_show_agents_for(AgentSlot::Primary),
-        DialogField::DesignerAgentSettings => !modal.should_show_agents_for(AgentSlot::Designer),
-        DialogField::ReviewerAgentSettings => !modal.should_show_agents_for(AgentSlot::Reviewer),
-        _ => false,
-    }
-}
-
 fn selector_form_rows(
     modal: &ModalState,
     content: Rect,
@@ -3523,15 +3483,10 @@ fn fit_form_scroll(
     scroll: usize,
     focused: DialogField,
 ) -> usize {
-    let visible: Vec<DialogField> = fields
-        .iter()
-        .copied()
-        .filter(|field| !should_skip_field(modal, *field))
-        .collect();
-    if visible.is_empty() {
+    if fields.is_empty() {
         return 0;
     }
-    let heights: Vec<u32> = visible
+    let heights: Vec<u32> = fields
         .iter()
         .map(|field| match field {
             DialogField::Description => u32::from(description_content_height(modal, content.width)),
@@ -3540,11 +3495,11 @@ fn fit_form_scroll(
         .collect();
     let fits = |range: &[u32]| range.iter().sum::<u32>() <= u32::from(content.height);
 
-    let mut scroll = scroll.min(visible.len() - 1);
+    let mut scroll = scroll.min(fields.len() - 1);
     while scroll > 0 && fits(&heights[scroll - 1..]) {
         scroll -= 1;
     }
-    if let Some(focus) = visible.iter().position(|field| *field == focused) {
+    if let Some(focus) = fields.iter().position(|field| *field == focused) {
         scroll = scroll.min(focus);
         while scroll < focus && !fits(&heights[scroll..=focus]) {
             scroll += 1;
@@ -3567,15 +3522,7 @@ fn selector_form_rows_from_scroll(
 
     let mut rows = Vec::new();
     let mut used: u16 = 0;
-    let mut visible_count = 0;
-    for field in fields.iter().copied() {
-        if should_skip_field(modal, field) {
-            continue;
-        }
-        if visible_count < scroll {
-            visible_count += 1;
-            continue;
-        }
+    for field in fields.iter().copied().skip(scroll.min(fields.len() - 1)) {
         let remaining = content.height.saturating_sub(used);
         let height = match field {
             // The description follows its text, not the spare space: it grows
