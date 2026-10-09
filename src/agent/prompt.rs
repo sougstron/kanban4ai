@@ -141,8 +141,8 @@ not touch the project folder's own checkout.\n"
 
 /// Small follow-up sent when Codex/pi/omp reopen their native conversation. The
 /// backend already has the original task, rules, tool history, and its own
-/// replies, so only the new board session identity and thread delta belong in
-/// this turn.
+/// replies. Refresh the board session identity and current project instructions,
+/// then append only the thread delta.
 pub fn build_resume_prompt<'a>(
     roots: impl Into<Roots<'a>>,
     task: &Task,
@@ -183,6 +183,7 @@ write into the project. Board operations remain fully available through kanban4a
 creating or editing tasks and finishing this task; usual role and column rules still apply.",
         );
     }
+    append_project_instructions(roots, &mut prompt);
     append_thread_delta(roots, task, previous_session_id, &mut prompt)?;
     Ok(prompt)
 }
@@ -542,6 +543,15 @@ Column ownership:
     }
 }
 
+/// Read the current project-wide settings for fresh launches and native resumes.
+fn append_project_instructions(roots: Roots<'_>, prompt: &mut String) {
+    if let Ok(Some(text)) = Config::new(roots.data_root).get_instructions() {
+        prompt.push_str(&format!(
+            "\nProject instructions (from Project Settings); they apply to every task in this project and supersede earlier Project Settings instructions:\n{text}\n"
+        ));
+    }
+}
+
 /// Project instructions that belong to one role only, read from
 /// `.kanban/instructions/<role>.md`.
 ///
@@ -555,11 +565,7 @@ Column ownership:
 /// `.kanban/config.yaml`) come first: every role of every task on the board
 /// gets them whenever they are not blank.
 fn append_role_instructions(roots: Roots<'_>, role: Role, prompt: &mut String) {
-    if let Ok(Some(text)) = Config::new(roots.data_root).get_instructions() {
-        prompt.push_str(&format!(
-            "\nProject instructions (from Project Settings); they apply to every task in this project:\n{text}\n"
-        ));
-    }
+    append_project_instructions(roots, prompt);
     let path = roots
         .data_path("instructions")
         .join(format!("{}.md", role.as_str()));

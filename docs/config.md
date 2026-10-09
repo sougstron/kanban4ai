@@ -28,6 +28,9 @@ auto-loaded into every agent session. Read it when you are reading or adding a s
   task on this board (all roles: orchestrator, designer, executor, reviewer),
   ahead of `.kanban/instructions/<role>.md`. Project-only — never inherited from
   the global config; a blank value removes the key.
+  The current non-blank value is read on every launch, including backend
+  switches and native conversation resumes; it supersedes earlier Project
+  Settings instructions in a resumed conversation.
 
 ## TUI Settings (.kanban/config.yaml `tui:`)
 - `card_height_lines`: 4 - task card height

@@ -1031,6 +1031,84 @@ agents:
 }
 
 #[test]
+fn backend_switch_refreshes_project_instructions_for_fresh_and_resumed_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let config = "auto_launch:\n  enabled: true\n  default_agent: codex\nnotifications:\n  enabled: false\nagents:\n  codex:\n    command: codex\n  claude:\n    command: claude\n";
+    write_agent_config(
+        dir.path(),
+        &format!("{config}instructions: Original project rule.\n"),
+    );
+    let mut task = storage
+        .create_task(NewTask::titled("Switch backends"))
+        .unwrap();
+    task.agent_backend = Some("codex".to_string());
+    let initial = build_launch_plan(dir.path(), &task, "ses-original", false).unwrap();
+    assert!(initial.prompt.contains("Original project rule."));
+
+    let sessions = SessionManager::new(dir.path());
+    let mut previous = sessions
+        .link_named_session(&task.id, "ses-original", "old")
+        .unwrap();
+    previous.status = kanban4ai::core::models::SessionStatus::Closed;
+    previous.ended_at = Some(previous.last_seen);
+    sessions.save_session(&previous).unwrap();
+    provenance::write_manifest(
+        &storage.provenance_dir,
+        &InputManifest {
+            session_id: previous.id.clone(),
+            backend: "codex".to_string(),
+            backend_session_id: Some("original-codex-thread".to_string()),
+            ..InputManifest::default()
+        },
+    )
+    .unwrap();
+
+    write_agent_config(
+        dir.path(),
+        &format!("{config}instructions: Updated rule for Claude.\n"),
+    );
+    task.agent_backend = Some("claude".to_string());
+    task.auto_resumes = 1;
+    let fresh = build_launch_plan(dir.path(), &task, "ses-claude", false).unwrap();
+    assert_eq!(fresh.backend, "claude");
+    assert!(fresh.resumed_backend_session.is_none());
+    assert!(fresh.prompt.contains("Updated rule for Claude."));
+    assert!(!fresh.prompt.contains("Original project rule."));
+    let mut switched = sessions
+        .link_named_session(&task.id, "ses-claude", "switched")
+        .unwrap();
+    switched.status = kanban4ai::core::models::SessionStatus::Closed;
+    switched.ended_at = Some(switched.last_seen);
+    sessions.save_session(&switched).unwrap();
+    provenance::write_manifest(
+        &storage.provenance_dir,
+        &InputManifest {
+            session_id: switched.id,
+            backend: "claude".to_string(),
+            backend_session_id: Some("claude-conversation".to_string()),
+            ..InputManifest::default()
+        },
+    )
+    .unwrap();
+
+    write_agent_config(
+        dir.path(),
+        &format!("{config}instructions: Current rule on return to Codex.\n"),
+    );
+    task.agent_backend = Some("codex".to_string());
+    let resumed = build_launch_plan(dir.path(), &task, "ses-return", false).unwrap();
+    assert_eq!(
+        resumed.resumed_backend_session.as_deref(),
+        Some("original-codex-thread")
+    );
+    assert!(resumed.prompt.contains("Current rule on return to Codex."));
+    assert!(!resumed.prompt.contains("Original project rule."));
+    assert!(!resumed.prompt.contains("Updated rule for Claude."));
+}
+
+#[test]
 fn full_prompt_does_not_replay_agent_reply_when_same_run_posted_context() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::new(dir.path());
