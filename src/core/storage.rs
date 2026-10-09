@@ -273,8 +273,17 @@ impl Storage {
     }
 
     pub fn save_task(&self, task: &Task) -> Result<()> {
-        {
+        let threads = ThreadManager::new(&self.project_path)?;
+        let description_unchanged = {
             let _guard = self.lock()?;
+            // The thread's task message mirrors the description; when it is
+            // unchanged (most saves are status/session/flag updates) there
+            // is no need to parse the whole thread to compare it.
+            let description_unchanged = threads.stamp(&task.id).is_some()
+                && self
+                    .get_task_path(&task.id)
+                    .and_then(|path| self.parse_task_file(&path).ok())
+                    .is_some_and(|old| old.description.trim() == task.description.trim());
             let new_path = self
                 .tasks_dir
                 .join(task.status.as_str())
@@ -293,8 +302,11 @@ impl Storage {
                     let _ = fs::remove_file(&other);
                 }
             }
+            description_unchanged
+        };
+        if !description_unchanged {
+            threads.update_task_message(task)?;
         }
-        ThreadManager::new(&self.project_path)?.update_task_message(task)?;
         Ok(())
     }
 
@@ -330,6 +342,24 @@ impl Storage {
         let mut tasks = Vec::new();
         for status_dir in status_dirs {
             if !status_dir.is_dir() {
+                continue;
+            }
+            for path in task_files_in(&status_dir) {
+                if let Ok(task) = self.parse_task_file(&path) {
+                    tasks.push(task);
+                }
+            }
+        }
+        Ok(tasks)
+    }
+
+    /// Every task outside the archive. The archive only grows, so periodic
+    /// scans that never act on archived tasks should not parse it.
+    pub fn list_unarchived_tasks(&self) -> Result<Vec<Task>> {
+        let archive = self.tasks_dir.join(TaskStatus::Archive.as_str());
+        let mut tasks = Vec::new();
+        for status_dir in self.status_dirs() {
+            if status_dir == archive {
                 continue;
             }
             for path in task_files_in(&status_dir) {

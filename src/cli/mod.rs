@@ -27,9 +27,11 @@ use crate::core::models::{RunMode, Task, TaskStatus};
 use crate::core::operations::{
     AgentExitOutcome, LandOutcome, Operations, QuestionRef, TaskPatch, Verdict, WaitWake,
 };
+use crate::core::project::ProjectStore;
 use crate::core::session::{SessionManager, estimate_session_tokens};
 use crate::core::stats;
 use crate::core::storage::NewTask;
+use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 use crate::core::update;
 
@@ -330,6 +332,15 @@ enum Command {
         #[arg(long = "with-context")]
         with_context: bool,
     },
+    /// Collapse runs of identical board notes in task threads into one
+    /// message with a (×N) counter. Fixes threads bloated by a repeating
+    /// status note; without TASK_ID every thread of the board is compacted.
+    CompactThreads {
+        task_id: Option<String>,
+        /// Compact every project of the store
+        #[arg(long = "all-projects", conflicts_with = "task_id")]
+        all_projects: bool,
+    },
     /// Compact context for a task.
     Compact {
         task_id: String,
@@ -525,6 +536,13 @@ fn launch_tui(selector: Option<&str>) -> Result<ExitCode> {
 /// `kanban limits`: remaining subscription capacity per provider. Reuses the
 /// snapshot the TUI caches unless it is stale (or `--refresh` is given), so
 /// repeated calls do not re-poll the providers.
+fn print_compacted_threads(project: Option<&str>, compacted: Vec<(String, usize, usize)>) {
+    for (task_id, before, after) in compacted {
+        let label = project.map_or(task_id.clone(), |name| format!("{name}/{task_id}"));
+        println!("{label}: {before} -> {after} messages");
+    }
+}
+
 fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
     let snapshot = match limits::cached() {
         Some(snapshot)
@@ -716,6 +734,17 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Command::Stats => {
             println!("{}", stats::collect_store_report(timefmt::now())?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::CompactThreads {
+            all_projects: true, ..
+        } => {
+            for project in ProjectStore::open()?.list()? {
+                print_compacted_threads(
+                    Some(&project.name),
+                    ThreadManager::new(&project.data_root)?.compact_all_repeats()?,
+                );
+            }
             return Ok(ExitCode::SUCCESS);
         }
         Command::Update { check } => return run_update(check),
@@ -1213,6 +1242,21 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     println!("\nContext:\n{context}");
                 }
             }
+        }
+        Command::CompactThreads { task_id, .. } => {
+            let threads = ThreadManager::new(ops.data_root())?;
+            let compacted = match task_id {
+                Some(task_id) => threads
+                    .compact_repeats(&task_id)?
+                    .map(|(before, after)| (task_id, before, after))
+                    .into_iter()
+                    .collect(),
+                None => threads.compact_all_repeats()?,
+            };
+            if compacted.is_empty() {
+                println!("No repeated notes to collapse.");
+            }
+            print_compacted_threads(None, compacted);
         }
         Command::Compact { task_id, force } => {
             let config = Config::new(ops.data_root());

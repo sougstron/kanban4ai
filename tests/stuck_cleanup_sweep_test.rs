@@ -128,4 +128,17 @@ fn a_cleanup_that_needs_a_human_is_not_retried_every_tick() {
     );
     let task = ops.storage.load_task(&task_id).unwrap().unwrap();
     assert_eq!(task.branch.as_deref(), Some(branch.as_str()));
+    // The backoff lives on the task, so a fresh process (here: a fresh
+    // board handle) does not retry at once either.
+    assert!(task.cleanup_retry_at.is_some());
+
+    // Once the backoff ran out the retry runs again, but the thread does
+    // not take the same failure note a second time.
+    let mut task = task;
+    task.cleanup_retry_at = Some(task.cleanup_retry_at.unwrap() - chrono::Duration::hours(1));
+    ops.storage.save_task(&task).unwrap();
+    assert!(ops.sweep_deferred_cleanups().unwrap().is_empty());
+    assert_eq!(failure_notes(&ops, &task_id), 1);
+    let task = ops.storage.load_task(&task_id).unwrap().unwrap();
+    assert!(task.cleanup_retry_at.unwrap() > kanban4ai::core::timefmt::now());
 }
