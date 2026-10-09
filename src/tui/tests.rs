@@ -12337,3 +12337,42 @@ fn only_the_focused_text_field_draws_a_cursor() {
     app.handle_key(key(KeyCode::Tab)).unwrap();
     assert_eq!(reversed_cells(&mut app), [0, 1]);
 }
+
+#[test]
+fn card_shows_suggestion_count_in_top_right_corner_on_done() {
+    let (dir, mut app) = app_with_board();
+    let ops = Operations::new(dir.path());
+    let task = ops
+        .create_task(NewTask {
+            title: "Shipped".to_string(),
+            ..Default::default()
+        })
+        .expect("create task");
+    ops.move_task(&task.id, "done", false)
+        .expect("move to done");
+    for idea in ["First idea", "Second idea"] {
+        ops.suggest_improvement(&task.id, idea, "agent", vec![])
+            .expect("suggest");
+    }
+    app.board =
+        super::app::BoardSnapshot::load_reusing(&app.ops, Some(&app.board)).expect("reload");
+    assert_eq!(app.board.suggestions[&task.id].count, 2);
+
+    let backend = TestBackend::new(96, 28);
+    let mut terminal = Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| board::ui(frame, &mut app))
+        .expect("draw");
+    let (_, _, area) = card_hits(&app)[0];
+    let buffer = terminal.backend().buffer();
+    let corner = &buffer[(area.x + area.width - 2, area.y)];
+    assert_eq!(corner.symbol(), "2");
+    assert_eq!(corner.fg, app.theme.focus);
+
+    // A cached count is reused only while the thread file is unchanged.
+    ops.suggest_improvement(&task.id, "Third idea", "agent", vec![])
+        .expect("suggest");
+    app.board =
+        super::app::BoardSnapshot::load_reusing(&app.ops, Some(&app.board)).expect("reload");
+    assert_eq!(app.board.suggestions[&task.id].count, 3);
+}

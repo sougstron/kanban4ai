@@ -35,7 +35,7 @@ use crate::core::models::{
     Message, MessageKind, MessageStatus, RunMode, RunPhase, Session, SessionStatus, Task,
     TaskStatus,
 };
-use crate::core::operations::{Operations, QuestionRef, TaskPatch, WaitWake};
+use crate::core::operations::{Operations, QuestionRef, SuggestionCount, TaskPatch, WaitWake};
 use crate::core::project::{Project, ProjectStore};
 use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
@@ -136,6 +136,10 @@ pub struct BoardSnapshot {
     pub session_deadlines: HashMap<String, chrono::NaiveDateTime>,
     pub session_wait_deadlines: HashMap<String, chrono::NaiveDateTime>,
     pub session_wait_notes: HashMap<String, String>,
+    /// Suggestion count per task thread (any status), shown in the card's
+    /// top-right corner. Carries the thread stamp so the next rebuild only
+    /// re-parses changed threads.
+    pub suggestions: HashMap<String, SuggestionCount>,
     /// Project-wide designer bot on; drives the pending `✎ design` card mark
     /// (a task's own `use_designer` ORs in).
     pub designer_bot: bool,
@@ -2908,7 +2912,7 @@ impl App {
         }
         let fingerprint = self.ops.storage.tui_fingerprint();
         if global_changed || fingerprint != self.board.fingerprint {
-            self.board = BoardSnapshot::load(&self.ops)?;
+            self.board = BoardSnapshot::load_reusing(&self.ops, Some(&self.board))?;
             self.refresh_archived_tasks()?;
             if self.screen == Screen::Sessions {
                 self.refresh_active_sessions()?;
@@ -3738,7 +3742,7 @@ impl App {
     /// Reload the board and, when the detail screen is open, its task —
     /// preserving scroll position and panel focus where still valid.
     fn refresh_after_action(&mut self) -> Result<()> {
-        self.board = BoardSnapshot::load(&self.ops)?;
+        self.board = BoardSnapshot::load_reusing(&self.ops, Some(&self.board))?;
         self.refresh_archived_tasks()?;
         self.clamp_focus();
         if let Some(detail) = self.detail.as_ref() {
@@ -6238,7 +6242,7 @@ impl App {
                 {
                     self.close_detail()?;
                 }
-                self.board = BoardSnapshot::load(&self.ops)?;
+                self.board = BoardSnapshot::load_reusing(&self.ops, Some(&self.board))?;
                 self.refresh_archived_tasks()?;
                 self.clamp_focus();
                 self.status = format!("Deleted {task_id}");
@@ -6492,6 +6496,7 @@ impl BoardSnapshot {
             session_deadlines: HashMap::new(),
             session_wait_deadlines: HashMap::new(),
             session_wait_notes: HashMap::new(),
+            suggestions: HashMap::new(),
             designer_bot: false,
             reviewer_bot: false,
             fingerprint: (0, 0, 0),
@@ -6499,6 +6504,12 @@ impl BoardSnapshot {
     }
 
     pub fn load(ops: &Operations) -> Result<Self> {
+        Self::load_reusing(ops, None)
+    }
+
+    /// [`Self::load`], reusing `previous` suggestion counts for threads whose
+    /// file has not changed since.
+    pub fn load_reusing(ops: &Operations, previous: Option<&Self>) -> Result<Self> {
         let config = ops.config.load()?;
         let orch = OrchestrationSettings::from_mapping(&config.orchestration);
         let ids = config.column_ids();
@@ -6596,6 +6607,11 @@ impl BoardSnapshot {
             })
             .collect::<HashMap<_, _>>();
         let extras = Self::load_extras(ops, &tasks, &session_states)?;
+        let mut suggestions = HashMap::new();
+        for task in &tasks {
+            let cached = previous.and_then(|board| board.suggestions.get(&task.id).copied());
+            suggestions.insert(task.id.clone(), ops.suggestion_count(&task.id, cached)?);
+        }
         for task in tasks {
             grouped
                 .entry(task.status.as_str().to_string())
@@ -6618,6 +6634,7 @@ impl BoardSnapshot {
             session_deadlines,
             session_wait_deadlines,
             session_wait_notes,
+            suggestions,
             designer_bot: orch.designer.enabled,
             reviewer_bot: orch.reviewer.enabled,
             fingerprint: ops.storage.tui_fingerprint(),
