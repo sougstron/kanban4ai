@@ -680,7 +680,7 @@ impl Default for PoolThresholds {
 }
 
 /// `orchestration.executors`: the board-level executor pools. `cheap` is the
-/// default executor assignment for tasks with no explicit one, `middle` the
+/// default role for orchestrator plan nodes (never for hand-made tasks), `middle` the
 /// opt-in "smart" pool (reviews, designers, or `role_profile: middle`). Both
 /// are ordered — the first candidate with provider headroom runs — and hold
 /// at most three entries. Empty pools mean today's behaviour.

@@ -357,18 +357,35 @@ fn a_limit_crash_fails_over_to_the_next_model_in_the_roster() {
          auto_restart:\n    enabled: true\n    delays_minutes: [1, 30]\n  \
          roles:\n    tier:\n    - claude/opus\n    - claude/sonnet\n",
     );
-    let mut task = ops
-        .create_task(NewTask {
-            title: "Node".into(),
-            agent_backend: Some("claude".into()),
-            ai_model: Some("opus".into()),
-            role_profile: Some("tier".into()),
-            ..Default::default()
-        })
-        .unwrap();
-    task.status = TaskStatus::InProgress;
-    task.run_phase = Some(RunPhase::Execute);
-    ops.storage.save_task(&task).unwrap();
+    let parent = ops.create_task(NewTask::titled("Orchestrated")).unwrap();
+    let in_progress = |new_task: NewTask| {
+        let mut task = ops.create_task(new_task).unwrap();
+        task.status = TaskStatus::InProgress;
+        task.run_phase = Some(RunPhase::Execute);
+        ops.storage.save_task(&task).unwrap();
+        task
+    };
+    let task = in_progress(NewTask {
+        title: "Node".into(),
+        agent_backend: Some("claude".into()),
+        ai_model: Some("opus".into()),
+        role_profile: Some("tier".into()),
+        parent_task: Some(parent.id.clone()),
+        ..Default::default()
+    });
+
+    // Rosters are the orchestrator's: a hand-made task keeps its model and
+    // goes through the crash restarts instead.
+    let hand_made = in_progress(NewTask {
+        title: "Hand-made".into(),
+        agent_backend: Some("claude".into()),
+        ai_model: Some("opus".into()),
+        role_profile: Some("tier".into()),
+        ..Default::default()
+    });
+    assert!(!ops.advance_role_roster(&hand_made.id, "quota").unwrap());
+    let kept = ops.get_task(&hand_made.id).unwrap().unwrap();
+    assert_eq!(kept.ai_model.as_deref(), Some("opus"));
 
     assert!(
         ops.advance_role_roster(&task.id, "quota").unwrap(),

@@ -321,12 +321,11 @@ orchestration:
 - `middle`: [] - up to three ordered candidates. Opt-in: a task only uses it
   with `role_profile: middle` (a plan node asks for it with `role: middle`). "Middle" is the smart pool — the same roster resolves designer and
   reviewer launches when their bot settings opt in through it
-- `cheap`: [] - up to three ordered candidates. This is the executor default:
-  any queued task whose launch settings are indistinguishable from the board
-  defaults (the human left backend/model on Default) resolves through it. An
-  explicit per-task assignment always wins — the pool never overrides a model
-  the user picked. It is also the default `orchestration.orchestrator.default_role`,
-  so plan nodes land here unless the planner asked for something else
+- `cheap`: [] - up to three ordered candidates for orchestrator plan nodes
+  only. It is the default `orchestration.orchestrator.default_role`, so plan
+  nodes land here unless the planner asked for something else. Hand-made
+  tasks never use it: an explicit pick or "Default" runs as assigned, and a
+  failure goes to the crash restarts, not to another model
 - `thresholds.week_percent`: 5 - minimum *remaining* percentage a provider's
   weekly window must show (inclusive boundary) for a candidate to pass
 - `thresholds.five_hour_percent`: 15 - the same floor for 5h windows; every
