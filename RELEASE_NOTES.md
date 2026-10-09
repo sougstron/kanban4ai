@@ -1,3 +1,25 @@
+# kanban4ai 0.7.3
+
+Hand-made tasks keep the assignment they were given, and a text field draws
+its cursor only while that field is focused.
+
+## Changed
+
+- **Executor pools stay on orchestrator plan nodes**
+  (`src/core/operations.rs`). The cheap and middle pools, and role-roster
+  failover after a limit crash, apply only to a plan node (`parent_task`
+  set) whose `role_profile` is `cheap` or `middle`. A hand-made task runs
+  its explicit pick or the board Default, and a failure stays on that model
+  through the crash restarts instead of walking the pool onto another
+  model. A hand-made task that an earlier build already swapped onto a pool
+  drops that profile on its next launch and, unless the assignment was
+  pinned, returns to the board default.
+
+- **Text cursors only in the focused field** (`src/tui/dialogs.rs`,
+  `src/tui/detail.rs`). Unfocused text areas in dialogs and the review-edits
+  editor no longer draw the reversed cursor cell, including while the
+  pointer is only hovering. Hover still highlights the field border.
+
 # kanban4ai 0.7.2
 
 Agent settings blocks are always rendered again: the task form and the
