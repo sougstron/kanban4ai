@@ -4107,13 +4107,27 @@ impl Operations {
         }
         let had_isolation = task.worktree.is_some() || task.branch.is_some();
         let problems = self.clear_task_worktree(task, false);
+        let key = (self.data_root().to_path_buf(), task.id.clone());
+        let mut failures = cleanup_failures()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if !problems.is_empty() {
-            self.post_queue_note(
-                &task.id,
-                &format!("⚠ landing cleanup failed: {}", problems.join("; ")),
-            );
-        } else if had_isolation && task.worktree.is_none() {
-            self.post_queue_note(&task.id, "🧹 landed — isolated worktree and branch removed");
+            let note = format!("⚠ landing cleanup failed: {}", problems.join("; "));
+            let repeated = failures.get(&key).is_some_and(|(last, _)| *last == note);
+            failures.insert(key, (note.clone(), Instant::now()));
+            drop(failures);
+            // The deferred sweep retries a failure that needs a human (an
+            // unmerged branch); posting it on every retry grew threads to
+            // tens of thousands of identical notes.
+            if !repeated {
+                self.post_queue_note(&task.id, &note);
+            }
+        } else {
+            failures.remove(&key);
+            drop(failures);
+            if had_isolation && task.worktree.is_none() {
+                self.post_queue_note(&task.id, "🧹 landed — isolated worktree and branch removed");
+            }
         }
     }
 
@@ -4150,6 +4164,19 @@ impl Operations {
                 .is_some_and(|s| self.session_manager().is_session_active(s))
     }
 
+    /// Whether this task's cleanup failed in this process less than
+    /// [`DEFERRED_CLEANUP_RETRY`] ago. The sweep runs on every pump tick of
+    /// every open TUI and the daemon; without the pause a stuck cleanup ran
+    /// git and rewrote the task's thread every few seconds, forever.
+    fn deferred_cleanup_backing_off(&self, task_id: &str) -> bool {
+        let key = (self.data_root().to_path_buf(), task_id.to_string());
+        cleanup_failures()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&key)
+            .is_some_and(|(_, at)| at.elapsed() < DEFERRED_CLEANUP_RETRY)
+    }
+
     /// Daemon-tick sweep for deferred post-landing cleanups that no
     /// `agent-exit` will finish (a session not started through the launch
     /// wrapper). `kanban done` closes the session before its shell exits, so
@@ -4165,7 +4192,7 @@ impl Operations {
         let _guard = self.storage.lock()?;
         let mut swept = Vec::new();
         for mut task in self.storage.list_tasks(None)? {
-            if !self.awaits_deferred_cleanup(&task) {
+            if !self.awaits_deferred_cleanup(&task) || self.deferred_cleanup_backing_off(&task.id) {
                 continue;
             }
             let Some(rel) = task.worktree.clone() else {
@@ -5384,7 +5411,14 @@ impl Operations {
         };
         let mut problems: Vec<String> = Vec::new();
         let wt_path = self.storage.worktrees_dir.join(&rel);
-        if wt_path.is_dir() {
+        if wt_path.is_dir() && !wt_path.join(".git").exists() {
+            // Not a checkout at all: git already removed the worktree and a
+            // late tool write (a `.vite` cache) recreated the bare directory.
+            // `git worktree remove` refuses it as "not a working tree", which
+            // used to wedge the cleanup forever, so sweep the residue here.
+            let _ = fs::remove_dir_all(&wt_path);
+            let _ = repo.prune_worktrees();
+        } else if wt_path.is_dir() {
             // The checkout dies with the task; --force keeps modified or
             // untracked leftovers from wedging the removal.
             if let Err(err) = repo.remove_worktree(&wt_path, true) {
@@ -5902,6 +5936,19 @@ fn cwd_within(dir: &Path) -> bool {
 /// `/proc/<pid>/cwd`. `None` when `/proc` is unavailable (non-Linux), so the
 /// caller can stay conservative. Unreadable entries (other users'
 /// processes, races with exits) are skipped.
+/// How long the deferred-cleanup sweep leaves a task alone after its cleanup
+/// failed in this process.
+const DEFERRED_CLEANUP_RETRY: Duration = Duration::from_secs(600);
+
+/// Post-landing cleanups that failed in this process, keyed by board data
+/// root and task id: the failure note last posted and when it was tried.
+type CleanupFailures = std::sync::Mutex<HashMap<(PathBuf, String), (String, Instant)>>;
+
+fn cleanup_failures() -> &'static CleanupFailures {
+    static FAILURES: std::sync::OnceLock<CleanupFailures> = std::sync::OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
 fn any_process_cwd_within(dir: &Path) -> Option<bool> {
     let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
     let entries = fs::read_dir("/proc").ok()?;
