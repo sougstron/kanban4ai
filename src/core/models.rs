@@ -452,6 +452,15 @@ pub struct Task {
     /// byte-identically.
     #[serde(default, skip_serializing_if = "is_integration_default")]
     pub integration: IntegrationState,
+    /// A failed post-landing cleanup is not retried by the store sweep
+    /// before this moment. Kept on the task so the backoff holds across
+    /// every process that pumps the board. Omitted while unset.
+    #[serde(
+        default,
+        with = "timefmt::serde_naive_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cleanup_retry_at: Option<NaiveDateTime>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -509,6 +518,7 @@ impl Task {
             designed: false,
             worktree: None,
             branch: None,
+            cleanup_retry_at: None,
             base_commit: None,
             integration: IntegrationState::None,
         }

@@ -1,3 +1,23 @@
+# Unreleased
+
+## Performance
+
+- Projects summaries scan in the background and cache task counts, sessions
+  and display names independently. Initial paint no longer parses every task;
+  refresh preserves the selected project and ignores pre-action scan results.
+- Board reload separates tasks from session/thread sidecars. Heartbeats do not
+  reparse task files; changed task files reuse a per-file cache, and Archive
+  comes from the same snapshot.
+- `compact-threads [TASK-ID] [--all-projects]` collapses repeated kanban notes
+  without dropping agent/user context or reply parents. Thread writes avoid
+  redundant YAML parsing and message reloads, and merge uses indexed lookup.
+- Deferred cleanup retry timestamps persist on tasks across process restarts.
+  `thresholds.deferred_cleanup_retry_interval` controls the delay (600 seconds
+  by default); repeated failure notes are deduplicated on disk.
+- Thread save, board-note dedupe and compaction hold the board lock. A stale
+  writer no longer resurrects unchanged compacted notes; a new reply still
+  keeps its referenced parent.
+
 # kanban4ai 0.7.3
 
 Hand-made tasks keep the assignment they were given, and a text field draws

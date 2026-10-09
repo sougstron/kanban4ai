@@ -8,6 +8,8 @@ auto-loaded into every agent session. Read it when you are reading or adding a s
 - `context_warning`: 51200 (50KB) - warn about large context
 - `context_auto_compact`: 102400 (100KB) - auto-compress
 - `session_heartbeat_timeout`: 1800 (30 min) - mark crashed
+- `deferred_cleanup_retry_interval`: 600 (sec) - persist the next retry time
+  on a task after post-landing worktree cleanup fails; shared across processes
 - `context_summary_max_length`: 5000 chars
 - `tui_refresh_interval`: 1 (sec) - TUI refresh fallback (primary refresh is inotify)
 - `question_poll_interval`: 3 (sec) - poll interval for `kanban ask --wait`

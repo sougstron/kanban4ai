@@ -6,6 +6,7 @@
 //! of being handed to `List`, so the mouse hitboxes and the scroll offset are
 //! computed from the same geometry the cells are drawn with.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -17,9 +18,11 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use serde::Deserialize;
 
-use crate::core::models::RunPhase;
+use crate::core::config::Config;
+use crate::core::models::{RunPhase, Session};
 use crate::core::project::{Project, ProjectStore, default_name};
 use crate::core::session::SessionManager;
+use crate::core::storage::{Fingerprint, Storage, stat_ns};
 use crate::core::timefmt;
 
 use super::app::{App, HitAction, Hitbox, UiAction};
@@ -74,24 +77,6 @@ pub struct ProjectRow {
     pub display_name: String,
 }
 
-impl ProjectRow {
-    pub fn from_project(project: Project) -> Self {
-        Self {
-            counts: scan_counts(&project.data_root),
-            missing: project.work_path_missing(),
-            display_name: display_name(&project),
-            project,
-        }
-    }
-}
-
-/// The name the projects list, the rename dialog and the delete confirmation
-/// all speak: project settings first, the registry entry second.
-pub fn display_name(project: &Project) -> String {
-    crate::core::migrate::board_display_name(&project.data_root)
-        .unwrap_or_else(|| project.name.clone())
-}
-
 /// Visible rows: optional pinned create-cwd action, then matching projects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectListItem {
@@ -99,11 +84,86 @@ pub enum ProjectListItem {
     Project(ProjectRow),
 }
 
-pub fn load_rows(store: &ProjectStore) -> crate::core::error::Result<Vec<ProjectRow>> {
+/// Parsed summaries owned by the Projects scan worker. Deleted projects are
+/// evicted on every scan; session heartbeats never reparse task frontmatter.
+#[derive(Default)]
+pub(super) struct ProjectCache {
+    entries: HashMap<PathBuf, CachedProject>,
+}
+
+struct CachedProject {
+    tasks_stamp: Fingerprint,
+    sessions_stamp: Fingerprint,
+    config_stamp: Option<(u128, u64)>,
+    global_stamp: Option<std::time::SystemTime>,
+    counts: ProjectCounts,
+    sessions: Vec<Session>,
+    name: Option<String>,
+}
+
+impl ProjectCache {
+    pub fn load(&mut self, store: &ProjectStore) -> crate::core::error::Result<Vec<ProjectRow>> {
+        let projects = store.list()?;
+        self.entries
+            .retain(|root, _| projects.iter().any(|project| &project.data_root == root));
+        let mut rows = Vec::with_capacity(projects.len());
+        let now = timefmt::now();
+        for project in projects {
+            let storage = Storage::new(&project.data_root);
+            let config = Config::new(&project.data_root);
+            // Capture before reading so concurrent writes invalidate next scan.
+            let tasks_stamp = storage.tasks_fingerprint();
+            let sessions_stamp = storage.sessions_fingerprint();
+            let config_stamp = stat_ns(&config.config_file);
+            let global_stamp = config.global_stamp();
+            let entry = self
+                .entries
+                .entry(project.data_root.clone())
+                .or_insert_with(|| CachedProject {
+                    tasks_stamp,
+                    sessions_stamp,
+                    config_stamp,
+                    global_stamp,
+                    counts: scan_task_counts(&project.data_root),
+                    sessions: SessionManager::new(&project.data_root).list_active_sessions(),
+                    name: crate::core::migrate::board_display_name(&project.data_root),
+                });
+            if entry.tasks_stamp != tasks_stamp {
+                entry.counts = scan_task_counts(&project.data_root);
+                entry.tasks_stamp = tasks_stamp;
+            }
+            if entry.sessions_stamp != sessions_stamp {
+                entry.sessions = SessionManager::new(&project.data_root).list_active_sessions();
+                entry.sessions_stamp = sessions_stamp;
+            }
+            if entry.config_stamp != config_stamp || entry.global_stamp != global_stamp {
+                entry.name = crate::core::migrate::board_display_name(&project.data_root);
+                entry.config_stamp = config_stamp;
+                entry.global_stamp = global_stamp;
+            }
+            rows.push(ProjectRow {
+                counts: with_session_counts(entry.counts, &entry.sessions, now),
+                missing: project.work_path_missing(),
+                display_name: entry.name.clone().unwrap_or_else(|| project.name.clone()),
+                project,
+            });
+        }
+        Ok(rows)
+    }
+}
+
+/// Initial paint needs only the registry. Counts and board-specific names
+/// arrive from the worker; the status bar marks this loading state.
+pub(super) fn initial_rows(store: &ProjectStore) -> crate::core::error::Result<Vec<ProjectRow>> {
     Ok(store
         .list()?
         .into_iter()
-        .map(ProjectRow::from_project)
+        .map(|project| ProjectRow {
+            counts: ProjectCounts::default(),
+            missing: project.work_path_missing(),
+            display_name: project.name.clone(),
+            project,
+        })
         .collect())
 }
 
@@ -179,26 +239,43 @@ pub fn cwd_create_path(store: &ProjectStore, cwd: &Path) -> Option<PathBuf> {
     }
 }
 
+#[cfg(test)]
 pub fn scan_counts(data_root: &Path) -> ProjectCounts {
+    with_session_counts(
+        scan_task_counts(data_root),
+        &SessionManager::new(data_root).list_active_sessions(),
+        timefmt::now(),
+    )
+}
+
+fn scan_task_counts(data_root: &Path) -> ProjectCounts {
     let tasks = data_root.join(".kanban").join("tasks");
     let [todo, in_progress, review, done] =
         ["todo", "in_progress", "review", "done"].map(|s| scan_task_dir(&tasks.join(s)));
-    let active_sessions = SessionManager::new(data_root).list_active_sessions();
-    let now = timefmt::now();
-    let waiting_sessions = active_sessions
-        .iter()
-        .filter(|session| session.wait_until.is_some_and(|deadline| now <= deadline))
-        .count() as u32;
     ProjectCounts {
         todo: todo.files,
         in_progress: in_progress.files,
         review: review.files,
         done: done.files,
-        sessions: active_sessions.len() as u32 - waiting_sessions,
-        paused: todo.paused + in_progress.paused + review.paused + done.paused + waiting_sessions,
+        paused: todo.paused + in_progress.paused + review.paused + done.paused,
         review_unseen: review.unseen,
         questions: todo.questions + in_progress.questions + review.questions + done.questions,
+        ..ProjectCounts::default()
     }
+}
+
+fn with_session_counts(
+    mut counts: ProjectCounts,
+    sessions: &[Session],
+    now: NaiveDateTime,
+) -> ProjectCounts {
+    let waiting = sessions
+        .iter()
+        .filter(|session| session.wait_until.is_some_and(|deadline| now <= deadline))
+        .count() as u32;
+    counts.sessions = sessions.len() as u32 - waiting;
+    counts.paused += waiting;
+    counts
 }
 
 pub fn shorten_path(path: &Path) -> String {
@@ -630,4 +707,25 @@ fn scan_task_dir(dir: &Path) -> DirScan {
         }
     }
     acc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_session_wait_expires_without_a_file_change() {
+        let deadline = timefmt::parse("2026-10-09T10:00:00").unwrap();
+        let mut session = Session::new("ses-wait-count", "TASK-001");
+        session.wait_until = Some(deadline);
+        let sessions = [session];
+        let before = with_session_counts(ProjectCounts::default(), &sessions, deadline);
+        let after = with_session_counts(
+            ProjectCounts::default(),
+            &sessions,
+            deadline + chrono::Duration::seconds(1),
+        );
+        assert_eq!((before.sessions, before.paused), (0, 1));
+        assert_eq!((after.sessions, after.paused), (1, 0));
+    }
 }

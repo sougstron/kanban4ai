@@ -377,3 +377,256 @@ fn new_does_not_create_kanban_directories() {
         "constructing ThreadManager must not mkdir .kanban"
     );
 }
+
+#[test]
+fn board_note_repeating_the_last_message_is_not_posted() {
+    let (_dir, manager, task_id) = setup();
+
+    let first = manager.post_board_note(&task_id, "⚠ stuck").unwrap();
+    assert!(first.is_some());
+    assert!(
+        manager
+            .post_board_note(&task_id, "⚠ stuck")
+            .unwrap()
+            .is_none()
+    );
+    // A different note in between makes the next repeat news again.
+    assert!(
+        manager
+            .post_board_note(&task_id, "▶ other")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        manager
+            .post_board_note(&task_id, "⚠ stuck")
+            .unwrap()
+            .is_some()
+    );
+
+    let notes = manager
+        .messages_of_kind(&task_id, MessageKind::AgentStep)
+        .unwrap();
+    let bodies: Vec<&str> = notes.iter().map(|m| m.body.as_str()).collect();
+    assert_eq!(bodies, ["⚠ stuck", "▶ other", "⚠ stuck"]);
+    assert!(notes.iter().all(|m| m.author.as_deref() == Some("kanban")));
+}
+
+#[test]
+fn compact_repeats_collapses_runs_of_board_notes() {
+    let (_dir, manager, task_id) = setup();
+    let post_note = |body: &str| {
+        manager
+            .post(
+                &task_id,
+                MessageRole::System,
+                MessageKind::AgentStep,
+                body,
+                None,
+                vec![],
+                Some("kanban".into()),
+            )
+            .unwrap()
+    };
+    for _ in 0..4 {
+        post_note("⚠ cleanup failed");
+    }
+    let agent = manager
+        .post(
+            &task_id,
+            MessageRole::Agent,
+            MessageKind::AgentStep,
+            "⚠ cleanup failed",
+            None,
+            vec![],
+            Some("claude".into()),
+        )
+        .unwrap();
+    let last = post_note("⚠ cleanup failed");
+    post_note("⚠ cleanup failed");
+    let rev = manager.load(&task_id).unwrap().rev;
+
+    assert_eq!(manager.compact_repeats(&task_id).unwrap(), Some((9, 5)));
+    let thread = manager.load(&task_id).unwrap();
+    assert_eq!(thread.rev, rev + 1);
+    let bodies: Vec<&str> = thread.messages.iter().map(|m| m.body.as_str()).collect();
+    assert_eq!(
+        &bodies[2..],
+        [
+            "⚠ cleanup failed (×4)",
+            "⚠ cleanup failed",
+            "⚠ cleanup failed (×2)"
+        ]
+    );
+    // The agent's own message is never folded into a board note run.
+    assert_eq!(thread.messages[3].id, agent.id);
+    assert!(thread.messages[4].updated_at >= last.updated_at);
+
+    // Idempotent, and the counter keeps the repeat suppressed.
+    assert_eq!(manager.compact_repeats(&task_id).unwrap(), None);
+    assert!(
+        manager
+            .post_board_note(&task_id, "⚠ cleanup failed")
+            .unwrap()
+            .is_none()
+    );
+    // A later run continues the counter.
+    manager.post_board_note(&task_id, "▶ x").unwrap();
+    post_note("⚠ cleanup failed");
+    post_note("⚠ cleanup failed");
+    manager.compact_repeats(&task_id).unwrap();
+    let thread = manager.load(&task_id).unwrap();
+    assert_eq!(
+        thread.messages.last().unwrap().body,
+        "⚠ cleanup failed (×2)"
+    );
+}
+
+#[test]
+fn compact_repeats_keeps_a_note_someone_replied_to() {
+    let (_dir, manager, task_id) = setup();
+    let note = manager.post_board_note(&task_id, "⚠ x").unwrap().unwrap();
+    manager
+        .post(
+            &task_id,
+            MessageRole::System,
+            MessageKind::AgentStep,
+            "⚠ x",
+            None,
+            vec![],
+            Some("kanban".into()),
+        )
+        .unwrap();
+    manager
+        .post(
+            &task_id,
+            MessageRole::Human,
+            MessageKind::Context,
+            "why?",
+            Some(note.id.clone()),
+            vec![],
+            None,
+        )
+        .unwrap();
+    assert_eq!(manager.compact_repeats(&task_id).unwrap(), None);
+}
+
+#[test]
+fn save_after_an_unseen_concurrent_write_still_merges() {
+    let (_dir, manager, task_id) = setup();
+    let mut stale = manager.load(&task_id).unwrap();
+    manager
+        .post(
+            &task_id,
+            MessageRole::Agent,
+            MessageKind::Context,
+            "concurrent",
+            None,
+            vec![],
+            None,
+        )
+        .unwrap();
+    stale.messages.push(Message::new(
+        "MSG-010",
+        MessageRole::Human,
+        MessageKind::Context,
+        "stale writer",
+    ));
+    let stale_rev = stale.rev;
+    manager.save(&task_id, &mut stale).unwrap();
+    assert_eq!(stale.rev, stale_rev + 2);
+    let bodies: Vec<String> = manager
+        .load(&task_id)
+        .unwrap()
+        .messages
+        .into_iter()
+        .map(|m| m.body)
+        .collect();
+    assert!(bodies.contains(&"concurrent".to_string()));
+    assert!(bodies.contains(&"stale writer".to_string()));
+}
+
+#[test]
+fn stale_save_does_not_restore_compacted_board_notes() {
+    let (_dir, manager, task_id) = setup();
+    for _ in 0..4 {
+        manager
+            .post(
+                &task_id,
+                MessageRole::System,
+                MessageKind::AgentStep,
+                "repeated cleanup",
+                None,
+                vec![],
+                Some("kanban".into()),
+            )
+            .unwrap();
+    }
+    let mut stale = manager.load(&task_id).unwrap();
+    manager.compact_repeats(&task_id).unwrap();
+    stale.messages.push(Message::new(
+        "MSG-100",
+        MessageRole::Human,
+        MessageKind::Context,
+        "fresh context",
+    ));
+    manager.save(&task_id, &mut stale).unwrap();
+    let saved = manager.load(&task_id).unwrap();
+    let notes: Vec<_> = saved
+        .messages
+        .iter()
+        .filter(|message| message.kind == MessageKind::AgentStep)
+        .map(|message| message.body.as_str())
+        .collect();
+    assert_eq!(notes, ["repeated cleanup (×4)"]);
+    assert_eq!(saved.messages.last().unwrap().body, "fresh context");
+}
+
+#[test]
+fn stale_reply_keeps_its_compacted_parent() {
+    let (_dir, manager, task_id) = setup();
+    for _ in 0..3 {
+        manager
+            .post(
+                &task_id,
+                MessageRole::System,
+                MessageKind::AgentStep,
+                "repeated cleanup",
+                None,
+                vec![],
+                Some("kanban".into()),
+            )
+            .unwrap();
+    }
+    let mut stale = manager.load(&task_id).unwrap();
+    let parent = stale.messages.last().unwrap().id.clone();
+    manager.compact_repeats(&task_id).unwrap();
+    let mut reply = Message::new(
+        "MSG-100",
+        MessageRole::Human,
+        MessageKind::Context,
+        "reply to cleanup",
+    );
+    reply.parent_id = Some(parent.clone());
+    stale.messages.push(reply);
+    manager.save(&task_id, &mut stale).unwrap();
+    let saved = manager.load(&task_id).unwrap();
+    assert!(
+        saved
+            .messages
+            .iter()
+            .any(|message| message.id == parent && message.body == "repeated cleanup")
+    );
+    assert_eq!(
+        saved.messages.last().unwrap().parent_id.as_deref(),
+        Some(parent.as_str())
+    );
+    assert_eq!(
+        saved
+            .messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::AgentStep)
+            .count(),
+        2
+    );
+}

@@ -6,12 +6,13 @@
 //! lists are merged (additions from both sides survive, locally-changed
 //! messages win over their stale base) before writing `rev + 1`.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::core::error::{KanbanError, Result};
 use crate::core::models::{Message, MessageKind, MessageRole, MessageStatus, Task, Thread};
-use crate::core::storage::{atomic_write_text, stat_ns};
+use crate::core::storage::{BoardGuard, atomic_write_text, lock_file_reentrant, stat_ns};
 use crate::core::timefmt;
 
 pub struct ThreadManager {
@@ -33,38 +34,62 @@ impl ThreadManager {
         self.threads_dir.join(format!("{task_id}.yaml"))
     }
 
+    fn lock(&self) -> Result<BoardGuard> {
+        let lock_path = self.threads_dir.with_file_name(".lock");
+        fs::create_dir_all(lock_path.parent().expect("thread directory has a parent"))?;
+        lock_file_reentrant(&lock_path)
+    }
+
     pub fn load(&self, task_id: &str) -> Result<Thread> {
         let thread_file = self.thread_file(task_id);
         if !thread_file.exists() {
             return Ok(Thread::new(task_id));
         }
         let raw = fs::read_to_string(&thread_file)?;
-        let mut thread: Thread = if raw.trim().is_empty() {
-            Thread::default()
-        } else {
-            serde_yaml_ng::from_str(&raw)?
-        };
-        if thread.task_id.is_empty() {
-            thread.task_id = task_id.to_string();
-        }
+        let mut thread = parse_thread(&raw, task_id)?;
         thread.snapshot_base();
         Ok(thread)
     }
 
     /// Merge-and-write `thread`, then update it in place to the stored state.
+    ///
+    /// When the stored `rev` still equals the one `thread` was loaded at,
+    /// nobody wrote in between and the merge is a no-op, so only the
+    /// top-level `rev:` line is read instead of parsing the whole file
+    /// again; a busy thread is otherwise parsed twice per write.
     pub fn save(&self, task_id: &str, thread: &mut Thread) -> Result<()> {
-        let desired = thread.clone();
-        let current = self.load(task_id)?;
-        let mut merged = if current.rev == desired.rev {
-            desired
-        } else {
-            merge_threads(&current, &desired)
+        let _guard = self.lock()?;
+        let thread_file = self.thread_file(task_id);
+        let raw = match fs::read_to_string(&thread_file) {
+            Ok(raw) => Some(raw),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
         };
-        merged.task_id = task_id.to_string();
-        merged.rev = current.rev + 1;
+        let unchanged = match raw.as_deref() {
+            None => thread.rev == 0,
+            Some(raw) => peek_rev(raw) == Some(thread.rev),
+        };
         fs::create_dir_all(&self.threads_dir)?;
-        atomic_write_text(&self.thread_file(task_id), &serialize_thread(&merged)?)?;
-        *thread = merged;
+        if unchanged {
+            thread.task_id = task_id.to_string();
+            thread.rev += 1;
+            if let Err(err) =
+                serialize_thread(thread).and_then(|text| atomic_write_text(&thread_file, &text))
+            {
+                thread.rev -= 1;
+                return Err(err);
+            }
+        } else {
+            let current = match raw.as_deref() {
+                Some(raw) => parse_thread(raw, task_id)?,
+                None => Thread::new(task_id),
+            };
+            let mut merged = merge_threads(current, thread);
+            merged.task_id = task_id.to_string();
+            merged.rev += 1;
+            atomic_write_text(&thread_file, &serialize_thread(&merged)?)?;
+            *thread = merged;
+        }
         thread.snapshot_base();
         Ok(())
     }
@@ -181,9 +206,38 @@ impl ThreadManager {
         let msg_id = message.id.clone();
         thread.messages.push(message);
         self.save(task_id, &mut thread)?;
-        self.get_message(task_id, &msg_id)?.ok_or_else(|| {
+        take_message(thread, &msg_id).ok_or_else(|| {
             KanbanError::Invalid(format!("Failed to store message {msg_id} for {task_id}"))
         })
+    }
+
+    /// Post a board-authored `agent_step` note unless it repeats the last
+    /// message of the thread (ignoring a collapsed `(×N)` counter). Returns
+    /// `None` when the note was a repeat and nothing was written. Board notes
+    /// come from every process that pumps the store, so an in-process dedupe
+    /// is not enough to keep a stuck condition from flooding the thread.
+    pub fn post_board_note(&self, task_id: &str, body: &str) -> Result<Option<Message>> {
+        let _guard = self.lock()?;
+        let mut thread = self.load(task_id)?;
+        if thread
+            .messages
+            .last()
+            .is_some_and(|last| is_board_note(last) && strip_repeat(&last.body) == body)
+        {
+            return Ok(None);
+        }
+        let mut message = Message::new(
+            next_msg_id_for_thread(&thread),
+            MessageRole::System,
+            MessageKind::AgentStep,
+            body,
+        );
+        message.author = Some(BOARD_AUTHOR.to_string());
+        message.origin = Some(BOARD_AUTHOR.to_string());
+        let msg_id = message.id.clone();
+        thread.messages.push(message);
+        self.save(task_id, &mut thread)?;
+        Ok(take_message(thread, &msg_id))
     }
 
     pub fn answer(
@@ -206,7 +260,7 @@ impl ThreadManager {
             message.origin = Some("human".to_string());
         }
         self.save(task_id, &mut thread)?;
-        self.get_message(task_id, msg_id)?.ok_or_else(|| {
+        take_message(thread, msg_id).ok_or_else(|| {
             KanbanError::Invalid(format!("Failed to answer message {msg_id} for {task_id}"))
         })
     }
@@ -219,7 +273,7 @@ impl ThreadManager {
         message.draft = draft.to_string();
         message.updated_at = timefmt::now();
         self.save(task_id, &mut thread)?;
-        self.get_message(task_id, msg_id)?.ok_or_else(|| {
+        take_message(thread, msg_id).ok_or_else(|| {
             KanbanError::Invalid(format!("Failed to store draft on {msg_id} for {task_id}"))
         })
     }
@@ -236,7 +290,7 @@ impl ThreadManager {
             Some(now)
         };
         self.save(task_id, &mut thread)?;
-        self.get_message(task_id, msg_id)?.ok_or_else(|| {
+        take_message(thread, msg_id).ok_or_else(|| {
             KanbanError::Invalid(format!("Failed to resolve message {msg_id} for {task_id}"))
         })
     }
@@ -307,6 +361,78 @@ impl ThreadManager {
         Ok(removed)
     }
 
+    /// Collapse every run of consecutive identical board notes (see
+    /// [`Self::post_board_note`]) into its first message, carrying a `(×N)`
+    /// counter and the last repeat's `updated_at`. Messages another message
+    /// replies to are kept as they are. Returns `(before, after)` message
+    /// counts, or `None` when there was nothing to collapse.
+    ///
+    /// Like [`Self::remove_kind`] this writes directly under a rev bump:
+    /// merge-on-save would resurrect the dropped repeats.
+    pub fn compact_repeats(&self, task_id: &str) -> Result<Option<(usize, usize)>> {
+        let _guard = self.lock()?;
+        let thread_file = self.thread_file(task_id);
+        if !thread_file.exists() {
+            return Ok(None);
+        }
+        let mut thread = self.load(task_id)?;
+        let before = thread.messages.len();
+        let referenced: HashSet<String> = thread
+            .messages
+            .iter()
+            .filter_map(|m| m.parent_id.clone())
+            .collect();
+        let collapsible = |m: &Message| is_board_note(m) && !referenced.contains(&m.id);
+        let mut kept: Vec<Message> = Vec::with_capacity(before);
+        let mut run = 1usize;
+        for message in std::mem::take(&mut thread.messages) {
+            if let Some(head) = kept.last_mut()
+                && collapsible(head)
+                && collapsible(&message)
+                && strip_repeat(&head.body) == strip_repeat(&message.body)
+            {
+                run += repeat_count(&message.body);
+                head.body = format!("{} (×{run})", strip_repeat(&head.body));
+                head.updated_at = head.updated_at.max(message.updated_at);
+                continue;
+            }
+            run = repeat_count(&message.body);
+            kept.push(message);
+        }
+        if kept.len() == before {
+            return Ok(None);
+        }
+        thread.messages = kept;
+        thread.rev += 1;
+        atomic_write_text(&thread_file, &serialize_thread(&thread)?)?;
+        Ok(Some((before, thread.messages.len())))
+    }
+
+    /// [`Self::compact_repeats`] over every thread of the board; returns
+    /// `(task_id, before, after)` for each thread that shrank.
+    pub fn compact_all_repeats(&self) -> Result<Vec<(String, usize, usize)>> {
+        let entries = match fs::read_dir(&self.threads_dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err.into()),
+        };
+        let mut task_ids: Vec<String> = entries
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                Some(name.strip_suffix(".yaml")?.to_string())
+            })
+            .collect();
+        task_ids.sort();
+        let mut compacted = Vec::new();
+        for task_id in task_ids {
+            if let Some((before, after)) = self.compact_repeats(&task_id)? {
+                compacted.push((task_id, before, after));
+            }
+        }
+        Ok(compacted)
+    }
+
     /// Drop the whole sidecar thread of `task_id`.
     ///
     /// Task ids are recycled (`Storage::get_next_id` hands out `max + 1`), so a
@@ -331,15 +457,82 @@ fn task_body_of(task: &Task) -> String {
     }
 }
 
-fn merge_threads(current: &Thread, desired: &Thread) -> Thread {
-    let mut merged = current.clone();
+/// Author and origin of notes the board itself posts.
+const BOARD_AUTHOR: &str = "kanban";
+
+fn is_board_note(message: &Message) -> bool {
+    message.kind == MessageKind::AgentStep
+        && message.author.as_deref() == Some(BOARD_AUTHOR)
+        && message.answer.is_none()
+}
+
+/// `body` without the ` (×N)` counter [`ThreadManager::compact_repeats`] appends.
+fn strip_repeat(body: &str) -> &str {
+    split_repeat(body).map_or(body, |(base, _)| base)
+}
+
+/// How many notes `body` stands for: its ` (×N)` counter, or 1.
+fn repeat_count(body: &str) -> usize {
+    split_repeat(body).map_or(1, |(_, count)| count)
+}
+
+fn split_repeat(body: &str) -> Option<(&str, usize)> {
+    let (base, tail) = body.strip_suffix(')')?.rsplit_once(" (×")?;
+    Some((base, tail.parse().ok().filter(|n| *n > 1)?))
+}
+
+fn parse_thread(raw: &str, task_id: &str) -> Result<Thread> {
+    let mut thread: Thread = if raw.trim().is_empty() {
+        Thread::default()
+    } else {
+        serde_yaml_ng::from_str(raw)?
+    };
+    if thread.task_id.is_empty() {
+        thread.task_id = task_id.to_string();
+    }
+    Ok(thread)
+}
+
+/// The top-level `rev:` of a serialized thread without parsing the
+/// messages. Message fields are indented under the `messages:` sequence, so
+/// an unindented `rev:` line can only be the thread's own. `None` when the
+/// line is missing or unreadable; the caller then parses the whole file.
+fn peek_rev(raw: &str) -> Option<u64> {
+    raw.lines()
+        .find_map(|line| line.strip_prefix("rev:"))
+        .and_then(|value| value.trim().trim_matches(['\'', '"']).parse().ok())
+}
+
+fn take_message(thread: Thread, msg_id: &str) -> Option<Message> {
+    thread.messages.into_iter().find(|m| m.id == msg_id)
+}
+
+fn merge_threads(current: Thread, desired: &Thread) -> Thread {
+    let mut merged = current;
+    let mut index: HashMap<String, usize> = merged
+        .messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.id.clone(), i))
+        .collect();
+    let referenced: HashSet<&str> = desired
+        .messages
+        .iter()
+        .filter_map(|message| message.parent_id.as_deref())
+        .collect();
     for desired_message in &desired.messages {
-        match merged
-            .messages
-            .iter()
-            .position(|m| m.id == desired_message.id)
-        {
-            None => merged.messages.push(desired_message.clone()),
+        match index.get(&desired_message.id).copied() {
+            None => {
+                // A concurrent compaction/deletion removed this unchanged
+                // base message. Only a local edit or a reply needs it back.
+                if desired.base_messages.get(&desired_message.id) == Some(desired_message)
+                    && !referenced.contains(desired_message.id.as_str())
+                {
+                    continue;
+                }
+                index.insert(desired_message.id.clone(), merged.messages.len());
+                merged.messages.push(desired_message.clone());
+            }
             Some(index) => {
                 // Only overwrite the concurrent copy if we actually changed
                 // this message relative to the state we loaded it from.
@@ -350,7 +543,9 @@ fn merge_threads(current: &Thread, desired: &Thread) -> Thread {
             }
         }
     }
-    merged.messages.sort_by_key(message_sort_key);
+    merged
+        .messages
+        .sort_by(|a, b| message_sort_key(a).cmp(&message_sort_key(b)));
     merged
 }
 
@@ -376,10 +571,10 @@ fn msg_number(id: &str) -> Option<u64> {
     id.strip_prefix("MSG-")?.parse().ok()
 }
 
-fn message_sort_key(message: &Message) -> (u64, String) {
+fn message_sort_key(message: &Message) -> (u64, &str) {
     match msg_number(&message.id) {
-        Some(num) => (num, message.id.clone()),
-        None => (1_000_000_000, message.id.clone()),
+        Some(num) => (num, message.id.as_str()),
+        None => (1_000_000_000, message.id.as_str()),
     }
 }
 

@@ -1339,20 +1339,12 @@ impl Operations {
         Ok(Some(task))
     }
 
-    /// Best-effort audit line on the thread for a queue phase change.
+    /// Best-effort audit line on the thread for a queue phase change. A note
+    /// identical to the thread's last message is not posted again.
     pub(crate) fn post_queue_note(&self, task_id: &str, body: &str) {
-        let _ = self.thread_manager().and_then(|tm| {
-            tm.post_with_origin(
-                task_id,
-                MessageRole::System,
-                MessageKind::AgentStep,
-                body,
-                None,
-                vec![],
-                Some("kanban".to_string()),
-                Some("kanban".to_string()),
-            )
-        });
+        let _ = self
+            .thread_manager()
+            .and_then(|tm| tm.post_board_note(task_id, body));
     }
 
     /// Whether the orchestration queue would hold this task back: queueing
@@ -4152,24 +4144,24 @@ impl Operations {
         }
         let had_isolation = task.worktree.is_some() || task.branch.is_some();
         let problems = self.clear_task_worktree(task, false);
-        let key = (self.data_root().to_path_buf(), task.id.clone());
-        let mut failures = cleanup_failures()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
         if !problems.is_empty() {
+            // Kept on the task, not in this process: every TUI and the
+            // daemon sweep the board, and each new process would otherwise
+            // retry at once. The note itself is deduped by the thread, so a
+            // failure that needs a human (an unmerged branch) is posted once
+            // instead of on every retry.
+            let retry_secs = self
+                .config
+                .get_threshold("deferred_cleanup_retry_interval")
+                .unwrap_or(super::config::DEFAULT_DEFERRED_CLEANUP_RETRY_SECS);
+            let retry = chrono::Duration::try_seconds(retry_secs.max(1)).unwrap_or_else(|| {
+                chrono::Duration::seconds(super::config::DEFAULT_DEFERRED_CLEANUP_RETRY_SECS)
+            });
+            task.cleanup_retry_at = Some(timefmt::now() + retry);
             let note = format!("⚠ landing cleanup failed: {}", problems.join("; "));
-            let repeated = failures.get(&key).is_some_and(|(last, _)| *last == note);
-            failures.insert(key, (note.clone(), Instant::now()));
-            drop(failures);
-            // The deferred sweep retries a failure that needs a human (an
-            // unmerged branch); posting it on every retry grew threads to
-            // tens of thousands of identical notes.
-            if !repeated {
-                self.post_queue_note(&task.id, &note);
-            }
+            self.post_queue_note(&task.id, &note);
         } else {
-            failures.remove(&key);
-            drop(failures);
+            task.cleanup_retry_at = None;
             if had_isolation && task.worktree.is_none() {
                 self.post_queue_note(&task.id, "🧹 landed — isolated worktree and branch removed");
             }
@@ -4192,8 +4184,9 @@ impl Operations {
         if !self.awaits_deferred_cleanup(&task) {
             return;
         }
+        let retry_at = task.cleanup_retry_at;
         self.cleanup_after_land(&mut task, &orch.isolation, false);
-        if task.worktree.is_none() {
+        if task.worktree.is_none() || task.cleanup_retry_at != retry_at {
             let _ = self.storage.save_task(&task);
         }
     }
@@ -4209,17 +4202,12 @@ impl Operations {
                 .is_some_and(|s| self.session_manager().is_session_active(s))
     }
 
-    /// Whether this task's cleanup failed in this process less than
-    /// [`DEFERRED_CLEANUP_RETRY`] ago. The sweep runs on every pump tick of
-    /// every open TUI and the daemon; without the pause a stuck cleanup ran
-    /// git and rewrote the task's thread every few seconds, forever.
-    fn deferred_cleanup_backing_off(&self, task_id: &str) -> bool {
-        let key = (self.data_root().to_path_buf(), task_id.to_string());
-        cleanup_failures()
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .get(&key)
-            .is_some_and(|(_, at)| at.elapsed() < DEFERRED_CLEANUP_RETRY)
+    /// Whether the persisted cleanup retry deadline is still in the future.
+    /// A pause prevents every pump process from retrying the same stuck
+    /// cleanup and rewriting its failure note on every tick.
+    fn deferred_cleanup_backing_off(task: &Task) -> bool {
+        task.cleanup_retry_at
+            .is_some_and(|retry_at| timefmt::now() < retry_at)
     }
 
     /// Daemon-tick sweep for deferred post-landing cleanups that no
@@ -4236,19 +4224,23 @@ impl Operations {
         }
         let _guard = self.storage.lock()?;
         let mut swept = Vec::new();
-        for mut task in self.storage.list_tasks(None)? {
-            if !self.awaits_deferred_cleanup(&task) || self.deferred_cleanup_backing_off(&task.id) {
+        // Read `/proc` once per sweep, and only when some task needs it.
+        let mut cwds: Option<Option<Vec<PathBuf>>> = None;
+        for mut task in self.storage.list_unarchived_tasks()? {
+            if Self::deferred_cleanup_backing_off(&task) || !self.awaits_deferred_cleanup(&task) {
                 continue;
             }
             let Some(rel) = task.worktree.clone() else {
                 continue;
             };
-            if any_process_cwd_within(&self.storage.worktrees_dir.join(rel)) != Some(false) {
+            let cwds = cwds.get_or_insert_with(process_cwds);
+            if any_cwd_within(cwds.as_deref(), &self.storage.worktrees_dir.join(rel)) != Some(false)
+            {
                 continue;
             }
             self.cleanup_after_land(&mut task, &orch.isolation, false);
+            self.storage.save_task(&task)?;
             if task.worktree.is_none() {
-                self.storage.save_task(&task)?;
                 swept.push(task.id);
             }
         }
@@ -5977,27 +5969,15 @@ fn cwd_within(dir: &Path) -> bool {
         || std::env::var_os("PWD").is_some_and(|pwd| inside(PathBuf::from(pwd)))
 }
 
-/// How long the deferred-cleanup sweep leaves a task alone after its cleanup
-/// failed in this process.
-const DEFERRED_CLEANUP_RETRY: Duration = Duration::from_secs(600);
-
-/// Post-landing cleanups that failed in this process, keyed by board data
-/// root and task id: the failure note last posted and when it was tried.
-type CleanupFailures = std::sync::Mutex<HashMap<(PathBuf, String), (String, Instant)>>;
-
-fn cleanup_failures() -> &'static CleanupFailures {
-    static FAILURES: std::sync::OnceLock<CleanupFailures> = std::sync::OnceLock::new();
-    FAILURES.get_or_init(Default::default)
-}
-
-/// Whether any visible process has its cwd inside `dir`, read from
-/// `/proc/<pid>/cwd`. `None` when `/proc` is unavailable (non-Linux), so the
-/// caller can stay conservative. Unreadable entries (other users'
-/// processes, races with exits) are skipped.
-fn any_process_cwd_within(dir: &Path) -> Option<bool> {
-    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+/// The cwd of every visible process, read from `/proc/<pid>/cwd`. `None`
+/// when `/proc` is unavailable (non-Linux), so callers can stay
+/// conservative. Unreadable entries (other users' processes, races with
+/// exits) are skipped.
+fn process_cwds() -> Option<Vec<PathBuf>> {
     let entries = fs::read_dir("/proc").ok()?;
+    let own = std::process::id().to_string();
     let mut saw_self = false;
+    let mut cwds = Vec::new();
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name();
         if !name
@@ -6009,13 +5989,21 @@ fn any_process_cwd_within(dir: &Path) -> Option<bool> {
         let Ok(cwd) = fs::read_link(entry.path().join("cwd")) else {
             continue;
         };
-        saw_self |= name.to_str() == Some(&std::process::id().to_string());
-        if cwd.starts_with(dir) || cwd.starts_with(&canonical) {
-            return Some(true);
-        }
+        saw_self |= name.to_str() == Some(own.as_str());
+        cwds.push(cwd);
     }
     // Not even our own cwd was readable: `/proc` is not usable here.
-    saw_self.then_some(false)
+    saw_self.then_some(cwds)
+}
+
+/// Whether any of `cwds` (see [`process_cwds`]) lies inside `dir`.
+fn any_cwd_within(cwds: Option<&[PathBuf]>, dir: &Path) -> Option<bool> {
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    Some(
+        cwds?
+            .iter()
+            .any(|cwd| cwd.starts_with(dir) || cwd.starts_with(&canonical)),
+    )
 }
 
 fn dir_has_files(dir: &Path) -> bool {

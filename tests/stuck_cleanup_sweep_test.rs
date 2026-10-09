@@ -105,6 +105,12 @@ fn a_cleanup_that_needs_a_human_is_not_retried_every_tick() {
     let store = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
     let (ops, task_id) = landed_board(store.path(), work.path());
+    fs::write(
+        ops.data_root().join(".kanban/config.yaml"),
+        format!("{CONFIG}thresholds:\n  deferred_cleanup_retry_interval: 37\n"),
+    )
+    .unwrap();
+    ops.config.load_fresh().unwrap();
     // A branch with work the integration ref never saw: deleting it is
     // refused until a human decides.
     let branch = format!("kanban/{task_id}-extra");
@@ -118,6 +124,7 @@ fn a_cleanup_that_needs_a_human_is_not_retried_every_tick() {
     if !Path::new("/proc/self/cwd").exists() {
         return;
     }
+    let before_retry = kanban4ai::core::timefmt::now();
     for _ in 0..3 {
         assert!(ops.sweep_deferred_cleanups().unwrap().is_empty());
     }
@@ -128,4 +135,32 @@ fn a_cleanup_that_needs_a_human_is_not_retried_every_tick() {
     );
     let task = ops.storage.load_task(&task_id).unwrap().unwrap();
     assert_eq!(task.branch.as_deref(), Some(branch.as_str()));
+    // The backoff lives on the task, so a fresh process (here: a fresh
+    // board handle) does not retry at once either.
+    let retry_at = task.cleanup_retry_at.unwrap();
+    assert!(retry_at >= before_retry + chrono::Duration::seconds(37));
+    assert!(retry_at <= kanban4ai::core::timefmt::now() + chrono::Duration::seconds(37));
+    let project = ProjectStore::at(store.path()).list().unwrap().remove(0);
+    let fresh = Operations::for_project(&project);
+    assert!(fresh.sweep_deferred_cleanups().unwrap().is_empty());
+    assert_eq!(
+        fresh
+            .storage
+            .load_task(&task_id)
+            .unwrap()
+            .unwrap()
+            .cleanup_retry_at,
+        Some(retry_at)
+    );
+    assert_eq!(failure_notes(&fresh, &task_id), 1);
+
+    // Once the backoff ran out the retry runs again, but the thread does
+    // not take the same failure note a second time.
+    let mut task = task;
+    task.cleanup_retry_at = Some(task.cleanup_retry_at.unwrap() - chrono::Duration::hours(1));
+    ops.storage.save_task(&task).unwrap();
+    assert!(ops.sweep_deferred_cleanups().unwrap().is_empty());
+    assert_eq!(failure_notes(&ops, &task_id), 1);
+    let task = ops.storage.load_task(&task_id).unwrap().unwrap();
+    assert!(task.cleanup_retry_at.unwrap() > kanban4ai::core::timefmt::now());
 }
