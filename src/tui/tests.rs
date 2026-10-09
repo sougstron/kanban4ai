@@ -12316,26 +12316,27 @@ fn only_the_focused_text_field_draws_a_cursor() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).unwrap();
 
-    let reversed_cells = |app: &mut App| {
+    let styled_cells = |app: &mut App, modifier: Modifier| {
         let mut terminal = Terminal::new(TestBackend::new(96, 28)).expect("terminal");
         terminal.draw(|frame| board::ui(frame, app)).expect("draw");
         let buffer = terminal.backend().buffer().clone();
         [DialogField::Title, DialogField::Description].map(|field| {
             let area = modal_hitbox(app, HitAction::ModalField(field));
             area.positions()
-                .filter(|&position| {
-                    buffer[position]
-                        .style()
-                        .add_modifier
-                        .contains(Modifier::REVERSED)
-                })
+                .filter(|&position| buffer[position].style().add_modifier.contains(modifier))
                 .count()
         })
     };
 
-    assert_eq!(reversed_cells(&mut app), [1, 0]);
+    assert_eq!(styled_cells(&mut app, Modifier::REVERSED), [1, 0]);
+    app.handle_key(key(KeyCode::Char('x'))).unwrap();
+    let [title, description] = styled_cells(&mut app, Modifier::UNDERLINED);
+    assert!(title > 0 && description == 0);
     app.handle_key(key(KeyCode::Tab)).unwrap();
-    assert_eq!(reversed_cells(&mut app), [0, 1]);
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+    assert_eq!(styled_cells(&mut app, Modifier::REVERSED), [0, 1]);
+    let [title, description] = styled_cells(&mut app, Modifier::UNDERLINED);
+    assert!(title == 0 && description > 0);
 }
 
 #[test]
