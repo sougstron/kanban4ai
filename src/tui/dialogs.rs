@@ -5243,13 +5243,16 @@ fn render_escape_to_projects(frame: &mut Frame<'_>, app: &App, modal: &ModalStat
     );
 }
 
-/// Only the focused text field draws its cursor; every other field hides it.
+/// Only the focused text field draws its cursor and cursor-line underline;
+/// every other field hides both.
 pub(super) fn set_cursor_visible(textarea: &mut TextArea<'static>, visible: bool) {
-    textarea.set_cursor_style(if visible {
-        Style::default().add_modifier(Modifier::REVERSED)
+    if visible {
+        textarea.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+        textarea.set_cursor_line_style(Style::default().add_modifier(Modifier::UNDERLINED));
     } else {
-        Style::default()
-    });
+        textarea.set_cursor_style(Style::default());
+        textarea.set_cursor_line_style(Style::default());
+    }
 }
 
 fn render_textarea(

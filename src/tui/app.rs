@@ -3935,7 +3935,6 @@ impl App {
         if let Some(editor) = preserved_review_edits {
             review_edits = editor;
         }
-        review_edits.set_cursor_line_style(ratatui::style::Style::default());
         review_edits.set_wrap_mode(WrapMode::WordOrGlyph);
         let has_prompt = task
             .as_ref()
