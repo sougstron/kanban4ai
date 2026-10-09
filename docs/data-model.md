@@ -160,7 +160,9 @@ the OAuth usage polls (see **Projects & Store**).
 The dispatcher daemon is machine-wide for the same reason — it ticks every
 registered project — so its two files sit at the store root, not under any
 board's `.kanban/`: `<store>/daemon.lock` (the exclusive single-instance
-`flock`) and `<store>/logs/daemon.log` (one appended line per
+`flock`), `<store>/pump.lock` (held for one store-wide tick by whichever
+TUI or daemon pumps; its mtime stamps the last tick) and
+`<store>/logs/daemon.log` (one appended line per
 resume/reap/restart/dispatch). See **Headless Dispatcher Daemon**.
 
 ## Projects & Store
@@ -181,6 +183,7 @@ Store root resolution (empty or relative values are ignored):
 <store>/
 ├── .lock                       # flock, serializes registry mutations
 ├── daemon.lock                 # exclusive lock for `kanban daemon`
+├── pump.lock                   # per-tick lock + stamp of the shared store pump
 ├── logs/daemon.log             # one line per daemon resume/reap/restart/dispatch
 ├── config.yaml                 # machine-wide settings (`daemon.interval`, TUI)
 └── projects/

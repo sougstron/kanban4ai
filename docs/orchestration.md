@@ -249,7 +249,23 @@ the sleep and the log append.
 same order.)
 
 So a crash detected in tick *N* is scheduled in the same tick, and started in
-whichever later tick its backoff comes due. The daemon adds no new rules: it
+whichever later tick its backoff comes due.
+
+**Quiet skip.** After a full pump each process remembers the project's file
+stamp (task, session and config `stat`s, taken after the pump's own writes)
+and its next clock deadline: a session's heartbeat timeout or wait end, a
+`restart_at`, a `launch_at`. While the stamp is unchanged and no deadline has
+come, the next tick skips the project — pumping it could not act. A queued
+task waiting for a slot keeps its board pumped every tick, and every board is
+pumped at least once a minute (`QUIET_BACKSTOP`) for what no stamp shows, such
+as a deferred cleanup waiting for a process to leave its worktree.
+
+**Shared pump.** Every open TUI (every 5 s) and the daemon loop (every
+`interval`) go through `shared_tick`, which `flock`s `<store>/pump.lock` for
+the tick and uses its mtime as the last-tick stamp. A pump skips while another
+process holds the lock or the last tick by anyone is younger than its own
+gap, so N TUIs plus a daemon pump the store once, not N + 1 times. A daemon
+with `--project` always pumps that project. The daemon adds no new rules: it
 calls the same `Operations` methods the TUI does, and starts land under the
 same locked claim, so a daemon and an open TUI pumping the same board at the
 same time is safe.

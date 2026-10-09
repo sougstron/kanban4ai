@@ -416,25 +416,42 @@ impl Storage {
     pub fn tui_fingerprint(&self) -> Fingerprint {
         let (mut count, mut max_mtime, mut total_size) = self.tasks_fingerprint();
         for directory in [&self.threads_dir, &self.sessions_dir] {
-            if let Some((mtime, _)) = stat_ns(directory) {
-                max_mtime = max_mtime.max(mtime);
-            }
-            let Ok(entries) = fs::read_dir(directory) else {
-                continue;
-            };
-            for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
-                if !path.is_file() {
-                    continue;
-                }
-                count += 1;
-                if let Some((mtime, size)) = stat_ns(&path) {
-                    max_mtime = max_mtime.max(mtime);
-                    total_size = total_size.saturating_add(size);
-                }
-            }
+            let (dir_count, dir_mtime, dir_size) = dir_fingerprint(directory);
+            count += dir_count;
+            max_mtime = max_mtime.max(dir_mtime);
+            total_size = total_size.saturating_add(dir_size);
         }
         (count, max_mtime, total_size)
     }
+
+    /// The same signature over `sessions/` alone: heartbeats, waits, closes
+    /// and crashes all rewrite a session file.
+    pub fn sessions_fingerprint(&self) -> Fingerprint {
+        dir_fingerprint(&self.sessions_dir)
+    }
+}
+
+/// `(file_count, max_mtime_ns, total_bytes)` over the plain files directly
+/// in `directory`, the directory's own mtime included.
+fn dir_fingerprint(directory: &Path) -> Fingerprint {
+    let (mut count, mut max_mtime, mut total_size) = (0, 0, 0u64);
+    if let Some((mtime, _)) = stat_ns(directory) {
+        max_mtime = mtime;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return (count, max_mtime, total_size);
+    };
+    for path in entries.filter_map(|entry| entry.ok().map(|entry| entry.path())) {
+        if !path.is_file() {
+            continue;
+        }
+        count += 1;
+        if let Some((mtime, size)) = stat_ns(&path) {
+            max_mtime = max_mtime.max(mtime);
+            total_size = total_size.saturating_add(size);
+        }
+    }
+    (count, max_mtime, total_size)
 }
 
 /// Parameters for [`Storage::create_task`].

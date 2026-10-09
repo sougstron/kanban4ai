@@ -458,7 +458,7 @@ pub struct App {
     /// Last time the TUI advanced every registered board's orchestration.
     last_store_pump: Option<Instant>,
     /// Store-wide warnings already shown during this TUI run.
-    store_pump_warnings: Arc<Mutex<HashSet<String>>>,
+    store_pump_state: Arc<Mutex<daemon::PumpState>>,
     /// Backends whose warmed model catalog has already been reflected into an
     /// open modal, so `tick` refreshes options at most once per backend.
     catalog_ready: HashSet<String>,
@@ -906,7 +906,7 @@ impl App {
             last_queue_dispatch: None,
             global_config_stamp: None,
             last_store_pump: None,
-            store_pump_warnings: Arc::new(Mutex::new(HashSet::new())),
+            store_pump_state: Arc::new(Mutex::new(daemon::PumpState::default())),
             catalog_ready,
             project: None,
             projects: Vec::new(),
@@ -1009,7 +1009,7 @@ impl App {
             last_queue_dispatch: None,
             global_config_stamp: None,
             last_store_pump: None,
-            store_pump_warnings: Arc::new(Mutex::new(HashSet::new())),
+            store_pump_state: Arc::new(Mutex::new(daemon::PumpState::default())),
             catalog_ready: HashSet::new(),
             project: None,
             projects,
@@ -3200,7 +3200,8 @@ impl App {
 
     /// Advance orchestration for every registered board while any TUI screen
     /// is open. This uses the daemon's store-wide, lock-safe tick so the
-    /// projects screen and an unrelated board keep retries and queues moving.
+    /// projects screen and an unrelated board keep retries and queues moving;
+    /// the tick is shared, so a second TUI or a daemon does not repeat it.
     fn pump_store_throttled(&mut self) {
         const STORE_PUMP_INTERVAL: Duration = Duration::from_secs(5);
         if self
@@ -3216,11 +3217,11 @@ impl App {
         let Some(store) = self.store.clone() else {
             return;
         };
-        let warnings = Arc::clone(&self.store_pump_warnings);
+        let state = Arc::clone(&self.store_pump_state);
         self.spawn_launch(None, move |_| {
-            let mut warned = warnings.lock().unwrap_or_else(|poison| poison.into_inner());
-            match daemon::tick(&store, None, &mut warned) {
-                Ok(lines) if !lines.is_empty() => LaunchReport {
+            let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            match daemon::shared_tick(&store, STORE_PUMP_INTERVAL, &mut state) {
+                Ok(Some(lines)) if !lines.is_empty() => LaunchReport {
                     status: Some(match lines.as_slice() {
                         [line] => format!("Background: {line}"),
                         _ => format!(
