@@ -19,6 +19,8 @@ use crate::core::models::{Role, Task};
 use crate::core::project::PROJECTS_DIR;
 use crate::core::storage::atomic_write_text;
 
+pub const DEFAULT_DEFERRED_CLEANUP_RETRY_SECS: i64 = 600;
+
 /// Written verbatim by `kanban init`; also the source of per-key fallbacks.
 /// Mirrors the Python `DEFAULT_CONFIG` exactly.
 pub const DEFAULT_CONFIG_YAML: &str = r#"columns:
@@ -57,6 +59,7 @@ thresholds:
   agent_reply_max_chars: 32768
   agent_reply_message_max_chars: 8192
   limits_refresh_interval: 120
+  deferred_cleanup_retry_interval: 600
 verification:
   command: null
   block_on_failure: true

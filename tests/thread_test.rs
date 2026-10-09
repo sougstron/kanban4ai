@@ -545,3 +545,88 @@ fn save_after_an_unseen_concurrent_write_still_merges() {
     assert!(bodies.contains(&"concurrent".to_string()));
     assert!(bodies.contains(&"stale writer".to_string()));
 }
+
+#[test]
+fn stale_save_does_not_restore_compacted_board_notes() {
+    let (_dir, manager, task_id) = setup();
+    for _ in 0..4 {
+        manager
+            .post(
+                &task_id,
+                MessageRole::System,
+                MessageKind::AgentStep,
+                "repeated cleanup",
+                None,
+                vec![],
+                Some("kanban".into()),
+            )
+            .unwrap();
+    }
+    let mut stale = manager.load(&task_id).unwrap();
+    manager.compact_repeats(&task_id).unwrap();
+    stale.messages.push(Message::new(
+        "MSG-100",
+        MessageRole::Human,
+        MessageKind::Context,
+        "fresh context",
+    ));
+    manager.save(&task_id, &mut stale).unwrap();
+    let saved = manager.load(&task_id).unwrap();
+    let notes: Vec<_> = saved
+        .messages
+        .iter()
+        .filter(|message| message.kind == MessageKind::AgentStep)
+        .map(|message| message.body.as_str())
+        .collect();
+    assert_eq!(notes, ["repeated cleanup (×4)"]);
+    assert_eq!(saved.messages.last().unwrap().body, "fresh context");
+}
+
+#[test]
+fn stale_reply_keeps_its_compacted_parent() {
+    let (_dir, manager, task_id) = setup();
+    for _ in 0..3 {
+        manager
+            .post(
+                &task_id,
+                MessageRole::System,
+                MessageKind::AgentStep,
+                "repeated cleanup",
+                None,
+                vec![],
+                Some("kanban".into()),
+            )
+            .unwrap();
+    }
+    let mut stale = manager.load(&task_id).unwrap();
+    let parent = stale.messages.last().unwrap().id.clone();
+    manager.compact_repeats(&task_id).unwrap();
+    let mut reply = Message::new(
+        "MSG-100",
+        MessageRole::Human,
+        MessageKind::Context,
+        "reply to cleanup",
+    );
+    reply.parent_id = Some(parent.clone());
+    stale.messages.push(reply);
+    manager.save(&task_id, &mut stale).unwrap();
+    let saved = manager.load(&task_id).unwrap();
+    assert!(
+        saved
+            .messages
+            .iter()
+            .any(|message| message.id == parent && message.body == "repeated cleanup")
+    );
+    assert_eq!(
+        saved.messages.last().unwrap().parent_id.as_deref(),
+        Some(parent.as_str())
+    );
+    assert_eq!(
+        saved
+            .messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::AgentStep)
+            .count(),
+        2
+    );
+}

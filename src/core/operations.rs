@@ -4150,8 +4150,14 @@ impl Operations {
             // retry at once. The note itself is deduped by the thread, so a
             // failure that needs a human (an unmerged branch) is posted once
             // instead of on every retry.
-            task.cleanup_retry_at =
-                Some(timefmt::now() + chrono::Duration::from_std(DEFERRED_CLEANUP_RETRY).unwrap());
+            let retry_secs = self
+                .config
+                .get_threshold("deferred_cleanup_retry_interval")
+                .unwrap_or(super::config::DEFAULT_DEFERRED_CLEANUP_RETRY_SECS);
+            let retry = chrono::Duration::try_seconds(retry_secs.max(1)).unwrap_or_else(|| {
+                chrono::Duration::seconds(super::config::DEFAULT_DEFERRED_CLEANUP_RETRY_SECS)
+            });
+            task.cleanup_retry_at = Some(timefmt::now() + retry);
             let note = format!("⚠ landing cleanup failed: {}", problems.join("; "));
             self.post_queue_note(&task.id, &note);
         } else {
@@ -4196,10 +4202,9 @@ impl Operations {
                 .is_some_and(|s| self.session_manager().is_session_active(s))
     }
 
-    /// Whether this task's cleanup failed less than
-    /// [`DEFERRED_CLEANUP_RETRY`] ago. The sweep runs on every pump tick;
-    /// without the pause a stuck cleanup ran git and rewrote the task's
-    /// thread every few seconds, forever.
+    /// Whether the persisted cleanup retry deadline is still in the future.
+    /// A pause prevents every pump process from retrying the same stuck
+    /// cleanup and rewriting its failure note on every tick.
     fn deferred_cleanup_backing_off(task: &Task) -> bool {
         task.cleanup_retry_at
             .is_some_and(|retry_at| timefmt::now() < retry_at)
@@ -5963,10 +5968,6 @@ fn cwd_within(dir: &Path) -> bool {
     std::env::current_dir().is_ok_and(inside)
         || std::env::var_os("PWD").is_some_and(|pwd| inside(PathBuf::from(pwd)))
 }
-
-/// How long the deferred-cleanup sweep leaves a task alone after its cleanup
-/// failed (stored on the task as `cleanup_retry_at`).
-const DEFERRED_CLEANUP_RETRY: Duration = Duration::from_secs(600);
 
 /// The cwd of every visible process, read from `/proc/<pid>/cwd`. `None`
 /// when `/proc` is unavailable (non-Linux), so callers can stay

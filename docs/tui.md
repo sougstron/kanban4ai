@@ -197,6 +197,12 @@ queued, retrying, or waiting) and Last opened drop on a narrow terminal
 rather than squeezing the name.
 A yellow `?` marks open questions and a `●` marks unseen Review work,
 both in a flags column left of the name.
+The first frame uses registry names while `Loading project counts…` is shown.
+Board-specific names and summaries arrive from a background scan; subsequent
+scans reuse unchanged task counts, sessions and names independently. Session
+wait expiry still updates counts without a file write. Only one scan runs at
+a time, and rename/delete/path changes discard an older in-flight result.
+Selection follows the project id when refreshed summaries change row ordering.
 The selected row carries a border-coloured background; the row the mouse
 rests on is preselected with a fainter `theme.hover` background, so the
 pointer target is visible without moving the keyboard selection.
@@ -219,6 +225,13 @@ dialog (unregister by default; Space toggles
 “also delete board data”), `/` filters. `q` quits the TUI outright; `Esc`
 returns to the board this list was opened from, or quits when the list is the
 entry screen.
+
+Board refresh tracks task, session and thread files separately. A heartbeat
+refreshes session-derived card state without parsing every task again; a
+thread post refreshes thread-derived flags and counts. Changed task files are
+parsed through a per-file cache, and the Archive view uses the same snapshot.
+An open detail reloads for its task/thread/session changes, not every unrelated
+heartbeat; polling remains the fallback to filesystem notifications.
 
 The open project is named in two places, both free of screen space. On screen,
 a ` ▸ <name> ` badge is right-aligned into the top border row of the rightmost

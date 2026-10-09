@@ -8596,6 +8596,18 @@ fn write_active_session(data_root: &std::path::Path, id: &str) {
     .expect("session file");
 }
 
+fn loaded_projects_at(
+    store: ProjectStore,
+    return_project: Option<crate::core::project::Project>,
+    create_cwd: Option<std::path::PathBuf>,
+) -> crate::core::error::Result<App> {
+    let mut app = App::projects_at(store, return_project, create_cwd.clone())?;
+    app.reload_if_changed()?;
+    app.create_cwd = create_cwd;
+    app.project_selected = 0;
+    Ok(app)
+}
+
 fn projects_app(
     work: &std::path::Path,
     create_cwd: Option<std::path::PathBuf>,
@@ -8606,7 +8618,7 @@ fn projects_app(
     let added = store.add(work, Some("Demo Board")).expect("add project");
     write_task_file(&added.project.data_root, "todo", "TASK-001");
     write_task_file(&added.project.data_root, "in_progress", "TASK-002");
-    let app = App::projects_at(store, None, create_cwd).expect("projects app");
+    let app = loaded_projects_at(store, None, create_cwd).expect("projects app");
     (store_dir, app)
 }
 
@@ -8617,7 +8629,7 @@ fn projects_app_with_return(work: &std::path::Path) -> (tempfile::TempDir, App) 
     std::fs::create_dir_all(work).expect("work dir");
     let store = ProjectStore::at(store_dir.path());
     let added = store.add(work, Some("Demo Board")).expect("add project");
-    let app = App::projects_at(store, Some(added.project.clone()), None).expect("projects app");
+    let app = loaded_projects_at(store, Some(added.project.clone()), None).expect("projects app");
     (store_dir, app)
 }
 
@@ -8661,7 +8673,7 @@ fn projects_screen_ticks_retry_deadlines_on_registered_boards() {
     retry.restart_at = Some(crate::core::timefmt::now() - chrono::Duration::minutes(1));
     ops.storage.save_task(&retry).expect("save retry task");
 
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     app.tick().expect("global TUI tick");
 
     let retried = ops.get_task(&retry.id).unwrap().unwrap();
@@ -8759,7 +8771,7 @@ fn projects_table_keeps_its_columns_across_mixed_rows() {
         .expect("add gone");
     std::fs::remove_dir_all(&gone).expect("drop work dir");
 
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     app.project_selected = 1;
     let rendered = render_at(&mut app, 100, 20);
     insta::assert_snapshot!("projects_table", rendered);
@@ -8807,7 +8819,7 @@ fn mouse_move_preselects_a_project_row_without_taking_the_selection() {
             .add(&work, Some(&format!("Project {index:02}")))
             .expect("add project");
     }
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     let _ = render_at(&mut app, 100, 16);
 
     let hovered_row = app
@@ -8864,7 +8876,7 @@ fn the_open_folder_button_hands_the_work_folder_to_the_file_manager() {
     store.save_global_config(&config).expect("save config");
 
     let mut app =
-        App::projects_at(ProjectStore::at(store_dir.path()), None, None).expect("projects app");
+        loaded_projects_at(ProjectStore::at(store_dir.path()), None, None).expect("projects app");
     let rendered = render_at(&mut app, 120, 16);
     assert!(rendered.contains("o folder"), "{rendered}");
     // The status bar is informational: the hint is not itself clickable.
@@ -8904,7 +8916,7 @@ fn opening_a_missing_project_folder_reports_it_instead_of_launching() {
     store.add(&work, Some("Gone")).expect("add project");
     std::fs::remove_dir_all(&work).expect("remove work dir");
 
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     app.handle_key(key(KeyCode::Char('o'))).expect("press o");
     assert!(
         app.status.contains("Folder is missing"),
@@ -8925,7 +8937,7 @@ fn projects_list_scrolls_the_selection_into_view_and_keeps_hitboxes_on_it() {
             .add(&work, Some(&format!("Project {index:02}")))
             .expect("add project");
     }
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
 
     let top = rendered_lines(&mut app, 100, 16).join("\n");
     assert!(top.contains("Project 01"), "{top}");
@@ -8987,7 +8999,7 @@ fn projects_list_names_a_project_from_its_board_settings() {
     let store_dir = tempfile::tempdir().expect("store");
     let work = tempfile::tempdir().expect("work");
     let store = project_with_board_name(store_dir.path(), work.path(), "Ledger");
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
 
     let folder = work
         .path()
@@ -9009,7 +9021,7 @@ fn renaming_a_project_also_renames_it_in_the_board_settings() {
     let store_dir = tempfile::tempdir().expect("store");
     let work = tempfile::tempdir().expect("work");
     let store = project_with_board_name(store_dir.path(), work.path(), "Ledger");
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
 
     app.handle_key(key(KeyCode::Char('r'))).expect("rename");
     let modal = app.modal.as_mut().expect("rename modal");
@@ -9103,7 +9115,7 @@ fn project_row_places_running_and_unreviewed_status_next_to_the_name() {
         "id: ses-test\ntask_id: TASK-002\nstatus: active\nstarted_at: '2026-08-14T11:00:00'\nlast_seen: '2026-08-14T11:00:00'\n",
     )
     .expect("session");
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     let lines = rendered_lines(&mut app, 96, 12);
     let row_at = lines
         .iter()
@@ -9153,7 +9165,7 @@ fn project_row_shows_paused_tasks_next_to_running_agents() {
     );
     write_active_session(&added.project.data_root, "ses-running");
 
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     let counts = &app.projects[0].counts;
     assert_eq!(counts.sessions, 1);
     assert_eq!(counts.paused, 1);
@@ -9209,7 +9221,7 @@ fn project_row_shows_yellow_question_mark_when_any_task_has_a_question() {
         "---\nid: TASK-002\ntitle: TASK-002\nstatus: in_progress\nhas_questions: true\n---\n",
     )
     .expect("questioned task");
-    let mut app = App::projects_at(store, None, Some(cwd.clone())).expect("projects app");
+    let mut app = loaded_projects_at(store, None, Some(cwd.clone())).expect("projects app");
     let rendered = render_at(&mut app, 96, 12);
     let lines = rendered
         .split("\n\n--- style runs ---")
@@ -9592,7 +9604,7 @@ fn projects_screen_reflects_the_saved_global_escape_setting() {
     let added = store.add(&work, Some("Demo Board")).expect("add project");
     write_task_file(&added.project.data_root, "todo", "TASK-001");
 
-    let app = App::projects_at(store, None, None).expect("projects app");
+    let app = loaded_projects_at(store, None, None).expect("projects app");
     assert!(app.settings.escape_to_projects);
 
     let _ = std::fs::remove_dir_all(&work);
@@ -9641,7 +9653,7 @@ fn sorted_projects_store() -> (tempfile::TempDir, ProjectStore) {
 #[test]
 fn projects_screen_orders_rows_by_the_sort_setting() {
     let (_store_dir, store) = sorted_projects_store();
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
 
     // Default: alphabetical.
     assert_eq!(app.settings.project_sort, "name");
@@ -9679,7 +9691,7 @@ fn projects_screen_sort_applies_to_the_filtered_list() {
     set_project_created_at(&apple.project.data_root, "2026-01-01T10:00:00");
     set_project_created_at(&birch.project.data_root, "2026-03-01T10:00:00");
     set_project_created_at(&cedar.project.data_root, "2026-02-01T10:00:00");
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     app.settings.project_sort = "newest".to_string();
     // Distinctive token so a tempfile path cannot accidentally match.
     app.search.query.insert_str("QXK");
@@ -9692,7 +9704,7 @@ fn projects_screen_sort_keeps_create_cwd_pinned() {
     let (_store_dir, store) = sorted_projects_store();
     let cwd = tempfile::tempdir().expect("cwd");
     let mut app =
-        App::projects_at(store, None, Some(cwd.path().to_path_buf())).expect("projects app");
+        loaded_projects_at(store, None, Some(cwd.path().to_path_buf())).expect("projects app");
     app.settings.project_sort = "newest".to_string();
     let items = app.visible_project_items();
     assert!(
@@ -9721,7 +9733,7 @@ fn projects_screen_smart_sort_prefers_unread_over_running() {
         "TASK-009",
         "review_unseen: true\n",
     );
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     app.settings.project_sort = "smart".to_string();
     // Both unread; the tie-break is newest first, so Beta outranks Gamma.
     assert_eq!(visible_project_names(&app), ["Beta", "Gamma", "Alpha"]);
@@ -9742,7 +9754,7 @@ fn projects_screen_smart_sort_counts_open_questions_as_unread() {
         "TASK-007",
         "has_questions: true\n",
     );
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     app.settings.project_sort = "smart".to_string();
     // Alpha (questions) and Gamma (unseen review) share the unread tier;
     // newest unread wins, and both still outrank running Beta.
@@ -9777,7 +9789,7 @@ fn projects_screen_smart_sort_orders_tiers_by_last_opened() {
         "TASK-001",
         "review_unseen: true\n",
     );
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     app.settings.project_sort = "smart".to_string();
     // Unread Gamma first; the quiet tier follows Last opened (Alpha Sep 3
     // before Beta Sep 1) even though Beta is the newer registration.
@@ -9793,7 +9805,7 @@ fn projects_screen_smart_name_sort_orders_tiers_by_display_name() {
     let zulu_work = tempfile::tempdir().expect("zulu work");
     let zulu = store.add(zulu_work.path(), Some("Zulu")).expect("add zulu");
     set_project_created_at(&zulu.project.data_root, "2026-04-01T10:00:00");
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     app.settings.project_sort = "smart_name".to_string();
     // Unread Gamma, running Beta, then the quiet tier alphabetical: Alpha
     // (created Jan) before Zulu (created Apr) — recency is irrelevant here.
@@ -9811,7 +9823,7 @@ fn projects_screen_smart_name_sort_orders_tiers_by_display_name() {
         .find(|p| p.name == "Zulu")
         .expect("zulu");
     store.rename(&zulu.id, "Aardvark").expect("rename zulu");
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     app.settings.project_sort = "smart_name".to_string();
     assert_eq!(
         visible_project_names(&app),
@@ -9829,7 +9841,7 @@ fn projects_screen_reflects_the_saved_global_project_sort() {
             config
         })
         .expect("seed global config");
-    let app = App::projects_at(store, None, None).expect("projects app");
+    let app = loaded_projects_at(store, None, None).expect("projects app");
     assert_eq!(app.settings.project_sort, "newest");
     assert_eq!(visible_project_names(&app), ["Beta", "Gamma", "Alpha"]);
 }
@@ -10351,7 +10363,7 @@ fn action_status_returns_to_ready_after_notice_window() {
 fn projects_idle_status_does_not_expire() {
     let store_dir = tempfile::tempdir().expect("tempdir");
     let store = ProjectStore::at(store_dir.path());
-    let mut app = App::projects_at(store, None, None).expect("projects app");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
     assert_eq!(app.status, "Projects");
     app.expire_transient_status_at(Instant::now() + Duration::from_secs(4));
     assert_eq!(app.status, "Projects");
@@ -11280,7 +11292,7 @@ fn update_banner(version: &str) -> String {
 fn global_settings_app() -> (tempfile::TempDir, App) {
     let dir = tempfile::tempdir().expect("store");
     let store = ProjectStore::at(dir.path());
-    let app = App::projects_at(store, None, None).expect("projects app");
+    let app = loaded_projects_at(store, None, None).expect("projects app");
     (dir, app)
 }
 
@@ -12427,4 +12439,112 @@ fn archive_list_comes_from_the_board_snapshot() {
             .all(|column| column.tasks.is_empty()),
         "archived tasks have no board column"
     );
+}
+
+#[test]
+fn project_summaries_follow_task_edits_session_waits_names_and_removal() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let store = ProjectStore::at(store_dir.path());
+    let added = store.add(work.path(), Some("Summary")).unwrap();
+    let ops = Operations::for_project(&added.project);
+    ops.storage.init_board().unwrap();
+    let task = ops.create_task(NewTask::titled("Tracked")).unwrap();
+    let manager = SessionManager::new(&added.project.data_root);
+    let mut session = manager.link_session(&task.id, "ses-summary").unwrap();
+    session.wait_until = Some(crate::core::timefmt::now() + chrono::Duration::minutes(1));
+    manager.save_session(&session).unwrap();
+    let mut cache = super::projects::ProjectCache::default();
+    let first = cache.load(&store).unwrap();
+    assert_eq!(
+        (
+            first[0].counts.todo,
+            first[0].counts.sessions,
+            first[0].counts.paused
+        ),
+        (1, 0, 1)
+    );
+
+    // A session rewrite ends the wait and invalidates only its cached input.
+    session.wait_until = Some(crate::core::timefmt::now() - chrono::Duration::seconds(1));
+    manager.save_session(&session).unwrap();
+    let second = cache.load(&store).unwrap();
+    assert_eq!((second[0].counts.sessions, second[0].counts.paused), (1, 0));
+    let unchanged = cache.load(&store).unwrap();
+    assert_eq!(unchanged, second);
+
+    let mut changed = ops.get_task(&task.id).unwrap().unwrap();
+    changed.status = TaskStatus::Review;
+    changed.review_unseen = true;
+    changed.has_questions = true;
+    ops.storage.save_task(&changed).unwrap();
+    crate::core::migrate::set_board_display_name(&added.project.data_root, "Renamed summary")
+        .unwrap();
+    let third = cache.load(&store).unwrap();
+    assert_eq!((third[0].counts.todo, third[0].counts.review), (0, 1));
+    assert_eq!(
+        (third[0].counts.review_unseen, third[0].counts.questions),
+        (1, 1)
+    );
+    assert_eq!(third[0].display_name, "Renamed summary");
+    manager.close_session("ses-summary").unwrap();
+    assert_eq!(cache.load(&store).unwrap()[0].counts.sessions, 0);
+    store.remove(&added.project.id, false).unwrap();
+    assert!(cache.load(&store).unwrap().is_empty());
+}
+
+#[test]
+fn projects_background_scan_preserves_selection_and_applies_updates() {
+    let store_dir = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let store = ProjectStore::at(store_dir.path());
+    let added = store.add(work.path(), Some("Background summary")).unwrap();
+    let ops = Operations::for_project(&added.project);
+    ops.storage.init_board().unwrap();
+    let task = ops.create_task(NewTask::titled("Initial")).unwrap();
+    let mut app = App::projects_at(store, None, None).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.enable_background_launches(tx);
+    rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.projects[0].counts.todo != 1 {
+        app.poll_launches();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Projects scan stalled"
+        );
+        std::thread::yield_now();
+    }
+    app.poll_launches();
+    assert_eq!(app.projects[0].counts.todo, 1);
+    assert!(matches!(
+        &app.visible_project_items()[app.project_selected],
+        super::projects::ProjectListItem::Project(row) if row.project.id == added.project.id
+    ));
+
+    let mut changed = ops.get_task(&task.id).unwrap().unwrap();
+    changed.status = TaskStatus::Review;
+    changed.review_unseen = true;
+    ops.storage.save_task(&changed).unwrap();
+    app.reload_if_changed().unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.projects[0].counts.review != 1 {
+        app.poll_launches();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Projects scan stalled"
+        );
+        std::thread::yield_now();
+    }
+    app.poll_launches();
+    assert_eq!(
+        (app.projects[0].counts.todo, app.projects[0].counts.review),
+        (0, 1)
+    );
+    assert_eq!(app.projects[0].counts.review_unseen, 1);
+    assert!(matches!(
+        &app.visible_project_items()[app.project_selected],
+        super::projects::ProjectListItem::Project(row) if row.project.id == added.project.id
+    ));
 }

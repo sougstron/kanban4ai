@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::error::{KanbanError, Result};
 use crate::core::models::{Message, MessageKind, MessageRole, MessageStatus, Task, Thread};
-use crate::core::storage::{atomic_write_text, stat_ns};
+use crate::core::storage::{BoardGuard, atomic_write_text, lock_file_reentrant, stat_ns};
 use crate::core::timefmt;
 
 pub struct ThreadManager {
@@ -34,6 +34,12 @@ impl ThreadManager {
         self.threads_dir.join(format!("{task_id}.yaml"))
     }
 
+    fn lock(&self) -> Result<BoardGuard> {
+        let lock_path = self.threads_dir.with_file_name(".lock");
+        fs::create_dir_all(lock_path.parent().expect("thread directory has a parent"))?;
+        lock_file_reentrant(&lock_path)
+    }
+
     pub fn load(&self, task_id: &str) -> Result<Thread> {
         let thread_file = self.thread_file(task_id);
         if !thread_file.exists() {
@@ -52,6 +58,7 @@ impl ThreadManager {
     /// top-level `rev:` line is read instead of parsing the whole file
     /// again; a busy thread is otherwise parsed twice per write.
     pub fn save(&self, task_id: &str, thread: &mut Thread) -> Result<()> {
+        let _guard = self.lock()?;
         let thread_file = self.thread_file(task_id);
         let raw = match fs::read_to_string(&thread_file) {
             Ok(raw) => Some(raw),
@@ -210,6 +217,7 @@ impl ThreadManager {
     /// come from every process that pumps the store, so an in-process dedupe
     /// is not enough to keep a stuck condition from flooding the thread.
     pub fn post_board_note(&self, task_id: &str, body: &str) -> Result<Option<Message>> {
+        let _guard = self.lock()?;
         let mut thread = self.load(task_id)?;
         if thread
             .messages
@@ -362,6 +370,7 @@ impl ThreadManager {
     /// Like [`Self::remove_kind`] this writes directly under a rev bump:
     /// merge-on-save would resurrect the dropped repeats.
     pub fn compact_repeats(&self, task_id: &str) -> Result<Option<(usize, usize)>> {
+        let _guard = self.lock()?;
         let thread_file = self.thread_file(task_id);
         if !thread_file.exists() {
             return Ok(None);
@@ -506,9 +515,21 @@ fn merge_threads(current: Thread, desired: &Thread) -> Thread {
         .enumerate()
         .map(|(i, m)| (m.id.clone(), i))
         .collect();
+    let referenced: HashSet<&str> = desired
+        .messages
+        .iter()
+        .filter_map(|message| message.parent_id.as_deref())
+        .collect();
     for desired_message in &desired.messages {
         match index.get(&desired_message.id).copied() {
             None => {
+                // A concurrent compaction/deletion removed this unchanged
+                // base message. Only a local edit or a reply needs it back.
+                if desired.base_messages.get(&desired_message.id) == Some(desired_message)
+                    && !referenced.contains(desired_message.id.as_str())
+                {
+                    continue;
+                }
                 index.insert(desired_message.id.clone(), merged.messages.len());
                 merged.messages.push(desired_message.clone());
             }
@@ -522,7 +543,9 @@ fn merge_threads(current: Thread, desired: &Thread) -> Thread {
             }
         }
     }
-    merged.messages.sort_by_key(message_sort_key);
+    merged
+        .messages
+        .sort_by(|a, b| message_sort_key(a).cmp(&message_sort_key(b)));
     merged
 }
 
@@ -548,10 +571,10 @@ fn msg_number(id: &str) -> Option<u64> {
     id.strip_prefix("MSG-")?.parse().ok()
 }
 
-fn message_sort_key(message: &Message) -> (u64, String) {
+fn message_sort_key(message: &Message) -> (u64, &str) {
     match msg_number(&message.id) {
-        Some(num) => (num, message.id.clone()),
-        None => (1_000_000_000, message.id.clone()),
+        Some(num) => (num, message.id.as_str()),
+        None => (1_000_000_000, message.id.as_str()),
     }
 }
 

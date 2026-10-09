@@ -473,6 +473,9 @@ pub struct App {
     catalog_ready: HashSet<String>,
     pub project: Option<Project>,
     pub projects: Vec<ProjectRow>,
+    project_cache: Option<projects::ProjectCache>,
+    project_scan: Option<JoinHandle<ProjectScanReport>>,
+    project_generation: u64,
     pub project_selected: usize,
     /// First project row drawn on the projects screen. Owned by the renderer,
     /// which is the only place that knows how many rows a frame holds.
@@ -491,6 +494,12 @@ pub struct App {
     /// Wakes the event loop when a worker finishes. `None` until the event
     /// loop opts in (and always in tests), which runs every job inline.
     launch_wake: Option<Sender<AppEvent>>,
+}
+
+struct ProjectScanReport {
+    cache: projects::ProjectCache,
+    rows: Result<Vec<ProjectRow>>,
+    generation: u64,
 }
 
 /// A background launch; `task_id` is `None` for a board/store pump.
@@ -571,6 +580,9 @@ impl Drop for App {
     fn drop(&mut self) {
         for job in self.launches.drain(..) {
             let _ = job.handle.join();
+        }
+        if let Some(scan) = self.project_scan.take() {
+            let _ = scan.join();
         }
     }
 }
@@ -919,6 +931,9 @@ impl App {
             catalog_ready,
             project: None,
             projects: Vec::new(),
+            project_cache: Some(projects::ProjectCache::default()),
+            project_scan: None,
+            project_generation: 0,
             project_selected: 0,
             project_scroll: 0,
             create_cwd: None,
@@ -964,7 +979,7 @@ impl App {
         return_project: Option<Project>,
         create_cwd: Option<PathBuf>,
     ) -> Result<Self> {
-        let projects = projects::load_rows(&store)?;
+        let projects = projects::initial_rows(&store)?;
         let dummy = store.root().join(".no-board");
         let (launch_tx, launch_rx) = mpsc::channel();
         let mut app = Self {
@@ -987,7 +1002,7 @@ impl App {
             archived_tasks: Vec::new(),
             archive_selected: 0,
             should_quit: false,
-            status: "Projects".to_string(),
+            status: "Loading project counts…".to_string(),
             hitboxes: Vec::new(),
             hovered: None,
             dragging: None,
@@ -1022,6 +1037,9 @@ impl App {
             catalog_ready: HashSet::new(),
             project: None,
             projects,
+            project_cache: Some(projects::ProjectCache::default()),
+            project_scan: None,
+            project_generation: 0,
             project_selected: 0,
             project_scroll: 0,
             create_cwd,
@@ -2905,7 +2923,7 @@ impl App {
 
     pub fn reload_if_changed(&mut self) -> Result<()> {
         if !self.has_board {
-            return self.refresh_projects();
+            return self.refresh_projects_if_changed();
         }
         // Inherited settings follow the global config, so an edit there
         // (another board, the Projects screen) reloads this board too.
@@ -3354,6 +3372,11 @@ impl App {
     /// finished job's report is waiting (see [`Self::poll_launches`]).
     pub fn enable_background_launches(&mut self, wake: Sender<AppEvent>) {
         self.launch_wake = Some(wake);
+        if !self.has_board
+            && let Err(err) = self.refresh_projects_if_changed()
+        {
+            self.status = err.to_string();
+        }
     }
 
     /// Run `job` on a worker thread with its own [`Operations`] for this
@@ -3396,6 +3419,7 @@ impl App {
         while let Ok(report) = self.launch_rx.try_recv() {
             self.apply_launch_report(report);
         }
+        self.poll_project_scan();
     }
 
     fn apply_launch_report(&mut self, report: LaunchReport) {
@@ -4556,15 +4580,87 @@ impl App {
     }
 
     fn refresh_projects(&mut self) -> Result<()> {
-        let Some(store) = self.store.as_ref() else {
+        // An action may have changed files while a worker was reading. Do not
+        // let that older result overwrite the rename/delete/path change.
+        self.project_generation = self.project_generation.wrapping_add(1);
+        self.refresh_projects_if_changed()
+    }
+
+    fn refresh_projects_if_changed(&mut self) -> Result<()> {
+        self.poll_project_scan();
+        let Some(store) = self.store.clone() else {
             return Ok(());
         };
-        self.projects = projects::load_rows(store)?;
-        if let Ok(cwd) = std::env::current_dir() {
+        let Some(mut cache) = self.project_cache.take() else {
+            return Ok(()); // Exactly one scan may be in flight.
+        };
+        let generation = self.project_generation;
+        if let Some(wake) = self.launch_wake.clone() {
+            self.project_scan = Some(thread::spawn(move || {
+                let rows = cache.load(&store);
+                let report = ProjectScanReport {
+                    cache,
+                    rows,
+                    generation,
+                };
+                let _ = wake.send(AppEvent::LaunchDone);
+                report
+            }));
+        } else {
+            // Same inline mode as launch workers, for embedded callers/tests.
+            let rows = cache.load(&store);
+            self.project_cache = Some(cache);
+            self.apply_project_rows(rows?);
+        }
+        Ok(())
+    }
+
+    fn poll_project_scan(&mut self) {
+        if !self
+            .project_scan
+            .as_ref()
+            .is_some_and(|scan| scan.is_finished())
+        {
+            return;
+        }
+        match self.project_scan.take().expect("finished scan").join() {
+            Ok(report) => {
+                self.project_cache = Some(report.cache);
+                if report.generation == self.project_generation {
+                    match report.rows {
+                        Ok(rows) => self.apply_project_rows(rows),
+                        Err(err) => self.status = format!("Projects refresh failed: {err}"),
+                    }
+                }
+            }
+            Err(_) => {
+                self.project_cache = Some(projects::ProjectCache::default());
+                self.status = "Projects scan worker crashed".to_string();
+            }
+        }
+    }
+
+    fn apply_project_rows(&mut self, rows: Vec<ProjectRow>) {
+        let selected = self
+            .selected_project_row()
+            .map(|row| row.project.id.clone());
+        self.projects = rows;
+        if let Some(store) = self.store.as_ref()
+            && let Ok(cwd) = std::env::current_dir()
+        {
             self.create_cwd = projects::cwd_create_path(store, &cwd);
         }
+        if let Some(id) = selected
+            && let Some(index) = self.visible_project_items().iter().position(
+                |item| matches!(item, ProjectListItem::Project(row) if row.project.id == id),
+            )
+        {
+            self.project_selected = index;
+        }
         self.clamp_project_selection();
-        Ok(())
+        if self.status == "Loading project counts…" {
+            self.status = "Projects".to_string();
+        }
     }
 
     fn clamp_project_selection(&mut self) {
