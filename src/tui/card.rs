@@ -141,9 +141,28 @@ pub fn render_card(
     if dragging {
         card_style = card_style.add_modifier(Modifier::REVERSED);
     }
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style);
+    // Suggestion counter in the top-right corner of the border, on every
+    // column: it costs no content line and reads as "ideas left in here".
+    if let Some(count) = app
+        .board
+        .suggestions
+        .get(&task.id)
+        .map(|suggestions| suggestions.count)
+        .filter(|count| *count > 0)
+    {
+        block = block.title_top(
+            Line::from(Span::styled(
+                count.to_string(),
+                Style::default()
+                    .fg(app.theme.focus)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        );
+    }
     frame.render_widget(Paragraph::new(lines).block(block).style(card_style), area);
 }
 

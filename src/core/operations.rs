@@ -337,6 +337,13 @@ impl OperationsSeed {
     }
 }
 
+/// See [`Operations::suggestion_count`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuggestionCount {
+    pub stamp: Option<(u128, u64)>,
+    pub count: usize,
+}
+
 pub struct Operations {
     pub storage: Storage,
     pub config: Config,
@@ -3287,6 +3294,32 @@ impl Operations {
             return Ok(Vec::new());
         };
         tm.open_messages(&task.id, None)
+    }
+
+    /// Suggestion messages of any status in a task's thread, for the board
+    /// card counter, paired with the thread file stamp it was counted at.
+    /// A `cached` result whose stamp still matches is returned as is, so a
+    /// snapshot rebuild only re-parses threads that changed. Read-only and
+    /// lock-free; an unreadable thread counts as zero rather than failing
+    /// the whole board.
+    pub fn suggestion_count(
+        &self,
+        task_id: &str,
+        cached: Option<SuggestionCount>,
+    ) -> Result<SuggestionCount> {
+        let tm = self.thread_manager()?;
+        let stamp = tm.stamp(task_id);
+        if let Some(cached) = cached.filter(|cached| cached.stamp == stamp) {
+            return Ok(cached);
+        }
+        let count = match stamp {
+            Some(_) => tm
+                .messages_of_kind(task_id, MessageKind::Suggestion)
+                .map(|messages| messages.len())
+                .unwrap_or(0),
+            None => 0,
+        };
+        Ok(SuggestionCount { stamp, count })
     }
 
     /// Earliest open question on a task, for board-card previews. Read-only:

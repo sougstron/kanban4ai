@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::error::{KanbanError, Result};
 use crate::core::models::{Message, MessageKind, MessageRole, MessageStatus, Task, Thread};
-use crate::core::storage::atomic_write_text;
+use crate::core::storage::{atomic_write_text, stat_ns};
 use crate::core::timefmt;
 
 pub struct ThreadManager {
@@ -277,6 +277,12 @@ impl ThreadManager {
             .into_iter()
             .filter(|m| m.kind == kind)
             .collect())
+    }
+
+    /// `(mtime, size)` of the thread file, or `None` when it does not exist;
+    /// lets callers skip re-parsing an unchanged thread.
+    pub fn stamp(&self, task_id: &str) -> Option<(u128, u64)> {
+        stat_ns(&self.thread_file(task_id))
     }
 
     /// Delete every message of `kind`, returning the count removed.

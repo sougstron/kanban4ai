@@ -502,7 +502,7 @@ fn task_number(path: &Path) -> Option<u64> {
     digits.parse().ok()
 }
 
-fn stat_ns(path: &Path) -> Option<(u128, u64)> {
+pub(crate) fn stat_ns(path: &Path) -> Option<(u128, u64)> {
     let metadata = fs::metadata(path).ok()?;
     let mtime = metadata
         .modified()
