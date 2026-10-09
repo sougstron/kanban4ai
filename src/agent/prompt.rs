@@ -550,7 +550,16 @@ Column ownership:
 /// runs it does not apply to. A role file is the opposite: only the role it
 /// names ever sees it, and only when that role is actually launched. Missing
 /// or empty files are simply skipped.
+///
+/// The project-wide instructions from Project Settings (`instructions:` in
+/// `.kanban/config.yaml`) come first: every role of every task on the board
+/// gets them whenever they are not blank.
 fn append_role_instructions(roots: Roots<'_>, role: Role, prompt: &mut String) {
+    if let Ok(Some(text)) = Config::new(roots.data_root).get_instructions() {
+        prompt.push_str(&format!(
+            "\nProject instructions (from Project Settings); they apply to every task in this project:\n{text}\n"
+        ));
+    }
     let path = roots
         .data_path("instructions")
         .join(format!("{}.md", role.as_str()));

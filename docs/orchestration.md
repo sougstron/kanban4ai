@@ -552,3 +552,7 @@ crash-restart backoff takes over.
 is actually launched. `AGENTS.md` and `CLAUDE.md` are loaded into *every*
 session, so anything role-specific written there is charged to every run on the
 board; a role file is the opposite. Missing or empty files are skipped.
+
+The project-wide `instructions:` string from Project Settings (Prompt tab) is
+appended to every role's prompt, just ahead of the role file, whenever it is
+not blank (see `docs/config.md`).

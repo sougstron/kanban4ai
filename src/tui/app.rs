@@ -1203,10 +1203,14 @@ impl App {
             {
                 return None;
             }
-            return Some(matches!(
-                modal.active_field(),
-                DialogField::Description | DialogField::Answer
-            ));
+            // Project instructions reuse `Description` but are plain text.
+            return Some(
+                !matches!(modal.modal, Modal::Settings)
+                    && matches!(
+                        modal.active_field(),
+                        DialogField::Description | DialogField::Answer
+                    ),
+            );
         }
         if self.search.active {
             return Some(false);
@@ -4217,6 +4221,9 @@ impl App {
         modal.theme = TextArea::new(vec![
             Theme::normalize_name(&tui_string(&config.tui, "theme", "dark")).to_string(),
         ]);
+        modal.description = super::dialogs::wrapped_description(super::dialogs::lines_or_empty(
+            &config.instructions,
+        ));
         modal.inherit = inherit;
         modal.global_view = Some(Box::new(global_view));
         modal.settings_base = Some(Box::new(config.clone()));
@@ -6090,6 +6097,7 @@ impl App {
                         Value::String(theme_name.clone()),
                     );
                     config.inherit = modal.inherit.to_mapping();
+                    config.instructions = modal.description_text();
                     retain_source_legacy_auto_launch_keys(
                         &self.ops.config.config_file,
                         &mut config,

@@ -674,3 +674,34 @@ fn fixture_tasks_gain_no_graph_keys_on_rewrite() {
         }
     }
 }
+
+/// Project Settings instructions reach every role's prompt; blank ones add
+/// nothing.
+#[test]
+fn project_instructions_reach_every_role() {
+    let (dir, ops, _recorder) = graph_board("  queue_enabled: true\n");
+    let task = todo(&ops, "Anything");
+    let executor =
+        build_agent_prompt(ops.roots(), &task, "ses-test", false, Role::Executor).unwrap();
+    assert!(
+        !executor.contains("Project instructions (from"),
+        "{executor}"
+    );
+
+    let config_file = dir.path().join(".kanban/config.yaml");
+    let mut config = fs::read_to_string(&config_file).unwrap();
+    config.push_str("instructions: |\n  Answer in Russian.\n  Never touch vendor/.\n");
+    fs::write(&config_file, config).unwrap();
+    for role in [
+        Role::Executor,
+        Role::Designer,
+        Role::Reviewer,
+        Role::Orchestrator,
+    ] {
+        let prompt = build_agent_prompt(ops.roots(), &task, "ses-test", false, role).unwrap();
+        assert!(
+            prompt.contains("Answer in Russian.\nNever touch vendor/."),
+            "{role:?}: {prompt}"
+        );
+    }
+}

@@ -1583,10 +1583,10 @@ fn settings_tab_arrows_wrap_and_tab_stays_in_page() {
     app.handle_key(key(KeyCode::Left)).expect("wrap left");
     assert_eq!(
         app.modal.as_ref().unwrap().settings_tab,
-        SettingsTab::Executor
+        SettingsTab::Instructions
     );
-    // Right from the last tab wraps back to the first. The Executor page
-    // opens on a slot selector that owns the arrows, so Confirm — which
+    // Right from the last tab wraps back to the first. The Instructions page
+    // opens on a textarea that owns the arrows, so Confirm — which
     // surrendered them to the tab strip — is the vantage point here.
     let modal = app.modal.as_mut().unwrap();
     modal.focus_field(DialogField::Confirm);
@@ -2036,6 +2036,51 @@ fn settings_tab_pages_render() {
     let modal = app.modal.as_mut().unwrap();
     modal.set_settings_tab(SettingsTab::Executor);
     insta::assert_snapshot!("settings_tab_executor", render_at(&mut app, 80, 24));
+    let modal = app.modal.as_mut().unwrap();
+    modal.set_settings_tab(SettingsTab::Instructions);
+    insta::assert_snapshot!("settings_tab_instructions", render_at(&mut app, 80, 24));
+}
+
+/// The Prompt tab edits `instructions:` in the project config: Enter breaks
+/// lines, Save writes the text, reopening loads it back, and clearing it
+/// drops the key again.
+#[test]
+fn settings_instructions_tab_round_trips_through_config() {
+    let (dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    let modal = app.modal.as_mut().unwrap();
+    modal.set_settings_tab(SettingsTab::Instructions);
+    assert_eq!(modal.active_field(), DialogField::Description);
+    for ch in "Use pnpm".chars() {
+        app.handle_key(key(KeyCode::Char(ch))).unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    for ch in "No emojis".chars() {
+        app.handle_key(key(KeyCode::Char(ch))).unwrap();
+    }
+    assert!(app.modal.is_some(), "Enter must not submit the dialog");
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.modal.is_none(), "{:?}", app.status);
+    let config = crate::core::config::Config::new(dir.path());
+    assert_eq!(
+        config.get_instructions().unwrap().as_deref(),
+        Some("Use pnpm\nNo emojis")
+    );
+
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("reopen settings");
+    let modal = app.modal.as_mut().unwrap();
+    assert_eq!(modal.description_text(), "Use pnpm\nNo emojis");
+    modal.description = TextArea::default();
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.modal.is_none(), "{:?}", app.status);
+    let config = crate::core::config::Config::new(dir.path());
+    assert_eq!(config.get_instructions().unwrap(), None);
+    let raw = std::fs::read_to_string(dir.path().join(".kanban/config.yaml")).unwrap();
+    assert!(!raw.contains("instructions"), "{raw}");
 }
 
 /// Slot options carry the live provider numbers from the cached limits
@@ -9570,7 +9615,7 @@ fn project_settings_never_show_the_projects_tab() {
     assert!(!modal.settings_tabs().contains(&SettingsTab::Projects));
     assert!(!modal.settings_tabs().contains(&SettingsTab::Backends));
     assert_eq!(
-        SettingsTab::Executor.next(modal.settings_tabs()),
+        SettingsTab::Instructions.next(modal.settings_tabs()),
         SettingsTab::Common
     );
 }
