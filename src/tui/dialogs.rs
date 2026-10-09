@@ -194,6 +194,8 @@ pub enum SettingsTab {
     Designer,
     Reviewer,
     Executor,
+    /// Project Settings only: extra instructions injected into every task.
+    Instructions,
     /// Global Settings only: the order backend pickers list backends in.
     Backends,
     /// Global Settings only: which registered projects the list shows.
@@ -201,11 +203,12 @@ pub enum SettingsTab {
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 4] = [
+    pub const ALL: [SettingsTab; 5] = [
         SettingsTab::Common,
         SettingsTab::Designer,
         SettingsTab::Reviewer,
         SettingsTab::Executor,
+        SettingsTab::Instructions,
     ];
 
     /// The Global Settings strip: every project tab plus Backends and Projects.
@@ -224,6 +227,7 @@ impl SettingsTab {
             SettingsTab::Designer => "Designer",
             SettingsTab::Reviewer => "Reviewer",
             SettingsTab::Executor => "Executor",
+            SettingsTab::Instructions => "Prompt",
             SettingsTab::Backends => "Backends",
             SettingsTab::Projects => "Projects",
         }
@@ -236,6 +240,7 @@ impl SettingsTab {
             SettingsTab::Designer => "Des",
             SettingsTab::Reviewer => "Rev",
             SettingsTab::Executor => "Exe",
+            SettingsTab::Instructions => "Prm",
             SettingsTab::Backends => "Bck",
             SettingsTab::Projects => "Prj",
         }
@@ -313,6 +318,14 @@ const SETTINGS_PAGE_EXECUTOR_FIELDS: [DialogField; 11] = [
     DialogField::Cancel,
 ];
 
+/// The project's free-form agent instructions. The form reuses the
+/// `Description` textarea, which project settings has no other use for.
+const SETTINGS_PAGE_INSTRUCTIONS_FIELDS: [DialogField; 3] = [
+    DialogField::Description,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
 /// The Global Settings Common page: the machine-only settings first, then
 /// the global half of every inheritable group on that tab. The other tabs
 /// are the project pages minus their inherit checkbox.
@@ -353,6 +366,7 @@ const GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS: [DialogField; 3] = [
 
 /// The whole field page of one settings tab, buttons included. Project
 /// settings never show the Backends or Projects tab; they fall back to Common.
+/// Global Settings never shows Instructions; it falls back to Common too.
 pub(crate) fn settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
     match tab {
         SettingsTab::Common | SettingsTab::Backends | SettingsTab::Projects => {
@@ -361,13 +375,14 @@ pub(crate) fn settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
         SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS,
         SettingsTab::Reviewer => &SETTINGS_PAGE_REVIEWER_FIELDS,
         SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS,
+        SettingsTab::Instructions => &SETTINGS_PAGE_INSTRUCTIONS_FIELDS,
     }
 }
 
 /// The Global Settings page of one tab, buttons included.
 pub(crate) fn global_settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
     match tab {
-        SettingsTab::Common => &GLOBAL_SETTINGS_PAGE_COMMON_FIELDS,
+        SettingsTab::Common | SettingsTab::Instructions => &GLOBAL_SETTINGS_PAGE_COMMON_FIELDS,
         SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS[1..],
         SettingsTab::Reviewer => &SETTINGS_PAGE_REVIEWER_FIELDS[1..],
         SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS[1..],
@@ -420,6 +435,7 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::ExecutorCheap3
         | DialogField::ExecutorWeekThreshold
         | DialogField::ExecutorFiveHourThreshold => Some(SettingsTab::Executor),
+        DialogField::Description => Some(SettingsTab::Instructions),
         DialogField::BackendOrder => Some(SettingsTab::Backends),
         DialogField::ProjectVisibility => Some(SettingsTab::Projects),
         _ => None,
@@ -1140,7 +1156,9 @@ impl ModalState {
             ) | (Modal::AnswerQuestion { .. }, DialogField::Answer)
                 | (
                     Modal::Settings,
-                    DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel
+                    DialogField::Description
+                        | DialogField::MaxRunningPerBackend
+                        | DialogField::MaxRunningPerBackendModel
                 )
         )
     }
@@ -3466,7 +3484,14 @@ fn description_content_height(modal: &ModalState, row_width: u16) -> u16 {
     (&probe).render(area, &mut scratch);
     let rows =
         u16::try_from(probe.screen_cursor().row.saturating_add(1)).unwrap_or(DESCRIPTION_MAX_ROWS);
-    rows.clamp(DESCRIPTION_MIN_ROWS, DESCRIPTION_MAX_ROWS)
+    // The project instructions are alone on their tab, so they take the
+    // whole page (callers clamp to the space left) instead of a small box.
+    let min_rows = if matches!(modal.modal, Modal::Settings) {
+        DESCRIPTION_MAX_ROWS
+    } else {
+        DESCRIPTION_MIN_ROWS
+    };
+    rows.clamp(min_rows, DESCRIPTION_MAX_ROWS)
 }
 
 /// The first visible field to draw so the focused one sits fully inside
@@ -5293,13 +5318,19 @@ fn render_description_textarea(
     } else {
         app.theme.border
     };
+    // Project settings reuse the textarea for the board's agent instructions.
+    let title = if matches!(modal.modal, Modal::Settings) {
+        " Instructions for every task (Enter newline) "
+    } else {
+        " Description (Ctrl+V paste, Enter newline) "
+    };
     set_cursor_visible(&mut modal.description, focused);
     modal.description.set_block(
         Block::default()
             // Enter, Shift+Enter, and Alt+Enter all insert a newline. The
             // title names Enter because that is the key every terminal can
             // deliver; the modifiers are accepted too.
-            .title(" Description (Ctrl+V paste, Enter newline) ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border)),
     );
@@ -5504,7 +5535,7 @@ pub(super) fn one_line(text: &str) -> TextArea<'static> {
     )])
 }
 
-fn wrapped_description(lines: Vec<String>) -> TextArea<'static> {
+pub(crate) fn wrapped_description(lines: Vec<String>) -> TextArea<'static> {
     let mut textarea = TextArea::new(lines);
     textarea.set_wrap_mode(WrapMode::WordOrGlyph);
     textarea
@@ -5588,7 +5619,7 @@ fn select_matching(options: &[SelectOption], value: Option<&str>) -> usize {
         .unwrap_or(0)
 }
 
-fn lines_or_empty(text: &str) -> Vec<String> {
+pub(crate) fn lines_or_empty(text: &str) -> Vec<String> {
     let lines = text.lines().map(sanitize_terminal_text).collect::<Vec<_>>();
     if lines.is_empty() {
         vec![String::new()]

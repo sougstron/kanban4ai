@@ -22,6 +22,13 @@ auto-loaded into every agent session. Read it when you are reading or adding a s
 - `agent_reply_message_max_chars`: 8192 - maximum length kept from any single *earlier* message of that answer, so one long mid-run message cannot eat the whole budget (`0` disables the per-message cap)
 - `limits_refresh_interval`: 120 (sec) - how long a provider-limits snapshot stays fresh before the TUI refreshes it in the background
 
+## Project Instructions (.kanban/config.yaml `instructions:`)
+- `instructions`: free-form multi-line text, edited on the Project Settings
+  **Prompt** tab. When it is not blank it is injected into the prompt of every
+  task on this board (all roles: orchestrator, designer, executor, reviewer),
+  ahead of `.kanban/instructions/<role>.md`. Project-only — never inherited from
+  the global config; a blank value removes the key.
+
 ## TUI Settings (.kanban/config.yaml `tui:`)
 - `card_height_lines`: 4 - task card height
 - `card_line_max_symbols`: 40 - fixed one-line preview length before adding `...`

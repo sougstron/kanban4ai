@@ -307,6 +307,10 @@ pub struct BoardConfig {
     /// [`InheritFlags`]). Absent on boards written before global configs.
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
     pub inherit: Mapping,
+    /// Project-wide agent instructions, injected into every task prompt of
+    /// this board when non-blank. Project-only: never inherited.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub instructions: String,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
@@ -2226,6 +2230,13 @@ impl Config {
     /// Typed snapshot of the `orchestration:` section. Business logic (queue
     /// dispatcher, crash restarts, role bots) reads this — never the raw
     /// `Mapping`.
+    /// The project's extra agent instructions, `None` when unset or blank.
+    pub fn get_instructions(&self) -> Result<Option<String>> {
+        let text = self.load()?.instructions;
+        let text = text.trim();
+        Ok((!text.is_empty()).then(|| text.to_string()))
+    }
+
     pub fn get_orchestration(&self) -> Result<OrchestrationSettings> {
         Ok(OrchestrationSettings::from_mapping(
             &self.load()?.orchestration,

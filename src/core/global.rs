@@ -96,6 +96,7 @@ impl GlobalConfig {
             verification: Mapping::new(),
             orchestration: self.orchestration.clone(),
             inherit: Mapping::new(),
+            instructions: String::new(),
             extras: Mapping::new(),
         }
     }

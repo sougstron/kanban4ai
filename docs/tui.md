@@ -67,7 +67,7 @@ the plain-letter hotkeys.
   a live session cannot be queued
 - `n`: New task — always created in To Do, regardless of the focused column
 - `s`: Open Project Settings from Board or Detail. The dialog is split into
-  four **tabs** — `Common │ Designer │ Reviewer │ Executor` — rendered as a
+  five **tabs** — `Common │ Designer │ Reviewer │ Executor │ Prompt` — rendered as a
   labelled strip with a rule under it. **Left/Right switch tabs** (wrapping at
   the ends) whenever the focused field does not own those arrows — i.e.
   everywhere except text inputs, the per-backend cap lists, and the filtered
@@ -98,8 +98,12 @@ the plain-letter hotkeys.
     `next:` order line, and the two quota floors (`Week %`, `5h %`). See
     `docs/config.md` (`orchestration.executors`) and `docs/orchestration.md`
     (Executor Pools).
+  - **Prompt**: one multi-line `Instructions for every task` box (Enter
+    breaks lines, plain-text paste) stored as `instructions:` in
+    `.kanban/config.yaml`; when not blank it is injected into every task's
+    agent prompt. See `docs/config.md` ("Project Instructions").
   On the Projects screen `s` instead opens Global Settings (see "Global
-  Settings"): the same four tabs without the inherit checkboxes, project
+  Settings"): the same tabs minus Prompt and the inherit checkboxes, project
   name, theme and isolation row — they edit the global values the projects
   inherit. Its Common tab adds the machine-only settings (Updates section,
   Esc-from-board, project sorting, update check on open).

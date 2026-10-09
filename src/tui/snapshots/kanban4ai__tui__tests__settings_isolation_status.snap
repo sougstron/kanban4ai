@@ -7,7 +7,7 @@ expression: output
 │task              ││                  ││                  ││                  │
 │                  ││                  ││                  ││                  │
 │           ┌ Project settings ────────────────────────────────────┐           │
-│           │ Common │ Designer │ Reviewer │ Executor              │           │
+│           │ Common │ Designer │ Reviewer │ Executor │ Prompt     │           │
 │           │──────────────────────────────────────────────────────│           │
 │           │┌ Limits · Max tasks per backend/model (`opencode/mod┐│           │
 │           ││                                                    ││           │
@@ -75,7 +75,9 @@ expression: output
 5:33-43 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:43-44 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:44-54 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-5:54-67 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+5:54-55 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+5:55-63 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+5:63-67 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:67-68 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:68-79 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:79-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
