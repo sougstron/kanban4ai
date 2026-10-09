@@ -1,7 +1,28 @@
-# Unreleased
+# kanban4ai 0.7.4
+
+Open boards do less repeated work, a project can give every task the same
+instructions, and suggestion counts sit on the card border.
+
+## Changed
+
+- **Project instructions** (Project Settings Prompt tab,
+  `.kanban/config.yaml` `instructions:`). A non-blank value is injected into
+  every role's prompt, ahead of `.kanban/instructions/<role>.md`. It is
+  project-only. Native resumes reread the current text, including when
+  returning to a backend that already has a conversation.
+- **Suggestion counts on cards.** Each card shows how many suggestion
+  messages its thread holds, in the top-right border, on every column. The
+  count is cached by the thread file's mtime and size.
+- **Cursor-line underline follows focus.** Only the focused text field draws
+  the reversed cursor and the underlined cursor line.
 
 ## Performance
 
+- **Shared store pump.** Every open TUI and the daemon take `<store>/pump.lock`
+  for one tick and skip while a more recent tick is still inside their own
+  gap, so several TUIs plus a daemon pump the store once. Unchanged projects
+  with no due deadline are skipped, with a one-minute backstop.
+  `kanban daemon --project` still always pumps that project.
 - Projects summaries scan in the background and cache task counts, sessions
   and display names independently. Initial paint no longer parses every task;
   refresh preserves the selected project and ignores pre-action scan results.
