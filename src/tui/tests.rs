@@ -12310,3 +12310,30 @@ fn ctrl_v_in_the_answer_panel_keeps_the_draft_and_never_types_v() {
         "Ctrl+V must not clobber the draft or type v: {text:?}"
     );
 }
+
+#[test]
+fn only_the_focused_text_field_draws_a_cursor() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+
+    let reversed_cells = |app: &mut App| {
+        let mut terminal = Terminal::new(TestBackend::new(96, 28)).expect("terminal");
+        terminal.draw(|frame| board::ui(frame, app)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        [DialogField::Title, DialogField::Description].map(|field| {
+            let area = modal_hitbox(app, HitAction::ModalField(field));
+            area.positions()
+                .filter(|&position| {
+                    buffer[position]
+                        .style()
+                        .add_modifier
+                        .contains(Modifier::REVERSED)
+                })
+                .count()
+        })
+    };
+
+    assert_eq!(reversed_cells(&mut app), [1, 0]);
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+    assert_eq!(reversed_cells(&mut app), [0, 1]);
+}

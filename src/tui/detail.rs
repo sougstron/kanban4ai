@@ -19,6 +19,7 @@ use crate::core::timefmt;
 use super::app::{App, DetailFocus, HitAction, Hitbox, TextRegion, UiAction};
 use super::board;
 use super::card::{format_tokens, sanitize_terminal_text, truncate_display};
+use super::dialogs::set_cursor_visible;
 use super::projects::shorten_path;
 use super::theme::Theme;
 use super::thread_view::{pin_last_message_scroll, visible_thread_messages};
@@ -827,6 +828,7 @@ fn render_edits_panel(
         action: HitAction::DetailEdits,
     });
     let review_edits = &mut app.detail.as_mut().unwrap().review_edits;
+    set_cursor_visible(review_edits, focused);
     review_edits.set_block(
         Block::default()
             .title(title)
