@@ -57,6 +57,7 @@ fn depends_on_is_omitted_from_frontmatter_while_empty() {
         "roster_index",
         "use_orchestrator",
         "orchestrated",
+        "silence",
     ] {
         assert!(
             !text.contains(key),
@@ -244,6 +245,26 @@ fn an_orchestrator_plan_builds_the_graph_and_starts_only_its_roots() {
         vec![parent.id.clone()]
     );
     drop(dir);
+}
+
+#[test]
+fn silence_mode_is_inherited_by_planned_nodes() {
+    let (_dir, ops, _recorder) =
+        graph_board("  queue_enabled: true\n  orchestrator:\n    max_subtasks: 4\n");
+    let parent = ops
+        .create_task(NewTask {
+            title: "Quiet plan".into(),
+            use_orchestrator: true,
+            silence: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let plan = Plan::parse(
+        "nodes:\n- key: one\n  title: First slice\n- key: two\n  title: Second slice\n",
+    )
+    .unwrap();
+    let outcome = ops.apply_plan(&parent.id, &plan, None).unwrap();
+    assert!(outcome.created.iter().all(|task| task.silence));
 }
 
 #[test]

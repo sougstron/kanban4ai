@@ -317,6 +317,11 @@ pub struct Task {
     /// Omitted while false so legacy task files round-trip unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub readonly: bool,
+    /// Questions are refused. The agent decides ambiguous points itself and
+    /// records each dispute with `kanban suggest`. Omitted while false so
+    /// legacy boards round-trip byte-identically. Wins over `interactive`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub silence: bool,
     /// Opt this task into the designer bot even when
     /// `orchestration.designer.enabled` is off. Models and agents still
     /// come from the project designer settings. Omitted while false so
@@ -497,6 +502,7 @@ impl Task {
             agent_name: None,
             interactive: false,
             readonly: false,
+            silence: false,
             use_designer: false,
             use_reviewer: false,
             use_orchestrator: false,

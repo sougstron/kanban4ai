@@ -1333,27 +1333,27 @@ fn options_popup_save_stages_toggles_and_esc_restores() {
     app.handle_key(key(KeyCode::Enter)).expect("open popup");
     let modal = app.modal.as_ref().expect("modal");
     assert!(modal.popup_open());
-    assert_eq!(modal.active_field(), DialogField::UseOrchestrator);
+    assert_eq!(modal.active_field(), DialogField::Silence);
 
     // Toggling then cancelling restores the exact opening state.
     app.handle_key(key(KeyCode::Char(' ')))
-        .expect("toggle orchestrator");
+        .expect("toggle silence");
     app.handle_key(key(KeyCode::Esc)).expect("cancel popup");
     let modal = app.modal.as_ref().expect("parent remains open");
     assert!(!modal.popup_open());
     assert_eq!(modal.active_field(), DialogField::TaskOptions);
-    assert!(!modal.use_orchestrator, "cancel must roll the toggle back");
+    assert!(!modal.silence, "cancel must roll the toggle back");
 
     // Toggling then saving stages the value on the parent form.
     app.handle_key(key(KeyCode::Enter)).expect("reopen popup");
     app.handle_key(key(KeyCode::Char(' ')))
-        .expect("toggle orchestrator");
+        .expect("toggle silence");
     app.handle_key(ctrl_key(KeyCode::Char('s')))
         .expect("save popup");
     let modal = app.modal.as_ref().expect("parent remains open");
     assert!(!modal.popup_open());
     assert_eq!(modal.active_field(), DialogField::TaskOptions);
-    assert!(modal.use_orchestrator, "save must stage the toggle");
+    assert!(modal.silence, "save must stage the toggle");
 }
 
 #[test]
@@ -10750,6 +10750,7 @@ fn new_task_mode_toggles_save_on_the_task() {
     app.handle_key(key(KeyCode::Enter)).expect("open options");
     assert!(app.modal.as_ref().expect("modal").popup_open());
     for (field, toggle) in [
+        (DialogField::Silence, true),
         (DialogField::UseOrchestrator, true),
         (DialogField::UseDesigner, true),
         (DialogField::UseReviewer, true),
@@ -10789,6 +10790,7 @@ fn new_task_mode_toggles_save_on_the_task() {
         .find(|task| task.title == "Per-task bots")
         .expect("created task");
     assert!(created.readonly);
+    assert!(created.silence);
     assert!(created.use_orchestrator);
     assert!(created.use_designer);
     assert!(created.use_reviewer);

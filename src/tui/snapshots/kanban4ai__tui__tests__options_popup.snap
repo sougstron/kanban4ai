@@ -10,24 +10,24 @@ expression: rendered
 │└─────────────────────┘││                       ││                       ││                       │
 │              ┌ New task ──────────────────────────────────────────────────────────┐              │
 │              │┌ T┌ Task options ──────────────────────────────────────────────┐──┐│              │
-│              ││  │┌ Orchestrator ────────────────────────────────────────────┐│  ││              │
-│              │└──││☐ plan a subtask graph first (Space toggles)              ││──┘│              │
+│              ││  │┌ Silence ─────────────────────────────────────────────────┐│  ││              │
+│              │└──││☐ decide without asking; record disputes as suggestions (S││──┘│              │
 │              │┌ D│└──────────────────────────────────────────────────────────┘│──┐│              │
-│              ││  │┌ Designer ────────────────────────────────────────────────┐│  ││              │
-│              ││  ││☐ designer for this task (Space toggles)                  ││  ││              │
+│              ││  │┌ Orchestrator ────────────────────────────────────────────┐│  ││              │
+│              ││  ││☐ plan a subtask graph first (Space toggles)              ││  ││              │
 │              ││  │└──────────────────────────────────────────────────────────┘│  ││              │
-│              │└──│┌ Reviewer ────────────────────────────────────────────────┐│──┘│              │
-│              │┌ A││☐ reviewer for this task (Space toggles)                  ││──┐│              │
+│              │└──│┌ Designer ────────────────────────────────────────────────┐│──┘│              │
+│              │┌ A││☐ designer for this task (Space toggles)                  ││──┐│              │
 │              ││de│└──────────────────────────────────────────────────────────┘│  ││              │
-│              │└──│┌ Planned launch ──────────────────────────────────────────┐│──┘│              │
-│              │┌ R││☐ start automatically at a set time (Space toggles)       ││──┐│              │
+│              │└──│┌ Reviewer ────────────────────────────────────────────────┐│──┘│              │
+│              │┌ R││☐ reviewer for this task (Space toggles)                  ││──┐│              │
 │              ││☐ │└──────────────────────────────────────────────────────────┘│  ││              │
-│              ││  │┌──────────────────────────────────────────────────────────┐│  ││              │
-│              │└──││ Launch at — enable “Planned launch”                      ││──┘│              │
+│              ││  │┌ Planned launch ──────────────────────────────────────────┐│  ││              │
+│              │└──││☐ start automatically at a set time (Space toggles)       ││──┘│              │
 │              │┌ C│└──────────────────────────────────────────────────────────┘│──┐│              │
-│              ││/ │                                                            │  ││              │
-│              ││› │                                                            │  ││              │
-│              │└──│                                                            │──┘│              │
+│              ││/ │┌──────────────────────────────────────────────────────────┐│  ││              │
+│              ││› ││ Launch at — enable “Planned launch”                      ││  ││              │
+│              │└──│└──────────────────────────────────────────────────────────┘│──┘│              │
 │              │┌ O│                                                            │──┐│              │
 │              ││of│                                                            │  ││              │
 │              │└──│┌──────────────────────────────────────────────────────────┐│──┘│              │
@@ -285,7 +285,7 @@ expression: rendered
 21:16-19 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:19-20 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:20-21 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-21:21-79 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+21:21-79 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:79-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:80-81 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:81-84 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -309,7 +309,7 @@ expression: rendered
 23:16-17 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 23:17-19 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 23:19-20 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-23:20-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+23:20-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 23:80-81 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 23:81-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 23:83-84 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -322,7 +322,9 @@ expression: rendered
 24:16-17 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 24:17-19 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
 24:19-20 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-24:20-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+24:20-21 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+24:21-79 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+24:79-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 24:80-81 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 24:81-83 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
 24:83-84 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -334,7 +336,7 @@ expression: rendered
 25:15-16 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 25:16-19 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 25:19-20 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-25:20-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+25:20-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 25:80-81 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 25:81-84 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 25:84-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

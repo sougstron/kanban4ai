@@ -6299,6 +6299,7 @@ impl App {
                     agent_name: modal.agent_text(),
                     interactive: false,
                     readonly: modal.readonly,
+                    silence: modal.silence,
                     use_designer: modal.use_designer,
                     use_reviewer: modal.use_reviewer,
                     use_orchestrator: modal.use_orchestrator,
@@ -6352,6 +6353,7 @@ impl App {
                         agent_name: Some(modal.agent_text()),
                         interactive: None,
                         readonly: Some(modal.readonly),
+                        silence: Some(modal.silence),
                         use_designer: Some(modal.use_designer),
                         use_reviewer: Some(modal.use_reviewer),
                         use_orchestrator: Some(modal.use_orchestrator),
@@ -7575,6 +7577,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::ReviewerAgentSettings
         | DialogField::TaskOptions
         | DialogField::Readonly
+        | DialogField::Silence
         | DialogField::UseOrchestrator
         | DialogField::UseDesigner
         | DialogField::UseReviewer

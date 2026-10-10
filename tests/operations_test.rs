@@ -897,6 +897,40 @@ fn ask_form_posts_one_question_per_entry_with_variants() {
 }
 
 #[test]
+fn silence_mode_refuses_questions_and_still_takes_suggestions() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops
+        .create_task(NewTask {
+            title: "Quiet".into(),
+            silence: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let refused = ops
+        .ask_question(&task.id, "Which one?", "agent", vec![])
+        .unwrap_err();
+    let message = refused.to_string();
+    assert!(message.contains("silence mode"), "{message}");
+    let form =
+        kanban4ai::core::ask_form::AskForm::parse("questions:\n  - prompt: Which one?\n").unwrap();
+    let form_refused = ops.ask_form(&task.id, &form, "user", None).unwrap_err();
+    assert!(matches!(form_refused, KanbanError::Permission(_)));
+    let wait_refused = ops
+        .ask_and_wait(&task.id, "Blocking?", None, vec![], Some(0), Some(0))
+        .unwrap_err();
+    assert!(matches!(wait_refused, KanbanError::Permission(_)));
+    assert!(ops.list_open_messages(&task.id).unwrap().is_empty());
+
+    ops.suggest_improvement(&task.id, "Picked the smaller change", "agent", vec![])
+        .unwrap()
+        .unwrap();
+    let open = ops.list_open_messages(&task.id).unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].kind, MessageKind::Suggestion);
+}
+
+#[test]
 fn ask_form_missing_task_returns_none() {
     let (_dir, ops, _rec) = ops_with_recorder(false);
     let form = kanban4ai::core::ask_form::AskForm::parse("questions:\n  - prompt: Hi?\n").unwrap();

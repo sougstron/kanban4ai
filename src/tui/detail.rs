@@ -290,6 +290,11 @@ fn render_meta(
     if task.readonly {
         meta.push(Line::from("🔒 Readonly: project-file writes disabled"));
     }
+    if task.silence {
+        meta.push(Line::from(
+            "🔇 Silence: questions refused — decide and record disputes as suggestions",
+        ));
+    }
     if let Some(launch_at) = task.launch_at {
         meta.push(Line::from(format!(
             "🕐 Planned launch at {}",
