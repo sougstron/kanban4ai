@@ -116,6 +116,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::core::http::{HttpError, http_get_json, http_request_json};
+use crate::core::limit_share;
 use crate::core::project::store_root;
 use crate::core::storage::atomic_write_text;
 
@@ -887,6 +888,7 @@ pub fn store_claude_bridge(windows: &[LimitWindow]) -> bool {
     let Ok(text) = serde_json::to_string(&file) else {
         return false;
     };
+    limit_share::record_readings("claude", windows, file.updated_at);
     atomic_write_text(&path, &text).is_ok()
 }
 
@@ -2867,6 +2869,15 @@ fn store(snapshot: Arc<LimitsSnapshot>, persist: bool) -> Arc<LimitsSnapshot> {
     } else {
         snapshot
     };
+    if persist {
+        for provider in merged.providers.iter().filter(|entry| entry.is_ready()) {
+            limit_share::record_readings(
+                &provider.provider,
+                &provider.windows,
+                provider.observed_at.unwrap_or(now),
+            );
+        }
+    }
     if persist
         && let Some(path) = cache_file()
         && let Ok(text) = serde_json::to_string(merged.as_ref())

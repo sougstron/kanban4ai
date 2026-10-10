@@ -413,7 +413,7 @@ pub fn badges(
 /// Role color for a delegated run: blue for design/planning, purple for
 /// review, the default ok green for the executor. Shared by the live badge,
 /// the "▶ running" row and the telemetry stats line so all three agree.
-fn phase_color(theme: &Theme, phase: Option<RunPhase>) -> Color {
+pub(super) fn phase_color(theme: &Theme, phase: Option<RunPhase>) -> Color {
     match phase {
         Some(RunPhase::Orchestrate | RunPhase::Design) => theme.focus,
         Some(RunPhase::Review) => theme.review,

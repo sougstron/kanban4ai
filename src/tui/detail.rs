@@ -7,9 +7,10 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::core::limit_share::LimitShare;
 use crate::core::limits::format_span;
 use crate::core::models::{
-    IntegrationState, Message, MessageKind, MessageStatus, Task, TaskStatus,
+    IntegrationState, Message, MessageKind, MessageStatus, RunPhase, Task, TaskStatus,
 };
 use crate::core::session::SessionState;
 use crate::core::stats::TaskAnalytics;
@@ -18,6 +19,7 @@ use crate::core::timefmt;
 
 use super::app::{App, DetailFocus, HitAction, Hitbox, TextRegion, UiAction};
 use super::board;
+use super::card;
 use super::card::{format_tokens, sanitize_terminal_text, truncate_display};
 use super::dialogs::set_cursor_visible;
 use super::projects::shorten_path;
@@ -32,8 +34,15 @@ const META_TITLE_WIDTH: u16 = META_TITLE.len() as u16;
 /// after the `› ` marker and this label, and `render_answer_panel` plus the
 /// mouse caret mapping both measure it.
 pub(super) const ANSWER_LABEL: &str = "Custom answer: ";
-/// The Analytics panel is a single bordered row.
-const ANALYTICS_HEIGHT: u16 = 3;
+/// The Analytics panel is one bordered row, plus a second for the task's
+/// limit shares once it has any.
+fn analytics_height(analytics: &TaskAnalytics) -> u16 {
+    if analytics.limit_shares.is_empty() {
+        3
+    } else {
+        4
+    }
+}
 
 pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let Some(detail) = app.detail.as_ref() else {
@@ -64,6 +73,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let edits_editable = detail.edits_editable();
     let focus = detail.focus;
     let task = task.clone();
+    let analytics_height = analytics_height(&detail.analytics);
 
     let description_lines = task_description_lines(&task);
     let isolated = task.worktree.is_some();
@@ -83,7 +93,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         let switch_rows = if open_questions.len() > 1 { 2 } else { 0 };
         let desired = 4 + question.variants.len() as u16 + 1 + switch_rows;
         let reserved = meta_height
-            .saturating_add(ANALYTICS_HEIGHT)
+            .saturating_add(analytics_height)
             .saturating_add(if show_edits { 6 } else { 0 })
             .saturating_add(1)
             .saturating_add(3);
@@ -93,7 +103,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     let mut constraints = vec![
         Constraint::Length(meta_height),
-        Constraint::Length(ANALYTICS_HEIGHT),
+        Constraint::Length(analytics_height),
         Constraint::Min(5),
         Constraint::Length(answer_height),
         Constraint::Length(if show_edits { 6 } else { 0 }),
@@ -507,8 +517,12 @@ fn render_analytics(
         }
         Line::from(spans)
     };
+    let mut lines = vec![line];
+    if !analytics.limit_shares.is_empty() {
+        lines.push(limit_shares_line(theme, &analytics.limit_shares));
+    }
     frame.render_widget(
-        Paragraph::new(line)
+        Paragraph::new(lines)
             .block(
                 Block::default()
                     .title(" Analytics ")
@@ -518,6 +532,51 @@ fn render_analytics(
             .style(Style::default().bg(theme.bg).fg(theme.fg)),
         area,
     );
+}
+
+/// `Limits claude 5h ✎0.4% ▶2.1% ⚖0.3% · 7d …`: the share of each provider
+/// window the task consumed, one value per role in the role colors the cards
+/// use (`card::phase_color`). `shares` arrive sorted by provider, window and
+/// role.
+fn limit_shares_line(theme: &Theme, shares: &[LimitShare]) -> Line<'static> {
+    let muted = Style::default().fg(theme.muted);
+    let mut spans = vec![Span::styled("Limits", muted)];
+    let mut previous: Option<(&str, &str)> = None;
+    for share in shares {
+        match previous {
+            Some((provider, label)) if provider == share.provider && label == share.label => {}
+            Some((provider, _)) if provider == share.provider => {
+                spans.push(Span::styled(format!(" · {}", share.label), muted));
+            }
+            prev => {
+                if prev.is_some() {
+                    spans.push(Span::styled(" │", Style::default().fg(theme.border)));
+                }
+                spans.push(Span::styled(
+                    format!(" {} {}", share.provider, share.label),
+                    muted,
+                ));
+            }
+        }
+        previous = Some((&share.provider, &share.label));
+        let (glyph, phase) = match share.role.as_str() {
+            "designer" => ("✎", Some(RunPhase::Design)),
+            "reviewer" => ("⚖", Some(RunPhase::Review)),
+            _ => ("▶", None),
+        };
+        let percent = if share.percent < 0.05 {
+            "<0.1%".to_string()
+        } else {
+            format!("{:.1}%", share.percent)
+        };
+        spans.push(Span::styled(
+            format!(" {glyph}{percent}"),
+            Style::default()
+                .fg(card::phase_color(theme, phase))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn render_answer_panel(

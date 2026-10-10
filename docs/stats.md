@@ -138,6 +138,43 @@ added at render time: its open `Running` span (`running_since`) while the
 session is Live, and its tokens from `App::session_progress` unless its
 `Usage` is already counted. Nothing involves the agent.
 
+## Per-task limit shares (`core/limit_share.rs`)
+
+The Analytics panel's second row, `Limits claude 5h ✎0.4% ▶3.1% · 7d ▶0.6%
+│ codex 7d ⚖1.2%`: how many percentage points of each provider window the
+task consumed, split by role (designer / executor / reviewer). Providers only
+report a window's total spend, so it is reconstructed from two append-only
+logs:
+
+- **Limit history** (`<store>/limits-history.jsonl`): `{at, provider, label,
+  used, resets_at?, rolling?}`, appended whenever a window's used percent
+  changes (or its reset time jumps by more than 10 minutes). Written from
+  `limits::store` (every persisted snapshot) and `store_claude_bridge` (the
+  statusline shim and every headless claude `rate_limit_event`, i.e. after
+  each API call of a delegated claude run). Unit tests never write it.
+- **Token samples** (`.kanban/stats/samples.jsonl`, per project):
+  `{at, task_id, session_id, weight, provider?, role?}` with `weight` the
+  session's cumulative cost-weighted tokens (uncached input ×1, cache write
+  ×1.25, cache read ×0.1, output ×5). A zero at `link_session`, one per
+  `kanban heartbeat` while the transcript or log changed since the previous
+  heartbeat (and the session is not in a declared wait), and the final tally
+  at close. Provider and role are stamped only while the task still points at
+  the session, resolved through `resolve_launch_settings` for its current
+  phase (a designer/reviewer bot may run on another provider); a session's
+  first tagged sample wins.
+
+`attribute` walks consecutive readings of each window. Their increase — or,
+across a reset, the whole later reading, counted from the reset time — is
+split over every session on that provider, in every registered project, in
+proportion to the weight each spent inside that interval (linear
+interpolation between its samples). Parallel tasks and uneven consumption
+fall out of this directly. Accepted approximations: non-kanban usage that
+overlaps a kanban run is charged to the runs; spend before a window's first
+or after its last reading is lost; rolling (synthetic) quotas count only
+their increases; the weights are list-price ratios rather than each
+provider's real limit formula; claude reports whole percents. Only sessions
+started after this existed have samples.
+
 ## Two accepted approximations
 
 Both fine for a for-fun feature, neither for anything load-bearing:

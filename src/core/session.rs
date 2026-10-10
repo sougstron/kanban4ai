@@ -5,10 +5,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use chrono::NaiveDateTime;
 use regex::Regex;
 
+use crate::agent::resolve_launch_settings;
+use crate::core::config::Config;
 use crate::core::error::{KanbanError, Result};
-use crate::core::models::{MessageKind, MessageRole, Session, SessionStatus};
+use crate::core::limit_share;
+use crate::core::limits;
+use crate::core::models::{MessageKind, MessageRole, Role, Session, SessionStatus, Task};
 use crate::core::stats;
 use crate::core::storage::{Storage, atomic_write_text};
 use crate::core::telemetry;
@@ -83,7 +88,7 @@ impl SessionManager {
         Self::validate_session_id(session_id)?;
         let session = Session::new(session_id, task_id);
         self.save_session(&session)?;
-        self.record_stats_running_start(task_id);
+        self.record_stats_running_start(task_id, session_id);
         Ok(session)
     }
 
@@ -96,7 +101,7 @@ impl SessionManager {
         Self::validate_session_id(session_id)?;
         let session = Session::named(session_id, task_id, name);
         self.save_session(&session)?;
-        self.record_stats_running_start(task_id);
+        self.record_stats_running_start(task_id, session_id);
         Ok(session)
     }
 
@@ -105,7 +110,10 @@ impl SessionManager {
     /// direct launch, revoke). Tags come off the task's current launch fields
     /// — best effort: a task that vanished between the caller's own lookup
     /// and this one just yields untagged stats instead of failing the launch.
-    fn record_stats_running_start(&self, task_id: &str) {
+    ///
+    /// Also opens the session's token-sample curve at zero for the per-task
+    /// limit shares (`core::limit_share`).
+    fn record_stats_running_start(&self, task_id: &str, session_id: &str) {
         let tags = Storage::new(&self.project_path)
             .load_task(task_id)
             .ok()
@@ -113,6 +121,69 @@ impl SessionManager {
             .map(|task| stats::Tags::from_task(&task))
             .unwrap_or_default();
         stats::record_enter(&self.project_path, task_id, stats::Phase::Running, &tags);
+        limit_share::record_sample(&self.project_path, task_id, session_id, 0.0, None, None);
+    }
+
+    /// Append one cumulative weighted-token sample for a session of `task`.
+    /// The sample is tagged with the provider and role the session runs as
+    /// only while the task still points at it: the launch paths link the
+    /// session before saving the claimed task, and a closing session's task
+    /// may already have moved on to its next phase. The provider follows the
+    /// phase's real launch settings (a designer or reviewer bot can differ
+    /// from the task's executor).
+    fn record_token_sample(&self, task: &Task, session_id: &str, weight: f64) {
+        let tags = (task.session.as_deref() == Some(session_id))
+            .then(|| {
+                let config = Config::new(&self.project_path).load().ok()?;
+                let settings = resolve_launch_settings(&config, task).ok()?;
+                let provider = limits::provider_for(&settings.backend, settings.model.as_deref())?;
+                Some((provider, Role::from_phase(task.run_phase).as_str()))
+            })
+            .flatten();
+        limit_share::record_sample(
+            &self.project_path,
+            &task.id,
+            session_id,
+            weight,
+            tags.map(|tags| tags.0),
+            tags.map(|tags| tags.1),
+        );
+    }
+
+    /// Sample a live session's tokens on its heartbeat, so the limit shares
+    /// can see *when* inside a run the tokens were spent. Skipped while the
+    /// session sits in a declared wait or when neither its transcript nor its
+    /// log changed since `previous_seen` (the heartbeat before this one).
+    pub fn sample_live_tokens(&self, session_id: &str, previous_seen: NaiveDateTime) {
+        let Some(session) = self.load_session(session_id) else {
+            return;
+        };
+        if session.status != SessionStatus::Active || session.wait_until.is_some() {
+            return;
+        }
+        let logs = self.project_path.join(".kanban").join("logs");
+        let changed = ["transcript.jsonl", "log"].iter().any(|ext| {
+            fs::metadata(logs.join(format!("{session_id}.{ext}")))
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| {
+                    chrono::DateTime::<chrono::Local>::from(modified).naive_local() > previous_seen
+                })
+        });
+        if !changed {
+            return;
+        }
+        let Some(task) = Storage::new(&self.project_path)
+            .load_task(&session.task_id)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let backend = task.agent_backend.as_deref().unwrap_or("claude");
+        let progress = telemetry::read_session_progress(&self.project_path, session_id, backend);
+        if let Some(weight) = limit_share::weigh_progress(&progress) {
+            self.record_token_sample(&task, session_id, weight);
+        }
     }
 
     /// End whichever phase a session was actually in when it stopped
@@ -140,6 +211,9 @@ impl SessionManager {
         };
         let backend = task.agent_backend.as_deref().unwrap_or("claude");
         let progress = telemetry::read_session_progress(&self.project_path, &session.id, backend);
+        if let Some(weight) = limit_share::weigh_progress(&progress) {
+            self.record_token_sample(&task, &session.id, weight);
+        }
         if let Some(tokens) = progress.tokens {
             stats::record_usage(
                 &self.project_path,
@@ -220,13 +294,21 @@ impl SessionManager {
     }
 
     pub fn heartbeat(&self, session_id: &str) -> Result<()> {
+        self.heartbeat_seen(session_id).map(|_| ())
+    }
+
+    /// [`Self::heartbeat`], returning the `last_seen` it replaced (`None`
+    /// when the session does not exist).
+    pub fn heartbeat_seen(&self, session_id: &str) -> Result<Option<NaiveDateTime>> {
         Self::validate_session_id(session_id)?;
         let _guard = Storage::new(&self.project_path).lock()?;
-        if let Some(mut session) = self.load_session(session_id) {
-            session.last_seen = timefmt::now();
-            self.save_session(&session)?;
-        }
-        Ok(())
+        let Some(mut session) = self.load_session(session_id) else {
+            return Ok(None);
+        };
+        let previous = session.last_seen;
+        session.last_seen = timefmt::now();
+        self.save_session(&session)?;
+        Ok(Some(previous))
     }
 
     /// Record a wait the agent declared: the session stays alive (no crash
