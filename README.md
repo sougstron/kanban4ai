@@ -203,10 +203,10 @@ agent settings through a nested backend/model/effort/persona popup, theme, and t
 status-bar hint is clickable when
 it fits. `Ctrl+T` remains the quick theme toggle. All action keys work from
 the board and from the detail view, which also offers clickable action buttons
-and an inline panel for answering agent questions. A Review task opens with the
-review editor focused; while the detail has a text panel, plain letters type
-into it and actions move to `Alt+letter` (`Alt+y` approves), so a stray key
-cannot approve or run anything.
+and an inline panel for answering agent questions. A Review task opens on the
+thread, so `Esc` closes the detail at once; while the detail has a text panel,
+plain letters type into it and actions move to `Alt+letter` (`Alt+y` approves),
+so a stray key cannot approve or run anything.
 
 Task create/edit dialogs group the form as Title, Description, a nested
 `Agent settings` popup, a Readonly checkbox, a Chain-to selector, and a nested

@@ -7,10 +7,11 @@ auto-loaded into every agent session. Read it when you are changing TUI key hand
 
 Action hotkeys work on both the board (focused card) and the open detail view.
 
-Detail type-to-edit: a Review task opens with the review editor focused. While
-the detail has a text panel (the Review editor, or the answer box of an open
-question), a plain printable key never fires an action: on the thread it moves
-focus into that panel (Review editor first) and is typed there. Actions then
+Detail type-to-edit: a Review task opens on the thread, so `Esc` closes the
+detail at once. While the detail has a text panel (the Review editor, or the
+answer box of an open question), a plain printable key never fires an action:
+on the thread it moves focus into that panel (Review editor first) and is
+typed there. `Tab` or a click focuses the editor explicitly. Actions then
 live on `Alt+letter` from every panel (`Alt+y` approve, `Alt+r` run,
 `Alt+Shift+f` run now, `Alt+x` reject, `Alt+q` close, …), shown as `M-y` on the
 action buttons and status hints; buttons stay clickable. `Esc` leaves a text
