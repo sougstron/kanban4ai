@@ -1,7 +1,7 @@
-# kanban4ai 0.7.5
+# kanban4ai 0.7.6
 
-A task can forbid questions, Analytics shows that task's share of each
-provider limit, and a running card's token counts match the same panel.
+Task threads render Markdown, and the task description field keeps its
+visible text inside the 5–20 row limit.
 
 ## Changed
 
@@ -9,6 +9,17 @@ provider limit, and a running card's token counts match the same panel.
   quotes and horizontal rules render alongside tables. Links show their label,
   underline on hover and open in the desktop handler on click; formulas and
   embedded HTML are not interpreted.
+- **Description field height.** New-task and edit dialogs count the description
+  box borders separately from its text. The field shows 5 to 20 text rows and
+  scrolls the rest, including on a short terminal.
+
+# kanban4ai 0.7.5
+
+A task can forbid questions, Analytics shows that task's share of each
+provider limit, and a running card's token counts match the same panel.
+
+## Changed
+
 - **Silence mode** (`kanban create --silence`, the Options popup, task field
   `silence`). `kanban ask` and `kanban ask-form` are refused, and this wins
   over interactive. The agent decides ambiguous points itself and records
