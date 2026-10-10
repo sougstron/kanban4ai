@@ -7162,7 +7162,7 @@ fn running_card_and_sessions_show_live_telemetry() {
     running.session = Some("ses-tel".to_string());
     running.agent_backend = Some("claude".to_string());
     app.ops.storage.save_task(&running).unwrap();
-    // A claude transcript: 2/3 todos completed, usage totalling 12.4k, last
+    // A claude transcript: 2/3 todos completed, 12k in / 400 out, last
     // tool an Edit. The card and Sessions list both derive from this on tick.
     let transcript = dir.path().join(".kanban/logs/ses-tel.transcript.jsonl");
     std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
@@ -7185,8 +7185,8 @@ fn running_card_and_sessions_show_live_telemetry() {
     assert!(board.contains("▓"), "card shows a progress bar:\n{board}");
     assert!(board.contains("2/3"), "card shows todo count:\n{board}");
     assert!(
-        board.contains("12.4k"),
-        "card shows humanized tokens:\n{board}"
+        board.contains("12.0k/400 tok"),
+        "card shows humanized input/output tokens:\n{board}"
     );
     assert!(
         board.contains("→ Edit src/auth/mod.rs"),
@@ -7241,7 +7241,7 @@ fn live_design_and_review_cards_show_the_role_running_row() {
         // The badge names the phase, so "▶ running" can only come from the
         // dedicated role-colored row under it.
         assert!(board.contains("▶ running"), "running row:\n{board}");
-        assert!(board.contains("12.4k"), "tokens:\n{board}");
+        assert!(board.contains("12.0k/400 tok"), "tokens:\n{board}");
         assert!(board.contains(color), "role color:\n{board}");
         // Title + badge + running row + stats + activity.
         assert_eq!(super::card::card_line_count(&app, &running), 5);

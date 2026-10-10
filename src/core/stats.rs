@@ -421,6 +421,33 @@ pub struct TaskAnalytics {
     pub limit_shares: Vec<LimitShare>,
 }
 
+impl TaskAnalytics {
+    /// Token split of every run so far: the closed sessions plus the live
+    /// session's transcript telemetry, unless that session's usage is already
+    /// on record. Shared by the card and the detail panel so both agree.
+    pub fn tokens_with_live(
+        &self,
+        live_session: Option<&str>,
+        live: Option<&TokenBreakdown>,
+    ) -> TokenBreakdown {
+        let mut tokens = self.breakdown;
+        let counted = live_session.is_some_and(|session| self.counted_sessions.contains(session));
+        if !counted && let Some(live) = live {
+            tokens.add(live);
+        }
+        tokens
+    }
+}
+
+/// Size and mtime of the stats events file (`None` while it is missing), so
+/// callers can cache [`task_analytics`] until a new record lands.
+pub type EventsStamp = Option<(u64, std::time::SystemTime)>;
+
+pub fn events_stamp(project_path: &Path) -> EventsStamp {
+    let meta = fs::metadata(events_path(project_path)).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
 /// Aggregate one task's analytics. Only events at or after `since` (the
 /// task's `created_at`) count, so a recycled task id does not inherit the
 /// history of the abandoned task that held it before.

@@ -461,14 +461,10 @@ fn render_analytics(
     {
         running_seconds += (timefmt::now() - since).num_seconds().max(0);
     }
-    let mut tokens = analytics.breakdown;
-    let live_session_counted = task
-        .session
-        .as_ref()
-        .is_some_and(|session| analytics.counted_sessions.contains(session));
-    if !live_session_counted && let Some(breakdown) = live.and_then(|live| live.breakdown) {
-        tokens.add(&breakdown);
-    }
+    let tokens = analytics.tokens_with_live(
+        task.session.as_deref(),
+        live.and_then(|live| live.breakdown.as_ref()),
+    );
 
     let muted = Style::default().fg(theme.muted);
     let value = Style::default().add_modifier(Modifier::BOLD);

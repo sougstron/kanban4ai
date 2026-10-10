@@ -8,7 +8,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::core::models::{IntegrationState, RunPhase, Task, TaskStatus};
 use crate::core::session::SessionState;
-use crate::core::telemetry::SessionProgress;
+use crate::core::telemetry::{SessionProgress, TokenBreakdown};
 
 use super::app::App;
 use super::theme::Theme;
@@ -114,6 +114,7 @@ pub fn render_card(
     if let Some(progress) = progress {
         lines.extend(telemetry_lines(
             progress,
+            app.task_tokens.get(&task.id),
             phase_color(&app.theme, task.run_phase),
             app.theme.muted,
             line_width,
@@ -428,10 +429,13 @@ pub fn retry_badge(restart_at: chrono::NaiveDateTime) -> String {
 /// The two live-telemetry rows for a running agent: a stats line (todo progress
 /// bar, tokens, cost) and, when known, a `→ <last tool>` activity line. Either
 /// may be empty; callers only reach here when [`SessionProgress::has_data`].
+/// `tokens` is the task's cumulative split (`input/output`, matching the
+/// detail Analytics panel); without one the live session's estimate shows.
 /// `color` tints the stats line with the run role's color; `muted` styles the
 /// activity line.
 fn telemetry_lines(
     progress: &SessionProgress,
+    tokens: Option<&TokenBreakdown>,
     color: Color,
     muted: Color,
     line_width: usize,
@@ -441,7 +445,13 @@ fn telemetry_lines(
     if let Some((done, total)) = progress.todos() {
         stats.push(format!("{} {done}/{total}", progress_bar(done, total, 5)));
     }
-    if let Some(tokens) = progress.tokens {
+    if let Some(tokens) = tokens {
+        stats.push(format!(
+            "{}/{} tok",
+            format_tokens(tokens.input),
+            format_tokens(tokens.output)
+        ));
+    } else if let Some(tokens) = progress.tokens {
         stats.push(format!("{} tok", format_tokens(tokens)));
     }
     if let Some(cost) = progress.cost_usd {
@@ -517,7 +527,11 @@ pub(crate) fn card_line_count(app: &App, task: &Task) -> u16 {
     // only questioned/running cards grow. Telemetry rows, by contrast, are
     // must-see and force growth.
     if let Some(progress) = app.session_progress.get(&task.id).filter(|p| p.has_data()) {
-        if progress.todos().is_some() || progress.tokens.is_some() || progress.cost_usd.is_some() {
+        if progress.todos().is_some()
+            || progress.tokens.is_some()
+            || app.task_tokens.contains_key(&task.id)
+            || progress.cost_usd.is_some()
+        {
             lines += 1;
         }
         if progress.last_activity.is_some() {
@@ -570,7 +584,7 @@ mod tests {
     use chrono::NaiveDate;
 
     use crate::core::models::RunPhase;
-    use crate::core::telemetry::SessionProgress;
+    use crate::core::telemetry::{SessionProgress, TokenBreakdown};
     use crate::tui::theme::Theme;
 
     use super::{
@@ -675,11 +689,27 @@ mod tests {
             last_activity: Some("Edit src/x.rs".to_string()),
             ..SessionProgress::default()
         };
-        let rows = telemetry_lines(&progress, theme.focus, theme.muted, 40);
+        let rows = telemetry_lines(&progress, None, theme.focus, theme.muted, 40);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].spans.len(), 1);
         assert_eq!(rows[0].spans[0].style.fg, Some(theme.focus));
         assert_eq!(rows[0].spans[0].content.as_ref(), "12.4k tok");
         assert_eq!(rows[1].spans[0].style.fg, Some(theme.muted));
+    }
+
+    #[test]
+    fn telemetry_shows_task_input_output_split() {
+        let theme = Theme::named("dark");
+        let progress = SessionProgress {
+            tokens: Some(12_400),
+            ..SessionProgress::default()
+        };
+        let total = TokenBreakdown {
+            input: 1_200_000,
+            output: 15_300,
+            ..TokenBreakdown::default()
+        };
+        let rows = telemetry_lines(&progress, Some(&total), theme.focus, theme.muted, 40);
+        assert_eq!(rows[0].spans[0].content.as_ref(), "1.2M/15.3k tok");
     }
 }
