@@ -1051,8 +1051,10 @@ impl ModalState {
 
     /// Plain Up/Down as field navigation. Text fields first walk the caret
     /// to their top (Up) or very end (Down) and only leave from there; an
-    /// empty field is already at both edges. Selectors and lists keep the
-    /// arrows for their own selection. Returns `true` when the key was used.
+    /// empty field is already at both edges. Selectors behave the same way:
+    /// the arrows move the selection and only leave from the first (Up) or
+    /// last (Down) visible option. Reorderable lists keep the arrows for
+    /// themselves. Returns `true` when the key was used.
     pub fn vertical_arrow(&mut self, key: ratatui::crossterm::event::KeyEvent) -> bool {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         let up = match key.code {
@@ -1064,7 +1066,11 @@ impl ModalState {
             return false;
         }
         let field = self.active_field();
-        if field_owns_vertical_arrows(field) {
+        if let Some(kind) = selector_kind(field) {
+            if !self.selector_at_vertical_edge(field, kind, up) {
+                return false;
+            }
+        } else if field_owns_vertical_arrows(field) {
             return false;
         }
         if let Some(textarea) = self.text_field_mut(field) {
@@ -1075,6 +1081,19 @@ impl ModalState {
         }
         self.arrow_field(if up { -1 } else { 1 });
         true
+    }
+
+    /// Whether the selection sits on the first (`up`) or last visible
+    /// option, so a further arrow press should leave the selector. An empty
+    /// list is at both edges; a selection hidden by the filter is at neither,
+    /// so the arrow first steps back onto a visible option.
+    fn selector_at_vertical_edge(&self, field: DialogField, kind: SelectorKind, up: bool) -> bool {
+        let visible = self.visible_options(field);
+        let edge = if up { visible.first() } else { visible.last() };
+        match edge {
+            Some(&edge) => self.selection_value_for(field, kind) == edge,
+            None => true,
+        }
     }
 
     /// Walk focus one field up or down without wrapping, skipping fields
