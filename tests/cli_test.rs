@@ -127,6 +127,57 @@ fn create_can_opt_one_task_into_designer_and_reviewer() {
 }
 
 #[test]
+fn create_can_mark_a_task_silent() {
+    let dir = board();
+    kanban(&dir)
+        .args(["create", "Decide yourself", "--silence"])
+        .assert()
+        .success();
+
+    let task = Operations::new(dir.data_root())
+        .get_task("TASK-001")
+        .unwrap()
+        .unwrap();
+    assert!(task.silence);
+    kanban(&dir)
+        .args(["show", "TASK-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Silence: on"));
+
+    kanban(&dir)
+        .args(["ask", "TASK-001", "Which approach?", "--agent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("silence mode"))
+        .stderr(predicate::str::contains("kanban suggest"));
+    kanban(&dir)
+        .args(["ask", "TASK-001", "Which approach?"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("silence mode"));
+
+    let form = dir.work().join("ask.yaml");
+    std::fs::write(&form, "questions:\n  - prompt: Which one?\n").unwrap();
+    kanban(&dir)
+        .args([
+            "ask-form",
+            "TASK-001",
+            "--file",
+            form.to_str().unwrap(),
+            "--agent",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("silence mode"));
+
+    kanban(&dir)
+        .args(["suggest", "TASK-001", "Picked the smaller API"])
+        .assert()
+        .success();
+}
+
+#[test]
 fn create_can_mark_a_task_readonly() {
     let dir = board();
     kanban(&dir)

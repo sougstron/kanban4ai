@@ -322,6 +322,47 @@ fn every_role_can_ask_for_clarification_and_interactive_tasks_can_wait() {
 }
 
 #[test]
+fn silence_mode_prompt_forbids_questions_for_every_role() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let task = storage
+        .create_task(NewTask {
+            title: "Decide yourself".into(),
+            silence: true,
+            interactive: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+    for role in [
+        Role::Executor,
+        Role::Designer,
+        Role::Reviewer,
+        Role::Orchestrator,
+    ] {
+        let prompt = build_agent_prompt(dir.path(), &task, "ses-silence", false, role).unwrap();
+        assert!(
+            prompt.contains("Silence mode (mandatory)"),
+            "missing silence rule for {role:?}:\n{prompt}"
+        );
+        assert!(prompt.contains("\"$KANBAN_CMD\" suggest TASK-001"));
+        assert!(
+            !prompt.contains("<question>"),
+            "silence prompt still invites a question for {role:?}:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("ask-form TASK-001"),
+            "silence prompt still invites ask-form for {role:?}:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("--wait"),
+            "interactive wait must not override silence for {role:?}"
+        );
+    }
+}
+
+#[test]
 fn readonly_task_prompt_forbids_project_writes_but_allows_board_output() {
     let dir = tempfile::tempdir().unwrap();
     let storage = Storage::new(dir.path());

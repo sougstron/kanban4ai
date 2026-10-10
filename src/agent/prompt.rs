@@ -6,6 +6,72 @@ use crate::core::project::Roots;
 use crate::core::storage::Storage;
 use crate::core::thread::ThreadManager;
 
+/// Session-contract line that replaces the usual "ask when unclear" instruction
+/// while silence mode is on. The full rule is [`silence_mode_note`].
+fn clarification_line(task: &Task) -> String {
+    if task.silence {
+        "- Silence mode: do not ask the human. Decide unclear points yourself and record each dispute with suggest (details below).\n".to_string()
+    } else {
+        format!(
+            "- Ask whenever clarification is needed with: \"$KANBAN_CMD\" ask {} <question> --agent\n",
+            task.id
+        )
+    }
+}
+
+/// Shared "how to finish" clause for executor and designer prompts. The
+/// surrounding sentence names what an unfinished reply strands.
+fn long_wait_finish_clause(silence: bool) -> &'static str {
+    if silence {
+        "the done command above, or the waiting/detach command if you are waiting on a declared long-running result. Do not ask; a question is refused"
+    } else {
+        "the done command above, the ask command if you are blocked, or the waiting/detach command if you are waiting on a declared long-running result"
+    }
+}
+
+fn silence_mode_note(task_id: &str) -> String {
+    format!(
+        "\nSilence mode (mandatory): do not ask the human anything. \"$KANBAN_CMD\" ask and \
+\"$KANBAN_CMD\" ask-form are refused for this task. Decide every ambiguous point yourself, \
+using the task text and the project conventions, and keep working. Record each decision you \
+were unsure about with: \"$KANBAN_CMD\" suggest {task_id} <what you decided and the alternatives> \
+so the human can review it later. Do not stop for clarification.\n"
+    )
+}
+
+/// Ask-form guidance, or the silence rule when questions are forbidden.
+fn append_question_guidance(
+    prompt: &mut String,
+    task: &Task,
+    session_id: &str,
+    form_file: &str,
+    schema_help: bool,
+) {
+    if task.silence {
+        prompt.push_str(&silence_mode_note(&task.id));
+        return;
+    }
+    prompt.push_str(&format!(
+        "- To ask the human one or more questions, prefer a strict YAML form over free text so \
+each question renders with selectable options. Write {form_file} then submit it:\n  \
+\"$KANBAN_CMD\" ask-form {} --file {form_file} --agent --session {session_id}\n",
+        task.id
+    ));
+    if schema_help {
+        prompt.push_str("  Schema and examples: \"$KANBAN_CMD\" ask-form --help.\n");
+    }
+}
+
+fn append_interactive_wait(prompt: &mut String, task: &Task, session_id: &str) {
+    if task.silence || !task.interactive {
+        return;
+    }
+    prompt.push_str(&format!(
+        "- This task is interactive: for blocking questions use \"$KANBAN_CMD\" ask {} <question> --agent --wait --session {}; for non-blocking ideas use \"$KANBAN_CMD\" suggest.\n",
+        task.id, session_id
+    ));
+}
+
 /// Assemble the prompt handed to a delegated agent.
 ///
 /// Every board path in it is absolute: the agent's working directory is the
@@ -41,6 +107,8 @@ pub fn build_agent_prompt<'a>(
         .join("<task>-<stamp>.log")
         .display()
         .to_string();
+    let clarification_line = clarification_line(task);
+    let finish_clause = long_wait_finish_clause(task.silence);
 
     let mut prompt = format!(
         "Task: {}: {}\n\n\
@@ -54,7 +122,7 @@ Session contract:\n\
 - Record important progress with: \"$KANBAN_CMD\" context {} <text> --source agent\n\
 - Keep the session alive with: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
 - When implementation and verification are complete, run: \"$KANBAN_CMD\" done {} --session {session_id} --agent\n\
-- Ask whenever clarification is needed with: \"$KANBAN_CMD\" ask {} <question> --agent\n\
+{clarification_line}\
 - This session is non-interactive and terminates the moment you end your reply; background tasks, \
 monitors, and \"notifications\" die with it, so nothing you launch can re-invoke you later.\n\
 - Long-running foreground commands are safe: the board heartbeats for you while your process runs, \
@@ -68,13 +136,11 @@ To wait on something you did not detach, use \
 \"$KANBAN_CMD\" waiting {} --session {session_id} --eta <expected-seconds> --note <what you wait for>\n\
   Either way the board relaunches you after the deadline to check the result. \
 Details: \"$KANBAN_CMD\" detach --help, \"$KANBAN_CMD\" waiting --help.\n\
-- The final command of your reply must be the done command above, the ask command if you are \
-blocked, or the waiting/detach command if you are waiting on a declared long-running result. \
+- The final command of your reply must be {finish_clause}. \
 Ending a reply without one of those strands the task and forces an automatic resume.\n",
         task.id,
         task.title,
         roots.work_path.display(),
-        task.id,
         task.id,
         task.id,
         task.id,
@@ -87,13 +153,7 @@ Ending a reply without one of those strands the task and forces an automatic res
 (don't block on them, keep working) with: \"$KANBAN_CMD\" suggest {} <idea>\n",
         task.id
     ));
-    prompt.push_str(&format!(
-        "- To ask the human one or more questions, prefer a strict YAML form over free text so \
-each question renders with selectable options. Write {form_file} then submit it:\n  \
-\"$KANBAN_CMD\" ask-form {} --file {form_file} --agent --session {session_id}\n  \
-Schema and examples: \"$KANBAN_CMD\" ask-form --help.\n",
-        task.id
-    ));
+    append_question_guidance(&mut prompt, task, session_id, &form_file, true);
     if task.readonly {
         prompt.push_str(
             "\nReadonly mode (mandatory): investigate and report, but do not create, edit, \
@@ -101,17 +161,23 @@ delete, rename, or move any project file, including plans, notes, generated file
 artifacts. Do not run formatters, fixers, builds, tests, or commands that write into the project. \
 Board operations remain fully available: you may create or edit tasks and use the required \
 callbacks through kanban4ai, including finishing this task as instructed below. The usual role \
-and column rules still apply. The only other permitted write is the absolute `.kanban` form path \
-given above. If the task appears to require a project-file change, report the proposed change \
-through context or suggest instead of applying it.\n",
+and column rules still apply. ",
         );
+        if task.silence {
+            prompt.push_str(
+                "Questions are refused, so do not write an ask form. If the task appears to \
+require a project-file change, report the proposed change through context or suggest instead \
+of applying it.\n",
+            );
+        } else {
+            prompt.push_str(
+                "The only other permitted write is the absolute `.kanban` form path given above. \
+If the task appears to require a project-file change, report the proposed change through \
+context or suggest instead of applying it.\n",
+            );
+        }
     }
-    if task.interactive {
-        prompt.push_str(&format!(
-            "- This task is interactive: for blocking questions use \"$KANBAN_CMD\" ask {} <question> --agent --wait --session {}; for non-blocking ideas use \"$KANBAN_CMD\" suggest.\n",
-            task.id, session_id
-        ));
-    }
+    append_interactive_wait(&mut prompt, task, session_id);
     prompt.push_str(role_column_block(Role::Executor));
     if let (Some(branch), Some(worktree)) = (&task.branch, &task.worktree) {
         let checkout = roots
@@ -183,6 +249,12 @@ write into the project. Board operations remain fully available through kanban4a
 creating or editing tasks and finishing this task; usual role and column rules still apply.",
         );
     }
+    if task.silence {
+        prompt.push_str(
+            "\nSilence mode remains mandatory: do not ask. Decide unclear points yourself and \
+record each dispute with \"$KANBAN_CMD\" suggest.",
+        );
+    }
     append_project_instructions(roots, &mut prompt);
     append_thread_delta(roots, task, previous_session_id, &mut prompt)?;
     Ok(prompt)
@@ -202,6 +274,8 @@ fn build_designer_prompt(roots: Roots<'_>, task: &Task, session_id: &str) -> Res
         .join("<task>-<stamp>.log")
         .display()
         .to_string();
+    let clarification_line = clarification_line(task);
+    let finish_clause = long_wait_finish_clause(task.silence);
 
     let mut prompt = format!(
         "Task: {}: {}\n\n\
@@ -222,7 +296,7 @@ Session contract:\n\
   then starts the assigned implementation bot. Do not treat done as \"the work is finished\".\n\
 - Do not implement the task. Do not edit source files. Do not call commands that change the repo.\n\
 - Do not move the task between columns (no take/move to Review/Done).\n\
-- Ask whenever clarification is needed with: \"$KANBAN_CMD\" ask {} <question> --agent\n\
+{clarification_line}\
 - This session is non-interactive and terminates the moment you end your reply; background tasks, \
 monitors, and \"notifications\" die with it, so nothing you launch can re-invoke you later.\n\
 - Long-running foreground commands are safe: the board heartbeats for you while your process runs, \
@@ -236,13 +310,11 @@ To wait on something you did not detach, use \
 \"$KANBAN_CMD\" waiting {} --session {session_id} --eta <expected-seconds> --note <what you wait for>\n\
   Either way the board relaunches you after the deadline to check the result. \
 Details: \"$KANBAN_CMD\" detach --help, \"$KANBAN_CMD\" waiting --help.\n\
-- The final command of your reply must be the done command above, the ask command if you are \
-blocked, or the waiting/detach command if you are waiting on a declared long-running result. \
+- The final command of your reply must be {finish_clause}. \
 Ending a reply without one of those strands the design phase and forces an automatic resume.\n",
         task.id,
         task.title,
         roots.work_path.display(),
-        task.id,
         task.id,
         task.id,
         task.id,
@@ -255,19 +327,8 @@ Ending a reply without one of those strands the design phase and forces an autom
 (don't block on them, keep planning) with: \"$KANBAN_CMD\" suggest {} <idea>\n",
         task.id
     ));
-    prompt.push_str(&format!(
-        "- To ask the human one or more questions, prefer a strict YAML form over free text so \
-each question renders with selectable options. Write {form_file} then submit it:\n  \
-\"$KANBAN_CMD\" ask-form {} --file {form_file} --agent --session {session_id}\n  \
-Schema and examples: \"$KANBAN_CMD\" ask-form --help.\n",
-        task.id
-    ));
-    if task.interactive {
-        prompt.push_str(&format!(
-            "- This task is interactive: for blocking questions use \"$KANBAN_CMD\" ask {} <question> --agent --wait --session {}; for non-blocking ideas use \"$KANBAN_CMD\" suggest.\n",
-            task.id, session_id
-        ));
-    }
+    append_question_guidance(&mut prompt, task, session_id, &form_file, true);
+    append_interactive_wait(&mut prompt, task, session_id);
     prompt.push_str(role_column_block(Role::Designer));
     append_role_instructions(roots, Role::Designer, &mut prompt);
     prompt.push_str("\nUser task:\n");
@@ -398,6 +459,28 @@ inherit this task's own backend and model.\n\n",
             ),
         }
     }
+    let decompose_clause = if task.silence {
+        "Silence mode: do not ask. When the decomposition is ambiguous, choose the graph yourself and record each fork with suggest (details below).".to_string()
+    } else {
+        format!(
+            "Ask whenever the decomposition depends on something you cannot determine: \"$KANBAN_CMD\" ask {} <question> --agent",
+            task.id
+        )
+    };
+    let plan_finish = if task.silence {
+        "The final command of your reply must be the done command above. Do not ask; a question is refused."
+    } else {
+        "The final command of your reply must be the done command above, or the ask command if you are blocked."
+    };
+    let ask_form_tail = if task.silence {
+        silence_mode_note(&task.id)
+    } else {
+        format!(
+            "- To ask the human one or more questions, prefer a strict YAML form: write {form_file} then submit it with\n  \
+\"$KANBAN_CMD\" ask-form {} --file {form_file} --agent --session {session_id}\n",
+            task.id
+        )
+    };
     prompt.push_str(&format!(
         "Session contract:\n\
 - KANBAN_SESSION is set to {session_id}.\n\
@@ -412,14 +495,13 @@ inherit this task's own backend and model.\n\n",
 - Do not implement the task. Do not edit source files. Do not run commands that change the repo.\n\
 - Do not move tasks between columns and do not start subtasks yourself; the dispatcher does that\n\
   under the board's concurrency caps.\n\
-- Ask whenever the decomposition depends on something you cannot determine: \"$KANBAN_CMD\" ask {} <question> --agent\n\
+- {decompose_clause}\n\
 - This session is non-interactive and terminates the moment you end your reply.\n\
-- The final command of your reply must be the done command above, or the ask command if you are blocked.\n\
+- {plan_finish}\n\
   Ending a reply without one strands the planning phase and forces an automatic resume.\n\
 - Record non-blocking ideas or risks you notice with: \"$KANBAN_CMD\" suggest {} <idea>\n\
-- To ask the human one or more questions, prefer a strict YAML form: write {form_file} then submit it with\n  \
-\"$KANBAN_CMD\" ask-form {} --file {form_file} --agent --session {session_id}\n",
-        task.id, task.id, task.id, task.id, task.id, task.id
+{ask_form_tail}",
+        task.id, task.id, task.id, task.id
     ));
     prompt.push_str(role_column_block(Role::Orchestrator));
     append_role_instructions(roots, Role::Orchestrator, &mut prompt);
@@ -438,6 +520,12 @@ fn build_reviewer_prompt(roots: Roots<'_>, task: &Task, session_id: &str) -> Res
         .data_path("forms")
         .join(format!("{}.ask.yaml", task.id));
     let form_file = form_file.display().to_string();
+    let clarification_line = clarification_line(task);
+    let verdict_finish = if task.silence {
+        "The final command of your reply must be one of the verdict commands above. Do not ask; a question is refused."
+    } else {
+        "The final command of your reply must be one of the verdict commands above, or the ask command if you are blocked."
+    };
 
     let mut prompt = format!(
         "Task: {}: {}\n\n\
@@ -457,15 +545,14 @@ Session contract:\n\
   Approve: \"$KANBAN_CMD\" verdict {} --approve --session {session_id} --agent\n\
   Request changes: \"$KANBAN_CMD\" verdict {} --changes <what to fix> --session {session_id} --agent\n\
   For a longer write-up, put the text in a file and pass --file <path> with --changes.\n\
-- Ask whenever clarification is needed with: \"$KANBAN_CMD\" ask {} <question> --agent\n\
+{clarification_line}\
 - This session is non-interactive and terminates the moment you end your reply; background tasks, \
 monitors, and \"notifications\" die with it, so nothing you launch can re-invoke you later.\n\
-- The final command of your reply must be one of the verdict commands above, or the ask command if you are blocked.\n\
+- {verdict_finish}\n\
   Ending a reply without a verdict strands the review and forces an automatic resume.\n",
         task.id,
         task.title,
         roots.work_path.display(),
-        task.id,
         task.id,
         task.id,
         task.id,
@@ -476,18 +563,8 @@ monitors, and \"notifications\" die with it, so nothing you launch can re-invoke
 (don't block on them) with: \"$KANBAN_CMD\" suggest {} <idea>\n",
         task.id
     ));
-    prompt.push_str(&format!(
-        "- To ask the human one or more questions, prefer a strict YAML form over free text so \
-each question renders with selectable options. Write {form_file} then submit it:\n  \
-\"$KANBAN_CMD\" ask-form {} --file {form_file} --agent --session {session_id}\n",
-        task.id
-    ));
-    if task.interactive {
-        prompt.push_str(&format!(
-            "- This task is interactive: for blocking questions use \"$KANBAN_CMD\" ask {} <question> --agent --wait --session {}; for non-blocking ideas use \"$KANBAN_CMD\" suggest.\n",
-            task.id, session_id
-        ));
-    }
+    append_question_guidance(&mut prompt, task, session_id, &form_file, false);
+    append_interactive_wait(&mut prompt, task, session_id);
     prompt.push_str(role_column_block(Role::Reviewer));
     append_role_instructions(roots, Role::Reviewer, &mut prompt);
     prompt.push_str("\nUser task:\n");

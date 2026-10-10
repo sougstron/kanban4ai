@@ -105,6 +105,7 @@ pub enum DialogField {
     PlannedLaunch,
     LaunchTime,
     Readonly,
+    Silence,
     UseOrchestrator,
     UseDesigner,
     UseReviewer,
@@ -175,7 +176,8 @@ const TASK_FORM_FIELDS: [DialogField; 6] = [
 /// The `Options` subpopup of the task form: per-task orchestration opt-ins
 /// and the planned launch, grouped off the parent form like the agent
 /// settings popup.
-const TASK_OPTIONS_FIELDS: [DialogField; 7] = [
+const TASK_OPTIONS_FIELDS: [DialogField; 8] = [
+    DialogField::Silence,
     DialogField::UseOrchestrator,
     DialogField::UseDesigner,
     DialogField::UseReviewer,
@@ -581,6 +583,7 @@ struct AgentPopupState {
 
 /// Opening snapshot of the `Options` subpopup; Cancel restores exactly this.
 struct OptionsSnapshot {
+    silence: bool,
     use_orchestrator: bool,
     use_designer: bool,
     use_reviewer: bool,
@@ -688,6 +691,7 @@ pub struct ModalState {
     pub task_sort: TextArea<'static>,
     pub interactive: bool,
     pub readonly: bool,
+    pub silence: bool,
     pub use_orchestrator: bool,
     pub use_designer: bool,
     pub use_reviewer: bool,
@@ -812,6 +816,7 @@ impl ModalState {
             task_sort: one_line("task_number"),
             interactive: false,
             readonly: false,
+            silence: false,
             use_orchestrator: false,
             use_designer: false,
             use_reviewer: false,
@@ -904,6 +909,7 @@ impl ModalState {
         );
         state.interactive = task.interactive;
         state.readonly = task.readonly;
+        state.silence = task.silence;
         state.use_orchestrator = task.use_orchestrator;
         state.use_designer = task.use_designer;
         state.use_reviewer = task.use_reviewer;
@@ -1229,6 +1235,7 @@ impl ModalState {
             field_index: 0,
             form_scroll: 0,
             original: OptionsSnapshot {
+                silence: self.silence,
                 use_orchestrator: self.use_orchestrator,
                 use_designer: self.use_designer,
                 use_reviewer: self.use_reviewer,
@@ -1260,6 +1267,7 @@ impl ModalState {
             match &popup {
                 SubPopup::Agent(agent) => self.restore_picker(agent.slot, agent.original.clone()),
                 SubPopup::Options(options) => {
+                    self.silence = options.original.silence;
                     self.use_orchestrator = options.original.use_orchestrator;
                     self.use_designer = options.original.use_designer;
                     self.use_reviewer = options.original.use_reviewer;
@@ -1746,6 +1754,7 @@ impl ModalState {
             DialogField::PlannedLaunch => toggle_on_space(&mut self.planned_launch, key),
             DialogField::LaunchTime => input_single_line(&mut self.launch_time, key),
             DialogField::Readonly => toggle_on_space(&mut self.readonly, key),
+            DialogField::Silence => toggle_on_space(&mut self.silence, key),
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings
@@ -1949,6 +1958,7 @@ impl ModalState {
             | DialogField::ReviewerAgentSettings
             | DialogField::TaskOptions
             | DialogField::Readonly
+            | DialogField::Silence
             | DialogField::UseOrchestrator
             | DialogField::UseDesigner
             | DialogField::UseReviewer
@@ -2575,6 +2585,7 @@ impl ModalState {
             raw_textarea_text(&self.target_status),
             self.interactive.to_string(),
             self.readonly.to_string(),
+            self.silence.to_string(),
             self.use_orchestrator.to_string(),
             self.use_designer.to_string(),
             self.use_reviewer.to_string(),
@@ -2960,7 +2971,7 @@ fn render_options_popup(
     };
     let view = SubPopupView {
         title: " Task options ".to_string(),
-        fields: &TASK_OPTIONS_FIELDS[..5],
+        fields: &TASK_OPTIONS_FIELDS[..TASK_OPTIONS_FIELDS.len() - 2],
         scroll: popup.form_scroll,
     };
     render_sub_popup(frame, app, modal, parent_area, view, hitboxes);
@@ -3605,6 +3616,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::DesignerAgentSettings
         | DialogField::ReviewerAgentSettings
         | DialogField::TaskOptions
+        | DialogField::Silence
         | DialogField::UseOrchestrator
         | DialogField::UseDesigner
         | DialogField::UseReviewer
@@ -4029,6 +4041,15 @@ fn render_selector_field(
             "Readonly",
             "investigate without changing project files",
             modal.readonly,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::Silence => render_checkbox(
+            frame,
+            app,
+            area,
+            "Silence",
+            "decide without asking; record disputes as suggestions",
+            modal.silence,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::UseOrchestrator => render_checkbox(
@@ -4514,6 +4535,9 @@ fn render_agent_launcher(
 
 fn render_options_launcher(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
     let mut parts = Vec::new();
+    if modal.silence {
+        parts.push("silence".to_string());
+    }
     if modal.use_orchestrator {
         parts.push("orchestrator".to_string());
     }

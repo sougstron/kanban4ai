@@ -107,6 +107,38 @@ fn launch_at_round_trips_and_stays_off_the_frontmatter_while_unset() {
 }
 
 #[test]
+fn silence_flag_is_omitted_while_false_and_round_trips() {
+    let (dir, storage) = temp_board();
+    let plain = storage.create_task(NewTask::titled("Plain")).unwrap();
+    let quiet = storage
+        .create_task(NewTask {
+            title: "Quiet".into(),
+            silence: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let plain_raw = fs::read_to_string(
+        dir.path()
+            .join(".kanban/tasks/todo")
+            .join(format!("{}.md", plain.id)),
+    )
+    .unwrap();
+    assert!(
+        !plain_raw.contains("silence"),
+        "false silence must stay off the frontmatter: {plain_raw}"
+    );
+    let quiet_raw = fs::read_to_string(
+        dir.path()
+            .join(".kanban/tasks/todo")
+            .join(format!("{}.md", quiet.id)),
+    )
+    .unwrap();
+    assert!(quiet_raw.contains("silence: true"), "{quiet_raw}");
+    assert!(storage.load_task(&quiet.id).unwrap().unwrap().silence);
+}
+
+#[test]
 fn create_task_persists_designer_and_reviewer_flags_and_omits_them_when_false() {
     let (dir, storage) = temp_board();
     let plain = storage.create_task(NewTask::titled("Plain")).unwrap();

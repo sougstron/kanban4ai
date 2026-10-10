@@ -332,9 +332,13 @@ as: Title, Description, an `Agent settings` row that opens a nested popup for
 backend, model, effort, and persona, a Readonly checkbox (investigation and
 board-side reporting without project-file writes), a "Chain to task" selector,
 and an `Options` row that opens a second nested popup holding the
-Orchestrator, Designer, and Reviewer checkboxes (per-task opt-in; models and
-agents come from project settings) plus the "Planned launch" checkbox with an
-HH:MM time field. The Description box sizes itself from its own text the way
+Silence, Orchestrator, Designer, and Reviewer checkboxes plus the "Planned
+launch" checkbox with an HH:MM time field. Silence forbids questions on this
+task: the agent decides ambiguous points itself and records each dispute as a
+suggestion. Orchestrator, Designer, and Reviewer are per-task opt-ins; models
+and agents come from project settings. The Options summary names the toggles
+that are on (`silence`, `orchestrator`, `designer`, `reviewer`, `launch at
+HH:MM`), and a silence task shows a `🔇 silence` badge. The Description box sizes itself from its own text the way
 the option selectors size from their option count: 5 rows for an empty field,
 growing with the soft-wrapped text up to 20 rows and shrinking again on
 delete, so window size no longer stretches it — spare rows go to the

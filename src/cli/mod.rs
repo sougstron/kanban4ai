@@ -75,6 +75,9 @@ enum Command {
         /// Prevent delegated agents from modifying project files
         #[arg(long)]
         readonly: bool,
+        /// Forbid questions: the agent decides and records disputes as suggestions
+        #[arg(long)]
+        silence: bool,
         /// Run the project designer bot for this task even if it is off board-wide
         #[arg(long)]
         designer: bool,
@@ -772,6 +775,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             agent_name,
             interactive,
             readonly,
+            silence,
             designer,
             reviewer,
             orchestrator,
@@ -800,6 +804,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 agent_name,
                 interactive,
                 readonly,
+                silence,
                 use_designer: designer,
                 use_reviewer: reviewer,
                 use_orchestrator: orchestrator,
@@ -1226,6 +1231,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             if task.readonly {
                 println!("Readonly: on");
+            }
+            if task.silence {
+                println!("Silence: on");
             }
             if let Some(session) = &task.session {
                 println!("Session: {session}");
@@ -1758,6 +1766,7 @@ fn task_to_json(task: &Task) -> serde_json::Value {
         "agent_name": task.agent_name,
         "interactive": task.interactive,
         "readonly": task.readonly,
+        "silence": task.silence,
         "use_designer": task.use_designer,
         "use_reviewer": task.use_reviewer,
         "use_orchestrator": task.use_orchestrator,

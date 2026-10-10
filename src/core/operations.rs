@@ -141,6 +141,7 @@ pub struct TaskPatch {
     pub agent_name: Option<Option<String>>,
     pub interactive: Option<bool>,
     pub readonly: Option<bool>,
+    pub silence: Option<bool>,
     pub use_designer: Option<bool>,
     pub use_reviewer: Option<bool>,
     pub use_orchestrator: Option<bool>,
@@ -579,6 +580,9 @@ impl Operations {
         if let Some(readonly) = patch.readonly {
             task.readonly = readonly;
         }
+        if let Some(silence) = patch.silence {
+            task.silence = silence;
+        }
         if let Some(use_designer) = patch.use_designer {
             task.use_designer = use_designer;
         }
@@ -658,6 +662,7 @@ impl Operations {
             agent_name: task.agent_name,
             interactive: new_task.interactive,
             readonly: new_task.readonly,
+            silence: new_task.silence,
             use_designer: new_task.use_designer,
             use_reviewer: new_task.use_reviewer,
             use_orchestrator: new_task.use_orchestrator,
@@ -2216,6 +2221,8 @@ impl Operations {
                 explicit_assignment: candidate.is_some() || inherit_explicit,
                 interactive: false,
                 readonly: false,
+                // A silent planner must not spawn children that stop to ask.
+                silence: parent.silence,
                 use_designer: node.designer,
                 use_reviewer: node.reviewer,
                 // A node that planned more nodes would let one orchestrated
@@ -2703,6 +2710,19 @@ impl Operations {
 
     // ---------------------------------------------------- questions / thread
 
+    /// Silence mode refuses every question posted through ask / ask-form /
+    /// ask --wait. The executor-pool quota question does not come through
+    /// here, so a parked silent task can still be reassigned by the human.
+    fn refuse_silence_questions(task: &Task) -> Result<()> {
+        if !task.silence {
+            return Ok(());
+        }
+        Err(KanbanError::Permission(format!(
+            "{} is in silence mode: questions are refused. Decide yourself and record the dispute with kanban suggest",
+            task.id
+        )))
+    }
+
     pub fn ask_question(
         &self,
         task_id: &str,
@@ -2725,6 +2745,7 @@ impl Operations {
         let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
             return Ok(None);
         };
+        Self::refuse_silence_questions(&task)?;
 
         if let Some(session_id) = session_id {
             self.require_current_agent_session(&task, session_id)?;
@@ -2767,6 +2788,7 @@ impl Operations {
         let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
             return Ok(None);
         };
+        Self::refuse_silence_questions(&task)?;
 
         if let Some(session_id) = session_id {
             self.require_current_agent_session(&task, session_id)?;
@@ -3350,6 +3372,7 @@ impl Operations {
             let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
                 return Ok(None);
             };
+            Self::refuse_silence_questions(&task)?;
             if let Some(session_id) = session_id {
                 self.require_current_agent_session(&task, session_id)?;
             }

@@ -4,7 +4,7 @@ Reference detail split out of [AGENTS.md](../AGENTS.md) so it is not
 auto-loaded into every agent session. Read it when the task/thread file format, the board directory layout, or the project store.
 
 ## Data Model
-- **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, readonly, use_designer, use_reviewer, use_orchestrator, depends_on, needs, parent_task, role_profile, roster_index, orchestrated, ai_model, ai_effort, explicit_assignment, agent_backend, agent_name, chained_to, launch_at, review_edits, auto_resumes, completed_at, run_phase, crash_restarts, restart_at, review_rounds, designed, worktree, branch, base_commit, integration. `explicit_assignment` is set when a human named a backend, model, effort, or agent, so a later save tells it apart from "Default" even when it equals the board defaults; executor pools only ever reassign orchestrator plan nodes. Omitted while false. `description` is the **user-authored task body**; agent replies and progress belong to the sidecar thread. `readonly` instructs delegated agents to investigate and report through board commands without modifying project files or producing project-local artifacts.
+- **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, readonly, silence, use_designer, use_reviewer, use_orchestrator, depends_on, needs, parent_task, role_profile, roster_index, orchestrated, ai_model, ai_effort, explicit_assignment, agent_backend, agent_name, chained_to, launch_at, review_edits, auto_resumes, completed_at, run_phase, crash_restarts, restart_at, review_rounds, designed, worktree, branch, base_commit, integration. `explicit_assignment` is set when a human named a backend, model, effort, or agent, so a later save tells it apart from "Default" even when it equals the board defaults; executor pools only ever reassign orchestrator plan nodes. Omitted while false. `description` is the **user-authored task body**; agent replies and progress belong to the sidecar thread. `readonly` instructs delegated agents to investigate and report through board commands without modifying project files or producing project-local artifacts. `silence` forbids questions on this task: `kanban ask` and `kanban ask-form` are refused, the agent decides ambiguous points itself, and each dispute is recorded with `kanban suggest`. It wins over `interactive`. Omitted while false. Planned subtasks inherit it from the orchestrator task.
 - **Session**: id, task_id, started_at, status (active/closed/crashed), last_seen, wait_until, wait_note, wait_exited. `wait_until`/`wait_note` are set by `kanban waiting`; `wait_exited` means the agent process ended during the declared wait — at the deadline the pause is handed back to the queue (or, with the queue off, the agent is relaunched directly) to check the result.
 - **MessageRole** / **MessageKind** / **MessageStatus**: enums for thread message author, type, and lifecycle state. `MessageKind` is one of `system`, `task`, `question`, `suggestion`, `context`, or `review_edit`.
 - New tasks initialize their sidecar thread with `system` and `task` messages: `MSG-001` records creation metadata, `MSG-002` stores the initial user-authored task body so the TUI can render the whole conversation from the thread.
@@ -74,7 +74,11 @@ adds, and the human's review feedback, lives in the sidecar thread:
 
   Empty `questions` or a blank `prompt` is rejected; malformed YAML is a YAML
   error. Delegated agents are prompted to prefer `ask-form` and to proactively
-  file non-blocking ideas via `kanban suggest`.
+  file non-blocking ideas via `kanban suggest`. A task with `silence: true`
+  refuses every `ask` and `ask-form` (agent or human). The prompt tells the
+  agent to decide and to record each dispute as a suggestion. The
+  executor-pool quota question is board infrastructure and is not an ask, so
+  a parked silent task can still be reassigned.
 
   Answering the task's **last** open question wakes the agent (rule
   `resume_after_last_answer`, gated by `auto_launch.enabled`),
