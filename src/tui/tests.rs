@@ -1716,6 +1716,83 @@ fn settings_alt_arrows_switch_tabs_from_owning_fields() {
     );
 }
 
+/// Plain Up/Down inside a selector move the selection and only leave the
+/// field from its first (Up) or last (Down) visible option, like a text
+/// caret at its edge.
+#[test]
+fn plain_arrows_leave_a_selector_from_its_edge_options() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::ChainTo);
+    let visible = app
+        .modal
+        .as_ref()
+        .unwrap()
+        .visible_options(DialogField::ChainTo);
+    assert!(visible.len() >= 2, "need several chain options");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .select_option(DialogField::ChainTo, visible[0]);
+
+    app.handle_key(key(KeyCode::Up)).expect("up");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Readonly,
+        "Up on the first option leaves upward"
+    );
+    app.handle_key(key(KeyCode::Down)).expect("down");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::ChainTo
+    );
+    for _ in 1..visible.len() {
+        app.handle_key(key(KeyCode::Down)).expect("down");
+        assert_eq!(
+            app.modal.as_ref().unwrap().active_field(),
+            DialogField::ChainTo,
+            "Down inside the list moves the selection"
+        );
+    }
+    assert_eq!(
+        app.modal.as_ref().unwrap().chain_selected,
+        *visible.last().unwrap()
+    );
+    app.handle_key(key(KeyCode::Down)).expect("down");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::TaskOptions,
+        "Down on the last option leaves downward"
+    );
+
+    // The agent popup's selectors follow the same rule: Backend opens on
+    // its first option, so Up stays (nothing above) and Down at the last
+    // backend steps on to Model.
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::AgentSettings);
+    app.handle_key(key(KeyCode::Enter)).expect("open popup");
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.active_field(), DialogField::Backend);
+    let backends = modal.visible_options(DialogField::Backend).len();
+    for _ in 0..backends {
+        app.handle_key(key(KeyCode::Down)).expect("down");
+    }
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Model
+    );
+    app.handle_key(key(KeyCode::Up)).expect("up");
+    let modal = app.modal.as_ref().unwrap();
+    if modal.model_selected == modal.visible_options(DialogField::Model)[0] {
+        assert_eq!(modal.active_field(), DialogField::Backend);
+    }
+}
+
 /// `Alt+Up/Down` walk a dialog's fields from anywhere — out of a text caret
 /// and out of a selector that owns the plain arrows — without wrapping;
 /// Tab remains the wrapping cycle and the button row is not stepped over.

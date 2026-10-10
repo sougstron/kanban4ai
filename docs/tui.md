@@ -27,6 +27,10 @@ the plain-letter hotkeys.
   agent-settings and Options popups included) — even out of a text caret or
   a selector/card selection, where the plain arrows keep their local
   meaning. No wrapping: `Tab` stays the wrapping cycle
+- Plain `↑/↓` in a dialog leave a field from its edge: a text field from its
+  top line/end, a selector (chain-to, backend/model/effort/agent, the
+  Executor middle/cheap slots, sort/theme/status pickers) from its first or
+  last visible option; inside, they move the caret or selection
 - `Alt+←/→`: switch the settings dialog's tabs from any field (text inputs
   and filtered selectors included). Where no tabs own the chord it deletes a
   word: in the detail's text panels and in every dialog text field `Alt+←`
