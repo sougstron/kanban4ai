@@ -43,9 +43,9 @@ use crate::core::operations::{
 use crate::core::project::{Project, ProjectStore};
 use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
-use crate::core::stats::{self, TaskAnalytics};
+use crate::core::stats::{self, EventsStamp, TaskAnalytics};
 use crate::core::storage::{BoardStamps, NewTask, Storage, TaskCache};
-use crate::core::telemetry::{self, SessionProgress};
+use crate::core::telemetry::{self, SessionProgress, TokenBreakdown};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 use crate::core::update;
@@ -410,6 +410,13 @@ pub struct App {
     /// keyed by task id and refreshed each tick for tasks with a running
     /// agent. Derived from the transcript; never persisted.
     pub session_progress: HashMap<String, SessionProgress>,
+    /// Cumulative token split per running task (closed runs plus the live
+    /// one), the same figure the detail Analytics panel shows. Refreshed with
+    /// [`Self::session_progress`].
+    pub task_tokens: HashMap<String, TokenBreakdown>,
+    /// Closed-run analytics per running task, reused until the stats events
+    /// file changes so the tick does not reparse it.
+    task_analytics_cache: HashMap<String, (EventsStamp, TaskAnalytics)>,
     /// Provider subscription limits drawn above the status bar. Pulled from the
     /// background-refreshed cache by the event loop, so rendering never reaches
     /// for a global and non-TUI callers (tests) start with no row.
@@ -894,6 +901,8 @@ impl App {
             active_sessions: Vec::new(),
             session_selected: 0,
             session_progress: HashMap::new(),
+            task_tokens: HashMap::new(),
+            task_analytics_cache: HashMap::new(),
             limits: None,
             archived_tasks,
             archive_selected: 0,
@@ -1000,6 +1009,8 @@ impl App {
             active_sessions: Vec::new(),
             session_selected: 0,
             session_progress: HashMap::new(),
+            task_tokens: HashMap::new(),
+            task_analytics_cache: HashMap::new(),
             limits: None,
             archived_tasks: Vec::new(),
             archive_selected: 0,
@@ -3047,6 +3058,11 @@ impl App {
     /// map is rebuilt each pass so a finished agent's line disappears with it.
     fn refresh_session_progress(&mut self) {
         let mut progress = HashMap::new();
+        let mut tokens = HashMap::new();
+        let mut cache = std::mem::take(&mut self.task_analytics_cache);
+        let mut fresh = HashMap::new();
+        let root = self.ops.data_root();
+        let stamp = stats::events_stamp(root);
         for column in &self.board.columns {
             for task in &column.tasks {
                 let Some(session_id) = task.session.as_deref() else {
@@ -3059,14 +3075,24 @@ impl App {
                     continue;
                 }
                 let backend = task.agent_backend.as_deref().unwrap_or("claude");
-                let found =
-                    telemetry::read_session_progress(self.ops.data_root(), session_id, backend);
+                let found = telemetry::read_session_progress(root, session_id, backend);
+                let analytics = match cache.remove(&task.id) {
+                    Some((cached, analytics)) if cached == stamp => analytics,
+                    _ => stats::task_analytics(root, &task.id, task.created_at),
+                };
+                let total = analytics.tokens_with_live(Some(session_id), found.breakdown.as_ref());
+                if !total.is_empty() {
+                    tokens.insert(task.id.clone(), total);
+                }
+                fresh.insert(task.id.clone(), (stamp, analytics));
                 if found.has_data() {
                     progress.insert(task.id.clone(), found);
                 }
             }
         }
         self.session_progress = progress;
+        self.task_tokens = tokens;
+        self.task_analytics_cache = fresh;
     }
 
     fn refresh_modal_after_catalog_warm(&mut self) {
