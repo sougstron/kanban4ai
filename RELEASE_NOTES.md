@@ -1,3 +1,31 @@
+# kanban4ai 0.7.5
+
+A task can forbid questions, Analytics shows that task's share of each
+provider limit, and a running card's token counts match the same panel.
+
+## Changed
+
+- **Silence mode** (`kanban create --silence`, the Options popup, task field
+  `silence`). `kanban ask` and `kanban ask-form` are refused, and this wins
+  over interactive. The agent decides ambiguous points itself and records
+  each dispute with `kanban suggest`. `kanban show` prints `Silence: on`.
+  Planned subtasks inherit it. The card shows a `🔇 silence` badge.
+- **Per-task limit shares.** The Analytics panel adds a Limits row: percentage
+  points of each provider window the task consumed, split by role (designer,
+  executor, reviewer). Each window increase is split across concurrent
+  sessions on that provider, in every project, by cost-weighted tokens
+  sampled at start, heartbeat, and close.
+- **Card tokens match Analytics.** A running card shows the task's cumulative
+  input and output (closed runs plus the live transcript) instead of a
+  per-session context estimate.
+- **Review detail opens on the thread.** `Esc` closes the detail at once.
+  `Tab` or a click focuses the review editor; plain letters still jump into
+  a text panel and type there.
+- **Dialog arrows leave a selector from its edge.** Chain-to, backend, model,
+  effort, agent, executor pool slots, and the other dialog selectors move
+  the selection with Up/Down and step to the next field only from the first
+  or last option.
+
 # kanban4ai 0.7.4
 
 Open boards do less repeated work, a project can give every task the same
