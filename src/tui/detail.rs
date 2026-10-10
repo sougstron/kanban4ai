@@ -24,7 +24,7 @@ use super::card::{format_tokens, sanitize_terminal_text, truncate_display};
 use super::dialogs::set_cursor_visible;
 use super::projects::shorten_path;
 use super::theme::Theme;
-use super::thread_view::{message_body_lines, pin_last_message_scroll, visible_thread_messages};
+use super::thread_view::{pin_last_message_scroll, visible_thread_messages};
 
 /// Width of the meta block's own title, which the project badge has to clear
 /// on the same border row.
@@ -147,6 +147,8 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // is kept out of the thread entirely and shown only in the `v` popup.
     let inner_width = chunks[2].width.saturating_sub(2);
     let hide_kanban = app.settings.hide_kanban_messages;
+    let mut links = Vec::new();
+    let mut thread_region = TextRegion::default();
     let (panel_lines, last_start) = {
         let detail_ref = app.detail.as_ref().unwrap();
         let visible = visible_thread_messages(&detail_ref.messages, hide_kanban);
@@ -154,18 +156,31 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .thread_selected
             .and_then(|index| detail_ref.messages.get(index))
             .map(|message| message.id.clone());
-        let panel_lines = thread_lines(&visible, selected_id.as_deref(), &theme, inner_width);
+        let panel_lines = thread_lines(
+            &visible,
+            selected_id.as_deref(),
+            &theme,
+            inner_width,
+            &mut links,
+            &mut thread_region,
+        );
         let last_start = if visible.len() <= 1 {
             0
         } else {
             wrapped_row_count(
-                &thread_lines(&visible[..visible.len() - 1], None, &theme, inner_width),
+                &thread_lines(
+                    &visible[..visible.len() - 1],
+                    None,
+                    &theme,
+                    inner_width,
+                    &mut Vec::new(),
+                    &mut TextRegion::default(),
+                ),
                 inner_width,
             )
         };
         (panel_lines, last_start)
     };
-    let mut thread_region = wrapped_text_region(&panel_lines, inner_width);
     let thread = Paragraph::new(panel_lines)
         .style(Style::default().bg(theme.bg).fg(theme.fg))
         .wrap(Wrap { trim: false });
@@ -219,6 +234,39 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .scroll((scroll, 0)),
         chunks[2],
     );
+    for link in links {
+        if link.row < usize::from(scroll)
+            || link.row >= usize::from(scroll) + usize::from(visible_height)
+            || link.column >= usize::from(inner_width)
+        {
+            continue;
+        }
+        let area = Rect::new(
+            chunks[2].x + 1 + link.column as u16,
+            chunks[2].y + 1 + (link.row - usize::from(scroll)) as u16,
+            link.width.min(usize::from(inner_width) - link.column) as u16,
+            1,
+        );
+        // Hover is evaluated after all fragments have registered.
+        app.thread_links.push((area, link.url));
+    }
+    if app.modal.is_none()
+        && let Some((x, y)) = app.mouse_position
+        && let Some((_, target)) = app
+            .thread_links
+            .iter()
+            .find(|(area, _)| area.contains((x, y).into()))
+    {
+        for (area, url) in &app.thread_links {
+            if url == target {
+                for x in area.x..area.right() {
+                    frame.buffer_mut()[(x, area.y)]
+                        .modifier
+                        .insert(Modifier::UNDERLINED);
+                }
+            }
+        }
+    }
     if max_scroll > 0 {
         let mut scrollbar_state =
             ScrollbarState::new(max_scroll as usize).position(scroll as usize);
@@ -1054,17 +1102,28 @@ fn wrapped_text_region(lines: &[Line<'static>], width: u16) -> TextRegion {
     region
 }
 
+fn append_text_region(target: &mut TextRegion, source: TextRegion) {
+    let offset = target.lines.len();
+    target
+        .rows
+        .extend(source.rows.into_iter().map(|row| row + offset));
+    target.lines.extend(source.lines);
+}
+
 fn thread_lines(
     messages: &[&Message],
     selected_id: Option<&str>,
     theme: &Theme,
     width: u16,
+    links: &mut Vec<super::markdown::Link>,
+    region: &mut TextRegion,
 ) -> Vec<Line<'static>> {
     if messages.is_empty() {
         return vec![Line::from("No thread messages")];
     }
     let mut lines = Vec::new();
     for message in messages {
+        let start = lines.len();
         let selected = selected_id == Some(message.id.as_str());
         let rejected = message.status == MessageStatus::Rejected;
         let mut style = match message.kind {
@@ -1123,7 +1182,23 @@ fn thread_lines(
             body_style = body_style.add_modifier(Modifier::REVERSED);
         }
         let sanitized_body = sanitize_terminal_text(&message.body);
-        lines.extend(message_body_lines(&sanitized_body, width, body_style));
+        let mut rendered = super::markdown::render(&sanitized_body, width, body_style);
+        append_text_region(region, wrapped_text_region(&lines[start..], width));
+        let offset = region.rows.len();
+        for link in &mut rendered.links {
+            link.row += offset;
+        }
+        links.extend(rendered.links);
+        let source_offset = region.lines.len();
+        region.rows.extend(
+            rendered
+                .row_sources
+                .into_iter()
+                .map(|row| row + source_offset),
+        );
+        region.lines.extend(rendered.source_lines);
+        lines.extend(rendered.lines);
+        let tail_start = lines.len();
         if !message.variants.is_empty() {
             lines.push(Line::from(format!(
                 "Variants: {}",
@@ -1137,6 +1212,7 @@ fn thread_lines(
             )));
         }
         lines.push(Line::from(""));
+        append_text_region(region, wrapped_text_region(&lines[tail_start..], width));
     }
     lines
 }

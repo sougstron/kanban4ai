@@ -8,6 +8,7 @@ mod dialogs;
 mod event;
 mod image;
 mod limits;
+mod markdown;
 mod projects;
 mod search;
 mod sessions;

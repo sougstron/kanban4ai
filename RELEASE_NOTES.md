@@ -5,6 +5,10 @@ provider limit, and a running card's token counts match the same panel.
 
 ## Changed
 
+- **Markdown thread view.** Basic headings, emphasis, code, lists, checkboxes,
+  quotes and horizontal rules render alongside tables. Links show their label,
+  underline on hover and open in the desktop handler on click; formulas and
+  embedded HTML are not interpreted.
 - **Silence mode** (`kanban create --silence`, the Options popup, task field
   `silence`). `kanban ask` and `kanban ask-form` are refused, and this wins
   over interactive. The agent decides ambiguous points itself and records

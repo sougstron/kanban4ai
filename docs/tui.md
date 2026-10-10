@@ -3,7 +3,7 @@
 Reference detail split out of [AGENTS.md](../AGENTS.md) so it is not
 auto-loaded into every agent session. Read it when you are changing TUI key handling or dialogs.
 
-## Tables in task threads
+## Markdown in task threads
 
 Markdown pipe tables in message bodies render as bordered, aligned columns
 with a bold header. Both `| A | B |` and `A | B` rows are supported; the
@@ -15,8 +15,22 @@ Column widths follow the thread panel width. Long cell text wraps inside its
 column (including wide Unicode text); at widths too small for a grid, rows
 render as `Header: value` pairs instead. Thread scrolling and mouse text
 selection use the rendered rows. Tables inside fenced code blocks remain
-literal text. Other Markdown formatting is unchanged; messages on disk are
-not rewritten.
+literal text. Messages on disk are not rewritten.
+
+Thread bodies support CommonMark headings (`#` through `######`, plus setext
+headings), bold, italic, strikethrough, inline code, fenced/indented code,
+bulleted and numbered lists, nested lists, task checkboxes, blockquotes and
+horizontal rules. Code contents stay literal; fence delimiters are hidden.
+HTML is displayed as text, not executed; formulas are not interpreted.
+
+Markdown links display their label rather than their destination, including
+reference links and autolinks. Hover underlines the link; left click opens it
+with the desktop URL handler. HTTP, HTTPS and mailto destinations are supported;
+other schemes are not clickable. Image syntax displays its alt text as a link,
+not an embedded image. Shift-drag remains available for selecting link text.
+Links retain their targets through table layout, Unicode wrapping and scrolling.
+Linux requires `xdg-open` and a registered browser/mail handler; macOS uses
+`open`. A missing opener is reported in the TUI status bar.
 
 ## TUI Keyboard Shortcuts
 
