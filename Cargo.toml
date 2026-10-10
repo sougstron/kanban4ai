@@ -19,6 +19,7 @@ fs2 = "0.4.3"
 libc = "0.2.186"
 regex = "1.13.0"
 notify = "8.2.0"
+pulldown-cmark = { version = "0.13", default-features = false }
 ratatui = { version = "0.30", features = [
     "crossterm",
     "unstable-rendered-line-info",

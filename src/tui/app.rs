@@ -427,6 +427,8 @@ pub struct App {
     pub status: String,
     pub hitboxes: Vec<Hitbox>,
     hovered: Option<HitAction>,
+    pub(crate) thread_links: Vec<(Rect, String)>,
+    pub(crate) mouse_position: Option<(u16, u16)>,
     pub dragging: Option<DragState>,
     rendered_screen: RenderedScreen,
     /// Wrapped paragraphs drawn this frame; handed to the captured screen so a
@@ -910,6 +912,8 @@ impl App {
             status,
             hitboxes: Vec::new(),
             hovered: None,
+            thread_links: Vec::new(),
+            mouse_position: None,
             dragging: None,
             rendered_screen: RenderedScreen::default(),
             text_regions: Vec::new(),
@@ -1018,6 +1022,8 @@ impl App {
             status: "Loading project counts…".to_string(),
             hitboxes: Vec::new(),
             hovered: None,
+            thread_links: Vec::new(),
+            mouse_position: None,
             dragging: None,
             rendered_screen: RenderedScreen::default(),
             text_regions: Vec::new(),
@@ -2080,6 +2086,22 @@ impl App {
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<()> {
+        self.mouse_position = Some((mouse.column, mouse.row));
+        if self.screen == Screen::Detail
+            && self.modal.is_none()
+            && mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && !mouse.modifiers.contains(KeyModifiers::SHIFT)
+            && let Some((_, url)) = self
+                .thread_links
+                .iter()
+                .find(|(area, _)| contains(*area, mouse.column, mouse.row))
+        {
+            self.status = match super::markdown::open_url(url) {
+                Ok(()) => format!("Opened {url}"),
+                Err(error) => format!("Could not open link: {error}"),
+            };
+            return Ok(());
+        }
         if self.handle_text_input_mouse(mouse)? {
             return Ok(());
         }

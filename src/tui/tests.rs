@@ -3729,8 +3729,57 @@ fn copying_thread_paragraphs_drops_frames_and_rejoins_wrapped_lines() {
 
     assert_eq!(
         copied,
-        format!("{first}\n\nSecond paragraph stays apart.\n- list item one")
+        format!("{first}\n\nSecond paragraph stays apart.\n• list item one")
     );
+}
+
+#[test]
+fn markdown_link_hover_tracks_scrolled_table_cells() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Markdown links"))
+        .unwrap();
+    ThreadManager::new(dir.path()).unwrap().post(
+        &task.id,
+        crate::core::models::MessageRole::Agent,
+        crate::core::models::MessageKind::Context,
+        &format!("### Heading\n\n| Name | Value |\n| --- | --- |\n| [**Benchmark** methodology](https://example.org/bench#cold) | *OK* |\n\n{}", "Tail\n".repeat(20)),
+        None, Vec::new(), Some("agent".to_owned()),
+    ).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    let before = rendered_buffer(&mut app, 60, 30);
+    let (area, target) = app.thread_links.first().cloned().expect("visible link");
+    assert_eq!(target, "https://example.org/bench#cold");
+    assert!(
+        !before[(area.x, area.y)]
+            .modifier
+            .contains(Modifier::UNDERLINED)
+    );
+    app.handle_mouse(mouse(MouseEventKind::Moved, area.x, area.y))
+        .unwrap();
+    let hovered = rendered_buffer(&mut app, 60, 30);
+    assert!(
+        hovered[(area.x, area.y)]
+            .modifier
+            .contains(Modifier::UNDERLINED)
+    );
+    assert_eq!(hovered[(area.x, area.y)].symbol(), "B");
+    app.handle_mouse(mouse(MouseEventKind::Moved, 0, 0))
+        .unwrap();
+    let after = rendered_buffer(&mut app, 60, 30);
+    assert!(
+        !after[(area.x, area.y)]
+            .modifier
+            .contains(Modifier::UNDERLINED)
+    );
+    app.detail.as_mut().unwrap().scroll += 1;
+    let scrolled = rendered_buffer(&mut app, 60, 30);
+    let (shifted, _) = app.thread_links.first().unwrap();
+    assert_eq!(shifted.y, area.y - 1);
+    assert_eq!(scrolled[(shifted.x, shifted.y)].symbol(), "B");
 }
 
 #[test]
