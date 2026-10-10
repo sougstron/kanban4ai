@@ -50,6 +50,7 @@ use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
 use crate::core::error::Result;
+use crate::core::limit_share::LimitShare;
 use crate::core::limits::format_span;
 use crate::core::models::Task;
 use crate::core::project::ProjectStore;
@@ -415,6 +416,9 @@ pub struct TaskAnalytics {
     pub unsplit_tokens: i64,
     /// Sessions whose usage is already in the totals above.
     pub counted_sessions: HashSet<String>,
+    /// Share of each provider limit window the task consumed, per role
+    /// (`core::limit_share`). Left empty here; the caller fills it in.
+    pub limit_shares: Vec<LimitShare>,
 }
 
 /// Aggregate one task's analytics. Only events at or after `since` (the

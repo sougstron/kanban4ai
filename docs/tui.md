@@ -43,7 +43,9 @@ the plain-letter hotkeys.
   thread/answer/editor panels (detail)
 - `Enter`: Show task detail. Between the Task and Thread panels an
   Analytics row shows cumulative agent run time, run count, and
-  input/output tokens with the cache hit rate (`docs/stats.md`)
+  input/output tokens with the cache hit rate, plus a `Limits` row with the
+  task's share of each provider window per role (`✎` designer, `▶` executor,
+  `⚖` reviewer, in the card role colors) once one exists (`docs/stats.md`)
 - `r`: **Run (= queue) / Revoke** — put the task into the orchestration queue
   (To Do moves to In Progress with phase `queued`; Review folds its edits and
   joins the queue) and pump the queue once, so on an idle board the task starts

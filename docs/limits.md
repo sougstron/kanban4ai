@@ -162,6 +162,10 @@ number. The renderer only ever draws
 degrades with width: reset times drop first, then window labels and provider
 names, then whole providers from the right.
 
+Every persisted reading whose used percent changed is also appended to
+`<store>/limits-history.jsonl` for the per-task limit shares
+(`docs/stats.md`).
+
 **Click refresh**: every provider segment of the row is a hitbox
 (`UiAction::RefreshLimits`); a click refreshes that provider on a background
 thread (`refresh_provider_async`, guarded against overlapping runs) and merges

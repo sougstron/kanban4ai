@@ -11981,6 +11981,43 @@ fn detail_analytics_panel_sums_runs_and_tokens() {
     );
 }
 
+/// The task's limit shares get a second Analytics row: one value per role,
+/// in the role colors, grouped by provider and window.
+#[test]
+fn detail_analytics_panel_shows_limit_shares_per_role() {
+    use crate::core::limit_share::LimitShare;
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new(dir.path()).unwrap();
+    app.ops
+        .create_task(NewTask {
+            title: "Limit shares".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    let share = |provider: &str, label: &str, role: &str, percent: f64| LimitShare {
+        provider: provider.to_string(),
+        label: label.to_string(),
+        role: role.to_string(),
+        percent,
+    };
+    app.detail.as_mut().unwrap().analytics.limit_shares = vec![
+        share("claude", "5h", "designer", 0.42),
+        share("claude", "5h", "executor", 3.1),
+        share("claude", "7d", "executor", 0.02),
+        share("codex", "7d", "reviewer", 1.25),
+    ];
+
+    let rendered = render_snapshot(&mut app);
+    assert!(
+        rendered.contains("│Limits claude 5h ✎0.4% ▶3.1% · 7d ▶<0.1% │ codex 7d ⚖1.2%"),
+        "limit shares row missing:\n{rendered}"
+    );
+    insta::assert_snapshot!("detail_analytics_limit_shares", rendered);
+}
+
 /// Up/Down walk the dialog fields like BackTab/Tab, but a text field first
 /// carries the caret to its top or very end and only leaves from there.
 #[test]

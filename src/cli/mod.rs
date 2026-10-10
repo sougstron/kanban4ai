@@ -1288,7 +1288,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         }
         Command::Heartbeat { session } => {
             let session_id = env_session(session);
-            SessionManager::new(ops.data_root()).heartbeat(&session_id)?;
+            let sessions = SessionManager::new(ops.data_root());
+            if let Some(previous_seen) = sessions.heartbeat_seen(&session_id)? {
+                sessions.sample_live_tokens(&session_id, previous_seen);
+            }
             println!("Heartbeat updated for session {session_id}");
         }
         Command::Waiting {

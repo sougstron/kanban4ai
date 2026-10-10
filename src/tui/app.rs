@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use chrono::TimeZone as _;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -30,6 +31,7 @@ use crate::core::context::ContextManager;
 use crate::core::daemon;
 use crate::core::error::{KanbanError, Result};
 use crate::core::executors::{self, Pool};
+use crate::core::limit_share;
 use crate::core::limits::LimitsSnapshot;
 use crate::core::models::{
     Message, MessageKind, MessageStatus, RunMode, RunPhase, Session, SessionStatus, Task,
@@ -4004,7 +4006,16 @@ impl App {
         let has_provenance = !provenance.is_empty();
         let analytics = task
             .as_ref()
-            .map(|task| stats::task_analytics(self.ops.data_root(), &task.id, task.created_at))
+            .map(|task| {
+                let root = self.ops.data_root();
+                let mut analytics = stats::task_analytics(root, &task.id, task.created_at);
+                let since = chrono::Local
+                    .from_local_datetime(&task.created_at)
+                    .earliest()
+                    .map_or(0, |at| at.timestamp());
+                analytics.limit_shares = limit_share::task_limit_shares(root, &task.id, since);
+                analytics
+            })
             .unwrap_or_default();
         let mut detail = DetailState {
             task_id: task_id.to_string(),
