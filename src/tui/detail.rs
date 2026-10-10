@@ -24,7 +24,7 @@ use super::card::{format_tokens, sanitize_terminal_text, truncate_display};
 use super::dialogs::set_cursor_visible;
 use super::projects::shorten_path;
 use super::theme::Theme;
-use super::thread_view::{pin_last_message_scroll, visible_thread_messages};
+use super::thread_view::{message_body_lines, pin_last_message_scroll, visible_thread_messages};
 
 /// Width of the meta block's own title, which the project badge has to clear
 /// on the same border row.
@@ -154,12 +154,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .thread_selected
             .and_then(|index| detail_ref.messages.get(index))
             .map(|message| message.id.clone());
-        let panel_lines = thread_lines(&visible, selected_id.as_deref(), &theme);
+        let panel_lines = thread_lines(&visible, selected_id.as_deref(), &theme, inner_width);
         let last_start = if visible.len() <= 1 {
             0
         } else {
             wrapped_row_count(
-                &thread_lines(&visible[..visible.len() - 1], None, &theme),
+                &thread_lines(&visible[..visible.len() - 1], None, &theme, inner_width),
                 inner_width,
             )
         };
@@ -1058,6 +1058,7 @@ fn thread_lines(
     messages: &[&Message],
     selected_id: Option<&str>,
     theme: &Theme,
+    width: u16,
 ) -> Vec<Line<'static>> {
     if messages.is_empty() {
         return vec![Line::from("No thread messages")];
@@ -1122,13 +1123,7 @@ fn thread_lines(
             body_style = body_style.add_modifier(Modifier::REVERSED);
         }
         let sanitized_body = sanitize_terminal_text(&message.body);
-        if sanitized_body.is_empty() {
-            lines.push(Line::from(""));
-        } else {
-            for body_line in sanitized_body.lines() {
-                lines.push(Line::from(Span::styled(body_line.to_string(), body_style)));
-            }
-        }
+        lines.extend(message_body_lines(&sanitized_body, width, body_style));
         if !message.variants.is_empty() {
             lines.push(Line::from(format!(
                 "Variants: {}",
