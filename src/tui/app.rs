@@ -4031,14 +4031,12 @@ impl App {
             analytics,
             thread_stamp,
         };
-        // A fresh open of a Review task lands in the review editor, so the
-        // first keystrokes type feedback instead of firing hotkeys.
-        detail.focus = match preserved_focus {
-            Some(focus) if detail.focus_available(focus) => focus,
-            Some(_) => DetailFocus::Thread,
-            None if detail.focus_available(DetailFocus::Edits) => DetailFocus::Edits,
-            None => DetailFocus::Thread,
-        };
+        // A fresh open stays on the thread so Esc closes the detail at once.
+        // Plain letters still jump into the review editor (or the answer box)
+        // and are typed there; Tab or a click focuses the editor explicitly.
+        detail.focus = preserved_focus
+            .filter(|focus| detail.focus_available(*focus))
+            .unwrap_or(DetailFocus::Thread);
         if let Some((question_id, answer_input, variant_selected)) = preserved_answer
             && let Some(question_index) = detail
                 .open_questions()
