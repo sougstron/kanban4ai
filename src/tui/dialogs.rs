@@ -3495,19 +3495,19 @@ fn selector_form_rows(
     selector_form_rows_from_scroll(modal, content, fields, modal.form_scroll)
 }
 
-/// Rows the description textarea claims at `row_width`: its soft-wrapped text
-/// measured with the widget's own wrap map, clamped to
-/// [`DESCRIPTION_MIN_ROWS`]..[`DESCRIPTION_MAX_ROWS`] — the same
-/// content-driven sizing the option selectors get from their option count.
+/// Outer height of the description textarea at `row_width`: its soft-wrapped
+/// text is clamped to [`DESCRIPTION_MIN_ROWS`]..[`DESCRIPTION_MAX_ROWS`]
+/// visible rows, then the top and bottom borders are added.
 fn description_content_height(modal: &ModalState, row_width: u16) -> u16 {
     // Measure on a throwaway copy: parking the caret on the last visual row
     // mutates the widget's cursor and remembered scroll, and the live field
     // must keep both.
     let mut probe = modal.description.clone();
+    probe.remove_block();
     probe.cancel_selection();
     probe.move_cursor(CursorMove::Bottom);
     probe.move_cursor(CursorMove::End);
-    let area = Rect::new(0, 0, row_width.max(1), 1);
+    let area = Rect::new(0, 0, row_width.saturating_sub(2).max(1), 1);
     let mut scratch = Buffer::empty(area);
     // A scratch render loads the wrap map at this width; nothing reaches the
     // screen.
@@ -3521,7 +3521,7 @@ fn description_content_height(modal: &ModalState, row_width: u16) -> u16 {
     } else {
         DESCRIPTION_MIN_ROWS
     };
-    rows.clamp(min_rows, DESCRIPTION_MAX_ROWS)
+    rows.clamp(min_rows, DESCRIPTION_MAX_ROWS) + 2
 }
 
 /// The first visible field to draw so the focused one sits fully inside
@@ -3584,7 +3584,7 @@ fn selector_form_rows_from_scroll(
             // and shrinks with edits, and on a short terminal it takes what
             // is left instead of vanishing below the fold.
             DialogField::Description => description_height
-                .unwrap_or(DESCRIPTION_MIN_ROWS)
+                .unwrap_or(DESCRIPTION_MIN_ROWS + 2)
                 .min(remaining),
             _ => task_field_min_height(field),
         };
@@ -3621,11 +3621,9 @@ fn selector_form_rows_from_scroll(
     rows
 }
 
-/// The description field starts at this many rows and follows its text from
-/// there; empty text still gets the full minimum.
+/// Minimum visible text rows, excluding the textarea's borders.
 const DESCRIPTION_MIN_ROWS: u16 = 5;
-/// Hard cap for the content-driven description height so a huge description
-/// cannot crowd the rest of the form off the screen.
+/// Maximum visible text rows; additional content scrolls within the field.
 const DESCRIPTION_MAX_ROWS: u16 = 20;
 
 fn task_field_min_height(field: DialogField) -> u16 {
@@ -3664,7 +3662,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor => 1,
-        DialogField::Description => DESCRIPTION_MIN_ROWS,
+        DialogField::Description => DESCRIPTION_MIN_ROWS + 2,
         DialogField::ProjectVisibility | DialogField::BackendOrder => 4,
         DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel => 5,
         // The chain selector always shows its filter and the "No chain"
