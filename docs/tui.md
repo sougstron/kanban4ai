@@ -3,6 +3,21 @@
 Reference detail split out of [AGENTS.md](../AGENTS.md) so it is not
 auto-loaded into every agent session. Read it when you are changing TUI key handling or dialogs.
 
+## Tables in task threads
+
+Markdown pipe tables in message bodies render as bordered, aligned columns
+with a bold header. Both `| A | B |` and `A | B` rows are supported; the
+header must be followed by a separator such as `| --- | ---: |`.
+Colon markers select left, center, or right alignment. Escaped pipes (`\|`)
+remain part of a cell.
+
+Column widths follow the thread panel width. Long cell text wraps inside its
+column (including wide Unicode text); at widths too small for a grid, rows
+render as `Header: value` pairs instead. Thread scrolling and mouse text
+selection use the rendered rows. Tables inside fenced code blocks remain
+literal text. Other Markdown formatting is unchanged; messages on disk are
+not rewritten.
+
 ## TUI Keyboard Shortcuts
 
 Action hotkeys work on both the board (focused card) and the open detail view.
