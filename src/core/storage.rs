@@ -27,6 +27,14 @@ use crate::core::timefmt;
 
 /// Atomically replace `path` with `content` (temp file + rename).
 pub fn atomic_write_text(path: &Path, content: &str) -> Result<()> {
+    if crate::core::sync::capture(path, Some(content))? {
+        return Ok(());
+    }
+    atomic_write_text_raw(path, content)
+}
+
+/// Sync metadata bypasses capture to avoid recursive journal writes.
+pub(crate) fn atomic_write_text_raw(path: &Path, content: &str) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| KanbanError::Invalid(format!("path has no parent: {}", path.display())))?;
@@ -34,7 +42,9 @@ pub fn atomic_write_text(path: &Path, content: &str) -> Result<()> {
         .prefix(".tmp_")
         .tempfile_in(parent)?;
     tmp.write_all(content.as_bytes())?;
+    tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| KanbanError::Io(e.error))?;
+    File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -312,8 +322,12 @@ impl Storage {
     }
 
     pub fn delete_task(&self, task_id: &str) -> Result<bool> {
+        let _guard = self.lock()?;
         match self.get_task_path(task_id) {
             Some(path) => {
+                if crate::core::sync::capture(&path, None)? {
+                    return Ok(true);
+                }
                 fs::remove_file(path)?;
                 Ok(true)
             }
