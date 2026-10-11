@@ -466,6 +466,9 @@ pub struct Task {
         skip_serializing_if = "Option::is_none"
     )]
     pub cleanup_retry_at: Option<NaiveDateTime>,
+    /// Preferred launch node; absent means the node receiving the launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<crate::core::sync::NodeRole>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -527,6 +530,7 @@ impl Task {
             cleanup_retry_at: None,
             base_commit: None,
             integration: IntegrationState::None,
+            runner: None,
         }
     }
 

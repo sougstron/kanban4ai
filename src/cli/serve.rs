@@ -27,6 +27,7 @@ use crate::core::error::{KanbanError, Result};
 use crate::core::project::ProjectStore;
 use crate::core::storage::{atomic_write_text_raw, lock_file_reentrant};
 
+mod api;
 mod discovery;
 mod pairing;
 mod sync;
@@ -259,7 +260,8 @@ fn router(tokens: PathBuf) -> Router {
         .to_path_buf();
     let protected = Router::new()
         .merge(discovery::routes(root.clone()))
-        .merge(sync::routes(root))
+        .merge(sync::routes(root.clone()))
+        .merge(api::routes(root))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "NOT_FOUND", "Unknown endpoint") })
         .layer(middleware::from_fn_with_state(tokens.clone(), authenticate));
     Router::new()

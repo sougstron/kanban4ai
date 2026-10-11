@@ -6371,6 +6371,7 @@ impl App {
                     needs: None,
                     parent_task: None,
                     role_profile: None,
+                    runner: None,
                 };
                 let target = target_status
                     .as_deref()

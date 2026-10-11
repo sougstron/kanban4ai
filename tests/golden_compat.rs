@@ -339,6 +339,7 @@ fn rust_written_task_is_parseable_and_stable() {
             needs: None,
             parent_task: None,
             role_profile: None,
+            runner: None,
         })
         .unwrap();
 
