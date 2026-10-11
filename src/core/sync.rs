@@ -12,6 +12,9 @@ use serde_json::Value;
 use super::error::{KanbanError, Result};
 use super::storage::{atomic_write_text_raw, lock_file_reentrant};
 
+mod apply;
+pub use apply::Conflict;
+
 type Fields = BTreeMap<String, Value>;
 pub type VersionVector = BTreeMap<String, u64>;
 
@@ -86,6 +89,9 @@ pub struct JournalState {
     pub message_uids: BTreeMap<String, String>,
     pub project_uids: BTreeMap<String, String>,
     pub compacted: VersionVector,
+    /// Retained causal versions make conflict detection independent of delivery order.
+    #[serde(default)]
+    pub operations: BTreeMap<String, Operation>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -144,6 +150,7 @@ impl Journal {
     pub fn open(store: &Path) -> Result<Self> {
         let root = store.join("sync");
         fs::create_dir_all(&root)?;
+        apply::recover_remote(&root)?;
         let _guard = lock_file_reentrant(&root.join(".lock"))?;
         let path = root.join("node.yaml");
         let mut node: NodeIdentity = if path.exists() {
@@ -209,12 +216,14 @@ impl Journal {
     }
 
     pub fn state(&self) -> Result<JournalState> {
+        apply::recover_remote(&self.root)?;
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
         load(&self.root.join("meta/state.json"))
     }
 
     pub fn observe(&self, remote: &Hlc, max_skew_ms: u64) -> Result<()> {
+        apply::recover_remote(&self.root)?;
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
         let mut clock: Hlc = load(&self.root.join("hlc"))?;
@@ -309,6 +318,7 @@ impl Journal {
     /// is durable before replacing the journal, and includes field clocks and
     /// tombstones. Callers must supply all paired peers, not just online peers.
     pub fn compact(&self, peers: &[VersionVector]) -> Result<u64> {
+        apply::recover_remote(&self.root)?;
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
         let mut state: JournalState = load(&self.root.join("meta/state.json"))?;
@@ -362,13 +372,16 @@ fn key(project: &str, entity: &str, id: &str) -> String {
 }
 
 fn apply_meta(state: &mut JournalState, op: &Operation) {
+    state.operations.insert(op.op.clone(), op.clone());
     let fields = state
         .fields
         .entry(key(&op.project, &op.entity, &op.id))
         .or_default();
     for (field, value) in &op.set {
-        fields.values.insert(field.clone(), value.clone());
-        fields.clocks.insert(field.clone(), op.hlc.clone());
+        if fields.clocks.get(field).is_none_or(|clock| clock < &op.hlc) {
+            fields.values.insert(field.clone(), value.clone());
+            fields.clocks.insert(field.clone(), op.hlc.clone());
+        }
     }
     state
         .vector
