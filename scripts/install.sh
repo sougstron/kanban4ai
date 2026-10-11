@@ -7,10 +7,12 @@ source_binary=${KANBAN4AI_BINARY:-target/release/kanban4ai}
 bindir=${destdir}${prefix}/bin
 canonical=${bindir}/kanban4ai
 with_daemon=0
+with_serve=0
 
 for arg in "$@"; do
     case $arg in
         --with-daemon) with_daemon=1 ;;
+        --with-serve) with_serve=1 ;;
         *)
             printf '%s\n' "error: unknown option: $arg" >&2
             exit 1
@@ -71,4 +73,23 @@ if [ "$with_daemon" -eq 1 ]; then
     printf '%s\n' "installed user unit $unit_dest (not enabled)"
     printf '%s\n' "enable with: systemctl --user enable --now kanban4ai.service"
     printf '%s\n' "cron fallback: * * * * * kanban daemon --once"
+fi
+
+if [ "$with_serve" -eq 1 ]; then
+    script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    unit_src=$script_dir/../packaging/systemd/kanban4ai-serve.service
+    if [ ! -f "$unit_src" ]; then
+        printf '%s\n' "error: systemd unit not found: $unit_src" >&2
+        exit 1
+    fi
+    unit_dir=${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user
+    if [ -n "$destdir" ]; then
+        unit_dir=${destdir}${unit_dir}
+    fi
+    mkdir -p "$unit_dir"
+    unit_dest=$unit_dir/kanban4ai-serve.service
+    sed "s|^ExecStart=.*|ExecStart=${prefix}/bin/kanban4ai serve|" \
+        "$unit_src" >"$unit_dest"
+    printf '%s\n' "installed user unit $unit_dest (not enabled)"
+    printf '%s\n' "enable with: systemctl --user enable --now kanban4ai-serve.service"
 fi

@@ -1,3 +1,13 @@
+# Unreleased
+
+- **LAN HTTP server.** `kanban4ai serve` runs in the existing binary, binds
+  individual LAN/loopback addresses, and exposes public `/health` and `/version`
+  probes (protocol 1). Other paths require hashed node/client Bearer tokens;
+  client tokens cannot access sync or git. SIGINT/SIGTERM drain requests with a
+  configurable deadline, including when a client leaves HTTP headers unfinished.
+  AUR packages and `install.sh --with-serve` install the opt-in
+  `kanban4ai-serve.service` user unit.
+
 # kanban4ai 0.7.6
 
 Task threads render Markdown, and the task description field keeps its

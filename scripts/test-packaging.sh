@@ -36,6 +36,8 @@ if [ -e "$tmpdir/usr/lib/systemd/user/kanban4ai.service" ] \
     printf '%s\n' "error: installer wrote a user unit without --with-daemon" >&2
     exit 1
 fi
+test ! -e "$tmpdir$fake_config/systemd/user/kanban4ai-serve.service"
+test ! -e "$tmpdir/usr/lib/systemd/user/kanban4ai-serve.service"
 
 # Opt-in daemon install: unit lands under DESTDIR+HOME, is never enabled.
 daemon_tmp=$(mktemp -d)
@@ -45,7 +47,7 @@ config=$home/.config
 mkdir -p "$config"
 DESTDIR=$daemon_tmp PREFIX=/usr HOME=$home XDG_CONFIG_HOME=$config \
     KANBAN4AI_BINARY=$binary \
-    sh "$project_root/scripts/install.sh" --with-daemon >/dev/null
+    sh "$project_root/scripts/install.sh" --with-daemon --with-serve >/dev/null
 unit=$daemon_tmp$config/systemd/user/kanban4ai.service
 test -f "$unit"
 grep -q '^ExecStart=/usr/bin/kanban4ai daemon$' "$unit"
@@ -57,5 +59,14 @@ if [ -e "$config/systemd/user/default.target.wants/kanban4ai.service" ] \
     printf '%s\n' "error: installer enabled the user unit" >&2
     exit 1
 fi
+
+serve_unit=$daemon_tmp$config/systemd/user/kanban4ai-serve.service
+test -f "$serve_unit"
+grep -q '^ExecStart=/usr/bin/kanban4ai serve$' "$serve_unit"
+grep -q '^Type=simple$' "$serve_unit"
+grep -q '^Restart=on-failure$' "$serve_unit"
+grep -q '^KillSignal=SIGTERM$' "$serve_unit"
+test ! -e "$config/systemd/user/default.target.wants/kanban4ai-serve.service"
+test ! -e "$daemon_tmp$config/systemd/user/default.target.wants/kanban4ai-serve.service"
 
 printf '%s\n' "packaging smoke test passed"

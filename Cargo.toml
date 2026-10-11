@@ -13,6 +13,12 @@ categories = ["command-line-utilities"]
 keywords = ["kanban", "tui", "agents", "opencode", "claude"]
 
 [dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+if-addrs = "0.15"
+ipnet = { version = "2", features = ["serde"] }
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "fs", "time"] }
 chrono = "0.4.45"
 clap = { version = "4.6.1", features = ["derive"] }
 fs2 = "0.4.3"
@@ -42,3 +48,4 @@ strip = true
 assert_cmd = "2.2.2"
 insta = "1.43.2"
 predicates = "3.1.4"
+tower = { version = "0.5", features = ["util"] }

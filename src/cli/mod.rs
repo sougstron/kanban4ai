@@ -6,6 +6,7 @@ mod daemon;
 mod init;
 mod project;
 mod resolve;
+mod serve;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -405,6 +406,15 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Serve the local store over HTTP on LAN and loopback interfaces.
+    Serve {
+        /// Override store `serve.port` (default: 7420)
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        port: Option<u16>,
+        /// Issue a 256-bit node/client token, print it once, and exit.
+        #[arg(long, value_parser = ["node", "client"], conflicts_with = "port")]
+        issue_token: Option<String>,
+    },
     /// Recover a crashed task.
     Recover { task_id: String },
     /// Land an isolated task branch into the work folder (re-runs the merge
@@ -754,6 +764,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Tui => return launch_tui(cli.project.as_deref()),
         Command::Daemon { interval, once } => {
             return daemon::run(once, interval, cli.project.as_deref());
+        }
+        Command::Serve { port, issue_token } => {
+            return serve::run(port, issue_token.as_deref());
         }
         _ => {}
     }
@@ -1488,6 +1501,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         | Command::Stats
         | Command::Update { .. }
         | Command::StatuslineBridge
+        | Command::Serve { .. }
         | Command::Daemon { .. } => {
             unreachable!("handled before resolve")
         }
