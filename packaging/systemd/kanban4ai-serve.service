@@ -1,0 +1,17 @@
+# User unit; installed but never enabled automatically.
+# systemctl --user enable --now kanban4ai-serve.service
+[Unit]
+Description=kanban4ai LAN HTTP server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/kanban4ai serve
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGTERM
+TimeoutStopSec=30
+UMask=0077
+
+[Install]
+WantedBy=default.target
