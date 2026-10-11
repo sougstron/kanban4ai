@@ -27,6 +27,9 @@ use crate::core::error::{KanbanError, Result};
 use crate::core::project::ProjectStore;
 use crate::core::storage::{atomic_write_text_raw, lock_file_reentrant};
 
+mod pairing;
+pub use pairing::PairingOptions;
+
 const PROTO: u32 = 1;
 const MIN_PROTO: u32 = 1;
 
@@ -92,7 +95,7 @@ fn token_hash(token: &str) -> String {
     hex(&Sha256::digest(token.as_bytes()))
 }
 
-fn issue_token(root: &Path, kind: TokenKind) -> Result<()> {
+fn issue_token(root: &Path, kind: TokenKind) -> Result<String> {
     fs::create_dir_all(root.join("sync"))?;
     let _guard = lock_file_reentrant(&root.join("sync/.lock"))?;
     let path = root.join("sync/tokens.yaml");
@@ -116,8 +119,7 @@ fn issue_token(root: &Path, kind: TokenKind) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     }
-    println!("{secret}");
-    Ok(())
+    Ok(secret)
 }
 
 fn allowed(ip: IpAddr, networks: &[IpNet]) -> bool {
@@ -248,7 +250,7 @@ async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: N
 fn router(tokens: PathBuf) -> Router {
     let protected = Router::new()
         .fallback(|| async { error(StatusCode::NOT_FOUND, "NOT_FOUND", "Unknown endpoint") })
-        .layer(middleware::from_fn_with_state(tokens, authenticate));
+        .layer(middleware::from_fn_with_state(tokens.clone(), authenticate));
     Router::new()
         .route("/health", get(|| async { Json(json!({"ok": true})) }))
         .route(
@@ -258,6 +260,16 @@ fn router(tokens: PathBuf) -> Router {
                     "app_version": env!("CARGO_PKG_VERSION"), "proto": PROTO, "min_proto": MIN_PROTO
                 }))
             }),
+        )
+        .route(
+            "/pair",
+            axum::routing::post(pairing::accept).with_state(
+                tokens
+                    .parent()
+                    .and_then(Path::parent)
+                    .unwrap_or(Path::new("."))
+                    .to_path_buf(),
+            ),
         )
         .merge(protected)
 }
@@ -324,10 +336,14 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
     result
 }
 
-pub fn run(port: Option<u16>, token_kind: Option<&str>) -> Result<ExitCode> {
+pub fn run(
+    port: Option<u16>,
+    token_kind: Option<&str>,
+    pairing: PairingOptions,
+) -> Result<ExitCode> {
     let store = ProjectStore::open()?;
     if let Some(kind) = token_kind {
-        issue_token(
+        let secret = issue_token(
             store.root(),
             match kind {
                 "node" => TokenKind::Node,
@@ -335,6 +351,10 @@ pub fn run(port: Option<u16>, token_kind: Option<&str>) -> Result<ExitCode> {
                 _ => return Err(invalid("token kind must be node or client")),
             },
         )?;
+        println!("{secret}");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if pairing::run(&store, &pairing)? {
         return Ok(ExitCode::SUCCESS);
     }
     let global = store.load_global_config()?;
