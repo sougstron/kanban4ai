@@ -1835,7 +1835,7 @@ impl Config {
 
     pub fn init(&self) -> Result<()> {
         fs::create_dir_all(&self.kanban_dir)?;
-        fs::write(&self.config_file, DEFAULT_CONFIG_YAML)?;
+        atomic_write_text(&self.config_file, DEFAULT_CONFIG_YAML)?;
         Ok(())
     }
 

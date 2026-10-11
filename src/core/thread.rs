@@ -439,9 +439,13 @@ impl ThreadManager {
     /// thread left behind by a deleted task would otherwise be adopted by the
     /// next task that lands on the same id.
     pub fn discard_thread(&self, task_id: &str) -> Result<bool> {
+        let _guard = self.lock()?;
         let thread_file = self.thread_file(task_id);
         if !thread_file.exists() {
             return Ok(false);
+        }
+        if crate::core::sync::capture(&thread_file, None)? {
+            return Ok(true);
         }
         fs::remove_file(&thread_file)?;
         Ok(true)

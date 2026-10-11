@@ -236,6 +236,7 @@ impl ProjectStore {
     pub fn open() -> Result<Self> {
         let store = ProjectStore::at(store_root()?);
         fs::create_dir_all(store.projects_dir())?;
+        crate::core::sync::Journal::open(store.root())?;
         Ok(store)
     }
 

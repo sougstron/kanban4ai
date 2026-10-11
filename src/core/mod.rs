@@ -22,6 +22,7 @@ pub mod scheduler;
 pub mod session;
 pub mod stats;
 pub mod storage;
+pub mod sync;
 pub mod telemetry;
 pub mod thread;
 pub mod timefmt;
