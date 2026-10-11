@@ -414,6 +414,8 @@ enum Command {
         /// Issue a 256-bit node/client token, print it once, and exit.
         #[arg(long, value_parser = ["node", "client"], conflicts_with = "port")]
         issue_token: Option<String>,
+        #[command(flatten)]
+        pairing: serve::PairingOptions,
     },
     /// Recover a crashed task.
     Recover { task_id: String },
@@ -765,8 +767,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Daemon { interval, once } => {
             return daemon::run(once, interval, cli.project.as_deref());
         }
-        Command::Serve { port, issue_token } => {
-            return serve::run(port, issue_token.as_deref());
+        Command::Serve {
+            port,
+            issue_token,
+            pairing,
+        } => {
+            return serve::run(port, issue_token.as_deref(), pairing);
         }
         _ => {}
     }
