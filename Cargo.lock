@@ -1171,10 +1171,12 @@ version = "0.7.6"
 dependencies = [
  "assert_cmd",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "flume",
  "fs2",
+ "futures-util",
  "if-addrs 0.15.0",
  "insta",
  "ipnet",

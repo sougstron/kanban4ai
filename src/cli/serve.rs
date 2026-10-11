@@ -29,6 +29,7 @@ use crate::core::storage::{atomic_write_text_raw, lock_file_reentrant};
 
 mod discovery;
 mod pairing;
+mod sync;
 pub use discovery::DiscoveryOptions;
 pub use pairing::PairingOptions;
 
@@ -251,14 +252,14 @@ async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: N
 }
 
 fn router(tokens: PathBuf) -> Router {
+    let root = tokens
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
     let protected = Router::new()
-        .merge(discovery::routes(
-            tokens
-                .parent()
-                .and_then(Path::parent)
-                .unwrap_or(Path::new("."))
-                .to_path_buf(),
-        ))
+        .merge(discovery::routes(root.clone()))
+        .merge(sync::routes(root))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "NOT_FOUND", "Unknown endpoint") })
         .layer(middleware::from_fn_with_state(tokens.clone(), authenticate));
     Router::new()
@@ -306,6 +307,7 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
         listeners.push(TcpListener::bind(address).await?);
     }
     let discovery = discovery::start(root, networks, port).await?;
+    let replication = sync::start(root);
     let (stop, _) = watch::channel(false);
     let mut tasks = JoinSet::new();
     for listener in listeners {
@@ -329,6 +331,8 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
         }
     };
     discovery.stop().await;
+    // Ends live SSE streams too, so graceful drain does not wait for them.
+    replication.stop().await;
     let _ = stop.send(true);
     let drain = async {
         while let Some(task) = tasks.join_next().await {
@@ -480,7 +484,7 @@ mod tests {
                     Some(client.as_str()),
                     StatusCode::FORBIDDEN,
                 ),
-                ("/sync/ops", Some(node.as_str()), StatusCode::NOT_FOUND),
+                ("/sync/unknown", Some(node.as_str()), StatusCode::NOT_FOUND),
             ] {
                 let response = app.clone().oneshot(request(path, token)).await.unwrap();
                 assert_eq!(response.status(), expected, "{path}");

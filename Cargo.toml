@@ -13,6 +13,8 @@ categories = ["command-line-utilities"]
 keywords = ["kanban", "tui", "agents", "opencode", "claude"]
 
 [dependencies]
+base64 = "0.22"
+futures-util = { version = "0.3", default-features = false }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 if-addrs = "0.15"
 ipnet = { version = "2", features = ["serde"] }
