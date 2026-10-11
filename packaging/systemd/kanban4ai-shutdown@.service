@@ -1,0 +1,17 @@
+# System unit, opt-in: systemctl enable --now kanban4ai-shutdown@USERNAME.service
+[Unit]
+Description=Notify kanban4ai peers before shutdown (%i)
+After=network.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+User=%i
+RemainAfterExit=yes
+ExecStart=/usr/bin/true
+ExecStop=-/usr/bin/kanban4ai serve --bye shutdown
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

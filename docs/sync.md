@@ -574,7 +574,8 @@ Loopback включается независимо от CIDR. Wildcard bind (`0.
 Логи: `journalctl --user -u kanban4ai-serve.service`.
 
 Публичные probes реализованы в этой задаче; сопряжение — в TASK-411,
-обнаружение/mDNS, sync/git и клиентский API — в TASK-412…TASK-414 и TASK-418.
+обнаружение/mDNS и статусы — в TASK-412; sync/git и клиентский API —
+в TASK-413…TASK-414 и TASK-418.
 Неизвестный защищённый путь без токена возвращает 401, с разрешённым токеном —
 404; это не реализация будущего endpoint.
 
@@ -644,9 +645,11 @@ kanban4ai serve --revoke-token <sha256>
 store_id и получение данных выполняются последующим bootstrap, не `/pair`.
 
 `sync.peers` в глобальном `config.yaml` содержит карточки пиров без токенов.
-`sync/peers.yaml` — список `{node_id, token, inbound_sha256}`: исходящий
-bearer-секрет и fingerprint входящего токена. В `sync/tokens.yaml` остаются
-только хеши входящих токенов; сырой исходящий секрет необходим HTTP-клиенту.
+`sync/peers.yaml` — список `{node_id, token, inbound_sha256, address, addresses}`:
+исходящий bearer-секрет, fingerprint входящего токена, основной статический
+`IP:port` и необязательный список запасных адресов. Старые записи без адресов
+используют `sync.peers[].address`. В `sync/tokens.yaml` остаются только хеши
+входящих токенов; сырой исходящий секрет необходим HTTP-клиенту.
 Повторное сопряжение того же node_id заменяет исходящий секрет и отзывает
 предыдущий входящий токен. Все записи атомарны; изменения списка держат
 store lock, затем sync lock. Секретные файлы имеют права 0600 и не реплицируются.
@@ -660,6 +663,62 @@ store lock, затем sync lock. Секретные файлы имеют пр�
 ограничения. Создание кода и отзыв не требуют перезапуска HTTP-сервиса.
 QR содержит `{address, port, node_id, token}`, где address — IP без порта.
 QR и одноразовые секреты следует передавать только владельцу телефона/узла.
+
+#### Реализация Serve 03 (TASK-412)
+
+- `serve` анонсирует `_kanban4ai._tcp.local.` с TXT `node_id`, `name`, `role`,
+  `proto` и слушает объявления других узлов. mDNS работает только на разрешённых
+  LAN-интерфейсах, без loopback; ошибка mDNS не отключает статические адреса.
+  Объявление не сопрягает узлы: идентичность подтверждается парным bearer-токеном
+  и `node_id` из защищённого `/node`. Новое объявление запускает проверку даже
+  при сохранённом bye: пропущенный hello не оставляет узел навечно «выключенным»;
+  сама запись mDNS не снимает bye без подтверждённого контакта.
+- `kanban serve --discover` собирает объявления в течение `sync.probe_timeout`
+  и выдаёт JSON с адресами, без собственного узла. `kanban serve --probe` и
+  защищённый `GET /nodes` возвращают `{node, status, code, message, since,
+  last_seen}` для всех сопряжённых пиров. Фоновые probes выполняются каждые
+  `sync.interval` секунд. `node` — UUID; тексты используют роль «Сервер»/«Ноут».
+- Настройки `sync.home_networks`, `probe_timeout` (секунды, по умолчанию 3),
+  `interval` (секунды, 30), `max_skew` (секунды, 300) машинно-локальны.
+  Нулевые timeout/interval запрещены. Вне домашней сети probes не обращаются к
+  пирам. Без `home_networks` домашней считается активная private IPv4 / ULA IPv6
+  сеть; один loopback не считается присутствием в LAN.
+- Адреса из mDNS проверяются первыми, затем основной/запасные статические адреса
+  из `peers.yaml`, затем карточка в конфиге. Ошибки одного адреса не мешают
+  проверить остальные; HTTP redirects и proxy из окружения отключены.
+- `sync/presence.yaml` — атомарная машинно-локальная запись под sync lock:
+  последний подтверждённый контакт, `{reason, at}` ухода и обнаруженные адреса.
+  Отметка `bye` переживает перезапуск. Поздний `bye`, старше последнего контакта,
+  не отменяет новое состояние. Обычный отказ соединения без `bye` —
+  `NODE_SERVICE_DOWN`, таймаут — `NODE_UNREACHABLE`; случайное завершение serve
+  не выдаётся за выключение хоста.
+- `kanban serve --bye shutdown|sleep` отправляет `POST /sync/bye {reason, at}`
+  всем пирам; `--hello` отправляет `POST /sync/hello`. `serve` также шлёт hello
+  при старте. Эти методы принимают только токены сопряжённых узлов; отправитель
+  определяется по fingerprint, а не по переданному UUID. Hello и свежий
+  защищённый контакт и подтверждённый ответ на исходящий hello снимают отметку
+  ухода. `/sync/vector` с hello и push хвоста
+  журнала перед bye подключаются транспортом TASK-413.
+
+Systemd-хуки — **system**, не user units: пользовательский manager не получает
+`sleep.target`. AUR устанавливает `kanban4ai-sleep@.service` и
+`kanban4ai-shutdown@.service` в `/usr/lib/systemd/system`, не включает их.
+`scripts/install.sh --with-serve` кладёт их в
+`$PREFIX/share/kanban4ai/systemd`; администратор копирует их в
+`/etc/systemd/system` и выполняет `sudo systemctl daemon-reload`.
+Включение для пользователя `USERNAME`:
+
+```sh
+sudo systemctl enable kanban4ai-sleep@USERNAME.service
+sudo systemctl enable --now kanban4ai-shutdown@USERNAME.service
+```
+
+Sleep hook шлёт bye перед `sleep.target`, hello — при его остановке после
+пробуждения. Shutdown hook остаётся активным до выключения и шлёт bye до
+остановки сети. Используется store пользователя; для нестандартного store
+нужен drop-in с `Environment=KANBAN_HOME=/absolute/store`.
+Таймауты hooks — 20 с, допускают systemd override; недоступный пир не блокирует
+сон/выключение. Отключение/ручная остановка shutdown hook также отправляет bye.
 
 
 

@@ -416,6 +416,8 @@ enum Command {
         issue_token: Option<String>,
         #[command(flatten)]
         pairing: serve::PairingOptions,
+        #[command(flatten)]
+        discovery: serve::DiscoveryOptions,
     },
     /// Recover a crashed task.
     Recover { task_id: String },
@@ -771,8 +773,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             port,
             issue_token,
             pairing,
+            discovery,
         } => {
-            return serve::run(port, issue_token.as_deref(), pairing);
+            return serve::run(port, issue_token.as_deref(), pairing, discovery);
         }
         _ => {}
     }

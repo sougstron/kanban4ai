@@ -92,4 +92,11 @@ if [ "$with_serve" -eq 1 ]; then
         "$unit_src" >"$unit_dest"
     printf '%s\n' "installed user unit $unit_dest (not enabled)"
     printf '%s\n' "enable with: systemctl --user enable --now kanban4ai-serve.service"
+    hook_dir=${destdir}${prefix}/share/kanban4ai/systemd
+    mkdir -p "$hook_dir"
+    for hook in kanban4ai-sleep@.service kanban4ai-shutdown@.service; do
+        sed "s|/usr/bin/kanban4ai|${prefix}/bin/kanban4ai|g" \
+            "$script_dir/../packaging/systemd/$hook" >"$hook_dir/$hook"
+    done
+    printf '%s\n' "installed opt-in system hooks in $hook_dir (copy to /etc/systemd/system to enable)"
 fi

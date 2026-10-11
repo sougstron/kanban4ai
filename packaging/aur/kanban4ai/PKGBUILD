@@ -50,4 +50,7 @@ package() {
     "$pkgdir/usr/lib/systemd/user/kanban4ai.service"
   install -Dm644 packaging/systemd/kanban4ai-serve.service \
     "$pkgdir/usr/lib/systemd/user/kanban4ai-serve.service"
+  for hook in kanban4ai-sleep@.service kanban4ai-shutdown@.service; do
+    install -Dm644 "packaging/systemd/$hook" "$pkgdir/usr/lib/systemd/system/$hook"
+  done
 }
