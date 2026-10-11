@@ -511,7 +511,7 @@ fn take_message(thread: Thread, msg_id: &str) -> Option<Message> {
     thread.messages.into_iter().find(|m| m.id == msg_id)
 }
 
-fn merge_threads(current: Thread, desired: &Thread) -> Thread {
+pub(crate) fn merge_threads(current: Thread, desired: &Thread) -> Thread {
     let mut merged = current;
     let mut index: HashMap<String, usize> = merged
         .messages
@@ -572,7 +572,7 @@ fn next_msg_id_for_thread(thread: &Thread) -> String {
 }
 
 fn msg_number(id: &str) -> Option<u64> {
-    id.strip_prefix("MSG-")?.parse().ok()
+    id.strip_prefix("MSG-")?.split('@').next()?.parse().ok()
 }
 
 fn message_sort_key(message: &Message) -> (u64, &str) {
