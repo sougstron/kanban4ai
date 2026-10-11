@@ -154,6 +154,7 @@ pub struct TaskPatch {
     pub needs: Option<Option<String>>,
     pub role_profile: Option<Option<String>>,
     pub session: Option<Option<String>>,
+    pub runner: Option<Option<crate::core::sync::NodeRole>>,
 }
 
 #[derive(Debug, Clone)]
@@ -541,6 +542,9 @@ impl Operations {
             return Ok(None);
         };
         let assignment_before = launch_assignment(&task);
+        if let Some(runner) = patch.runner {
+            task.runner = runner;
+        }
         let profile_patched = patch.role_profile.is_some();
         let launch_patched = patch.ai_model.is_some()
             || patch.ai_effort.is_some()
@@ -672,6 +676,7 @@ impl Operations {
             needs: new_task.needs,
             parent_task: new_task.parent_task,
             role_profile: new_task.role_profile,
+            runner: new_task.runner,
         })
     }
 
@@ -2190,6 +2195,7 @@ impl Operations {
             // is copied and stays pinned.
             let inherit_explicit = candidate.is_none() && parent.explicit_assignment;
             let new_task = NewTask {
+                runner: parent.runner,
                 title: node.title.trim().to_string(),
                 description: node.description.trim().to_string(),
                 // A candidate is the node's whole assignment — a field it

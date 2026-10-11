@@ -840,6 +840,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 needs: None,
                 parent_task: None,
                 role_profile: None,
+                runner: None,
             })?;
             println!("Created task {}: {}", task.id, task.title);
             if let Some(chained_to) = &task.chained_to {

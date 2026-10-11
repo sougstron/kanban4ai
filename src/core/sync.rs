@@ -26,6 +26,22 @@ pub use transport::{Page, Snapshot, install_snapshot};
 type Fields = BTreeMap<String, Value>;
 pub type VersionVector = BTreeMap<String, u64>;
 
+thread_local! {
+    static REQUEST_ACTOR: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// HTTP requests must not inherit the serve process's agent environment.
+pub(crate) fn with_actor<T>(actor: &'static str, action: impl FnOnce() -> T) -> T {
+    struct Reset(Option<&'static str>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            REQUEST_ACTOR.set(self.0);
+        }
+    }
+    let _reset = Reset(REQUEST_ACTOR.replace(Some(actor)));
+    action()
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeRole {
@@ -703,12 +719,16 @@ pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
             id,
             set,
             prev,
-            actor: if std::env::var_os("KANBAN_SESSION").is_some() {
-                "agent"
-            } else {
-                "human"
-            }
-            .into(),
+            actor: REQUEST_ACTOR
+                .get()
+                .unwrap_or_else(|| {
+                    if std::env::var_os("KANBAN_SESSION").is_some() {
+                        "agent"
+                    } else {
+                        "human"
+                    }
+                })
+                .into(),
         };
         apply_meta(&mut state, &op);
         if target.entity == "message" && after.is_null() {

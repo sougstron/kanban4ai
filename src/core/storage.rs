@@ -236,6 +236,7 @@ impl Storage {
         let _guard = self.lock()?;
         let task_id = self.get_next_id()?;
         let mut task = Task::new(task_id.clone(), new_task.title);
+        task.runner = new_task.runner;
         task.description = new_task.description;
         task.ai_model = new_task.ai_model;
         task.ai_effort = new_task.ai_effort;
@@ -643,6 +644,7 @@ pub struct NewTask {
     pub needs: Option<String>,
     pub parent_task: Option<String>,
     pub role_profile: Option<String>,
+    pub runner: Option<crate::core::sync::NodeRole>,
 }
 
 impl NewTask {
