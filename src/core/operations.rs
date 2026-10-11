@@ -2929,6 +2929,9 @@ impl Operations {
         if !self.auto_launch_enabled()? || !self.config.get_rule("resume_after_last_answer")? {
             return Ok(None);
         }
+        if !crate::core::sync::remote_runs(&self.storage.project_path, task_id)?.is_empty() {
+            return Ok(None);
+        }
 
         let session_mgr = self.session_manager();
         {

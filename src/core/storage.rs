@@ -487,7 +487,16 @@ impl Storage {
     /// The same signature over `sessions/` alone: heartbeats, waits, closes
     /// and crashes all rewrite a session file.
     pub fn sessions_fingerprint(&self) -> Fingerprint {
-        dir_fingerprint(&self.sessions_dir)
+        let local = dir_fingerprint(&self.sessions_dir);
+        let Some(store) = crate::core::sync::store_for_board(&self.project_path) else {
+            return local;
+        };
+        let remote = dir_fingerprint(&store.join("sync/meta"));
+        (
+            local.0 + remote.0,
+            local.1.max(remote.1),
+            local.2.saturating_add(remote.2),
+        )
     }
 
     /// [`Self::tui_fingerprint`] split by source, so a reader can tell a
@@ -497,7 +506,7 @@ impl Storage {
         BoardStamps {
             tasks: self.tasks_fingerprint(),
             threads: dir_fingerprint(&self.threads_dir),
-            sessions: dir_fingerprint(&self.sessions_dir),
+            sessions: self.sessions_fingerprint(),
         }
     }
 

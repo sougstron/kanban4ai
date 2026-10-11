@@ -1238,6 +1238,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             if let Some(session) = &task.session {
                 println!("Session: {session}");
             }
+            for run in crate::core::sync::remote_runs(ops.data_root(), &task.id)? {
+                println!(
+                    "Run: {} · {} · {}",
+                    run.label(),
+                    run.phase,
+                    run.branch.as_deref().unwrap_or("-")
+                );
+            }
             println!("Created: {}", timefmt::format(&task.created_at));
             println!("Updated: {}", timefmt::format(&task.updated_at));
             if !task.description.is_empty() {

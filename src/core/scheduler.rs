@@ -255,6 +255,11 @@ impl Operations {
 
         let mut dispatched = Vec::new();
         for candidate in candidates {
+            if !crate::core::sync::remote_runs(&self.storage.project_path, &candidate.id)?
+                .is_empty()
+            {
+                continue;
+            }
             let Ok((settings, next_phase)) = upcoming_run_plan(&config, &candidate) else {
                 continue;
             };
@@ -406,6 +411,9 @@ impl Operations {
         let _guard = self.storage.lock()?;
         let mut due = Vec::new();
         for mut task in self.storage.list_tasks(Some("in_progress"))? {
+            if !crate::core::sync::remote_runs(&self.storage.project_path, &task.id)?.is_empty() {
+                continue;
+            }
             let Some(restart_at) = task.restart_at else {
                 continue;
             };

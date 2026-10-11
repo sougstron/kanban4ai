@@ -140,6 +140,7 @@ pub struct BoardSnapshot {
     pub session_deadlines: HashMap<String, chrono::NaiveDateTime>,
     pub session_wait_deadlines: HashMap<String, chrono::NaiveDateTime>,
     pub session_wait_notes: HashMap<String, String>,
+    pub remote_runs: HashMap<String, Vec<crate::core::sync::RunDescriptor>>,
     /// Suggestion count per task thread (any status), shown in the card's
     /// top-right corner. Carries the thread stamp so the next rebuild only
     /// re-parses changed threads.
@@ -3825,6 +3826,9 @@ impl App {
     /// bar does not advertise — pressing `Q` on a Done card used to reach
     /// `enqueue_task` just to be rejected by it.
     pub(super) fn queue_action_for(&self, task: &Task) -> Option<UiAction> {
+        if self.board.remote_runs.contains_key(&task.id) {
+            return None;
+        }
         if task.run_phase == Some(RunPhase::Queued) {
             return Some(UiAction::Dequeue);
         }
@@ -6699,6 +6703,7 @@ impl BoardSnapshot {
             session_deadlines: HashMap::new(),
             session_wait_deadlines: HashMap::new(),
             session_wait_notes: HashMap::new(),
+            remote_runs: HashMap::new(),
             suggestions: HashMap::new(),
             designer_bot: false,
             reviewer_bot: false,
@@ -6777,6 +6782,7 @@ impl BoardSnapshot {
             session_deadlines: sessions.deadlines,
             session_wait_deadlines: sessions.wait_deadlines,
             session_wait_notes: sessions.wait_notes,
+            remote_runs: sessions.remote_runs,
             suggestions,
             designer_bot: orch.designer.enabled,
             reviewer_bot: orch.reviewer.enabled,
@@ -6806,6 +6812,7 @@ impl BoardSnapshot {
             self.session_deadlines = sessions.deadlines;
             self.session_wait_deadlines = sessions.wait_deadlines;
             self.session_wait_notes = sessions.wait_notes;
+            self.remote_runs = sessions.remote_runs;
         }
         if threads_changed {
             let mut suggestions = HashMap::new();
@@ -6852,6 +6859,7 @@ struct SessionView {
     deadlines: HashMap<String, chrono::NaiveDateTime>,
     wait_deadlines: HashMap<String, chrono::NaiveDateTime>,
     wait_notes: HashMap<String, String>,
+    remote_runs: HashMap<String, Vec<crate::core::sync::RunDescriptor>>,
 }
 
 impl SessionView {
@@ -6886,6 +6894,12 @@ impl SessionView {
             deadlines: HashMap::new(),
             wait_deadlines: HashMap::new(),
             wait_notes: HashMap::new(),
+            remote_runs: crate::core::sync::remote_runs_for_tasks(
+                &ops.storage.project_path,
+                tasks.iter().map(|task| task.id.as_str()),
+            )?
+            .into_iter()
+            .collect(),
         };
         for task in tasks {
             let Some((_, state, deadline, note)) = own_session(task) else {
@@ -6912,6 +6926,7 @@ impl SessionView {
                 && task.run_phase != Some(RunPhase::Queued)
                 && let Some(session_id) = task.session.as_deref()
                 && !view.states.contains_key(&task.id)
+                && !view.remote_runs.contains_key(&task.id)
                 && !(task.has_questions && ops.first_open_question(&task.id)?.is_some())
                 && session_mgr.load_session(session_id).is_none()
             {
