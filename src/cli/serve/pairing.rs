@@ -58,6 +58,10 @@ struct SecretPeer {
     node_id: String,
     token: String,
     inbound_sha256: String,
+    #[serde(default)]
+    address: Option<SocketAddr>,
+    #[serde(default)]
+    addresses: Vec<SocketAddr>,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +152,8 @@ fn install(store: &ProjectStore, peer: &Card, inbound: &str, outbound: &str) -> 
         node_id: peer.node.node_id.clone(),
         token: outbound.into(),
         inbound_sha256: hash,
+        address: Some(peer.address),
+        addresses: Vec::new(),
     });
     let mut config: serde_yaml_ng::Value = load(&root.join("config.yaml"))?;
     if config.is_null() {

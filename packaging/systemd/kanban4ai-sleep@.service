@@ -1,0 +1,18 @@
+# System unit, opt-in: systemctl enable kanban4ai-sleep@USERNAME.service
+[Unit]
+Description=Notify kanban4ai peers before sleep and after resume (%i)
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+User=%i
+RemainAfterExit=yes
+ExecStart=-/usr/bin/kanban4ai serve --bye sleep
+ExecStop=-/usr/bin/kanban4ai serve --hello
+TimeoutStartSec=20
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=sleep.target

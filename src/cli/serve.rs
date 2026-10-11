@@ -27,7 +27,9 @@ use crate::core::error::{KanbanError, Result};
 use crate::core::project::ProjectStore;
 use crate::core::storage::{atomic_write_text_raw, lock_file_reentrant};
 
+mod discovery;
 mod pairing;
+pub use discovery::DiscoveryOptions;
 pub use pairing::PairingOptions;
 
 const PROTO: u32 = 1;
@@ -244,11 +246,19 @@ async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: N
         );
     }
     request.extensions_mut().insert(kind);
+    request.extensions_mut().insert(hash);
     next.run(request).await
 }
 
 fn router(tokens: PathBuf) -> Router {
     let protected = Router::new()
+        .merge(discovery::routes(
+            tokens
+                .parent()
+                .and_then(Path::parent)
+                .unwrap_or(Path::new("."))
+                .to_path_buf(),
+        ))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "NOT_FOUND", "Unknown endpoint") })
         .layer(middleware::from_fn_with_state(tokens.clone(), authenticate));
     Router::new()
@@ -295,6 +305,7 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
     for address in addresses(networks, port)? {
         listeners.push(TcpListener::bind(address).await?);
     }
+    let discovery = discovery::start(root, networks, port).await?;
     let (stop, _) = watch::channel(false);
     let mut tasks = JoinSet::new();
     for listener in listeners {
@@ -317,6 +328,7 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
             _ => Err(invalid("HTTP listener stopped unexpectedly")),
         }
     };
+    discovery.stop().await;
     let _ = stop.send(true);
     let drain = async {
         while let Some(task) = tasks.join_next().await {
@@ -340,6 +352,7 @@ pub fn run(
     port: Option<u16>,
     token_kind: Option<&str>,
     pairing: PairingOptions,
+    discovery_options: DiscoveryOptions,
 ) -> Result<ExitCode> {
     let store = ProjectStore::open()?;
     if let Some(kind) = token_kind {
@@ -355,6 +368,9 @@ pub fn run(
         return Ok(ExitCode::SUCCESS);
     }
     if pairing::run(&store, &pairing)? {
+        return Ok(ExitCode::SUCCESS);
+    }
+    if discovery::run(&store, discovery_options)? {
         return Ok(ExitCode::SUCCESS);
     }
     let global = store.load_global_config()?;
@@ -397,7 +413,8 @@ mod tests {
     #[test]
     fn authentication_is_fail_closed_and_revocation_is_immediate() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.yaml");
+        fs::create_dir_all(dir.path().join("sync")).unwrap();
+        let path = dir.path().join("sync/tokens.yaml");
         let node = "a".repeat(64);
         let client = "b".repeat(64);
         let app = router(path.clone());
@@ -451,7 +468,7 @@ mod tests {
                     Some("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"),
                     StatusCode::UNAUTHORIZED,
                 ),
-                ("/node", Some(node.as_str()), StatusCode::NOT_FOUND),
+                ("/node", Some(node.as_str()), StatusCode::OK),
                 (
                     "/api/v1/tasks",
                     Some(client.as_str()),
