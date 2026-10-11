@@ -217,12 +217,15 @@ fn validate(op: &Operation, store: &str) -> Result<()> {
     }
     if !matches!(
         op.entity.as_str(),
-        "task" | "message" | "project" | "config" | "tombstone" | "restore" | "lease"
+        "task" | "message" | "project" | "config" | "tombstone" | "restore" | "lease" | "run"
     ) {
         return Err(invalid("unsupported sync entity"));
     }
     if op.entity == "lease" {
         lease::decode(op)?;
+    }
+    if op.entity == "run" {
+        run::validate(op)?;
     }
     if (op.entity == "tombstone" || op.entity == "restore")
         && !matches!(
@@ -501,6 +504,11 @@ fn project_files(
             continue;
         }
         let path = match entity.as_str() {
+            "run" => {
+                let (path, text) = run::projection(&store.join("sync"), &project, &id, fields)?;
+                writes.insert(path, Some(text));
+                continue;
+            }
             "task" => {
                 let tasks = old_root.join(".kanban/tasks");
                 let mut existing = None;

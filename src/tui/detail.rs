@@ -63,6 +63,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let session_state = app.board.session_states.get(&task.id).copied();
     let wait_deadline = app.board.session_wait_deadlines.get(&task.id).copied();
     let wait_note = app.board.session_wait_notes.get(&task.id).cloned();
+    let remote_label = app.board.remote_runs.get(&task.id).map(|runs| {
+        runs.iter()
+            .map(|run| format!("{} · {}", run.label(), run.phase))
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
     let open_questions = detail
         .open_questions()
         .into_iter()
@@ -121,6 +127,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         waiting,
         wait_deadline,
         wait_note: wait_note.as_deref(),
+        remote_label: remote_label.as_deref(),
         session_state,
         worktree_path: task
             .worktree
@@ -302,6 +309,7 @@ struct MetaState<'a> {
     wait_note: Option<&'a str>,
     session_state: Option<SessionState>,
     worktree_path: Option<String>,
+    remote_label: Option<&'a str>,
 }
 
 fn render_meta(
@@ -328,7 +336,11 @@ fn render_meta(
             task.run_phase
                 .map(|phase| format!(" · {phase}"))
                 .unwrap_or_default(),
-            sanitize_terminal_text(task.session.as_deref().unwrap_or("-")),
+            sanitize_terminal_text(
+                meta_state
+                    .remote_label
+                    .unwrap_or_else(|| task.session.as_deref().unwrap_or("-"))
+            ),
             task.interactive
         )),
         Line::from(format!(

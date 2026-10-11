@@ -14,9 +14,12 @@ use super::storage::{atomic_write_text_raw, lock_file_reentrant};
 
 mod apply;
 mod lease;
+mod run;
 pub use apply::Conflict;
 pub use lease::IdLease;
 pub(crate) use lease::allocate as allocate_task_id;
+pub use run::{RunDescriptor, RunState, remote_runs};
+pub(crate) use run::{remote_runs_for_tasks, store_for_board};
 
 type Fields = BTreeMap<String, Value>;
 pub type VersionVector = BTreeMap<String, u64>;
@@ -311,6 +314,12 @@ impl Journal {
         }
         file.sync_all()?;
         atomic_write_text_raw(&self.root.join("meta/state.json"), &json(&pending.state)?)?;
+        for op in pending.operations.iter().filter(|op| op.entity == "run") {
+            let fields = &pending.state.fields[&key(&op.project, "run", &op.id)];
+            let (path, text) = run::projection(&self.root, &op.project, &op.id, fields)?;
+            fs::create_dir_all(path.parent().expect("run parent"))?;
+            atomic_write_text_raw(&path, &text)?;
+        }
         if let Some(op) = pending.operations.last() {
             atomic_write_text_raw(&self.root.join("hlc"), &json(&op.hlc)?)?;
         }
@@ -417,6 +426,8 @@ fn target(path: &Path) -> Option<Target> {
                 "task"
             } else if text.starts_with(".kanban/threads/") && text.ends_with(".yaml") {
                 "message"
+            } else if text.starts_with(".kanban/sessions/") && text.ends_with(".yaml") {
+                "session"
             } else {
                 return None;
             };
@@ -487,6 +498,10 @@ fn fields(value: &Value, entity: &str, global: bool) -> Fields {
             "base_commit",
             "integration",
             "cleanup_retry_at",
+            "run_phase",
+            "crash_restarts",
+            "restart_at",
+            "auto_resumes",
         ],
         "project" => &["work_path", "migrated_from", "last_opened_at"],
         "config" if global => &["node", "sync", "serve", "daemon", "tui", "recent_models"],
@@ -557,6 +572,17 @@ pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
         .map(|s| parse(s, target.entity))
         .transpose()?
         .unwrap_or(Value::Null);
+    let mut clock: Hlc = load(&journal.root.join("hlc"))?;
+    let mut operations = Vec::new();
+    run::capture(
+        &journal,
+        &target,
+        &project,
+        (&before, &after),
+        &mut state,
+        &mut clock,
+        &mut operations,
+    )?;
     let mut changes = Vec::new();
     if target.entity == "message" {
         let old: BTreeMap<String, Value> = before
@@ -601,11 +627,9 @@ pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
                 new.get(id).cloned().unwrap_or(Value::Null),
             ));
         }
-    } else {
+    } else if target.entity != "session" {
         changes.push((target.id.clone(), before, after));
     }
-    let mut clock: Hlc = load(&journal.root.join("hlc"))?;
-    let mut operations = Vec::new();
     for (display_id, before, after) in changes {
         let old = fields(&before, target.entity, target.project.is_empty());
         let new = fields(&after, target.entity, target.project.is_empty());

@@ -278,6 +278,11 @@ pub fn badges(
     app: &App,
 ) -> Vec<(String, ratatui::style::Color)> {
     let mut badges = Vec::new();
+    if let Some(runs) = app.board.remote_runs.get(&task.id) {
+        for run in runs {
+            badges.push((run.label(), app.theme.focus));
+        }
+    }
     // Conflict is the one blocking isolation state (the report sits in
     // review_edits and a human must resolve it), so it leads the card and
     // displaces the plain worktree badge it implies.
