@@ -118,6 +118,7 @@ impl Journal {
             apply_meta(&mut state, op);
             changed = true;
         }
+        lease::validate_state(&state)?;
         if !changed {
             return conflicts(&state);
         }
@@ -216,9 +217,12 @@ fn validate(op: &Operation, store: &str) -> Result<()> {
     }
     if !matches!(
         op.entity.as_str(),
-        "task" | "message" | "project" | "config" | "tombstone" | "restore"
+        "task" | "message" | "project" | "config" | "tombstone" | "restore" | "lease"
     ) {
         return Err(invalid("unsupported sync entity"));
+    }
+    if op.entity == "lease" {
+        lease::decode(op)?;
     }
     if (op.entity == "tombstone" || op.entity == "restore")
         && !matches!(
