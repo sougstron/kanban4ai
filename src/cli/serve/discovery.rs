@@ -23,16 +23,20 @@ pub struct DiscoveryOptions {
     /// Notify peers after resume; also sent automatically on serve startup.
     #[arg(long, conflicts_with_all = ["issue_token", "pair_code", "pair", "revoke_token", "phone_qr"])]
     hello: bool,
+    /// Run one sync cycle with every paired peer and exit (serve does this
+    /// continuously on its own).
+    #[arg(long, conflicts_with_all = ["issue_token", "pair_code", "pair", "revoke_token", "phone_qr"])]
+    sync: bool,
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(default)]
-struct Config {
-    home_networks: Vec<IpNet>,
-    probe_timeout: u64,
-    interval: u64,
-    max_skew: u64,
-    peers: Vec<PeerCard>,
+pub(super) struct Config {
+    pub(super) home_networks: Vec<IpNet>,
+    pub(super) probe_timeout: u64,
+    pub(super) interval: u64,
+    pub(super) max_skew: u64,
+    pub(super) peers: Vec<PeerCard>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -46,15 +50,15 @@ impl Default for Config {
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct PeerCard {
+pub(super) struct PeerCard {
     #[serde(flatten)]
-    node: NodeIdentity,
-    address: SocketAddr,
+    pub(super) node: NodeIdentity,
+    pub(super) address: SocketAddr,
 }
 #[derive(Deserialize)]
-struct Credential {
-    node_id: String,
-    token: String,
+pub(super) struct Credential {
+    pub(super) node_id: String,
+    pub(super) token: String,
     inbound_sha256: String,
     #[serde(default)]
     address: Option<SocketAddr>,
@@ -62,16 +66,16 @@ struct Credential {
     addresses: Vec<SocketAddr>,
 }
 #[derive(Clone, Serialize, Deserialize)]
-struct Bye {
+pub(super) struct Bye {
     reason: String,
-    at: DateTime<Utc>,
+    pub(super) at: DateTime<Utc>,
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
-struct Presence {
+pub(super) struct Presence {
     #[serde(default)]
-    last_seen: Option<DateTime<Utc>>,
+    pub(super) last_seen: Option<DateTime<Utc>>,
     #[serde(default)]
-    bye: Option<Bye>,
+    pub(super) bye: Option<Bye>,
     #[serde(default)]
     discovered: Vec<SocketAddr>,
 }
@@ -101,14 +105,14 @@ struct NodeCard {
     wol: Option<serde_json::Value>,
 }
 
-fn load<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
+pub(super) fn load<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(serde_yaml_ng::from_str(&text)?),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e.into()),
     }
 }
-fn config(root: &Path) -> Result<Config> {
+pub(super) fn config(root: &Path) -> Result<Config> {
     let global = ProjectStore::at(root).load_global_config()?;
     let config: Config = global
         .extras
@@ -124,20 +128,24 @@ fn config(root: &Path) -> Result<Config> {
     }
     Ok(config)
 }
-fn update_presence(root: &Path, id: &str, update: impl FnOnce(&mut Presence)) -> Result<()> {
+pub(super) fn update_presence(
+    root: &Path,
+    id: &str,
+    update: impl FnOnce(&mut Presence),
+) -> Result<()> {
     let _lock = lock_file_reentrant(&root.join("sync/.lock"))?;
     let path = root.join("sync/presence.yaml");
     let mut state: BTreeMap<String, Presence> = load(&path)?;
     update(state.entry(id.into()).or_default());
     atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&state)?)
 }
-fn in_lan(config: &Config) -> Result<bool> {
+pub(super) fn in_lan(config: &Config) -> Result<bool> {
     Ok(if_addrs::get_if_addrs()?.iter().any(|i| {
         let ip = i.ip();
         !ip.is_loopback() && allowed(ip, &config.home_networks)
     }))
 }
-fn peer_addresses(
+pub(super) fn peer_addresses(
     peer: &PeerCard,
     secret: Option<&Credential>,
     presence: &Presence,
@@ -385,7 +393,7 @@ pub(super) fn routes(root: PathBuf) -> Router {
             started_at: Utc::now(),
         })
 }
-fn caller(root: &Path, hash: &str) -> Result<String> {
+pub(super) fn caller(root: &Path, hash: &str) -> Result<String> {
     let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
     credentials
         .into_iter()
@@ -498,7 +506,11 @@ async fn hello(State(state): State<HttpState>, Extension(hash): Extension<String
         p.last_seen = Some(Utc::now());
         p.bye = None;
     }) {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Ok(()) => {
+            // The peer is back: catch up now instead of at the next interval.
+            super::sync::kick();
+            Json(json!({"ok": true})).into_response()
+        }
         Err(e) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "INTERNAL_ERROR",
@@ -510,6 +522,14 @@ async fn notify(root: &Path, reason: Option<&str>) -> Result<()> {
     let config = config(root)?;
     if !in_lan(&config)? {
         return Ok(());
+    }
+    if reason.is_some() {
+        // Push the journal tail first; an unreachable peer must not block sleep.
+        for (peer, result) in super::sync::once(root, false).await? {
+            if let Err(e) = result {
+                eprintln!("sync {peer} before bye: {e}");
+            }
+        }
     }
     let http = client(&config)?;
     let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
@@ -586,6 +606,7 @@ async fn rediscovered(root: &Path, discovered: Discovered) -> Result<()> {
     let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
     let secret = credentials.iter().find(|c| c.node_id == discovered.node_id);
     probe_peer(root, &config, peer, secret, &presence, in_lan(&config)?).await?;
+    super::sync::kick();
     Ok(())
 }
 
@@ -746,7 +767,12 @@ pub(super) async fn start(root: &Path, networks: &[IpNet], port: u16) -> Result<
     Ok(Running { daemon, worker })
 }
 pub(super) fn run(store: &ProjectStore, options: DiscoveryOptions) -> Result<bool> {
-    if !options.discover && !options.probe && options.bye.is_none() && !options.hello {
+    if !options.discover
+        && !options.probe
+        && options.bye.is_none()
+        && !options.hello
+        && !options.sync
+    {
         return Ok(false);
     }
     tokio::runtime::Builder::new_multi_thread()
@@ -765,6 +791,20 @@ pub(super) fn run(store: &ProjectStore, options: DiscoveryOptions) -> Result<boo
                     serde_json::to_string_pretty(&probes(store.root()).await?)
                         .map_err(|e| invalid(e.to_string()))?
                 );
+            } else if options.sync {
+                let mut failed = Vec::new();
+                for (peer, result) in super::sync::once(store.root(), true).await? {
+                    match result {
+                        Ok(()) => println!("synced with {peer}"),
+                        Err(e) => {
+                            eprintln!("sync {peer}: {e}");
+                            failed.push(peer);
+                        }
+                    }
+                }
+                if !failed.is_empty() {
+                    return Err(invalid(format!("Cannot sync with: {}", failed.join(", "))));
+                }
             } else {
                 notify(store.root(), options.bye.as_deref()).await?;
             }

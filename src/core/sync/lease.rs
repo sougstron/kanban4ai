@@ -81,7 +81,10 @@ pub(super) fn validate_state(state: &JournalState) -> Result<()> {
     Ok(())
 }
 
-fn grants<'a>(state: &'a JournalState, project: &str) -> Result<Vec<(&'a Operation, IdLease)>> {
+pub(super) fn grants<'a>(
+    state: &'a JournalState,
+    project: &str,
+) -> Result<Vec<(&'a Operation, IdLease)>> {
     let mut result = state
         .operations
         .values()
@@ -90,6 +93,39 @@ fn grants<'a>(state: &'a JournalState, project: &str) -> Result<Vec<(&'a Operati
         .collect::<Result<Vec<_>>>()?;
     result.sort_by_key(|(_, lease)| lease.from);
     Ok(result)
+}
+
+/// Before any grant exists, only one paired node may issue the first grants
+/// and keep the legacy `max + 1`: the laptop (bootstrap source), with node_id
+/// as the tie-breaker. Unpaired stores keep the legacy behavior.
+pub(super) fn fallback_issuer(store: &Path, node: &NodeIdentity) -> Result<bool> {
+    let config: Value = match fs::read_to_string(store.join("config.yaml")) {
+        Ok(text) => serde_yaml_ng::from_str(&text)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(e) => return Err(e.into()),
+    };
+    let rank = |role: &str, id: &str| (role != "laptop", id.to_owned());
+    let own = rank(
+        match node.role {
+            NodeRole::Laptop => "laptop",
+            NodeRole::Server => "server",
+        },
+        &node.node_id,
+    );
+    Ok(config
+        .get("sync")
+        .and_then(|sync| sync.get("peers"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|peer| {
+            Some(rank(
+                peer.get("role")?.as_str()?,
+                peer.get("node_id")?.as_str()?,
+            ))
+        })
+        .filter(|peer| peer.1 != node.node_id)
+        .all(|peer| own < peer))
 }
 
 fn maximum(state: &JournalState, project: &str, existing: u64) -> u64 {
@@ -324,13 +360,19 @@ pub(crate) fn allocate(board: &Storage) -> Result<Option<String>> {
     let _sync = lock_file_reentrant(&journal.root.join(".lock"))?;
     journal.recover()?;
     let state: JournalState = load(&journal.root.join("meta/state.json"))?;
-    let Some(uid) = state.project_uids.get(&target.project) else {
-        return Ok(None);
+    let uid = state.project_uids.get(&target.project);
+    let all = match uid {
+        Some(uid) => grants(&state, uid)?,
+        None => Vec::new(),
     };
-    let all = grants(&state, uid)?;
-    if all.is_empty() {
-        return Ok(None);
-    }
+    let Some(uid) = uid.filter(|_| !all.is_empty()) else {
+        if fallback_issuer(&target.store, &journal.node)? {
+            return Ok(None);
+        }
+        return Err(invalid(
+            "SYNC_ID_BLOCK_EXHAUSTED: waiting for the first task ID lease from the paired laptop",
+        ));
+    };
     let allocation_path = journal.root.join("meta/allocation.json");
     let mut allocation: Allocation = load(&allocation_path)?;
     for (op, lease) in all {

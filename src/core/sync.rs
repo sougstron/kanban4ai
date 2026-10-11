@@ -15,11 +15,13 @@ use super::storage::{atomic_write_text_raw, lock_file_reentrant};
 mod apply;
 mod lease;
 mod run;
+mod transport;
 pub use apply::Conflict;
 pub use lease::IdLease;
 pub(crate) use lease::allocate as allocate_task_id;
 pub use run::{RunDescriptor, RunState, remote_runs};
 pub(crate) use run::{remote_runs_for_tasks, store_for_board};
+pub use transport::{Page, Snapshot, install_snapshot};
 
 type Fields = BTreeMap<String, Value>;
 pub type VersionVector = BTreeMap<String, u64>;
@@ -156,6 +158,7 @@ impl Journal {
     pub fn open(store: &Path) -> Result<Self> {
         let root = store.join("sync");
         fs::create_dir_all(&root)?;
+        transport::recover_bootstrap(store)?;
         apply::recover_remote(&root)?;
         let _guard = lock_file_reentrant(&root.join(".lock"))?;
         let path = root.join("node.yaml");
@@ -489,8 +492,8 @@ fn flatten(value: &Value, prefix: &str, fields: &mut Fields) {
     }
 }
 
-fn fields(value: &Value, entity: &str, global: bool) -> Fields {
-    let local: &[&str] = match entity {
+fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
+    match entity {
         "task" => &[
             "session",
             "worktree",
@@ -506,7 +509,11 @@ fn fields(value: &Value, entity: &str, global: bool) -> Fields {
         "project" => &["work_path", "migrated_from", "last_opened_at"],
         "config" if global => &["node", "sync", "serve", "daemon", "tui", "recent_models"],
         _ => &[],
-    };
+    }
+}
+
+fn fields(value: &Value, entity: &str, global: bool) -> Fields {
+    let local = local_fields(entity, global);
     let mut result = Fields::new();
     if let Some(map) = value.as_object() {
         for (field, value) in map {
