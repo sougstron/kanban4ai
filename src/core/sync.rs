@@ -13,7 +13,10 @@ use super::error::{KanbanError, Result};
 use super::storage::{atomic_write_text_raw, lock_file_reentrant};
 
 mod apply;
+mod lease;
 pub use apply::Conflict;
+pub use lease::IdLease;
+pub(crate) use lease::allocate as allocate_task_id;
 
 type Fields = BTreeMap<String, Value>;
 pub type VersionVector = BTreeMap<String, u64>;
