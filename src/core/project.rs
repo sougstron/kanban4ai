@@ -487,7 +487,26 @@ impl ProjectStore {
 
     fn write_project(&self, project: &Project) -> Result<()> {
         fs::create_dir_all(&project.data_root)?;
-        let yaml = serde_yaml_ng::to_string(&ProjectFile::from(project))?;
+        let mut value = serde_yaml_ng::to_value(ProjectFile::from(project))?;
+        let repo = if !project.work_path.as_os_str().is_empty() && project.work_path.is_dir() {
+            crate::core::vcs::detect(&project.work_path)
+        } else {
+            None
+        };
+        let remote = match repo {
+            Some(repo) => repo.code_remote()?,
+            None => match fs::read_to_string(project.data_root.join(PROJECT_FILE)) {
+                Ok(text) => serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text)?["git_remote"]
+                    .as_str()
+                    .map(str::to_owned),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            },
+        };
+        if let Some(remote) = remote {
+            value["git_remote"] = remote.into();
+        }
+        let yaml = serde_yaml_ng::to_string(&value)?;
         let yaml = timefmt::quote_yaml_timestamp_fields(&yaml, &["created_at", "last_opened_at"]);
         atomic_write_text(&project.data_root.join(PROJECT_FILE), &yaml)
     }

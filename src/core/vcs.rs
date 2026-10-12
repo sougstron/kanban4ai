@@ -23,9 +23,9 @@ use tempfile::NamedTempFile;
 
 use super::error::{KanbanError, Result};
 
-/// The spine ref: never in `refs/heads`, never checked out, never pushed.
-/// It gives concurrent tasks a common ancestor that includes the human's
-/// uncommitted work.
+/// The spine ref: never in `refs/heads`, never checked out.
+/// Paired nodes exchange it through code bundles or the project remote.
+/// It gives concurrent tasks a common ancestor including the human's live work.
 pub const INTEGRATION_REF: &str = "refs/kanban/integration";
 
 /// `git merge-tree --write-tree` (object-database 3-way merge) requires 2.38.
@@ -263,6 +263,190 @@ impl GitRepo {
     /// The work tree root this repo was detected at.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Preferred code remote; never interprets remote names as command options.
+    pub fn code_remote(&self) -> Result<Option<String>> {
+        let out = require(self.git(&["remote"])?, "remote")?;
+        let names = String::from_utf8_lossy(&out.stdout);
+        let name = names
+            .lines()
+            .find(|n| *n == "origin")
+            .or_else(|| names.lines().next());
+        match name {
+            Some(name) => {
+                let out = require(
+                    self.git(&["remote", "get-url", "--", name])?,
+                    "remote get-url",
+                )?;
+                Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_owned()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Export all history needed for a first clone, plus the live spine and task refs.
+    /// `have` contains verified commit IDs, not arbitrary revision expressions.
+    pub fn code_bundle(&self, destination: &Path, have: &[String], live: bool) -> Result<()> {
+        self.capture_code_snapshot(live)?;
+        let mut args = vec![
+            s("bundle"),
+            s("create"),
+            destination.as_os_str(),
+            s("HEAD"),
+            s("--branches"),
+            s(INTEGRATION_REF),
+        ];
+        let exclusions: Vec<String> = have
+            .iter()
+            .map(|oid| {
+                if oid_from(oid).is_none() {
+                    return Err(KanbanError::Invalid("Invalid bundle prerequisite".into()));
+                }
+                Ok(format!("^{oid}"))
+            })
+            .collect::<Result<_>>()?;
+        for exclusion in &exclusions {
+            args.push(s(exclusion));
+        }
+        require(run(&self.root, &args, None)?, "bundle create")?;
+        Ok(())
+    }
+
+    pub fn capture_code_snapshot(&self, live: bool) -> Result<()> {
+        let previous = self.integration_ref()?;
+        if live || previous.is_none() {
+            let parent = previous.as_ref().map(Oid::as_str).unwrap_or("HEAD");
+            let snapshot = self.snapshot(parent, "kanban: transfer live working directory")?;
+            self.set_integration_ref(&snapshot)?;
+        }
+        Ok(())
+    }
+
+    /// Clone without local hardlinks; fetching code never changes an existing checkout.
+    pub fn clone_code(source: &str, destination: &Path) -> Result<Self> {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| KanbanError::Invalid("Clone has no parent".into()))?;
+        fs::create_dir_all(parent)?;
+        require(
+            run(
+                parent,
+                &[
+                    s("clone"),
+                    s("--no-local"),
+                    s("--"),
+                    s(source),
+                    destination.as_os_str(),
+                ],
+                None,
+            )?,
+            "clone",
+        )?;
+        detect(destination)
+            .ok_or_else(|| KanbanError::Invalid("Clone is not a working repository".into()))
+    }
+
+    pub fn remove_code_origin(&self) -> Result<()> {
+        require(
+            self.git(&["remote", "remove", "origin"])?,
+            "remove bundle origin",
+        )?;
+        Ok(())
+    }
+
+    pub fn fetch_code_remote(&self, remote: &str) -> Result<()> {
+        require(
+            self.git(&[
+                "fetch",
+                "--no-tags",
+                "--",
+                remote,
+                "+refs/heads/*:refs/remotes/kanban-code/*",
+                "+refs/heads/kanban/*:refs/heads/kanban/*",
+            ])?,
+            "fetch code",
+        )?;
+        let refs = require(
+            self.git(&["ls-remote", "--", remote, INTEGRATION_REF])?,
+            "ls-remote",
+        )?;
+        if !refs.stdout.is_empty() {
+            require(
+                self.git(&[
+                    "fetch",
+                    "--no-tags",
+                    "--",
+                    remote,
+                    "+refs/kanban/integration:refs/kanban/integration",
+                ])?,
+                "fetch integration",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Publish only kanban refs; never the user's branch.
+    pub fn publish_code(&self, remote: &str) -> Result<()> {
+        let out = require(
+            self.git(&[
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/kanban/",
+                INTEGRATION_REF,
+            ])?,
+            "list code refs",
+        )?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let specs: Vec<String> = text.lines().map(|name| format!("{name}:{name}")).collect();
+        if !specs.is_empty() {
+            let mut args = vec!["push", "--", remote];
+            args.extend(specs.iter().map(String::as_str));
+            require(self.git(&args)?, "push code")?;
+        }
+        Ok(())
+    }
+
+    /// Only task branches and the integration spine may be installed from a peer.
+    /// Human branches, HEAD and the index are never overwritten.
+    pub fn import_code_bundle(&self, bundle: &Path) -> Result<()> {
+        require(
+            run(
+                &self.root,
+                &[s("bundle"), s("verify"), bundle.as_os_str()],
+                None,
+            )?,
+            "bundle verify",
+        )?;
+        let out = require(
+            run(
+                &self.root,
+                &[s("bundle"), s("list-heads"), bundle.as_os_str()],
+                None,
+            )?,
+            "bundle list-heads",
+        )?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut specs = Vec::new();
+        for line in text.lines() {
+            let Some((oid, name)) = line.split_once(' ') else {
+                continue;
+            };
+            if oid_from(oid).is_none() {
+                return Err(KanbanError::Invalid("Invalid bundle object ID".into()));
+            }
+            if name == INTEGRATION_REF || name.starts_with("refs/heads/kanban/TASK-") {
+                // Git itself validates the complete ref syntax.
+                require(self.git(&["check-ref-format", name])?, "check-ref-format")?;
+                specs.push(format!("+{name}:{name}"));
+            }
+        }
+        if !specs.is_empty() {
+            let mut args = vec![s("fetch"), s("--no-tags"), s("--"), bundle.as_os_str()];
+            args.extend(specs.iter().map(|spec| s(spec)));
+            require(run(&self.root, &args, None)?, "fetch bundle")?;
+        }
+        Ok(())
     }
 
     fn git(&self, args: &[&str]) -> Result<Output> {

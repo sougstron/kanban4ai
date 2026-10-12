@@ -15,18 +15,18 @@ keywords = ["kanban", "tui", "agents", "opencode", "claude"]
 [dependencies]
 base64 = "0.22"
 futures-util = { version = "0.3", default-features = false }
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 if-addrs = "0.15"
 ipnet = { version = "2", features = ["serde"] }
 mdns-sd = "0.13.11"
 flume = "0.11"
 flate2 = "1"
 tar = "0.4"
-reqwest = { version = "0.12", default-features = false, features = ["json", "socks", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "socks", "stream", "rustls-tls"] }
 sha2 = "0.10"
 subtle = "2"
 qrcode = { version = "0.14", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "fs", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "sync", "fs", "time", "io-util"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
 fs2 = "0.4.3"
