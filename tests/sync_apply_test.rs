@@ -375,6 +375,47 @@ fn independent_fields_drafts_and_dotted_settings_preserve_local_state() {
 }
 
 #[test]
+fn concurrent_edits_of_different_fields_do_not_conflict_on_updated_at() {
+    let (dir, journal) = apply(&[project(), task()]);
+    let mut title = op(
+        "b",
+        1,
+        3,
+        "task",
+        "TASK-001",
+        json!({"title":"renamed", "updated_at":"2026-01-01T00:00:03"}),
+    );
+    title.prev.insert("title".into(), task().hlc);
+    let mut description = op(
+        "c",
+        1,
+        4,
+        "task",
+        "TASK-001",
+        json!({"description":"edited", "updated_at":"2026-01-01T00:00:04"}),
+    );
+    description.prev.insert("description".into(), task().hlc);
+    let mut ops = vec![title, description];
+    for op in &mut ops {
+        op.store = journal.node.store_id.clone();
+    }
+    assert!(journal.apply_remote(&ops, 0).unwrap().is_empty());
+    let conflicts =
+        fs::read_to_string(dir.path().join("sync/meta/conflicts.jsonl")).unwrap_or_default();
+    assert!(conflicts.is_empty(), "{conflicts}");
+    let task = Storage::new(dir.path().join("projects/demo"))
+        .load_task("TASK-001")
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.title, "renamed");
+    assert_eq!(task.description, "edited");
+    assert_eq!(
+        task.updated_at.format("%Y-%m-%dT%H:%M:%S").to_string(),
+        "2026-01-01T00:00:04"
+    );
+}
+
+#[test]
 fn remote_answer_survives_a_stale_thread_writer() {
     use kanban4ai::core::models::{Message, MessageKind, MessageRole};
     use kanban4ai::core::thread::ThreadManager;

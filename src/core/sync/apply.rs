@@ -284,7 +284,14 @@ fn conflicts(state: &JournalState) -> Result<Vec<Conflict>> {
     let ops: Vec<_> = state.operations.values().collect();
     let mut groups: BTreeMap<(&str, &str, &str, &str), Vec<&Operation>> = BTreeMap::new();
     for op in &ops {
-        for field in op.set.keys().filter(|field| field.as_str() != "draft") {
+        // `updated_at` is stamped by every edit, so concurrent edits of
+        // different fields would otherwise always collide on it; it still
+        // merges by LWW, it just never counts as a user-visible conflict.
+        for field in op
+            .set
+            .keys()
+            .filter(|field| !matches!(field.as_str(), "draft" | "updated_at"))
+        {
             groups
                 .entry((&op.project, &op.entity, &op.id, field))
                 .or_default()

@@ -2371,6 +2371,18 @@ fn start_task_launches_fresh_session_and_blocks_double_start() {
 }
 
 #[test]
+fn start_task_back_to_back_starts_get_distinct_sessions() {
+    let (_dir, ops, recorder) = ops_with_recorder(true);
+    let first = ops.create_task(NewTask::titled("First")).unwrap();
+    let second = ops.create_task(NewTask::titled("Second")).unwrap();
+
+    let a = ops.start_task(&first.id).unwrap().unwrap();
+    let b = ops.start_task(&second.id).unwrap().unwrap();
+    assert_ne!(a, b);
+    assert_eq!(recorder.calls().len(), 2);
+}
+
+#[test]
 fn start_task_launch_failure_surfaces_error_and_rolls_back() {
     let (dir, _storage) = common::quiet_board(true);
     let ops = Operations::with_launcher(dir.path(), Box::new(FailingLauncher));
