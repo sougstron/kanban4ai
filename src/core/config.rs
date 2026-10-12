@@ -291,14 +291,15 @@ inherit:
 "#;
 
 /// Placement preference only; availability and launch routing belong to the runner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
 pub enum Runner {
     Auto,
     Server,
     Here,
     Laptop,
     Mobile,
+    Node(String),
 }
 
 impl Runner {
@@ -313,23 +314,67 @@ impl Runner {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Auto => "auto",
+            Self::Server => "server",
+            Self::Here => "here",
+            Self::Laptop => "laptop",
+            Self::Mobile => "mobile",
+            Self::Node(name) => name,
+        }
+    }
+
+    pub fn label(&self) -> &str {
         match self {
             Self::Auto => "Auto",
             Self::Server => "Сервер",
             Self::Here => "Это устройство",
             Self::Laptop => "Laptop",
             Self::Mobile => "Mobile",
+            Self::Node(name) => name,
         }
     }
 
-    pub fn node_role(self) -> Option<crate::core::sync::NodeRole> {
+    pub fn node_role(&self) -> Option<crate::core::sync::NodeRole> {
         use crate::core::sync::NodeRole;
         match self {
             Self::Server => Some(NodeRole::Server),
             Self::Laptop => Some(NodeRole::Laptop),
             Self::Mobile => Some(NodeRole::Mobile),
-            Self::Auto | Self::Here => None,
+            Self::Auto | Self::Here | Self::Node(_) => None,
+        }
+    }
+}
+
+impl From<Runner> for String {
+    fn from(value: Runner) -> Self {
+        match value {
+            Runner::Auto => "auto".into(),
+            Runner::Here => "here".into(),
+            Runner::Server => "server".into(),
+            Runner::Laptop => "laptop".into(),
+            Runner::Mobile => "mobile".into(),
+            Runner::Node(name) => name,
+        }
+    }
+}
+
+impl TryFrom<String> for Runner {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        if let Some(preference) = Self::parse(&value) {
+            return Ok(preference);
+        }
+        if !value.is_empty()
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            Ok(Self::Node(value))
+        } else {
+            Err("runner must be a placement preference or lowercase node slug".into())
         }
     }
 }
