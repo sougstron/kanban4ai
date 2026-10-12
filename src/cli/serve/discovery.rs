@@ -71,7 +71,7 @@ pub(super) struct Credential {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Bye {
-    reason: String,
+    pub(super) reason: String,
     pub(super) at: DateTime<Utc>,
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -171,6 +171,9 @@ pub(super) fn peer_addresses(
     presence: &Presence,
     config: &Config,
 ) -> Result<Vec<String>> {
+    if peer.node.outbound_only() {
+        return Ok(Vec::new());
+    }
     let mut result = presence.discovered.clone();
     if let Some(secret) = secret {
         result.extend(secret.address);
@@ -251,6 +254,10 @@ fn status(
     let since = presence.bye.as_ref().map(|bye| bye.at);
     let message = match code {
         "ONLINE" => format!("{node} в сети"),
+        "OFFLINE" => presence.last_seen.map_or_else(
+            || format!("{node}: ещё не был в сети"),
+            |at| format!("{node}: не в сети с {}", time_text(at)),
+        ),
         "NODE_OUT_OF_LAN" => format!(
             "Вы вне домашней сети — {node} недоступен. Изменения сохранятся и уйдут при возвращении"
         ),
@@ -341,6 +348,18 @@ async fn probe_peer(
     presence: &Presence,
     lan: bool,
 ) -> Result<Status> {
+    if peer.node.outbound_only() {
+        let online = presence.bye.is_none()
+            && presence.last_seen.is_some_and(|seen| {
+                (Utc::now() - seen).num_seconds() < config.interval.saturating_mul(3) as i64
+            });
+        return Ok(status(
+            peer,
+            presence,
+            if online { "ONLINE" } else { "OFFLINE" },
+            None,
+        ));
+    }
     if !lan
         && matches!(
             crate::core::net::settings(root)?.mode,
@@ -497,7 +516,7 @@ pub(super) fn caller(root: &Path, hash: &str) -> Result<String> {
 async fn node(State(state): State<HttpState>, Extension(hash): Extension<String>) -> Response {
     let result = (|| -> Result<NodeCard> {
         let journal = Journal::open(&state.root)?;
-        // A paired request is a fresh contact; client tokens do not alter peer state.
+        // A paired request is a fresh contact.
         if let Ok(id) = caller(&state.root, &hash) {
             update_presence(&state.root, &id, |p| {
                 p.last_seen = Some(Utc::now());
@@ -611,7 +630,7 @@ async fn hello(State(state): State<HttpState>, Extension(hash): Extension<String
         ),
     }
 }
-async fn notify(root: &Path, reason: Option<&str>) -> Result<()> {
+pub(super) async fn notify(root: &Path, reason: Option<&str>) -> Result<()> {
     let config = config(root)?;
     if !network_available(root, &config)? {
         return Ok(());
@@ -628,6 +647,9 @@ async fn notify(root: &Path, reason: Option<&str>) -> Result<()> {
     let presence: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
     let mut failed = Vec::new();
     for peer in &config.peers {
+        if peer.node.outbound_only() {
+            continue;
+        }
         let Some(secret) = credentials.iter().find(|s| s.node_id == peer.node.node_id) else {
             failed.push(peer.node.name.clone());
             continue;
@@ -804,11 +826,15 @@ impl Running {
 pub(super) async fn start(root: &Path, networks: &[IpNet], port: u16) -> Result<Running> {
     let config = config(root)?;
     let node = Journal::open(root)?.node;
-    let ips: Vec<_> = addresses(networks, port)?
-        .iter()
-        .map(|a| a.ip())
-        .filter(|ip| !ip.is_loopback())
-        .collect();
+    let ips: Vec<_> = if node.outbound_only() {
+        BTreeSet::new()
+    } else {
+        addresses(networks, port)?
+    }
+    .iter()
+    .map(|a| a.ip())
+    .filter(|ip| !ip.is_loopback())
+    .collect();
     let mdns = (|| -> Result<_> {
         let (daemon, receiver) = browser(networks)?;
         let role = match node.role {
@@ -968,6 +994,52 @@ mod tests {
         );
         remote.tailscale_address = Some("public.example.com:4242".into());
         assert!(peer_addresses(root.path(), &remote, None, &presence, &Config::default()).is_err());
+    }
+
+    #[test]
+    fn mobile_departure_and_stale_contact_are_neutral_even_outside_lan() {
+        runtime().block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let mut mobile = peer(root.path(), "127.0.0.1:1".parse().unwrap());
+            mobile.node.role = NodeRole::Mobile;
+            let config = Config::default();
+            let now = Utc::now();
+            for presence in [
+                Presence::default(),
+                Presence {
+                    last_seen: Some(now - chrono::Duration::seconds(91)),
+                    ..Default::default()
+                },
+                Presence {
+                    last_seen: Some(now),
+                    bye: Some(Bye {
+                        reason: "shutdown".into(),
+                        at: now,
+                    }),
+                    ..Default::default()
+                },
+            ] {
+                let result = probe_peer(root.path(), &config, &mobile, None, &presence, false)
+                    .await
+                    .unwrap();
+                assert_eq!(result.code, "OFFLINE");
+                assert_eq!(result.status, "offline");
+                assert!(!result.message.contains("не отвечает"));
+            }
+            let presence = Presence {
+                last_seen: Some(now),
+                ..Default::default()
+            };
+            let result = probe_peer(root.path(), &config, &mobile, None, &presence, true)
+                .await
+                .unwrap();
+            assert_eq!(result.code, "ONLINE");
+            assert!(
+                peer_addresses(root.path(), &mobile, None, &presence, &config)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
     }
 
     #[test]

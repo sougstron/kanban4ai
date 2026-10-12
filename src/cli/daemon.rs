@@ -36,62 +36,43 @@ pub fn run(once: bool, interval: Option<u64>, project: Option<&str>) -> Result<E
     });
 
     let mut network = crate::core::net::Manager::new(store.root())?;
+    let _sync = super::serve::Embedded::start(store.root())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    #[cfg(unix)]
-    let mut terminate = runtime.block_on(async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    })?;
-    #[cfg(unix)]
-    let mut interrupt = runtime.block_on(async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-    })?;
-    let mut state = PumpState::default();
-    loop {
-        if let Err(error) = network.tick() {
-            let line = error.to_string();
-            eprintln!("{line}");
-            append_log(&store, &line);
-        }
-        // The whole store goes through the shared pump, so an open TUI that
-        // pumps more often leaves the daemon idle instead of doubling the
-        // work; `--project` is an explicit request and always runs.
-        let lines = if project.is_some() {
-            daemon::tick(&store, project, &mut state)?
-        } else {
-            daemon::shared_tick(&store, Duration::from_secs(interval), &mut state)?
-                .unwrap_or_default()
-        };
-        for line in &lines {
-            println!("{line}");
-            append_log(&store, line);
-        }
-        if once {
-            break;
-        }
-        let stopped = runtime.block_on(async {
-            #[cfg(unix)]
-            {
-                tokio::select! {
-                    _ = terminate.recv() => true,
-                    _ = interrupt.recv() => true,
-                    _ = tokio::time::sleep(Duration::from_secs(interval)) => false,
-                }
+    runtime.block_on(async {
+        let shutdown = super::serve::shutdown_signal()?;
+        tokio::pin!(shutdown);
+        let mut state = PumpState::default();
+        loop {
+            if let Err(error) = network.tick() {
+                let line = error.to_string();
+                eprintln!("{line}");
+                append_log(&store, &line);
             }
-            #[cfg(not(unix))]
-            {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => true,
-                    _ = tokio::time::sleep(Duration::from_secs(interval)) => false,
-                }
+            // The whole store goes through the shared pump, so an open TUI that
+            // pumps more often leaves the daemon idle instead of doubling the
+            // work; `--project` is an explicit request and always runs.
+            let lines = if project.is_some() {
+                daemon::tick(&store, project, &mut state)?
+            } else {
+                daemon::shared_tick(&store, Duration::from_secs(interval), &mut state)?
+                    .unwrap_or_default()
+            };
+            for line in &lines {
+                println!("{line}");
+                append_log(&store, line);
             }
-        });
-        if stopped {
-            break;
+            if once {
+                break;
+            }
+            tokio::select! {
+                result = &mut shutdown => { result?; break; }
+                _ = tokio::time::sleep(Duration::from_secs(interval)) => (),
+            }
         }
-    }
-    Ok(ExitCode::SUCCESS)
+        Ok(ExitCode::SUCCESS)
+    })
 }
 
 fn append_log(store: &ProjectStore, line: &str) {
