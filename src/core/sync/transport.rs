@@ -325,11 +325,22 @@ fn component(part: &str) -> Result<()> {
 /// Strip machine-local fields while preserving key order and file format.
 fn replicated(text: &str, entity: &str, global: bool) -> Result<String> {
     let mut value = parse(text, entity)?;
+    let relay_encrypt = (entity == "config" && global)
+        .then(|| {
+            value
+                .get("sync")
+                .and_then(|sync| sync.get("relay_encrypt"))
+                .cloned()
+        })
+        .flatten();
     let map = value
         .as_object_mut()
         .ok_or_else(|| invalid("snapshot file is not a mapping"))?;
     for field in local_fields(entity, global) {
         map.remove(*field);
+    }
+    if let Some(encrypt) = relay_encrypt {
+        map.insert("sync".into(), serde_json::json!({"relay_encrypt": encrypt}));
     }
     match entity {
         "task" => {
@@ -354,6 +365,10 @@ fn replicated(text: &str, entity: &str, global: bool) -> Result<String> {
 /// Replicated global keys come from the snapshot; local sections stay.
 fn merge_global(local_path: &Path, remote: &str) -> Result<String> {
     let mut merged: serde_yaml_ng::Mapping = serde_yaml_ng::from_str(remote)?;
+    let relay_encrypt = merged
+        .get("sync")
+        .and_then(|sync| sync.get("relay_encrypt"))
+        .cloned();
     let local: serde_yaml_ng::Mapping = match fs::read_to_string(local_path) {
         Ok(text) => serde_yaml_ng::from_str(&text)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
@@ -364,6 +379,14 @@ fn merge_global(local_path: &Path, remote: &str) -> Result<String> {
         if let Some(value) = local.get(*field) {
             merged.insert((*field).into(), value.clone());
         }
+    }
+    if let Some(encrypt) = relay_encrypt {
+        let sync = merged
+            .entry("sync".into())
+            .or_insert_with(|| serde_yaml_ng::Value::Mapping(Default::default()));
+        sync.as_mapping_mut()
+            .ok_or_else(|| invalid("invalid local sync settings"))?
+            .insert("relay_encrypt".into(), encrypt);
     }
     Ok(serde_yaml_ng::to_string(&merged)?)
 }

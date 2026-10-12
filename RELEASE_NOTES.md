@@ -1,5 +1,13 @@
 # Unreleased
 
+- **Git relay sync.** Paired laptop/server/mobile nodes can exchange operations
+  through a bare git remote when LAN/tailnet is unavailable. Each node pushes
+  only its append-only `refs/kanban/sync/<node_id>`; JSONL batches use the same
+  HLC/LWW/dedup path as HTTP. Configurable 60-second heartbeat/fetch cadence,
+  early push on local writes, fresh relay availability in probe, dedicated
+  store remote or project origins, and optional age encryption with paired
+  public keys. Machine-local credentials and Tailscale state are excluded.
+
 - **Outbound mobile sync.** Mobile identities are non-unique, never dialed by
   peers and appear neutrally offline after departure. TUI and daemon own sync
   workers when serve is absent, send hello/bye and yield to a later serve.

@@ -88,6 +88,7 @@ struct Status {
     node: String,
     status: &'static str,
     code: &'static str,
+    path: &'static str,
     message: String,
     since: Option<DateTime<Utc>>,
     last_seen: Option<DateTime<Utc>>,
@@ -314,6 +315,7 @@ fn status(
             "offline"
         },
         code,
+        path: if code == "ONLINE" { "direct" } else { "none" },
         message,
         since,
         last_seen: presence.last_seen,
@@ -472,19 +474,38 @@ async fn probes(root: &Path) -> Result<Vec<Status>> {
     let lan = in_lan(&config)?;
     let mut statuses = Vec::with_capacity(config.peers.len());
     for peer in &config.peers {
-        statuses.push(
-            probe_peer(
-                root,
-                &config,
-                peer,
-                credentials.iter().find(|c| c.node_id == peer.node.node_id),
-                presence
-                    .get(&peer.node.node_id)
-                    .unwrap_or(&Presence::default()),
-                lan,
+        let mut result = probe_peer(
+            root,
+            &config,
+            peer,
+            credentials.iter().find(|c| c.node_id == peer.node.node_id),
+            presence
+                .get(&peer.node.node_id)
+                .unwrap_or(&Presence::default()),
+            lan,
+        )
+        .await?;
+        if result.code != "ONLINE"
+            && matches!(
+                result.code,
+                "OFFLINE"
+                    | "NODE_OUT_OF_LAN"
+                    | "NODE_POWERED_OFF"
+                    | "NODE_UNREACHABLE"
+                    | "NODE_SERVICE_DOWN"
             )
-            .await?,
-        );
+            && crate::core::sync::relay::available(
+                root,
+                &peer.node.node_id,
+                Utc::now().timestamp_millis().max(0) as u64,
+            )?
+        {
+            result.status = "online";
+            result.code = "ONLINE";
+            result.path = "relay";
+            result.message = format!("{} в сети через git-relay", display_node(&peer.node));
+        }
+        statuses.push(result);
     }
     Ok(statuses)
 }
