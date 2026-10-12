@@ -829,6 +829,15 @@ pub(super) fn start(root: &Path) -> Running {
     Running { tasks }
 }
 
+pub(super) async fn catch_up(root: &Path, peer: &PeerCard) -> Result<()> {
+    let config = discovery::config(root)?;
+    let (link, _) = Link::connect(root, &config, peer).await?;
+    link.cycle()
+        .await?
+        .ok_or_else(|| invalid("Runner replica is not bootstrapped"))?;
+    Ok(())
+}
+
 /// One catch-up cycle with every paired peer (`serve --sync`, and the tail
 /// push before bye). With `full == false` only pushes local operations.
 pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<()>)>> {

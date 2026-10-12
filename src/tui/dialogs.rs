@@ -922,7 +922,7 @@ impl ModalState {
         state.interactive = task.interactive;
         state.readonly = task.readonly;
         state.silence = task.silence;
-        state.runner = task.runner;
+        state.runner = task.runner.clone();
         state.use_orchestrator = task.use_orchestrator;
         state.use_designer = task.use_designer;
         state.use_reviewer = task.use_reviewer;
@@ -1820,7 +1820,7 @@ impl ModalState {
                     } else {
                         1
                     };
-                    self.runner = choices[(current + delta) % choices.len()];
+                    self.runner = choices[(current + delta) % choices.len()].clone();
                 }
             }
             DialogField::UseOrchestrator => toggle_on_space(&mut self.use_orchestrator, key),
@@ -4128,6 +4128,7 @@ fn render_selector_field(
             };
             let value = modal
                 .runner
+                .as_ref()
                 .map(Runner::label)
                 .unwrap_or("Inherit from project");
             render_textarea(
