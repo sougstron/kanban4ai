@@ -273,6 +273,19 @@ impl Journal {
         load(&self.root.join("meta/state.json"))
     }
 
+    /// Field conflicts the last remote apply recorded (`meta/conflicts.jsonl`).
+    pub fn conflicts(&self) -> Result<Vec<Conflict>> {
+        let text = match fs::read_to_string(self.root.join("meta/conflicts.jsonl")) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        text.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).map_err(|e| invalid(&e.to_string())))
+            .collect()
+    }
+
     pub fn observe(&self, remote: &Hlc, max_skew_ms: u64) -> Result<()> {
         apply::recover_remote(&self.root)?;
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
