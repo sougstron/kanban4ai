@@ -3,7 +3,6 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::ExitCode;
-use std::thread;
 use std::time::Duration;
 
 use crate::core::daemon::{self, PumpState, try_lock};
@@ -36,8 +35,25 @@ pub fn run(once: bool, interval: Option<u64>, project: Option<&str>) -> Result<E
             .unwrap_or(daemon::DEFAULT_INTERVAL_SECS)
     });
 
+    let mut network = crate::core::net::Manager::new(store.root())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    #[cfg(unix)]
+    let mut terminate = runtime.block_on(async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    })?;
+    #[cfg(unix)]
+    let mut interrupt = runtime.block_on(async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+    })?;
     let mut state = PumpState::default();
     loop {
+        if let Err(error) = network.tick() {
+            let line = error.to_string();
+            eprintln!("{line}");
+            append_log(&store, &line);
+        }
         // The whole store goes through the shared pump, so an open TUI that
         // pumps more often leaves the daemon idle instead of doubling the
         // work; `--project` is an explicit request and always runs.
@@ -54,7 +70,26 @@ pub fn run(once: bool, interval: Option<u64>, project: Option<&str>) -> Result<E
         if once {
             break;
         }
-        thread::sleep(Duration::from_secs(interval));
+        let stopped = runtime.block_on(async {
+            #[cfg(unix)]
+            {
+                tokio::select! {
+                    _ = terminate.recv() => true,
+                    _ = interrupt.recv() => true,
+                    _ = tokio::time::sleep(Duration::from_secs(interval)) => false,
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => true,
+                    _ = tokio::time::sleep(Duration::from_secs(interval)) => false,
+                }
+            }
+        });
+        if stopped {
+            break;
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

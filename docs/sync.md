@@ -122,7 +122,7 @@ store_id: 2b9e…-uuid4       # общий для всех реплик одно
 | `rev` треда | локальный счётчик оптимистичной записи |
 | `<store>/config.yaml`: секции `node`, `sync`, `serve`, `daemon`, `tui`, `net` | идентичность, пиры, сеть, интервалы, отображение |
 | `<store>/sync/node.yaml`, `peers.yaml`, `tokens.yaml` | секреты, права 0600 |
-| `<store>/net/tailscale/` | state dir managed tailscaled (ключи машины, 0600), раздел 11.5 |
+| `<store>/net/tailscale/` | state dir managed tailscaled (каталоги 0700, файлы 0600), раздел 11.5 |
 | `sync.clone_root` и ленивые клоны в нём | пути этой машины, раздел 8 |
 | `<store>/sync/meta/allocation.json` | локальные cursors расходования ID и подтверждения peer; не копируются при bootstrap |
 
@@ -1045,20 +1045,43 @@ net:
     auth_key_file: null      # необязательно: одноразовый auth key, удаляется после входа
 ```
 
-- `<store>/net/tailscale/` — state dir sidecar (ключи машины), права 0600,
+- `<store>/net/tailscale/` — state dir sidecar (ключи машины): каталоги 0700
+  (0600 не позволяет входить в каталог), файлы и приватный socket 0600;
   машинно-локально, не реплицируется и не попадает в bootstrap и relay.
-- Бинарь: `pacman -S tailscale` в Arch внутри proot или `kanban4ai net install`
-  (статический tarball с pkgs.tailscale.com, проверка sha256).
-- Жизненный цикл managed: sidecar стартует вместе с TUI/daemon и
-  останавливается при выходе; если Android его убил, поднимается на следующем
-  тике. Падение без восстановления — `NET_TAILSCALE_SIDECAR_DOWN`.
+- Бинарь: PATH (`pacman -S tailscale` в Arch внутри proot), затем
+  `<store>/net/bin/{tailscale,tailscaled}`. `kanban4ai net install` получает
+  stable static tarball amd64/arm64 с pkgs.tailscale.com, проверяет SHA-256
+  и извлекает только два точных regular-file члена архива. Ссылки, дубликаты
+  и неполная пара отвергаются до установки.
+- Жизненный цикл managed: sidecar стартует вместе с TUI/daemon/serve и
+  останавливается при выходе; один владелец под store-local lock, остальные
+  процессы наблюдают его. На Linux parent-death signal убирает sidecar также
+  при аварийном завершении владельца. Если Android его убил, следующий тик
+  запускает новый. Падение без восстановления — `NET_TAILSCALE_SIDECAR_DOWN`.
+  Отдельный `net up` оставляет daemon до `net down`; следующий TUI/daemon/serve
+  забирает его под свой жизненный цикл. `net down` запрещает автоматический
+  рестарт до следующего `net up`.
 - Вход: кнопка `[Подключить]` показывает URL и QR входа Tailscale; либо auth
   key из `auth_key_file`. Состояние сохраняется, повторный вход не нужен (на
   узлах стоит отключить key expiry в админке Tailscale).
-- Адреса пиров: при сопряжении через tailnet в `peers.yaml` пишется
-  MagicDNS-имя пира (`kanban-server.<tailnet>.ts.net:7420`) как запасной адрес
-  после LAN-адресов (порядок проверки — 12.1).
-- CLI для агентов: `kanban4ai net up|down|status|install`. Человек работает
+- Адреса пиров: `sync.peers[].tailscale_address` в store config и необязательное
+  `tailscale_address` в `sync/peers.yaml` задают `host:port` запасного tailnet-адреса:
+  `kanban-server.<tailnet>.ts.net:7420`, CGNAT IP или Tailscale IPv6.
+  Существующий `address: IP:port` сохраняется. Сначала пробуются LAN-адреса,
+  затем tailnet; в `off` tailnet исключён. В managed HTTP и SSE используют
+  внутренний SOCKS5h proxy на loopback: MagicDNS разрешается sidecar, а не
+  локальным DNS. LAN остаётся прямым; system использует системный tun напрямую.
+  Relay fallback — отдельный TASK-440, этот транспорт его не подменяет.
+- CLI: сначала задать `net.tailscale.mode` в машинно-локальном store config;
+  `net up [--auth-key-file PATH]` не включает managed неявно. При необходимости
+  входа печатаются URL и терминальный QR, команда возвращает
+  `NET_TAILSCALE_LOGIN_REQUIRED`; после входа повторить `net up` или проверить
+  `net status`. Ключ передаётся Tailscale по имени файла, не в argv как секрет;
+  файл удаляется только после подтверждённого успешного входа.
+  `net down` отключает, `net logout` удаляет вход, `net status` печатает JSON
+  Tailscale (`CurrentTailnet`, `User`, `Self.TailscaleIPs`, `Peer[].CurAddr/Relay`)
+  и локальный mode. Пустой `CurAddr` при `Relay` означает DERP.
+- Человек работает
   через Settings → Sync → блок «Сеть» (TASK-434): статус (аккаунт, tailnet-IP,
   пиры онлайн, путь direct/DERP), кнопки `[Подключить]`, `[Отключить]`,
   `[Выйти из аккаунта]`.
@@ -1158,8 +1181,8 @@ wol:
 | `SYNC_STORE_MISMATCH` | у пира другая непустая база | «На {node} другая база kanban4ai. Выберите, какую оставить» | `[Оставить эту]` `[Взять с {node}]` (с подтверждением) |
 | `SYNC_NO_REMOTE` | запуск на mobile (или «Подготовить к поездке») для проекта без git remote | «У проекта {project} нет git remote — на телефоне его код недоступен» | добавить remote, запустить на сервере/ноуте |
 | `SYNC_LEASE_CONFLICT` | пересекающиеся аренды или две передачи полномочий выдачи | «Конфликт выдачи номеров задач с {node}» | выбрать выдающий узел |
-| `NET_TAILSCALE_NOT_INSTALLED` | режим `system`/`managed`, но `tailscaled` не найден | «Tailscale не установлен» | `[Установить]` (`net install`), инструкция |
-| `NET_TAILSCALE_LOGGED_OUT` | tailscaled запущен, но не вошёл в tailnet или ключ истёк | «Tailscale: требуется вход» | `[Подключить]` (URL + QR) |
+| `NET_TAILSCALE_MISSING` | режим `system`/`managed`, но нужный бинарь Tailscale не найден | «Tailscale не установлен» | `[Установить]` (`net install`), инструкция |
+| `NET_TAILSCALE_LOGIN_REQUIRED` | tailscaled запущен, но не вошёл в tailnet или ключ истёк | «Tailscale: требуется вход» | `[Подключить]` (URL + QR) |
 | `NET_TAILSCALE_SIDECAR_DOWN` | managed sidecar упал и не поднялся при перезапуске | «Tailscale на этом устройстве остановлен: {reason}» | `[Перезапустить]`, работать через LAN/relay |
 
 Статус синка в шапке (TASK-416, не коды):
