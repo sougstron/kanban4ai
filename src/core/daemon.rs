@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::NaiveDateTime;
@@ -278,6 +278,25 @@ fn pump_project(
     warned_once: &mut HashSet<String>,
 ) -> Result<(Vec<String>, Option<Quiet>)> {
     let ts = timefmt::format(&timefmt::now());
+    if project.work_path_missing() {
+        let pending_here = crate::core::storage::Storage::new(&project.data_root)
+            .get_all_tasks()?
+            .iter()
+            .any(|task| {
+                task.runner_request.is_some()
+                    && crate::cli::serve::local_runner(&project.data_root, task.runner.as_ref())
+                        .unwrap_or(false)
+            });
+        if pending_here {
+            let root = project
+                .data_root
+                .parent()
+                .and_then(Path::parent)
+                .ok_or_else(|| KanbanError::Invalid("Runner project outside store".into()))?;
+            let prepared = crate::core::code::prepare(root, &project.id)?;
+            return pump_project(&prepared, warned_once);
+        }
+    }
     if project.work_path_missing() {
         if warned_once.insert(format!("missing-work-path:{}", project.id)) {
             return Ok((
