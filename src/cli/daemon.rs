@@ -3,7 +3,6 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::process::ExitCode;
-use std::thread;
 use std::time::Duration;
 
 use crate::core::daemon::{self, PumpState, try_lock};
@@ -36,27 +35,38 @@ pub fn run(once: bool, interval: Option<u64>, project: Option<&str>) -> Result<E
             .unwrap_or(daemon::DEFAULT_INTERVAL_SECS)
     });
 
-    let mut state = PumpState::default();
-    loop {
-        // The whole store goes through the shared pump, so an open TUI that
-        // pumps more often leaves the daemon idle instead of doubling the
-        // work; `--project` is an explicit request and always runs.
-        let lines = if project.is_some() {
-            daemon::tick(&store, project, &mut state)?
-        } else {
-            daemon::shared_tick(&store, Duration::from_secs(interval), &mut state)?
-                .unwrap_or_default()
-        };
-        for line in &lines {
-            println!("{line}");
-            append_log(&store, line);
+    let _sync = super::serve::Embedded::start(store.root())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let shutdown = super::serve::shutdown_signal();
+        tokio::pin!(shutdown);
+        let mut state = PumpState::default();
+        loop {
+            // The whole store goes through the shared pump, so an open TUI that
+            // pumps more often leaves the daemon idle instead of doubling the
+            // work; `--project` is an explicit request and always runs.
+            let lines = if project.is_some() {
+                daemon::tick(&store, project, &mut state)?
+            } else {
+                daemon::shared_tick(&store, Duration::from_secs(interval), &mut state)?
+                    .unwrap_or_default()
+            };
+            for line in &lines {
+                println!("{line}");
+                append_log(&store, line);
+            }
+            if once {
+                break;
+            }
+            tokio::select! {
+                result = &mut shutdown => { result?; break; }
+                _ = tokio::time::sleep(Duration::from_secs(interval)) => (),
+            }
         }
-        if once {
-            break;
-        }
-        thread::sleep(Duration::from_secs(interval));
-    }
-    Ok(ExitCode::SUCCESS)
+        Ok(ExitCode::SUCCESS)
+    })
 }
 
 fn append_log(store: &ProjectStore, line: &str) {

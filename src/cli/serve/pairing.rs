@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::sync::NodeRole;
 use crate::core::sync::{Journal, NodeIdentity};
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -10,12 +11,12 @@ pub struct PairingOptions {
     #[arg(long, conflicts_with_all = ["issue_token", "pair", "revoke_token", "phone_qr"])]
     pair_code: bool,
     /// Pair with a LAN node at IP:port.
-    #[arg(long, requires_all = ["code", "address"], conflicts_with_all = ["issue_token", "revoke_token", "phone_qr"])]
+    #[arg(long, requires = "code", conflicts_with_all = ["issue_token", "revoke_token", "phone_qr"])]
     pair: Option<SocketAddr>,
     /// Revoke a token by its SHA-256 fingerprint.
     #[arg(long, conflicts_with_all = ["issue_token", "phone_qr"])]
     revoke_token: Option<String>,
-    /// Print a phone QR containing a freshly issued client token.
+    /// Print a single-use pairing QR for an outbound mobile node.
     #[arg(long, conflicts_with = "issue_token")]
     phone_qr: Option<SocketAddr>,
     /// Single-use code displayed on the other node.
@@ -37,10 +38,15 @@ struct Code {
 struct Card {
     #[serde(flatten)]
     node: NodeIdentity,
+    #[serde(default = "outbound_address")]
     address: SocketAddr,
     empty: bool,
     proto: u32,
     min_proto: u32,
+}
+
+fn outbound_address() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 0))
 }
 #[derive(Serialize, Deserialize)]
 pub(super) struct PairRequest {
@@ -110,17 +116,21 @@ fn card(store: &ProjectStore, address: SocketAddr) -> Result<Card> {
     })
 }
 fn validate(local: &Card, remote: &Card) -> Result<()> {
-    if !allowed(remote.address.ip(), &[]) || remote.address.port() == 0 {
+    if !remote.node.outbound_only()
+        && (!allowed(remote.address.ip(), &[]) || remote.address.port() == 0)
+    {
         return Err(invalid("Pairing requires a LAN address"));
     }
     if remote.proto < MIN_PROTO || remote.min_proto > PROTO {
         return Err(invalid("NODE_VERSION_MISMATCH"));
     }
     if local.node.node_id == remote.node.node_id
-        || local.node.role == remote.node.role
+        || (local.node.role == NodeRole::Server && remote.node.role == NodeRole::Server)
         || local.node.name == remote.node.name
     {
-        return Err(invalid("Node ID, name and role must differ from the peer"));
+        return Err(invalid(
+            "Node ID and name must differ; server role must be unique",
+        ));
     }
     if !local.empty && !remote.empty && local.node.store_id != remote.node.store_id {
         return Err(invalid("SYNC_STORE_MISMATCH"));
@@ -131,6 +141,10 @@ fn validate(local: &Card, remote: &Card) -> Result<()> {
 // out of the replicated journal; config contains no bearer secrets.
 fn install(store: &ProjectStore, peer: &Card, inbound: &str, outbound: &str) -> Result<()> {
     let root = store.root();
+    let mut peer = peer.clone();
+    if peer.node.role == NodeRole::Mobile {
+        peer.node.dial = crate::core::sync::NodeDial::Outbound;
+    }
     if [inbound, outbound]
         .iter()
         .any(|s| s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -175,9 +189,10 @@ fn install(store: &ProjectStore, peer: &Card, inbound: &str, outbound: &str) -> 
     };
     if peers.iter().any(|p| {
         p.node.node_id != peer.node.node_id
-            && (p.node.role == peer.node.role || p.node.name == peer.node.name)
+            && ((p.node.role == NodeRole::Server && peer.node.role == NodeRole::Server)
+                || p.node.name == peer.node.name)
     }) {
-        return Err(invalid("Peer role and name must be unique"));
+        return Err(invalid("Peer name and server role must be unique"));
     }
     peers.retain(|p| p.node.node_id != peer.node.node_id);
     peers.push(peer.clone());
@@ -283,45 +298,50 @@ fn accept_sync(root: &Path, request: PairRequest) -> Result<PairReply> {
     })
 }
 
+fn create_code(store: &ProjectStore) -> Result<String> {
+    let root = store.root();
+    let global = store.load_global_config()?;
+    let settings: PairingSettings = global
+        .extras
+        .get("sync")
+        .and_then(|v| v.get("pairing"))
+        .cloned()
+        .map(serde_yaml_ng::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    if !(1..=300).contains(&settings.code_ttl_seconds)
+        || !(1..=5).contains(&settings.code_max_attempts)
+    {
+        return Err(invalid(
+            "Pairing TTL must be 1..300 seconds and attempts 1..5",
+        ));
+    }
+    let _guard = lock_file_reentrant(&root.join("sync/.lock"))?;
+    let mut bytes = [0; 4];
+    let number = loop {
+        fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let n = u32::from_ne_bytes(bytes);
+        if n < u32::MAX - u32::MAX % 1_000_000 {
+            break n % 1_000_000;
+        }
+    };
+    let code = format!("{number:06}");
+    save(
+        &root.join("sync/pair-code.yaml"),
+        &Code {
+            hash: token_hash(&code),
+            expires: chrono::Utc::now().timestamp() + settings.code_ttl_seconds,
+            attempts: 0,
+            limit: settings.code_max_attempts,
+        },
+    )?;
+    Ok(code)
+}
+
 pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool> {
     let root = store.root();
     if options.pair_code {
-        let global = store.load_global_config()?;
-        let settings: PairingSettings = global
-            .extras
-            .get("sync")
-            .and_then(|v| v.get("pairing"))
-            .cloned()
-            .map(serde_yaml_ng::from_value)
-            .transpose()?
-            .unwrap_or_default();
-        if !(1..=300).contains(&settings.code_ttl_seconds)
-            || !(1..=5).contains(&settings.code_max_attempts)
-        {
-            return Err(invalid(
-                "Pairing TTL must be 1..300 seconds and attempts 1..5",
-            ));
-        }
-        let _guard = lock_file_reentrant(&root.join("sync/.lock"))?;
-        let mut bytes = [0; 4];
-        let number = loop {
-            fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-            let n = u32::from_ne_bytes(bytes);
-            if n < u32::MAX - u32::MAX % 1_000_000 {
-                break n % 1_000_000;
-            }
-        };
-        let code = format!("{number:06}");
-        save(
-            &root.join("sync/pair-code.yaml"),
-            &Code {
-                hash: token_hash(&code),
-                expires: chrono::Utc::now().timestamp() + settings.code_ttl_seconds,
-                attempts: 0,
-                limit: settings.code_max_attempts,
-            },
-        )?;
-        println!("{code}");
+        println!("{}", create_code(store)?);
     } else if let Some(hash) = &options.revoke_token {
         let _guard = lock_file_reentrant(&root.join("sync/.lock"))?;
         let mut tokens: Tokens = load(&root.join("sync/tokens.yaml"))?;
@@ -333,8 +353,8 @@ pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool
             return Err(invalid("QR requires a LAN address"));
         }
         let node = Journal::open(root)?.node;
-        let token = issue_token(root, TokenKind::Client)?;
-        let payload = json!({"address":address.ip().to_string(),"port":address.port(),"node_id":node.node_id,"token":token}).to_string();
+        let code = create_code(store)?;
+        let payload = json!({"address":address.ip().to_string(),"port":address.port(),"node_id":node.node_id,"code":code,"role":"mobile","dial":"outbound"}).to_string();
         let qr = qrcode::QrCode::new(payload.as_bytes()).map_err(|e| invalid(e.to_string()))?;
         println!(
             "{payload}\n{}",
@@ -344,14 +364,10 @@ pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool
         if !allowed(address.ip(), &[]) || address.port() == 0 {
             return Err(invalid("Pairing requires a LAN address"));
         }
-        let local = card(
-            store,
-            options
-                .address
-                .ok_or_else(|| invalid("--address required"))?,
-        )?;
-        if !allowed(local.address.ip(), &[]) || local.address.port() == 0 {
-            return Err(invalid("--address must be a LAN address"));
+        let node = Journal::open(root)?.node;
+        let local = card(store, options.address.unwrap_or_else(outbound_address))?;
+        if !node.outbound_only() && options.address.is_none() {
+            return Err(invalid("--address required for an inbound node"));
         }
         let request = PairRequest {
             code: options
@@ -474,7 +490,7 @@ mod tests {
         assert!(!dir.path().join("sync/tokens.yaml").exists());
     }
     #[test]
-    fn nonempty_stores_and_duplicate_roles_cannot_pair() {
+    fn nonempty_stores_and_duplicate_servers_cannot_pair() {
         let dir = tempfile::tempdir().unwrap();
         let local = card(
             &ProjectStore::at(dir.path()),
@@ -493,7 +509,35 @@ mod tests {
                 .contains("SYNC_STORE_MISMATCH")
         );
         remote.empty = true;
-        remote.node.role = local.node.role;
-        assert!(validate(&local, &remote).is_err());
+        remote.node.role = NodeRole::Laptop;
+        validate(&local, &remote).unwrap();
+        let mut server = local.clone();
+        server.node.role = NodeRole::Server;
+        remote.node.role = NodeRole::Server;
+        assert!(validate(&server, &remote).is_err());
+    }
+    #[test]
+    fn multiple_outbound_mobiles_pair_without_reachable_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ProjectStore::at(dir.path());
+        let local = card(&store, "127.0.0.1:7420".parse().unwrap()).unwrap();
+        for name in ["phone-one", "phone-two"] {
+            let mut remote = request(dir.path(), "123456").node_card;
+            remote.node.node_id = name.into();
+            remote.node.name = name.into();
+            remote.node.role = NodeRole::Mobile;
+            remote.node.dial = crate::core::sync::NodeDial::Outbound;
+            remote.address = "127.0.0.1:0".parse().unwrap();
+            validate(&local, &remote).unwrap();
+            install(&store, &remote, &secret().unwrap(), &secret().unwrap()).unwrap();
+        }
+        let peers = discovery::config(dir.path()).unwrap().peers;
+        assert_eq!(
+            peers
+                .iter()
+                .map(|p| p.node.name.as_str())
+                .collect::<Vec<_>>(),
+            ["phone-one", "phone-two"]
+        );
     }
 }

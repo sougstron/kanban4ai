@@ -6,7 +6,7 @@ mod daemon;
 mod init;
 mod project;
 mod resolve;
-mod serve;
+pub(crate) mod serve;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -411,8 +411,8 @@ enum Command {
         /// Override store `serve.port` (default: 7420)
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         port: Option<u16>,
-        /// Issue a 256-bit node/client token, print it once, and exit.
-        #[arg(long, value_parser = ["node", "client"], conflicts_with = "port")]
+        /// Issue a 256-bit node token, print it once, and exit.
+        #[arg(long, value_parser = ["node"], conflicts_with = "port")]
         issue_token: Option<String>,
         #[command(flatten)]
         pairing: serve::PairingOptions,

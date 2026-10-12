@@ -318,6 +318,8 @@ pub fn run(start: TuiStart) -> Result<()> {
     let _panic_hook = PanicHookGuard::install();
     let mut terminal = TerminalGuard::enter()?;
     let mut app = app_from_start(start)?;
+    let _sync =
+        crate::cli::serve::Embedded::start(crate::core::project::ProjectStore::open()?.root())?;
     let threads = event::spawn_shared_threads(app.settings.refresh_interval);
     loop {
         match event::run_event_loop(terminal.terminal_mut(), &mut app, &threads)? {

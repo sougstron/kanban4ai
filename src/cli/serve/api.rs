@@ -4,7 +4,6 @@ use crate::core::operations::{Operations, QuestionRef, TaskPatch};
 use crate::core::storage::{NewTask, Storage};
 use crate::core::sync::{Journal, NodeRole};
 use crate::core::thread::ThreadManager;
-use axum::Extension;
 use axum::extract::Path as Params;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -280,7 +279,6 @@ struct Action {
 }
 async fn action(
     State(root): State<PathBuf>,
-    Extension(kind): Extension<TokenKind>,
     Params((id, task, action)): Params<(String, String, String)>,
     body: std::result::Result<Json<Action>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -288,13 +286,6 @@ async fn action(
         Ok(body) => body,
         Err(e) => return error(StatusCode::BAD_REQUEST, "INVALID_REQUEST", &e.body_text()),
     };
-    if request.agent && matches!(kind, TokenKind::Client) {
-        return error(
-            StatusCode::FORBIDDEN,
-            "OPERATION_FORBIDDEN",
-            "Client requests are human operations",
-        );
-    }
     if let Err(e) = valid_task(&task) {
         return failure(e);
     }
@@ -574,7 +565,7 @@ mod tests {
         fs::create_dir_all(&work).unwrap();
         let p = ProjectStore::at(&store).add(&work, None).unwrap().project;
         Storage::new(&p.data_root).init_board().unwrap();
-        let client_token = issue_token(&store, TokenKind::Client).unwrap();
+        let client_token = issue_token(&store, TokenKind::Node).unwrap();
         let node_token = issue_token(&store, TokenKind::Node).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -816,7 +807,7 @@ mod tests {
         )
         .unwrap();
         let secret = issue_token(&runner, TokenKind::Node).unwrap();
-        let client = issue_token(&laptop, TokenKind::Client).unwrap();
+        let client = issue_token(&laptop, TokenKind::Node).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let runner_router = super::super::router(runner.join("sync/tokens.yaml"));

@@ -49,6 +49,13 @@ struct Ack {
     vector: VersionVector,
 }
 
+#[derive(Serialize, Deserialize)]
+struct LeaseRequest {
+    store_id: String,
+    vector: VersionVector,
+    remaining: BTreeMap<String, u64>,
+}
+
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
@@ -155,6 +162,7 @@ pub(super) fn routes(root: PathBuf) -> Router {
         )
         .route("/sync/stream", get(stream))
         .route("/sync/snapshot", get(snapshot))
+        .route("/sync/leases", axum::routing::post(lease_request))
         .with_state(root)
 }
 
@@ -210,6 +218,41 @@ async fn pull(State(root): State<PathBuf>, uri: Uri) -> Response {
 async fn receive(State(root): State<PathBuf>, Json(push): Json<Push>) -> Response {
     match apply(&root, push.operations).await {
         Ok(vector) => Json(Ack { vector }).into_response(),
+        Err(e) => failure(e),
+    }
+}
+
+async fn lease_request(
+    State(root): State<PathBuf>,
+    Extension(hash): Extension<String>,
+    Json(request): Json<LeaseRequest>,
+) -> Response {
+    let result = blocking(move || {
+        let peer = discovery::caller(&root, &hash)?;
+        let journal = Journal::open(&root)?;
+        if request.store_id != journal.node.store_id {
+            return Err(invalid("SYNC_STORE_MISMATCH"));
+        }
+        journal.confirm_id_leases(&peer, &request.vector)?;
+        let mut operations = Vec::new();
+        for (alias, uid) in journal.project_uids()? {
+            if journal.issues_id_leases(&uid)? {
+                operations.extend(journal.prepare_id_leases(
+                    &alias,
+                    &peer,
+                    &request.vector,
+                    request.remaining.get(&uid).copied().unwrap_or(0),
+                )?);
+            }
+        }
+        Ok(Push { operations })
+    })
+    .await;
+    match result {
+        Ok(grants) => {
+            changed();
+            Json(grants).into_response()
+        }
         Err(e) => failure(e),
     }
 }
@@ -503,9 +546,45 @@ impl Link {
             self.pull().await?;
             let acknowledged = self.push(reply.vector).await?;
             self.leases(acknowledged, &reply.remaining).await?;
+            if node.outbound_only() {
+                self.request_leases().await?;
+            }
             // Leases may have advanced both vectors; report the fresh one.
             return Ok(Some(self.vector().await?.vector));
         }
+    }
+
+    async fn request_leases(&self) -> Result<()> {
+        // The issuer cannot dial an outbound node. Request and acknowledge
+        // grants over the same outbound HTTP path instead.
+        for _ in 0..2 {
+            let root = self.root.clone();
+            let request = blocking(move || {
+                let journal = Journal::open(&root)?;
+                let mut remaining = BTreeMap::new();
+                for (alias, uid) in journal.project_uids()? {
+                    remaining.insert(uid, journal.remaining_primary_task_ids(&alias)?);
+                }
+                Ok(LeaseRequest {
+                    store_id: journal.node.store_id.clone(),
+                    vector: journal.vector()?,
+                    remaining,
+                })
+            })
+            .await?;
+            let grants: Push = self
+                .send(
+                    self.http
+                        .post(format!("{}/sync/leases", self.base))
+                        .json(&request),
+                )
+                .await?;
+            if grants.operations.is_empty() {
+                break;
+            }
+            apply(&self.root, grants.operations).await?;
+        }
+        Ok(())
     }
 
     async fn bootstrap(&self, store_id: &str) -> Result<()> {
@@ -600,6 +679,9 @@ async fn session(root: &Path, peer_id: &str) -> Result<bool> {
     let Some(peer) = config.peers.iter().find(|p| p.node.node_id == peer_id) else {
         return Ok(false);
     };
+    if peer.node.outbound_only() {
+        return Ok(false);
+    }
     // NODE_OUT_OF_LAN: never contact peers; writes wait in the journal.
     if !discovery::in_lan(&config)? {
         return Ok(true);
@@ -684,17 +766,29 @@ pub(super) fn start(root: &Path) -> Running {
     });
     let root = root.to_path_buf();
     tasks.spawn(async move {
-        let mut workers: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
+        let mut workers = JoinSet::new();
+        let mut active = std::collections::BTreeSet::new();
         let mut kicks = KICK.subscribe();
         loop {
             let config = discovery::config(&root);
             if let Ok(config) = &config {
-                workers.retain(|_, handle| !handle.is_finished());
+                while let Some(result) = workers.try_join_next() {
+                    if let Ok(id) = result {
+                        active.remove(&id);
+                    }
+                }
                 for peer in &config.peers {
+                    if peer.node.outbound_only() {
+                        continue;
+                    }
                     let id = peer.node.node_id.clone();
-                    workers
-                        .entry(id.clone())
-                        .or_insert_with(|| tokio::spawn(worker(root.clone(), id)));
+                    if active.insert(id.clone()) {
+                        let root = root.clone();
+                        workers.spawn(async move {
+                            worker(root, id.clone()).await;
+                            id
+                        });
+                    }
                 }
             }
             let interval = config.map_or(30, |c| c.interval);
@@ -717,6 +811,9 @@ pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<
         return Ok(results);
     }
     for peer in &config.peers {
+        if peer.node.outbound_only() {
+            continue;
+        }
         let result = async {
             let (link, reply) = Link::connect(root, &config, peer).await?;
             if full {
@@ -736,6 +833,7 @@ pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<
 mod tests {
     use super::*;
     use crate::core::storage::{NewTask, Storage, atomic_write_text};
+    static NETWORK_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn node(role: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -762,7 +860,7 @@ mod tests {
         fs::write(
             local.join("config.yaml"),
             format!(
-                "node:\n  node_id: {}\n  name: {}\n  role: {}\nsync:\n  peers:\n  - node_id: {}\n    name: {}\n    role: {}\n    store_id: {}\n    address: {address}\n",
+                "node:\n  node_id: {}\n  name: {}\n  role: {}\nsync:\n  interval: 1\n  peers:\n  - node_id: {}\n    name: {}\n    role: {}\n    store_id: {}\n    address: {address}\n",
                 own.node_id, own.name, role(own.role), peer.node_id, peer.name, role(peer.role), peer.store_id
             ),
         )
@@ -793,6 +891,7 @@ mod tests {
 
     #[test]
     fn empty_server_bootstraps_then_leases_and_live_stream_converge() {
+        let _serial = NETWORK_TEST.blocking_lock();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -870,6 +969,113 @@ mod tests {
             live.abort();
             sa.abort();
             sb.abort();
+        });
+    }
+
+    #[test]
+    fn mobile_outbound_worker_bootstraps_pushes_pulls_and_announces_lifecycle() {
+        let _serial = NETWORK_TEST.blocking_lock();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (mobile, mobile_id) = node("mobile");
+            let (server, _) = node("server");
+            let (a, b) = (mobile.path(), server.path());
+            let board = Storage::new(b.join("projects/demo"));
+            board.init_board().unwrap();
+            atomic_write_text(
+                &board.project_path.join("project.yaml"),
+                "id: demo\nname: Demo\nwork_path: /tmp/demo\ncreated_at: '2026-01-01T00:00:00'\n",
+            )
+            .unwrap();
+            let first = board
+                .create_task(NewTask::titled("server initial"))
+                .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (outbound, inbound) = ("c".repeat(64), "d".repeat(64));
+            pair(a, b, address, &outbound, &inbound);
+            // There is deliberately no mobile listener.
+            pair(b, a, "127.0.0.1:1".parse().unwrap(), &inbound, &outbound);
+            assert!(!session(b, &mobile_id).await.unwrap());
+            assert!(once(b, true).await.unwrap().is_empty());
+            use std::sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            };
+            let hello = Arc::new(AtomicUsize::new(0));
+            let bye = Arc::new(AtomicUsize::new(0));
+            let (hellos, byes) = (hello.clone(), bye.clone());
+            let app = router(b.join("sync/tokens.yaml")).layer(axum::middleware::from_fn(
+                move |request: Request, next: Next| {
+                    let (hellos, byes) = (hellos.clone(), byes.clone());
+                    async move {
+                        match request.uri().path() {
+                            "/sync/hello" => {
+                                hellos.fetch_add(1, Ordering::SeqCst);
+                            }
+                            "/sync/bye" => {
+                                byes.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => (),
+                        }
+                        next.run(request).await
+                    }
+                },
+            ));
+            let server_http = tokio::spawn(axum::serve(listener, app).into_future());
+            discovery::update_presence(b, &mobile_id, |p| {
+                p.bye = Some(discovery::Bye {
+                    reason: "shutdown".into(),
+                    at: chrono::Utc::now(),
+                });
+            })
+            .unwrap();
+            let owner = Embedded::start(a).unwrap();
+            let copy = Storage::new(a.join("projects/demo"));
+            wait_for("mobile bootstrap", || copy.task_exists(&first.id)).await;
+            let presence = || {
+                discovery::load::<BTreeMap<String, Presence>>(&b.join("sync/presence.yaml"))
+                    .unwrap()
+            };
+            assert!(presence()[&mobile_id].bye.is_none());
+            assert_eq!(hello.load(Ordering::SeqCst), 1);
+            let follower = Embedded::start(a).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(follower);
+            assert_eq!(hello.load(Ordering::SeqCst), 1);
+            assert_eq!(bye.load(Ordering::SeqCst), 0);
+            wait_for("mobile lease", || {
+                Journal::open(a)
+                    .unwrap()
+                    .remaining_task_ids("demo")
+                    .unwrap()
+                    > 0
+            })
+            .await;
+            let mobile_task = copy
+                .create_task(NewTask::titled("mobile offline write"))
+                .unwrap();
+            wait_for("mobile push", || board.task_exists(&mobile_task.id)).await;
+            let server_task = board
+                .create_task(NewTask::titled("server live write"))
+                .unwrap();
+            changed();
+            wait_for("mobile SSE pull", || copy.task_exists(&server_task.id)).await;
+            let serving = Embedded::serving(a).unwrap();
+            wait_for("serve takeover", || hello.load(Ordering::SeqCst) == 2).await;
+            drop(owner);
+            assert_eq!(bye.load(Ordering::SeqCst), 0);
+            assert!(presence()[&mobile_id].bye.is_none());
+            drop(serving);
+            assert!(presence()[&mobile_id].bye.is_some());
+            assert_eq!(bye.load(Ordering::SeqCst), 1);
+            tokio::time::sleep(POLL * 2).await;
+            assert!(presence()[&mobile_id].bye.is_some());
+            server_http.abort();
         });
     }
 

@@ -51,12 +51,28 @@ pub enum NodeRole {
     Mobile,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeDial {
+    #[default]
+    Inbound,
+    Outbound,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeIdentity {
     pub node_id: String,
     pub name: String,
     pub role: NodeRole,
     pub store_id: String,
+    #[serde(default)]
+    pub dial: NodeDial,
+}
+
+impl NodeIdentity {
+    pub fn outbound_only(&self) -> bool {
+        self.role == NodeRole::Mobile || self.dial == NodeDial::Outbound
+    }
 }
 
 /// Tuple serialization is the wire format, including the node tie-breaker.
@@ -187,6 +203,7 @@ impl Journal {
                 name: "laptop".into(),
                 role: NodeRole::Laptop,
                 store_id: uuid()?,
+                dial: NodeDial::Inbound,
             }
         };
         if let Ok(text) = fs::read_to_string(store.join("config.yaml")) {
@@ -206,12 +223,19 @@ impl Journal {
                     node.role = serde_json::from_value(role.clone())
                         .map_err(|e| invalid(&e.to_string()))?;
                 }
+                if let Some(dial) = settings.get("dial") {
+                    node.dial = serde_json::from_value(dial.clone())
+                        .map_err(|e| invalid(&e.to_string()))?;
+                }
                 if let Some(id) = settings.get("node_id").and_then(Value::as_str)
                     && id != node.node_id
                 {
                     return Err(invalid("node.node_id is immutable"));
                 }
             }
+        }
+        if node.role == NodeRole::Mobile {
+            node.dial = NodeDial::Outbound;
         }
         if !path.exists() || fs::read_to_string(&path)? != serde_yaml_ng::to_string(&node)? {
             atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&node)?)?;
@@ -230,7 +254,7 @@ impl Journal {
             Err(e) => return Err(e.into()),
         };
         let settings = serde_yaml_ng::to_value(
-            serde_json::json!({"node_id": node.node_id, "name": node.name, "role": node.role}),
+            serde_json::json!({"node_id": node.node_id, "name": node.name, "role": node.role, "dial": node.dial}),
         )?;
         if config.get("node") != Some(&settings) {
             config.insert("node".into(), settings);
