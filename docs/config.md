@@ -395,6 +395,33 @@ first (an answer or the deadline) runs the task; see
 limits snapshot only (`docs/limits.md`): a provider with no cached numbers is
 treated as usable, never as exhausted.
 
+## Git relay (`<store>/config.yaml`, `sync:`)
+
+```yaml
+sync:
+  relay_remote: git@host:owner/private-kanban-store.git
+  relay_interval: 60
+  relay_encrypt: false
+```
+
+- `relay_remote`: optional dedicated store remote (URL or local path).
+  Without it, paired nodes use the distinct `origin` URLs of registered projects.
+  Every endpoint receives the **whole store journal**, not just its project.
+  Keep the remote private or enable encryption; no publication occurs without peers.
+- `relay_interval`: positive seconds between heartbeat/fetch cycles, default 60.
+  Local writes push earlier; `serve --sync` forces a cycle.
+- `relay_encrypt`: replicated boolean, default false. Requires `age` and
+  `age-keygen`; enable before pairing/re-pairing to exchange public recipients.
+  The private key is `sync/relay-age.key` (0600); public peer keys are
+  `relay_recipient` in machine-local `sync/peers.yaml`. A missing recipient
+  fails closed. Enabling encryption does not encrypt old commits.
+
+Remote, interval, private keys, peer credentials, heartbeat cache and
+`net.tailscale` settings stay local. Relay only writes operation batches and
+heartbeats to `refs/kanban/sync/<node_id>`; no snapshots or remote launch.
+Probe reports `ONLINE` / `path: relay` while the peer heartbeat is at most
+twice the relay interval old. Protocol and recovery: `docs/sync.md` §10.6.
+
 ## Agent Backends (.kanban/config.yaml `agents:`)
 Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. Create/save with Default selected snapshots those resolved values onto the task so the detail view and stats see a concrete backend/model/effort/agent (provider is the model id's slash prefix). The `agents:` map defines one entry per backend:
 - `command`: executable resolved via PATH (e.g. `opencode`, `claude`, `codex`)

@@ -45,6 +45,8 @@ struct Card {
     empty: bool,
     proto: u32,
     min_proto: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_recipient: Option<String>,
 }
 
 fn outbound_address() -> SocketAddr {
@@ -72,6 +74,8 @@ struct SecretPeer {
     addresses: Vec<SocketAddr>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tailscale_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relay_recipient: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -173,6 +177,7 @@ fn card(store: &ProjectStore, address: SocketAddr) -> Result<Card> {
         empty: store.list()?.is_empty(),
         proto: PROTO,
         min_proto: MIN_PROTO,
+        relay_recipient: crate::core::sync::relay::recipient(store.root())?,
     })
 }
 fn validate(root: &Path, local: &Card, remote: &Card) -> Result<()> {
@@ -243,6 +248,7 @@ fn install(store: &ProjectStore, peer: &Card, inbound: &str, outbound: &str) -> 
         address: Some(peer.address),
         addresses: Vec::new(),
         tailscale_address: peer.tailscale_address.clone(),
+        relay_recipient: peer.relay_recipient.clone(),
     });
     let mut config: serde_yaml_ng::Value = load(&root.join("config.yaml"))?;
     if config.is_null() {
@@ -359,6 +365,7 @@ fn accept_sync(root: &Path, request: PairRequest) -> Result<PairReply> {
         tailscale_address: tailnet_address(root, port)?,
         proto: PROTO,
         min_proto: MIN_PROTO,
+        relay_recipient: crate::core::sync::relay::recipient(root)?,
     };
     validate(root, &local, &request.node_card)?;
     // Consume before generating credentials: failures never make a used code reusable.
@@ -526,6 +533,7 @@ mod tests {
                 empty: true,
                 proto: PROTO,
                 min_proto: MIN_PROTO,
+                relay_recipient: None,
             },
         }
     }
