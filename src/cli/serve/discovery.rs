@@ -54,6 +54,8 @@ pub(super) struct PeerCard {
     #[serde(flatten)]
     pub(super) node: NodeIdentity,
     pub(super) address: SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) tailscale_address: Option<String>,
 }
 #[derive(Deserialize)]
 pub(super) struct Credential {
@@ -64,6 +66,8 @@ pub(super) struct Credential {
     address: Option<SocketAddr>,
     #[serde(default)]
     addresses: Vec<SocketAddr>,
+    #[serde(default)]
+    tailscale_address: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Bye {
@@ -145,14 +149,30 @@ pub(super) fn in_lan(config: &Config) -> Result<bool> {
         !ip.is_loopback() && allowed(ip, &config.home_networks)
     }))
 }
+pub(super) fn network_available(root: &Path, config: &Config) -> Result<bool> {
+    Ok(in_lan(config)?
+        || !matches!(
+            crate::core::net::settings(root)?.mode,
+            crate::core::net::Mode::Off
+        ))
+}
+
+fn tailnet_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => u32::from(ip) & 0xffc0_0000 == 0x6440_0000,
+        IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
 pub(super) fn peer_addresses(
+    root: &Path,
     peer: &PeerCard,
     secret: Option<&Credential>,
     presence: &Presence,
     config: &Config,
-) -> Vec<SocketAddr> {
+) -> Result<Vec<String>> {
     if peer.node.outbound_only() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut result = presence.discovered.clone();
     if let Some(secret) = secret {
@@ -160,10 +180,54 @@ pub(super) fn peer_addresses(
         result.extend(&secret.addresses);
     }
     result.push(peer.address);
-    result.retain(|a| a.port() != 0 && allowed(a.ip(), &config.home_networks));
+    let enabled = !matches!(
+        crate::core::net::settings(root)?.mode,
+        crate::core::net::Mode::Off
+    );
+    result.retain(|a| {
+        a.port() != 0
+            && if tailnet_ip(a.ip()) {
+                enabled
+            } else {
+                allowed(a.ip(), &config.home_networks)
+            }
+    });
+    // Stable partition: every direct LAN route is tried before the tailnet.
+    result.sort_by_key(|a| tailnet_ip(a.ip()));
     let mut seen = BTreeSet::new();
-    result.retain(|a| seen.insert(*a));
-    result
+    let mut result: Vec<String> = result
+        .into_iter()
+        .filter(|a| seen.insert(*a))
+        .map(|a| a.to_string())
+        .collect();
+    if enabled {
+        for address in secret
+            .and_then(|s| s.tailscale_address.as_ref())
+            .into_iter()
+            .chain(peer.tailscale_address.as_ref())
+        {
+            let url = reqwest::Url::parse(&format!("http://{address}"))
+                .map_err(|_| invalid("Invalid tailscale_address: expected host:port"))?;
+            if !address
+                .rsplit_once(':')
+                .is_some_and(|(_, port)| port.parse::<u16>().is_ok_and(|port| port != 0))
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.path() != "/"
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || !crate::core::net::is_tailnet_address(address)
+            {
+                return Err(invalid(
+                    "Invalid tailscale_address: expected tailnet host:port",
+                ));
+            }
+            if !result.contains(address) {
+                result.push(address.clone());
+            }
+        }
+    }
+    Ok(result)
 }
 fn display_node(node: &NodeIdentity) -> &'static str {
     match node.role {
@@ -258,13 +322,23 @@ fn status(
 fn compatible(version: &Version) -> bool {
     version.proto >= MIN_PROTO && version.min_proto <= PROTO && version.min_proto <= version.proto
 }
-fn client(config: &Config) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+pub(super) fn peer_client(
+    root: &Path,
+    address: &str,
+    connect: Duration,
+    timeout: Option<Duration>,
+) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(config.probe_timeout))
-        .build()
-        .map_err(|e| invalid(e.to_string()))
+        .connect_timeout(connect);
+    if let Some(proxy) = crate::core::net::proxy_for(root, address)? {
+        builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|e| invalid(e.to_string()))?);
+    }
+    if let Some(timeout) = timeout {
+        builder = builder.timeout(timeout);
+    }
+    builder.build().map_err(|e| invalid(e.to_string()))
 }
 async fn probe_peer(
     root: &Path,
@@ -286,7 +360,12 @@ async fn probe_peer(
             None,
         ));
     }
-    if !lan {
+    if !lan
+        && matches!(
+            crate::core::net::settings(root)?.mode,
+            crate::core::net::Mode::Off
+        )
+    {
         return Ok(status(peer, presence, "NODE_OUT_OF_LAN", None));
     }
     if presence
@@ -296,25 +375,38 @@ async fn probe_peer(
     {
         return Ok(status(peer, presence, "NODE_POWERED_OFF", None));
     }
-    let http = client(config)?;
     let local = Journal::open(root)?.node;
     let mut code = "NODE_UNREACHABLE";
     let mut remote_version = None;
-    for address in peer_addresses(peer, secret, presence, config) {
-        match tokio::time::timeout(
+    for address in peer_addresses(root, peer, secret, presence, config)? {
+        let http = match peer_client(
+            root,
+            &address,
             Duration::from_secs(config.probe_timeout),
-            tokio::net::TcpStream::connect(address),
-        )
-        .await
+            Some(Duration::from_secs(config.probe_timeout)),
+        ) {
+            Ok(http) => http,
+            Err(e) => return Err(e),
+        };
+        // Never bypass managed SOCKS with a direct TCP preflight.
+        if let Ok(socket) = address.parse::<SocketAddr>()
+            && crate::core::net::proxy_for(root, &address)?.is_none()
         {
-            Ok(Ok(stream)) => drop(stream),
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                if code == "NODE_UNREACHABLE" {
-                    code = "NODE_SERVICE_DOWN";
+            match tokio::time::timeout(
+                Duration::from_secs(config.probe_timeout),
+                tokio::net::TcpStream::connect(socket),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => drop(stream),
+                Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    if code == "NODE_UNREACHABLE" {
+                        code = "NODE_SERVICE_DOWN";
+                    }
+                    continue;
                 }
-                continue;
+                _ => continue,
             }
-            _ => continue,
         }
         let base = format!("http://{address}");
         let Ok(reply) = http.get(format!("{base}/version")).send().await else {
@@ -540,7 +632,7 @@ async fn hello(State(state): State<HttpState>, Extension(hash): Extension<String
 }
 pub(super) async fn notify(root: &Path, reason: Option<&str>) -> Result<()> {
     let config = config(root)?;
-    if !in_lan(&config)? {
+    if !network_available(root, &config)? {
         return Ok(());
     }
     if reason.is_some() {
@@ -551,7 +643,6 @@ pub(super) async fn notify(root: &Path, reason: Option<&str>) -> Result<()> {
             }
         }
     }
-    let http = client(&config)?;
     let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
     let presence: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
     let mut failed = Vec::new();
@@ -565,13 +656,20 @@ pub(super) async fn notify(root: &Path, reason: Option<&str>) -> Result<()> {
         };
         let mut sent = false;
         for address in peer_addresses(
+            root,
             peer,
             Some(secret),
             presence
                 .get(&peer.node.node_id)
                 .unwrap_or(&Presence::default()),
             &config,
-        ) {
+        )? {
+            let http = peer_client(
+                root,
+                &address,
+                Duration::from_secs(config.probe_timeout),
+                Some(Duration::from_secs(config.probe_timeout)),
+            )?;
             let path = if reason.is_some() { "bye" } else { "hello" };
             let request = http
                 .post(format!("http://{address}/sync/{path}"))
@@ -858,7 +956,44 @@ mod tests {
         node.node_id = "remote".into();
         node.name = "server".into();
         node.role = NodeRole::Server;
-        PeerCard { node, address }
+        PeerCard {
+            node,
+            address,
+            tailscale_address: None,
+        }
+    }
+    #[test]
+    fn tailnet_candidates_follow_lan_and_off_keeps_legacy_cards() {
+        let root = tempfile::tempdir().unwrap();
+        let mut remote = peer(root.path(), "100.80.1.2:4242".parse().unwrap());
+        remote.tailscale_address = Some("runner.example.ts.net:4242".into());
+        let presence = Presence {
+            discovered: vec![
+                "100.80.1.3:4242".parse().unwrap(),
+                "192.168.1.3:4242".parse().unwrap(),
+            ],
+            ..Presence::default()
+        };
+        assert_eq!(
+            peer_addresses(root.path(), &remote, None, &presence, &Config::default()).unwrap(),
+            vec!["192.168.1.3:4242"]
+        );
+        fs::write(
+            root.path().join("config.yaml"),
+            "net:\n  tailscale:\n    mode: system\n",
+        )
+        .unwrap();
+        assert_eq!(
+            peer_addresses(root.path(), &remote, None, &presence, &Config::default()).unwrap(),
+            vec![
+                "192.168.1.3:4242",
+                "100.80.1.3:4242",
+                "100.80.1.2:4242",
+                "runner.example.ts.net:4242"
+            ]
+        );
+        remote.tailscale_address = Some("public.example.com:4242".into());
+        assert!(peer_addresses(root.path(), &remote, None, &presence, &Config::default()).is_err());
     }
 
     #[test]
@@ -899,7 +1034,11 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(result.code, "ONLINE");
-            assert!(peer_addresses(&mobile, None, &presence, &config).is_empty());
+            assert!(
+                peer_addresses(root.path(), &mobile, None, &presence, &config)
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
@@ -956,6 +1095,7 @@ mod tests {
                 inbound_sha256: "b".repeat(64),
                 address: None,
                 addresses: Vec::new(),
+                tailscale_address: None,
             };
             let rejected = std::net::TcpListener::bind("127.0.0.1:0")
                 .unwrap()

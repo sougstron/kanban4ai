@@ -350,30 +350,25 @@ impl Link {
             .cloned()
             .unwrap_or_default();
         let connect = Duration::from_secs(config.probe_timeout);
-        let build = |timeout: Option<Duration>| {
-            let builder = reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(connect);
-            match timeout {
-                Some(timeout) => builder.timeout(timeout),
-                None => builder,
-            }
-            .build()
-            .map_err(|e| invalid(e.to_string()))
-        };
-        let mut link = Link {
-            root: root.to_path_buf(),
-            peer: peer.node.node_id.clone(),
-            name: peer.node.name.clone(),
-            base: String::new(),
-            token: secret.token.clone(),
-            http: build(Some(REQUEST_TIMEOUT))?,
-            streaming: build(None)?,
-        };
         let mut last = invalid("NODE_UNREACHABLE: no address answered");
-        for address in discovery::peer_addresses(peer, Some(secret), &presence, config) {
-            link.base = format!("http://{address}");
+        for address in discovery::peer_addresses(root, peer, Some(secret), &presence, config)? {
+            let http = match discovery::peer_client(root, &address, connect, Some(REQUEST_TIMEOUT))
+            {
+                Ok(http) => http,
+                Err(e) => {
+                    last = e;
+                    continue;
+                }
+            };
+            let link = Link {
+                root: root.to_path_buf(),
+                peer: peer.node.node_id.clone(),
+                name: peer.node.name.clone(),
+                base: format!("http://{address}"),
+                token: secret.token.clone(),
+                http,
+                streaming: discovery::peer_client(root, &address, connect, None)?,
+            };
             match link.vector().await {
                 Ok(reply) if reply.node_id == link.peer => {
                     discovery::update_presence(root, &link.peer, |p| {
@@ -682,8 +677,8 @@ async fn session(root: &Path, peer_id: &str) -> Result<bool> {
     if peer.node.outbound_only() {
         return Ok(false);
     }
-    // NODE_OUT_OF_LAN: never contact peers; writes wait in the journal.
-    if !discovery::in_lan(&config)? {
+    // Writes wait in the journal until either LAN or tailnet is available.
+    if !discovery::network_available(root, &config)? {
         return Ok(true);
     }
     let presence: BTreeMap<String, Presence> = discovery::load(&root.join("sync/presence.yaml"))?;
@@ -807,7 +802,7 @@ pub(super) fn start(root: &Path) -> Running {
 pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<()>)>> {
     let config = discovery::config(root)?;
     let mut results = Vec::new();
-    if !discovery::in_lan(&config)? {
+    if !discovery::network_available(root, &config)? {
         return Ok(results);
     }
     for peer in &config.peers {
@@ -879,6 +874,96 @@ mod tests {
             format!("tokens:\n- kind: node\n  sha256: {}\n", token_hash(inbound)),
         )
         .unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn managed_magicdns_uses_local_socks_for_authenticated_http_and_streaming() {
+        let _serial = NETWORK_TEST.blocking_lock();
+        STOPPING.send_replace(false);
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (local, _) = node("laptop");
+            let (remote, remote_id) = node("server");
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let destination = listener.local_addr().unwrap();
+            let http_server = tokio::spawn(axum::serve(listener, router(remote.path().join("sync/tokens.yaml"))).into_future());
+            let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let unreachable = closed.local_addr().unwrap();
+            drop(closed);
+            let token = "a".repeat(64);
+            pair(local.path(), remote.path(), unreachable, &token, &"b".repeat(64));
+            fs::write(remote.path().join("sync/tokens.yaml"),
+                format!("tokens:\n- kind: node\n  sha256: {}\n", token_hash(&token))).unwrap();
+            let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = socks.local_addr().unwrap().port();
+            let requested = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            let recorded = requested.clone();
+            let proxy = tokio::spawn(async move {
+                loop {
+                    let (mut incoming, _) = socks.accept().await.unwrap();
+                    let recorded = recorded.clone();
+                    tokio::spawn(async move {
+                        let mut greeting = [0; 2];
+                        incoming.read_exact(&mut greeting).await.unwrap();
+                        assert_eq!(greeting[0], 5);
+                        let mut methods = vec![0; greeting[1] as usize];
+                        incoming.read_exact(&mut methods).await.unwrap();
+                        assert!(methods.contains(&0));
+                        incoming.write_all(&[5, 0]).await.unwrap();
+                        let mut connect = [0; 5];
+                        incoming.read_exact(&mut connect).await.unwrap();
+                        assert_eq!(&connect[..4], &[5, 1, 0, 3], "SOCKS5h must resolve MagicDNS at the proxy");
+                        let mut host = vec![0; connect[4] as usize];
+                        incoming.read_exact(&mut host).await.unwrap();
+                        let mut port = [0; 2];
+                        incoming.read_exact(&mut port).await.unwrap();
+                        recorded.lock().await.push((String::from_utf8(host).unwrap(), u16::from_be_bytes(port)));
+                        let mut outgoing = tokio::net::TcpStream::connect(destination).await.unwrap();
+                        incoming.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).await.unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                    });
+                }
+            });
+            let config_text = fs::read_to_string(local.path().join("config.yaml")).unwrap();
+            fs::write(local.path().join("config.yaml"), format!("{config_text}    tailscale_address: runner.example.ts.net:4242\nnet:\n  tailscale:\n    mode: managed\n    socks_port: {port}\n")).unwrap();
+            let bin = local.path().join("net/bin");
+            fs::create_dir_all(&bin).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+            for (name, script) in [
+                ("tailscaled", "#!/bin/sh\nwhile :; do sleep 1; done\n"),
+                ("tailscale", "#!/bin/sh\necho '{\"BackendState\":\"Running\"}'\n"),
+            ] {
+                let path = bin.join(name);
+                fs::write(&path, script).unwrap();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let mut manager = crate::core::net::Manager::new(local.path()).unwrap();
+            manager.tick().unwrap();
+            let config = discovery::config(local.path()).unwrap();
+            let (link, vector) = Link::connect(local.path(), &config, &config.peers[0]).await.unwrap();
+            assert_eq!(vector.node_id, remote_id);
+            assert_eq!(link.base, "http://runner.example.ts.net:4242");
+            let mut response = tokio::time::timeout(KEEPALIVE + Duration::from_secs(3),
+                link.streaming.get(format!("{}/sync/stream", link.base)).bearer_auth(&token).send()).await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            assert!(tokio::time::timeout(KEEPALIVE + Duration::from_secs(3), response.chunk()).await.unwrap().unwrap().is_some());
+            drop(response);
+            let rejected = link.http.get(format!("{}/sync/vector", link.base)).bearer_auth("revoked").send().await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+            let routes = requested.lock().await;
+            assert!(routes.iter().all(|(host, port)| host == "runner.example.ts.net" && *port == 4242));
+            drop(routes);
+            drop(link);
+            drop(manager);
+            proxy.abort();
+            http_server.abort();
+        });
     }
 
     async fn wait_for(what: &str, check: impl Fn() -> bool) {

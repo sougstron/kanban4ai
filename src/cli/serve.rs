@@ -1,5 +1,5 @@
-//! LAN-only HTTP entry point. Public probes bypass authentication; every other
-//! route is fail-closed, including routes added by later transport/API tasks.
+//! LAN-first HTTP entry point with optional paired tailnet fallback.
+//! Public probes bypass auth; all other routes remain fail-closed.
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
@@ -289,6 +289,27 @@ pub(super) async fn shutdown_signal() -> Result<()> {
 }
 
 async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> Result<()> {
+    let mut net = crate::core::net::Manager::new(root)?;
+    if let Err(e) = net.tick() {
+        eprintln!("serve network: {e}");
+    }
+    let mut bind_networks = networks.to_vec();
+    if matches!(
+        crate::core::net::settings(root)?.mode,
+        crate::core::net::Mode::System
+    ) {
+        bind_networks.extend(
+            ["100.64.0.0/10", "fd7a:115c:a1e0::/48"]
+                .map(|cidr| cidr.parse::<IpNet>().expect("static tailnet CIDR")),
+        );
+        // Preserve default private LAN binding when adding explicit tailnet CIDRs.
+        if networks.is_empty() {
+            bind_networks.extend(
+                ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]
+                    .map(|cidr| cidr.parse::<IpNet>().expect("static private CIDR")),
+            );
+        }
+    }
     let app = router(root.join("sync/tokens.yaml"));
     // Bind everything before starting any request handling: a failed bind
     // must not leave a partially started service running.
@@ -297,7 +318,7 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
     let bind_addresses = if node.outbound_only() {
         BTreeSet::from([SocketAddr::from(([127, 0, 0, 1], port))])
     } else {
-        addresses(networks, port)?
+        addresses(&bind_networks, port)?
     };
     for address in bind_addresses {
         listeners.push(TcpListener::bind(address).await?);
@@ -318,12 +339,21 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
                 .await
         });
     }
-    let result = tokio::select! {
-        result = shutdown_signal() => result,
-        result = tasks.join_next() => match result {
-            Some(Ok(Err(e))) => Err(e.into()),
-            Some(Err(e)) => Err(invalid(e.to_string())),
-            _ => Err(invalid("HTTP listener stopped unexpectedly")),
+    let mut net_tick =
+        tokio::time::interval(Duration::from_secs(discovery::config(root)?.interval));
+    let result = loop {
+        tokio::select! {
+            result = shutdown_signal() => break result,
+            result = tasks.join_next() => break match result {
+                Some(Ok(Err(e))) => Err(e.into()),
+                Some(Err(e)) => Err(invalid(e.to_string())),
+                _ => Err(invalid("HTTP listener stopped unexpectedly")),
+            },
+            _ = net_tick.tick() => {
+                if let Err(e) = net.tick() {
+                    eprintln!("serve network: {e}");
+                }
+            }
         }
     };
     discovery.stop().await;

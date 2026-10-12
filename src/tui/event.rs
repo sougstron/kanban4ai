@@ -52,6 +52,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     threads: &EventThreads,
+    network: &mut crate::core::net::Manager,
 ) -> Result<LoopOutcome> {
     let _watcher = start_watcher(app.watch_root(), threads.tx.clone());
     app.enable_background_launches(threads.tx.clone());
@@ -80,6 +81,9 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
             AppEvent::FsDebounced(generation) => app.reload_debounced_change(generation)?,
             AppEvent::LaunchDone => app.poll_launches(),
             AppEvent::Tick => {
+                if let Err(error) = network.tick() {
+                    app.status = error.to_string();
+                }
                 refresh_limits(app);
                 app.poll_update_banner();
                 app.tick()?;

@@ -318,11 +318,16 @@ pub fn run(start: TuiStart) -> Result<()> {
     let _panic_hook = PanicHookGuard::install();
     let mut terminal = TerminalGuard::enter()?;
     let mut app = app_from_start(start)?;
-    let _sync =
-        crate::cli::serve::Embedded::start(crate::core::project::ProjectStore::open()?.root())?;
+    let store = ProjectStore::open()?;
+    let mut network = crate::core::net::Manager::new(store.root())?;
+    let _sync = crate::cli::serve::Embedded::start(store.root())?;
+    // Network failure must not make the local board unavailable.
+    if let Err(error) = network.tick() {
+        app.status = error.to_string();
+    }
     let threads = event::spawn_shared_threads(app.settings.refresh_interval);
     loop {
-        match event::run_event_loop(terminal.terminal_mut(), &mut app, &threads)? {
+        match event::run_event_loop(terminal.terminal_mut(), &mut app, &threads, &mut network)? {
             LoopOutcome::Quit => break,
             LoopOutcome::OpenProject(project) => {
                 let mut next = app::App::for_project(project)?;

@@ -35,6 +35,7 @@ pub fn run(once: bool, interval: Option<u64>, project: Option<&str>) -> Result<E
             .unwrap_or(daemon::DEFAULT_INTERVAL_SECS)
     });
 
+    let mut network = crate::core::net::Manager::new(store.root())?;
     let _sync = super::serve::Embedded::start(store.root())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -44,6 +45,11 @@ pub fn run(once: bool, interval: Option<u64>, project: Option<&str>) -> Result<E
         tokio::pin!(shutdown);
         let mut state = PumpState::default();
         loop {
+            if let Err(error) = network.tick() {
+                let line = error.to_string();
+                eprintln!("{line}");
+                append_log(&store, &line);
+            }
             // The whole store goes through the shared pump, so an open TUI that
             // pumps more often leaves the daemon idle instead of doubling the
             // work; `--project` is an explicit request and always runs.
