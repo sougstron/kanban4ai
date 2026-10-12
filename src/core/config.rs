@@ -23,7 +23,10 @@ pub const DEFAULT_DEFERRED_CLEANUP_RETRY_SECS: i64 = 600;
 
 /// Written verbatim by `kanban init`; also the source of per-key fallbacks.
 /// Mirrors the Python `DEFAULT_CONFIG` exactly.
-pub const DEFAULT_CONFIG_YAML: &str = r#"columns:
+pub const DEFAULT_CONFIG_YAML: &str = r#"runner:
+  default: auto
+  auto_order: [server, here]
+columns:
 - name: To Do
   id: todo
 - name: In Progress
@@ -284,7 +287,52 @@ inherit:
   designer: true
   reviewer: true
   executor: true
+  placement: true
 "#;
+
+/// Placement preference only; availability and launch routing belong to the runner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Runner {
+    Auto,
+    Server,
+    Here,
+    Laptop,
+    Mobile,
+}
+
+impl Runner {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "server" => Some(Self::Server),
+            "here" => Some(Self::Here),
+            "laptop" => Some(Self::Laptop),
+            "mobile" => Some(Self::Mobile),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Server => "Сервер",
+            Self::Here => "Это устройство",
+            Self::Laptop => "Laptop",
+            Self::Mobile => "Mobile",
+        }
+    }
+
+    pub fn node_role(self) -> Option<crate::core::sync::NodeRole> {
+        use crate::core::sync::NodeRole;
+        match self {
+            Self::Server => Some(NodeRole::Server),
+            Self::Laptop => Some(NodeRole::Laptop),
+            Self::Mobile => Some(NodeRole::Mobile),
+            Self::Auto | Self::Here => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BoardConfig {
@@ -306,6 +354,8 @@ pub struct BoardConfig {
     pub verification: Mapping,
     #[serde(default)]
     pub orchestration: Mapping,
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub runner: Mapping,
     /// Which setting groups follow the machine-wide config (see
     /// [`InheritFlags`]). Absent on boards written before global configs.
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
@@ -325,6 +375,30 @@ impl Default for BoardConfig {
 }
 
 impl BoardConfig {
+    /// Task override > effective project placement (already inherited from global).
+    pub fn runner_for(&self, task: Option<Runner>) -> Runner {
+        task.unwrap_or_else(|| {
+            self.runner
+                .get("default")
+                .and_then(Value::as_str)
+                .and_then(Runner::parse)
+                .unwrap_or(Runner::Auto)
+        })
+    }
+
+    pub fn runner_auto_order(&self) -> Vec<Runner> {
+        self.runner
+            .get("auto_order")
+            .and_then(Value::as_sequence)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|v| v.as_str().and_then(Runner::parse))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![Runner::Server, Runner::Here])
+    }
+
     pub fn column_ids(&self) -> Vec<String> {
         self.columns
             .iter()
@@ -366,10 +440,11 @@ pub enum InheritGroup {
     Designer,
     Reviewer,
     Executor,
+    Placement,
 }
 
 impl InheritGroup {
-    pub const ALL: [InheritGroup; 7] = [
+    pub const ALL: [InheritGroup; 8] = [
         InheritGroup::Agent,
         InheritGroup::Limits,
         InheritGroup::Common,
@@ -377,6 +452,7 @@ impl InheritGroup {
         InheritGroup::Designer,
         InheritGroup::Reviewer,
         InheritGroup::Executor,
+        InheritGroup::Placement,
     ];
 
     /// The key under the project's `inherit:` section.
@@ -389,6 +465,7 @@ impl InheritGroup {
             InheritGroup::Designer => "designer",
             InheritGroup::Reviewer => "reviewer",
             InheritGroup::Executor => "executor",
+            InheritGroup::Placement => "placement",
         }
     }
 
@@ -419,6 +496,7 @@ impl InheritGroup {
                 orch_has("auto_restart") || config.tui.contains_key("hide_kanban_messages")
             }
             InheritGroup::TaskSort => config.tui.contains_key("task_sort"),
+            InheritGroup::Placement => !config.runner.is_empty(),
             InheritGroup::Designer | InheritGroup::Reviewer | InheritGroup::Executor => {
                 self.orchestration_section().is_some_and(orch_has)
             }
@@ -428,11 +506,11 @@ impl InheritGroup {
 
 /// Per-group "take this from the global config" switches (`inherit:`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InheritFlags([bool; 7]);
+pub struct InheritFlags([bool; 8]);
 
 impl InheritFlags {
     pub fn all(inherit: bool) -> Self {
-        Self([inherit; 7])
+        Self([inherit; 8])
     }
 
     pub fn get(&self, group: InheritGroup) -> bool {
@@ -510,6 +588,7 @@ pub fn copy_group(dst: &mut BoardConfig, src: &BoardConfig, group: InheritGroup)
             copy_key(&mut dst.tui, &src.tui, "hide_kanban_messages");
         }
         InheritGroup::TaskSort => copy_key(&mut dst.tui, &src.tui, "task_sort"),
+        InheritGroup::Placement => dst.runner = src.runner.clone(),
         InheritGroup::Designer | InheritGroup::Reviewer | InheritGroup::Executor => {
             if let Some(section) = group.orchestration_section() {
                 copy_key(&mut dst.orchestration, &src.orchestration, section);
@@ -1931,6 +2010,36 @@ impl Config {
         }
 
         Self::ensure_defaults(config);
+        if config
+            .runner
+            .get("default")
+            .and_then(Value::as_str)
+            .and_then(Runner::parse)
+            .is_none()
+        {
+            return Err(KanbanError::Invalid(
+                "runner.default must be auto, server, here, laptop or mobile".into(),
+            ));
+        }
+        let order = config
+            .runner
+            .get("auto_order")
+            .and_then(Value::as_sequence)
+            .ok_or_else(|| {
+                KanbanError::Invalid("runner.auto_order must be a non-empty sequence".into())
+            })?;
+        if order.is_empty()
+            || order.iter().any(|v| {
+                !matches!(
+                    v.as_str().and_then(Runner::parse),
+                    Some(Runner::Server | Runner::Here | Runner::Laptop | Runner::Mobile)
+                )
+            })
+        {
+            return Err(KanbanError::Invalid(
+                "runner.auto_order must contain server, here, laptop or mobile (not auto)".into(),
+            ));
+        }
 
         let rules = config.rules.clone();
         for (key, value) in &rules {
@@ -2177,6 +2286,7 @@ impl Config {
         merge_missing(&mut config.notifications, &defaults.notifications);
         merge_missing(&mut config.verification, &defaults.verification);
         merge_missing_deep(&mut config.orchestration, &defaults.orchestration);
+        merge_missing(&mut config.runner, &defaults.runner);
         for (backend, settings) in &defaults.agents {
             match config.agents.get_mut(backend) {
                 Some(Value::Mapping(existing)) => {
