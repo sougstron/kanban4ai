@@ -1242,7 +1242,7 @@ impl Operations {
     /// already running or the agent fails to launch.
     pub fn start_task(&self, task_id: &str) -> Result<Option<String>> {
         let session_mgr = self.session_manager();
-        let backend = {
+        let session_id = {
             let _guard = self.storage.lock()?;
             let Some(task) = self.storage.load_task(task_id)? else {
                 return Ok(None);
@@ -1254,9 +1254,10 @@ impl Operations {
                     "Task {task_id} is already running (session {session})"
                 )));
             }
-            upcoming_run_plan(&self.config.load()?, &task)?.0.backend
+            // Two starts within one second must not share a session id: the
+            // second would be refused as the first task's live session.
+            self.fresh_session_id(&upcoming_run_plan(&self.config.load()?, &task)?.0.backend)
         };
-        let session_id = format!("ses-{}-{}", backend, timefmt::now().format("%Y%m%d-%H%M%S"));
         if self
             .take_task_inner(task_id, &session_id, true, true)?
             .is_none()
