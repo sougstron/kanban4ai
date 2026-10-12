@@ -163,6 +163,81 @@ fn message_uids_parent_links_and_dotted_config_diffs() {
 }
 
 #[test]
+fn runner_preferences_replicate_and_task_can_return_to_inherit() {
+    use kanban4ai::core::config::{Config, Runner};
+    use kanban4ai::core::storage::NewTask;
+    let source = tempfile::tempdir().unwrap();
+    let a = Journal::open(source.path()).unwrap();
+    let work = source.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let project = kanban4ai::core::project::ProjectStore::at(source.path())
+        .add(&work, None)
+        .unwrap()
+        .project;
+    let root = project.data_root;
+    let storage = Storage::new(&root);
+    storage.init_board().unwrap();
+    atomic_write_text(
+        &source.path().join("config.yaml"),
+        "runner:\n  default: server\n  auto_order: [mobile, here]\n",
+    )
+    .unwrap();
+    let config = Config::new(&root);
+    let mut board = config.load_raw_fresh().unwrap();
+    board.runner.insert("default".into(), "mobile".into());
+    board.inherit.insert("placement".into(), false.into());
+    config.save(&board).unwrap();
+    let task = storage
+        .create_task(NewTask {
+            runner: Some(Runner::Here),
+            ..NewTask::titled("Placement")
+        })
+        .unwrap();
+    let peer = tempfile::tempdir().unwrap();
+    let b = Journal::open(peer.path()).unwrap();
+    let mut identity = b.node.clone();
+    identity.store_id = a.node.store_id.clone();
+    fs::write(
+        peer.path().join("sync/node.yaml"),
+        serde_yaml_ng::to_string(&identity).unwrap(),
+    )
+    .unwrap();
+    let b = Journal::open(peer.path()).unwrap();
+    let ops = operations(source.path(), &a.node.node_id);
+    b.apply_remote(&ops, 60_000).unwrap();
+    let remote_root = peer.path().join("projects").join(project.id);
+    let remote_storage = Storage::new(&remote_root);
+    assert_eq!(
+        remote_storage.load_task(&task.id).unwrap().unwrap().runner,
+        Some(Runner::Here)
+    );
+    assert_eq!(
+        Config::new(&remote_root).load().unwrap().runner_for(None),
+        Runner::Mobile
+    );
+    let global: kanban4ai::core::global::GlobalConfig =
+        serde_yaml_ng::from_str(&fs::read_to_string(peer.path().join("config.yaml")).unwrap())
+            .unwrap();
+    assert_eq!(global.board_sections().runner_for(None), Runner::Server);
+    assert_eq!(
+        global.board_sections().runner_auto_order(),
+        [Runner::Mobile, Runner::Here]
+    );
+    {
+        let _lock = storage.lock().unwrap();
+        let mut task = storage.load_task(&task.id).unwrap().unwrap();
+        task.runner = None;
+        storage.save_task(&task).unwrap();
+    }
+    b.apply_remote(&operations(source.path(), &a.node.node_id), 60_000)
+        .unwrap();
+    assert_eq!(
+        remote_storage.load_task(&task.id).unwrap().unwrap().runner,
+        None
+    );
+}
+
+#[test]
 fn redo_recovers_a_torn_append_and_never_duplicates_committed_operations() {
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open(dir.path()).unwrap();

@@ -154,7 +154,7 @@ pub struct TaskPatch {
     pub needs: Option<Option<String>>,
     pub role_profile: Option<Option<String>>,
     pub session: Option<Option<String>>,
-    pub runner: Option<Option<crate::core::sync::NodeRole>>,
+    pub runner: Option<Option<crate::core::config::Runner>>,
 }
 
 #[derive(Debug, Clone)]

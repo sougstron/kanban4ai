@@ -644,7 +644,7 @@ pub struct NewTask {
     pub needs: Option<String>,
     pub parent_task: Option<String>,
     pub role_profile: Option<String>,
-    pub runner: Option<crate::core::sync::NodeRole>,
+    pub runner: Option<crate::core::config::Runner>,
 }
 
 impl NewTask {
