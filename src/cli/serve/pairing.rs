@@ -381,7 +381,7 @@ fn accept_sync(root: &Path, request: PairRequest) -> Result<PairReply> {
     })
 }
 
-fn create_code(store: &ProjectStore) -> Result<String> {
+pub(super) fn create_code(store: &ProjectStore) -> Result<String> {
     let root = store.root();
     let global = store.load_global_config()?;
     let settings: PairingSettings = global
@@ -421,6 +421,78 @@ fn create_code(store: &ProjectStore) -> Result<String> {
     Ok(code)
 }
 
+pub(super) fn pair(
+    store: &ProjectStore,
+    address: &str,
+    code: String,
+    local_address: Option<SocketAddr>,
+) -> Result<String> {
+    let root = store.root();
+    endpoint(root, address)?;
+    let node = Journal::open(root)?.node;
+    let local = card(store, local_address.unwrap_or_else(outbound_address))?;
+    if !node.outbound_only() && local_address.is_none() {
+        return Err(invalid("--address required for an inbound node"));
+    }
+    if !node.outbound_only() && !reachable(root, local.address)? {
+        return Err(invalid("--address must be a LAN or enabled tailnet address"));
+    }
+    let request = PairRequest {
+        code,
+        node_card: local.clone(),
+    };
+    let mut command = Command::new("curl");
+    if let Some(proxy) = crate::core::net::proxy_for(root, address)? {
+        command.args(["--proxy", &proxy, "--noproxy", ""]);
+    } else {
+        command.args(["--noproxy", "*"]);
+    }
+    let mut child = command
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            "-H",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+        ])
+        .arg(format!("http://{address}/pair"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| invalid("curl stdin missing"))?
+        .write_all(&serde_json::to_vec(&request).map_err(|e| invalid(e.to_string()))?)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "Pair failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let mut reply: PairReply =
+        serde_json::from_slice(&output.stdout).map_err(|e| invalid(e.to_string()))?;
+    if let Ok(socket) = address.parse() {
+        reply.node_card.address = socket;
+    } else {
+        reply.node_card.tailscale_address = Some(address.to_owned());
+    }
+    validate(root, &local, &reply.node_card)?;
+    let _store_lock = lock_file_reentrant(&root.join(".lock"))?;
+    let _sync_lock = lock_file_reentrant(&root.join("sync/.lock"))?;
+    install(store, &reply.node_card, &reply.reverse_token, &reply.token)?;
+    Ok(reply.node_card.node.name)
+}
+
 pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool> {
     let root = store.root();
     if options.pair_code {
@@ -442,74 +514,16 @@ pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool
             qr.render::<qrcode::render::unicode::Dense1x2>().build()
         );
     } else if let Some(address) = &options.pair {
-        endpoint(root, address)?;
-        let node = Journal::open(root)?.node;
-        let local = card(store, options.address.unwrap_or_else(outbound_address))?;
-        if !node.outbound_only() && options.address.is_none() {
-            return Err(invalid("--address required for an inbound node"));
-        }
-        if !node.outbound_only() && !reachable(root, local.address)? {
-            return Err(invalid(
-                "--address must be a LAN or enabled tailnet address",
-            ));
-        }
-        let request = PairRequest {
-            code: options
+        let name = pair(
+            store,
+            address,
+            options
                 .code
                 .clone()
                 .ok_or_else(|| invalid("--code required"))?,
-            node_card: local.clone(),
-        };
-        let mut command = Command::new("curl");
-        if let Some(proxy) = crate::core::net::proxy_for(root, address)? {
-            command.args(["--proxy", &proxy, "--noproxy", ""]);
-        } else {
-            command.args(["--noproxy", "*"]);
-        }
-        let mut child = command
-            .args([
-                "--silent",
-                "--show-error",
-                "--fail-with-body",
-                "--connect-timeout",
-                "5",
-                "--max-time",
-                "15",
-                "-H",
-                "Content-Type: application/json",
-                "--data-binary",
-                "@-",
-            ])
-            .arg(format!("http://{address}/pair"))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| invalid("curl stdin missing"))?
-            .write_all(&serde_json::to_vec(&request).map_err(|e| invalid(e.to_string()))?)?;
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            return Err(invalid(format!(
-                "Pair failed: {} {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        let mut reply: PairReply =
-            serde_json::from_slice(&output.stdout).map_err(|e| invalid(e.to_string()))?;
-        if let Ok(socket) = address.parse() {
-            reply.node_card.address = socket;
-        } else {
-            reply.node_card.tailscale_address = Some(address.clone());
-        }
-        validate(root, &local, &reply.node_card)?;
-        let _store_lock = lock_file_reentrant(&root.join(".lock"))?;
-        let _sync_lock = lock_file_reentrant(&root.join("sync/.lock"))?;
-        install(store, &reply.node_card, &reply.reverse_token, &reply.token)?;
-        println!("Paired with {}", reply.node_card.node.name);
+            options.address,
+        )?;
+        println!("Paired with {name}");
     } else {
         return Ok(false);
     }

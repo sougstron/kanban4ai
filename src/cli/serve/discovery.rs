@@ -84,14 +84,14 @@ pub(super) struct Presence {
     discovered: Vec<SocketAddr>,
 }
 #[derive(Serialize)]
-struct Status {
-    node: String,
+pub(super) struct Status {
+    pub(super) node: String,
     status: &'static str,
-    code: &'static str,
-    path: &'static str,
-    message: String,
+    pub(super) code: &'static str,
+    pub(super) path: &'static str,
+    pub(super) message: String,
     since: Option<DateTime<Utc>>,
-    last_seen: Option<DateTime<Utc>>,
+    pub(super) last_seen: Option<DateTime<Utc>>,
 }
 #[derive(Serialize, Deserialize)]
 struct Version {
@@ -467,7 +467,7 @@ async fn probe_peer(
     }
     Ok(status(peer, presence, code, remote_version.as_ref()))
 }
-async fn probes(root: &Path) -> Result<Vec<Status>> {
+pub(super) async fn probes(root: &Path) -> Result<Vec<Status>> {
     let config = config(root)?;
     let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
     let presence: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
