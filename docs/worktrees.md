@@ -33,6 +33,10 @@ worktree instead of the shared folder:
   agent a tree missing it. `seed: head` branches from HEAD and never touches
   the ref. Because each snapshot parents on the previous integration tip, two
   tasks' merge-base is the shared snapshot, not committed HEAD.
+  In a machine-local peer clone (`sync.clone_root/<project-id>`), an existing
+  received integration tip is used directly: snapshotting the older local
+  checkout would erase the source node's unpublished work. See
+  [code transfer](sync.md#81-передача-кода-task-418).
 - Every launch root points at the worktree: the prompt's paths, tmux `-c`,
   the background process `current_dir`, verification gates, `kanban detach`,
   revert jobs, and provenance harvesting (whose recorded paths are
@@ -121,6 +125,8 @@ worktree), and — when no task holds a worktree — re-baselines the
 integration ref to a fresh snapshot parented on HEAD, releasing the old
 snapshot chain: the ref is a GC root, and without this every snapshot it
 ever pointed at would stay alive forever.
+Peer clones retain the received integration chain instead of re-baselining it
+from their local checkout; the source working folder remains the live authority.
 
 **Configuration** — the whole `orchestration.isolation` block, validated
 strictly (a value outside a closed set, a non-mapping `isolation:`, or a

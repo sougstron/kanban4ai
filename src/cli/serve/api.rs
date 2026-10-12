@@ -41,6 +41,13 @@ fn net_error_code(message: &str) -> Option<&'static str> {
     .find(|code| message.starts_with(code))
 }
 fn failure(e: KanbanError) -> Response {
+    if let KanbanError::Invalid(message) = &e {
+        for code in ["SYNC_NO_REMOTE", "RUNNER_REPO_MISSING"] {
+            if message.contains(code) {
+                return error(StatusCode::CONFLICT, code, message);
+            }
+        }
+    }
     let (status, code) = match &e {
         KanbanError::Invalid(message) if net_error_code(message).is_some() => {
             (StatusCode::BAD_GATEWAY, net_error_code(message).unwrap())
@@ -309,7 +316,11 @@ async fn action(
         }
     }
     respond(blocking(move || crate::core::sync::with_actor(if request.agent { "agent" } else { "human" }, || {
-        let p = project(&root, &id)?;
+        let p = if action == "launch" {
+            crate::core::code::for_launch(&root, &id)?
+        } else {
+            project(&root, &id)?
+        };
         let ops = Operations::for_project(&p);
         match action.as_str() {
             "move" => task_wire(found(ops.move_task(&task, request.status.as_deref().ok_or_else(|| invalid("status is required"))?, request.agent)?)?),
@@ -470,6 +481,88 @@ async fn proxy(
                 "NODE_VERSION_MISMATCH",
                 "Runner protocol is incompatible",
             );
+        }
+        if action == "launch" {
+            // Preserve launch exclusion before touching the runner's repository.
+            // The runner still enforces it at mutation time (this is not a lock).
+            let preflight = match http
+                .get(format!(
+                    "http://{address}/api/v1/projects/{id}/tasks/{task}"
+                ))
+                .bearer_auth(&secret.token)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    return error(StatusCode::BAD_GATEWAY, "NODE_UNREACHABLE", &e.to_string());
+                }
+            };
+            let status = preflight.status();
+            let value = match preflight.json::<Value>().await {
+                Ok(value) => value,
+                Err(e) => {
+                    return error(StatusCode::BAD_GATEWAY, "NODE_SERVICE_DOWN", &e.to_string());
+                }
+            };
+            if !status.is_success() {
+                return (status, Json(value)).into_response();
+            }
+            let runs: BTreeMap<String, crate::core::sync::RunDescriptor> =
+                match decode(value["runs"].clone()) {
+                    Ok(runs) => runs,
+                    Err(e) => return failure(e),
+                };
+            if runs.values().any(|run| run.active()) {
+                return error(
+                    StatusCode::CONFLICT,
+                    "RUN_ALREADY_RUNNING",
+                    "Task is already running",
+                );
+            }
+            let (code_root, code_id) = (root.to_path_buf(), id.to_owned());
+            let transfer = match blocking(move || {
+                let remote = crate::core::code::status(&code_root, &code_id)?.remote;
+                if role == NodeRole::Mobile && remote.is_none() {
+                    return Err(invalid("SYNC_NO_REMOTE"));
+                }
+                if let Some(remote) = remote {
+                    crate::core::code::publish_live(&code_root, &code_id, &remote)?;
+                    Ok((None, Some(remote)))
+                } else {
+                    let (bundle, _) = crate::core::code::export(&code_root, &code_id, &[])?;
+                    Ok((Some(bundle), None))
+                }
+            })
+            .await
+            {
+                Ok(transfer) => transfer,
+                Err(e) => return failure(e),
+            };
+            let mut upload = http
+                .post(format!("http://{address}/git/{id}/bundle"))
+                .bearer_auth(&secret.token);
+            if let Some(remote) = transfer.1 {
+                upload = upload.query(&[("remote", remote)]);
+            } else {
+                match super::git::bundle_stream(transfer.0.expect("LAN transfer bundle")).await {
+                    Ok(stream) => upload = upload.body(reqwest::Body::wrap_stream(stream)),
+                    Err(e) => return failure(e),
+                }
+            }
+            match upload.send().await {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => {
+                    let status = response.status();
+                    return match response.json::<Value>().await {
+                        Ok(value) => (status, Json(value)).into_response(),
+                        Err(e) => failure(invalid(e.to_string())),
+                    };
+                }
+                Err(e) => {
+                    return error(StatusCode::BAD_GATEWAY, "NODE_UNREACHABLE", &e.to_string());
+                }
+            }
         }
         let url = format!("http://{address}/api/v1/projects/{id}/tasks/{task}/{action}");
         match http

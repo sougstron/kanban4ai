@@ -563,6 +563,42 @@ runs:
 - Ветка из запуска на «чужом» узле при двойном запуске называется
   `kanban/TASK-N@<node>`.
 
+### 8.1 Передача кода (TASK-418)
+
+- `core/code.rs` хранит ленивые машинные клоны в `sync.clone_root/<project-id>`.
+  `git_remote` записывается в `project.yaml` при регистрации и перед передачей
+  кода; путь клона остаётся локальным `work_path`. Создание выполняется во
+  временном соседнем каталоге с rename только после успешного git clone/import.
+- Проксирование `POST /api/v1/projects/<project>/tasks/<task>/launch` сначала
+  публикует live-снапшот и подготавливает код на runner, затем запускает задачу.
+  При наличии remote публикуются только `refs/kanban/integration` и ветки
+  `kanban/*`; main и рабочая ветка человека не пушатся.
+- `GET /git/<project>/bundle?have=<oid,oid,...>` возвращает git bundle.
+  `have` — известные commit OID (SHA-1 или SHA-256), а не git rev expressions.
+  Bundle включает HEAD, ветки и integration; первая передача полная,
+  последующие могут исключать известную историю.
+  HTTP читает/пишет bundle потоково через временный файл: размер репозитория
+  не требует целиком держать bundle в памяти serve или прокси.
+- `POST /git/<project>/bundle` принимает bundle. Непустое тело разрешено
+  только по LAN/loopback, не по tailnet. Пустое тело с `?remote=<url>`
+  подготавливает/обновляет клон через remote и допускается по tailnet.
+  Оба метода требуют node bearer token. На mobile отсутствие remote —
+  `SYNC_NO_REMOTE`.
+- Обновление существующего клона не делает checkout/reset: bundle импортирует
+  только `refs/heads/kanban/TASK-*` и `refs/kanban/integration`, remote fetch
+  сохраняет обычные ветки в remote-tracking refs, а `kanban/*` — в локальные
+  task refs. HEAD, index и правки рабочей папки не меняются. Уже подготовленный
+  клон при запуске используется без повторного fetch (в том числе офлайн);
+  refresh выполняется входящей передачей или предварительной подготовкой.
+- В машинном клоне `seed: live` использует полученную integration напрямую;
+  сборка нового снимка из старого checkout и GC re-baseline не затирают WIP
+  исходного узла. Новая ветка задачи в таком клоне публикуется в remote;
+  ошибка публикации записывается в тред как `Code publication pending`.
+- `GET /git/<project>/status` возвращает `{project, state, path, remote,
+  integration}`; `state` — `missing` или `ready`. Это API статуса клона для
+  вкладки Sync; путь и наличие клона относятся к отвечающему узлу.
+
+
 ## 9. Runner
 
 - `runner: server | laptop | mobile | here | auto` на трёх уровнях: глобально
@@ -972,7 +1008,7 @@ Sleep hook шлёт bye перед `sleep.target`, hello — при его ос�
 | GET | `/sync/snapshot` | bootstrap-снапшот |
 | POST | `/sync/bye` | «ухожу» `{reason: shutdown\|sleep, at}` |
 | GET/PUT | `/blobs/<sha256>` | картинки |
-| GET | `/git/<project>/bundle?have=<refs>` | инкрементальный bundle |
+| GET | `/git/<project>/bundle?have=<oid,oid,...>` | инкрементальный bundle |
 | POST | `/git/<project>/bundle` | принять ветки / `refs/kanban/integration` |
 | GET | `/git/<project>/status` | состояние клона для вкладки Sync |
 
