@@ -222,7 +222,7 @@ fn validate(op: &Operation, store: &str) -> Result<()> {
         return Err(invalid("unsupported sync entity"));
     }
     if op.entity == "lease" {
-        lease::decode(op)?;
+        lease::validate_operation(op)?;
     }
     if op.entity == "run" {
         run::validate(op)?;

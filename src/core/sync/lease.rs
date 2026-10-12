@@ -1,6 +1,5 @@
-//! ID grants are immutable journal operations. Only the bootstrap source may
-//! extend them; a grant for that source is unusable until the peer acknowledges
-//! its sequence. Consumption is machine-local and durable before returning an ID.
+//! Immutable ID grants and explicit authority transfers. Consumption is
+//! machine-local and durable before returning an ID.
 use super::*;
 use crate::core::storage::Storage;
 
@@ -10,6 +9,8 @@ pub struct IdLease {
     pub node: String,
     pub from: u64,
     pub to: u64,
+    #[serde(default)]
+    pub reserve: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -46,7 +47,7 @@ pub(super) fn decode(op: &Operation) -> Result<IdLease> {
         || to == u64::MAX
         || op.id != op.op
         || !op.prev.is_empty()
-        || op.set.len() != 3
+        || op.set.len() != if op.set.contains_key("reserve") { 4 } else { 3 }
         || op.project.is_empty()
     {
         return Err(invalid("invalid immutable ID lease"));
@@ -56,29 +57,83 @@ pub(super) fn decode(op: &Operation) -> Result<IdLease> {
         node: node.into(),
         from,
         to,
+        reserve: match op.set.get("reserve") {
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| invalid("invalid lease reserve"))?,
+            None => false,
+        },
     })
 }
 
 pub(super) fn validate_state(state: &JournalState) -> Result<()> {
-    let mut leases: BTreeMap<&str, Vec<(&Operation, IdLease)>> = BTreeMap::new();
-    for op in state.operations.values().filter(|op| op.entity == "lease") {
-        leases
-            .entry(&op.project)
-            .or_default()
-            .push((op, decode(op)?));
-    }
-    for grants in leases.values_mut() {
-        grants.sort_by_key(|(_, lease)| lease.from);
-        let mut previous = None;
-        let issuer = grants[0].0.hlc.2.clone();
-        for (op, lease) in grants {
-            if op.hlc.2 != issuer || previous.is_some_and(|end| end >= lease.from) {
+    let projects: BTreeSet<_> = state
+        .operations
+        .values()
+        .filter(|op| op.entity == "lease")
+        .map(|op| op.project.as_str())
+        .collect();
+    for project in projects {
+        authority(state, project)?;
+        let grants = grants(state, project)?;
+        for pair in grants.windows(2) {
+            if pair[0].1.to >= pair[1].1.from {
                 return Err(invalid("SYNC_LEASE_CONFLICT"));
             }
-            previous = Some(lease.to);
         }
     }
     Ok(())
+}
+
+pub(super) fn validate_operation(op: &Operation) -> Result<()> {
+    if !op.set.contains_key("issuer") {
+        decode(op)?;
+        return Ok(());
+    }
+    if op.id != op.op
+        || !op.prev.is_empty()
+        || op.set.len() != 3
+        || op.project.is_empty()
+        || op.set.get("from_issuer").and_then(Value::as_str) != Some(&op.hlc.2)
+        || op
+            .set
+            .get("epoch")
+            .and_then(Value::as_u64)
+            .is_none_or(|epoch| epoch == 0)
+        || op
+            .set
+            .get("issuer")
+            .and_then(Value::as_str)
+            .is_none_or(|id| id.is_empty() || id == op.hlc.2 || id.contains(['/', '\\', '\0']))
+    {
+        return Err(invalid("invalid lease authority transfer"));
+    }
+    Ok(())
+}
+
+pub(super) fn authority(state: &JournalState, project: &str) -> Result<Option<(String, u64)>> {
+    let mut operations: Vec<_> = state
+        .operations
+        .values()
+        .filter(|op| op.entity == "lease" && op.project == project)
+        .collect();
+    operations.sort_by(|a, b| a.hlc.cmp(&b.hlc));
+    let mut current: Option<(String, u64)> = None;
+    for op in operations {
+        validate_operation(op)?;
+        let (issuer, epoch) = current.get_or_insert_with(|| (op.hlc.2.clone(), 0));
+        if *issuer != op.hlc.2 {
+            return Err(invalid("SYNC_LEASE_CONFLICT"));
+        }
+        if let Some(next) = op.set.get("issuer").and_then(Value::as_str) {
+            if op.set["epoch"].as_u64() != epoch.checked_add(1) {
+                return Err(invalid("SYNC_LEASE_CONFLICT"));
+            }
+            *issuer = next.into();
+            *epoch += 1;
+        }
+    }
+    Ok(current)
 }
 
 pub(super) fn grants<'a>(
@@ -88,27 +143,29 @@ pub(super) fn grants<'a>(
     let mut result = state
         .operations
         .values()
-        .filter(|op| op.entity == "lease" && op.project == project)
+        .filter(|op| {
+            op.entity == "lease" && op.project == project && !op.set.contains_key("issuer")
+        })
         .map(|op| Ok((op, decode(op)?)))
         .collect::<Result<Vec<_>>>()?;
     result.sort_by_key(|(_, lease)| lease.from);
     Ok(result)
 }
 
-/// Before any grant exists, only one paired node may issue the first grants
-/// and keep the legacy `max + 1`: the laptop (bootstrap source), with node_id
-/// as the tie-breaker. Unpaired stores keep the legacy behavior.
+/// Before the first grant, prefer the paired server. Unpaired stores retain
+/// legacy allocation; node_id breaks ties between equal roles.
 pub(super) fn fallback_issuer(store: &Path, node: &NodeIdentity) -> Result<bool> {
     let config: Value = match fs::read_to_string(store.join("config.yaml")) {
         Ok(text) => serde_yaml_ng::from_str(&text)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(e) => return Err(e.into()),
     };
-    let rank = |role: &str, id: &str| (role != "laptop", id.to_owned());
+    let rank = |role: &str, id: &str| (role != "server", role == "mobile", id.to_owned());
     let own = rank(
         match node.role {
             NodeRole::Laptop => "laptop",
             NodeRole::Server => "server",
+            NodeRole::Mobile => "mobile",
         },
         &node.node_id,
     );
@@ -124,7 +181,7 @@ pub(super) fn fallback_issuer(store: &Path, node: &NodeIdentity) -> Result<bool>
                 peer.get("node_id")?.as_str()?,
             ))
         })
-        .filter(|peer| peer.1 != node.node_id)
+        .filter(|peer| peer.2 != node.node_id)
         .all(|peer| own < peer))
 }
 
@@ -161,8 +218,8 @@ fn remaining(grants: &[(&Operation, IdLease)], node: &str, allocation: &Allocati
 }
 
 impl Journal {
-    /// Prepare bootstrap/renewal grants on the bootstrap source. The transport
-    /// must first exchange operations and supply the peer's acknowledged vector
+    /// Prepare grants, or transfer an existing laptop authority to its server.
+    /// The transport must first exchange operations and supply the peer's vector
     /// and reported number of unused IDs. Apply the returned operations on the
     /// peer, then call `confirm_id_leases` with its new vector. Retransmit after
     /// a lost response; unacknowledged grants are returned without extending them.
@@ -198,18 +255,22 @@ impl Journal {
         }
         let uid = state.project_uids[project].clone();
         let existing = grants(&state, &uid)?;
-        if existing
-            .first()
-            .is_some_and(|(op, _)| op.hlc.2 != self.node.node_id)
+        let authority = authority(&state, &uid)?;
+        if authority
+            .as_ref()
+            .is_some_and(|(issuer, _)| *issuer != self.node.node_id)
+            || (authority.is_none() && !fallback_issuer(store, &self.node)?)
         {
             return Err(invalid("SYNC_LEASE_AUTHORITY"));
         }
-        let pending: Vec<_> = existing
-            .iter()
-            .filter(|(op, _)| {
+        let pending: Vec<_> = state
+            .operations
+            .values()
+            .filter(|op| op.entity == "lease" && op.project == uid)
+            .filter(|op| {
                 sequence(op).expect("valid lease") > *acknowledged.get(&op.hlc.2).unwrap_or(&0)
             })
-            .map(|(op, _)| (*op).clone())
+            .cloned()
             .collect();
         if !pending.is_empty() {
             return Ok(pending);
@@ -232,17 +293,46 @@ impl Journal {
                 .ok_or_else(|| invalid("sync.id_block must be a positive integer"))?,
             None => 50,
         };
+        let peer_role = config
+            .get("sync")
+            .and_then(|sync| sync.get("peers"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|entry| entry.get("node_id").and_then(Value::as_str) == Some(peer))
+            .and_then(|entry| entry.get("role"))
+            .and_then(Value::as_str);
+        let reserve = match config
+            .get("sync")
+            .and_then(|sync| sync.get("lease_reserve"))
+        {
+            Some(value) => value
+                .as_u64()
+                .filter(|size| *size > 0)
+                .ok_or_else(|| invalid("sync.lease_reserve must be a positive integer"))?,
+            None => 200,
+        };
         let allocation_path = self.root.join("meta/allocation.json");
         let allocation: Allocation = load(&allocation_path)?;
         let own_remaining = remaining(&existing, &self.node.node_id, &allocation);
         let mut nodes = Vec::new();
         if existing.is_empty() || own_remaining < block.div_ceil(2) {
-            nodes.push(self.node.node_id.clone());
+            nodes.push((self.node.node_id.clone(), block, false));
         }
-        if !existing.iter().any(|(_, grant)| grant.node == peer)
+        if peer_role == Some("mobile") {
+            if peer_remaining < reserve {
+                nodes.push((peer.to_owned(), reserve - peer_remaining, false));
+            }
+            if !existing
+                .iter()
+                .any(|(_, grant)| grant.node == peer && grant.reserve)
+            {
+                nodes.push((peer.to_owned(), reserve, true));
+            }
+        } else if !existing.iter().any(|(_, grant)| grant.node == peer)
             || peer_remaining < block.div_ceil(2)
         {
-            nodes.push(peer.to_owned());
+            nodes.push((peer.to_owned(), block, false));
         }
         let max_file = board.max_task_number();
         let mut end = existing
@@ -251,14 +341,23 @@ impl Journal {
             .fold(maximum(&state, &uid, max_file), u64::max);
         let mut clock: Hlc = load(&self.root.join("hlc"))?;
         let mut operations = Vec::new();
-        for node in nodes {
+        let transfer = authority
+            .as_ref()
+            .filter(|_| self.node.role != NodeRole::Server && peer_role == Some("server"));
+        if transfer.is_some() {
+            nodes.clear();
+            nodes.push((peer.to_owned(), 0, false));
+        }
+        for (node, size, is_reserve) in nodes {
             let from = end
                 .checked_add(1)
                 .ok_or_else(|| invalid("task IDs exhausted"))?;
-            end = from
-                .checked_add(block - 1)
-                .filter(|end| *end < u64::MAX)
-                .ok_or_else(|| invalid("task IDs exhausted"))?;
+            if size > 0 {
+                end = from
+                    .checked_add(size - 1)
+                    .filter(|end| *end < u64::MAX)
+                    .ok_or_else(|| invalid("task IDs exhausted"))?;
+            }
             let seq = state
                 .vector
                 .get(&self.node.node_id)
@@ -275,11 +374,26 @@ impl Journal {
                 store: self.node.store_id.clone(),
                 project: uid.clone(),
                 entity: "lease".into(),
-                set: BTreeMap::from([
-                    ("node".into(), Value::String(node)),
-                    ("from".into(), Value::from(from)),
-                    ("to".into(), Value::from(end)),
-                ]),
+                set: if let Some((_, epoch)) = transfer {
+                    BTreeMap::from([
+                        ("issuer".into(), Value::String(node)),
+                        (
+                            "from_issuer".into(),
+                            Value::String(self.node.node_id.clone()),
+                        ),
+                        ("epoch".into(), Value::from(epoch + 1)),
+                    ])
+                } else {
+                    let mut fields = BTreeMap::from([
+                        ("node".into(), Value::String(node)),
+                        ("from".into(), Value::from(from)),
+                        ("to".into(), Value::from(end)),
+                    ]);
+                    if is_reserve {
+                        fields.insert("reserve".into(), Value::Bool(true));
+                    }
+                    fields
+                },
                 prev: BTreeMap::new(),
                 actor: "kanban".into(),
             };
@@ -332,6 +446,15 @@ impl Journal {
 
     /// Report durable unused capacity for the next online renewal handshake.
     pub fn remaining_task_ids(&self, project: &str) -> Result<u64> {
+        self.available_task_ids(project, false)
+    }
+
+    /// Capacity advertised for renewal excludes the emergency mobile range.
+    pub fn remaining_primary_task_ids(&self, project: &str) -> Result<u64> {
+        self.available_task_ids(project, true)
+    }
+
+    fn available_task_ids(&self, project: &str, primary_only: bool) -> Result<u64> {
         apply::recover_remote(&self.root)?;
         let _sync = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
@@ -344,6 +467,7 @@ impl Journal {
             .into_iter()
             .filter(|(op, lease)| {
                 lease.node == self.node.node_id
+                    && (!primary_only || !lease.reserve)
                     && (op.hlc.2 != self.node.node_id || allocation.confirmed.contains(&op.op))
             })
             .collect();
@@ -362,7 +486,11 @@ pub(crate) fn allocate(board: &Storage) -> Result<Option<String>> {
     let state: JournalState = load(&journal.root.join("meta/state.json"))?;
     let uid = state.project_uids.get(&target.project);
     let all = match uid {
-        Some(uid) => grants(&state, uid)?,
+        Some(uid) => {
+            let mut grants = grants(&state, uid)?;
+            grants.sort_by_key(|(_, grant)| (grant.reserve, grant.from));
+            grants
+        }
         None => Vec::new(),
     };
     let Some(uid) = uid.filter(|_| !all.is_empty()) else {
@@ -370,7 +498,7 @@ pub(crate) fn allocate(board: &Storage) -> Result<Option<String>> {
             return Ok(None);
         }
         return Err(invalid(
-            "SYNC_ID_BLOCK_EXHAUSTED: waiting for the first task ID lease from the paired laptop",
+            "SYNC_ID_BLOCK_EXHAUSTED: waiting for the first task ID lease from the paired server",
         ));
     };
     let allocation_path = journal.root.join("meta/allocation.json");

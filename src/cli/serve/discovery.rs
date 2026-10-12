@@ -166,6 +166,7 @@ fn display_node(node: &NodeIdentity) -> &'static str {
     match node.role {
         NodeRole::Server => "Сервер",
         NodeRole::Laptop => "Ноут",
+        NodeRole::Mobile => "Телефон",
     }
 }
 fn time_text(at: DateTime<Utc>) -> String {
@@ -715,6 +716,7 @@ pub(super) async fn start(root: &Path, networks: &[IpNet], port: u16) -> Result<
         let role = match node.role {
             NodeRole::Server => "server",
             NodeRole::Laptop => "laptop",
+            NodeRole::Mobile => "mobile",
         };
         let properties = [
             ("node_id", node.node_id.as_str()),

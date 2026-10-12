@@ -70,11 +70,11 @@ impl Journal {
     }
 
     /// Whether this node issues the next ID grants for project `uid`: the
-    /// issuer of existing grants, otherwise the paired laptop (section 6).
+    /// current authority, otherwise the paired server (section 6).
     pub fn issues_id_leases(&self, uid: &str) -> Result<bool> {
         let state = self.state()?;
-        match lease::grants(&state, uid)?.first() {
-            Some((op, _)) => Ok(op.hlc.2 == self.node.node_id),
+        match lease::authority(&state, uid)? {
+            Some((issuer, _)) => Ok(issuer == self.node.node_id),
             None => lease::fallback_issuer(self.root.parent().expect("sync parent"), &self.node),
         }
     }

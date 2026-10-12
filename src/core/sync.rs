@@ -48,6 +48,7 @@ pub enum NodeRole {
     #[default]
     Laptop,
     Server,
+    Mobile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

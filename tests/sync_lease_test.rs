@@ -288,3 +288,177 @@ fn concurrent_writers_consume_each_number_once() {
     );
     assert_eq!(ja.remaining_task_ids("demo").unwrap(), 0);
 }
+
+fn set_role(
+    root: &std::path::Path,
+    journal: &Journal,
+    role: kanban4ai::core::sync::NodeRole,
+) -> Journal {
+    let mut identity = journal.node.clone();
+    identity.role = role;
+    fs::write(
+        root.join("sync/node.yaml"),
+        serde_yaml_ng::to_string(&identity).unwrap(),
+    )
+    .unwrap();
+    Journal::open(root).unwrap()
+}
+
+#[test]
+fn laptop_transfers_authority_to_server_without_recycling_old_ranges() {
+    use kanban4ai::core::sync::NodeRole;
+    let (a, b, laptop, server, sa, sb) = pair(4);
+    let original = grant(&laptop, &server, 0);
+    let server = set_role(b.path(), &server, NodeRole::Server);
+    atomic_write_text(
+        &a.path().join("config.yaml"),
+        &format!(
+            "sync:\n  id_block: 4\n  peers:\n    - node_id: {}\n      role: server\n",
+            server.node.node_id
+        ),
+    )
+    .unwrap();
+    let transfer = grant(&laptop, &server, 4);
+    assert_eq!(transfer.len(), 1);
+    assert_eq!(transfer[0].set["issuer"], server.node.node_id);
+    assert_eq!(transfer[0].set["epoch"], 1);
+    let uid = laptop.project_uids().unwrap()["demo"].clone();
+    assert!(!laptop.issues_id_leases(&uid).unwrap());
+    assert!(server.issues_id_leases(&uid).unwrap());
+    assert!(
+        laptop
+            .prepare_id_leases("demo", &server.node.node_id, &server.vector().unwrap(), 0)
+            .unwrap_err()
+            .to_string()
+            .contains("LEASE_AUTHORITY")
+    );
+    assert_eq!(sa.get_next_id().unwrap(), "TASK-001");
+    assert_eq!(sb.get_next_id().unwrap(), "TASK-005");
+    let renewed = grant(&server, &laptop, 0);
+    assert!(
+        renewed
+            .iter()
+            .all(|op| op.set["from"].as_u64().unwrap() > 8)
+    );
+    for old in original {
+        assert_eq!(
+            serde_json::to_value(&server.state().unwrap().operations[&old.op]).unwrap(),
+            serde_json::to_value(old).unwrap()
+        );
+    }
+    // A delayed old-authority extension is rejected, even above the high-water mark.
+    let mut stale = renewed[0].clone();
+    stale.hlc = transfer[0].hlc.clone();
+    stale.hlc.1 += 1;
+    stale.op = format!(
+        "{}:{}",
+        laptop.node.node_id,
+        laptop.vector().unwrap()[&laptop.node.node_id] + 1
+    );
+    stale.id = stale.op.clone();
+    stale.set.insert("from".into(), json!(100));
+    stale.set.insert("to".into(), json!(103));
+    assert!(
+        server
+            .apply_remote(&[stale], 300_000)
+            .unwrap_err()
+            .to_string()
+            .contains("LEASE_CONFLICT")
+    );
+}
+
+#[test]
+fn mobile_spends_primary_then_reserve_offline_and_refills_with_three_disjoint_nodes() {
+    use kanban4ai::core::sync::NodeRole;
+    let (a, _b, server, laptop, sa, sb) = pair(4);
+    let server = set_role(a.path(), &server, NodeRole::Server);
+    grant(&server, &laptop, 0);
+    let c = tempfile::tempdir().unwrap();
+    let mobile = Journal::open(c.path()).unwrap();
+    let mut identity = mobile.node.clone();
+    identity.store_id = server.node.store_id.clone();
+    identity.role = NodeRole::Mobile;
+    fs::write(
+        c.path().join("sync/node.yaml"),
+        serde_yaml_ng::to_string(&identity).unwrap(),
+    )
+    .unwrap();
+    let mobile = Journal::open(c.path()).unwrap();
+    let sc = Storage::new(c.path().join("projects/demo"));
+    sc.init_board().unwrap();
+    atomic_write_text(&a.path().join("config.yaml"), &format!(
+        "sync:\n  id_block: 4\n  lease_reserve: 6\n  peers:\n    - node_id: {}\n      role: mobile\n",
+        mobile.node.node_id
+    )).unwrap();
+    let first = grant(&server, &mobile, 0);
+    assert_eq!(first.len(), 2);
+    assert_eq!(mobile.remaining_primary_task_ids("demo").unwrap(), 6);
+    assert_eq!(mobile.remaining_task_ids("demo").unwrap(), 12);
+    assert_eq!(first[1].set["reserve"], true);
+    let mut ids = std::collections::BTreeSet::new();
+    for _ in 0..7 {
+        assert!(
+            ids.insert(
+                sc.create_task(NewTask::titled("offline mobile"))
+                    .unwrap()
+                    .id
+            )
+        );
+    }
+    assert_eq!(mobile.remaining_primary_task_ids("demo").unwrap(), 0);
+    assert_eq!(mobile.remaining_task_ids("demo").unwrap(), 5);
+    let renewed = grant(
+        &server,
+        &mobile,
+        mobile.remaining_primary_task_ids("demo").unwrap(),
+    );
+    assert_eq!(renewed.len(), 1);
+    assert_eq!(mobile.remaining_primary_task_ids("demo").unwrap(), 6);
+    let next = sc.create_task(NewTask::titled("online again")).unwrap().id;
+    assert_eq!(
+        next,
+        format!("TASK-{:03}", renewed[0].set["from"].as_u64().unwrap())
+    );
+    assert!(ids.insert(next));
+    assert!(
+        grant(
+            &server,
+            &mobile,
+            mobile.remaining_primary_task_ids("demo").unwrap()
+        )
+        .iter()
+        .all(|op| !op.set.contains_key("reserve"))
+    );
+    for storage in [&sa, &sb] {
+        for _ in 0..4 {
+            assert!(
+                ids.insert(
+                    storage
+                        .create_task(NewTask::titled("other node"))
+                        .unwrap()
+                        .id
+                )
+            );
+        }
+    }
+    let state = server.state().unwrap();
+    let mut ranges: Vec<_> = state
+        .operations
+        .values()
+        .filter(|op| op.entity == "lease")
+        .map(|op| {
+            (
+                op.set["from"].as_u64().unwrap(),
+                op.set["to"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    ranges.sort();
+    assert!(ranges.windows(2).all(|pair| pair[0].1 < pair[1].0));
+    // Durable reserve consumption survives restart.
+    let restarted = Journal::open(c.path()).unwrap();
+    assert_eq!(
+        restarted.remaining_task_ids("demo").unwrap(),
+        mobile.remaining_task_ids("demo").unwrap()
+    );
+}
