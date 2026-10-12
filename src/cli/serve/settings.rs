@@ -56,7 +56,6 @@ pub(crate) struct View {
     pub api_enabled: bool,
     /// What systemd reports right now; `None` when it could not be asked.
     pub api_active: Option<bool>,
-    pub network: String,
     /// In priority order (`sync.peers`).
     pub peers: Vec<Peer>,
     pub conflicts: Vec<String>,
@@ -102,16 +101,6 @@ fn pending(local: &VersionVector, acknowledged: &VersionVector) -> u64 {
         .iter()
         .map(|(node, seq)| seq.saturating_sub(acknowledged.get(node).copied().unwrap_or(0)))
         .sum()
-}
-
-fn network(root: &Path) -> Result<String> {
-    use crate::core::net::Mode;
-    Ok(match crate::core::net::settings(root)?.mode {
-        Mode::Off => "Tailscale off",
-        Mode::System => "Tailscale: system",
-        Mode::Managed => "Tailscale: managed",
-    }
-    .into())
 }
 
 pub(super) fn clone_line(value: &Value) -> String {
@@ -204,7 +193,6 @@ pub(crate) fn local_view(root: &Path) -> Result<View> {
         role: journal.node.role,
         api_enabled: api_enabled(root)?,
         api_active: unit_active(),
-        network: network(root)?,
         peers,
         conflicts: journal.conflicts()?.iter().map(conflict_line).collect(),
         local_clones,
@@ -297,6 +285,40 @@ pub(crate) fn save_node(root: &Path, name: &str, role: NodeRole) -> Result<()> {
     // Re-open so node.yaml picks up the new identity right away.
     Journal::open(root)?;
     Ok(())
+}
+
+/// Machine-local mode changes preserve all other network settings and login state.
+pub(crate) fn set_network_mode(root: &Path, mode: crate::core::net::Mode) -> Result<()> {
+    use crate::core::net::{self, Mode};
+    let previous = net::settings(root)?.mode;
+    if previous == Mode::Managed && mode != previous {
+        net::down(root)?;
+    }
+    let store = ProjectStore::at(root);
+    let _guard = store.lock()?;
+    let mut config = store.load_global_config()?;
+    let section = config
+        .extras
+        .entry("net".into())
+        .or_insert_with(|| serde_yaml_ng::Value::Mapping(Default::default()));
+    let tailscale = section
+        .as_mapping_mut()
+        .ok_or_else(|| invalid("net must be a mapping"))?
+        .entry(serde_yaml_ng::Value::String("tailscale".into()))
+        .or_insert_with(|| serde_yaml_ng::Value::Mapping(Default::default()));
+    let name = match mode {
+        Mode::Off => "off",
+        Mode::System => "system",
+        Mode::Managed => "managed",
+    };
+    tailscale
+        .as_mapping_mut()
+        .ok_or_else(|| invalid("net.tailscale must be a mapping"))?
+        .insert(
+            serde_yaml_ng::Value::String("mode".into()),
+            serde_yaml_ng::Value::String(name.into()),
+        );
+    store.save_global_config(&config)
 }
 
 /// Move a peer one step up (`-1`) or down (`1`) in `sync.peers`, the order
@@ -435,7 +457,7 @@ pub(crate) fn pairing_code(root: &Path, address: &str) -> Result<(String, Option
 
 /// Pair with the node at `address` using the code it showed. Returns its name.
 pub(crate) fn pair(root: &Path, address: &str, code: &str, local: &str) -> Result<String> {
-    let peer = address
+    let peer: SocketAddr = address
         .trim()
         .parse()
         .map_err(|_| invalid("Peer address: IP:port, e.g. 192.168.0.20:7420"))?;
@@ -455,7 +477,12 @@ pub(crate) fn pair(root: &Path, address: &str, code: &str, local: &str) -> Resul
     if code.is_empty() {
         return Err(invalid("Enter the pairing code"));
     }
-    pairing::pair(&ProjectStore::at(root), &peer.to_string(), code.into(), local)
+    pairing::pair(
+        &ProjectStore::at(root),
+        &peer.to_string(),
+        code.into(),
+        local,
+    )
 }
 
 #[cfg(test)]

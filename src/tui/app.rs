@@ -4440,7 +4440,11 @@ impl App {
         };
         let root = store.root().to_path_buf();
         let sync = &mut modal.sync;
-        sync.poll(&root);
+        sync.poll(
+            &root,
+            self.settings.refresh_interval,
+            modal.settings_tab == SettingsTab::Sync,
+        );
         if modal.settings_tab == SettingsTab::Sync
             && sync.view.is_none()
             && sync.notice.is_none()

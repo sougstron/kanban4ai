@@ -1,10 +1,13 @@
 //! Global Settings → Sync (TASK-415): this node, the API switch, paired
 //! nodes in phone priority order, pairing, sync state and clone status.
 //! Every change is a button or a switch and applies at once; Save/Cancel of
-//! the dialog never touch it. Store I/O lives in `cli::serve::settings`;
-//! this module only holds the page state, its keys and its rendering.
+//! the dialog never touch it. Store I/O lives in `cli::serve::settings` and
+//! `core::net`; this module owns page state, actions and rendering.
+use crate::core::net;
+use serde_json::Value;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -25,6 +28,11 @@ pub(crate) enum Row {
     Name,
     Role,
     Api,
+    NetworkMode,
+    AuthKey,
+    Connect,
+    Disconnect,
+    Logout,
     Peer(usize),
     Pair,
     Code,
@@ -37,6 +45,7 @@ pub(crate) enum FormKind {
     Rename,
     Pair,
     Code,
+    AuthKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,12 +77,26 @@ pub(crate) enum Request {
         code: String,
         local: String,
     },
+    Network(NetworkAction),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NetworkAction {
+    Status,
+    Mode(net::Mode),
+    Connect(String),
+    Disconnect,
+    Logout,
+}
 /// Results of work that touches the network and so runs off the UI thread.
 pub(crate) enum Outcome {
     View(Result<View, String>),
     Paired(Result<String, String>),
+    Network {
+        mode: Option<net::Mode>,
+        status: Result<Value, String>,
+        login: Result<Option<String>, String>,
+    },
 }
 
 #[derive(Default)]
@@ -89,6 +112,12 @@ pub(crate) struct SyncTab {
     pub notice: Option<(String, bool)>,
     pub request: Option<Request>,
     pub job: Option<Receiver<Outcome>>,
+    pub network_mode: Option<net::Mode>,
+    pub network: Option<Result<Value, String>>,
+    pub auth_key: String,
+    pub login_url: Option<String>,
+    pub login_qr: Option<String>,
+    last_network_poll: Option<Instant>,
 }
 
 const ROLES: [NodeRole; 3] = [NodeRole::Laptop, NodeRole::Server, NodeRole::Mobile];
@@ -103,7 +132,16 @@ fn role_label(role: NodeRole) -> &'static str {
 
 impl SyncTab {
     pub fn rows(&self) -> Vec<Row> {
-        let mut rows = vec![Row::Name, Row::Role, Row::Api];
+        let mut rows = vec![
+            Row::Name,
+            Row::Role,
+            Row::Api,
+            Row::NetworkMode,
+            Row::AuthKey,
+            Row::Connect,
+            Row::Disconnect,
+            Row::Logout,
+        ];
         let peers = self.view.as_ref().map_or(0, |view| view.peers.len());
         rows.extend((0..peers).map(Row::Peer));
         rows.extend([Row::Pair, Row::Code, Row::Refresh]);
@@ -116,12 +154,13 @@ impl SyncTab {
 
     /// Owns Esc and the arrows while a form or the pairing code is open.
     pub fn overlay_open(&self) -> bool {
-        self.form.is_some() || self.pairing.is_some()
+        self.form.is_some() || self.pairing.is_some() || self.login_url.is_some()
     }
 
     pub fn close_overlay(&mut self) {
         self.form = None;
         self.pairing = None;
+        self.login_url = None;
     }
 
     fn open(&mut self, kind: FormKind) {
@@ -141,6 +180,10 @@ impl SyncTab {
             FormKind::Code => vec![(
                 "This node's LAN address for a phone QR (optional)",
                 String::new(),
+            )],
+            FormKind::AuthKey => vec![(
+                "Auth key (one-time, never saved)",
+                std::mem::take(&mut self.auth_key),
             )],
         };
         self.form = Some(Form {
@@ -169,6 +212,12 @@ impl SyncTab {
                 KeyCode::Enter if form.focus < last => form.focus += 1,
                 KeyCode::Enter => self.submit(),
                 _ => {}
+            }
+            return;
+        }
+        if self.login_url.is_some() {
+            if matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+                self.login_url = None;
             }
             return;
         }
@@ -234,6 +283,30 @@ impl SyncTab {
                 })
             }
             Row::Api => Some(Request::SetApi(!view.api_enabled)),
+            Row::NetworkMode => {
+                self.auth_key.clear();
+                let next = match self.network_mode.unwrap_or(net::Mode::Off) {
+                    net::Mode::Off => net::Mode::System,
+                    net::Mode::System => net::Mode::Managed,
+                    net::Mode::Managed => net::Mode::Off,
+                };
+                Some(Request::Network(NetworkAction::Mode(next)))
+            }
+            Row::AuthKey => return self.open(FormKind::AuthKey),
+            Row::Connect | Row::Disconnect | Row::Logout
+                if self.network_mode != Some(net::Mode::Managed) =>
+            {
+                self.notice = Some((
+                    "Select Managed; System is read-only (use the system Tailscale app).".into(),
+                    true,
+                ));
+                return;
+            }
+            Row::Connect => Some(Request::Network(NetworkAction::Connect(std::mem::take(
+                &mut self.auth_key,
+            )))),
+            Row::Disconnect => Some(Request::Network(NetworkAction::Disconnect)),
+            Row::Logout => Some(Request::Network(NetworkAction::Logout)),
             Row::Peer(_) => return,
             Row::Pair => return self.open(FormKind::Pair),
             Row::Code => return self.open(FormKind::Code),
@@ -244,6 +317,10 @@ impl SyncTab {
     fn submit(&mut self) {
         let Some(form) = self.form.take() else { return };
         let value = |index: usize| form.fields[index].1.trim().to_string();
+        if form.kind == FormKind::AuthKey {
+            self.auth_key = value(0);
+            return;
+        }
         self.request = Some(match form.kind {
             FormKind::Rename => Request::SaveNode {
                 name: value(0),
@@ -255,16 +332,33 @@ impl SyncTab {
                 local: value(2),
             },
             FormKind::Code => Request::PairingCode { address: value(0) },
+            FormKind::AuthKey => unreachable!(),
         });
     }
 
     /// Run a request against the store. Network work goes to a thread whose
     /// result [`SyncTab::poll`] collects.
     pub fn execute(&mut self, root: &Path, request: Request) {
+        if self.busy() {
+            self.request = Some(request);
+            return;
+        }
         let root = root.to_path_buf();
         let result = match request {
+            Request::Network(action) => {
+                self.spawn(move || {
+                    let login = run_network(&root, action).map_err(|e| e.to_string());
+                    Outcome::Network {
+                        mode: net::settings(&root).ok().map(|s| s.mode),
+                        status: net::status(&root).map_err(|e| e.to_string()),
+                        login,
+                    }
+                });
+                return;
+            }
             Request::Load => settings::local_view(&root).map(|view| {
                 self.view = Some(view);
+                self.request = Some(Request::Network(NetworkAction::Status));
                 None
             }),
             Request::Refresh => {
@@ -352,7 +446,17 @@ impl SyncTab {
     }
 
     /// Collect a finished background job; called from the app tick.
-    pub fn poll(&mut self, root: &Path) {
+    pub fn poll(&mut self, root: &Path, interval: Duration, active: bool) {
+        if active
+            && self.view.is_some()
+            && !self.busy()
+            && self.request.is_none()
+            && self
+                .last_network_poll
+                .is_none_or(|at| at.elapsed() >= interval)
+        {
+            self.request = Some(Request::Network(NetworkAction::Status));
+        }
         let Some(job) = &self.job else { return };
         let outcome = match job.try_recv() {
             Ok(outcome) => outcome,
@@ -365,6 +469,31 @@ impl SyncTab {
         };
         self.job = None;
         match outcome {
+            Outcome::Network {
+                mode,
+                status,
+                login,
+            } => {
+                self.network_mode = mode;
+                if status
+                    .as_ref()
+                    .is_ok_and(|v| v["BackendState"] == "Running")
+                {
+                    self.login_url = None;
+                }
+                self.network = Some(status);
+                self.last_network_poll = Some(Instant::now());
+                match login {
+                    Ok(Some(url)) => {
+                        self.login_qr = qrcode::QrCode::new(url.as_bytes())
+                            .ok()
+                            .map(|qr| qr.render::<qrcode::render::unicode::Dense1x2>().build());
+                        self.login_url = Some(url);
+                    }
+                    Ok(None) => {}
+                    Err(error) => self.notice = Some((error, true)),
+                }
+            }
             Outcome::View(Ok(view)) => {
                 self.view = Some(view);
                 self.notice = None;
@@ -377,6 +506,53 @@ impl SyncTab {
             Outcome::Paired(Err(e)) => self.notice = Some((e, true)),
         }
     }
+}
+
+fn run_network(root: &Path, action: NetworkAction) -> crate::core::error::Result<Option<String>> {
+    match action {
+        NetworkAction::Status => {}
+        NetworkAction::Connect(key) => return net::connect(root, &key),
+        NetworkAction::Disconnect => net::down(root)?,
+        NetworkAction::Logout => net::logout(root)?,
+        NetworkAction::Mode(mode) => settings::set_network_mode(root, mode)?,
+    }
+    Ok(None)
+}
+
+fn render_login(frame: &mut Frame<'_>, app: &App, url: &str, qr: Option<&str>) {
+    let area = Rect {
+        height: frame.area().height.saturating_sub(1),
+        ..frame.area()
+    };
+    let block = Block::default()
+        .title(" Tailscale login ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.focus));
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(block, area);
+    let mut lines = vec![
+        Line::from("Open this link or scan the QR:"),
+        Line::from(sanitize_terminal_text(url)),
+    ];
+    let link_height = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(inner.width);
+    if let Some(qr) = qr {
+        let width = qr.lines().map(|s| s.chars().count()).max().unwrap_or(0);
+        let height = qr.lines().count();
+        if width <= usize::from(inner.width)
+            && link_height + height + 2 <= usize::from(inner.height)
+        {
+            lines.extend(qr.lines().map(|s| Line::from(s.to_owned())));
+        } else {
+            lines.push(Line::from(
+                "QR needs a wider/taller terminal; use the link.",
+            ));
+        }
+    }
+    lines.push(Line::from("Waiting for login… Enter/Esc closes."));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn heading(app: &App, text: &str) -> Line<'static> {
@@ -473,10 +649,102 @@ fn lines(
             Span::styled(format!(" · {state}"), muted),
         ],
     );
-    out.push(Line::from(Span::styled(
-        format!("  Network: {}", sanitize_terminal_text(&view.network)),
-        muted,
-    )));
+    out.push(Line::default());
+    out.push(heading(app, "Сеть / Network"));
+    let mode = match tab.network_mode.unwrap_or(net::Mode::Off) {
+        net::Mode::Off => "Off",
+        net::Mode::System => "System",
+        net::Mode::Managed => "Managed",
+    };
+    row(
+        &mut out,
+        Row::NetworkMode,
+        vec![Span::raw(format!("Mode: ◀ {mode} ▶"))],
+    );
+    match &tab.network {
+        Some(Ok(status)) => {
+            out.push(detail(
+                app,
+                format!(
+                    "Status: {}",
+                    status["BackendState"].as_str().unwrap_or("unknown")
+                ),
+            ));
+            let user_id = status["Self"]["UserID"]
+                .as_u64()
+                .map(|id| id.to_string())
+                .unwrap_or_default();
+            let account = status["User"][&user_id]["LoginName"]
+                .as_str()
+                .unwrap_or("—");
+            out.push(detail(app, format!("Account: {account}")));
+            let ips = status["TailscaleIPs"]
+                .as_array()
+                .map(|ips| {
+                    ips.iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| "—".into());
+            out.push(detail(app, format!("Tailnet IP: {ips}")));
+            let peers = status["Peer"].as_object();
+            let online = peers.map_or(0, |peers| {
+                peers.values().filter(|peer| peer["Online"] == true).count()
+            });
+            out.push(detail(app, format!("Peers online: {online}")));
+            if let Some(peers) = peers {
+                for peer in peers.values().filter(|peer| peer["Online"] == true) {
+                    let route = if peer["CurAddr"].as_str().is_some_and(|s| !s.is_empty()) {
+                        "direct".to_string()
+                    } else if let Some(relay) = peer["Relay"].as_str().filter(|s| !s.is_empty()) {
+                        format!("DERP ({relay})")
+                    } else {
+                        "path unknown".into()
+                    };
+                    out.push(detail(
+                        app,
+                        format!("{}: {route}", peer["HostName"].as_str().unwrap_or("peer")),
+                    ));
+                }
+            }
+        }
+        Some(Err(error)) => out.push(detail(app, error.clone())),
+        None => out.push(detail(app, "Status: not refreshed".into())),
+    }
+    if tab.network_mode == Some(net::Mode::System) {
+        out.push(detail(
+            app,
+            "System is read-only; use the installed Tailscale app.".into(),
+        ));
+    }
+    row(
+        &mut out,
+        Row::AuthKey,
+        vec![Span::raw(format!(
+            "Auth key: {} (one-time)",
+            if tab.auth_key.is_empty() {
+                "empty"
+            } else {
+                "••••••••"
+            }
+        ))],
+    );
+    row(
+        &mut out,
+        Row::Connect,
+        vec![Span::raw("[ Подключить / Connect ]")],
+    );
+    row(
+        &mut out,
+        Row::Disconnect,
+        vec![Span::raw("[ Отключить / Disconnect ]")],
+    );
+    row(
+        &mut out,
+        Row::Logout,
+        vec![Span::raw("[ Выйти из аккаунта / Logout ]")],
+    );
     out.push(Line::default());
     out.push(heading(
         app,
@@ -656,6 +924,9 @@ pub(crate) fn render(
             },
         );
     }
+    if let Some(url) = &tab.login_url {
+        render_login(frame, app, url, tab.login_qr.as_deref());
+    }
     if let Some(form) = &tab.form {
         render_form(frame, app, form, inner);
     } else if let Some(pairing) = &tab.pairing {
@@ -682,6 +953,7 @@ fn render_form(frame: &mut Frame<'_>, app: &App, form: &Form, area: Rect) {
         FormKind::Rename => " Rename this node ",
         FormKind::Pair => " Pair with a node ",
         FormKind::Code => " Pairing code ",
+        FormKind::AuthKey => " One-time Tailscale auth key ",
     };
     let mut lines = Vec::new();
     for (index, (label, value)) in form.fields.iter().enumerate() {
@@ -692,7 +964,19 @@ fn render_form(frame: &mut Frame<'_>, app: &App, form: &Form, area: Rect) {
         )));
         let caret = if focused { "▏" } else { "" };
         lines.push(Line::from(Span::styled(
-            format!("{}{caret}", sanitize_terminal_text(value)),
+            format!(
+                "{}{caret}",
+                if form.kind == FormKind::AuthKey {
+                    "•".repeat(
+                        value
+                            .chars()
+                            .count()
+                            .min(usize::from(area.width.saturating_sub(3))),
+                    )
+                } else {
+                    sanitize_terminal_text(value)
+                }
+            ),
             if focused {
                 Style::default().fg(app.theme.focus)
             } else {
@@ -704,10 +988,13 @@ fn render_form(frame: &mut Frame<'_>, app: &App, form: &Form, area: Rect) {
         "Enter: next / confirm · ↑/↓: field · Esc: cancel",
         Style::default().fg(app.theme.muted),
     )));
-    let area = overlay(area, lines.len() as u16 + 2);
+    let height = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(area.width.saturating_sub(2));
+    let area = overlay(area, u16::try_from(height + 2).unwrap_or(u16::MAX));
     frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)

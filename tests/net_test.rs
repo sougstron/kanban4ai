@@ -82,6 +82,7 @@ case "$verb" in
             case "$arg" in --auth-key=file:*) auth=${arg#--auth-key=file:} ;; esac
         done
         if [ -n "$auth" ]; then
+            printf '%s' "$auth" > "$state/auth-path"
             if [ -f "$state/fail-login" ]; then
                 /bin/cat "$auth" >&2
                 exit 1
@@ -180,6 +181,37 @@ fn fake_process_scenario() {
     };
     let root = PathBuf::from(std::env::var_os("KANBAN_NET_TEST_ROOT").unwrap());
     match case.as_str() {
+        "tui-connect" => {
+            let config = fs::read(root.join("config.yaml")).unwrap();
+            assert_eq!(
+                net::connect(&root, "").unwrap().as_deref(),
+                Some("https://login.tailscale.com/a/fake-login")
+            );
+            fs::write(root.join("net/tailscale/fail-login"), "").unwrap();
+            let error = net::connect(&root, SECRET).unwrap_err().to_string();
+            assert!(!error.contains(SECRET));
+            let auth = fs::read_to_string(root.join("net/tailscale/auth-path")).unwrap();
+            assert!(
+                !Path::new(&auth).exists(),
+                "Failed login retained the one-time key"
+            );
+            fs::remove_file(root.join("net/tailscale/fail-login")).unwrap();
+            assert_eq!(net::connect(&root, SECRET).unwrap(), None);
+            let auth = fs::read_to_string(root.join("net/tailscale/auth-path")).unwrap();
+            assert!(
+                !Path::new(&auth).exists(),
+                "Successful login retained the key"
+            );
+            assert_eq!(fs::read(root.join("config.yaml")).unwrap(), config);
+            net::down(&root).unwrap();
+            assert!(root.join("net/tailscale/tailscaled.state").exists());
+            // The same on-disk login is reused after down/up; no second key.
+            assert_eq!(net::connect(&root, "").unwrap(), None);
+            assert_eq!(net::status(&root).unwrap()["BackendState"], "Running");
+            net::logout(&root).unwrap();
+            assert_eq!(net::status(&root).unwrap()["BackendState"], "NeedsLogin");
+            net::down(&root).unwrap();
+        }
         "lifecycle" => {
             running(&root);
             let mut first = Manager::new(&root).unwrap();
@@ -751,4 +783,14 @@ fn installer_verifies_checksum_and_extracts_only_regular_exact_members() {
             "{kind}"
         );
     }
+}
+
+#[test]
+fn tui_connect_is_silent_and_never_retains_one_time_key() {
+    let output = Fixture::new().check("tui-connect");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("Tailscale login:"));
+    assert!(!stdout.contains(SECRET));
+    assert!(!stderr.contains(SECRET));
 }

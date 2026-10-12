@@ -435,7 +435,9 @@ pub(super) fn pair(
         return Err(invalid("--address required for an inbound node"));
     }
     if !node.outbound_only() && !reachable(root, local.address)? {
-        return Err(invalid("--address must be a LAN or enabled tailnet address"));
+        return Err(invalid(
+            "--address must be a LAN or enabled tailnet address",
+        ));
     }
     let request = PairRequest {
         code,

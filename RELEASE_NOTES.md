@@ -12,6 +12,10 @@
   and routes, confirmed exchange times, pending operations, conflicts and
   local/remote Git clone status. Buttons work by keyboard and mouse; long
   details wrap and PgUp/PgDn reaches the bottom of short dialogs.
+- **Settings → Sync → Network.** Immediate Off/System/Managed mode selection,
+  live account/IP/online-peer/direct/DERP status, managed Connect/Disconnect/Logout,
+  full-screen login URL/QR and masked, non-persisted one-time auth keys. Narrow
+  40–60-column terminals use the available screen; saved sidecar identity is reused.
 
 - **Outbound mobile sync.** Mobile identities are non-unique, never dialed by
   peers and appear neutrally offline after departure. TUI and daemon own sync

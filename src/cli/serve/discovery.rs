@@ -1148,10 +1148,16 @@ mod tests {
             assert_eq!(result.code, "NODE_AUTH_FAILED");
             server.abort();
             let _ = server.await;
+            // Reserve a non-listening port. A dropped ephemeral listener can
+            // be reused by another parallel test before the refusal probe.
+            let refused = tokio::net::TcpSocket::new_v4().unwrap();
+            refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let mut stopped_peer = peer.clone();
+            stopped_peer.address = refused.local_addr().unwrap();
             let result = probe_peer(
                 root.path(),
                 &Config::default(),
-                &peer,
+                &stopped_peer,
                 Some(&secret),
                 &Presence::default(),
                 true,

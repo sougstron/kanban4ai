@@ -15,17 +15,17 @@ expression: "render_at(&mut app, 100, 30)"
 │              ││› Name: laptop  (Enter renames)                                   ││              │
 │              ││  Role: ◀ server ▶  (Space changes)                               ││              │
 │              ││  ☐ API server enabled (user unit) · state unknown                ││              │
-│              ││  Network: Tailscale off                                          ││              │
+│              ││                                                                  ││              │
 │              ││┌ Rename this node ──────────────────────────────────────────────┐││              │
 │              │││Name                                                            │││              │
 │              │││home-srv▏                                                       │││              │
 │              │││Enter: next / confirm · ↑/↓: field · Esc: cancel                │││              │
 │              ││└────────────────────────────────────────────────────────────────┘││              │
-│              ││  2. phone (mobile)                                               ││              │
-│              ││      Not probed yet — press Refresh                              ││              │
-│              ││      phone dials in · never exchanged · 1 op(s) waiting          ││              │
-│              ││  [ Pair with a node… ]                                           ││              │
-│              ││  [ Show a pairing code / phone QR… ]                             ││              │
+│              ││      Peers online: 0                                             ││              │
+│              ││  Auth key: empty (one-time)                                      ││              │
+│              ││  [ Подключить / Connect ]                                        ││              │
+│              ││  [ Отключить / Disconnect ]                                      ││              │
+│              ││  [ Выйти из аккаунта / Logout ]                                  ││              │
 │              │└──────────────────────────────────────────────────────────────────┘│              │
 │              └────────────────────────────────────────────────────────────────────┘              │
 │                                                                                                  │
@@ -145,8 +145,7 @@ expression: "render_at(&mut app, 100, 30)"
 13:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 13:1-15 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 13:15-17 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-13:17-41 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-13:41-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+13:17-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:83-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 13:85-99 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 13:99-100 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
@@ -195,24 +194,23 @@ expression: "render_at(&mut app, 100, 30)"
 18:99-100 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 19:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 19:1-15 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
-19:15-19 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-19:19-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+19:15-17 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+19:17-38 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+19:38-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 19:83-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 19:85-99 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 19:99-100 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 20:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 20:1-15 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
-20:15-17 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-20:17-53 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-20:53-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+20:15-19 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+20:19-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 20:83-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 20:85-99 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 20:99-100 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 21:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 21:1-15 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
-21:15-17 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-21:17-73 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-21:73-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+21:15-19 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+21:19-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:83-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 21:85-99 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 21:99-100 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)

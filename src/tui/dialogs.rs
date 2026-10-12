@@ -1960,6 +1960,9 @@ impl ModalState {
     /// could trigger the focused button.
     /// Whether `paste` would insert into the focused field.
     pub fn accepts_paste(&self) -> bool {
+        if self.active_field() == DialogField::SyncPanel {
+            return self.sync.form.is_some();
+        }
         matches!(
             self.active_field(),
             DialogField::Title
@@ -1979,6 +1982,15 @@ impl ModalState {
     }
 
     pub fn paste(&mut self, text: &str) -> bool {
+        if self.active_field() == DialogField::SyncPanel {
+            if let Some(form) = &mut self.sync.form {
+                form.fields[form.focus]
+                    .1
+                    .push_str(&sanitize_paste_text(text).replace(['\n', '\r'], " "));
+                return true;
+            }
+            return false;
+        }
         let before = self.editable_signature();
         let text = sanitize_paste_text(text);
         match self.active_field() {
@@ -2844,6 +2856,17 @@ pub(super) fn filtered_indices(options: &[SelectOption], filter: &str) -> Vec<us
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Rect) -> Vec<Hitbox> {
+    let area = if matches!(modal.modal, Modal::GlobalSettings)
+        && modal.settings_tab == SettingsTab::Sync
+        && frame.area().width <= 60
+    {
+        Rect {
+            height: frame.area().height.saturating_sub(1),
+            ..frame.area()
+        }
+    } else {
+        area
+    };
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(modal_title(&modal.modal))

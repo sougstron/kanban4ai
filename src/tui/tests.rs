@@ -12777,6 +12777,17 @@ fn sync_tab_app(work: &std::path::Path) -> (tempfile::TempDir, App) {
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open global settings");
     app.handle_key(key(KeyCode::Left)).expect("sync tab");
+    app.settings.refresh_interval = std::time::Duration::from_secs(60);
+    let sync = &mut app.modal.as_mut().unwrap().sync;
+    if let Some(request) = sync.request.take() {
+        sync.execute(store_dir.path(), request);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sync.busy() {
+        sync.poll(store_dir.path(), std::time::Duration::from_secs(60), false);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
     (store_dir, app)
 }
 
@@ -12807,7 +12818,6 @@ fn global_settings_sync_tab_snapshot() {
         role: NodeRole::Laptop,
         api_enabled: true,
         api_active: Some(true),
-        network: "Tailscale: system".into(),
         peers: vec![
             Peer {
                 id: "n-server".into(),
@@ -12888,7 +12898,7 @@ fn global_settings_sync_tab_changes_node_and_peer_order() {
 
     // The phone's priority order: K on the second node moves it up.
     assert_eq!(peer_order(&store), ["n-server", "n-phone"]);
-    for _ in 0..4 {
+    for _ in 0..9 {
         app.handle_key(key(KeyCode::Down)).expect("walk to phone");
     }
     app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
@@ -12963,4 +12973,138 @@ fn global_settings_sync_tab_qr_needs_a_lan_address() {
         .clone()
         .expect("code");
     assert!(qr.is_some_and(|qr| qr.lines().count() > 10));
+}
+
+#[test]
+fn global_settings_network_snapshots() {
+    use super::sync_tab::Row;
+    use crate::core::net::Mode;
+    let (_store, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-network-snapshots"));
+    let tab = &mut app.modal.as_mut().unwrap().sync;
+    tab.network_mode = Some(Mode::Managed);
+    tab.network = Some(Ok(serde_json::json!({
+        "BackendState": "Running",
+        "TailscaleIPs": ["100.64.0.7"],
+        "Self": {"UserID": 42},
+        "User": {"42": {"LoginName": "example@example.com"}},
+        "Peer": {
+            "a": {"HostName":"server", "Online":true, "CurAddr":"192.168.0.20:41641"},
+            "b": {"HostName":"phone", "Online":true, "CurAddr":"", "Relay":"fra"},
+            "c": {"HostName":"offline", "Online":false}
+        }
+    })));
+    tab.selected = tab
+        .rows()
+        .iter()
+        .position(|row| *row == Row::NetworkMode)
+        .unwrap();
+    for width in [40, 50, 60, 100] {
+        insta::assert_snapshot!(
+            format!("global_settings_network_{width}"),
+            render_at(&mut app, width, 36)
+        );
+    }
+    let tab = &mut app.modal.as_mut().unwrap().sync;
+    tab.selected = tab
+        .rows()
+        .iter()
+        .position(|row| *row == Row::Logout)
+        .unwrap();
+    insta::assert_snapshot!(
+        "global_settings_network_actions_40",
+        render_at(&mut app, 40, 24)
+    );
+    let tab = &mut app.modal.as_mut().unwrap().sync;
+    tab.selected = tab
+        .rows()
+        .iter()
+        .position(|row| *row == Row::AuthKey)
+        .unwrap();
+    tab.input(key(KeyCode::Enter));
+    app.handle_paste("tskey-auth-private-never-visible")
+        .unwrap();
+    let text = render_at(&mut app, 40, 24);
+    assert!(!text.contains("tskey"));
+    insta::assert_snapshot!("global_settings_network_auth_40", text);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.modal.as_ref().unwrap().sync.auth_key,
+        "tskey-auth-private-never-visible"
+    );
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(
+        app.modal.as_ref().unwrap().sync.auth_key.is_empty(),
+        "Cancel discards the key"
+    );
+    let tab = &mut app.modal.as_mut().unwrap().sync;
+    let url = "https://login.tailscale.com/a/snapshot-login";
+    tab.login_url = Some(url.into());
+    tab.login_qr = Some(
+        qrcode::QrCode::new(url.as_bytes())
+            .unwrap()
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .build(),
+    );
+    for width in [40, 50, 60] {
+        let text = render_at(&mut app, width, 30);
+        assert!(text.contains("login.tailscale.com"));
+        insta::assert_snapshot!(format!("global_settings_network_login_{width}"), text);
+    }
+}
+
+#[test]
+fn global_settings_network_mode_is_immediate_and_system_is_read_only() {
+    use super::sync_tab::Row;
+    use crate::core::net::{self, Mode};
+    let (store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-network-actions"));
+    let store = ProjectStore::at(store_dir.path());
+    let mut config = store.load_global_config().unwrap();
+    config.extras.insert(
+        "net".into(),
+        serde_yaml_ng::from_str("tailscale:\n  mode: off\n  socks_port: 11055\n").unwrap(),
+    );
+    store.save_global_config(&config).unwrap();
+    let tab = &mut app.modal.as_mut().unwrap().sync;
+    tab.selected = tab
+        .rows()
+        .iter()
+        .position(|row| *row == Row::NetworkMode)
+        .unwrap();
+    for expected in [Mode::System, Mode::Managed, Mode::Off] {
+        app.handle_key(key(KeyCode::Char(' '))).unwrap();
+        let tab = &mut app.modal.as_mut().unwrap().sync;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tab.busy() {
+            tab.poll(store_dir.path(), std::time::Duration::from_secs(60), false);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(net::settings(store_dir.path()).unwrap().mode, expected);
+        assert_eq!(net::settings(store_dir.path()).unwrap().socks_port, 11055);
+        if expected == Mode::System {
+            tab.selected = tab
+                .rows()
+                .iter()
+                .position(|row| *row == Row::Connect)
+                .unwrap();
+            tab.input(key(KeyCode::Enter));
+            assert!(tab.request.is_none());
+            assert!(matches!(&tab.notice, Some((text, true)) if text.contains("read-only")));
+            tab.selected = tab
+                .rows()
+                .iter()
+                .position(|row| *row == Row::NetworkMode)
+                .unwrap();
+        }
+    }
+    // Cancel closes the draft dialog, not these already-applied local controls.
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(app.modal.is_none());
+    assert_eq!(net::settings(store_dir.path()).unwrap().mode, Mode::Off);
+    assert!(
+        store.load_global_config().unwrap().extras["net"]["tailscale"]
+            .get("auth_key")
+            .is_none()
+    );
 }
