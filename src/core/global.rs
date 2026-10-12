@@ -70,6 +70,8 @@ pub struct GlobalConfig {
     pub agents: Mapping,
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
     pub orchestration: Mapping,
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub runner: Mapping,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
@@ -95,6 +97,7 @@ impl GlobalConfig {
             agents: self.agents.clone(),
             verification: Mapping::new(),
             orchestration: self.orchestration.clone(),
+            runner: self.runner.clone(),
             inherit: Mapping::new(),
             instructions: String::new(),
             extras: Mapping::new(),
@@ -111,6 +114,7 @@ impl GlobalConfig {
         self.auto_launch = sections.auto_launch;
         self.agents = sections.agents;
         self.orchestration = sections.orchestration;
+        self.runner = sections.runner;
         for key in ["task_sort", "hide_kanban_messages"] {
             match sections.tui.get(key) {
                 Some(value) => {

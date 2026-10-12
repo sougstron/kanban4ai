@@ -400,6 +400,14 @@ so the detail view and usage stats show the concrete values instead of
 `-`/`default`/`unknown`. The selector labels still show what Default would
 resolve to.
 
+The task form's **Runner** row cycles with Left/Right or Space through
+**Inherit from project / Auto / Сервер / Это устройство / Laptop / Mobile**.
+Create and Edit use the same control; inherit leaves no task-level override.
+Global Settings has **Default runner**; Project Settings has **Runner** and
+**Inherit runner from global** on Common. Inherited placement is read-only
+until the checkbox is unticked. These controls save placement preferences;
+remote execution/availability selection belongs to Runner 02.
+
 Dialog fields advance on Enter as well as Tab, except in multi-line text
 areas (task Description, Add-message body, custom Answer): those insert a
 newline on Enter, Shift+Enter, and Alt+Enter. Many terminals — and tmux

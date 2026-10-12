@@ -879,6 +879,50 @@ fn store_board(project: &str, global: Option<&str>) -> (tempfile::TempDir, Confi
     (store, config)
 }
 
+#[test]
+fn runner_precedence_and_legacy_inheritance() {
+    use kanban4ai::core::config::Runner;
+    let global = "runner:\n  default: server\n  auto_order: [mobile, here]\n";
+    for (project, expected) in [
+        ("", Runner::Server),
+        ("runner:\n  default: laptop\n", Runner::Laptop),
+        (
+            "runner:\n  default: mobile\ninherit:\n  placement: true\n",
+            Runner::Server,
+        ),
+        (
+            "runner:\n  default: here\ninherit:\n  placement: false\n",
+            Runner::Here,
+        ),
+    ] {
+        let (_store, config) = store_board(project, Some(global));
+        let effective = config.load().unwrap();
+        assert_eq!(effective.runner_for(None), expected);
+        assert_eq!(effective.runner_for(Some(Runner::Auto)), Runner::Auto);
+        assert_eq!(effective.runner_for(Some(Runner::Mobile)), Runner::Mobile);
+        if expected == Runner::Server {
+            assert_eq!(
+                effective.runner_auto_order(),
+                [Runner::Mobile, Runner::Here]
+            );
+        }
+    }
+}
+
+#[test]
+fn invalid_runner_order_is_rejected_and_invalid_global_falls_back() {
+    use kanban4ai::core::config::Runner;
+    for value in ["[]", "[auto]", "[unknown]", "server", "[3]"] {
+        let (_store, config) = store_board(
+            &format!("runner:\n  auto_order: {value}\ninherit:\n  placement: false\n"),
+            None,
+        );
+        assert!(config.load().is_err(), "{value}");
+    }
+    let (_store, config) = store_board("", Some("runner:\n  default: unknown\n"));
+    assert_eq!(config.load().unwrap().runner_for(None), Runner::Auto);
+}
+
 const GLOBAL_GROUPS: &str = r#"tui:
   escape_to_projects: true
   task_sort: updated_at_desc
@@ -905,7 +949,7 @@ orchestration:
 fn all_inherit(value: bool) -> String {
     format!(
         "inherit:\n  agent: {value}\n  limits: {value}\n  common: {value}\n  task_sort: {value}\n  \
-         designer: {value}\n  reviewer: {value}\n  executor: {value}\n"
+         designer: {value}\n  reviewer: {value}\n  executor: {value}\n  placement: {value}\n"
     )
 }
 

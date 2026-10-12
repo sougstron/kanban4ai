@@ -6371,7 +6371,7 @@ impl App {
                     needs: None,
                     parent_task: None,
                     role_profile: None,
-                    runner: None,
+                    runner: modal.runner,
                 };
                 let target = target_status
                     .as_deref()
@@ -6421,6 +6421,7 @@ impl App {
                         use_orchestrator: Some(modal.use_orchestrator),
                         chained_to: Some(modal.chain_text()),
                         launch_at,
+                        runner: Some(modal.runner),
                         ..Default::default()
                     },
                 )?;
@@ -7615,6 +7616,8 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::InheritLimits
         | DialogField::InheritCommon
         | DialogField::InheritTaskSort
+        | DialogField::InheritPlacement
+        | DialogField::Runner
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor
@@ -7793,6 +7796,9 @@ fn fill_settings_group(modal: &mut ModalState, config: &BoardConfig, group: Inhe
                 normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
                     .to_string(),
             ]);
+        }
+        InheritGroup::Placement => {
+            modal.runner = Some(config.runner_for(None));
         }
         InheritGroup::Common => {
             modal.hide_kanban_messages = tui_bool(&config.tui, "hide_kanban_messages", false);
@@ -8422,6 +8428,12 @@ fn apply_settings_groups(
     draft: &SettingsDraft,
 ) -> Result<()> {
     let edits = |group: InheritGroup| !modal.inherit.get(group);
+    if edits(InheritGroup::Placement) {
+        config.runner.insert(
+            Value::String("default".to_string()),
+            serde_yaml_ng::to_value(modal.runner.unwrap_or(crate::core::config::Runner::Auto))?,
+        );
+    }
     if edits(InheritGroup::Agent) {
         let Some(Value::Mapping(backend_config)) =
             config.agents.get_mut(Value::String(draft.backend.clone()))

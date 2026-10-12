@@ -129,7 +129,7 @@ they are edited: press `s` on the Projects screen. Saved under the store
 - `net.tailscale.auth_key_file`: null, or a one-time key file path (relative paths resolve under the store). Used by `net up` and managed startup; chmod 0600, deleted only after confirmed login. No key content is stored in config or passed in process arguments. These settings and `<store>/net/` stay machine-local; see `docs/sync.md` §11.5.
 
 ### Inheriting settings from the global config
-Project settings come in seven groups, each of which either follows the
+Project settings come in eight groups, each of which either follows the
 global config or uses the project's own keys. The project file records the
 choice in a top-level `inherit:` section:
 
@@ -142,6 +142,7 @@ choice in a top-level `inherit:` section:
 | `designer` | `orchestration.designer` |
 | `reviewer` | `orchestration.reviewer` |
 | `executor` | `orchestration.executors` |
+| `placement` | `runner:` (`default` and `auto_order`) |
 
 Everything else — `tui.name`, `tui.theme`, the other `tui:` keys, `columns`,
 `rules`, `thresholds`, `notifications`, `verification`, and
@@ -163,6 +164,36 @@ Everything else — `tui.name`, `tui.theme`, the other `tui:` keys, `columns`,
   board used in place inherits the built-in defaults.
 - Code that rewrites the project file starts from `Config::load_raw` (project
   file only); `Config::load` is the effective view every reader uses.
+
+## Runner placement
+
+The replicated `runner:` section exists in both `<store>/config.yaml` and
+the project `.kanban/config.yaml`:
+
+```yaml
+runner:
+  default: auto
+  auto_order: [server, here]
+inherit:
+  placement: true # project file only
+```
+
+- `runner.default`: `auto`, `server`, `here`, `laptop`, or `mobile`.
+  Global Settings offers **Auto / Сервер / Это устройство**; Project Settings
+  additionally offers Laptop and Mobile. `inherit.placement: true` follows
+  global placement; untick **Inherit runner from global** to override it.
+- `runner.auto_order`: a non-empty ordered list of `server`, `here`, `laptop`,
+  or `mobile`. `auto` cannot occur inside the list. Edited in YAML; inherited
+  together with `runner.default`, preserved when the UI changes the default.
+- Task `runner`: the same five values; absent/null means **Inherit from
+  project**. Explicit `auto` overrides a project's fixed runner. Returning a
+  task to inherit removes the override, so subsequent project edits apply.
+- Precedence: task override → effective project placement → global placement
+  → built-in `auto` with `[server, here]`. Legacy projects that omit `runner:`
+  inherit; ones that define it without inheritance flags keep their placement.
+
+TASK-417 implements configuration, persistence and replication only. Availability
+selection, resolving `here`/`auto` at launch, and routing execution are Runner 02.
 
 ## Notification Settings (.kanban/config.yaml `notifications:`)
 - `enabled`: true - master switch for desktop notifications

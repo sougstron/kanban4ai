@@ -355,9 +355,11 @@ async fn target(
             .into_values()
             .find(|run| run.active());
         let role = if action == "stop" {
-            active.map(|run| run.role).or(task.runner)
+            active
+                .map(|run| run.role)
+                .or(task.runner.and_then(crate::core::config::Runner::node_role))
         } else {
-            requested.or(task.runner)
+            requested.or(task.runner.and_then(crate::core::config::Runner::node_role))
         };
         Ok(role.filter(|role| *role != journal.node.role))
     })
@@ -805,7 +807,7 @@ mod tests {
         Storage::new(&b.data_root).init_board().unwrap();
         let local = Operations::for_project(&a)
             .create_task(NewTask {
-                runner: Some(NodeRole::Server),
+                runner: Some(crate::core::config::Runner::Server),
                 ..NewTask::titled("Remote run")
             })
             .unwrap();
