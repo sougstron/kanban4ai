@@ -122,6 +122,8 @@ pub enum DialogField {
     UpdateCheckOnOpen,
     ProjectVisibility,
     BackendOrder,
+    /// Global Settings Sync page: one panel of live buttons and switches.
+    SyncPanel,
     QueueEnabled,
     MaxRunningTotal,
     MaxRunningDesigner,
@@ -202,6 +204,8 @@ pub enum SettingsTab {
     Backends,
     /// Global Settings only: which registered projects the list shows.
     Projects,
+    /// Global Settings only: this node, its peers and replication state.
+    Sync,
 }
 
 impl SettingsTab {
@@ -213,14 +217,16 @@ impl SettingsTab {
         SettingsTab::Instructions,
     ];
 
-    /// The Global Settings strip: every project tab plus Backends and Projects.
-    pub const GLOBAL: [SettingsTab; 6] = [
+    /// The Global Settings strip: every project tab plus Backends, Projects
+    /// and Sync.
+    pub const GLOBAL: [SettingsTab; 7] = [
         SettingsTab::Common,
         SettingsTab::Designer,
         SettingsTab::Reviewer,
         SettingsTab::Executor,
         SettingsTab::Backends,
         SettingsTab::Projects,
+        SettingsTab::Sync,
     ];
 
     pub fn label(self) -> &'static str {
@@ -232,6 +238,7 @@ impl SettingsTab {
             SettingsTab::Instructions => "Prompt",
             SettingsTab::Backends => "Backends",
             SettingsTab::Projects => "Projects",
+            SettingsTab::Sync => "Sync",
         }
     }
 
@@ -245,6 +252,7 @@ impl SettingsTab {
             SettingsTab::Instructions => "Prm",
             SettingsTab::Backends => "Bck",
             SettingsTab::Projects => "Prj",
+            SettingsTab::Sync => "Syn",
         }
     }
 
@@ -366,12 +374,20 @@ const GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS: [DialogField; 3] = [
     DialogField::Cancel,
 ];
 
+/// The Global Settings Sync page. Its changes apply at once; Save and
+/// Cancel still close the dialog as on every other tab.
+const GLOBAL_SETTINGS_PAGE_SYNC_FIELDS: [DialogField; 3] = [
+    DialogField::SyncPanel,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
 /// The whole field page of one settings tab, buttons included. Project
 /// settings never show the Backends or Projects tab; they fall back to Common.
 /// Global Settings never shows Instructions; it falls back to Common too.
 pub(crate) fn settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
     match tab {
-        SettingsTab::Common | SettingsTab::Backends | SettingsTab::Projects => {
+        SettingsTab::Common | SettingsTab::Backends | SettingsTab::Projects | SettingsTab::Sync => {
             &SETTINGS_PAGE_COMMON_FIELDS
         }
         SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS,
@@ -390,6 +406,7 @@ pub(crate) fn global_settings_page_fields(tab: SettingsTab) -> &'static [DialogF
         SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS[1..],
         SettingsTab::Backends => &GLOBAL_SETTINGS_PAGE_BACKENDS_FIELDS,
         SettingsTab::Projects => &GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS,
+        SettingsTab::Sync => &GLOBAL_SETTINGS_PAGE_SYNC_FIELDS,
     }
 }
 
@@ -440,6 +457,7 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         DialogField::Description => Some(SettingsTab::Instructions),
         DialogField::BackendOrder => Some(SettingsTab::Backends),
         DialogField::ProjectVisibility => Some(SettingsTab::Projects),
+        DialogField::SyncPanel => Some(SettingsTab::Sync),
         _ => None,
     }
 }
@@ -747,6 +765,8 @@ pub struct ModalState {
     /// Global Settings Backends tab: every backend in picker order.
     pub backend_order: Vec<String>,
     pub backend_order_selected: usize,
+    /// Global Settings Sync tab; loaded the first time the tab shows.
+    pub sync: super::sync_tab::SyncTab,
     pub purge_data: bool,
     pub queue_enabled: bool,
     pub max_running_total: TextArea<'static>,
@@ -860,6 +880,7 @@ impl ModalState {
             project_visibility_selected: 0,
             backend_order: Vec::new(),
             backend_order_selected: 0,
+            sync: Default::default(),
             purge_data: false,
             queue_enabled: true,
             max_running_total: one_line("3"),
@@ -1221,6 +1242,11 @@ impl ModalState {
             Some(SubPopup::Agent(popup)) => Some(popup.slot),
             _ => None,
         }
+    }
+
+    /// Whether a Sync page form or pairing code owns the keys.
+    pub fn sync_overlay_open(&self) -> bool {
+        self.active_field() == DialogField::SyncPanel && self.sync.overlay_open()
     }
 
     /// Whether any nested popup (agent settings or task options) owns focus.
@@ -1794,6 +1820,7 @@ impl ModalState {
             DialogField::ProjectSort => self.input_select(key, SelectorKind::ProjectSort),
             DialogField::ProjectVisibility => self.input_project_visibility(key),
             DialogField::BackendOrder => self.input_backend_order(key),
+            DialogField::SyncPanel => self.sync.input(key),
             DialogField::PurgeData => {
                 if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
                     self.purge_data = !self.purge_data;
@@ -1985,7 +2012,8 @@ impl ModalState {
             | DialogField::EscapeToProjects
             | DialogField::UpdateCheckOnOpen
             | DialogField::ProjectVisibility
-            | DialogField::BackendOrder => &mut self.answer,
+            | DialogField::BackendOrder
+            | DialogField::SyncPanel => &mut self.answer,
             DialogField::ProjectSort => &mut self.project_sort,
             DialogField::TargetStatus => &mut self.target_status,
             DialogField::MessageKind => &mut self.description,
@@ -3068,6 +3096,14 @@ fn render_settings_form(
     let fields = &page[..page.len() - 2];
     if matches!(modal.modal, Modal::GlobalSettings) && tab == SettingsTab::Common {
         render_global_settings_common(frame, app, modal, form_area, hitboxes, fields);
+    } else if matches!(modal.modal, Modal::GlobalSettings) && tab == SettingsTab::Sync {
+        let field = DialogField::SyncPanel;
+        let active = modal.active_field() == field;
+        super::sync_tab::render(frame, app, &modal.sync, active, form_area, hitboxes);
+        hitboxes.push(Hitbox {
+            area: form_area,
+            action: HitAction::ModalField(field),
+        });
     } else {
         render_selector_form(frame, app, modal, form_area, hitboxes, fields);
     }
@@ -5595,6 +5631,7 @@ fn field_owns_vertical_arrows(field: DialogField) -> bool {
             | DialogField::ProjectSort
             | DialogField::ProjectVisibility
             | DialogField::BackendOrder
+            | DialogField::SyncPanel
             | DialogField::TargetStatus
             | DialogField::MessageKind
             | DialogField::Question

@@ -1,5 +1,11 @@
 # Unreleased
 
+- **Global Settings → Sync.** Node name/role, opt-in API user-unit switch,
+  one-time code/phone QR pairing, phone peer priority, live status explanations
+  and routes, confirmed exchange times, pending operations, conflicts and
+  local/remote Git clone status. Buttons work by keyboard and mouse; long
+  details wrap and PgUp/PgDn reaches the bottom of short dialogs.
+
 - **Outbound mobile sync.** Mobile identities are non-unique, never dialed by
   peers and appear neutrally offline after departure. TUI and daemon own sync
   workers when serve is absent, send hello/bye and yield to a later serve.
