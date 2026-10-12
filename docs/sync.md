@@ -963,9 +963,13 @@ store lock, затем sync lock. Секретные файлы имеют пр�
 Параметры `sync.pairing.code_ttl_seconds` (1…300, по умолчанию 300) и
 `sync.pairing.code_max_attempts` (1…5, по умолчанию 5) позволяют ужесточить
 ограничения. Создание кода и отзыв не требуют перезапуска HTTP-сервиса.
-QR содержит `{address, port, node_id, token}`, где address — IP без порта.
-QR и одноразовые секреты следует передавать только владельцу телефона/узла.
-По плану v3 `--phone-qr` заменяется QR-сопряжением узла `mobile` (11.2, TASK-432).
+QR `--phone-qr` содержит `{address, port, node_id, code, role: "mobile",
+dial: "outbound"}`; `address` — LAN-IP или MagicDNS-имя, `code` — тот же
+одноразовый 6-значный код, адрес сервера в QR не шифруется. QR и одноразовые
+секреты следует передавать только владельцу телефона/узла. Телефон читает из
+QR адрес и код и сам выполняет `serve --pair` (11.2, TASK-432): kanban4ai
+камеру не сканирует, QR читается любым сканером или строкой payload,
+печатаемой над ним.
 
 #### Реализация Serve 03 (TASK-412)
 
@@ -1175,8 +1179,9 @@ net:
 ```
 
 - `<store>/net/tailscale/` — state dir sidecar (ключи машины): каталоги 0700
-  (0600 не позволяет входить в каталог), файлы и приватный socket 0600;
-  машинно-локально, не реплицируется и не попадает в bootstrap и relay.
+  (0600 не позволяет входить в каталог), файлы 0600; приватный socket 0600
+  лежит рядом, в `<store>/net/tailscale.sock`. Всё машинно-локально, не
+  реплицируется и не попадает в bootstrap и relay.
 - Бинарь: PATH (`pacman -S tailscale` в Arch внутри proot), затем
   `<store>/net/bin/{tailscale,tailscaled}`. `kanban4ai net install` получает
   stable static tarball amd64/arm64 с pkgs.tailscale.com, проверяет SHA-256
