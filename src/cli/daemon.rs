@@ -41,7 +41,7 @@ pub fn run(once: bool, interval: Option<u64>, project: Option<&str>) -> Result<E
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let shutdown = super::serve::shutdown_signal();
+        let shutdown = super::serve::shutdown_signal()?;
         tokio::pin!(shutdown);
         let mut state = PumpState::default();
         loop {

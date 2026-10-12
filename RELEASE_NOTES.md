@@ -1,5 +1,11 @@
 # Unreleased
 
+- **Outbound mobile sync.** Mobile identities are non-unique, never dialed by
+  peers and appear neutrally offline after departure. TUI and daemon own sync
+  workers when serve is absent, send hello/bye and yield to a later serve.
+  Phone QR pairing issues a mobile node through a one-time code; retired client
+  credentials are removed without invalidating paired node tokens.
+
 - **Managed Tailscale.** Machine-local `net.tailscale` selects off/system/managed.
   TUI, daemon and serve supervise a private userspace `tailscaled`, restart it
   after a crash and stop it on exit. `net up/down/logout/status/install` provides
@@ -10,9 +16,9 @@
 
 - **LAN HTTP server.** `kanban4ai serve` runs in the existing binary, binds
   individual LAN/loopback addresses, and exposes public `/health` and `/version`
-  probes (protocol 1). Other paths require hashed node/client Bearer tokens;
-  client tokens cannot access sync or git. SIGINT/SIGTERM drain requests with a
-  configurable deadline, including when a client leaves HTTP headers unfinished.
+  probes (protocol 1). Other paths require hashed node Bearer tokens.
+  SIGINT/SIGTERM handlers are installed before listeners become ready and drain
+  requests with a configurable deadline, including unfinished HTTP headers.
   AUR packages and `install.sh --with-serve` install the opt-in
   `kanban4ai-serve.service` user unit.
 

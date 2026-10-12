@@ -275,20 +275,25 @@ fn router(tokens: PathBuf) -> Router {
         .merge(protected)
 }
 
-pub(super) async fn shutdown_signal() -> Result<()> {
+pub(super) fn shutdown_signal() -> Result<impl Future<Output = Result<()>>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut terminate = signal(SignalKind::terminate())?;
         let mut interrupt = signal(SignalKind::interrupt())?;
-        tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {} }
+        Ok(async move {
+            tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {} }
+            Ok(())
+        })
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
-    Ok(())
+    Ok(async { tokio::signal::ctrl_c().await.map_err(Into::into) })
 }
 
 async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> Result<()> {
+    // Install handlers before listeners can advertise readiness.
+    let shutdown = shutdown_signal()?;
+    tokio::pin!(shutdown);
     let mut net = crate::core::net::Manager::new(root)?;
     if let Err(e) = net.tick() {
         eprintln!("serve network: {e}");
@@ -343,7 +348,7 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
         tokio::time::interval(Duration::from_secs(discovery::config(root)?.interval));
     let result = loop {
         tokio::select! {
-            result = shutdown_signal() => break result,
+            result = &mut shutdown => break result,
             result = tasks.join_next() => break match result {
                 Some(Ok(Err(e))) => Err(e.into()),
                 Some(Err(e)) => Err(invalid(e.to_string())),
