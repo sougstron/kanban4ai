@@ -787,6 +787,7 @@ impl Operations {
 
         if repo.read_ref(&iso.integration_ref)?.is_some()
             && !tasks.iter().any(|task| task.worktree.is_some())
+            && !crate::core::code::managed_clone(self.data_root(), self.work_path())?
         {
             let snap = repo.snapshot(
                 "HEAD",
@@ -3823,6 +3824,19 @@ impl Operations {
         self.storage
             .save_task(&current)
             .map_err(|e| e.to_string())?;
+        if crate::core::code::managed_clone(self.data_root(), self.work_path())
+            .map_err(|e| e.to_string())?
+        {
+            let published = repo.code_remote().and_then(|remote| {
+                if let Some(remote) = remote {
+                    repo.publish_code(&remote)?;
+                }
+                Ok(())
+            });
+            if let Err(error) = published {
+                self.post_queue_note(&task.id, &format!("Code publication pending: {error}"));
+            }
+        }
         self.post_queue_note(
             &task.id,
             &format!(
@@ -3848,6 +3862,11 @@ impl Operations {
         match iso.seed {
             IsolationSeed::Head => repo.head_oid(),
             IsolationSeed::Live => {
+                if crate::core::code::managed_clone(self.data_root(), self.work_path())? {
+                    if let Some(tip) = repo.read_ref(&iso.integration_ref)? {
+                        return Ok(tip);
+                    }
+                }
                 let parent = repo
                     .read_ref(&iso.integration_ref)?
                     .map(|oid| oid.as_str().to_string())

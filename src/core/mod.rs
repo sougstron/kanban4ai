@@ -1,4 +1,5 @@
 pub mod ask_form;
+pub mod code;
 pub mod compaction;
 pub mod config;
 pub mod context;

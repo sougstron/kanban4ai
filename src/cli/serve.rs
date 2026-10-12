@@ -31,6 +31,7 @@ mod api;
 mod embedded;
 pub(crate) use embedded::Embedded;
 mod discovery;
+mod git;
 mod pairing;
 mod sync;
 pub use discovery::DiscoveryOptions;
@@ -249,6 +250,7 @@ fn router(tokens: PathBuf) -> Router {
     let protected = Router::new()
         .merge(discovery::routes(root.clone()))
         .merge(sync::routes(root.clone()))
+        .merge(git::routes(root.clone()))
         .merge(api::routes(root))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "NOT_FOUND", "Unknown endpoint") })
         .layer(middleware::from_fn_with_state(tokens.clone(), authenticate));
@@ -337,11 +339,14 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
         let app = app.clone();
         println!("serve listening on http://{}", listener.local_addr()?);
         tasks.spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = stopped.changed().await;
-                })
-                .await
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = stopped.changed().await;
+            })
+            .await
         });
     }
     let mut net_tick =
