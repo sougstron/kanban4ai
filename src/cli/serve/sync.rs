@@ -170,7 +170,7 @@ async fn vector(State(root): State<PathBuf>, Extension(hash): Extension<String>)
         let journal = Journal::open(&root)?;
         let mut remaining = BTreeMap::new();
         for (alias, uid) in journal.project_uids()? {
-            remaining.insert(uid, journal.remaining_task_ids(&alias)?);
+            remaining.insert(uid, journal.remaining_primary_task_ids(&alias)?);
         }
         Ok(VectorReply {
             node_id: journal.node.node_id.clone(),
@@ -757,6 +757,7 @@ mod tests {
         let role = |r| match r {
             crate::core::sync::NodeRole::Laptop => "laptop",
             crate::core::sync::NodeRole::Server => "server",
+            crate::core::sync::NodeRole::Mobile => "mobile",
         };
         fs::write(
             local.join("config.yaml"),
@@ -844,11 +845,8 @@ mod tests {
             );
             assert!(discovery::config(&b).unwrap().peers.len() == 1);
             assert!(install_snapshot(&a, &ja.snapshot().unwrap()).unwrap_err().to_string().contains("SYNC_STORE_MISMATCH"));
-            // No grant yet: the server must not invent max + 1.
-            let refused = copy.create_task(NewTask::titled("too early")).unwrap_err();
-            assert!(refused.to_string().contains("SYNC_ID_BLOCK_EXHAUSTED"), "{refused}");
 
-            // The laptop issues grants once both vectors match.
+            // The server issues grants once both vectors match.
             let config = discovery::config(&a).unwrap();
             let (to_server, _) = Link::connect(&a, &config, &config.peers[0]).await.unwrap();
             let acknowledged = to_server.cycle().await.unwrap().unwrap();
