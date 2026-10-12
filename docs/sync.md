@@ -1080,13 +1080,25 @@ net:
   внутренний SOCKS5h proxy на loopback: MagicDNS разрешается sidecar, а не
   локальным DNS. LAN остаётся прямым; system использует системный tun напрямую.
   Relay fallback — отдельный TASK-440, этот транспорт его не подменяет.
+  При сопряжении каждый включённый узел объявляет `Self.DNSName` из
+  `tailscale status --json` (без завершающей точки) с портом serve; адрес
+  сохраняется в обеих карточках `sync.peers` и `sync/peers.yaml`.
+  `serve --pair HOST:PORT` и `serve --phone-qr HOST:PORT` принимают MagicDNS
+  либо tailnet-IP при включённом tailnet. QR сохраняет имя хоста и порт;
+  токены и проверка одноразового кода не меняются.
+  В system serve добавляет CGNAT и Tailscale IPv6 к разрешённым адресам
+  слушателей даже при явно заданных `home_networks`; при пустом списке
+  сохраняются стандартные частные LAN-диапазоны. mDNS остаётся LAN-discovery.
 - CLI: сначала задать `net.tailscale.mode` в машинно-локальном store config;
-  `net up [--auth-key-file PATH]` не включает managed неявно. При необходимости
+  `net up [--auth-key-file PATH]` относится к managed и не включает его неявно. При необходимости
   входа печатаются URL и терминальный QR, команда возвращает
   `NET_TAILSCALE_LOGIN_REQUIRED`; после входа повторить `net up` или проверить
   `net status`. Ключ передаётся Tailscale по имени файла, не в argv как секрет;
   файл удаляется только после подтверждённого успешного входа.
-  `net down` отключает, `net logout` удаляет вход, `net status` печатает JSON
+  В managed `net down` отключает, `net logout` удаляет вход. В system обе
+  команды и `net up` отказываются менять установленный daemon: вход и
+  systemd-сервис настраивает администратор через системный `tailscale`.
+  `net status` в обоих режимах печатает JSON
   Tailscale (`CurrentTailnet`, `User`, `Self.TailscaleIPs`, `Peer[].CurAddr/Relay`)
   и локальный mode. Пустой `CurAddr` при `Relay` означает DERP.
 - Человек работает

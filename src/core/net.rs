@@ -725,6 +725,11 @@ pub fn up(root: &Path, auth: Option<&Path>) -> Result<()> {
             "net.tailscale.mode is off; select managed or system first",
         ));
     }
+    if config.mode == Mode::System {
+        return Err(invalid(
+            "system Tailscale is read-only; manage login with the installed tailscale CLI",
+        ));
+    }
     let paths = Paths::new(&root);
     let _operation = if config.mode == Mode::Managed {
         paths.prepare()?;
@@ -752,6 +757,11 @@ pub fn up(root: &Path, auth: Option<&Path>) -> Result<()> {
 pub fn down(root: &Path) -> Result<()> {
     let root = fs::canonicalize(root)?;
     let config = settings(&root)?;
+    if config.mode == Mode::System {
+        return Err(invalid(
+            "system Tailscale is read-only; manage it with the installed tailscale CLI",
+        ));
+    }
     let paths = Paths::new(&root);
     // A managed sidecar can still exist after switching the config to off.
     if config.mode == Mode::Managed || paths.record().exists() {
@@ -763,12 +773,6 @@ pub fn down(root: &Path) -> Result<()> {
         }
         return Ok(());
     }
-    if config.mode == Mode::System {
-        let output = command(&root, Mode::System)?.arg("down").output()?;
-        if !output.status.success() {
-            return Err(invalid(format!("{DOWN}: tailscale down failed")));
-        }
-    }
     Ok(())
 }
 
@@ -777,6 +781,11 @@ pub fn logout(root: &Path) -> Result<()> {
     let config = settings(&root)?;
     if config.mode == Mode::Off {
         return Err(invalid("net.tailscale.mode is off"));
+    }
+    if config.mode == Mode::System {
+        return Err(invalid(
+            "system Tailscale is read-only; manage login with the installed tailscale CLI",
+        ));
     }
     let paths = Paths::new(&root);
     let _operation = if config.mode == Mode::Managed {
