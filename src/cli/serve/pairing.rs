@@ -10,15 +10,15 @@ pub struct PairingOptions {
     /// Create a single-use pairing code (serve may already be running).
     #[arg(long, conflicts_with_all = ["issue_token", "pair", "revoke_token", "phone_qr"])]
     pair_code: bool,
-    /// Pair with a LAN node at IP:port.
+    /// Pair with a LAN or enabled tailnet node at host:port.
     #[arg(long, requires = "code", conflicts_with_all = ["issue_token", "revoke_token", "phone_qr"])]
-    pair: Option<SocketAddr>,
+    pair: Option<String>,
     /// Revoke a token by its SHA-256 fingerprint.
     #[arg(long, conflicts_with_all = ["issue_token", "phone_qr"])]
     revoke_token: Option<String>,
     /// Print a single-use pairing QR for an outbound mobile node.
     #[arg(long, conflicts_with = "issue_token")]
-    phone_qr: Option<SocketAddr>,
+    phone_qr: Option<String>,
     /// Single-use code displayed on the other node.
     #[arg(long, requires = "pair")]
     code: Option<String>,
@@ -40,6 +40,8 @@ struct Card {
     node: NodeIdentity,
     #[serde(default = "outbound_address")]
     address: SocketAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tailscale_address: Option<String>,
     empty: bool,
     proto: u32,
     min_proto: u32,
@@ -68,6 +70,8 @@ struct SecretPeer {
     address: Option<SocketAddr>,
     #[serde(default)]
     addresses: Vec<SocketAddr>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tailscale_address: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -106,20 +110,90 @@ fn secret() -> Result<String> {
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(hex(&bytes))
 }
+fn reachable(root: &Path, address: SocketAddr) -> Result<bool> {
+    Ok(address.port() != 0
+        && (allowed(address.ip(), &[])
+            || (crate::core::net::settings(root)?.mode != crate::core::net::Mode::Off
+                && match address.ip() {
+                    IpAddr::V4(ip) => u32::from(ip) & 0xffc0_0000 == 0x6440_0000,
+                    IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+                })))
+}
+
+fn endpoint(root: &Path, address: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(&format!("http://{address}"))
+        .map_err(|_| invalid("Expected LAN or tailnet host:port"))?;
+    let host = url.host_str().unwrap_or_default();
+    let valid = address
+        .parse::<SocketAddr>()
+        .map(|a| reachable(root, a))
+        .unwrap_or_else(|_| {
+            Ok(
+                crate::core::net::settings(root)?.mode != crate::core::net::Mode::Off
+                    && crate::core::net::is_tailnet_address(host),
+            )
+        })?;
+    if !valid
+        || !address
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port.parse::<u16>().is_ok_and(|p| p != 0))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid("Expected LAN or enabled tailnet host:port"));
+    }
+    Ok(url)
+}
+
+fn tailnet_address(root: &Path, port: u16) -> Result<Option<String>> {
+    if port == 0 || crate::core::net::settings(root)?.mode == crate::core::net::Mode::Off {
+        return Ok(None);
+    }
+    let Ok(status) = crate::core::net::status(root) else {
+        return Ok(None);
+    };
+    if status["BackendState"] != "Running" {
+        return Ok(None);
+    }
+    Ok(status["Self"]["DNSName"]
+        .as_str()
+        .map(|name| name.trim_end_matches('.'))
+        .filter(|name| crate::core::net::is_tailnet_address(name))
+        .map(|name| format!("{name}:{port}")))
+}
+
 fn card(store: &ProjectStore, address: SocketAddr) -> Result<Card> {
     Ok(Card {
         node: Journal::open(store.root())?.node,
         address,
+        tailscale_address: tailnet_address(store.root(), address.port())?,
         empty: store.list()?.is_empty(),
         proto: PROTO,
         min_proto: MIN_PROTO,
     })
 }
-fn validate(local: &Card, remote: &Card) -> Result<()> {
-    if !remote.node.outbound_only()
-        && (!allowed(remote.address.ip(), &[]) || remote.address.port() == 0)
-    {
-        return Err(invalid("Pairing requires a LAN address"));
+fn validate(root: &Path, local: &Card, remote: &Card) -> Result<()> {
+    if !remote.node.outbound_only() && !reachable(root, remote.address)? {
+        return Err(invalid("Pairing requires a LAN or enabled tailnet address"));
+    }
+    if let Some(address) = &remote.tailscale_address {
+        let url = reqwest::Url::parse(&format!("http://{address}"))
+            .map_err(|_| invalid("Invalid peer tailnet address"))?;
+        if !crate::core::net::is_tailnet_address(address)
+            || !address
+                .rsplit_once(':')
+                .is_some_and(|(_, port)| port.parse::<u16>().is_ok_and(|p| p != 0))
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(invalid("Invalid peer tailnet address"));
+        }
     }
     if remote.proto < MIN_PROTO || remote.min_proto > PROTO {
         return Err(invalid("NODE_VERSION_MISMATCH"));
@@ -168,6 +242,7 @@ fn install(store: &ProjectStore, peer: &Card, inbound: &str, outbound: &str) -> 
         inbound_sha256: hash,
         address: Some(peer.address),
         addresses: Vec::new(),
+        tailscale_address: peer.tailscale_address.clone(),
     });
     let mut config: serde_yaml_ng::Value = load(&root.join("config.yaml"))?;
     if config.is_null() {
@@ -281,10 +356,11 @@ fn accept_sync(root: &Path, request: PairRequest) -> Result<PairReply> {
             .find(|a| !a.ip().is_loopback())
             .unwrap_or(SocketAddr::from(([127, 0, 0, 1], port))),
         empty: store.list()?.is_empty(),
+        tailscale_address: tailnet_address(root, port)?,
         proto: PROTO,
         min_proto: MIN_PROTO,
     };
-    validate(&local, &request.node_card)?;
+    validate(root, &local, &request.node_card)?;
     // Consume before generating credentials: failures never make a used code reusable.
     code.expires = 0;
     save(&path, &code)?;
@@ -348,26 +424,27 @@ pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool
         tokens.tokens.retain(|t| &t.sha256 != hash);
         save(&root.join("sync/tokens.yaml"), &tokens)?;
         println!("Token revoked");
-    } else if let Some(address) = options.phone_qr {
-        if !allowed(address.ip(), &[]) || address.port() == 0 {
-            return Err(invalid("QR requires a LAN address"));
-        }
+    } else if let Some(address) = &options.phone_qr {
+        let url = endpoint(root, address)?;
         let node = Journal::open(root)?.node;
         let code = create_code(store)?;
-        let payload = json!({"address":address.ip().to_string(),"port":address.port(),"node_id":node.node_id,"code":code,"role":"mobile","dial":"outbound"}).to_string();
+        let payload = json!({"address":url.host_str().unwrap().trim_matches(['[', ']']),"port":url.port_or_known_default().unwrap(),"node_id":node.node_id,"code":code,"role":"mobile","dial":"outbound"}).to_string();
         let qr = qrcode::QrCode::new(payload.as_bytes()).map_err(|e| invalid(e.to_string()))?;
         println!(
             "{payload}\n{}",
             qr.render::<qrcode::render::unicode::Dense1x2>().build()
         );
-    } else if let Some(address) = options.pair {
-        if !allowed(address.ip(), &[]) || address.port() == 0 {
-            return Err(invalid("Pairing requires a LAN address"));
-        }
+    } else if let Some(address) = &options.pair {
+        endpoint(root, address)?;
         let node = Journal::open(root)?.node;
         let local = card(store, options.address.unwrap_or_else(outbound_address))?;
         if !node.outbound_only() && options.address.is_none() {
             return Err(invalid("--address required for an inbound node"));
+        }
+        if !node.outbound_only() && !reachable(root, local.address)? {
+            return Err(invalid(
+                "--address must be a LAN or enabled tailnet address",
+            ));
         }
         let request = PairRequest {
             code: options
@@ -376,13 +453,17 @@ pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool
                 .ok_or_else(|| invalid("--code required"))?,
             node_card: local.clone(),
         };
-        let mut child = Command::new("curl")
+        let mut command = Command::new("curl");
+        if let Some(proxy) = crate::core::net::proxy_for(root, address)? {
+            command.args(["--proxy", &proxy, "--noproxy", ""]);
+        } else {
+            command.args(["--noproxy", "*"]);
+        }
+        let mut child = command
             .args([
                 "--silent",
                 "--show-error",
                 "--fail-with-body",
-                "--noproxy",
-                "*",
                 "--connect-timeout",
                 "5",
                 "--max-time",
@@ -412,8 +493,12 @@ pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool
         }
         let mut reply: PairReply =
             serde_json::from_slice(&output.stdout).map_err(|e| invalid(e.to_string()))?;
-        reply.node_card.address = address;
-        validate(&local, &reply.node_card)?;
+        if let Ok(socket) = address.parse() {
+            reply.node_card.address = socket;
+        } else {
+            reply.node_card.tailscale_address = Some(address.clone());
+        }
+        validate(root, &local, &reply.node_card)?;
         let _store_lock = lock_file_reentrant(&root.join(".lock"))?;
         let _sync_lock = lock_file_reentrant(&root.join("sync/.lock"))?;
         install(store, &reply.node_card, &reply.reverse_token, &reply.token)?;
@@ -437,6 +522,7 @@ mod tests {
             node_card: Card {
                 node,
                 address: "127.0.0.1:7421".parse().unwrap(),
+                tailscale_address: None,
                 empty: true,
                 proto: PROTO,
                 min_proto: MIN_PROTO,
@@ -503,18 +589,54 @@ mod tests {
         remote.empty = false;
         remote.node.store_id = "different-store".into();
         assert!(
-            validate(&populated, &remote)
+            validate(dir.path(), &populated, &remote)
                 .unwrap_err()
                 .to_string()
                 .contains("SYNC_STORE_MISMATCH")
         );
         remote.empty = true;
         remote.node.role = NodeRole::Laptop;
-        validate(&local, &remote).unwrap();
+        validate(dir.path(), &local, &remote).unwrap();
         let mut server = local.clone();
         server.node.role = NodeRole::Server;
         remote.node.role = NodeRole::Server;
-        assert!(validate(&server, &remote).is_err());
+        assert!(validate(dir.path(), &server, &remote).is_err());
+    }
+    #[test]
+    fn tailnet_pairing_persists_magic_dns_and_rejects_public_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.yaml"),
+            "net:\n  tailscale:\n    mode: system\n",
+        )
+        .unwrap();
+        let mut req = request(dir.path(), "123456");
+        req.node_card.address = "100.80.1.2:7420".parse().unwrap();
+        req.node_card.tailscale_address = Some("kanban-server.example.ts.net:7420".into());
+        set_code(dir.path(), chrono::Utc::now().timestamp() + 300);
+        accept_sync(dir.path(), req).unwrap();
+        let peers: Vec<SecretPeer> = load(&dir.path().join("sync/peers.yaml")).unwrap();
+        assert_eq!(
+            peers[0].tailscale_address.as_deref(),
+            Some("kanban-server.example.ts.net:7420")
+        );
+        assert!(endpoint(dir.path(), "kanban-server.example.ts.net:7420").is_ok());
+        assert!(endpoint(dir.path(), "100.64.0.1:80").is_ok());
+        for address in [
+            "8.8.8.8:7420",
+            "server.example.com:7420",
+            "user@server.example.ts.net:7420",
+            "server.example.ts.net:7420/secret",
+        ] {
+            assert!(endpoint(dir.path(), address).is_err(), "{address}");
+        }
+        fs::write(
+            dir.path().join("config.yaml"),
+            "net:\n  tailscale:\n    mode: off\n",
+        )
+        .unwrap();
+        assert!(endpoint(dir.path(), "100.80.1.2:7420").is_err());
+        assert!(endpoint(dir.path(), "kanban-server.example.ts.net:7420").is_err());
     }
     #[test]
     fn multiple_outbound_mobiles_pair_without_reachable_addresses() {
@@ -528,7 +650,7 @@ mod tests {
             remote.node.role = NodeRole::Mobile;
             remote.node.dial = crate::core::sync::NodeDial::Outbound;
             remote.address = "127.0.0.1:0".parse().unwrap();
-            validate(&local, &remote).unwrap();
+            validate(dir.path(), &local, &remote).unwrap();
             install(&store, &remote, &secret().unwrap(), &secret().unwrap()).unwrap();
         }
         let peers = discovery::config(dir.path()).unwrap().peers;

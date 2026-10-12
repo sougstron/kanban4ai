@@ -409,8 +409,31 @@ fn fake_process_scenario() {
                     .unwrap()
                     .contains("--socket")
             );
-            net::down(&root).unwrap();
-            assert!(!root.join("net/tailscale/running").exists());
+            let before = fs::read(root.join("net/tailscale/cli-args")).unwrap();
+            assert!(
+                net::up(&root, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("read-only")
+            );
+            assert!(
+                net::down(&root)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("read-only")
+            );
+            assert!(
+                net::logout(&root)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("read-only")
+            );
+            assert_eq!(
+                fs::read(root.join("net/tailscale/cli-args")).unwrap(),
+                before
+            );
+            drop(manager);
+            assert!(root.join("net/tailscale/running").exists());
         }
         "install" => net::install(&root).unwrap(),
         "bad-install" => assert!(net::install(&root).is_err()),
