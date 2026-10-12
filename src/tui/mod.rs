@@ -320,6 +320,7 @@ pub fn run(start: TuiStart) -> Result<()> {
     let mut app = app_from_start(start)?;
     let store = ProjectStore::open()?;
     let mut network = crate::core::net::Manager::new(store.root())?;
+    let _sync = crate::cli::serve::Embedded::start(store.root())?;
     // Network failure must not make the local board unavailable.
     if let Err(error) = network.tick() {
         app.status = error.to_string();

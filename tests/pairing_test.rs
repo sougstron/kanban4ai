@@ -8,7 +8,7 @@ fn command(root: &std::path::Path) -> Command {
 }
 
 #[test]
-fn phone_credentials_are_private_and_revocable() {
+fn phone_qr_uses_expiring_pair_code_not_bearer_credentials() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let output = command(dir.path())
@@ -22,28 +22,46 @@ fn phone_credentials_are_private_and_revocable() {
     );
     let text = String::from_utf8(output.stdout).unwrap();
     let payload: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-    let token = payload["token"].as_str().unwrap();
-    assert_eq!(token.len(), 64);
-    let path = dir.path().join("sync/tokens.yaml");
+    assert_eq!(payload["role"], "mobile");
+    assert_eq!(payload["dial"], "outbound");
+    assert!(payload.get("token").is_none());
+    let code = payload["code"].as_str().unwrap();
+    let path = dir.path().join("sync/pair-code.yaml");
     let registry = std::fs::read_to_string(&path).unwrap();
-    assert!(!registry.contains(token));
+    assert!(!registry.contains(code));
     assert_eq!(
         std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
         0o600
     );
-    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&registry).unwrap();
-    assert_eq!(value["tokens"][0]["kind"].as_str(), Some("client"));
-    let fingerprint = value["tokens"][0]["sha256"].as_str().unwrap();
+    assert!(!dir.path().join("sync/tokens.yaml").exists());
+}
+
+#[test]
+fn retiring_clients_preserves_existing_node_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sync")).unwrap();
+    let path = dir.path().join("sync/tokens.yaml");
+    let node_hash = "a".repeat(64);
+    let client_hash = "b".repeat(64);
+    std::fs::write(&path, format!(
+        "tokens:\n- kind: node\n  sha256: {node_hash}\n- kind: client\n  sha256: {client_hash}\n"
+    )).unwrap();
+    let output = command(dir.path())
+        .args(["serve", "--issue-token", "node"])
+        .output()
+        .unwrap();
     assert!(
-        command(dir.path())
-            .args(["serve", "--revoke-token", fingerprint])
-            .status()
-            .unwrap()
-            .success()
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let value: serde_yaml_ng::Value = serde_yaml_ng::from_str(
-        &std::fs::read_to_string(dir.path().join("sync/tokens.yaml")).unwrap(),
-    )
-    .unwrap();
-    assert!(value["tokens"].as_sequence().unwrap().is_empty());
+    let registry = std::fs::read_to_string(path).unwrap();
+    assert!(registry.contains(&node_hash));
+    assert!(!registry.contains(&client_hash));
+    assert!(!registry.contains("kind: client"));
+    let rejected = command(dir.path())
+        .args(["serve", "--issue-token", "client"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
 }

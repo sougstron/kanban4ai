@@ -28,6 +28,8 @@ use crate::core::project::ProjectStore;
 use crate::core::storage::{atomic_write_text_raw, lock_file_reentrant};
 
 mod api;
+mod embedded;
+pub(crate) use embedded::Embedded;
 mod discovery;
 mod pairing;
 mod sync;
@@ -68,7 +70,6 @@ struct Networks {
 #[serde(rename_all = "lowercase")]
 enum TokenKind {
     Node,
-    Client,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -234,19 +235,6 @@ async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: N
             "Token is unknown or revoked",
         );
     };
-    let path = request.uri().path();
-    if matches!(kind, TokenKind::Client)
-        && (path == "/sync"
-            || path.starts_with("/sync/")
-            || path == "/git"
-            || path.starts_with("/git/"))
-    {
-        return error(
-            StatusCode::FORBIDDEN,
-            "NODE_AUTH_FAILED",
-            "Client tokens cannot access sync or git",
-        );
-    }
     request.extensions_mut().insert(kind);
     request.extensions_mut().insert(hash);
     next.run(request).await
@@ -287,20 +275,25 @@ fn router(tokens: PathBuf) -> Router {
         .merge(protected)
 }
 
-async fn shutdown_signal() -> Result<()> {
+pub(super) fn shutdown_signal() -> Result<impl Future<Output = Result<()>>> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut terminate = signal(SignalKind::terminate())?;
         let mut interrupt = signal(SignalKind::interrupt())?;
-        tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {} }
+        Ok(async move {
+            tokio::select! { _ = terminate.recv() => {}, _ = interrupt.recv() => {} }
+            Ok(())
+        })
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
-    Ok(())
+    Ok(async { tokio::signal::ctrl_c().await.map_err(Into::into) })
 }
 
 async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> Result<()> {
+    // Install handlers before listeners can advertise readiness.
+    let shutdown = shutdown_signal()?;
+    tokio::pin!(shutdown);
     let mut net = crate::core::net::Manager::new(root)?;
     if let Err(e) = net.tick() {
         eprintln!("serve network: {e}");
@@ -326,11 +319,17 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
     // Bind everything before starting any request handling: a failed bind
     // must not leave a partially started service running.
     let mut listeners = Vec::new();
-    for address in addresses(&bind_networks, port)? {
+    let node = crate::core::sync::Journal::open(root)?.node;
+    let bind_addresses = if node.outbound_only() {
+        BTreeSet::from([SocketAddr::from(([127, 0, 0, 1], port))])
+    } else {
+        addresses(&bind_networks, port)?
+    };
+    for address in bind_addresses {
         listeners.push(TcpListener::bind(address).await?);
     }
+    let replication = Embedded::serving(root)?;
     let discovery = discovery::start(root, networks, port).await?;
-    let replication = sync::start(root);
     let (stop, _) = watch::channel(false);
     let mut tasks = JoinSet::new();
     for listener in listeners {
@@ -349,7 +348,7 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
         tokio::time::interval(Duration::from_secs(discovery::config(root)?.interval));
     let result = loop {
         tokio::select! {
-            result = shutdown_signal() => break result,
+            result = &mut shutdown => break result,
             result = tasks.join_next() => break match result {
                 Some(Ok(Err(e))) => Err(e.into()),
                 Some(Err(e)) => Err(invalid(e.to_string())),
@@ -364,7 +363,7 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
     };
     discovery.stop().await;
     // Ends live SSE streams too, so graceful drain does not wait for them.
-    replication.stop().await;
+    drop(replication);
     let _ = stop.send(true);
     let drain = async {
         while let Some(task) = tasks.join_next().await {
@@ -384,6 +383,30 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
     result
 }
 
+/// Remove retired client credentials without invalidating paired node tokens.
+fn retire_client_tokens(root: &Path) -> Result<()> {
+    let path = root.join("sync/tokens.yaml");
+    if !path.exists() {
+        return Ok(());
+    }
+    let _lock = lock_file_reentrant(&root.join("sync/.lock"))?;
+    let mut registry: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&path)?)?;
+    if let Some(tokens) = registry
+        .get_mut("tokens")
+        .and_then(serde_yaml_ng::Value::as_sequence_mut)
+    {
+        let before = tokens.len();
+        tokens.retain(|token| {
+            token.get("kind").and_then(serde_yaml_ng::Value::as_str) != Some("client")
+        });
+        if tokens.len() != before {
+            let validated: Tokens = serde_yaml_ng::from_value(registry)?;
+            atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&validated)?)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn run(
     port: Option<u16>,
     token_kind: Option<&str>,
@@ -391,13 +414,13 @@ pub fn run(
     discovery_options: DiscoveryOptions,
 ) -> Result<ExitCode> {
     let store = ProjectStore::open()?;
+    retire_client_tokens(store.root())?;
     if let Some(kind) = token_kind {
         let secret = issue_token(
             store.root(),
             match kind {
                 "node" => TokenKind::Node,
-                "client" => TokenKind::Client,
-                _ => return Err(invalid("token kind must be node or client")),
+                _ => return Err(invalid("token kind must be node")),
             },
         )?;
         println!("{secret}");
@@ -452,7 +475,6 @@ mod tests {
         fs::create_dir_all(dir.path().join("sync")).unwrap();
         let path = dir.path().join("sync/tokens.yaml");
         let node = "a".repeat(64);
-        let client = "b".repeat(64);
         let app = router(path.clone());
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -482,16 +504,10 @@ mod tests {
             fs::write(
                 &path,
                 serde_yaml_ng::to_string(&Tokens {
-                    tokens: vec![
-                        Token {
-                            kind: TokenKind::Node,
-                            sha256: token_hash(&node),
-                        },
-                        Token {
-                            kind: TokenKind::Client,
-                            sha256: token_hash(&client),
-                        },
-                    ],
+                    tokens: vec![Token {
+                        kind: TokenKind::Node,
+                        sha256: token_hash(&node),
+                    }],
                 })
                 .unwrap(),
             )
@@ -505,17 +521,6 @@ mod tests {
                     StatusCode::UNAUTHORIZED,
                 ),
                 ("/node", Some(node.as_str()), StatusCode::OK),
-                (
-                    "/api/v1/tasks",
-                    Some(client.as_str()),
-                    StatusCode::NOT_FOUND,
-                ),
-                ("/sync/ops", Some(client.as_str()), StatusCode::FORBIDDEN),
-                (
-                    "/git/project/bundle",
-                    Some(client.as_str()),
-                    StatusCode::FORBIDDEN,
-                ),
                 ("/sync/unknown", Some(node.as_str()), StatusCode::NOT_FOUND),
             ] {
                 let response = app.clone().oneshot(request(path, token)).await.unwrap();
