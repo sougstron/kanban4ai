@@ -467,30 +467,6 @@ async fn probe_peer(
     }
     Ok(status(peer, presence, code, remote_version.as_ref()))
 }
-pub(super) async fn runner_online(root: &Path, peer: &PeerCard) -> Result<bool> {
-    let config = config(root)?;
-    let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
-    let presence: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
-    Ok(probe_peer(
-        root,
-        &config,
-        peer,
-        credentials.iter().find(|c| c.node_id == peer.node.node_id),
-        presence
-            .get(&peer.node.node_id)
-            .unwrap_or(&Presence::default()),
-        in_lan(&config)?,
-    )
-    .await?
-    .code
-        == "ONLINE"
-        || crate::core::sync::relay::available(
-            root,
-            &peer.node.node_id,
-            Utc::now().timestamp_millis().max(0) as u64,
-        )?)
-}
-
 pub(super) async fn probes(root: &Path) -> Result<Vec<Status>> {
     let config = config(root)?;
     let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;

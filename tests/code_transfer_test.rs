@@ -97,27 +97,15 @@ fn bundle_clone_and_update_preserve_checkouts_and_seed_remote_live_work() {
     );
     assert_eq!(git(&status.path, &["rev-parse", "HEAD"]), head);
     let received = ProjectStore::at(&receiver).get(&p.id).unwrap().unwrap();
-    fs::write(received.kanban_dir().join("config.yaml"), "notifications:\n  enabled: false\nauto_launch:\n  enabled: true\norchestration:\n  isolation:\n    mode: off\n").unwrap();
+    fs::write(received.kanban_dir().join("config.yaml"), "notifications:\n  enabled: false\nauto_launch:\n  enabled: true\norchestration:\n  isolation:\n    mode: auto\n").unwrap();
     let ops = Operations::for_project_with_launcher(
         &received,
         Box::new(common::RecordingLauncher::new()),
     );
-    let mut task = ops.create_task(NewTask::titled("Peer live seed")).unwrap();
-    {
-        let _lock = ops.storage.lock().unwrap();
-        task.runner_request = Some("pending-manual-start".into());
-        ops.storage.save_task(&task).unwrap();
-    }
+    let task = ops.create_task(NewTask::titled("Peer live seed")).unwrap();
     ops.take_task(&task.id, "ses-code-transfer", true)
         .unwrap()
         .unwrap();
-    assert!(
-        ops.get_task(&task.id)
-            .unwrap()
-            .unwrap()
-            .runner_request
-            .is_none()
-    );
     let wt = received.kanban_dir().join("worktrees").join(&task.id);
     assert_eq!(
         fs::read_to_string(wt.join("tracked")).unwrap(),
@@ -207,109 +195,5 @@ fn invalid_bundle_leaves_no_clone_and_mobile_requires_remote() {
             .unwrap()
             .to_string()
             .contains("SYNC_NO_REMOTE")
-    );
-}
-
-#[test]
-fn remote_queue_intent_is_runner_owned_and_obeys_runner_caps() {
-    use kanban4ai::core::{
-        config::Runner,
-        models::{RunPhase, TaskStatus},
-        session::SessionManager,
-        sync::{Journal, install_snapshot},
-    };
-    let temp = tempfile::tempdir().unwrap();
-    let (_work, p) = fixture(temp.path());
-    let sender = temp.path().join("sender");
-    let receiver = temp.path().join("receiver");
-    fs::write(p.kanban_dir().join("config.yaml"),
-        "notifications:\n  enabled: false\nauto_launch:\n  enabled: true\norchestration:\n  queue_enabled: true\n  max_running_total: 1\n").unwrap();
-    let storage = Storage::new(&p.data_root);
-    let mut task = Operations::for_project(&p)
-        .create_task(NewTask {
-            runner: Some(Runner::Node("home".into())),
-            ..NewTask::titled("Remote queued")
-        })
-        .unwrap();
-    {
-        let _lock = storage.lock().unwrap();
-        task.status = TaskStatus::InProgress;
-        task.run_phase = Some(RunPhase::Queued);
-        task.runner_request = Some("request-1".into());
-        storage.save_task(&task).unwrap();
-    }
-    fs::create_dir_all(&receiver).unwrap();
-    fs::write(
-        receiver.join("config.yaml"),
-        "node:\n  name: home\n  role: server\n",
-    )
-    .unwrap();
-    let a = Journal::open(&sender).unwrap();
-    Journal::open(&receiver).unwrap();
-    install_snapshot(&receiver, &a.snapshot().unwrap()).unwrap();
-    let b = Journal::open(&receiver).unwrap();
-    let peers = |node: &kanban4ai::core::sync::NodeIdentity| {
-        serde_yaml_ng::to_string(&serde_json::json!({"sync": {"peers": [{
-            "node_id": node.node_id, "name": node.name, "role": node.role,
-            "store_id": node.store_id, "address":"127.0.0.1:1"
-        }]}}))
-        .unwrap()
-    };
-    fs::write(sender.join("config.yaml"), peers(&b.node)).unwrap();
-    // The sender must not consume the replicated request or its local queued marker.
-    assert!(
-        Operations::for_project(&p)
-            .dispatch_queue()
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        SessionManager::new(&p.data_root)
-            .list_active_sessions()
-            .is_empty()
-    );
-    assert_eq!(
-        storage
-            .load_task(&task.id)
-            .unwrap()
-            .unwrap()
-            .runner_request
-            .as_deref(),
-        Some("request-1")
-    );
-    let (bundle, _) = code::export(&sender, &p.id, &[]).unwrap();
-    code::receive(&receiver, &p.id, bundle.path(), None).unwrap();
-    let copy = ProjectStore::at(&receiver).get(&p.id).unwrap().unwrap();
-    let ops = Operations::for_project(&copy);
-    let busy = ops
-        .create_task(NewTask::titled("Existing local run"))
-        .unwrap();
-    let sessions = SessionManager::new(&copy.data_root);
-    sessions.link_session(&busy.id, "ses-occupied").unwrap();
-    {
-        let _lock = ops.storage.lock().unwrap();
-        let mut busy = ops.get_task(&busy.id).unwrap().unwrap();
-        busy.status = TaskStatus::InProgress;
-        busy.session = Some("ses-occupied".into());
-        ops.storage.save_task(&busy).unwrap();
-    }
-    fs::write(
-        receiver.join("config.yaml"),
-        format!("node:\n  name: home\n  role: server\n{}", peers(&a.node)),
-    )
-    .unwrap();
-    assert!(ops.dispatch_queue().unwrap().is_empty());
-    let queued = ops.get_task(&task.id).unwrap().unwrap();
-    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
-    assert!(queued.runner_request.is_none());
-    assert!(queued.session.is_none());
-    assert!(ops.dispatch_queue().unwrap().is_empty());
-    assert_eq!(
-        sessions
-            .list_active_sessions()
-            .iter()
-            .map(|s| s.id.as_str())
-            .collect::<Vec<_>>(),
-        ["ses-occupied"]
     );
 }

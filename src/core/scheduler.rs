@@ -14,7 +14,7 @@ use chrono::NaiveDateTime;
 
 use crate::agent::{resolve_launch_settings, upcoming_run_plan};
 use crate::core::config::{BoardConfig, OrchestrationSettings};
-use crate::core::error::{KanbanError, Result};
+use crate::core::error::Result;
 use crate::core::models::{Role, RunPhase, TaskStatus};
 use crate::core::operations::{Operations, PoolOutcome, safe_session_component, sort_tasks};
 use crate::core::session::{SessionManager, SessionState};
@@ -227,39 +227,6 @@ impl Operations {
     /// double-start a task. Plain library call: no TUI or terminal
     /// assumptions, safe to loop over projects from a headless daemon.
     pub fn dispatch_queue(&self) -> Result<Vec<Dispatched>> {
-        // A replicated queue intent belongs only to the pinned runner.
-        // Prepare its machine-local clone before creating any local session.
-        let requests = self
-            .storage
-            .get_all_tasks()?
-            .into_iter()
-            .filter(|task| task.runner_request.is_some())
-            .filter_map(|task| {
-                match crate::cli::serve::local_runner(self.data_root(), task.runner.as_ref()) {
-                    Ok(true) => Some(Ok(task)),
-                    Ok(false) => None,
-                    Err(e) => Some(Err(e)),
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if !requests.is_empty() {
-            let root = self
-                .data_root()
-                .parent()
-                .and_then(std::path::Path::parent)
-                .ok_or_else(|| KanbanError::Invalid("Runner request outside store".into()))?;
-            let id = self
-                .data_root()
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| KanbanError::Invalid("Invalid runner project".into()))?;
-            let project = crate::core::code::prepare(root, id)?;
-            let prepared = Operations::for_project(&project);
-            for task in requests {
-                prepared.queue_run(&task.id)?;
-            }
-            return prepared.dispatch_queue();
-        }
         // Reap sessions whose process is gone before counting, exactly like
         // `kanban check-sessions`: otherwise a dead session would hold its
         // slot until the heartbeat timeout. Newly crashed sessions enter the
@@ -288,9 +255,6 @@ impl Operations {
 
         let mut dispatched = Vec::new();
         for candidate in candidates {
-            if !crate::cli::serve::local_runner(self.data_root(), candidate.runner.as_ref())? {
-                continue;
-            }
             if !crate::core::sync::remote_runs(&self.storage.project_path, &candidate.id)?
                 .is_empty()
             {
@@ -359,9 +323,6 @@ impl Operations {
                 return Ok(None);
             };
             if task.status != TaskStatus::InProgress || task.run_phase != Some(RunPhase::Queued) {
-                return Ok(None);
-            }
-            if !crate::cli::serve::local_runner(self.data_root(), task.runner.as_ref())? {
                 return Ok(None);
             }
             if task.restart_at.is_some_and(|at| at > timefmt::now()) {

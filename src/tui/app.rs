@@ -5163,10 +5163,7 @@ impl App {
         self.spawn_launch(Some(task_id.clone()), move |ops| {
             let (status, started) = match ops.start_task(&task_id) {
                 Ok(Some(session_id)) => (format!("Started {task_id} → {session_id}{suffix}"), true),
-                Ok(None) => match ops.get_task(&task_id) {
-                    Ok(Some(_)) => (format!("Queued {task_id} on its runner"), true),
-                    _ => (format!("Task {task_id} not found"), false),
-                },
+                Ok(None) => (format!("Task {task_id} not found"), false),
                 Err(err) => (err.to_string(), false),
             };
             LaunchReport {
@@ -6434,7 +6431,7 @@ impl App {
                     needs: None,
                     parent_task: None,
                     role_profile: None,
-                    runner: modal.runner.clone(),
+                    runner: modal.runner,
                 };
                 let target = target_status
                     .as_deref()
@@ -6484,7 +6481,7 @@ impl App {
                         use_orchestrator: Some(modal.use_orchestrator),
                         chained_to: Some(modal.chain_text()),
                         launch_at,
-                        runner: Some(modal.runner.clone()),
+                        runner: Some(modal.runner),
                         ..Default::default()
                     },
                 )?;
@@ -8495,12 +8492,7 @@ fn apply_settings_groups(
     if edits(InheritGroup::Placement) {
         config.runner.insert(
             Value::String("default".to_string()),
-            serde_yaml_ng::to_value(
-                modal
-                    .runner
-                    .clone()
-                    .unwrap_or(crate::core::config::Runner::Auto),
-            )?,
+            serde_yaml_ng::to_value(modal.runner.unwrap_or(crate::core::config::Runner::Auto))?,
         );
     }
     if edits(InheritGroup::Agent) {

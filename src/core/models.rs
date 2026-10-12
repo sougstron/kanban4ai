@@ -469,9 +469,6 @@ pub struct Task {
     /// Placement override; absent inherits the project's effective runner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<crate::core::config::Runner>,
-    /// Durable remote queue intent. Only the pinned runner consumes it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runner_request: Option<String>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -534,7 +531,6 @@ impl Task {
             base_commit: None,
             integration: IntegrationState::None,
             runner: None,
-            runner_request: None,
         }
     }
 
