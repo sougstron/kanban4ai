@@ -123,6 +123,10 @@ they are edited: press `s` on the Projects screen. Saved under the store
   `tui.task_sort` / `tui.hide_kanban_messages`: the global half of the
   inheritable groups below, same shapes as in the project file. Absent keys
   read as the built-in defaults. Edited on the Global Settings tabs.
+- `net.tailscale.mode`: `off` (default), `system` (read/control the existing Tailscale service), or `managed` (private userspace sidecar supervised by TUI/daemon/serve).
+- `net.tailscale.hostname`: `kanban-<role>` from machine-local `sync/node.yaml`, falling back to `kanban-laptop`; DNS hostname label.
+- `net.tailscale.socks_port`: `1055`, loopback SOCKS5 listener in managed mode.
+- `net.tailscale.auth_key_file`: null, or a one-time key file path (relative paths resolve under the store). Used by `net up` and managed startup; chmod 0600, deleted only after confirmed login. No key content is stored in config or passed in process arguments. These settings and `<store>/net/` stay machine-local; see `docs/sync.md` §11.5.
 
 ### Inheriting settings from the global config
 Project settings come in seven groups, each of which either follows the

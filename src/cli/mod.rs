@@ -4,6 +4,7 @@
 mod bridge;
 mod daemon;
 mod init;
+mod net;
 mod project;
 mod resolve;
 mod serve;
@@ -406,6 +407,11 @@ enum Command {
         #[arg(long)]
         once: bool,
     },
+    /// Manage this machine's Tailscale connection.
+    Net {
+        #[command(subcommand)]
+        command: net::NetCommand,
+    },
     /// Serve the local store over HTTP on LAN and loopback interfaces.
     Serve {
         /// Override store `serve.port` (default: 7420)
@@ -765,6 +771,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Command::Update { check } => return run_update(check),
+        Command::Net { command } => return net::run(command),
         Command::Tui => return launch_tui(cli.project.as_deref()),
         Command::Daemon { interval, once } => {
             return daemon::run(once, interval, cli.project.as_deref());
@@ -1507,6 +1514,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
         }
         Command::Tui
+        | Command::Net { .. }
         | Command::Limits { .. }
         | Command::Stats
         | Command::Update { .. }

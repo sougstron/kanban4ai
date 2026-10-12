@@ -32,8 +32,20 @@ pub(super) fn routes(root: PathBuf) -> Router {
         .route("/events", get(events))
         .with_state(root)
 }
+fn net_error_code(message: &str) -> Option<&'static str> {
+    [
+        "NET_TAILSCALE_MISSING",
+        "NET_TAILSCALE_LOGIN_REQUIRED",
+        "NET_TAILSCALE_SIDECAR_DOWN",
+    ]
+    .into_iter()
+    .find(|code| message.starts_with(code))
+}
 fn failure(e: KanbanError) -> Response {
     let (status, code) = match &e {
+        KanbanError::Invalid(message) if net_error_code(message).is_some() => {
+            (StatusCode::BAD_GATEWAY, net_error_code(message).unwrap())
+        }
         KanbanError::Permission(_) => (StatusCode::FORBIDDEN, "OPERATION_FORBIDDEN"),
         KanbanError::Invalid(message) if message.contains("already running") => {
             (StatusCode::CONFLICT, "RUN_ALREADY_RUNNING")
@@ -363,11 +375,15 @@ async fn proxy(
         Ok(c) => c,
         Err(e) => return failure(e),
     };
-    if !discovery::in_lan(&config).unwrap_or(false) {
+    let available = match discovery::network_available(root, &config) {
+        Ok(available) => available,
+        Err(e) => return failure(e),
+    };
+    if !available {
         return error(
             StatusCode::CONFLICT,
             "NODE_OUT_OF_LAN",
-            "This node is outside the home LAN",
+            "This node has neither home LAN nor tailnet enabled",
         );
     }
     let Some(peer) = config.peers.iter().find(|p| p.node.role == role) else {
@@ -405,17 +421,20 @@ async fn proxy(
             "Runner has announced shutdown or sleep",
         );
     }
-    let http = match reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(config.probe_timeout))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return error(StatusCode::BAD_GATEWAY, "NODE_SERVICE_DOWN", &e.to_string()),
+    let addresses = match discovery::peer_addresses(root, peer, Some(secret), &presence, &config) {
+        Ok(addresses) => addresses,
+        Err(e) => return failure(e),
     };
-    let mut last = None;
-    for address in discovery::peer_addresses(peer, Some(secret), &presence, &config) {
+    let mut last: Option<String> = None;
+    for address in addresses {
+        let timeout = Duration::from_secs(config.probe_timeout);
+        let http = match discovery::peer_client(root, &address, timeout, Some(timeout)) {
+            Ok(http) => http,
+            Err(e) => {
+                last = Some(e.to_string());
+                continue;
+            }
+        };
         let probe = match http
             .get(format!("http://{address}/node"))
             .bearer_auth(&secret.token)
@@ -424,11 +443,11 @@ async fn proxy(
         {
             Ok(response) => response,
             Err(e) => {
-                last = Some(e);
+                last = Some(e.to_string());
                 continue;
             }
         };
-        if probe.status() == StatusCode::UNAUTHORIZED {
+        if probe.status() == StatusCode::UNAUTHORIZED || probe.status() == StatusCode::FORBIDDEN {
             return error(
                 StatusCode::BAD_GATEWAY,
                 "NODE_AUTH_FAILED",
@@ -475,7 +494,7 @@ async fn proxy(
                 };
             }
             // A response timeout may follow a committed launch: never retry a mutation.
-            Err(e) if e.is_connect() => last = Some(e),
+            Err(e) if e.is_connect() => last = Some(e.to_string()),
             Err(e) => {
                 return error(
                     StatusCode::GATEWAY_TIMEOUT,
@@ -485,12 +504,11 @@ async fn proxy(
             }
         }
     }
+    let message = last.unwrap_or_else(|| "No LAN or tailnet runner address".into());
     error(
         StatusCode::BAD_GATEWAY,
-        "NODE_UNREACHABLE",
-        &last
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "No LAN runner address".into()),
+        net_error_code(&message).unwrap_or("NODE_UNREACHABLE"),
+        &message,
     )
 }
 fn event_state(root: &Path, selected: Option<&str>) -> Result<Value> {

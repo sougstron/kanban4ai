@@ -1,5 +1,13 @@
 # Unreleased
 
+- **Managed Tailscale.** Machine-local `net.tailscale` selects off/system/managed.
+  TUI, daemon and serve supervise a private userspace `tailscaled`, restart it
+  after a crash and stop it on exit. `net up/down/logout/status/install` provides
+  URL/terminal-QR login, one-time key-file cleanup and SHA-256-verified static
+  amd64/arm64 installation. Sync tries LAN before tailnet, using loopback
+  SOCKS5h for managed HTTP and SSE, including MagicDNS. Android/VPN operation
+  still requires the manual TASK-431 spike; relay is a separate transport.
+
 - **LAN HTTP server.** `kanban4ai serve` runs in the existing binary, binds
   individual LAN/loopback addresses, and exposes public `/health` and `/version`
   probes (protocol 1). Other paths require hashed node/client Bearer tokens;
