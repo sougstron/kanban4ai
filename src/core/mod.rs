@@ -20,6 +20,7 @@ pub mod operations;
 pub mod project;
 pub mod provenance;
 pub mod reply;
+pub mod runner_failure;
 pub mod scheduler;
 pub mod session;
 pub mod stats;

@@ -524,6 +524,7 @@ struct LaunchJob {
 #[derive(Default)]
 struct LaunchReport {
     status: Option<String>,
+    modal: Option<Modal>,
     /// Close the detail screen if it still shows this task.
     close_detail_for: Option<String>,
     focus: Option<String>,
@@ -3521,6 +3522,9 @@ impl App {
         if let Some(task_id) = report.focus {
             let _ = self.focus_task(&task_id);
         }
+        if let Some(modal) = report.modal {
+            self.modal = Some(ModalState::new(modal));
+        }
         if let Some(status) = report.status {
             self.status = status;
         }
@@ -4440,7 +4444,11 @@ impl App {
         };
         let root = store.root().to_path_buf();
         let sync = &mut modal.sync;
-        sync.poll(&root);
+        sync.poll(
+            &root,
+            self.settings.refresh_interval,
+            modal.settings_tab == SettingsTab::Sync,
+        );
         if modal.settings_tab == SettingsTab::Sync
             && sync.view.is_none()
             && sync.notice.is_none()
@@ -5104,6 +5112,9 @@ impl App {
             self.status = "No task selected".to_string();
             return Ok(());
         };
+        if crate::cli::serve::remote_runner_on_board(self.ops.data_root(), &task_id)?.is_some() {
+            return self.run_on_runner(&task_id, None, false);
+        }
         if !self.ops.queue_can_dispatch()? {
             return self.run_current_task_now_with_suffix(" (queue is off — started directly)");
         }
@@ -5149,6 +5160,9 @@ impl App {
             self.status = "No task selected".to_string();
             return Ok(());
         };
+        if crate::cli::serve::remote_runner_on_board(self.ops.data_root(), &task_id)?.is_some() {
+            return self.run_on_runner(&task_id, None, false);
+        }
         if self.launch_busy(&task_id) {
             return Ok(());
         }
@@ -5169,6 +5183,74 @@ impl App {
                 redraw: true,
                 ..LaunchReport::default()
             }
+        });
+        Ok(())
+    }
+
+    fn run_on_runner(
+        &mut self,
+        task_id: &str,
+        runner: Option<crate::core::sync::NodeRole>,
+        queue: bool,
+    ) -> Result<()> {
+        if self.launch_busy(task_id) {
+            return Ok(());
+        }
+        let task_id = task_id.to_owned();
+        self.status = format!("Starting {task_id}…");
+        self.spawn_launch(Some(task_id.clone()), move |ops| {
+            let result =
+                crate::cli::serve::launch_on_board(ops.data_root(), &task_id, runner, queue);
+            let mut report = LaunchReport {
+                refresh: true,
+                redraw: true,
+                ..Default::default()
+            };
+            match result {
+                Ok(Some(value)) if value.get("alternatives").is_some() => {
+                    let roles = (
+                        serde_json::from_value(value["error"]["node"].clone()),
+                        serde_json::from_value(value["alternatives"][0]["node"].clone()),
+                    );
+                    if let (Ok(runner), Ok(other)) = roles {
+                        report.modal = Some(Modal::RunnerUnavailable {
+                            task_id,
+                            code: value["error"]["code"].as_str().unwrap_or("").into(),
+                            message: value["error"]["message"].as_str().unwrap_or("").into(),
+                            runner,
+                            other,
+                        });
+                    }
+                }
+                Ok(Some(value)) => {
+                    report.status = Some(if let Some(error) = value.get("error") {
+                        format!(
+                            "{}: {}",
+                            error["code"].as_str().unwrap_or(""),
+                            error["message"].as_str().unwrap_or("")
+                        )
+                    } else if value["queued"] == true {
+                        format!(
+                            "Queued {task_id} — ждёт {}",
+                            value["node"].as_str().unwrap_or("runner")
+                        )
+                    } else {
+                        format!(
+                            "Started {task_id} → {}",
+                            value["session"].as_str().unwrap_or("")
+                        )
+                    })
+                }
+                Ok(None) => {
+                    report.status = Some(match ops.start_task(&task_id) {
+                        Ok(Some(session)) => format!("Started {task_id} → {session}"),
+                        Ok(None) => format!("Task {task_id} not found"),
+                        Err(e) => e.to_string(),
+                    })
+                }
+                Err(e) => report.status = Some(e.to_string()),
+            }
+            report
         });
         Ok(())
     }
@@ -5320,6 +5402,7 @@ impl App {
                 focus: moved,
                 refresh: true,
                 redraw: true,
+                ..Default::default()
             }
         });
         Ok(())
@@ -5990,6 +6073,26 @@ impl App {
         let Some(mut modal) = self.modal.take() else {
             return Ok(false);
         };
+        if matches!(modal.modal, Modal::RunnerUnavailable { .. }) {
+            match key.code {
+                KeyCode::Esc => {
+                    self.status = "Запуск отменён".into();
+                    return Ok(true);
+                }
+                KeyCode::Tab | KeyCode::Right | KeyCode::Down => modal.next_field(),
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Up => modal.prev_field(),
+                KeyCode::Enter => {
+                    let field = modal.active_field();
+                    if field == DialogField::Cancel {
+                        return Ok(true);
+                    }
+                    return self.submit_modal(modal).map(|_| true);
+                }
+                _ => {}
+            }
+            self.modal = Some(modal);
+            return Ok(true);
+        }
         let field_before = modal.active_field();
         let slot_before = slot_selection_snapshot(&modal, field_before);
         let inherit_before = modal.inherit;
@@ -6196,6 +6299,17 @@ impl App {
         let Some(mut modal) = self.modal.take() else {
             return Ok(());
         };
+        if matches!(modal.modal, Modal::RunnerUnavailable { .. }) {
+            if matches!(button, ModalButton::Cancel | ModalButton::No) {
+                return Ok(());
+            }
+            modal.focus_field(if button == ModalButton::Save {
+                DialogField::Variant
+            } else {
+                DialogField::Confirm
+            });
+            return self.submit_modal(modal);
+        }
         if modal.discard_confirm {
             return match button {
                 ModalButton::Yes => self.discard_modal(modal).map(|_| ()),
@@ -6386,6 +6500,15 @@ impl App {
                 self.theme = Theme::named(&theme_name);
                 self.refresh_after_action()?;
                 self.status = "Project settings saved".to_string();
+            }
+            Modal::RunnerUnavailable {
+                ref task_id,
+                runner,
+                other,
+                ..
+            } => {
+                let queue = modal.active_field() == DialogField::Variant;
+                self.run_on_runner(task_id, Some(if queue { runner } else { other }), queue)?;
             }
             Modal::NewTask { target_status } => {
                 let title = modal.title_text();

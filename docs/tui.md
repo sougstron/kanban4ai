@@ -293,8 +293,29 @@ unconfirmed operation counts, field conflicts and project clone statuses.
   exceed the dialog height. Arrow navigation returns to the selected control.
 
 Sync changes apply immediately, independently of the dialog's Save/Cancel.
-The Network row reports off/system/managed mode; connection management belongs
-to the separate Network block (TASK-434).
+
+**Сеть / Network** controls machine-local Tailscale networking:
+
+- Mode cycles **Off → System → Managed** and saves immediately. Switching
+  away from Managed disconnects its private sidecar without deleting login state.
+  System only reads the installed daemon; use the system Tailscale app/CLI to
+  connect, disconnect or log out.
+- Status refreshes in the background at the configured TUI refresh interval:
+  account, tailnet IPs, online peer count and each online peer's direct/DERP route.
+  Missing binaries, login requirements and stopped sidecars remain visible.
+- **Подключить / Connect** opens the Tailscale login link and full-screen QR.
+  The overlay closes automatically after login, or with `Enter`/`Esc`.
+  When the QR does not fit, the complete link wraps instead of clipping.
+- **Auth key** accepts typing or paste into a masked one-time input. Confirm
+  it, then select Connect. It is never stored in config, logs, or argv; its
+  private temporary file is removed after either success or failure.
+  Cancelling the input discards the key.
+- **Отключить / Disconnect** preserves `<store>/net/tailscale/` for the next
+  Connect or application start; **Выйти из аккаунта / Logout** revokes login.
+  Disconnect suppresses automatic restart until Connect.
+- Keyboard navigation and mouse clicks reach every control. At 40–60 columns
+  Sync uses the available terminal area; long status details wrap and selected
+  controls scroll into view.
 
 Board refresh tracks task, session and thread files separately. A heartbeat
 refreshes session-derived card state without parsing every task again; a

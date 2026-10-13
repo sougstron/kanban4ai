@@ -224,7 +224,14 @@ pub fn for_launch(root: &Path, id: &str) -> Result<Project> {
     if repository(&project).is_some() {
         return Ok(project);
     }
-    prepare(root, id)
+    prepare(root, id).map_err(|e| {
+        if e.to_string().contains("SYNC_NO_REMOTE") || e.to_string().contains("RUNNER_REPO_MISSING")
+        {
+            e
+        } else {
+            invalid(&format!("RUNNER_REPO_MISSING: {e}"))
+        }
+    })
 }
 
 /// Remote-only preparation, also usable by the mobile preflight UI.
