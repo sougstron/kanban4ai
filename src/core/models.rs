@@ -460,6 +460,11 @@ pub struct Task {
     /// byte-identically.
     #[serde(default, skip_serializing_if = "is_integration_default")]
     pub integration: IntegrationState,
+    /// Machine-local code reconciliation state; never copied from another node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_pending: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub run_duplicate: bool,
     /// A failed post-landing cleanup is not retried by the store sweep
     /// before this moment. Kept on the task so the backoff holds across
     /// every process that pumps the board. Omitted while unset.
@@ -537,6 +542,8 @@ impl Task {
             cleanup_retry_at: None,
             base_commit: None,
             integration: IntegrationState::None,
+            landing_pending: None,
+            run_duplicate: false,
             runner: None,
             runner_request: None,
         }

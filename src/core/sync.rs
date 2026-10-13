@@ -21,8 +21,8 @@ mod transport;
 pub use apply::Conflict;
 pub use lease::IdLease;
 pub(crate) use lease::allocate as allocate_task_id;
-pub use run::{RunDescriptor, RunState, remote_runs};
-pub(crate) use run::{remote_runs_for_tasks, store_for_board};
+pub use run::{LandingDescriptor, RunDescriptor, RunState, remote_runs};
+pub(crate) use run::{remote_runs_for_tasks, store_for_board, task_landings, task_runs};
 pub use transport::{Page, Snapshot, install_snapshot};
 
 type Fields = BTreeMap<String, Value>;
@@ -560,6 +560,8 @@ fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
             "branch",
             "base_commit",
             "integration",
+            "landing_pending",
+            "run_duplicate",
             "cleanup_retry_at",
             "run_phase",
             "crash_restarts",

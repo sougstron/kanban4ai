@@ -407,6 +407,65 @@ impl GitRepo {
         }
         Ok(())
     }
+    /// Immutable per-run refs avoid overwriting an offline peer's task branch.
+    pub fn push_run(&self, remote: &str, reference: &str) -> Result<()> {
+        let spec = format!("{reference}:{reference}");
+        require(
+            self.git(&["push", "--", remote, &spec])?,
+            "push completed run",
+        )?;
+        Ok(())
+    }
+
+    pub fn fetch_run(&self, remote: &str, reference: &str) -> Result<()> {
+        let spec = format!("{reference}:{reference}");
+        require(
+            self.git(&["fetch", "--no-tags", "--", remote, &spec])?,
+            "fetch completed run",
+        )?;
+        Ok(())
+    }
+
+    /// Do not move a ref underneath a running/retained isolated checkout.
+    pub fn install_run_branch(&self, branch: &str, tip: &Oid) -> Result<bool> {
+        let reference = format!("refs/heads/{branch}");
+        require(
+            self.git(&["check-ref-format", &reference])?,
+            "validate run branch",
+        )?;
+        if self.checked_out_task_branches()?.contains(&reference) {
+            return Ok(self.read_ref(&reference)?.as_ref() == Some(tip));
+        }
+        self.set_ref(&reference, tip)?;
+        Ok(true)
+    }
+
+    pub fn rename_run_branch(&self, old: &str, new: &str, tip: &Oid) -> Result<()> {
+        if self.read_ref(old)?.as_ref() != Some(tip) {
+            return Err(KanbanError::Invalid(
+                "local run branch changed after completion".into(),
+            ));
+        }
+        if self.read_ref(new)?.is_some_and(|existing| &existing != tip) {
+            return Err(KanbanError::Invalid(
+                "duplicate run branch already holds another result".into(),
+            ));
+        }
+        require(
+            self.git(&["branch", "-M", old, new])?,
+            "rename duplicate run",
+        )?;
+        Ok(())
+    }
+
+    pub fn publish_run_branch(&self, remote: &str, branch: &str) -> Result<()> {
+        let spec = format!("+refs/heads/{branch}:refs/heads/{branch}");
+        require(
+            self.git(&["push", "--", remote, &spec])?,
+            "publish Review branch",
+        )?;
+        Ok(())
+    }
 
     /// Only task branches and the integration spine may be installed from a peer.
     /// Human branches, HEAD and the index are never overwritten.

@@ -429,7 +429,12 @@ enum Command {
     Recover { task_id: String },
     /// Land an isolated task branch into the work folder (re-runs the merge
     /// after a conflict was resolved, or lands a `land: manual` board).
-    Integrate { task_id: String },
+    Integrate {
+        task_id: String,
+        /// Select a replicated result when offline runs produced two branches.
+        #[arg(long)]
+        branch: Option<String>,
+    },
     /// Stop the running agent session for a task (leaves the task In Progress).
     Stop { task_id: String },
 
@@ -1445,11 +1450,17 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             None => eprintln!("Task {task_id} not found"),
         },
-        Command::Integrate { task_id } => match ops.integrate_task(&task_id)? {
+        Command::Integrate { task_id, branch } => match match branch.as_deref() {
+            Some(branch) => ops.integrate_received(&task_id, branch)?,
+            None => ops.integrate_task(&task_id)?,
+        } {
             Some((task, LandOutcome::Landed { changed })) => {
                 println!(
                     "Landed {} into {} ({} path(s), unstaged):",
-                    task.branch.as_deref().unwrap_or("branch"),
+                    branch
+                        .as_deref()
+                        .or(task.branch.as_deref())
+                        .unwrap_or("branch"),
                     ops.work_path().display(),
                     changed.len()
                 );

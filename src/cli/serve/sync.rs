@@ -773,6 +773,10 @@ pub(super) fn start(root: &Path) -> Running {
             if let Err(e) = discovery::probes(&monitor_root).await {
                 eprintln!("runner availability: {e}");
             }
+            let root = monitor_root.clone();
+            if let Err(e) = blocking(move || crate::core::code::reconcile(&root)).await {
+                eprintln!("code replication: {e}");
+            }
             let interval = discovery::config(&monitor_root).map_or(30, |c| c.interval);
             tokio::time::sleep(Duration::from_secs(interval)).await;
         }
@@ -921,6 +925,10 @@ pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<
         }
         Ok(_) => (),
         Err(e) => results.push(("git-relay".into(), Err(e))),
+    }
+    let code_root = root.to_path_buf();
+    if let Err(e) = blocking(move || crate::core::code::reconcile(&code_root)).await {
+        results.push(("code-remote".into(), Err(e)));
     }
     Ok(results)
 }
