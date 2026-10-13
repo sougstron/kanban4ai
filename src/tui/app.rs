@@ -1341,8 +1341,12 @@ impl App {
     fn handle_key_inner(&mut self, key: KeyEvent) -> Result<()> {
         if is_ctrl_c(key) {
             if self.modal.is_none()
-                && matches!(self.screen, Screen::Board | Screen::Detail)
-                && self.current_task_id().is_some()
+                && !self.search.active
+                && self.screen == Screen::Detail
+                && self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.focus == DetailFocus::Thread)
             {
                 return self.dispatch(UiAction::CopyTask);
             }
@@ -1425,8 +1429,7 @@ impl App {
                     self.screen = Screen::Board;
                     self.detail = None;
                 } else {
-                    self.status =
-                        "Press ctrl + C twice to close when no task is selected".to_string();
+                    self.status = "Press ctrl + C twice to close".to_string();
                 }
             }
             (KeyCode::Esc, _) if matches!(self.screen, Screen::Archive | Screen::Help) => {
@@ -4351,23 +4354,9 @@ impl App {
             return Ok(());
         };
         self.detail = None;
-        self.screen = if copied.status == TaskStatus::Archive {
-            Screen::Archive
-        } else {
-            Screen::Board
-        };
+        self.screen = Screen::Board;
         self.refresh_after_action()?;
-        if self.screen == Screen::Archive {
-            if let Some(index) = self
-                .archived_tasks
-                .iter()
-                .position(|task| task.id == copied.id)
-            {
-                self.archive_selected = index;
-            }
-        } else {
-            let _ = self.focus_task(&copied.id);
-        }
+        let _ = self.focus_task(&copied.id);
         self.status = format!("Copied {source_id} → {}", copied.id);
         Ok(())
     }
