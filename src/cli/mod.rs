@@ -440,7 +440,7 @@ enum Command {
 
     /// List active sessions.
     Sessions,
-    /// Show remaining subscription limits for the agent providers (claude, codex, grok, zai, synthetic, kimi, gemini).
+    /// Show remaining subscription limits for the agent providers (claude, codex, grok, zai, synthetic, kimi).
     Limits {
         /// Output format
         #[arg(long = "format", value_parser = ["table", "json"], default_value = "table")]
@@ -624,17 +624,10 @@ fn print_limits(output_format: &str, refresh: bool) -> Result<()> {
                 .map(|seconds| format!("resets in {}", limits::format_span(seconds)))
                 .unwrap_or_else(|| "reset unknown".to_string());
             let age = if index == 0 { age.as_str() } else { "" };
-            match window.spent_usd {
-                Some(usd) => println!(
-                    "{name:<9} {:<5}{:>6} spent{age}",
-                    window.label,
-                    limits::format_usd(usd)
-                ),
-                None => println!(
-                    "{name:<9} {:<5}{:>5.0}% left  {reset}{age}",
-                    window.label, window.remaining_percent
-                ),
-            }
+            println!(
+                "{name:<9} {:<5}{:>5.0}% left  {reset}{age}",
+                window.label, window.remaining_percent
+            );
         }
     }
     Ok(())
