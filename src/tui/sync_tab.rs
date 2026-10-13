@@ -554,7 +554,6 @@ fn render_login(frame: &mut Frame<'_>, app: &App, url: &str, qr: Option<&str>) {
     lines.push(Line::from("Waiting for login… Enter/Esc closes."));
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
-
 fn heading(app: &App, text: &str) -> Line<'static> {
     Line::from(Span::styled(
         text.to_string(),

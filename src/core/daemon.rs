@@ -312,6 +312,7 @@ fn pump_project(
     }
 
     let ops = Operations::for_project(project);
+    crate::core::sync::control::process(&ops)?;
     let orchestration = ops.config.get_orchestration()?;
     let mut lines = Vec::new();
     // Ineffective settings (an unknown backend in a cap map). Warned once per

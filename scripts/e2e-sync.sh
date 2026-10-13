@@ -287,6 +287,32 @@ check "conflicts only for the field edited on both sides" \
 api laptop GET "$P/$LAP1/thread" >"$W/lap1-thread.json"
 check "colliding MSG numbers get a node suffix" grep -q 'MSG-[0-9]*@' "$W/lap1-thread.json"
 
+# --- Runner 03 launch-only alternatives and wait queue ------------------------
+# A separate project keeps runner assertions independent of integration refs
+# changed by the duplicate-run scenario below.
+log "== Runner 03 explicit unavailable runner and recovery"
+git init -q -b master "$W/runner-check"
+git -C "$W/runner-check" -c user.name=e2e -c user.email=e2e@test commit -q --allow-empty -m init
+kb server init --path "$W/runner-check" >/dev/null
+kb server --project runner-check create "Runner recovery" >/dev/null
+R=/api/v1/projects/runner-check/tasks/TASK-001
+check "runner fixture reaches the laptop" wait_for 15 api_has laptop GET "$R" "" '"title":"Runner recovery"'
+git clone -q "$W/runner-check" "$W/laptop-runner-check"
+kb laptop project set-path runner-check "$W/laptop-runner-check" >/dev/null
+kb server serve --bye shutdown >/dev/null
+power_off server
+check "runner fallback sees the server powered off" wait_for 10 probe_is laptop NODE_POWERED_OFF
+check "the refusal offers alternatives" \
+	api_has laptop POST "$R/launch" '{"runner":"server"}' alternatives
+check "waiting keeps the explicit server runner queued" \
+	api_has laptop POST "$R/launch" '{"runner":"server","on_unavailable":"queue"}' '"queued":true'
+start_serve server
+check "the queued runner comes back ONLINE" wait_for 30 probe_is laptop ONLINE
+kb laptop --project runner-check check-sessions >"$W/runner-wait-dispatch.log"
+check "the waiting launch goes to the server after it returns" \
+	wait_for 15 api_has server GET "$R" "" '"state":"running"'
+api laptop POST "$R/stop" '{}' >"$W/runner-wait-stop.json"
+
 # --- 14.3 double launch -------------------------------------------------------
 log "== 14.3 double launch"
 api laptop POST "$P/TASK-005/launch" '{"runner":"server"}' >/dev/null
@@ -312,17 +338,17 @@ expect TASK-422 "the second run's branch is kanban/TASK-006@<node>" \
 
 # --- 14.4 runner powered off mid-run ------------------------------------------
 log "== 14.4 runner powered off mid-run"
-api laptop POST "$P/TASK-007/launch" '{"runner":"server"}' >/dev/null
+api laptop POST "$P/TASK-007/launch" '{"runner":"server"}' >"$W/runner-launch.json"
 check "laptop sees the remote run" wait_for 15 api_has laptop GET "$P/TASK-007" "" '"state":"running"'
 kb server serve --bye shutdown >/dev/null
 power_off server
 check "laptop reports the server as NODE_POWERED_OFF" wait_for 10 probe_is laptop NODE_POWERED_OFF
 check "explicit launch on the powered-off server is refused" \
 	api_has laptop POST "$P/TASK-008/launch" '{"runner":"server"}' NODE_POWERED_OFF
-expect TASK-420 "the refusal offers alternatives" \
+check "the refusal offers alternatives" \
 	api_has laptop POST "$P/TASK-008/launch" '{"runner":"server"}' alternatives
-expect TASK-421 "the interrupted run carries RUN_NODE_POWERED_OFF" \
-	api_has laptop GET "$P/TASK-007" "" RUN_NODE_POWERED_OFF
+check "the interrupted run carries RUN_NODE_POWERED_OFF" \
+	wait_for 20 api_has laptop GET "$P/TASK-007" "" RUN_NODE_POWERED_OFF
 start_serve server
 check "server comes back ONLINE" wait_for 30 probe_is laptop ONLINE
 

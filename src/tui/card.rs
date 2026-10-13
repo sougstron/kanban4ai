@@ -301,7 +301,15 @@ pub fn badges(
     // it means waiting for a slot. Live/waiting/crashed still come from
     // SessionState.
     let phase_badge = match task.run_phase {
-        Some(RunPhase::Queued) => Some(("⏸ queued", app.theme.warn)),
+        Some(RunPhase::Queued) => Some((
+            match task.runner {
+                Some(crate::core::config::Runner::Server) => "⏸ ждёт server",
+                Some(crate::core::config::Runner::Laptop) => "⏸ ждёт laptop",
+                Some(crate::core::config::Runner::Mobile) => "⏸ ждёт mobile",
+                _ => "⏸ queued",
+            },
+            app.theme.warn,
+        )),
         Some(RunPhase::Orchestrate) => Some(("◧ plan", app.theme.focus)),
         Some(RunPhase::Design) => Some(("✎ design", app.theme.focus)),
         Some(RunPhase::Review) => Some(("⚖ review", app.theme.review)),

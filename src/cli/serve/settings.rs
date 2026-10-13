@@ -56,6 +56,7 @@ pub(crate) struct View {
     pub api_enabled: bool,
     /// What systemd reports right now; `None` when it could not be asked.
     pub api_active: Option<bool>,
+
     /// In priority order (`sync.peers`).
     pub peers: Vec<Peer>,
     pub conflicts: Vec<String>,
@@ -193,6 +194,7 @@ pub(crate) fn local_view(root: &Path) -> Result<View> {
         role: journal.node.role,
         api_enabled: api_enabled(root)?,
         api_active: unit_active(),
+
         peers,
         conflicts: journal.conflicts()?.iter().map(conflict_line).collect(),
         local_clones,
@@ -320,7 +322,6 @@ pub(crate) fn set_network_mode(root: &Path, mode: crate::core::net::Mode) -> Res
         );
     store.save_global_config(&config)
 }
-
 /// Move a peer one step up (`-1`) or down (`1`) in `sync.peers`, the order
 /// in which the phone tries nodes.
 pub(crate) fn move_peer(root: &Path, id: &str, offset: isize) -> Result<()> {
@@ -457,10 +458,6 @@ pub(crate) fn pairing_code(root: &Path, address: &str) -> Result<(String, Option
 
 /// Pair with the node at `address` using the code it showed. Returns its name.
 pub(crate) fn pair(root: &Path, address: &str, code: &str, local: &str) -> Result<String> {
-    let peer: SocketAddr = address
-        .trim()
-        .parse()
-        .map_err(|_| invalid("Peer address: IP:port, e.g. 192.168.0.20:7420"))?;
     let local = match local.trim() {
         "" => None,
         text => Some(
@@ -477,12 +474,7 @@ pub(crate) fn pair(root: &Path, address: &str, code: &str, local: &str) -> Resul
     if code.is_empty() {
         return Err(invalid("Enter the pairing code"));
     }
-    pairing::pair(
-        &ProjectStore::at(root),
-        &peer.to_string(),
-        code.into(),
-        local,
-    )
+    pairing::pair(&ProjectStore::at(root), address.trim(), code.into(), local)
 }
 
 #[cfg(test)]

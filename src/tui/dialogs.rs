@@ -17,6 +17,13 @@ use super::card::{sanitize_paste_text, sanitize_terminal_text, truncate_display}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
+    RunnerUnavailable {
+        task_id: String,
+        code: String,
+        message: String,
+        runner: crate::core::sync::NodeRole,
+        other: crate::core::sync::NodeRole,
+    },
     NewTask {
         target_status: Option<String>,
     },
@@ -38,6 +45,9 @@ pub enum Modal {
     },
     KillSessionConfirm {
         session_id: String,
+    },
+    StopTaskConfirm {
+        task_id: String,
     },
     RestoreConfirm {
         task_id: String,
@@ -981,10 +991,16 @@ impl ModalState {
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
+            Modal::RunnerUnavailable { .. } => &[
+                DialogField::Confirm,
+                DialogField::Variant,
+                DialogField::Cancel,
+            ],
             Modal::DeleteConfirm { .. }
             | Modal::RevertConfirm { .. }
             | Modal::BulkConfirm { .. }
             | Modal::KillSessionConfirm { .. }
+            | Modal::StopTaskConfirm { .. }
             | Modal::RestoreConfirm { .. } => &[DialogField::Confirm, DialogField::Cancel],
             Modal::AnswerQuestion { .. } => &[
                 DialogField::Question,
@@ -1493,6 +1509,7 @@ impl ModalState {
                 | Modal::RevertConfirm { .. }
                 | Modal::BulkConfirm { .. }
                 | Modal::KillSessionConfirm { .. }
+                | Modal::StopTaskConfirm { .. }
                 | Modal::RestoreConfirm { .. }
                 | Modal::DeleteProject { .. }
         )
@@ -2882,6 +2899,60 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
         return hitboxes;
     }
     match &modal.modal {
+        Modal::RunnerUnavailable {
+            code,
+            message,
+            runner,
+            other,
+            ..
+        } => {
+            let label = |role| match role {
+                crate::core::sync::NodeRole::Server => "сервер",
+                crate::core::sync::NodeRole::Laptop => "ноут",
+                crate::core::sync::NodeRole::Mobile => "телефон",
+            };
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "{}\n{}",
+                    sanitize_terminal_text(code),
+                    sanitize_terminal_text(message)
+                ))
+                .wrap(Wrap { trim: false }),
+                inner,
+            );
+            for (index, (text, field, button)) in [
+                (
+                    format!("Запустить на {}", label(*other)),
+                    DialogField::Confirm,
+                    ModalButton::Yes,
+                ),
+                (
+                    format!("Ждать {} в очереди", label(*runner)),
+                    DialogField::Variant,
+                    ModalButton::Save,
+                ),
+                ("Отмена".into(), DialogField::Cancel, ModalButton::Cancel),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let row = Rect::new(
+                    inner.x,
+                    inner.y.saturating_add(4 + index as u16 * 2),
+                    inner.width,
+                    1,
+                );
+                frame.render_widget(
+                    Paragraph::new(format!("[{text}]"))
+                        .style(button_style(app, modal.active_field() == field)),
+                    row,
+                );
+                hitboxes.push(Hitbox {
+                    area: row,
+                    action: HitAction::ModalButton(button),
+                });
+            }
+        }
         Modal::NewTask { .. } | Modal::EditTask { .. } => {
             render_task_form(frame, app, modal, inner, &mut hitboxes)
         }
@@ -2922,6 +2993,23 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
                 )),
                 Line::from(
                     "Stops the agent process and closes the session. The task keeps its status.",
+                ),
+            ],
+            &mut hitboxes,
+        ),
+        Modal::StopTaskConfirm { task_id } => render_simple_confirm(
+            frame,
+            app,
+            modal,
+            inner,
+            app.theme.err,
+            vec![
+                Line::from(format!(
+                    "Stop {} on its runner?",
+                    sanitize_terminal_text(task_id)
+                )),
+                Line::from(
+                    "The request is delivered through sync, including when the runner is offline.",
                 ),
             ],
             &mut hitboxes,
@@ -5686,11 +5774,13 @@ fn modal_title(modal: &Modal) -> &'static str {
     match modal {
         Modal::NewTask { .. } => " New task ",
         Modal::EditTask { .. } => " Edit task ",
+        Modal::RunnerUnavailable { .. } => " Runner недоступен ",
         Modal::MoveTask { .. } => " Move task ",
         Modal::DeleteConfirm { .. } => " Delete permanently ",
         Modal::RevertConfirm { .. } => " Revert task ",
         Modal::BulkConfirm { .. } => " Confirm bulk action ",
         Modal::KillSessionConfirm { .. } => " Kill session ",
+        Modal::StopTaskConfirm { .. } => " Stop remote task ",
         Modal::RestoreConfirm { .. } => " Restore task ",
         Modal::AddMessage { .. } => " Add to thread ",
         Modal::AnswerQuestion { .. } => " Answer question ",
