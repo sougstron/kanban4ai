@@ -475,6 +475,9 @@ fn ready(root: &Path, paths: &Paths) -> Result<Value> {
         }
         socket_permissions(paths)?;
         if let Ok(value) = cli_status(root, Mode::Managed) {
+            // The daemon may have bound its socket since the call above, and
+            // the next full supervision pass can be SUPERVISE_INTERVAL away.
+            socket_permissions(paths)?;
             return Ok(value);
         }
         if Instant::now() >= deadline {
