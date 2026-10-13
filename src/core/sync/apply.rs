@@ -206,7 +206,7 @@ fn component(value: &str) -> Result<&str> {
     Ok(value)
 }
 
-fn validate(op: &Operation, store: &str) -> Result<()> {
+pub(super) fn validate(op: &Operation, store: &str) -> Result<()> {
     if op.store != store {
         return Err(invalid("SYNC_STORE_MISMATCH"));
     }
@@ -250,6 +250,12 @@ fn validate(op: &Operation, store: &str) -> Result<()> {
     }
     let global = op.project.is_empty();
     for field in op.set.keys() {
+        if op.entity == "config" && global && field == "sync.relay_encrypt" {
+            if !op.set[field].is_boolean() && !op.set[field].is_null() {
+                return Err(invalid("invalid sync.relay_encrypt"));
+            }
+            continue;
+        }
         let top = field.split('.').next().unwrap_or(field);
         let probe = serde_json::json!({top: true});
         if !fields(&probe, &op.entity, global).contains_key(top) {
@@ -284,7 +290,14 @@ fn conflicts(state: &JournalState) -> Result<Vec<Conflict>> {
     let ops: Vec<_> = state.operations.values().collect();
     let mut groups: BTreeMap<(&str, &str, &str, &str), Vec<&Operation>> = BTreeMap::new();
     for op in &ops {
-        for field in op.set.keys().filter(|field| field.as_str() != "draft") {
+        // `updated_at` is stamped by every edit, so concurrent edits of
+        // different fields would otherwise always collide on it; it still
+        // merges by LWW, it just never counts as a user-visible conflict.
+        for field in op
+            .set
+            .keys()
+            .filter(|field| !matches!(field.as_str(), "draft" | "updated_at"))
+        {
             groups
                 .entry((&op.project, &op.entity, &op.id, field))
                 .or_default()

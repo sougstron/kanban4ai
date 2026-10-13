@@ -14,6 +14,7 @@ use super::storage::{atomic_write_text_raw, lock_file_reentrant};
 
 mod apply;
 mod lease;
+pub mod relay;
 mod run;
 mod transport;
 pub use apply::Conflict;
@@ -561,7 +562,15 @@ fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
             "auto_resumes",
         ],
         "project" => &["work_path", "migrated_from", "last_opened_at"],
-        "config" if global => &["node", "sync", "serve", "daemon", "tui", "recent_models"],
+        "config" if global => &[
+            "node",
+            "sync",
+            "serve",
+            "net",
+            "daemon",
+            "tui",
+            "recent_models",
+        ],
         _ => &[],
     }
 }
@@ -571,6 +580,11 @@ fn fields(value: &Value, entity: &str, global: bool) -> Fields {
     let mut result = Fields::new();
     if let Some(map) = value.as_object() {
         for (field, value) in map {
+            if entity == "config" && global && field == "sync" {
+                if let Some(encrypt) = value.get("relay_encrypt") {
+                    result.insert("sync.relay_encrypt".into(), encrypt.clone());
+                }
+            }
             if local.contains(&field.as_str()) {
                 continue;
             }

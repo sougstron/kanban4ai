@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Widget, Wrap};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
-use crate::core::config::{BoardConfig, InheritFlags, InheritGroup};
+use crate::core::config::{BoardConfig, InheritFlags, InheritGroup, Runner};
 use crate::core::models::Task;
 use crate::core::operations::QuestionRef;
 use crate::core::update;
@@ -116,6 +116,7 @@ pub enum DialogField {
     Answer,
     Theme,
     TaskSort,
+    Runner,
     HideKanbanMessages,
     EscapeToProjects,
     ProjectSort,
@@ -158,6 +159,7 @@ pub enum DialogField {
     InheritLimits,
     InheritCommon,
     InheritTaskSort,
+    InheritPlacement,
     InheritDesigner,
     InheritReviewer,
     InheritExecutor,
@@ -166,13 +168,14 @@ pub enum DialogField {
     PurgeData,
 }
 
-const TASK_FORM_FIELDS: [DialogField; 6] = [
+const TASK_FORM_FIELDS: [DialogField; 7] = [
     DialogField::Title,
     DialogField::Description,
     DialogField::AgentSettings,
     DialogField::Readonly,
     DialogField::ChainTo,
     DialogField::TaskOptions,
+    DialogField::Runner,
 ];
 
 /// The `Options` subpopup of the task form: per-task orchestration opt-ins
@@ -272,13 +275,15 @@ impl SettingsTab {
 /// One settings tab's field page, Save/Cancel inclusive: the buttons render
 /// under every tab and save the whole dialog, not just the visible one. Each
 /// inheritable group leads with its "Inherit from global" checkbox.
-const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 21] = [
+const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 23] = [
     DialogField::Title,
     DialogField::Theme,
     DialogField::InheritAgent,
     DialogField::AgentSettings,
     DialogField::InheritTaskSort,
     DialogField::TaskSort,
+    DialogField::InheritPlacement,
+    DialogField::Runner,
     DialogField::InheritCommon,
     DialogField::HideKanbanMessages,
     DialogField::AutoRestartEnabled,
@@ -339,12 +344,13 @@ const SETTINGS_PAGE_INSTRUCTIONS_FIELDS: [DialogField; 3] = [
 /// The Global Settings Common page: the machine-only settings first, then
 /// the global half of every inheritable group on that tab. The other tabs
 /// are the project pages minus their inherit checkbox.
-const GLOBAL_SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 17] = [
+const GLOBAL_SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 18] = [
     DialogField::EscapeToProjects,
     DialogField::ProjectSort,
     DialogField::UpdateCheckOnOpen,
     DialogField::AgentSettings,
     DialogField::TaskSort,
+    DialogField::Runner,
     DialogField::HideKanbanMessages,
     DialogField::AutoRestartEnabled,
     DialogField::AutoRestartDelays,
@@ -419,6 +425,8 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::AgentSettings
         | DialogField::Theme
         | DialogField::TaskSort
+        | DialogField::Runner
+        | DialogField::InheritPlacement
         | DialogField::HideKanbanMessages
         | DialogField::QueueEnabled
         | DialogField::MaxRunningTotal
@@ -469,6 +477,7 @@ pub(crate) fn inherit_checkbox_group(field: DialogField) -> Option<InheritGroup>
         DialogField::InheritLimits => Some(InheritGroup::Limits),
         DialogField::InheritCommon => Some(InheritGroup::Common),
         DialogField::InheritTaskSort => Some(InheritGroup::TaskSort),
+        DialogField::InheritPlacement => Some(InheritGroup::Placement),
         DialogField::InheritDesigner => Some(InheritGroup::Designer),
         DialogField::InheritReviewer => Some(InheritGroup::Reviewer),
         DialogField::InheritExecutor => Some(InheritGroup::Executor),
@@ -496,6 +505,7 @@ pub(crate) fn field_group(field: DialogField) -> Option<InheritGroup> {
         | DialogField::AutoRestartEnabled
         | DialogField::AutoRestartDelays => Some(InheritGroup::Common),
         DialogField::TaskSort => Some(InheritGroup::TaskSort),
+        DialogField::Runner => Some(InheritGroup::Placement),
         DialogField::DesignerEnabled
         | DialogField::DesignerAgentSettings
         | DialogField::DesignerBackend
@@ -707,6 +717,7 @@ pub struct ModalState {
     pub answer: TextArea<'static>,
     pub theme: TextArea<'static>,
     pub task_sort: TextArea<'static>,
+    pub runner: Option<Runner>,
     pub interactive: bool,
     pub readonly: bool,
     pub silence: bool,
@@ -834,6 +845,7 @@ impl ModalState {
             answer: TextArea::default(),
             theme: one_line("dark"),
             task_sort: one_line("task_number"),
+            runner: None,
             interactive: false,
             readonly: false,
             silence: false,
@@ -931,6 +943,7 @@ impl ModalState {
         state.interactive = task.interactive;
         state.readonly = task.readonly;
         state.silence = task.silence;
+        state.runner = task.runner;
         state.use_orchestrator = task.use_orchestrator;
         state.use_designer = task.use_designer;
         state.use_reviewer = task.use_reviewer;
@@ -953,6 +966,7 @@ impl ModalState {
                 DialogField::Readonly,
                 DialogField::ChainTo,
                 DialogField::TaskOptions,
+                DialogField::Runner,
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
@@ -1804,6 +1818,37 @@ impl ModalState {
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings
             | DialogField::TaskOptions => {}
+            DialogField::Runner => {
+                use ratatui::crossterm::event::KeyCode;
+                if matches!(
+                    key.code,
+                    KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                ) {
+                    let settings = matches!(self.modal, Modal::Settings | Modal::GlobalSettings);
+                    let choices = [
+                        None,
+                        Some(Runner::Auto),
+                        Some(Runner::Server),
+                        Some(Runner::Here),
+                        Some(Runner::Laptop),
+                        Some(Runner::Mobile),
+                    ];
+                    let choices = if matches!(self.modal, Modal::GlobalSettings) {
+                        &choices[1..4]
+                    } else if settings {
+                        &choices[1..]
+                    } else {
+                        &choices[..]
+                    };
+                    let current = choices.iter().position(|v| *v == self.runner).unwrap_or(0);
+                    let delta = if key.code == KeyCode::Left {
+                        choices.len() - 1
+                    } else {
+                        1
+                    };
+                    self.runner = choices[(current + delta) % choices.len()];
+                }
+            }
             DialogField::UseOrchestrator => toggle_on_space(&mut self.use_orchestrator, key),
             DialogField::UseDesigner => toggle_on_space(&mut self.use_designer, key),
             DialogField::UseReviewer => toggle_on_space(&mut self.use_reviewer, key),
@@ -1891,6 +1936,7 @@ impl ModalState {
             | DialogField::InheritLimits
             | DialogField::InheritCommon
             | DialogField::InheritTaskSort
+            | DialogField::InheritPlacement
             | DialogField::InheritDesigner
             | DialogField::InheritReviewer
             | DialogField::InheritExecutor => {
@@ -2005,6 +2051,7 @@ impl ModalState {
             | DialogField::TaskOptions
             | DialogField::Readonly
             | DialogField::Silence
+            | DialogField::Runner
             | DialogField::UseOrchestrator
             | DialogField::UseDesigner
             | DialogField::UseReviewer
@@ -2059,6 +2106,7 @@ impl ModalState {
             | DialogField::InheritLimits
             | DialogField::InheritCommon
             | DialogField::InheritTaskSort
+            | DialogField::InheritPlacement
             | DialogField::InheritDesigner
             | DialogField::InheritReviewer
             | DialogField::InheritExecutor => &mut self.answer,
@@ -2633,6 +2681,7 @@ impl ModalState {
             self.interactive.to_string(),
             self.readonly.to_string(),
             self.silence.to_string(),
+            format!("{:?}", self.runner),
             self.use_orchestrator.to_string(),
             self.use_designer.to_string(),
             self.use_reviewer.to_string(),
@@ -3670,6 +3719,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::ReviewerAgentSettings
         | DialogField::TaskOptions
         | DialogField::Silence
+        | DialogField::Runner
         | DialogField::UseOrchestrator
         | DialogField::UseDesigner
         | DialogField::UseReviewer
@@ -3695,6 +3745,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::InheritLimits
         | DialogField::InheritCommon
         | DialogField::InheritTaskSort
+        | DialogField::InheritPlacement
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor => 1,
@@ -4105,6 +4156,26 @@ fn render_selector_field(
             modal.silence,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
+        DialogField::Runner => {
+            let label = if matches!(modal.modal, Modal::GlobalSettings) {
+                "Default runner"
+            } else {
+                "Runner"
+            };
+            let value = modal
+                .runner
+                .map(Runner::label)
+                .unwrap_or("Inherit from project");
+            render_textarea(
+                frame,
+                app,
+                &one_line(value),
+                area,
+                &format!("{label} · ←/→ or Space"),
+                modal.active_field() == field,
+                app.is_hovered(HitAction::ModalField(field)),
+            );
+        }
         DialogField::UseOrchestrator => render_checkbox(
             frame,
             app,
@@ -4468,6 +4539,7 @@ fn render_selector_field(
         | DialogField::InheritLimits
         | DialogField::InheritCommon
         | DialogField::InheritTaskSort
+        | DialogField::InheritPlacement
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor => {
@@ -4506,6 +4578,7 @@ fn render_inherit_checkbox(
         InheritGroup::Designer => "designer",
         InheritGroup::Reviewer => "reviewer",
         InheritGroup::Executor => "executors",
+        InheritGroup::Placement => "runner",
     };
     let mark = if checked { "☑" } else { "☐" };
     let style = if active {

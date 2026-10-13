@@ -435,10 +435,6 @@ pub(crate) fn pairing_code(root: &Path, address: &str) -> Result<(String, Option
 
 /// Pair with the node at `address` using the code it showed. Returns its name.
 pub(crate) fn pair(root: &Path, address: &str, code: &str, local: &str) -> Result<String> {
-    let peer = address
-        .trim()
-        .parse()
-        .map_err(|_| invalid("Peer address: IP:port, e.g. 192.168.0.20:7420"))?;
     let local = match local.trim() {
         "" => None,
         text => Some(
@@ -455,7 +451,7 @@ pub(crate) fn pair(root: &Path, address: &str, code: &str, local: &str) -> Resul
     if code.is_empty() {
         return Err(invalid("Enter the pairing code"));
     }
-    pairing::pair(&ProjectStore::at(root), peer, code.into(), local)
+    pairing::pair(&ProjectStore::at(root), address.trim(), code.into(), local)
 }
 
 #[cfg(test)]

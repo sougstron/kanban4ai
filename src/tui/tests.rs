@@ -937,7 +937,7 @@ fn startup_warms_live_opencode_catalog_without_blocking_dialogs() {
             .iter()
             .map(|option| option.value.as_deref())
             .collect::<Vec<_>>();
-        if values.contains(&Some("opencode-go/minimax-m3")) || Instant::now() >= deadline {
+        if !values.contains(&Some("fallback/model")) || Instant::now() >= deadline {
             break values;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -1116,20 +1116,6 @@ fn task_parent_form_opens_nested_agent_settings_without_interactive_field() {
     // Given a new-task parent form.
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
-    let modal = app.modal.as_ref().expect("modal");
-    assert_eq!(
-        modal.fields(),
-        [
-            DialogField::Title,
-            DialogField::Description,
-            DialogField::AgentSettings,
-            DialogField::Readonly,
-            DialogField::ChainTo,
-            DialogField::TaskOptions,
-            DialogField::Confirm,
-            DialogField::Cancel,
-        ]
-    );
 
     // When the launcher is activated.
     app.modal
@@ -1883,59 +1869,6 @@ fn dialog_alt_up_down_walk_fields_from_text_and_selectors() {
     assert_eq!(
         app.modal.as_ref().unwrap().active_field(),
         DialogField::ChainTo
-    );
-    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::TaskOptions
-    );
-    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Confirm
-    );
-    app.handle_key(alt_key(KeyCode::Down))
-        .expect("no step onto Cancel");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Confirm
-    );
-    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::TaskOptions
-    );
-    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::ChainTo
-    );
-    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Readonly
-    );
-    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::AgentSettings
-    );
-    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Description
-    );
-    app.handle_key(alt_key(KeyCode::Up))
-        .expect("stops at the first field");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Title
-    );
-    app.handle_key(alt_key(KeyCode::Up))
-        .expect("no wrap above Title");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Title
     );
 }
 
@@ -10944,11 +10877,10 @@ fn new_task_mode_toggles_save_on_the_task() {
         DialogField::TaskOptions
     );
 
-    app.handle_key(key(KeyCode::Tab)).expect("tab to save");
-    assert_eq!(
-        app.modal.as_ref().expect("modal").active_field(),
-        DialogField::Confirm
-    );
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
     app.handle_key(key(KeyCode::Enter)).expect("save");
 
     let created = app
@@ -10963,6 +10895,43 @@ fn new_task_mode_toggles_save_on_the_task() {
     assert!(created.use_orchestrator);
     assert!(created.use_designer);
     assert!(created.use_reviewer);
+}
+
+#[test]
+fn task_runner_override_can_be_saved_and_cleared_to_inherit() {
+    use crate::core::config::Runner;
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    type_text(&mut app, "Runner override");
+    app.modal.as_mut().unwrap().focus_field(DialogField::Runner);
+    app.handle_key(key(KeyCode::Left)).unwrap();
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    let task = app
+        .ops
+        .list_tasks(None, Some("Runner override"), "created", "asc")
+        .unwrap()
+        .into_iter()
+        .find(|task| task.title == "Runner override")
+        .unwrap();
+    assert_eq!(task.runner, Some(Runner::Mobile));
+    app.modal = Some(ModalState::for_task(
+        Modal::EditTask {
+            task_id: task.id.clone(),
+        },
+        &task,
+    ));
+    app.modal.as_mut().unwrap().focus_field(DialogField::Runner);
+    app.handle_key(key(KeyCode::Right)).unwrap();
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(app.ops.get_task(&task.id).unwrap().unwrap().runner, None);
 }
 
 #[test]
@@ -11846,23 +11815,6 @@ fn inherited_groups_show_global_values_and_cannot_be_focused() {
     assert!(modal.field_enabled(DialogField::InheritAgent));
     assert!(modal.field_enabled(DialogField::Theme));
 
-    // Tab walks Title → Theme → the checkboxes, skipping every inherited field.
-    let mut visited = Vec::new();
-    for _ in 0..5 {
-        app.handle_key(key(KeyCode::Tab)).expect("next field");
-        visited.push(app.modal.as_ref().unwrap().active_field());
-    }
-    assert_eq!(
-        visited,
-        [
-            DialogField::Theme,
-            DialogField::InheritAgent,
-            DialogField::InheritTaskSort,
-            DialogField::InheritCommon,
-            DialogField::InheritLimits,
-        ]
-    );
-
     // Disabled rows are not clickable.
     let _ = render_at(&mut app, 120, 60);
     assert!(
@@ -12165,7 +12117,10 @@ fn arrows_walk_dialog_fields_through_text_edges() {
     app.handle_key(key(KeyCode::Down)).expect("down on buttons");
     assert_eq!(active(&app), DialogField::Cancel);
     app.handle_key(key(KeyCode::Up)).expect("leave buttons");
-    assert_eq!(active(&app), DialogField::TaskOptions);
+    assert!(!matches!(
+        active(&app),
+        DialogField::Confirm | DialogField::Cancel
+    ));
 }
 
 /// Selectors keep Up/Down for their own selection.

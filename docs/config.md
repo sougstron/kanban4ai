@@ -123,13 +123,13 @@ they are edited: press `s` on the Projects screen. Saved under the store
   `tui.task_sort` / `tui.hide_kanban_messages`: the global half of the
   inheritable groups below, same shapes as in the project file. Absent keys
   read as the built-in defaults. Edited on the Global Settings tabs.
-- `net.tailscale.mode`: `off` (default), `system` (read/control the existing Tailscale service), or `managed` (private userspace sidecar supervised by TUI/daemon/serve).
+- `net.tailscale.mode`: `off` (default), `system` (read-only status of the installed systemd/kernel-tun Tailscale service), or `managed` (private userspace sidecar supervised by TUI/daemon/serve). System login/logout and service lifecycle belong to the administrator; `net up/down/logout` refuse to change that service.
 - `net.tailscale.hostname`: `kanban-<role>` from machine-local `sync/node.yaml`, falling back to `kanban-laptop`; DNS hostname label.
 - `net.tailscale.socks_port`: `1055`, loopback SOCKS5 listener in managed mode.
 - `net.tailscale.auth_key_file`: null, or a one-time key file path (relative paths resolve under the store). Used by `net up` and managed startup; chmod 0600, deleted only after confirmed login. No key content is stored in config or passed in process arguments. These settings and `<store>/net/` stay machine-local; see `docs/sync.md` §11.5.
 
 ### Inheriting settings from the global config
-Project settings come in seven groups, each of which either follows the
+Project settings come in eight groups, each of which either follows the
 global config or uses the project's own keys. The project file records the
 choice in a top-level `inherit:` section:
 
@@ -142,6 +142,7 @@ choice in a top-level `inherit:` section:
 | `designer` | `orchestration.designer` |
 | `reviewer` | `orchestration.reviewer` |
 | `executor` | `orchestration.executors` |
+| `placement` | `runner:` (`default` and `auto_order`) |
 
 Everything else — `tui.name`, `tui.theme`, the other `tui:` keys, `columns`,
 `rules`, `thresholds`, `notifications`, `verification`, and
@@ -163,6 +164,36 @@ Everything else — `tui.name`, `tui.theme`, the other `tui:` keys, `columns`,
   board used in place inherits the built-in defaults.
 - Code that rewrites the project file starts from `Config::load_raw` (project
   file only); `Config::load` is the effective view every reader uses.
+
+## Runner placement
+
+The replicated `runner:` section exists in both `<store>/config.yaml` and
+the project `.kanban/config.yaml`:
+
+```yaml
+runner:
+  default: auto
+  auto_order: [server, here]
+inherit:
+  placement: true # project file only
+```
+
+- `runner.default`: `auto`, `server`, `here`, `laptop`, or `mobile`.
+  Global Settings offers **Auto / Сервер / Это устройство**; Project Settings
+  additionally offers Laptop and Mobile. `inherit.placement: true` follows
+  global placement; untick **Inherit runner from global** to override it.
+- `runner.auto_order`: a non-empty ordered list of `server`, `here`, `laptop`,
+  or `mobile`. `auto` cannot occur inside the list. Edited in YAML; inherited
+  together with `runner.default`, preserved when the UI changes the default.
+- Task `runner`: the same five values; absent/null means **Inherit from
+  project**. Explicit `auto` overrides a project's fixed runner. Returning a
+  task to inherit removes the override, so subsequent project edits apply.
+- Precedence: task override → effective project placement → global placement
+  → built-in `auto` with `[server, here]`. Legacy projects that omit `runner:`
+  inherit; ones that define it without inheritance flags keep their placement.
+
+TASK-417 implements configuration, persistence and replication only. Availability
+selection, resolving `here`/`auto` at launch, and routing execution are Runner 02.
 
 ## Notification Settings (.kanban/config.yaml `notifications:`)
 - `enabled`: true - master switch for desktop notifications
@@ -363,6 +394,33 @@ first (an answer or the deadline) runs the task; see
 **Executor pools** in `docs/orchestration.md`. The gate reads the cached
 limits snapshot only (`docs/limits.md`): a provider with no cached numbers is
 treated as usable, never as exhausted.
+
+## Git relay (`<store>/config.yaml`, `sync:`)
+
+```yaml
+sync:
+  relay_remote: git@host:owner/private-kanban-store.git
+  relay_interval: 60
+  relay_encrypt: false
+```
+
+- `relay_remote`: optional dedicated store remote (URL or local path).
+  Without it, paired nodes use the distinct `origin` URLs of registered projects.
+  Every endpoint receives the **whole store journal**, not just its project.
+  Keep the remote private or enable encryption; no publication occurs without peers.
+- `relay_interval`: positive seconds between heartbeat/fetch cycles, default 60.
+  Local writes push earlier; `serve --sync` forces a cycle.
+- `relay_encrypt`: replicated boolean, default false. Requires `age` and
+  `age-keygen`; enable before pairing/re-pairing to exchange public recipients.
+  The private key is `sync/relay-age.key` (0600); public peer keys are
+  `relay_recipient` in machine-local `sync/peers.yaml`. A missing recipient
+  fails closed. Enabling encryption does not encrypt old commits.
+
+Remote, interval, private keys, peer credentials, heartbeat cache and
+`net.tailscale` settings stay local. Relay only writes operation batches and
+heartbeats to `refs/kanban/sync/<node_id>`; no snapshots or remote launch.
+Probe reports `ONLINE` / `path: relay` while the peer heartbeat is at most
+twice the relay interval old. Protocol and recovery: `docs/sync.md` §10.6.
 
 ## Agent Backends (.kanban/config.yaml `agents:`)
 Each task carries an `agent_backend` field selecting which CLI runs it. When unset, `auto_launch.default_agent` is used; an unknown backend falls back to `opencode`. Create/save with Default selected snapshots those resolved values onto the task so the detail view and stats see a concrete backend/model/effort/agent (provider is the model id's slash prefix). The `agents:` map defines one entry per backend:

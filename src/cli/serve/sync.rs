@@ -393,7 +393,7 @@ impl Link {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|e| invalid(format!("{}: {e}", self.name)))?;
+            .map_err(|e| invalid(format!("{}: NODE_UNREACHABLE: {e}", self.name)))?;
         if !reply.status().is_success() {
             let status = reply.status();
             let body: serde_json::Value = reply.json().await.unwrap_or_default();
@@ -764,6 +764,38 @@ pub(super) fn start(root: &Path) -> Running {
             }
         }
     });
+    let relay_root = root.to_path_buf();
+    tasks.spawn(async move {
+        let mut changes = CHANGED.subscribe();
+        let mut force = false;
+        let mut reported = None;
+        loop {
+            let root = relay_root.clone();
+            match blocking(move || crate::core::sync::relay::cycle(&root, force)).await {
+                Ok(count) => {
+                    if count > 0 {
+                        changed();
+                    }
+                    reported = None;
+                }
+                Err(e) => {
+                    let text = e.to_string();
+                    if reported.as_ref() != Some(&text) {
+                        eprintln!("sync relay: {text}");
+                        reported = Some(text);
+                    }
+                }
+            }
+            // Ignore our own notification; other workers observe the projection.
+            changes.borrow_and_update();
+            let interval = crate::core::sync::relay::settings(&relay_root)
+                .map_or(60, |config| config.relay_interval);
+            force = tokio::select! {
+                _ = changes.changed() => true,
+                _ = tokio::time::sleep(Duration::from_secs(interval)) => false,
+            };
+        }
+    });
     let root = root.to_path_buf();
     tasks.spawn(async move {
         let mut workers = JoinSet::new();
@@ -831,12 +863,13 @@ pub(super) async fn settings_peer(
 /// push before bye). With `full == false` only pushes local operations.
 pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<()>)>> {
     let config = discovery::config(root)?;
-    let mut results = Vec::new();
-    if !discovery::network_available(root, &config)? {
-        return Ok(results);
-    }
+    let mut results: Vec<(String, Result<()>)> = Vec::new();
+    let network = discovery::network_available(root, &config)?;
     for peer in &config.peers {
         if peer.node.outbound_only() {
+            continue;
+        }
+        if !network {
             continue;
         }
         let result = async {
@@ -850,6 +883,22 @@ pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<
         }
         .await;
         results.push((peer.node.name.clone(), result));
+    }
+    let relay_root = root.to_path_buf();
+    match blocking(move || crate::core::sync::relay::cycle(&relay_root, true)).await {
+        Ok(count) if count > 0 => {
+            // A relay push delivers to the durable remote, not necessarily to a
+            // live peer. Report that distinction instead of claiming HTTP contact.
+            results.retain(|(_, result)| {
+                !result
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().contains("NODE_UNREACHABLE"))
+            });
+            results.push(("git-relay".into(), Ok(())));
+            changed();
+        }
+        Ok(_) => (),
+        Err(e) => results.push(("git-relay".into(), Err(e))),
     }
     Ok(results)
 }
