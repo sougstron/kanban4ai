@@ -1268,6 +1268,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             if let Some(session) = &task.session {
                 println!("Session: {session}");
             }
+            if let Some(code) = &task.run_failure {
+                println!("Run failure: {code}");
+            }
             for run in crate::core::sync::remote_runs(ops.data_root(), &task.id)? {
                 println!(
                     "Run: {} · {} · {}",

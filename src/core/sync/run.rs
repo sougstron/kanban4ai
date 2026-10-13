@@ -288,6 +288,13 @@ pub(super) fn capture(
         .as_ref()
         .map(|s| timefmt::format(&s.last_seen))
         .unwrap_or_else(|| timefmt::format(&timefmt::now()));
+    let code = (state_of_run == RunState::Failed)
+        .then(|| {
+            task.get("run_failure")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .flatten();
     let mut run = RunDescriptor {
         node_id: journal.node.node_id.clone(),
         name: journal.node.name.clone(),
@@ -305,7 +312,7 @@ pub(super) fn capture(
             .map(str::to_owned)
             .or_else(|| old.and_then(|r| r.branch.clone())),
         heartbeat,
-        code: None,
+        code,
     };
     if let Some(old) = old {
         let config: Value = match fs::read_to_string(target.store.join("config.yaml")) {

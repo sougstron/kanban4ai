@@ -347,8 +347,8 @@ check "explicit launch on the powered-off server is refused" \
 	api_has laptop POST "$P/TASK-008/launch" '{"runner":"server"}' NODE_POWERED_OFF
 check "the refusal offers alternatives" \
 	api_has laptop POST "$P/TASK-008/launch" '{"runner":"server"}' alternatives
-expect TASK-421 "the interrupted run carries RUN_NODE_POWERED_OFF" \
-	api_has laptop GET "$P/TASK-007" "" RUN_NODE_POWERED_OFF
+check "the interrupted run carries RUN_NODE_POWERED_OFF" \
+	wait_for 20 api_has laptop GET "$P/TASK-007" "" RUN_NODE_POWERED_OFF
 start_serve server
 check "server comes back ONLINE" wait_for 30 probe_is laptop ONLINE
 

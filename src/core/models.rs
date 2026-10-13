@@ -399,6 +399,9 @@ pub struct Task {
     /// byte-identically — and reads as `Execute` wherever a phase is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_phase: Option<RunPhase>,
+    /// Replicated runner failure code; omitted on boards with no runner failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_failure: Option<String>,
     /// Crash auto-restarts consumed for this task. Separate from
     /// `auto_resumes`: a clean-exit resume and a crash restart are different
     /// failure modes and must not share a counter. Reset whenever a human
@@ -520,6 +523,7 @@ impl Task {
             auto_resumes: 0,
             review_unseen: false,
             run_phase: None,
+            run_failure: None,
             crash_restarts: 0,
             restart_at: None,
             launch_at: None,

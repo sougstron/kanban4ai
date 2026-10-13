@@ -43,7 +43,11 @@ fn net_error_code(message: &str) -> Option<&'static str> {
 }
 fn failure(e: KanbanError) -> Response {
     if let KanbanError::Invalid(message) = &e {
-        for code in ["SYNC_NO_REMOTE", "RUNNER_REPO_MISSING"] {
+        for code in [
+            "SYNC_NO_REMOTE",
+            "RUNNER_REPO_MISSING",
+            "RUNNER_BACKEND_MISSING",
+        ] {
             if message.contains(code) {
                 return error(StatusCode::CONFLICT, code, message);
             }
@@ -328,7 +332,18 @@ async fn action(
     }
     respond(blocking(move || crate::core::sync::with_actor(if request.agent { "agent" } else { "human" }, || {
         let p = if action == "launch" {
-            crate::core::code::for_launch(&root, &id)?
+            match crate::core::code::for_launch(&root, &id) {
+                Ok(project) => project,
+                Err(e) => {
+                    if e.to_string().contains(crate::core::runner_failure::REPO_MISSING) {
+                        let p = project(&root, &id)?;
+                        crate::core::runner_failure::record(&p.data_root, &task,
+                            crate::core::runner_failure::REPO_MISSING,
+                            &format!("{e}; нет клона или снапшота; можно перезапустить на другом узле"))?;
+                    }
+                    return Err(e);
+                }
+            }
         } else {
             project(&root, &id)?
         };
@@ -629,7 +644,25 @@ async fn proxy(
             .await
             {
                 Ok(transfer) => transfer,
-                Err(e) => return failure(e),
+                Err(e) => {
+                    if e.to_string()
+                        .contains(crate::core::runner_failure::REPO_MISSING)
+                    {
+                        if let Ok(p) = project(root, id) {
+                            if let Err(record_error) = crate::core::runner_failure::record(
+                                &p.data_root,
+                                task,
+                                crate::core::runner_failure::REPO_MISSING,
+                                &format!(
+                                    "{e}; нет клона или снапшота; можно перезапустить на другом узле"
+                                ),
+                            ) {
+                                return failure(record_error);
+                            }
+                        }
+                    }
+                    return failure(e);
+                }
             };
             let mut upload = http
                 .post(format!("http://{address}/git/{id}/bundle"))
@@ -711,6 +744,25 @@ async fn unavailable(
 ) -> Response {
     if action != "launch" {
         return error(StatusCode::CONFLICT, code, &message);
+    }
+    let run_code = match code {
+        "NODE_POWERED_OFF" => Some(crate::core::runner_failure::POWERED_OFF),
+        "NODE_UNREACHABLE" => Some(crate::core::runner_failure::UNREACHABLE),
+        _ => None,
+    };
+    if let Some(run_code) = run_code {
+        let recorded = (|| -> Result<()> {
+            let p = project(root, id)?;
+            crate::core::runner_failure::record(
+                &p.data_root,
+                task,
+                run_code,
+                &format!("{message}; можно перезапустить на другом узле"),
+            )
+        })();
+        if let Err(e) = recorded {
+            return failure(e);
+        }
     }
     let local = match Journal::open(root) {
         Ok(journal) => journal.node.role,
@@ -1015,7 +1067,14 @@ mod tests {
                     {"action": "cancel"}
                 ])
             );
-            assert_eq!(ops.get_task(&task.id).unwrap().unwrap(), task);
+            let refused = ops.get_task(&task.id).unwrap().unwrap();
+            assert_eq!(refused.status, task.status);
+            assert_eq!(refused.session, task.session);
+            assert_eq!(refused.runner, task.runner);
+            assert_eq!(
+                refused.run_failure.as_deref(),
+                Some(crate::core::runner_failure::POWERED_OFF)
+            );
             let response = http
                 .post(&url)
                 .bearer_auth(&token)
