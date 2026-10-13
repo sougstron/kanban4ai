@@ -469,9 +469,9 @@ and agents come from project settings. The Options summary names the toggles
 that are on (`silence`, `orchestrator`, `designer`, `reviewer`, `launch at
 HH:MM`), and a silence task shows a `🔇 silence` badge. The Description box sizes itself from its own text the way
 the option selectors size from their option count: at least 5 visible text rows,
-growing one row at a time with the soft-wrapped text up to 20 visible rows and
+growing one row at a time with the soft-wrapped text up to 15 visible rows and
 shrinking again on delete. The borders add two rows outside these limits.
-Content beyond 20 rows scrolls within the field; a short terminal still clips
+Content beyond 15 rows scrolls within the field; a short terminal still clips
 the field to the available space. Window size no longer stretches it — spare
 rows go to the selectors below instead. When the selected backend exposes no personas (no
 `agent_options`), the agent selector would offer only "Default agent", so the
