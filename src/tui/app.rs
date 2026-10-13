@@ -1530,6 +1530,22 @@ impl App {
             {
                 self.focus_next_column()
             }
+            (KeyCode::Up | KeyCode::Down, _)
+                if matches!(self.screen, Screen::Board | Screen::Detail) =>
+            {
+                let step = self.arrow_scroll_step(&key);
+                let delta = if key.code == KeyCode::Up { -step } else { step };
+                if self.screen == Screen::Board {
+                    let len = self.visible_tasks_for_column(self.focused_column).len();
+                    self.focused_card = self
+                        .focused_card
+                        .saturating_add_signed(delta as isize)
+                        .min(len.saturating_sub(1));
+                    self.ensure_focused_visible();
+                } else {
+                    self.scroll_detail(delta as isize);
+                }
+            }
             (KeyCode::Up, _) => self.focus_up(),
             (KeyCode::Down, _) => self.focus_down(),
             (KeyCode::PageUp, _) => self.page_up(),
@@ -5819,8 +5835,8 @@ impl App {
                     self.refresh_active_sessions()?;
                 }
             }
-            KeyCode::Up => self.scroll_text_view(-self.text_view_step(&key)),
-            KeyCode::Down => self.scroll_text_view(self.text_view_step(&key)),
+            KeyCode::Up => self.scroll_text_view(-self.arrow_scroll_step(&key)),
+            KeyCode::Down => self.scroll_text_view(self.arrow_scroll_step(&key)),
             KeyCode::PageUp => self.scroll_text_view(-10),
             KeyCode::PageDown => self.scroll_text_view(10),
             KeyCode::Home => {
@@ -5851,9 +5867,9 @@ impl App {
         }
     }
 
-    /// Arrow-key row step for the text pager: Ctrl scrolls x10 rows, Shift x3,
-    /// plain arrows x1 — the fast path for long reports such as the stats view.
-    fn text_view_step(&self, key: &KeyEvent) -> i32 {
+    /// Shared arrow step for board cards, thread rows and text-pager rows:
+    /// Ctrl moves x10, Shift x3, plain arrows x1; Ctrl takes precedence.
+    fn arrow_scroll_step(&self, key: &KeyEvent) -> i32 {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             10
         } else if key.modifiers.contains(KeyModifiers::SHIFT) {

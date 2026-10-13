@@ -8402,6 +8402,67 @@ fn text_pager_arrow_scroll_steps() {
     assert_eq!(scroll(&app), 0);
 }
 
+#[test]
+fn board_and_thread_arrow_scroll_acceleration() {
+    let (dir, mut app) = app_with_board();
+    for index in 0..24 {
+        app.ops
+            .create_task(NewTask::titled(format!("Scroll task {index}")))
+            .unwrap();
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    let task_id = app.current_task().unwrap().id.clone();
+    ThreadManager::new(dir.path())
+        .unwrap()
+        .post(
+            &task_id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            &(0..80)
+                .map(|i| format!("Thread row {i}\n"))
+                .collect::<String>(),
+            None,
+            Vec::new(),
+            Some("agent".to_string()),
+        )
+        .unwrap();
+
+    for screen in [Screen::Board, Screen::Detail] {
+        if screen == Screen::Detail {
+            app.handle_key(key(KeyCode::Enter)).unwrap();
+        }
+        let _ = render_at(&mut app, 96, 20);
+        app.handle_key(key(KeyCode::Home)).unwrap();
+        let position = |app: &App| match screen {
+            Screen::Board => app.focused_card as u16,
+            _ => app.detail.as_ref().unwrap().scroll,
+        };
+        for (code, modifiers, expected) in [
+            (KeyCode::Down, KeyModifiers::NONE, 1),
+            (KeyCode::Down, KeyModifiers::SHIFT, 4),
+            (KeyCode::Down, KeyModifiers::CONTROL, 14),
+            (KeyCode::Up, KeyModifiers::CONTROL | KeyModifiers::SHIFT, 4),
+            (KeyCode::Up, KeyModifiers::SHIFT, 1),
+            (KeyCode::Up, KeyModifiers::CONTROL, 0),
+            (KeyCode::Up, KeyModifiers::SHIFT, 0),
+        ] {
+            app.handle_key(KeyEvent::new(code, modifiers)).unwrap();
+            let _ = render_at(&mut app, 96, 20);
+            assert_eq!(
+                position(&app),
+                expected,
+                "{screen:?} {code:?} {modifiers:?}"
+            );
+        }
+        app.handle_key(key(KeyCode::End)).unwrap();
+        let bottom = position(&app);
+        app.handle_key(ctrl_key(KeyCode::Down)).unwrap();
+        assert_eq!(position(&app), bottom, "{screen:?} must clamp at the end");
+        app.handle_key(key(KeyCode::Home)).unwrap();
+    }
+}
+
 /// A task with neither a prompt dump nor provenance hides both viewer buttons.
 #[test]
 fn viewer_buttons_absent_without_prompt_or_provenance() {

@@ -69,6 +69,12 @@ textarea's own Alt bindings (`Alt+b/f/d/v`) are unavailable there — use
 the plain-letter hotkeys.
 
 - `↑/↓/←/→`: Move focus between tasks/columns
+- `Shift+↑/↓`: Move 3 tasks within the focused board column, or scroll 3
+  rendered rows while the detail thread is focused
+- `Ctrl+↑/↓`: Move 10 tasks within the focused board column, or scroll 10
+  rendered rows while the detail thread is focused. Ctrl takes precedence
+  over Shift; both stop at the beginning/end, matching the Stats text pager.
+  Answer/review text panels keep their editor arrow bindings
 - `Alt+↑/↓`: jump to the block above/below from anywhere — the detail's
   thread/answer/editor panels, a dialog's form fields (the nested
   agent-settings and Options popups included) — even out of a text caret or
