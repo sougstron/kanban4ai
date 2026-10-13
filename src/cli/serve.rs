@@ -28,6 +28,7 @@ use crate::core::project::ProjectStore;
 use crate::core::storage::{atomic_write_text_raw, lock_file_reentrant};
 
 mod api;
+pub(crate) use api::{launch_on_board, remote_runner_on_board};
 mod embedded;
 pub(crate) use embedded::Embedded;
 mod discovery;

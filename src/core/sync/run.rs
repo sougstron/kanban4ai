@@ -221,8 +221,17 @@ pub(super) fn capture(
     };
     let records = decode_fields(state.fields.get(&key(project, "run", &task_id)))?;
     let old = records.get(&journal.node.node_id);
-    let queued =
-        target.entity == "task" && task.get("run_phase").and_then(Value::as_str) == Some("queued");
+    // Waiting for an explicit remote runner does not claim a local run.
+    // Otherwise its replicated queued descriptor would exclude the real runner.
+    let remote_runner = task
+        .get("runner")
+        .and_then(Value::as_str)
+        .and_then(crate::core::config::Runner::parse)
+        .and_then(crate::core::config::Runner::node_role)
+        .is_some_and(|role| role != journal.node.role);
+    let queued = target.entity == "task"
+        && task.get("run_phase").and_then(Value::as_str) == Some("queued")
+        && !remote_runner;
     // An ordinary board edit on a peer must never create or claim a run.
     if target.entity == "task"
         && queued
