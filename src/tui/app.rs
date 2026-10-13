@@ -170,6 +170,8 @@ pub struct Hitbox {
 /// What a mouse press (or wheel, for column targeting) on a region maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitAction {
+    SyncConflict(usize),
+    SyncConflictSelect(isize),
     FocusCard {
         column: usize,
         card: usize,
@@ -495,6 +497,7 @@ pub struct App {
     /// Backends whose warmed model catalog has already been reflected into an
     /// open modal, so `tick` refreshes options at most once per backend.
     catalog_ready: HashSet<String>,
+    pub(crate) sync_board: super::sync_board::SyncBoard,
     pub project: Option<Project>,
     pub projects: Vec<ProjectRow>,
     project_cache: Option<projects::ProjectCache>,
@@ -902,6 +905,7 @@ impl App {
         };
         let (launch_tx, launch_rx) = mpsc::channel();
         Ok(Self {
+            sync_board: Default::default(),
             ops,
             screen: Screen::Board,
             board,
@@ -1068,6 +1072,7 @@ impl App {
             last_store_pump: None,
             store_pump_state: Arc::new(Mutex::new(daemon::PumpState::default())),
             catalog_ready: HashSet::new(),
+            sync_board: Default::default(),
             project: None,
             projects,
             project_cache: Some(projects::ProjectCache::default()),
@@ -1386,6 +1391,22 @@ impl App {
         }
         let action_screen = matches!(self.screen, Screen::Board | Screen::Detail);
         match (key.code, key.modifiers) {
+            (KeyCode::Char('v'), KeyModifiers::CONTROL) if self.screen == Screen::Detail => {
+                if let Some(hit) = self
+                    .hitboxes
+                    .iter()
+                    .find(|hit| matches!(hit.action, HitAction::SyncConflict(_)))
+                    .copied()
+                {
+                    self.click_at(hit.area.x, hit.area.y)?;
+                }
+            }
+            (KeyCode::Left, KeyModifiers::CONTROL) if self.screen == Screen::Detail => {
+                self.sync_board.selected = self.sync_board.selected.saturating_sub(1);
+            }
+            (KeyCode::Right, KeyModifiers::CONTROL) if self.screen == Screen::Detail => {
+                self.sync_board.selected = self.sync_board.selected.saturating_add(1);
+            }
             (KeyCode::Esc, _) if self.screen == Screen::Board && !self.search.text().is_empty() => {
                 self.clear_search();
             }
@@ -2361,6 +2382,8 @@ impl App {
             Some(
                 HitAction::OpenAnswer { .. }
                 | HitAction::Action(_)
+                | HitAction::SyncConflict(_)
+                | HitAction::SyncConflictSelect(_)
                 | HitAction::ModalField(_)
                 | HitAction::ModalTab(_)
                 | HitAction::ModalOption { .. }
@@ -2688,6 +2711,8 @@ impl App {
             | Some(HitAction::ColumnFocus(column)) => Some(column),
             Some(
                 HitAction::Action(_)
+                | HitAction::SyncConflict(_)
+                | HitAction::SyncConflictSelect(_)
                 | HitAction::ModalField(_)
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
@@ -2743,6 +2768,28 @@ impl App {
                 Ok(())
             }
             Some(HitAction::Action(action)) => self.dispatch(action),
+            Some(HitAction::SyncConflictSelect(delta)) => {
+                self.sync_board.selected = self.sync_board.selected.saturating_add_signed(delta);
+                Ok(())
+            }
+            Some(HitAction::SyncConflict(index)) => {
+                let conflict = self.sync_board.conflicts.get(index).cloned();
+                if let (Some(conflict), Some(store)) = (conflict, &self.store) {
+                    match crate::core::sync::Journal::open(store.root())
+                        .and_then(|journal| journal.take_other_version(&conflict))
+                    {
+                        Ok(()) => {
+                            self.sync_board.conflicts.remove(index);
+                            self.sync_board.tasks.remove(index);
+                            self.refresh_after_action()?;
+                            self.status =
+                                "Взята другая версия; изменение будет синхронизировано".into();
+                        }
+                        Err(error) => self.status = error.to_string(),
+                    }
+                }
+                Ok(())
+            }
             Some(HitAction::DetailAnswerOption { index }) => {
                 if let Some(detail) = self.detail.as_mut() {
                     detail.variant_selected = index;
@@ -2917,6 +2964,8 @@ impl App {
             ) => column,
             Some(
                 HitAction::Action(_)
+                | HitAction::SyncConflict(_)
+                | HitAction::SyncConflictSelect(_)
                 | HitAction::ModalField(_)
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
@@ -3063,6 +3112,13 @@ impl App {
     pub fn tick(&mut self) -> Result<()> {
         self.poll_launches();
         self.reload_if_changed()?;
+        if let Some(store) = &self.store {
+            self.sync_board.poll(
+                store.root(),
+                self.ops.data_root(),
+                self.settings.refresh_interval,
+            );
+        }
         self.refresh_modal_after_catalog_warm();
         let now = Instant::now();
         self.expire_ctrl_c_prompt_at(now);

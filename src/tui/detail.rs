@@ -80,6 +80,26 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let focus = detail.focus;
     let task = task.clone();
     let analytics_height = analytics_height(&detail.analytics);
+    let question_index = detail.question_index;
+    let count = app
+        .sync_board
+        .tasks
+        .iter()
+        .filter(|id| *id == &task.id)
+        .count();
+    let conflict_height = if count == 0 {
+        0
+    } else {
+        4.min(area.height.saturating_sub(12))
+    };
+    let conflict_area = Rect::new(area.x, area.y, area.width, conflict_height);
+    super::sync_board::render_conflicts(frame, app, &task.id, conflict_area);
+    let area = Rect::new(
+        area.x,
+        area.y.saturating_add(conflict_height),
+        area.width,
+        area.height.saturating_sub(conflict_height),
+    );
 
     let description_lines = task_description_lines(&task);
     let isolated = task.worktree.is_some();
@@ -93,7 +113,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         + description_lines;
     let meta_height = 6 + meta_extra_lines;
     let answer_height = if show_answer {
-        let question = &open_questions[detail.question_index.min(open_questions.len() - 1)];
+        let question = &open_questions[question_index.min(open_questions.len() - 1)];
         // Two more rows when several questions are open: the prev/next
         // question button row pinned under the variants.
         let switch_rows = if open_questions.len() > 1 { 2 } else { 0 };

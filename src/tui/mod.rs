@@ -12,6 +12,7 @@ mod markdown;
 mod projects;
 mod search;
 mod sessions;
+mod sync_board;
 mod sync_tab;
 mod theme;
 mod thread_view;

@@ -76,6 +76,61 @@ impl Journal {
         Ok(conflicts)
     }
 
+    /// Restore the losing field as a normal human edit with a fresh local HLC.
+    /// Reject stale controls rather than overwriting edits made since rendering.
+    pub fn take_other_version(&self, conflict: &Conflict) -> Result<()> {
+        let store = self.root.parent().expect("sync parent");
+        let _store = lock_file_reentrant(&store.join(".lock"))?;
+        let mut boards =
+            BTreeSet::from([store.join("projects").join(component(&conflict.project)?)]);
+        for entry in fs::read_dir(store.join("projects"))? {
+            let path = entry?.path();
+            if path.is_dir() {
+                boards.insert(path);
+            }
+        }
+        let _boards = boards
+            .iter()
+            .map(|path| Storage::new(path).lock())
+            .collect::<Result<Vec<_>>>()?;
+        let _sync = lock_file_reentrant(&self.root.join(".lock"))?;
+        self.recover()?;
+        let state = self.state()?;
+        let field = state
+            .fields
+            .get(&key(&conflict.project, &conflict.entity, &conflict.id))
+            .ok_or_else(|| invalid("conflict entity no longer exists"))?;
+        if field.clocks.get(&conflict.field) != Some(&conflict.winner) {
+            return Err(invalid(
+                "conflict changed; refresh before choosing a version",
+            ));
+        }
+        if !self.conflicts()?.contains(conflict) {
+            return Err(invalid("conflict is no longer active"));
+        }
+        let seq = state
+            .vector
+            .get(&self.node.node_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| invalid("operation sequence exhausted"))?;
+        let clock: Hlc = load(&self.root.join("hlc"))?;
+        let operation = Operation {
+            op: format!("{}:{seq}", self.node.node_id),
+            hlc: clock.tick(now_ms(), &self.node.node_id)?,
+            store: self.node.store_id.clone(),
+            project: conflict.project.clone(),
+            entity: conflict.entity.clone(),
+            id: conflict.id.clone(),
+            set: BTreeMap::from([(conflict.field.clone(), conflict.loser_value.clone())]),
+            prev: BTreeMap::from([(conflict.field.clone(), conflict.winner.clone())]),
+            actor: "human".into(),
+        };
+        self.apply_remote_transaction(&[operation], u64::MAX)?;
+        Ok(())
+    }
+
     fn apply_remote_transaction(
         &self,
         operations: &[Operation],

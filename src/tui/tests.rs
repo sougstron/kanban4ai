@@ -13108,3 +13108,67 @@ fn global_settings_network_mode_is_immediate_and_system_is_read_only() {
             .is_none()
     );
 }
+
+#[test]
+fn sync_board_status_and_conflicts_snapshots() {
+    use crate::cli::serve::settings::BoardPeer;
+    use crate::core::sync::{Conflict, Hlc};
+    let (_dir, mut app) = populated_app();
+    let at = chrono::DateTime::parse_from_rfc3339("2026-10-13T18:02:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    app.sync_board.peers = vec![BoardPeer {
+        name: "server".into(),
+        role: crate::core::sync::NodeRole::Server,
+        code: "NODE_UNREACHABLE".into(),
+        exchange: Some(at),
+        since: Some(at),
+        pending: 14,
+    }];
+    let id = app.board.columns[0].tasks[0].id.clone();
+    app.sync_board.tasks = vec![id.clone()];
+    app.sync_board.conflicts = vec![Conflict {
+        project: "demo".into(),
+        entity: "task".into(),
+        id,
+        field: "title".into(),
+        winner: Hlc(4, 0, "server".into()),
+        loser: Hlc(3, 0, "laptop".into()),
+        winner_value: serde_json::json!("Fix login"),
+        loser_value: serde_json::json!("Fix auth"),
+    }];
+    // Freeze local-clock formatting without assuming the machine timezone.
+    let mut offline = render_snapshot(&mut app);
+    offline = offline.replace(
+        &at.with_timezone(&chrono::Local).format("%H:%M").to_string(),
+        "18:02",
+    );
+    insta::assert_snapshot!("sync_board_offline_conflict", offline);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    let mut detail = render_snapshot(&mut app);
+    detail = detail.replace(
+        &at.with_timezone(&chrono::Local).format("%H:%M").to_string(),
+        "18:02",
+    );
+    insta::assert_snapshot!("sync_detail_conflict", detail);
+    app.sync_board.conflicts.push(crate::core::sync::Conflict {
+        field: "description".into(),
+        ..app.sync_board.conflicts[0].clone()
+    });
+    app.sync_board.tasks.push(app.sync_board.tasks[0].clone());
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(render_snapshot(&mut app).contains("task / description"));
+    app.screen = Screen::Board;
+    app.sync_board.peers[0].code = "ONLINE".into();
+    app.sync_board.peers[0].pending = 0;
+    assert_eq!(
+        app.sync_board
+            .header(at + chrono::Duration::seconds(3))
+            .unwrap(),
+        "синхронизировано с server 3 с назад"
+    );
+    // Future exchange clamps clock reversal to zero; stable snapshot.
+    app.sync_board.peers[0].exchange = Some(chrono::Utc::now() + chrono::Duration::days(1));
+    insta::assert_snapshot!("sync_board_online", render_snapshot(&mut app));
+}

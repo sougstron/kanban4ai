@@ -292,6 +292,9 @@ pub fn badges(
             badges.push((run.label(), app.theme.focus));
         }
     }
+    if app.sync_board.has_conflict(&task.id) {
+        badges.push(("⚠ sync".to_string(), app.theme.warn));
+    }
     // Conflict is the one blocking isolation state (the report sits in
     // review_edits and a human must resolve it), so it leads the card and
     // displaces the plain worktree badge it implies.
