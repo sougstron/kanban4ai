@@ -116,6 +116,43 @@ fn hold_stays_on_while_runs_that_started_before_are_still_live() {
 }
 
 #[test]
+fn conflict_mode_outlives_a_conflict_resolved_while_nothing_was_queued() {
+    let (dir, ops, _recorder) = board("", "");
+    let running = ops.create_task(NewTask::titled("Running")).unwrap();
+    ops.queue_run(&running.id).unwrap();
+    assert_eq!(ops.dispatch_queue().unwrap().len(), 1);
+
+    // A conflict comes and goes while the queue is empty.
+    let conflicted = ops
+        .create_task_in_status(NewTask::titled("Conflicted"), TaskStatus::Review)
+        .unwrap();
+    set_integration(&ops, &conflicted.id, IntegrationState::Conflict);
+    assert!(ops.dispatch_queue().unwrap().is_empty());
+    set_integration(&ops, &conflicted.id, IntegrationState::Landed);
+
+    // The earlier run is still live, so new work still waits.
+    let waiting = ops.create_task(NewTask::titled("Waiting")).unwrap();
+    ops.queue_run(&waiting.id).unwrap();
+    assert!(ops.dispatch_queue().unwrap().is_empty());
+    assert!(
+        ops.storage
+            .load_task(&waiting.id)
+            .unwrap()
+            .unwrap()
+            .conflict_held
+    );
+
+    let session = ops.storage.load_task(&running.id).unwrap().unwrap().session;
+    SessionManager::new(&ops.storage.project_path)
+        .close_session(session.as_deref().unwrap())
+        .unwrap();
+    let dispatched = ops.dispatch_queue().unwrap();
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(dispatched[0].task_id, waiting.id);
+    assert!(!dir.path().join(".kanban/conflict_mode").exists());
+}
+
+#[test]
 fn held_tasks_release_first_in_first_out() {
     let (_dir, ops, _recorder) = board("  max_running_total: 1\n", "");
     let conflicted = ops

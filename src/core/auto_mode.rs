@@ -261,9 +261,11 @@ impl Operations {
     /// The merge-conflict queue hold, on every board: while any In Progress
     /// or Review task has an unresolved conflict, new work waits in the
     /// queue instead of starting — every parallel run would only conflict
-    /// again. Runs already started keep going. Once the hold has parked a
-    /// task it stays on until the conflicts are gone *and* every running
-    /// agent has finished (each could still land into a new conflict).
+    /// again. Runs already started keep going. Once a conflict was seen the
+    /// board stays in conflict mode (a marker file, see
+    /// [`Self::enter_conflict_mode`]) until the conflicts are gone *and*
+    /// every running agent has finished (each could still land into a new
+    /// conflict), even when nothing was queued while the conflict lasted.
     ///
     /// `Some(ids)` while holding: the conflicted task ids, empty when only
     /// running agents keep the hold on.
@@ -281,11 +283,30 @@ impl Operations {
             }
         }
         if !conflicts.is_empty() {
+            self.enter_conflict_mode();
             return Ok(Some(conflicts));
         }
-        if held && Slots::measure(self)?.total > 0 {
+        let marker = self.conflict_mode_marker();
+        if (held || marker.exists()) && Slots::measure(self)?.total > 0 {
             return Ok(Some(Vec::new()));
         }
+        // No conflicts and no live agent: conflict mode is over.
+        let _ = fs::remove_file(marker);
         Ok(None)
+    }
+
+    /// Latch the board into conflict mode: recorded by the landing that hits
+    /// a conflict, so the hold outlives a conflict resolved while other
+    /// agents are still running. Best-effort — the conflicted task's own
+    /// `integration: conflict` holds the queue regardless.
+    pub(crate) fn enter_conflict_mode(&self) {
+        let marker = self.conflict_mode_marker();
+        if !marker.exists() {
+            let _ = fs::write(marker, timefmt::now().to_string());
+        }
+    }
+
+    fn conflict_mode_marker(&self) -> PathBuf {
+        self.storage.kanban_dir.join("conflict_mode")
     }
 }

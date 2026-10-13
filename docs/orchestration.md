@@ -170,9 +170,12 @@ queues instead of launching while the hold is on). Resumes of runs that
 already started (expired waits, crash restarts, answered questions, reviewer
 bounces) and the conflicted tasks themselves are never held, and running
 agents are never stopped. A held task gets `conflict_held: true`, the card
-badge `⏸ conflict hold`, and one thread note naming the conflicts. Once
-something was held, the hold lasts until there are no conflicts **and** no
-live agent (each running task could still land into a new conflict); then
+badge `⏸ conflict hold`, and one thread note naming the conflicts. The
+first conflict latches the board into conflict mode (`.kanban/conflict_mode`,
+written by the conflicted landing or the dispatcher), which lasts until there
+are no conflicts **and** no live agent (each running task could still land
+into a new conflict) — even if the conflict was resolved before anything was
+queued; then
 the held tasks start first, in the order they entered the queue
 (`queued_at`, FIFO), ahead of the board order.
 
