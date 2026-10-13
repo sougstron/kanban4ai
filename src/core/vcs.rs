@@ -356,17 +356,18 @@ impl GitRepo {
     }
 
     pub fn fetch_code_remote(&self, remote: &str) -> Result<()> {
-        require(
-            self.git(&[
-                "fetch",
-                "--no-tags",
-                "--",
-                remote,
-                "+refs/heads/*:refs/remotes/kanban-code/*",
-                "+refs/heads/kanban/*:refs/heads/kanban/*",
-            ])?,
-            "fetch code",
-        )?;
+        let checked_out = self.checked_out_task_branches()?;
+        let exclusions: Vec<String> = checked_out.iter().map(|name| format!("^{name}")).collect();
+        let mut args = vec![
+            "fetch",
+            "--no-tags",
+            "--",
+            remote,
+            "+refs/heads/*:refs/remotes/kanban-code/*",
+            "+refs/heads/kanban/*:refs/heads/kanban/*",
+        ];
+        args.extend(exclusions.iter().map(String::as_str));
+        require(self.git(&args)?, "fetch code")?;
         let refs = require(
             self.git(&["ls-remote", "--", remote, INTEGRATION_REF])?,
             "ls-remote",
@@ -406,6 +407,65 @@ impl GitRepo {
         }
         Ok(())
     }
+    /// Immutable per-run refs avoid overwriting an offline peer's task branch.
+    pub fn push_run(&self, remote: &str, reference: &str) -> Result<()> {
+        let spec = format!("{reference}:{reference}");
+        require(
+            self.git(&["push", "--", remote, &spec])?,
+            "push completed run",
+        )?;
+        Ok(())
+    }
+
+    pub fn fetch_run(&self, remote: &str, reference: &str) -> Result<()> {
+        let spec = format!("{reference}:{reference}");
+        require(
+            self.git(&["fetch", "--no-tags", "--", remote, &spec])?,
+            "fetch completed run",
+        )?;
+        Ok(())
+    }
+
+    /// Do not move a ref underneath a running/retained isolated checkout.
+    pub fn install_run_branch(&self, branch: &str, tip: &Oid) -> Result<bool> {
+        let reference = format!("refs/heads/{branch}");
+        require(
+            self.git(&["check-ref-format", &reference])?,
+            "validate run branch",
+        )?;
+        if self.checked_out_task_branches()?.contains(&reference) {
+            return Ok(self.read_ref(&reference)?.as_ref() == Some(tip));
+        }
+        self.set_ref(&reference, tip)?;
+        Ok(true)
+    }
+
+    pub fn rename_run_branch(&self, old: &str, new: &str, tip: &Oid) -> Result<()> {
+        if self.read_ref(old)?.as_ref() != Some(tip) {
+            return Err(KanbanError::Invalid(
+                "local run branch changed after completion".into(),
+            ));
+        }
+        if self.read_ref(new)?.is_some_and(|existing| &existing != tip) {
+            return Err(KanbanError::Invalid(
+                "duplicate run branch already holds another result".into(),
+            ));
+        }
+        require(
+            self.git(&["branch", "-M", old, new])?,
+            "rename duplicate run",
+        )?;
+        Ok(())
+    }
+
+    pub fn publish_run_branch(&self, remote: &str, branch: &str) -> Result<()> {
+        let spec = format!("+refs/heads/{branch}:refs/heads/{branch}");
+        require(
+            self.git(&["push", "--", remote, &spec])?,
+            "publish Review branch",
+        )?;
+        Ok(())
+    }
 
     /// Only task branches and the integration spine may be installed from a peer.
     /// Human branches, HEAD and the index are never overwritten.
@@ -427,6 +487,7 @@ impl GitRepo {
             "bundle list-heads",
         )?;
         let text = String::from_utf8_lossy(&out.stdout);
+        let checked_out = self.checked_out_task_branches()?;
         let mut specs = Vec::new();
         for line in text.lines() {
             let Some((oid, name)) = line.split_once(' ') else {
@@ -435,7 +496,9 @@ impl GitRepo {
             if oid_from(oid).is_none() {
                 return Err(KanbanError::Invalid("Invalid bundle object ID".into()));
             }
-            if name == INTEGRATION_REF || name.starts_with("refs/heads/kanban/TASK-") {
+            if (name == INTEGRATION_REF || name.starts_with("refs/heads/kanban/TASK-"))
+                && !checked_out.contains(name)
+            {
                 // Git itself validates the complete ref syntax.
                 require(self.git(&["check-ref-format", name])?, "check-ref-format")?;
                 specs.push(format!("+{name}:{name}"));
@@ -447,6 +510,21 @@ impl GitRepo {
             require(run(&self.root, &args, None)?, "fetch bundle")?;
         }
         Ok(())
+    }
+
+    /// A live agent owns its checked-out branch. Import may update inactive
+    /// task branches, but must never move a live checkout underneath its agent.
+    fn checked_out_task_branches(&self) -> Result<std::collections::HashSet<String>> {
+        let out = require(
+            self.git(&["worktree", "list", "--porcelain"])?,
+            "list checked-out branches",
+        )?;
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.strip_prefix("branch "))
+            .filter(|name| name.starts_with("refs/heads/kanban/TASK-"))
+            .map(str::to_owned)
+            .collect())
     }
 
     fn git(&self, args: &[&str]) -> Result<Output> {
@@ -1047,6 +1125,59 @@ mod tests {
         r.git(&["cat-file", "-e", &format!("{rev}:{path}")])
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn code_import_preserves_live_task_branch_and_updates_inactive_refs() {
+        let source = init_repo();
+        write(source.path(), "file", "base\n");
+        commit_all(source.path(), "base");
+        ok(source.path(), &["branch", "kanban/TASK-001"]);
+        let sender = repo(&source);
+        sender.capture_code_snapshot(true).unwrap();
+        let receiver = tempfile::tempdir().unwrap();
+        let clone = receiver.path().join("clone");
+        let imported = GitRepo::clone_code(source.path().to_str().unwrap(), &clone).unwrap();
+        imported
+            .fetch_code_remote(source.path().to_str().unwrap())
+            .unwrap();
+        let original = head(&clone);
+        let live = receiver.path().join("live");
+        ok(
+            &clone,
+            &["worktree", "add", live.to_str().unwrap(), "kanban/TASK-001"],
+        );
+        for bundle in [false, true] {
+            write(
+                source.path(),
+                "file",
+                if bundle { "bundle\n" } else { "remote\n" },
+            );
+            commit_all(source.path(), "advance");
+            ok(source.path(), &["branch", "-f", "kanban/TASK-001", "HEAD"]);
+            ok(source.path(), &["branch", "-f", "kanban/TASK-002", "HEAD"]);
+            sender.capture_code_snapshot(true).unwrap();
+            if bundle {
+                let file = tempfile::NamedTempFile::new().unwrap();
+                sender.code_bundle(file.path(), &[], true).unwrap();
+                imported.import_code_bundle(file.path()).unwrap();
+            } else {
+                imported
+                    .fetch_code_remote(source.path().to_str().unwrap())
+                    .unwrap();
+            }
+            assert_eq!(head(&live), original);
+            assert_eq!(fs::read_to_string(live.join("file")).unwrap(), "base\n");
+            assert_eq!(head(&clone), original);
+            assert_eq!(
+                ok(&clone, &["rev-parse", "kanban/TASK-002"]),
+                head(source.path())
+            );
+            assert_eq!(
+                imported.integration_ref().unwrap(),
+                sender.integration_ref().unwrap()
+            );
+        }
     }
 
     #[test]

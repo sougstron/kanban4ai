@@ -399,6 +399,9 @@ pub struct Task {
     /// byte-identically — and reads as `Execute` wherever a phase is needed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_phase: Option<RunPhase>,
+    /// Replicated runner failure code; omitted on boards with no runner failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_failure: Option<String>,
     /// Crash auto-restarts consumed for this task. Separate from
     /// `auto_resumes`: a clean-exit resume and a crash restart are different
     /// failure modes and must not share a counter. Reset whenever a human
@@ -457,6 +460,11 @@ pub struct Task {
     /// byte-identically.
     #[serde(default, skip_serializing_if = "is_integration_default")]
     pub integration: IntegrationState,
+    /// Machine-local code reconciliation state; never copied from another node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_pending: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub run_duplicate: bool,
     /// A failed post-landing cleanup is not retried by the store sweep
     /// before this moment. Kept on the task so the backoff holds across
     /// every process that pumps the board. Omitted while unset.
@@ -469,6 +477,9 @@ pub struct Task {
     /// Placement override; absent inherits the project's effective runner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<crate::core::config::Runner>,
+    /// Durable remote queue intent. Only the pinned runner consumes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner_request: Option<String>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -520,6 +531,7 @@ impl Task {
             auto_resumes: 0,
             review_unseen: false,
             run_phase: None,
+            run_failure: None,
             crash_restarts: 0,
             restart_at: None,
             launch_at: None,
@@ -530,7 +542,10 @@ impl Task {
             cleanup_retry_at: None,
             base_commit: None,
             integration: IntegrationState::None,
+            landing_pending: None,
+            run_duplicate: false,
             runner: None,
+            runner_request: None,
         }
     }
 

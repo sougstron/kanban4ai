@@ -233,6 +233,9 @@ async fn lease_request(
         if request.store_id != journal.node.store_id {
             return Err(invalid("SYNC_STORE_MISMATCH"));
         }
+        // The outbound peer has now confirmed its post-bootstrap store identity.
+        // Its original pairing card may still contain the empty store's UUID.
+        super::api::refresh_peer_store(&root, &peer, &journal.node.store_id)?;
         journal.confirm_id_leases(&peer, &request.vector)?;
         settings::acknowledge(&root, &peer, &request.vector)?;
         let mut operations = Vec::new();
@@ -764,6 +767,20 @@ pub(super) fn start(root: &Path) -> Running {
             }
         }
     });
+    let monitor_root = root.to_path_buf();
+    tasks.spawn(async move {
+        loop {
+            if let Err(e) = discovery::probes(&monitor_root).await {
+                eprintln!("runner availability: {e}");
+            }
+            let root = monitor_root.clone();
+            if let Err(e) = blocking(move || crate::core::code::reconcile(&root)).await {
+                eprintln!("code replication: {e}");
+            }
+            let interval = discovery::config(&monitor_root).map_or(30, |c| c.interval);
+            tokio::time::sleep(Duration::from_secs(interval)).await;
+        }
+    });
     let relay_root = root.to_path_buf();
     tasks.spawn(async move {
         let mut changes = CHANGED.subscribe();
@@ -789,7 +806,7 @@ pub(super) fn start(root: &Path) -> Running {
             // Ignore our own notification; other workers observe the projection.
             changes.borrow_and_update();
             let interval = crate::core::sync::relay::settings(&relay_root)
-                .map_or(60, |config| config.relay_interval);
+                .map_or(60, |config| config.relay_interval.min(config.log_interval));
             force = tokio::select! {
                 _ = changes.changed() => true,
                 _ = tokio::time::sleep(Duration::from_secs(interval)) => false,
@@ -832,6 +849,15 @@ pub(super) fn start(root: &Path) -> Running {
         // Unreachable: the JoinSet aborts this task; workers end with it via drop.
     });
     Running { tasks }
+}
+
+pub(super) async fn catch_up(root: &Path, peer: &PeerCard) -> Result<()> {
+    let config = discovery::config(root)?;
+    let (link, _) = Link::connect(root, &config, peer).await?;
+    link.cycle()
+        .await?
+        .ok_or_else(|| invalid("Runner replica is not bootstrapped"))?;
+    Ok(())
 }
 
 /// The Sync tab's view of a reachable peer: the route that answered and
@@ -899,6 +925,10 @@ pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<
         }
         Ok(_) => (),
         Err(e) => results.push(("git-relay".into(), Err(e))),
+    }
+    let code_root = root.to_path_buf();
+    if let Err(e) = blocking(move || crate::core::code::reconcile(&code_root)).await {
+        results.push(("code-remote".into(), Err(e)));
     }
     Ok(results)
 }
@@ -1240,6 +1270,33 @@ mod tests {
             tokio::time::sleep(POLL * 2).await;
             assert!(presence()[&mobile_id].bye.is_some());
             server_http.abort();
+            // Bootstrap replaces the mobile store UUID. Its authenticated
+            // acknowledgement must also update the server's trusted relay peer.
+            let remote = tempfile::tempdir().unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "--bare", "--quiet"])
+                    .arg(remote.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            for root in [a, b] {
+                let path = root.join("config.yaml");
+                let mut config: serde_yaml_ng::Value = discovery::load(&path).unwrap();
+                config["sync"]["relay_remote"] =
+                    serde_yaml_ng::Value::String(remote.path().display().to_string());
+                atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&config).unwrap()).unwrap();
+            }
+            let offline = copy
+                .create_task(NewTask::titled("mobile relay after bootstrap"))
+                .unwrap();
+            crate::core::sync::relay::cycle(a, true).unwrap();
+            crate::core::sync::relay::cycle(b, true).unwrap();
+            assert!(
+                board.task_exists(&offline.id),
+                "server must accept post-bootstrap mobile relay writes"
+            );
         });
     }
 

@@ -35,6 +35,7 @@ pub(super) struct Config {
     pub(super) home_networks: Vec<IpNet>,
     pub(super) probe_timeout: u64,
     pub(super) interval: u64,
+    pub(super) run_heartbeat: u64,
     pub(super) max_skew: u64,
     pub(super) peers: Vec<PeerCard>,
 }
@@ -44,6 +45,7 @@ impl Default for Config {
             home_networks: Vec::new(),
             probe_timeout: 3,
             interval: 30,
+            run_heartbeat: 60,
             max_skew: 300,
             peers: Vec::new(),
         }
@@ -126,9 +128,9 @@ pub(super) fn config(root: &Path) -> Result<Config> {
         .map(serde_yaml_ng::from_value)
         .transpose()?
         .unwrap_or_default();
-    if config.probe_timeout == 0 || config.interval == 0 {
+    if config.probe_timeout == 0 || config.interval == 0 || config.run_heartbeat == 0 {
         return Err(invalid(
-            "sync.probe_timeout and sync.interval must be positive",
+            "sync.probe_timeout, sync.interval and sync.run_heartbeat must be positive",
         ));
     }
     Ok(config)
@@ -467,6 +469,31 @@ async fn probe_peer(
     }
     Ok(status(peer, presence, code, remote_version.as_ref()))
 }
+
+pub(super) async fn runner_online(root: &Path, peer: &PeerCard) -> Result<bool> {
+    let config = config(root)?;
+    let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
+    let presence: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
+    Ok(probe_peer(
+        root,
+        &config,
+        peer,
+        credentials.iter().find(|c| c.node_id == peer.node.node_id),
+        presence
+            .get(&peer.node.node_id)
+            .unwrap_or(&Presence::default()),
+        in_lan(&config)?,
+    )
+    .await?
+    .code
+        == "ONLINE"
+        || crate::core::sync::relay::available(
+            root,
+            &peer.node.node_id,
+            Utc::now().timestamp_millis().max(0) as u64,
+        )?)
+}
+
 pub(super) async fn probes(root: &Path) -> Result<Vec<Status>> {
     let config = config(root)?;
     let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
@@ -504,6 +531,31 @@ pub(super) async fn probes(root: &Path) -> Result<Vec<Status>> {
             result.code = "ONLINE";
             result.path = "relay";
             result.message = format!("{} в сети через git-relay", display_node(&peer.node));
+        }
+        if matches!(
+            result.code,
+            "ONLINE" | "OFFLINE" | "NODE_POWERED_OFF" | "NODE_UNREACHABLE" | "NODE_SERVICE_DOWN"
+        ) {
+            let root = root.to_path_buf();
+            let node = peer.node.node_id.clone();
+            let online = result.code == "ONLINE";
+            let bye = presence.get(&node).and_then(|p| p.bye.clone());
+            let timeout = config
+                .interval
+                .max(config.run_heartbeat)
+                .saturating_mul(3)
+                .min(i64::MAX as u64) as i64;
+            tokio::task::spawn_blocking(move || {
+                crate::core::runner_failure::observe(
+                    &root,
+                    &node,
+                    online,
+                    bye.as_ref().map(|b| (b.at, b.reason.as_str())),
+                    timeout,
+                )
+            })
+            .await
+            .map_err(|e| invalid(e.to_string()))??;
         }
         statuses.push(result);
     }

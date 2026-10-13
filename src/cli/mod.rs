@@ -25,7 +25,7 @@ use crate::core::config::Config;
 use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
 use crate::core::limits;
-use crate::core::models::{RunMode, Task, TaskStatus};
+use crate::core::models::{RunMode, RunPhase, Task, TaskStatus};
 use crate::core::operations::{
     AgentExitOutcome, LandOutcome, Operations, QuestionRef, TaskPatch, Verdict, WaitWake,
 };
@@ -429,7 +429,12 @@ enum Command {
     Recover { task_id: String },
     /// Land an isolated task branch into the work folder (re-runs the merge
     /// after a conflict was resolved, or lands a `land: manual` board).
-    Integrate { task_id: String },
+    Integrate {
+        task_id: String,
+        /// Select a replicated result when offline runs produced two branches.
+        #[arg(long)]
+        branch: Option<String>,
+    },
     /// Stop the running agent session for a task (leaves the task In Progress).
     Stop { task_id: String },
 
@@ -1129,6 +1134,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 RunMode::Queued
             };
             match ops.rerun_review_task(&task_id, session.as_deref(), mode)? {
+                Some(task)
+                    if task.session.is_none() && task.run_phase != Some(RunPhase::Queued) =>
+                {
+                    println!("Re-run requested for {task_id} on its runner");
+                }
                 Some(task) if mode == RunMode::Immediate => println!(
                     "Task {task_id} re-running ({})",
                     task.session.as_deref().unwrap_or("none")
@@ -1267,6 +1277,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             if let Some(session) = &task.session {
                 println!("Session: {session}");
+            }
+            if let Some(code) = &task.run_failure {
+                println!("Run failure: {code}");
             }
             for run in crate::core::sync::remote_runs(ops.data_root(), &task.id)? {
                 println!(
@@ -1437,11 +1450,17 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             None => eprintln!("Task {task_id} not found"),
         },
-        Command::Integrate { task_id } => match ops.integrate_task(&task_id)? {
+        Command::Integrate { task_id, branch } => match match branch.as_deref() {
+            Some(branch) => ops.integrate_received(&task_id, branch)?,
+            None => ops.integrate_task(&task_id)?,
+        } {
             Some((task, LandOutcome::Landed { changed })) => {
                 println!(
                     "Landed {} into {} ({} path(s), unstaged):",
-                    task.branch.as_deref().unwrap_or("branch"),
+                    branch
+                        .as_deref()
+                        .or(task.branch.as_deref())
+                        .unwrap_or("branch"),
                     ops.work_path().display(),
                     changed.len()
                 );
@@ -1475,8 +1494,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         },
         Command::Stop { task_id } => match ops.stop_task(&task_id)? {
             Some(task) => {
-                let session = task.session.as_deref().unwrap_or("unknown");
-                println!("Stopped {task_id} session {session}");
+                if let Some(session) = task.session.as_deref() {
+                    println!("Stopped {task_id} session {session}");
+                } else {
+                    println!("Stop requested for {task_id} on its runner");
+                }
             }
             None => {
                 eprintln!("Task {task_id} not found");

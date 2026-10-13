@@ -995,6 +995,9 @@ fn render_action_bar(
         if app.task_can_stop(task) {
             buttons.push(("Stop k".to_string(), UiAction::Stop));
         }
+        if app.board.remote_runs.contains_key(&task.id) || task.runner.is_some() {
+            buttons.push(("Log L".to_string(), UiAction::ViewLog));
+        }
         if has_questions {
             buttons.push(("Answer w".to_string(), UiAction::AnswerQuestion));
         }
