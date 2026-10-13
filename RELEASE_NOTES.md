@@ -1,5 +1,10 @@
 # Unreleased
 
+- **Removed Gemini limits.** Gemini no longer appears in the status row or
+  `kanban limits`, including when loading an older cache. Removed Code Assist
+  quota/OAuth requests, pi spend and exhaustion tracking, and Gemini quota
+  gating for executor pools. Gemini models remain available to agent backends.
+
 - **Completed code replication and per-node landing.** Finished isolated runs
   retain immutable per-node/generation refs and publish results through the
   project remote; delivery retries independently of HTTP connectivity.

@@ -157,7 +157,7 @@ pub fn record_readings(provider: &str, windows: &[LimitWindow], observed_at: i64
     }
     let Some(path) = history_path() else { return };
     let last = last_readings(&path);
-    for window in windows.iter().filter(|window| window.spent_usd.is_none()) {
+    for window in windows {
         let reading = LimitReading {
             at: observed_at,
             provider: provider.to_string(),
