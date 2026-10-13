@@ -347,6 +347,8 @@ pub fn badges(
                 Some(crate::core::config::Runner::Server) => "⏸ ждёт server",
                 Some(crate::core::config::Runner::Laptop) => "⏸ ждёт laptop",
                 Some(crate::core::config::Runner::Mobile) => "⏸ ждёт mobile",
+                // Parked by the merge-conflict hold, not by a full board.
+                _ if task.conflict_held => "⏸ conflict hold",
                 _ => "⏸ queued",
             },
             app.theme.warn,

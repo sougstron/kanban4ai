@@ -3559,6 +3559,7 @@ fn mouse_backend_selection_refreshes_each_role_popup() {
             AgentSlot::Primary => DialogField::Model,
             AgentSlot::Designer => DialogField::DesignerModel,
             AgentSlot::Reviewer => DialogField::ReviewerModel,
+            AgentSlot::Arbiter => DialogField::ArbiterModel,
         };
         assert!(modal.options_for(model_field).len() > 1);
     }
@@ -9889,6 +9890,64 @@ fn global_settings_backends_tab_reorders_backend_pickers() {
         store.load_global_config().unwrap().backend_order(),
         expected
     );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn global_settings_auto_tab_saves_auto_mode() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-glob-auto");
+    let _ = std::fs::remove_dir_all(&work);
+    let (store_dir, mut app) = projects_app(&work, None);
+
+    // Left from Common wraps onto Sync, Projects, Backends, then Auto.
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open global settings");
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Left)).expect("previous tab");
+    }
+    let modal = app.modal.as_ref().expect("global settings modal");
+    assert_eq!(modal.settings_tab, SettingsTab::Auto);
+    assert_eq!(modal.active_field(), DialogField::AutoModeEnabled);
+    assert!(!modal.auto_mode_enabled);
+
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("enable auto mode");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::AutoModeArbiter);
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("arbiter answers");
+    insta::assert_snapshot!("global_settings_auto_tab", render_at(&mut app, 100, 30));
+
+    // The arbiter picker is its own agent slot with the backend catalog.
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::ArbiterAgentSettings);
+    app.handle_key(key(KeyCode::Enter))
+        .expect("open arbiter picker");
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.agent_popup_slot(), Some(AgentSlot::Arbiter));
+    assert!(modal.options_for(DialogField::ArbiterBackend).len() > 1);
+    app.handle_key(key(KeyCode::Esc))
+        .expect("close arbiter picker");
+    assert!(app.modal.as_ref().unwrap().agent_popup_slot().is_none());
+
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+    assert!(app.modal.is_none());
+    let mode = ProjectStore::at(store_dir.path())
+        .load_global_config()
+        .unwrap()
+        .auto_mode();
+    assert!(mode.enabled);
+    assert_eq!(mode.questions, crate::core::global::AutoQuestions::Arbiter);
+    assert_eq!(mode.arbiter_timeout_secs, 900);
 
     let _ = std::fs::remove_dir_all(&work);
 }

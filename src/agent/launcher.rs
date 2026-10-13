@@ -25,6 +25,10 @@ impl AgentLauncher for KanbanLauncher {
     fn detach(&self) -> Option<Box<dyn AgentLauncher + Send>> {
         Some(Box::new(KanbanLauncher))
     }
+
+    fn spawn_arbiter(&self, roots: Roots<'_>, task_id: &str) -> Result<bool> {
+        crate::agent::arbiter::spawn_arbiter(roots, task_id)
+    }
 }
 
 fn launch(

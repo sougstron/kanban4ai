@@ -111,6 +111,14 @@ pub trait AgentLauncher {
     fn detach(&self) -> Option<Box<dyn AgentLauncher + Send>> {
         None
     }
+
+    /// Start a detached auto-mode arbiter that answers the task's open
+    /// questions (`kanban arbiter <TASK-ID>`). `Ok(false)` — the default, and
+    /// what test stubs keep — means no arbiter started, so the caller falls
+    /// back to the `decide` answer.
+    fn spawn_arbiter(&self, _roots: Roots<'_>, _task_id: &str) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Test and fallback launcher that deliberately does not spawn processes.
@@ -358,6 +366,10 @@ pub struct Operations {
 }
 
 impl Operations {
+    pub(crate) fn launcher(&self) -> &dyn AgentLauncher {
+        self.launcher.as_ref()
+    }
+
     pub fn new(project_path: impl AsRef<Path>) -> Self {
         Self::with_launcher(project_path, Box::new(KanbanLauncher))
     }
@@ -419,7 +431,7 @@ impl Operations {
         )
     }
 
-    fn thread_manager(&self) -> Result<ThreadManager> {
+    pub(crate) fn thread_manager(&self) -> Result<ThreadManager> {
         ThreadManager::new(self.data_root())
     }
 
@@ -1180,6 +1192,8 @@ impl Operations {
                     &stats::Tags::default(),
                 );
                 task.run_phase = Some(RunPhase::Queued);
+                task.queued_at = Some(timefmt::now());
+                task.conflict_held = false;
             } else if will_auto_launch && orchestrator_enabled {
                 task.run_phase = Some(RunPhase::Orchestrate);
             } else if will_auto_launch && designer_enabled {
@@ -1308,6 +1322,12 @@ impl Operations {
     /// Human waiting queues are retried by the frontend, without publishing a
     /// relay launch intent or claiming a run on behalf of the remote runner.
     pub(crate) fn queue_local_run(&self, task_id: &str) -> Result<Option<Task>> {
+        self.queue_local_run_as(task_id, true)
+    }
+
+    /// [`Self::queue_local_run`]; `fresh: false` marks a resume of work that
+    /// already started, which a merge-conflict hold never parks.
+    pub(crate) fn queue_local_run_as(&self, task_id: &str, fresh: bool) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(None);
@@ -1348,6 +1368,10 @@ impl Operations {
         task.run_phase = Some(RunPhase::Queued);
         task.runner_request = None;
         task.updated_at = timefmt::now();
+        // New work: held while the board has a merge conflict. A resume of
+        // a run that already started (auto mode's answered question) is not.
+        task.queued_at = fresh.then_some(task.updated_at);
+        task.conflict_held = false;
         self.storage.save_task(&task)?;
         self.post_queue_note(&task.id, "⏸ queued — waiting for a free agent slot");
         Ok(Some(task))
@@ -1368,6 +1392,8 @@ impl Operations {
         }
         task.reset_human_restart();
         task.run_phase = None;
+        task.queued_at = None;
+        task.conflict_held = false;
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         self.post_queue_note(&task.id, "⏸ taken out of the queue — run it manually");
@@ -1392,6 +1418,10 @@ impl Operations {
         }
         let config = self.config.load()?;
         let (settings, phase) = upcoming_run_plan(&config, task)?;
+        // New work waits behind a merge conflict like any queued entry.
+        if task.integration != IntegrationState::Conflict && self.conflict_hold()?.is_some() {
+            return Ok(true);
+        }
         Ok(!Slots::measure(self)?.has_room(
             &orch,
             &settings.backend,
@@ -2767,6 +2797,27 @@ impl Operations {
         )))
     }
 
+    /// Silence mode, plus auto mode with `questions: decide`: nobody will
+    /// answer an agent question, so it is refused outright. Human-authored
+    /// questions are not affected by auto mode.
+    fn refuse_questions(&self, task: &Task, role: MessageRole) -> Result<()> {
+        Self::refuse_silence_questions(task)?;
+        if role == MessageRole::Agent && self.auto_decides_questions() {
+            return Err(KanbanError::Permission(format!(
+                "auto mode is on: questions on {} are refused. Decide yourself, keep working, and record the decision with kanban suggest",
+                task.id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Whether an agent question moves its task to Review. Auto mode keeps
+    /// the task In Progress: the arbiter answers it and the run resumes
+    /// without a human ever opening the Review column.
+    fn questions_go_to_review(&self) -> Result<bool> {
+        Ok(self.config.get_rule("questions_go_to_review")? && !self.auto_mode().enabled)
+    }
+
     pub fn ask_question(
         &self,
         task_id: &str,
@@ -2789,7 +2840,7 @@ impl Operations {
         let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
             return Ok(None);
         };
-        Self::refuse_silence_questions(&task)?;
+        self.refuse_questions(&task, role_for_source(source))?;
 
         if let Some(session_id) = session_id {
             self.require_current_agent_session(&task, session_id)?;
@@ -2807,12 +2858,16 @@ impl Operations {
 
         task.has_questions = tm.has_open_questions(&task.id)?;
         task.updated_at = timefmt::now();
-        if self.config.get_rule("questions_go_to_review")? {
+        if self.questions_go_to_review()? {
             task.status = TaskStatus::Review;
             task.review_unseen = role_for_source(source) == MessageRole::Agent;
         }
         self.storage.save_task(&task)?;
+        drop(_guard);
         self.notify_question(&task, question);
+        if role_for_source(source) == MessageRole::Agent {
+            self.auto_route_questions(&task.id);
+        }
         Ok(Some(task))
     }
 
@@ -2832,13 +2887,13 @@ impl Operations {
         let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
             return Ok(None);
         };
-        Self::refuse_silence_questions(&task)?;
+        let role = role_for_source(source);
+        self.refuse_questions(&task, role)?;
 
         if let Some(session_id) = session_id {
             self.require_current_agent_session(&task, session_id)?;
         }
 
-        let role = role_for_source(source);
         for question in &form.questions {
             tm.post(
                 &task.id,
@@ -2854,12 +2909,16 @@ impl Operations {
         let count = form.questions.len();
         task.has_questions = tm.has_open_questions(&task.id)?;
         task.updated_at = timefmt::now();
-        if self.config.get_rule("questions_go_to_review")? {
+        if self.questions_go_to_review()? {
             task.status = TaskStatus::Review;
             task.review_unseen = role == MessageRole::Agent;
         }
         self.storage.save_task(&task)?;
+        drop(_guard);
         self.notify_question(&task, &format!("{count} question(s) via form"));
+        if role == MessageRole::Agent {
+            self.auto_route_questions(&task.id);
+        }
         Ok(Some((task, count)))
     }
 
@@ -2868,6 +2927,19 @@ impl Operations {
         task_id: &str,
         question_ref: QuestionRef,
         answer: &str,
+    ) -> Result<Option<AnswerOutcome>> {
+        self.answer_question_as(task_id, question_ref, answer, MessageRole::Human)
+    }
+
+    /// [`Self::answer_question`] recorded as `role`'s answer: auto mode's
+    /// own answers are `System`, so the thread never passes them off as the
+    /// human's.
+    pub(crate) fn answer_question_as(
+        &self,
+        task_id: &str,
+        question_ref: QuestionRef,
+        answer: &str,
+        answered_by: MessageRole,
     ) -> Result<Option<AnswerOutcome>> {
         let (mut task, tm, expected_session, pool_wait_answer) = {
             let _guard = self.storage.lock()?;
@@ -2904,7 +2976,7 @@ impl Operations {
                 .and_then(|message| message.author)
                 .unwrap_or_default();
             let is_pool_question = source == EXECUTOR_POOL_QUESTION_SOURCE;
-            tm.answer(&task.id, &msg_id, answer, MessageRole::Human)?;
+            tm.answer(&task.id, &msg_id, answer, answered_by)?;
             task.has_questions = tm.has_open_questions(&task.id)?;
             // Answer-first: a provider answer is materialized before the
             // wake, so the fresh run starts on the chosen backend. A "wait"
@@ -3448,7 +3520,7 @@ impl Operations {
             let Some((mut task, tm)) = self.load_task_and_prepare_thread(task_id)? else {
                 return Ok(None);
             };
-            Self::refuse_silence_questions(&task)?;
+            self.refuse_questions(&task, MessageRole::Agent)?;
             if let Some(session_id) = session_id {
                 self.require_current_agent_session(&task, session_id)?;
             }
@@ -3463,7 +3535,7 @@ impl Operations {
             )?;
             task.has_questions = tm.has_open_questions(&task.id)?;
             task.updated_at = timefmt::now();
-            if self.config.get_rule("questions_go_to_review")? {
+            if self.questions_go_to_review()? {
                 task.status = TaskStatus::Review;
                 task.review_unseen = true;
             }
@@ -3471,6 +3543,7 @@ impl Operations {
             (task, tm, message)
         };
         self.notify_question(&task, question);
+        self.auto_route_questions(&task.id);
 
         let session_mgr = self.session_manager();
         let started = Instant::now();
@@ -4031,7 +4104,9 @@ impl Operations {
             return false;
         }
         match self.land_task_branch(task) {
-            Ok(LandOutcome::Conflict { .. }) => iso.on_conflict == IsolationOnConflict::Resolver,
+            Ok(LandOutcome::Conflict { .. }) => {
+                self.resolver_wanted(task, iso.on_conflict == IsolationOnConflict::Resolver)
+            }
             Ok(_) => false,
             Err(err) => {
                 self.post_queue_note(
@@ -4050,8 +4125,23 @@ impl Operations {
     /// (`on_conflict: resolver`): [`Self::rerun_review_task`] folds the
     /// conflict report into the thread and relaunches the agent on a fresh
     /// session. Must be called with no board lock held.
-    fn dispatch_resolver(&self, task_id: &str) {
-        if let Err(err) = self.rerun_review_task(task_id, None, RunMode::Immediate) {
+    pub(crate) fn dispatch_resolver(&self, task_id: &str) {
+        // The re-run resets the human-restart counters, the resolver budget
+        // with them; this run is automatic, so it is counted afterwards.
+        let spent = self
+            .storage
+            .load_task(task_id)
+            .ok()
+            .flatten()
+            .map_or(0, |task| task.resolver_runs);
+        let result = self.rerun_review_task(task_id, None, RunMode::Immediate);
+        if let Ok(_guard) = self.storage.lock()
+            && let Ok(Some(mut task)) = self.storage.load_task(task_id)
+        {
+            task.resolver_runs = spent.saturating_add(1);
+            let _ = self.storage.save_task(&task);
+        }
+        if let Err(err) = result {
             self.post_queue_note(
                 task_id,
                 &format!(
@@ -4158,6 +4248,7 @@ impl Operations {
                     ));
                 }
                 task.integration = IntegrationState::Landed;
+                task.resolver_runs = 0;
                 task.landing_pending = None;
                 let files = changed
                     .iter()
@@ -4507,11 +4598,14 @@ impl Operations {
                 )));
             }
             let outcome = self.land_task_branch(&mut task)?;
+            let resolver = matches!(outcome, LandOutcome::Conflict { .. })
+                && self.resolver_wanted(
+                    &task,
+                    self.config.get_orchestration()?.isolation.on_conflict
+                        == IsolationOnConflict::Resolver,
+                );
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
-            let resolver = matches!(outcome, LandOutcome::Conflict { .. })
-                && self.config.get_orchestration()?.isolation.on_conflict
-                    == IsolationOnConflict::Resolver;
             (task, outcome, resolver)
         };
         if resolver {

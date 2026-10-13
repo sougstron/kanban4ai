@@ -165,7 +165,12 @@ the plain-letter hotkeys.
   Settings"): the same tabs minus Prompt and the inherit checkboxes, project
   name, theme and isolation row — they edit the global values the projects
   inherit. Its Common tab adds the machine-only settings (Updates section,
-  Esc-from-board, project sorting, update check on open).
+  Esc-from-board, project sorting, update check on open). Its **Auto** tab
+  edits auto mode (`docs/config.md`, "Auto mode"): the on/off switch,
+  **Questions** (ticked: an arbiter agent answers; unticked: the agent
+  decides itself), the arbiter's agent settings (same picker as the
+  designer/reviewer bots), the arbiter timeout and the resolver-run budget.
+  A queued card parked by the merge-conflict hold shows `⏸ conflict hold`.
 - `e`: Edit task
 - `d` / `Ctrl+d` / `Delete` / `Backspace`: Delete task
 - `m`: Move task
