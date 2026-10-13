@@ -9599,9 +9599,11 @@ fn global_settings_projects_tab_hides_and_restores_a_project() {
     };
     assert_eq!(project_rows(&app), 1);
 
-    // Left from Common wraps onto the Projects tab, Global Settings only.
+    // Left from Common wraps onto Sync, then the Projects tab, Global
+    // Settings only.
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open global settings");
+    app.handle_key(key(KeyCode::Left)).expect("sync tab");
     app.handle_key(key(KeyCode::Left)).expect("projects tab");
     let modal = app.modal.as_ref().expect("global settings modal");
     assert_eq!(modal.settings_tab, SettingsTab::Projects);
@@ -9630,6 +9632,7 @@ fn global_settings_projects_tab_hides_and_restores_a_project() {
 
     // Ticking it again brings the row back.
     app.handle_key(key(KeyCode::Char('s'))).expect("reopen");
+    app.handle_key(key(KeyCode::Left)).expect("sync tab");
     app.handle_key(key(KeyCode::Left)).expect("projects tab");
     assert!(!app.modal.as_ref().unwrap().project_visibility[0].visible);
     app.handle_key(key(KeyCode::Char(' '))).expect("tick");
@@ -9656,9 +9659,10 @@ fn global_settings_backends_tab_reorders_backend_pickers() {
     let _ = std::fs::remove_dir_all(&work);
     let (store_dir, mut app) = projects_app(&work, None);
 
-    // Left from Common wraps onto Projects, then Backends.
+    // Left from Common wraps onto Sync, then Projects, then Backends.
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open global settings");
+    app.handle_key(key(KeyCode::Left)).expect("sync tab");
     app.handle_key(key(KeyCode::Left)).expect("projects tab");
     app.handle_key(key(KeyCode::Left)).expect("backends tab");
     let modal = app.modal.as_ref().expect("global settings modal");
@@ -12751,4 +12755,356 @@ fn projects_background_scan_preserves_selection_and_applies_updates() {
         &app.visible_project_items()[app.project_selected],
         super::projects::ProjectListItem::Project(row) if row.project.id == added.project.id
     ));
+}
+
+/// Global Settings → Sync with two paired nodes written straight into the
+/// store config, the way pairing leaves them.
+fn sync_tab_app(work: &std::path::Path) -> (tempfile::TempDir, App) {
+    let _ = std::fs::remove_dir_all(work);
+    let (store_dir, mut app) = projects_app(work, None);
+    let store = ProjectStore::at(store_dir.path());
+    let mut config = store.load_global_config().unwrap();
+    config.extras.insert(
+        "sync".into(),
+        serde_yaml_ng::from_str(
+            "peers:\n\
+             - {node_id: n-server, name: server, role: server, store_id: s, address: '192.168.0.20:7420'}\n\
+             - {node_id: n-phone, name: phone, role: mobile, store_id: s, dial: outbound, address: '0.0.0.0:0'}\n",
+        )
+        .unwrap(),
+    );
+    store.save_global_config(&config).unwrap();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open global settings");
+    app.handle_key(key(KeyCode::Left)).expect("sync tab");
+    app.settings.refresh_interval = std::time::Duration::from_secs(60);
+    let sync = &mut app.modal.as_mut().unwrap().sync;
+    if let Some(request) = sync.request.take() {
+        sync.execute(store_dir.path(), request);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while sync.busy() {
+        sync.poll(store_dir.path(), std::time::Duration::from_secs(60), false);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    (store_dir, app)
+}
+
+fn peer_order(store: &ProjectStore) -> Vec<String> {
+    store.load_global_config().unwrap().extras["sync"]["peers"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .map(|p| p["node_id"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[test]
+fn global_settings_sync_tab_snapshot() {
+    use crate::cli::serve::settings::{Peer, View};
+    use crate::core::sync::NodeRole;
+    let (_store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-tab"));
+    let modal = app.modal.as_mut().expect("global settings modal");
+    assert_eq!(modal.settings_tab, SettingsTab::Sync);
+    assert_eq!(modal.active_field(), DialogField::SyncPanel);
+    let loaded = modal.sync.view.as_ref().expect("loaded on first show");
+    assert_eq!(loaded.name, "laptop");
+    assert_eq!(loaded.peers.len(), 2);
+    assert!(!loaded.probed);
+    // Live probe results are network-bound, so the snapshot pins them.
+    modal.sync.view = Some(View {
+        name: "laptop".into(),
+        role: NodeRole::Laptop,
+        api_enabled: true,
+        api_active: Some(true),
+        peers: vec![
+            Peer {
+                id: "n-server".into(),
+                name: "server".into(),
+                role: NodeRole::Server,
+                route: "LAN".into(),
+                code: "ONLINE".into(),
+                message: "Сервер в сети".into(),
+                exchange: Some("12:30".into()),
+                pending: 3,
+                clones: vec!["demo: ready · /srv/clones/demo · integration 1a2b3c4d".into()],
+            },
+            Peer {
+                id: "n-phone".into(),
+                name: "phone".into(),
+                role: NodeRole::Mobile,
+                route: "phone dials in".into(),
+                code: String::new(),
+                message: "Телефон: был в сети 09:15".into(),
+                exchange: None,
+                pending: 7,
+                clones: Vec::new(),
+            },
+        ],
+        conflicts: vec!["demo/task TASK-001 · title: kept «Fix login», lost «Fix auth»".into()],
+        local_clones: vec!["demo: missing · /tmp/k4ai-sync-tab · integration —".into()],
+        probed: true,
+    });
+    insta::assert_snapshot!("global_settings_sync_tab", render_at(&mut app, 100, 40));
+    // At a small terminal size the lower read-only sections remain reachable.
+    for _ in 0..10 {
+        app.handle_key(key(KeyCode::PageDown)).unwrap();
+    }
+    let rendered = render_at(&mut app, 80, 24);
+    assert!(rendered.contains("Fix auth"), "{rendered}");
+    assert!(rendered.contains("integration —"), "{rendered}");
+    insta::assert_snapshot!("global_settings_sync_scrolled", rendered);
+}
+
+#[test]
+fn global_settings_sync_tab_changes_node_and_peer_order() {
+    let (store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-actions"));
+    let store = ProjectStore::at(store_dir.path());
+    let root = store_dir.path();
+
+    // Role is a switch: Space walks laptop → server and saves at once.
+    app.handle_key(key(KeyCode::Down)).expect("role row");
+    app.handle_key(key(KeyCode::Char(' '))).expect("next role");
+    let node = crate::core::sync::Journal::open(root).unwrap().node;
+    assert_eq!(node.role, crate::core::sync::NodeRole::Server);
+
+    // Enter on the name opens a one-line form; Enter saves it.
+    app.handle_key(key(KeyCode::Up)).expect("name row");
+    app.handle_key(key(KeyCode::Enter)).expect("rename form");
+    assert!(app.modal.as_ref().unwrap().sync_overlay_open());
+    for _ in 0.."laptop".len() {
+        app.handle_key(key(KeyCode::Backspace)).expect("erase");
+    }
+    for c in "home-srv".chars() {
+        app.handle_key(key(KeyCode::Char(c))).expect("type");
+    }
+    insta::assert_snapshot!("global_settings_sync_rename", render_at(&mut app, 100, 30));
+    app.handle_key(key(KeyCode::Enter)).expect("save name");
+    let modal = app.modal.as_ref().expect("dialog stays open");
+    assert!(!modal.sync_overlay_open());
+    assert_eq!(modal.sync.view.as_ref().unwrap().name, "home-srv");
+    assert_eq!(
+        crate::core::sync::Journal::open(root).unwrap().node.name,
+        "home-srv"
+    );
+
+    // An invalid name is refused with a message, nothing saved.
+    app.handle_key(key(KeyCode::Enter)).expect("rename form");
+    app.handle_key(key(KeyCode::Char('X'))).expect("type");
+    app.handle_key(key(KeyCode::Enter)).expect("refused");
+    let notice = app.modal.as_ref().unwrap().sync.notice.clone();
+    assert!(matches!(notice, Some((_, true))), "{notice:?}");
+
+    // The phone's priority order: K on the second node moves it up.
+    assert_eq!(peer_order(&store), ["n-server", "n-phone"]);
+    for _ in 0..9 {
+        app.handle_key(key(KeyCode::Down)).expect("walk to phone");
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
+        .expect("move up");
+    assert_eq!(peer_order(&store), ["n-phone", "n-server"]);
+    let view = app.modal.as_ref().unwrap().sync.view.clone().unwrap();
+    assert_eq!(view.peers[0].name, "phone");
+    // The cursor followed the node; Shift+↓ moves it back.
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
+        .expect("move down");
+    assert_eq!(peer_order(&store), ["n-server", "n-phone"]);
+
+    // Pairing code: an empty address gives a bare code, Esc closes it.
+    app.handle_key(key(KeyCode::End)).expect("refresh row");
+    app.handle_key(key(KeyCode::Up)).expect("code row");
+    app.handle_key(key(KeyCode::Enter)).expect("code form");
+    app.handle_key(key(KeyCode::Enter)).expect("make code");
+    let (code, qr) = app
+        .modal
+        .as_ref()
+        .unwrap()
+        .sync
+        .pairing
+        .clone()
+        .expect("code");
+    assert_eq!(code.len(), 6);
+    assert!(qr.is_none());
+    assert!(root.join("sync/pair-code.yaml").exists());
+    app.handle_key(key(KeyCode::Esc)).expect("close code");
+    let modal = app.modal.as_ref().expect("Esc closes only the overlay");
+    assert!(modal.sync.pairing.is_none());
+
+    // Save leaves everything above in place.
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+    assert!(app.modal.is_none());
+    assert_eq!(peer_order(&store), ["n-server", "n-phone"]);
+    assert_eq!(
+        crate::core::sync::Journal::open(root).unwrap().node.name,
+        "home-srv"
+    );
+}
+
+#[test]
+fn global_settings_sync_tab_qr_needs_a_lan_address() {
+    let (_store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-qr"));
+    app.handle_key(key(KeyCode::End)).expect("refresh row");
+    app.handle_key(key(KeyCode::Up)).expect("code row");
+    app.handle_key(key(KeyCode::Enter)).expect("code form");
+    for c in "8.8.8.8:7420".chars() {
+        app.handle_key(key(KeyCode::Char(c))).expect("type");
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("refused");
+    let sync = &app.modal.as_ref().unwrap().sync;
+    assert!(sync.pairing.is_none());
+    assert!(matches!(&sync.notice, Some((text, true)) if text.contains("LAN")));
+
+    app.handle_key(key(KeyCode::Enter)).expect("code form");
+    for c in "192.168.0.10:7420".chars() {
+        app.handle_key(key(KeyCode::Char(c))).expect("type");
+    }
+    app.handle_key(key(KeyCode::Enter)).expect("make QR");
+    let (_, qr) = app
+        .modal
+        .as_ref()
+        .unwrap()
+        .sync
+        .pairing
+        .clone()
+        .expect("code");
+    assert!(qr.is_some_and(|qr| qr.lines().count() > 10));
+}
+
+#[test]
+fn global_settings_network_snapshots() {
+    use super::sync_tab::Row;
+    use crate::core::net::Mode;
+    let (_store, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-network-snapshots"));
+    let tab = &mut app.modal.as_mut().unwrap().sync;
+    tab.network_mode = Some(Mode::Managed);
+    tab.network = Some(Ok(serde_json::json!({
+        "BackendState": "Running",
+        "TailscaleIPs": ["100.64.0.7"],
+        "Self": {"UserID": 42},
+        "User": {"42": {"LoginName": "example@example.com"}},
+        "Peer": {
+            "a": {"HostName":"server", "Online":true, "CurAddr":"192.168.0.20:41641"},
+            "b": {"HostName":"phone", "Online":true, "CurAddr":"", "Relay":"fra"},
+            "c": {"HostName":"offline", "Online":false}
+        }
+    })));
+    tab.selected = tab
+        .rows()
+        .iter()
+        .position(|row| *row == Row::NetworkMode)
+        .unwrap();
+    for width in [40, 50, 60, 100] {
+        insta::assert_snapshot!(
+            format!("global_settings_network_{width}"),
+            render_at(&mut app, width, 36)
+        );
+    }
+    let tab = &mut app.modal.as_mut().unwrap().sync;
+    tab.selected = tab
+        .rows()
+        .iter()
+        .position(|row| *row == Row::Logout)
+        .unwrap();
+    insta::assert_snapshot!(
+        "global_settings_network_actions_40",
+        render_at(&mut app, 40, 24)
+    );
+    let tab = &mut app.modal.as_mut().unwrap().sync;
+    tab.selected = tab
+        .rows()
+        .iter()
+        .position(|row| *row == Row::AuthKey)
+        .unwrap();
+    tab.input(key(KeyCode::Enter));
+    app.handle_paste("tskey-auth-private-never-visible")
+        .unwrap();
+    let text = render_at(&mut app, 40, 24);
+    assert!(!text.contains("tskey"));
+    insta::assert_snapshot!("global_settings_network_auth_40", text);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.modal.as_ref().unwrap().sync.auth_key,
+        "tskey-auth-private-never-visible"
+    );
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(
+        app.modal.as_ref().unwrap().sync.auth_key.is_empty(),
+        "Cancel discards the key"
+    );
+    let tab = &mut app.modal.as_mut().unwrap().sync;
+    let url = "https://login.tailscale.com/a/snapshot-login";
+    tab.login_url = Some(url.into());
+    tab.login_qr = Some(
+        qrcode::QrCode::new(url.as_bytes())
+            .unwrap()
+            .render::<qrcode::render::unicode::Dense1x2>()
+            .build(),
+    );
+    for width in [40, 50, 60] {
+        let text = render_at(&mut app, width, 30);
+        assert!(text.contains("login.tailscale.com"));
+        insta::assert_snapshot!(format!("global_settings_network_login_{width}"), text);
+    }
+}
+
+#[test]
+fn global_settings_network_mode_is_immediate_and_system_is_read_only() {
+    use super::sync_tab::Row;
+    use crate::core::net::{self, Mode};
+    let (store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-network-actions"));
+    let store = ProjectStore::at(store_dir.path());
+    let mut config = store.load_global_config().unwrap();
+    config.extras.insert(
+        "net".into(),
+        serde_yaml_ng::from_str("tailscale:\n  mode: off\n  socks_port: 11055\n").unwrap(),
+    );
+    store.save_global_config(&config).unwrap();
+    let tab = &mut app.modal.as_mut().unwrap().sync;
+    tab.selected = tab
+        .rows()
+        .iter()
+        .position(|row| *row == Row::NetworkMode)
+        .unwrap();
+    for expected in [Mode::System, Mode::Managed, Mode::Off] {
+        app.handle_key(key(KeyCode::Char(' '))).unwrap();
+        let tab = &mut app.modal.as_mut().unwrap().sync;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tab.busy() {
+            tab.poll(store_dir.path(), std::time::Duration::from_secs(60), false);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(net::settings(store_dir.path()).unwrap().mode, expected);
+        assert_eq!(net::settings(store_dir.path()).unwrap().socks_port, 11055);
+        if expected == Mode::System {
+            tab.selected = tab
+                .rows()
+                .iter()
+                .position(|row| *row == Row::Connect)
+                .unwrap();
+            tab.input(key(KeyCode::Enter));
+            assert!(tab.request.is_none());
+            assert!(matches!(&tab.notice, Some((text, true)) if text.contains("read-only")));
+            tab.selected = tab
+                .rows()
+                .iter()
+                .position(|row| *row == Row::NetworkMode)
+                .unwrap();
+        }
+    }
+    // Cancel closes the draft dialog, not these already-applied local controls.
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(app.modal.is_none());
+    assert_eq!(net::settings(store_dir.path()).unwrap().mode, Mode::Off);
+    assert!(
+        store.load_global_config().unwrap().extras["net"]["tailscale"]
+            .get("auth_key")
+            .is_none()
+    );
 }

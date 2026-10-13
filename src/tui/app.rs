@@ -2791,8 +2791,24 @@ impl App {
                 }
             }
             Some(HitAction::ModalTab(tab)) => {
-                if let Some(modal) = self.modal.as_mut() {
+                if let Some(mut modal) = self.modal.take() {
                     modal.set_settings_tab(tab);
+                    self.service_sync_tab(&mut modal);
+                    self.modal = Some(modal);
+                }
+            }
+            Some(HitAction::ModalOption {
+                field: DialogField::SyncPanel,
+                index,
+            }) => {
+                if let Some(mut modal) = self.modal.take() {
+                    modal.focus_field(DialogField::SyncPanel);
+                    modal.sync.selected = index;
+                    modal
+                        .sync
+                        .input(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    self.service_sync_tab(&mut modal);
+                    self.modal = Some(modal);
                 }
             }
             Some(HitAction::ModalOption { field, index }) => {
@@ -3036,6 +3052,10 @@ impl App {
         self.expire_limits_status_at(now);
         self.expire_transient_status_at(now);
         self.expire_session_states_at(timefmt::now());
+        if let Some(mut modal) = self.modal.take() {
+            self.service_sync_tab(&mut modal);
+            self.modal = Some(modal);
+        }
         if self.store.is_some() {
             self.pump_store_throttled();
         } else {
@@ -4406,6 +4426,34 @@ impl App {
                 Some(config)
             }
             _ => self.ops.config.load().ok(),
+        }
+    }
+
+    /// Global Settings → Sync: load the page the first time it shows, run
+    /// whatever its keys asked for and collect finished background probes.
+    fn service_sync_tab(&mut self, modal: &mut ModalState) {
+        if !matches!(modal.modal, Modal::GlobalSettings) {
+            return;
+        }
+        let Some(store) = &self.store else {
+            return;
+        };
+        let root = store.root().to_path_buf();
+        let sync = &mut modal.sync;
+        sync.poll(
+            &root,
+            self.settings.refresh_interval,
+            modal.settings_tab == SettingsTab::Sync,
+        );
+        if modal.settings_tab == SettingsTab::Sync
+            && sync.view.is_none()
+            && sync.notice.is_none()
+            && sync.request.is_none()
+        {
+            sync.request = Some(super::sync_tab::Request::Load);
+        }
+        if let Some(request) = sync.request.take() {
+            sync.execute(&root, request);
         }
     }
 
@@ -6012,6 +6060,17 @@ impl App {
                     self.modal = Some(modal);
                     return Ok(true);
                 }
+                // The Sync page's input forms and pairing code own Esc,
+                // Enter and the arrows until they close.
+                KeyCode::Esc if modal.sync_overlay_open() => modal.sync.close_overlay(),
+                KeyCode::Enter | KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                    if modal.sync_overlay_open() =>
+                {
+                    modal.input(key);
+                }
+                KeyCode::Enter if modal.active_field() == DialogField::SyncPanel => {
+                    modal.input(key);
+                }
                 KeyCode::Esc => return self.request_modal_close(modal),
                 // Alt+Up/Down walk the form fields from anywhere — text
                 // carets and selector lists included — where the plain
@@ -6123,6 +6182,7 @@ impl App {
             }
         }
         self.sync_inherit_checkboxes(&mut modal, inherit_before);
+        self.service_sync_tab(&mut modal);
         if let Some(slot) = ModalState::agent_slot(field_before) {
             let after = slot_selection_snapshot(&modal, field_before);
             if after.backend != slot_before.backend
@@ -7625,7 +7685,8 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor
         | DialogField::ProjectVisibility
-        | DialogField::BackendOrder => None,
+        | DialogField::BackendOrder
+        | DialogField::SyncPanel => None,
         DialogField::ProjectSort => Some(modal.project_sort_selected),
         DialogField::ChainTo => Some(modal.chain_selected),
         DialogField::TargetStatus => Some(modal.status_selected),

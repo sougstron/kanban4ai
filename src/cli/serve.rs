@@ -33,6 +33,7 @@ pub(crate) use embedded::Embedded;
 mod discovery;
 mod git;
 mod pairing;
+pub(crate) mod settings;
 mod sync;
 pub use discovery::DiscoveryOptions;
 pub use pairing::PairingOptions;

@@ -544,7 +544,12 @@ fn login_output(reader: impl Read, announce: bool, printed: Arc<AtomicBool>) -> 
     output
 }
 
-fn login(root: &Path, config: &Settings, auth: Option<&Path>) -> Result<()> {
+fn login(
+    root: &Path,
+    config: &Settings,
+    auth: Option<&Path>,
+    announce: bool,
+) -> Result<Option<String>> {
     let mut cmd = command(root, config.mode)?;
     cmd.arg("up")
         .arg("--json")
@@ -576,7 +581,7 @@ fn login(root: &Path, config: &Settings, auth: Option<&Path>) -> Result<()> {
         .spawn()
         .map_err(|_| invalid(format!("{DOWN}: tailscale up failed")))?;
     let printed = Arc::new(AtomicBool::new(false));
-    let announce = auth.is_none();
+    let announce = announce && auth.is_none();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let out_printed = Arc::clone(&printed);
@@ -594,10 +599,25 @@ fn login(root: &Path, config: &Settings, auth: Option<&Path>) -> Result<()> {
         if let Some(path) = auth {
             fs::remove_file(path)?;
         }
-        Ok(())
+        Ok(None)
     } else {
-        if auth.is_none() && !printed.load(Ordering::Relaxed) {
+        if auth.is_none() && announce && !printed.load(Ordering::Relaxed) {
             show_login(&status, Some(&output));
+        }
+        if auth.is_none() && !announce {
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if let Some(url) = status
+                .get("AuthURL")
+                .and_then(Value::as_str)
+                .filter(|url| url.starts_with("https://login.tailscale.com/"))
+                .or_else(|| login_url(&text))
+            {
+                return Ok(Some(url.to_owned()));
+            }
         }
         Err(invalid(format!(
             "{LOGIN}: run kanban net up to authenticate"
@@ -687,7 +707,7 @@ impl Manager {
         if logged_in(&value) {
             Ok(())
         } else if let Some(auth) = config.auth_key_file.as_deref().filter(|p| p.exists()) {
-            login(&self.root, &config, Some(auth))
+            login(&self.root, &config, Some(auth), false).map(|_| ())
         } else {
             Err(invalid(format!(
                 "{LOGIN}: run kanban net up to authenticate"
@@ -718,6 +738,32 @@ impl Drop for Manager {
 }
 
 pub fn up(root: &Path, auth: Option<&Path>) -> Result<()> {
+    up_inner(root, auth, true).map(|_| ())
+}
+
+/// TUI login: no terminal output, and the one-time key is never configuration.
+/// The private temporary file is removed on success, failure, or cancellation.
+pub fn connect(root: &Path, key: &str) -> Result<Option<String>> {
+    let paths = Paths::new(root);
+    paths.prepare()?;
+    let mut auth = if key.is_empty() {
+        None
+    } else {
+        let mut file = tempfile::NamedTempFile::new_in(&paths.net)?;
+        file.as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(key.as_bytes())?;
+        file.as_file().sync_all()?;
+        Some(file)
+    };
+    let result = up_inner(root, auth.as_ref().map(|f| f.path()), false);
+    if let Some(file) = auth.take() {
+        let _ = file.close();
+    }
+    result
+}
+
+fn up_inner(root: &Path, auth: Option<&Path>, announce: bool) -> Result<Option<String>> {
     let root = fs::canonicalize(root)?;
     let config = settings(&root)?;
     if config.mode == Mode::Off {
@@ -751,6 +797,7 @@ pub fn up(root: &Path, auth: Option<&Path>) -> Result<()> {
         &root,
         &config,
         auth.or(config.auth_key_file.as_deref().filter(|p| p.exists())),
+        announce,
     )
 }
 

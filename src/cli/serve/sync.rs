@@ -234,6 +234,7 @@ async fn lease_request(
             return Err(invalid("SYNC_STORE_MISMATCH"));
         }
         journal.confirm_id_leases(&peer, &request.vector)?;
+        settings::acknowledge(&root, &peer, &request.vector)?;
         let mut operations = Vec::new();
         for (alias, uid) in journal.project_uids()? {
             if journal.issues_id_leases(&uid)? {
@@ -466,7 +467,11 @@ impl Link {
             }
         }
         let (root, peer, ack) = (self.root.clone(), self.peer.clone(), acknowledged.clone());
-        blocking(move || Journal::open(&root)?.confirm_id_leases(&peer, &ack)).await?;
+        blocking(move || {
+            Journal::open(&root)?.confirm_id_leases(&peer, &ack)?;
+            settings::acknowledge(&root, &peer, &ack)
+        })
+        .await?;
         Ok(acknowledged)
     }
 
@@ -836,6 +841,31 @@ pub(super) async fn catch_up(root: &Path, peer: &PeerCard) -> Result<()> {
         .await?
         .ok_or_else(|| invalid("Runner replica is not bootstrapped"))?;
     Ok(())
+}
+
+/// The Sync tab's view of a reachable peer: the route that answered and
+/// the peer's own clone status for each project (`GET /git/<id>/status`).
+pub(super) async fn settings_peer(
+    root: &Path,
+    config: &Config,
+    peer: &PeerCard,
+    projects: &[String],
+) -> Result<(String, Vec<String>)> {
+    let (link, _) = Link::connect(root, config, peer).await?;
+    let route = if crate::core::net::is_tailnet_address(&link.base) {
+        "tailnet"
+    } else {
+        "LAN"
+    };
+    let mut clones = Vec::with_capacity(projects.len());
+    for id in projects {
+        let request = link.http.get(format!("{}/git/{id}/status", link.base));
+        clones.push(match link.send::<serde_json::Value>(request).await {
+            Ok(status) => settings::clone_line(&status),
+            Err(e) => format!("{id}: {e}"),
+        });
+    }
+    Ok((route.into(), clones))
 }
 
 /// One catch-up cycle with every paired peer (`serve --sync`, and the tail

@@ -1,0 +1,120 @@
+---
+source: src/tui/tests.rs
+expression: text
+---
+┌ Tailscale login ───────────────────────────────┐
+│Open this link or scan the QR:                  │
+│https://login.tailscale.com/a/snapshot-login    │
+│                                                │
+│                                                │
+│    █▀▀▀▀▀█ █▀ ▄▀ ▀ █▄▀▄ ▄█ █ █▀▀▀▀▀█           │
+│    █ ███ █ ▀▀ ▀▀  ▀▀▀▀▀  ▀█▄ █ ███ █           │
+│    █ ▀▀▀ █ ▀▄▀█▀██▀ ▄▀ █▄ ██ █ ▀▀▀ █           │
+│    ▀▀▀▀▀▀▀ ▀▄█ ▀▄▀ ▀ █▄█ ▀▄▀ ▀▀▀▀▀▀▀           │
+│    █  ▀▀▀▀██▄ █  ▀█▀▀▄█   █▀▀  █▄██▀           │
+│    ▀▄▀▄█ ▀█▀█▀ ▀ ██▀█▀▄ ▀ █▄█ ▄▀▀██▀           │
+│     ▄▄ ▄ ▀ █▀▄ █▀▀ █▀▀█▀▀█▄▀▄▀▀  ▄▀▀           │
+│    ▀▀ ▀▀▄▀█▄█▀▀▀█▄▄▀  ▄ ▀▄ ▄▄▀██▄█ ▄           │
+│    ▄ ▀▀  ▀█▄▀▄█▀██▄▄ ███▄█ ▀▀█▀█ ▄ ▄           │
+│    ▄▀██▄▄▀▀▄ ▀████▀▄▄▄▀▄▄ █ ▄▄▀▄██▄▀           │
+│    █▄▄▀▀▀▀   █▀ ▄█ ▄▄▄▀█▀▄▄▀  ▄▄▀▄ ▀           │
+│    █ █▀ ▀▀██▀ ▀█▄▀▀█▄▄  ▀ ▀ ▀ ▄▀ ▄▀▀           │
+│    ▀▀▀ ▀ ▀ ▄▀█ █  ██ ▄▀   ▀█▀▀▀█▀▄▄            │
+│    █▀▀▀▀▀█ ██▀ ██▄█  ▀▀ ▀▀██ ▀ █▄█▄            │
+│    █ ███ █ █▄███▀   █▀▀██ ▀▀█▀█▀▄  █           │
+│    █ ▀▀▀ █  █ █  ▄▄█ ▀ ▀▀█  ▀ ██████           │
+│    ▀▀▀▀▀▀▀ ▀   ▀▀  ▀▀     ▀▀ ▀▀▀               │
+│                                                │
+│                                                │
+│Waiting for login… Enter/Esc closes.            │
+│                                                │
+│                                                │
+│                                                │
+└────────────────────────────────────────────────┘
+ Projects │ Enter open · n new · ? help           
+
+--- style runs ---
+0:0-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+1:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+1:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+1:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+2:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+2:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+2:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+3:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+3:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+3:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+4:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+4:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+4:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+5:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+5:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+5:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+6:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+6:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+6:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+7:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+7:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+7:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+8:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+8:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+8:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+9:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+9:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+9:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+10:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+10:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+10:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+11:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+11:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+11:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+12:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+12:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+12:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+13:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+13:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+13:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+14:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+14:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+14:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+15:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+15:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+15:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+16:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+16:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+16:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+17:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+17:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+17:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+18:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+18:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+18:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+19:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+19:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+19:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+20:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+20:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+20:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+21:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+21:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+21:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+22:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+22:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+22:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+23:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+23:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+23:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+24:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+24:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+24:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+25:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+25:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+25:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+26:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+26:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+26:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+27:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+27:1-49 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
+27:49-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+28:0-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
+29:0-50 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)

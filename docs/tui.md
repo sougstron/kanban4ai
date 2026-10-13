@@ -266,6 +266,57 @@ dialog (unregister by default; Space toggles
 returns to the board this list was opened from, or quits when the list is the
 entry screen.
 
+### Global Settings → Sync
+
+From the Projects screen, `s` opens Global Settings. Select **Sync** in the
+tab strip (`←/→`, `Alt+←/→`, or a click). The page shows this node's name and
+role (`laptop`, `server`, `mobile`), the API user-unit switch, Tailscale mode,
+paired nodes in phone connection priority order, last confirmed exchanges,
+unconfirmed operation counts, field conflicts and project clone statuses.
+
+- `↑/↓` selects a control; `Enter` or Space activates it. Name, role, API,
+  pairing and Refresh controls also accept a mouse click.
+- Name opens an input; role cycles through the three roles. API enables and
+  starts `kanban4ai-serve.service` with `systemctl --user`, or stops and
+  disables it. When no unit is installed, the page installs one for the
+  current executable and store. A mobile node cannot enable an inbound API.
+- Select a peer and use `Shift+↑/↓` or `K/J` to change phone priority.
+- **Pair with a node** asks for the peer's LAN IP:port and one-time code,
+  plus this node's LAN IP:port for the return connection (optional on mobile).
+- **Show a pairing code / phone QR** creates a one-time code. Leave the
+  address empty for a code only; enter this node's LAN IP:port for a phone QR.
+  The QR uses the full terminal area; `Enter` or `Esc` closes it.
+- **Refresh status** (`r`) probes peers and fetches reachable peers' real
+  `GET /git/<project>/status` responses without blocking the page. Codes have
+  human-readable explanations; an absent phone is neutral, not an error.
+- `PgUp/PgDn` scrolls the read-only details, conflicts and clones when they
+  exceed the dialog height. Arrow navigation returns to the selected control.
+
+Sync changes apply immediately, independently of the dialog's Save/Cancel.
+
+**Сеть / Network** controls machine-local Tailscale networking:
+
+- Mode cycles **Off → System → Managed** and saves immediately. Switching
+  away from Managed disconnects its private sidecar without deleting login state.
+  System only reads the installed daemon; use the system Tailscale app/CLI to
+  connect, disconnect or log out.
+- Status refreshes in the background at the configured TUI refresh interval:
+  account, tailnet IPs, online peer count and each online peer's direct/DERP route.
+  Missing binaries, login requirements and stopped sidecars remain visible.
+- **Подключить / Connect** opens the Tailscale login link and full-screen QR.
+  The overlay closes automatically after login, or with `Enter`/`Esc`.
+  When the QR does not fit, the complete link wraps instead of clipping.
+- **Auth key** accepts typing or paste into a masked one-time input. Confirm
+  it, then select Connect. It is never stored in config, logs, or argv; its
+  private temporary file is removed after either success or failure.
+  Cancelling the input discards the key.
+- **Отключить / Disconnect** preserves `<store>/net/tailscale/` for the next
+  Connect or application start; **Выйти из аккаунта / Logout** revokes login.
+  Disconnect suppresses automatic restart until Connect.
+- Keyboard navigation and mouse clicks reach every control. At 40–60 columns
+  Sync uses the available terminal area; long status details wrap and selected
+  controls scroll into view.
+
 Board refresh tracks task, session and thread files separately. A heartbeat
 refreshes session-derived card state without parsing every task again; a
 thread post refreshes thread-derived flags and counts. Changed task files are

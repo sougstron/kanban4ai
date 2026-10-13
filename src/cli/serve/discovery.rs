@@ -84,14 +84,14 @@ pub(super) struct Presence {
     discovered: Vec<SocketAddr>,
 }
 #[derive(Serialize)]
-struct Status {
-    node: String,
+pub(super) struct Status {
+    pub(super) node: String,
     status: &'static str,
-    code: &'static str,
-    path: &'static str,
-    message: String,
+    pub(super) code: &'static str,
+    pub(super) path: &'static str,
+    pub(super) message: String,
     since: Option<DateTime<Utc>>,
-    last_seen: Option<DateTime<Utc>>,
+    pub(super) last_seen: Option<DateTime<Utc>>,
 }
 #[derive(Serialize, Deserialize)]
 struct Version {
@@ -492,7 +492,7 @@ pub(super) async fn runner_online(root: &Path, peer: &PeerCard) -> Result<bool> 
         )?)
 }
 
-async fn probes(root: &Path) -> Result<Vec<Status>> {
+pub(super) async fn probes(root: &Path) -> Result<Vec<Status>> {
     let config = config(root)?;
     let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
     let presence: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
@@ -1173,10 +1173,16 @@ mod tests {
             assert_eq!(result.code, "NODE_AUTH_FAILED");
             server.abort();
             let _ = server.await;
+            // Reserve a non-listening port. A dropped ephemeral listener can
+            // be reused by another parallel test before the refusal probe.
+            let refused = tokio::net::TcpSocket::new_v4().unwrap();
+            refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let mut stopped_peer = peer.clone();
+            stopped_peer.address = refused.local_addr().unwrap();
             let result = probe_peer(
                 root.path(),
                 &Config::default(),
-                &peer,
+                &stopped_peer,
                 Some(&secret),
                 &Presence::default(),
                 true,
