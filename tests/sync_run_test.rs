@@ -479,6 +479,64 @@ fn mobile_synced_last_answer_wakes_only_server_and_duplicate_does_not_replace_qu
 }
 
 #[test]
+fn mobile_answer_after_finished_server_run_does_not_claim_a_local_session() {
+    use kanban4ai::core::models::{MessageKind, MessageRole};
+    use kanban4ai::core::operations::{Operations, QuestionRef};
+    use kanban4ai::core::thread::ThreadManager;
+    let server = tempfile::tempdir().unwrap();
+    let mobile = tempfile::tempdir().unwrap();
+    let storage = control_board(server.path());
+    let journal = Journal::open(server.path()).unwrap();
+    let mobile_journal = peer(mobile.path(), &journal);
+    atomic_write_text(
+        &storage.project_path.join(".kanban/config.yaml"),
+        "auto_launch:\n  enabled: true\nrules:\n  resume_after_last_answer: true\n",
+    )
+    .unwrap();
+    let mut task = storage
+        .create_task(NewTask::titled("finished remote answer"))
+        .unwrap();
+    task.status = TaskStatus::InProgress;
+    task.session = Some("ses-finished-server".into());
+    storage.save_task(&task).unwrap();
+    let sessions = SessionManager::new(&storage.project_path);
+    sessions
+        .link_session(&task.id, "ses-finished-server")
+        .unwrap();
+    sessions.close_session("ses-finished-server").unwrap();
+    let question = ThreadManager::new(&storage.project_path)
+        .unwrap()
+        .post(
+            &task.id,
+            MessageRole::Agent,
+            MessageKind::Question,
+            "continue?",
+            None,
+            vec![],
+            Some("agent".into()),
+        )
+        .unwrap();
+    mobile_journal
+        .apply_remote(&operations(server.path(), &journal.node.node_id), 300_000)
+        .unwrap();
+    let frontend = Operations::new(mobile.path().join("projects/demo"));
+    let outcome = frontend
+        .answer_question(&task.id, QuestionRef::MsgId(question.id), "yes")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.remaining, 0);
+    assert!(outcome.resumed_session.is_none());
+    assert!(
+        SessionManager::new(frontend.data_root())
+            .list_active_sessions()
+            .is_empty()
+    );
+    let runs = mobile_journal.runs("demo", &task.id).unwrap();
+    assert!(!runs.contains_key(&mobile_journal.node.node_id));
+    assert_eq!(runs[&journal.node.node_id].state, RunState::Finished);
+}
+
+#[test]
 fn remote_rerun_routes_to_previous_runner_without_frontend_session() {
     use kanban4ai::core::models::RunMode;
     use kanban4ai::core::operations::Operations;

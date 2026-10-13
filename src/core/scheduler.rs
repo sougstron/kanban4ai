@@ -288,12 +288,15 @@ impl Operations {
 
         let mut dispatched = Vec::new();
         for candidate in candidates {
-            if !crate::cli::serve::local_runner(self.data_root(), candidate.runner.as_ref())? {
-                continue;
-            }
             if !crate::core::sync::remote_runs(&self.storage.project_path, &candidate.id)?
                 .is_empty()
             {
+                continue;
+            }
+            if !crate::cli::serve::local_runner(self.data_root(), candidate.runner.as_ref())? {
+                // A human waiting queue belongs to the frontend, unlike a
+                // runner_request already durably delivered through the relay.
+                crate::cli::serve::launch_on_board(self.data_root(), &candidate.id, None, true)?;
                 continue;
             }
             let Ok((settings, next_phase)) = upcoming_run_plan(&config, &candidate) else {

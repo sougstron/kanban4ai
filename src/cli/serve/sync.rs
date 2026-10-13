@@ -767,6 +767,16 @@ pub(super) fn start(root: &Path) -> Running {
             }
         }
     });
+    let monitor_root = root.to_path_buf();
+    tasks.spawn(async move {
+        loop {
+            if let Err(e) = discovery::probes(&monitor_root).await {
+                eprintln!("runner availability: {e}");
+            }
+            let interval = discovery::config(&monitor_root).map_or(30, |c| c.interval);
+            tokio::time::sleep(Duration::from_secs(interval)).await;
+        }
+    });
     let relay_root = root.to_path_buf();
     tasks.spawn(async move {
         let mut changes = CHANGED.subscribe();

@@ -505,6 +505,7 @@ impl Operations {
         copied.auto_resumes = 0;
         copied.review_unseen = false;
         copied.run_phase = None;
+        copied.run_failure = None;
         copied.crash_restarts = 0;
         copied.restart_at = None;
         copied.review_rounds = 0;
@@ -1300,6 +1301,12 @@ impl Operations {
         if crate::cli::serve::runner_action(self.data_root(), task_id, true)?.is_some() {
             return self.get_task(task_id);
         }
+        self.queue_local_run(task_id)
+    }
+
+    /// Human waiting queues are retried by the frontend, without publishing a
+    /// relay launch intent or claiming a run on behalf of the remote runner.
+    pub(crate) fn queue_local_run(&self, task_id: &str) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(None);
@@ -2955,8 +2962,28 @@ impl Operations {
         if !self.auto_launch_enabled()? || !self.config.get_rule("resume_after_last_answer")? {
             return Ok(None);
         }
-        if !crate::core::sync::remote_runs(&self.storage.project_path, task_id)?.is_empty() {
-            return Ok(None);
+        if let Some(store) = crate::core::sync::store_for_board(self.data_root())
+            && store.join("sync/node.yaml").exists()
+        {
+            let journal = crate::core::sync::Journal::open(store)?;
+            let project = self
+                .data_root()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| KanbanError::Invalid("invalid board".into()))?;
+            let runs = journal.runs(project, task_id)?;
+            if runs
+                .values()
+                .any(|run| run.active() && run.node_id != journal.node.node_id)
+                || runs
+                    .values()
+                    .max_by_key(|run| (run.generation, &run.node_id))
+                    .is_some_and(|run| run.node_id != journal.node.node_id)
+            {
+                // Finished foreign runs still own answer wakes. Only their
+                // runner may replace them when the synced answer arrives.
+                return Ok(None);
+            }
         }
 
         let session_mgr = self.session_manager();
@@ -3725,6 +3752,15 @@ impl Operations {
                 "Task {task_id} not found. Agent not started."
             )));
         };
+        crate::core::runner_failure::clear(self.data_root(), task_id)?;
+        let mut task = task;
+        task.run_failure = None;
+        if !self.work_path().is_dir() {
+            let code = crate::core::runner_failure::REPO_MISSING;
+            let message = "нет клона или снапшота; можно перезапустить на другом узле";
+            crate::core::runner_failure::record(self.data_root(), task_id, code, message)?;
+            return Err(KanbanError::Invalid(format!("{code}: {message}")));
+        }
         let task = self.record_launch_settings(task)?;
         let task = self.prepare_worktree(task)?;
         // Owned so `roots` can borrow the worktree path for its lifetime.
@@ -3738,6 +3774,17 @@ impl Operations {
             Ok(started) => Ok(started),
             Err(err) => {
                 self.log_launch_failure(&task, session_id, &err.to_string());
+                if err
+                    .to_string()
+                    .contains(crate::core::runner_failure::BACKEND_MISSING)
+                {
+                    crate::core::runner_failure::record(
+                        self.data_root(),
+                        task_id,
+                        crate::core::runner_failure::BACKEND_MISSING,
+                        &format!("{err}; можно перезапустить на другом узле"),
+                    )?;
+                }
                 Err(err)
             }
         }
@@ -5040,12 +5087,41 @@ impl Operations {
             .logs_dir
             .join(format!("{session_id}.transcript.jsonl"));
         let Some(event) = reply::fatal_error_event(&transcript) else {
+            if let Some(message) = crate::core::runner_failure::login_diagnostic(&transcript)
+                .or_else(|| {
+                    crate::core::runner_failure::login_diagnostic(
+                        &self.storage.logs_dir.join(format!("{session_id}.log")),
+                    )
+                })
+            {
+                let _ = crate::core::runner_failure::record(
+                    self.data_root(),
+                    task_id,
+                    crate::core::runner_failure::BACKEND_MISSING,
+                    &format!(
+                        "{message}; требуется вход в backend на runner; можно перезапустить на другом узле"
+                    ),
+                );
+                return CrashRestart::Skip;
+            }
             return CrashRestart::Backoff;
         };
         let Some(err) = provenance::stream_error(&event) else {
             return CrashRestart::Backoff;
         };
         self.post_queue_note(task_id, &format!("✖ agent error: {}", err.message));
+        if crate::core::runner_failure::authentication_error(&event, &err.message) {
+            let _ = crate::core::runner_failure::record(
+                self.data_root(),
+                task_id,
+                crate::core::runner_failure::BACKEND_MISSING,
+                &format!(
+                    "{}; требуется вход в backend на runner; можно перезапустить на другом узле",
+                    err.message
+                ),
+            );
+            return CrashRestart::Skip;
+        }
         if !err.retryable {
             self.post_queue_note(
                 task_id,

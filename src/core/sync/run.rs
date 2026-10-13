@@ -224,8 +224,19 @@ pub(super) fn capture(
     };
     let records = decode_fields(state.fields.get(&key(project, "run", &task_id)))?;
     let old = records.get(&journal.node.node_id);
-    let queued =
-        target.entity == "task" && task.get("run_phase").and_then(Value::as_str) == Some("queued");
+    // Waiting for an explicit remote runner does not claim a local run.
+    // Otherwise its replicated queued descriptor would exclude the real runner.
+    let queued = if target.entity == "task"
+        && task.get("run_phase").and_then(Value::as_str) == Some("queued")
+    {
+        let runner = task.get("runner").and_then(Value::as_str).map(|name| {
+            crate::core::config::Runner::parse(name)
+                .unwrap_or_else(|| crate::core::config::Runner::Node(name.to_owned()))
+        });
+        crate::cli::serve::local_runner(&board, runner.as_ref())?
+    } else {
+        false
+    };
     // An ordinary board edit on a peer must never create or claim a run.
     if target.entity == "task"
         && queued
@@ -282,6 +293,13 @@ pub(super) fn capture(
         .as_ref()
         .map(|s| timefmt::format(&s.last_seen))
         .unwrap_or_else(|| timefmt::format(&timefmt::now()));
+    let code = (state_of_run == RunState::Failed)
+        .then(|| {
+            task.get("run_failure")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .flatten();
     let mut run = RunDescriptor {
         node_id: journal.node.node_id.clone(),
         name: journal.node.name.clone(),
@@ -299,7 +317,7 @@ pub(super) fn capture(
             .map(str::to_owned)
             .or_else(|| old.and_then(|r| r.branch.clone())),
         heartbeat,
-        code: None,
+        code,
     };
     if let Some(old) = old {
         let config: Value = match fs::read_to_string(target.store.join("config.yaml")) {
