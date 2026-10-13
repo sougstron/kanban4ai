@@ -2873,10 +2873,7 @@ pub(super) fn filtered_indices(options: &[SelectOption], filter: &str) -> Vec<us
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Rect) -> Vec<Hitbox> {
-    let area = if matches!(modal.modal, Modal::GlobalSettings)
-        && modal.settings_tab == SettingsTab::Sync
-        && frame.area().width <= 60
-    {
+    let area = if frame.area().width < super::board::PORTRAIT_WIDTH {
         Rect {
             height: frame.area().height.saturating_sub(1),
             ..frame.area()
@@ -3094,7 +3091,15 @@ fn render_sub_popup(
     view: SubPopupView<'_>,
     hitboxes: &mut Vec<Hitbox>,
 ) {
-    let area = centered_percent(88, 90, parent_area);
+    let area = if frame.area().width < super::board::PORTRAIT_WIDTH {
+        Rect {
+            x: frame.area().x,
+            width: frame.area().width,
+            ..parent_area
+        }
+    } else {
+        centered_percent(88, 90, parent_area)
+    };
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(view.title)

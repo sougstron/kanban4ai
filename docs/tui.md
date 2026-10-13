@@ -34,6 +34,23 @@ Linux requires `xdg-open` and a registered browser/mail handler; macOS uses
 
 ## TUI Keyboard Shortcuts
 
+### Phone portrait layout
+
+Below 70 terminal columns, the board shows only the focused column.
+Cards occupy one row (task ID and truncated title); `?` marks open questions
+and `●` marks unseen review updates. The selected row is inverted.
+`←`/`→` and `Tab`/`Shift+Tab` switch columns; `↑`/`↓` and the wheel
+scroll cards as on the desktop board. Resize to 70 columns or wider to restore
+the side-by-side board without losing the selected column.
+
+The top `‹ 1/4 ›` pager is also tappable: its left half selects the previous
+column, its right half selects the next (wrapping at the ends). A card tap
+selects it and opens its detail on release. The terminal must translate taps
+into mouse events; no native touch/swipe protocol is required. Dialogs,
+including nested agent/options panels, use the full terminal width in portrait
+mode; forms keep their existing field scrolling and Save/Cancel controls.
+
+
 Action hotkeys work on both the board (focused card) and the open detail view.
 
 Detail type-to-edit: a Review task opens on the thread, so `Esc` closes the

@@ -638,6 +638,89 @@ fn renders_empty_and_populated_boards_in_both_themes() {
     insta::assert_snapshot!("populated_board", render_snapshot(&mut app));
 }
 
+#[test]
+fn portrait_board_snapshots() {
+    for width in [40, 50, 60] {
+        let (_dir, mut app) = plain_tasks_app(3);
+        app.ops
+            .create_task(NewTask::titled(
+                "Длинное название задачи для телефона 界界界",
+            ))
+            .unwrap();
+        app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+        insta::assert_snapshot!(
+            format!("portrait_board_{width}"),
+            render_at(&mut app, width, 24)
+        );
+        app.handle_key(key(KeyCode::Char('n'))).unwrap();
+        insta::assert_snapshot!(
+            format!("portrait_dialog_{width}"),
+            render_at(&mut app, width, 24)
+        );
+    }
+}
+
+#[test]
+fn portrait_navigation_scrolling_and_taps() {
+    for width in [40, 50, 60, 69] {
+        let (_dir, mut app) = plain_tasks_app(30);
+        let _ = render_at(&mut app, width, 12);
+        let hits = card_hits(&app);
+        assert!(
+            hits.iter().all(|(column, _, area)| *column == 0
+                && area.height == 1
+                && area.width == width - 2)
+        );
+        let second = hits[1].2;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second.x + 1,
+            second.y,
+        ))
+        .unwrap();
+        assert_eq!(app.focused_card, 1);
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            second.x + 1,
+            second.y,
+        ))
+        .unwrap();
+        assert_eq!(app.current_task().unwrap().title, "Plain task 2");
+        assert_eq!(app.screen, Screen::Detail);
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        for _ in 0..15 {
+            app.handle_key(key(KeyCode::Down)).unwrap();
+        }
+        let _ = render_at(&mut app, width, 12);
+        assert!(app.column_offsets[0] > 0);
+        assert!(
+            card_hits(&app)
+                .iter()
+                .any(|(_, card, _)| *card == app.focused_card)
+        );
+        app.handle_key(key(KeyCode::Right)).unwrap();
+        let _ = render_at(&mut app, width, 12);
+        assert_eq!(app.focused_column, 1);
+        assert!(card_hits(&app).is_empty());
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), width - 1, 0))
+            .unwrap();
+        assert_eq!(app.focused_column, 2);
+        let _ = render_at(&mut app, width, 12);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0))
+            .unwrap();
+        assert_eq!(app.focused_column, 1);
+        app.handle_key(key(KeyCode::Left)).unwrap();
+        let _ = render_at(&mut app, 70, 24);
+        assert_eq!(
+            app.hitboxes
+                .iter()
+                .filter(|hit| matches!(hit.action, HitAction::ColumnFocus(_)))
+                .count(),
+            app.board.columns.len()
+        );
+    }
+}
+
 fn review_card_border(app: &mut App) -> Style {
     app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
     let _ = render_at(app, 96, 28);
@@ -767,11 +850,6 @@ fn project_badge_degrades_instead_of_colliding_with_a_column_title() {
     let medium = rendered_lines(&mut app, 96, 28);
     assert!(medium[0].contains("▸ Long P…"), "{}", medium[0]);
     assert!(medium[0].contains("Done (0)"), "{}", medium[0]);
-
-    // Too little room left for a readable label: the frame stays clean.
-    let narrow = rendered_lines(&mut app, 60, 28);
-    assert!(!narrow[0].contains('▸'), "{}", narrow[0]);
-    assert!(narrow[0].contains("Done"), "{}", narrow[0]);
 }
 
 /// The badge sits inside the last column's area, so it has to be hit-tested
