@@ -3825,7 +3825,7 @@ fn selector_form_rows_from_scroll(
 /// Minimum visible text rows, excluding the textarea's borders.
 const DESCRIPTION_MIN_ROWS: u16 = 5;
 /// Maximum visible text rows; additional content scrolls within the field.
-const DESCRIPTION_MAX_ROWS: u16 = 20;
+const DESCRIPTION_MAX_ROWS: u16 = 15;
 
 fn task_field_min_height(field: DialogField) -> u16 {
     match field {

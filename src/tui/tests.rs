@@ -184,7 +184,7 @@ fn chain_selector_height_clamps_and_description_grows_taller() {
 }
 
 /// The description follows its own text: soft wrap at the current width sets
-/// the height (wider window, fewer rows), edits grow it up to the 20-row cap,
+/// the height (wider window, fewer rows), edits grow it up to the 15-row cap,
 /// deleting shrinks it back to the 5-row minimum, and the caret survives the
 /// measurement.
 #[test]
@@ -236,8 +236,8 @@ fn task_description_height_follows_its_text() {
     let _ = render_at(&mut app, 120, 80);
     assert_eq!(
         description_height(&app),
-        20,
-        "31 lines must clamp at the 20-row cap"
+        15,
+        "31 lines must clamp at the 15-row cap"
     );
 
     let caret;
@@ -258,7 +258,7 @@ fn task_description_height_follows_its_text() {
 }
 
 #[test]
-fn task_description_shows_five_to_twenty_text_rows_before_scrolling() {
+fn task_description_shows_five_to_fifteen_text_rows_before_scrolling() {
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     app.modal
@@ -276,12 +276,12 @@ fn task_description_shows_five_to_twenty_text_rows_before_scrolling() {
         }
         let screen = render_at(&mut app, 120, 80);
         let field = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
-        let visible_rows = count.clamp(5, 20);
+        let visible_rows = count.clamp(5, 15);
         assert_eq!(field.height.saturating_sub(2), visible_rows);
         for line in 1..=count {
             assert_eq!(
                 screen.contains(&format!("visible-line-{line:02}")),
-                line > count.saturating_sub(20),
+                line > count.saturating_sub(15),
                 "line {line} at {count} text rows"
             );
         }
