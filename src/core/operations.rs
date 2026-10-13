@@ -480,7 +480,7 @@ impl Operations {
         Ok(task)
     }
 
-    /// Copy a task's user-facing state and thread into a fresh task identity.
+    /// Copy a task's user-facing state and thread into a fresh To Do task.
     ///
     /// Run/session and worktree state belongs to the original task lifecycle,
     /// so a copy never inherits a live agent, restart bookkeeping, or isolation.
@@ -492,10 +492,11 @@ impl Operations {
         let source_thread = self.thread_manager()?.load(task_id)?;
         let created = self
             .storage
-            .create_task_in_status(NewTask::titled(source.title.clone()), source.status)?;
+            .create_task_in_status(NewTask::titled(source.title.clone()), TaskStatus::Todo)?;
         let now = timefmt::now();
         let mut copied = source;
         copied.id = created.id;
+        copied.status = TaskStatus::Todo;
         copied.session = None;
         copied.created_at = now;
         copied.updated_at = now;

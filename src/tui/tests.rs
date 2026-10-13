@@ -3914,22 +3914,99 @@ fn drag_selects_card_text_without_moving_or_opening_it() {
 }
 
 #[test]
-fn ctrl_c_copies_the_focused_task_without_quitting() {
-    let (_dir, mut app) = app_with_board();
-    let source = app
-        .ops
-        .create_task(NewTask::titled("Copy this task"))
-        .expect("create source task");
-    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
+fn ctrl_c_copies_only_the_viewed_task_to_todo_from_every_column() {
+    for status in ["todo", "in_progress", "review", "done", "archive"] {
+        let (_dir, mut app) = app_with_board();
+        let source = app
+            .ops
+            .create_task(NewTask::titled("Copy this task"))
+            .expect("create source task");
+        app.ops.move_task(&source.id, status, false).unwrap();
+        app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+        if status == "archive" {
+            app.handle_key(key(KeyCode::Char('a'))).unwrap();
+        } else {
+            app.focused_column = app
+                .board
+                .columns
+                .iter()
+                .position(|column| column.id == status)
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.screen, Screen::Detail);
+        assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-        .expect("copy focused task");
+        app.handle_key(ctrl_key(KeyCode::Char('c'))).unwrap();
 
-    let copied = app.focused_task().expect("focus copied task");
-    assert_ne!(copied.id, source.id);
-    assert_eq!(copied.title, source.title);
-    assert!(!app.should_quit);
-    assert_eq!(app.status, format!("Copied {} → {}", source.id, copied.id));
+        let copied = app.focused_task().expect("focus copied task");
+        assert_ne!(copied.id, source.id);
+        assert_eq!(copied.title, source.title);
+        assert_eq!(copied.status, TaskStatus::Todo);
+        assert!(copied.completed_at.is_none());
+        assert_eq!(app.screen, Screen::Board);
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.ops
+                .get_task(&source.id)
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
+            status
+        );
+    }
+}
+
+#[test]
+fn ctrl_c_exits_without_copying_on_board_dialogs_and_detail_text_panels() {
+    for context in ["board", "new", "edit", "review_edits", "answer", "search"] {
+        let (_dir, mut app) = app_with_board();
+        let source = app.ops.create_task(NewTask::titled("Do not copy")).unwrap();
+        if context == "review_edits" {
+            app.ops.move_task(&source.id, "review", false).unwrap();
+        } else if context == "answer" {
+            app.ops
+                .ask_question(&source.id, "Question?", "agent", vec![])
+                .unwrap();
+        }
+        app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+        let status = app.ops.get_task(&source.id).unwrap().unwrap().status;
+        app.focused_column = app
+            .board
+            .columns
+            .iter()
+            .position(|column| column.id == status.as_str())
+            .unwrap();
+        match context {
+            "new" => app.dispatch(UiAction::NewTask).unwrap(),
+            "edit" => app.dispatch(UiAction::EditTask).unwrap(),
+            "review_edits" | "answer" => {
+                app.handle_key(key(KeyCode::Enter)).unwrap();
+                app.detail.as_mut().unwrap().focus = if context == "answer" {
+                    DetailFocus::Answer
+                } else {
+                    DetailFocus::Edits
+                };
+            }
+            "search" => app.handle_key(key(KeyCode::Char('/'))).unwrap(),
+            _ => {}
+        }
+        app.handle_key(ctrl_key(KeyCode::Char('c'))).unwrap();
+        assert!(!app.should_quit, "{context}");
+        app.handle_key(ctrl_key(KeyCode::Char('c'))).unwrap();
+        assert!(app.should_quit, "{context}");
+        assert_eq!(
+            app.ops
+                .list_tasks(None, None, "created", "asc")
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec![source.id],
+            "{context}"
+        );
+    }
 }
 
 #[test]
@@ -6046,23 +6123,6 @@ fn phase_five_search_popup_escape_clears_and_enter_preserves_filter() {
         .expect("ignore board escape");
     assert!(!app.should_quit);
 
-    let task_count = app
-        .ops
-        .list_tasks(None, None, "created", "asc")
-        .expect("count source tasks")
-        .len();
-    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-        .expect("ctrl-c copies focused task");
-    assert!(!app.should_quit);
-    assert_eq!(
-        app.ops
-            .list_tasks(None, None, "created", "asc")
-            .expect("count copied tasks")
-            .len(),
-        task_count + 1
-    );
-    assert!(app.status.starts_with("Copied "));
-
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('/')))
         .expect("open search");
@@ -6076,10 +6136,6 @@ fn phase_five_search_popup_escape_clears_and_enter_preserves_filter() {
     app.handle_key(key(KeyCode::Char('q')))
         .expect("q does not quit from board");
     assert!(!app.should_quit);
-    assert_eq!(
-        app.status,
-        "Press ctrl + C twice to close when no task is selected"
-    );
     assert_eq!(app.search.text(), "kept", "q must not clear the filter");
 }
 

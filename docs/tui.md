@@ -191,7 +191,12 @@ the plain-letter hotkeys.
 - `/`: Search
 - `?`: Help overlay (scrollable, sized to its content; lists mouse gestures)
 - `q`: Back from detail/secondary screens — on the Projects screen `q` quits
-  the TUI; quit the TUI with `Ctrl+C` twice
+  the TUI; quit the TUI with `Ctrl+C` twice (within three seconds)
+- `Ctrl+C` in an open task's thread: copy the task and its thread to a fresh
+  To Do task, regardless of the original column (including Archive).
+  The board selects the copy. Everywhere else, including the board, new/edit
+  dialogs and the detail's answer/review-edit inputs, `Ctrl+C` is for exiting,
+  not copying.
 
 Clipboard pastes use bracketed paste: the whole block is inserted into the
 focused text field in one edit (flattened to a single line for one-line fields

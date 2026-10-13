@@ -823,7 +823,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  5h windows on the upper line, weekly/monthly on the lower"),
         Line::from("  hide the row with tui.show_limits: false · kanban limits prints it"),
         Line::from(""),
-        Line::from("?: toggle help · q/Esc: back · Ctrl+C: copy task"),
+        Line::from("?: toggle help · q/Esc: back · Ctrl+C twice: quit"),
+        Line::from("Ctrl+C on the task thread: copy task to To Do"),
     ]
 }
 
