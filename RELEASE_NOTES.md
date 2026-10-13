@@ -1,5 +1,11 @@
 # Unreleased
 
+- **Global Settings → Sync.** Node name/role, opt-in API user-unit switch,
+  one-time code/phone QR pairing, phone peer priority, live status explanations
+  and routes, confirmed exchange times, pending operations, conflicts and
+  local/remote Git clone status. Buttons work by keyboard and mouse; long
+  details wrap and PgUp/PgDn reaches the bottom of short dialogs.
+
 - **Git relay sync.** Paired laptop/server/mobile nodes can exchange operations
   through a bare git remote when LAN/tailnet is unavailable. Each node pushes
   only its append-only `refs/kanban/sync/<node_id>`; JSONL batches use the same
