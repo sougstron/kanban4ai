@@ -278,6 +278,15 @@ pub fn badges(
     app: &App,
 ) -> Vec<(String, ratatui::style::Color)> {
     let mut badges = Vec::new();
+    if task.run_duplicate {
+        badges.push((
+            "⚠ RUN_DUPLICATE · выбрать ветку в Review".into(),
+            app.theme.err,
+        ));
+    }
+    if let Some(node) = &task.landing_pending {
+        badges.push((format!("ожидает landing на {node}"), app.theme.warn));
+    }
     if let Some(runs) = app.board.remote_runs.get(&task.id) {
         for run in runs {
             badges.push((run.label(), app.theme.focus));

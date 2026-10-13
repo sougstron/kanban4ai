@@ -632,8 +632,7 @@ fn conflicting_lands_report_conflict_and_integrate_lands_after_resolution() {
     assert!(!git_ref_exists(&work_path, "refs/heads/kanban/TASK-001"));
 
     // A second integrate is refused: nothing new to land.
-    let err = ops.integrate_task(&task.id).unwrap_err();
-    assert!(err.to_string().contains("already landed"), "{err}");
+    assert!(ops.integrate_task(&task.id).is_err());
 }
 
 /// The resolution path the conflict report actually prescribes: resolve

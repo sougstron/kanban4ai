@@ -1496,10 +1496,18 @@ impl Operations {
             }
 
             if is_agent && self.config.get_rule("user_only_review_to_done")? {
-                if task.status == TaskStatus::Review {
+                // A peer can enter Review while this node's concurrent
+                // executor is still running; its result must still be sealed.
+                let duplicate = crate::core::code::duplicate_run(self.data_root(), task_id)?;
+                if task.status == TaskStatus::Review && !duplicate {
                     return Ok(None);
                 }
-                self.require_current_agent_session(&task, session_id)?;
+                let status = if duplicate && task.status == TaskStatus::Review {
+                    TaskStatus::Review
+                } else {
+                    TaskStatus::InProgress
+                };
+                self.require_agent_session_in_status(&task, session_id, status)?;
                 let context = self.context_manager().get_context(task_id, &self.storage)?;
                 if context.trim().is_empty() {
                     return Err(KanbanError::Permission(
@@ -1556,7 +1564,7 @@ impl Operations {
                     });
                 }
 
-                if self.should_start_bot_review(&task)? {
+                if !duplicate && self.should_start_bot_review(&task)? {
                     drop(_guard);
                     return self.start_bot_review(task_id, session_id);
                 }
@@ -1587,6 +1595,7 @@ impl Operations {
         };
 
         self.session_manager().close_session(session_id)?;
+        self.replicate_completed_code(&task.id);
 
         // The task just entered Review: launch any task chained to its completion.
         self.trigger_chained_tasks(&task.id)?;
@@ -1895,6 +1904,7 @@ impl Operations {
         };
 
         self.session_manager().close_session(session_id)?;
+        self.replicate_completed_code(task_id);
 
         match route {
             VerdictRoute::HumanReview { exhausted } => {
@@ -3259,7 +3269,16 @@ impl Operations {
     }
 
     fn require_current_agent_session(&self, task: &Task, session_id: &str) -> Result<()> {
-        let valid = task.status == TaskStatus::InProgress
+        self.require_agent_session_in_status(task, session_id, TaskStatus::InProgress)
+    }
+
+    fn require_agent_session_in_status(
+        &self,
+        task: &Task,
+        session_id: &str,
+        status: TaskStatus,
+    ) -> Result<()> {
+        let valid = task.status == status
             && task.session.as_deref() == Some(session_id)
             && self
                 .session_manager()
@@ -3958,6 +3977,14 @@ impl Operations {
         }
     }
 
+    fn replicate_completed_code(&self, task_id: &str) {
+        if let Some(root) = crate::core::sync::store_for_board(self.data_root())
+            && let Err(error) = crate::core::code::reconcile(root)
+        {
+            self.post_queue_note(task_id, &format!("Code publication pending: {error}"));
+        }
+    }
+
     /// Landing entry for the move to human Review (TASK-248): merge the
     /// task's branch into the work folder without ever committing on the
     /// user's branch or staging anything. Runs under the board lock held by
@@ -3967,6 +3994,16 @@ impl Operations {
     /// conflicted landing must auto-dispatch a resolver run (`on_conflict:
     /// resolver`) — the caller does that after releasing the board lock.
     fn land_on_review(&self, task: &mut Task) -> bool {
+        if let Err(error) = crate::core::code::seal_run(self.data_root(), self.work_path(), task) {
+            task.integration = IntegrationState::Pending;
+            self.post_queue_note(&task.id, &format!("Code publication pending: {error}"));
+            return false;
+        }
+        if crate::core::code::duplicate_run(self.data_root(), &task.id).unwrap_or(false) {
+            task.run_duplicate = true;
+            task.integration = IntegrationState::Pending;
+            return false;
+        }
         if task.branch.is_none() || task.worktree.is_none() {
             return false;
         }
@@ -4029,23 +4066,28 @@ impl Operations {
     /// with the reason already on the thread; board-level errors (config)
     /// propagate.
     fn land_task_branch(&self, task: &mut Task) -> Result<LandOutcome> {
-        let (Some(branch), Some(wt_rel)) = (&task.branch, &task.worktree) else {
+        let Some(branch) = &task.branch else {
             return Ok(LandOutcome::NotIsolated);
         };
-        let wt_path = self.storage.worktrees_dir.join(wt_rel);
-        if !wt_path.is_dir() {
+        let wt_path = task
+            .worktree
+            .as_ref()
+            .map(|rel| self.storage.worktrees_dir.join(rel));
+        if wt_path.as_ref().is_some_and(|path| !path.is_dir()) {
             return Ok(self.defer_landing(task, "the isolated worktree directory is gone"));
         }
         let Some(repo) = vcs::detect(self.work_path()) else {
             return Ok(self.defer_landing(task, "the work folder is no longer a git repository"));
         };
         let iso = self.config.get_orchestration()?.isolation.clone();
-
-        // 1. Commit everything the agent left uncommitted, so it still lands.
-        let tip = match repo.commit_all(
-            &wt_path,
-            &format!("kanban: {} uncommitted work at landing", task.id),
-        ) {
+        let committed = match &wt_path {
+            Some(path) => repo.commit_all(
+                path,
+                &format!("kanban: {} uncommitted work at landing", task.id),
+            ),
+            None => Ok(None),
+        };
+        let tip = match committed {
             Ok(Some(oid)) => oid,
             Ok(None) => match repo.read_ref(branch)? {
                 Some(oid) => oid,
@@ -4115,6 +4157,7 @@ impl Operations {
                     ));
                 }
                 task.integration = IntegrationState::Landed;
+                task.landing_pending = None;
                 let files = changed
                     .iter()
                     .map(|p| p.display().to_string())
@@ -4128,10 +4171,16 @@ impl Operations {
                         changed.len()
                     ),
                 );
-                self.cleanup_after_land(task, &iso, true);
+                if wt_path.is_some() && !task.run_duplicate {
+                    self.cleanup_after_land(task, &iso, true);
+                }
                 Ok(LandOutcome::Landed { changed })
             }
             vcs::Preflight::Conflict { paths, stages } => {
+                let Some(wt_path) = &wt_path else {
+                    task.integration = IntegrationState::Conflict;
+                    return Ok(LandOutcome::Conflict { paths });
+                };
                 // 5. Nothing was written anywhere. The human side is merged
                 //    INTO the task's own worktree, so the conflict markers
                 //    appear only in that isolated checkout (work_path stays
@@ -4140,7 +4189,7 @@ impl Operations {
                 //    and re-dispatches, or — with `on_conflict: resolver` —
                 //    a resolver run is dispatched immediately.
                 task.integration = IntegrationState::Conflict;
-                let merged = repo.merge_into_worktree(&wt_path, w.as_str());
+                let merged = repo.merge_into_worktree(wt_path, w.as_str());
                 // Advance the integration ref to W, so the next landing
                 // snapshots on top of it. Without this the next snapshot is
                 // parented on the pre-conflict integration tip again, the
@@ -4162,7 +4211,7 @@ impl Operations {
                         ),
                     );
                 }
-                task.review_edits = self.conflict_report(task, &wt_path, &stages, &merged);
+                task.review_edits = self.conflict_report(task, wt_path, &stages, &merged);
                 let list = paths.join(", ");
                 let tail = match iso.on_conflict {
                     IsolationOnConflict::Resolver => "; resolver run dispatched",
@@ -4377,6 +4426,50 @@ impl Operations {
         Ok(swept)
     }
 
+    /// Land a received Review branch without creating or checking out a worktree.
+    pub fn integrate_received(
+        &self,
+        task_id: &str,
+        branch: &str,
+    ) -> Result<Option<(Task, LandOutcome)>> {
+        let _guard = self.storage.lock()?;
+        let Some(mut task) = self.storage.load_task(task_id)? else {
+            return Ok(None);
+        };
+        if task.status != TaskStatus::Review {
+            return Err(KanbanError::Invalid(
+                "received branches can only land in Review".into(),
+            ));
+        }
+        let expected =
+            crate::core::code::validate_review_branch(self.data_root(), task_id, branch)?;
+        let repo = vcs::detect(self.work_path())
+            .ok_or_else(|| KanbanError::Invalid("repository missing".into()))?;
+        let tip = repo
+            .read_ref(branch)?
+            .ok_or_else(|| KanbanError::Invalid("branch missing".into()))?;
+        if tip.as_str() != expected {
+            return Err(KanbanError::Invalid(
+                "Review branch does not match the received result".into(),
+            ));
+        }
+        let retained_branch = task.branch.take();
+        let retained_worktree = task.worktree.take();
+        task.branch = Some(branch.into());
+        let outcome = self.land_task_branch(&mut task)?;
+        if matches!(outcome, LandOutcome::Landed { .. }) {
+            // Keep both Review branches: selecting one is not abandonment.
+            crate::core::code::record_selection(self.data_root(), task_id, tip.as_str())?;
+            task.landing_pending = crate::core::code::pending_landings(self.data_root(), task_id)?;
+        }
+        if retained_worktree.is_some() {
+            task.branch = retained_branch;
+            task.worktree = retained_worktree;
+        }
+        self.storage.save_task(&task)?;
+        Ok(Some((task, outcome)))
+    }
+
     /// `kanban integrate <TASK-ID>`: re-run the landing after a conflict was
     /// resolved (or for `land: manual` boards). Same sequence, same board
     /// lock, as the done-time landing. A conflicted re-land on a
@@ -4388,10 +4481,24 @@ impl Operations {
             let Some(mut task) = self.storage.load_task(task_id)? else {
                 return Ok(None);
             };
+            if task.run_duplicate {
+                return Err(KanbanError::Invalid(
+                    "RUN_DUPLICATE: select a result with integrate --branch".into(),
+                ));
+            }
             if task.integration == IntegrationState::Landed {
                 return Err(KanbanError::Invalid(format!(
                     "Task {task_id} is already landed; run it again to land new work"
                 )));
+            }
+            if task.worktree.is_none() {
+                let branch = format!("kanban/{task_id}");
+                if crate::core::code::validate_review_branch(self.data_root(), task_id, &branch)
+                    .is_ok()
+                {
+                    drop(_guard);
+                    return self.integrate_received(task_id, &branch);
+                }
             }
             if task.branch.is_none() || task.worktree.is_none() {
                 return Err(KanbanError::Invalid(format!(

@@ -2,11 +2,11 @@
 use super::{
     error::{KanbanError, Result},
     project::{Project, ProjectStore},
-    storage::{atomic_write_text, lock_file_reentrant},
-    sync::{Journal, NodeRole},
+    storage::{Storage, atomic_write_text, lock_file_reentrant},
+    sync::{Journal, NodeRole, RunDescriptor, RunState},
     vcs::{self, GitRepo},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -271,4 +271,356 @@ pub fn prepare(root: &Path, id: &str) -> Result<Project> {
     value["work_path"] = path.to_string_lossy().as_ref().into();
     save(&project, &value)?;
     self::project(root, id)
+}
+
+#[derive(Serialize, Deserialize)]
+struct SealedRun {
+    started_at: String,
+    tip: String,
+}
+
+pub(crate) fn sealed_tip(board: &Path, task: &str, start: Option<&str>) -> Result<Option<String>> {
+    let path = board.join(".kanban/code").join(format!("{task}.json"));
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let sealed: SealedRun =
+                serde_json::from_str(&text).map_err(|e| invalid(&e.to_string()))?;
+            Ok((Some(sealed.started_at.as_str()) == start).then_some(sealed.tip))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn run_ref(task: &str, run: &RunDescriptor) -> String {
+    format!("refs/kanban/runs/{task}/{}/{}", run.generation, run.node_id)
+}
+
+/// Commit and retain the result before on-land cleanup can remove its branch.
+pub(crate) fn seal_run(board: &Path, work: &Path, task: &super::models::Task) -> Result<()> {
+    let Some(root) = super::sync::store_for_board(board) else {
+        return Ok(());
+    };
+    if !root.join("sync/node.yaml").exists() {
+        return Ok(());
+    }
+    let (Some(branch), Some(wt), Some(session)) = (&task.branch, &task.worktree, &task.session)
+    else {
+        return Ok(());
+    };
+    let session = super::session::SessionManager::new(board).load_session(session);
+    let Some(session) = session else {
+        return Ok(());
+    };
+    let started_at = super::timefmt::format(&session.started_at);
+    if sealed_tip(board, &task.id, Some(&started_at))?.is_some() {
+        return Ok(());
+    }
+    let repo = vcs::detect(work).ok_or_else(|| invalid("RUNNER_REPO_MISSING"))?;
+    repo.commit_all(
+        &board.join(".kanban/worktrees").join(wt),
+        "kanban: seal completed run",
+    )?;
+    let tip = repo
+        .read_ref(branch)?
+        .ok_or_else(|| invalid("completed branch missing"))?;
+    let journal = Journal::open(root)?;
+    let alias = board
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| invalid("invalid board"))?;
+    let runs = journal.runs(alias, &task.id)?;
+    let run = runs
+        .get(&journal.node.node_id)
+        .ok_or_else(|| invalid("local run missing"))?;
+    repo.set_ref(&run_ref(&task.id, run), &tip)?;
+    let directory = board.join(".kanban/code");
+    fs::create_dir_all(&directory)?;
+    atomic_write_text(
+        &directory.join(format!("{}.json", task.id)),
+        &serde_json::to_string(&SealedRun {
+            started_at,
+            tip: tip.as_str().into(),
+        })
+        .map_err(|e| invalid(&e.to_string()))?,
+    )
+}
+
+fn current_runs(root: &Path, alias: &str, task: &str) -> Result<Vec<RunDescriptor>> {
+    Ok(select_runs(Journal::open(root)?.runs(alias, task)?))
+}
+
+fn select_runs(runs: std::collections::BTreeMap<String, RunDescriptor>) -> Vec<RunDescriptor> {
+    let generation = runs.values().map(|r| r.generation).max().unwrap_or(0);
+    let mut runs: Vec<_> = runs
+        .into_values()
+        .filter(|r| r.generation == generation)
+        .collect();
+    runs.sort_by(|a, b| {
+        a.start_hlc
+            .cmp(&b.start_hlc)
+            .then_with(|| a.started_at.cmp(&b.started_at))
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    runs
+}
+
+pub(crate) fn duplicate_run(board: &Path, task: &str) -> Result<bool> {
+    let Some(root) = super::sync::store_for_board(board) else {
+        return Ok(false);
+    };
+    if !root.join("sync/node.yaml").exists() {
+        return Ok(false);
+    }
+    let alias = board
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| invalid("invalid board"))?;
+    Ok(current_runs(root, alias, task)?.len() > 1)
+}
+
+fn review_branch(task: &str, run: &RunDescriptor, index: usize, runs: &[RunDescriptor]) -> String {
+    if index == 0 {
+        return format!("kanban/{task}");
+    }
+    let suffix = if runs.iter().filter(|r| r.name == run.name).count() > 1 {
+        format!("{}-{}", run.name, run.node_id)
+    } else {
+        run.name.clone()
+    };
+    format!("kanban/{task}@{suffix}")
+}
+
+pub(crate) fn validate_review_branch(board: &Path, task: &str, branch: &str) -> Result<String> {
+    let root = super::sync::store_for_board(board).ok_or_else(|| invalid("not a synced board"))?;
+    let alias = board
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| invalid("invalid board"))?;
+    let runs = current_runs(root, alias, task)?;
+    runs.iter()
+        .enumerate()
+        .find(|(i, run)| {
+            run.state == RunState::Finished
+                && run.tip.is_some()
+                && review_branch(task, run, *i, &runs) == branch
+        })
+        .and_then(|(_, run)| run.tip.clone())
+        .ok_or_else(|| invalid("branch is not a completed result of this task"))
+}
+
+/// Remote exchange is retried by serve even with no HTTP peer reachable.
+/// Fetch only per-run refs: never replace this node's integration spine.
+pub fn reconcile(root: &Path) -> Result<()> {
+    if !root.join("sync/node.yaml").exists() {
+        return Ok(());
+    }
+    let _store = ProjectStore::at(root).lock()?;
+    let journal = Journal::open(root)?;
+    let state = journal.state()?;
+    let mut failure = None;
+    for project in ProjectStore::at(root).list()? {
+        let storage = Storage::new(&project.data_root);
+        for task in storage.list_unarchived_tasks()? {
+            let runs = select_runs(super::sync::task_runs(&state, &project.id, &task.id)?);
+            if runs.is_empty() {
+                continue;
+            }
+            let _guard = storage.lock()?;
+            let Some(mut task) = storage.load_task(&task.id)? else {
+                continue;
+            };
+            let before = (
+                task.branch.clone(),
+                task.landing_pending.clone(),
+                task.run_duplicate,
+            );
+            task.run_duplicate = runs.len() > 1;
+            if !matches!(
+                task.status,
+                super::models::TaskStatus::Review | super::models::TaskStatus::InProgress
+            ) {
+                continue;
+            }
+            if task.run_duplicate && !before.2 {
+                let _ = super::thread::ThreadManager::new(&project.data_root)?.post_board_note(
+                    &task.id, "RUN_DUPLICATE: оба результата сохранены; выберите ветку в Review через integrate --branch.");
+            }
+            let finished = runs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.state == RunState::Finished && r.tip.is_some());
+            let Some((first_index, first_finished)) = finished.clone().next() else {
+                if task.run_duplicate != before.2 {
+                    storage.save_task(&task)?;
+                }
+                continue;
+            };
+            task.landing_pending = Some(journal.node.name.clone());
+            if !task.run_duplicate
+                && let Some(repo) = repository(&project)
+                && repo.read_ref(&run_ref(&task.id, first_finished))?.is_some()
+                && repo.integration_ref()?.is_some()
+                && repo.is_landed(first_finished.tip.as_deref().expect("finished tip"))?
+            {
+                task.landing_pending = None;
+            }
+            let transfer = (|| -> Result<()> {
+                let source = remote(&project)?.ok_or_else(|| invalid("SYNC_NO_REMOTE"))?;
+                let repo = match repository(&project) {
+                    Some(repo) => repo,
+                    None => {
+                        prepare(root, &project.id)?;
+                        let refreshed = ProjectStore::at(root)
+                            .get(&project.id)?
+                            .ok_or_else(|| invalid("project missing"))?;
+                        repository(&refreshed).ok_or_else(|| invalid("RUNNER_REPO_MISSING"))?
+                    }
+                };
+                for (_, run) in finished.clone() {
+                    if run.node_id == journal.node.node_id {
+                        repo.push_run(&source, &run_ref(&task.id, run))?;
+                    }
+                }
+                if let Some((index, local)) = finished
+                    .clone()
+                    .find(|(_, run)| run.node_id == journal.node.node_id)
+                {
+                    let canonical = format!("kanban/{}", task.id);
+                    let branch = review_branch(&task.id, local, index, &runs);
+                    if index != 0 && task.branch.as_deref() == Some(&canonical) {
+                        let tip = repo
+                            .read_ref(&run_ref(&task.id, local))?
+                            .ok_or_else(|| invalid("local result missing"))?;
+                        repo.rename_run_branch(&canonical, &branch, &tip)?;
+                        task.branch = Some(branch);
+                    }
+                }
+                for (index, run) in finished.clone() {
+                    let reference = run_ref(&task.id, run);
+                    if run.node_id != journal.node.node_id && repo.read_ref(&reference)?.is_none() {
+                        repo.fetch_run(&source, &reference)?;
+                    }
+                    let tip = repo
+                        .read_ref(&reference)?
+                        .ok_or_else(|| invalid("received result missing"))?;
+                    if Some(tip.as_str()) != run.tip.as_deref() {
+                        return Err(invalid("received result commit mismatch"));
+                    }
+                    let branch = review_branch(&task.id, run, index, &runs);
+                    if !repo.install_run_branch(&branch, &tip)? {
+                        return Err(invalid("Review branch is still owned by a live checkout"));
+                    }
+                    repo.publish_run_branch(&source, &branch)?;
+                }
+                if !task.run_duplicate {
+                    let branch = review_branch(&task.id, first_finished, first_index, &runs);
+                    if repo.integration_ref()?.is_some() && repo.is_landed(&branch)? {
+                        task.landing_pending = None;
+                    }
+                } else if task.integration == super::models::IntegrationState::Landed
+                    && selected_tip(&project.data_root, &task.id)?
+                        .is_some_and(|tip| runs.iter().any(|r| r.tip.as_ref() == Some(&tip)))
+                {
+                    task.landing_pending = None;
+                }
+                Ok(())
+            })();
+            let local_pending = task.landing_pending.is_some();
+            let selected = if !local_pending {
+                selected_tip(&project.data_root, &task.id)?
+            } else {
+                None
+            };
+            let tip = selected
+                .as_deref()
+                .unwrap_or_else(|| first_finished.tip.as_deref().expect("finished tip"));
+            journal.record_landing(
+                &project.data_root,
+                &task.id,
+                runs[0].generation,
+                tip,
+                local_pending,
+            )?;
+            task.landing_pending = pending_landings(&project.data_root, &task.id)?;
+            if task.branch != before.0
+                || task.landing_pending != before.1
+                || task.run_duplicate != before.2
+            {
+                storage.save_task(&task)?;
+            }
+            drop(_guard);
+            if let Err(error) = transfer {
+                failure = Some(error);
+                continue;
+            }
+            if local_pending
+                && !task.run_duplicate
+                && task.status == super::models::TaskStatus::Review
+                && task.worktree.is_none()
+            {
+                let refreshed = ProjectStore::at(root)
+                    .get(&project.id)?
+                    .ok_or_else(|| invalid("project missing"))?;
+                let ops = super::operations::Operations::for_project(&refreshed);
+                if ops.config.get_orchestration()?.isolation.land
+                    != super::config::IsolationLand::Manual
+                {
+                    ops.integrate_received(
+                        &task.id,
+                        &review_branch(&task.id, first_finished, first_index, &runs),
+                    )?;
+                }
+            }
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn selection_path(board: &Path, task: &str) -> PathBuf {
+    board.join(".kanban/code").join(format!("{task}.selected"))
+}
+fn selected_tip(board: &Path, task: &str) -> Result<Option<String>> {
+    match fs::read_to_string(selection_path(board, task)) {
+        Ok(tip) => Ok(Some(tip)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+pub(crate) fn record_selection(board: &Path, task: &str, tip: &str) -> Result<()> {
+    fs::create_dir_all(board.join(".kanban/code"))?;
+    atomic_write_text(&selection_path(board, task), tip)?;
+    let root = super::sync::store_for_board(board).ok_or_else(|| invalid("not a synced board"))?;
+    let alias = board
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| invalid("invalid board"))?;
+    let runs = current_runs(root, alias, task)?;
+    let generation = runs
+        .first()
+        .ok_or_else(|| invalid("run missing"))?
+        .generation;
+    Journal::open(root)?.record_landing(board, task, generation, tip, false)
+}
+
+pub(crate) fn pending_landings(board: &Path, task: &str) -> Result<Option<String>> {
+    let root = super::sync::store_for_board(board).ok_or_else(|| invalid("not a synced board"))?;
+    let alias = board
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| invalid("invalid board"))?;
+    let state = Journal::open(root)?.state()?;
+    let runs = select_runs(super::sync::task_runs(&state, alias, task)?);
+    let Some(run) = runs.first() else {
+        return Ok(None);
+    };
+    let names: Vec<_> = super::sync::task_landings(&state, alias, task)?
+        .into_values()
+        .filter(|ack| ack.pending && ack.generation == run.generation)
+        .map(|ack| ack.name)
+        .collect();
+    Ok((!names.is_empty()).then(|| names.join(", ")))
 }
