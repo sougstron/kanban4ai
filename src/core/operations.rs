@@ -4269,6 +4269,7 @@ impl Operations {
                 Ok(LandOutcome::Landed { changed })
             }
             vcs::Preflight::Conflict { paths, stages } => {
+                self.enter_conflict_mode();
                 let Some(wt_path) = &wt_path else {
                     task.integration = IntegrationState::Conflict;
                     return Ok(LandOutcome::Conflict { paths });
