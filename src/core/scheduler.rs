@@ -260,6 +260,24 @@ impl Operations {
             {
                 continue;
             }
+            if let Some(root) = crate::core::sync::store_for_board(self.data_root()) {
+                let journal = crate::core::sync::Journal::open(root)?;
+                if let Some(role) = config.runner_for(candidate.runner).node_role()
+                    && role != journal.node.role
+                {
+                    if let Some(reply) = crate::cli::serve::launch_on_board(
+                        self.data_root(),
+                        &candidate.id,
+                        Some(role),
+                        true,
+                    )? {
+                        if reply.get("session").is_some() {
+                            self.dequeue_task(&candidate.id)?;
+                        }
+                        continue;
+                    }
+                }
+            }
             let Ok((settings, next_phase)) = upcoming_run_plan(&config, &candidate) else {
                 continue;
             };
