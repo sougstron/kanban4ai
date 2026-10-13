@@ -505,6 +505,7 @@ impl Operations {
         copied.auto_resumes = 0;
         copied.review_unseen = false;
         copied.run_phase = None;
+        copied.run_failure = None;
         copied.crash_restarts = 0;
         copied.restart_at = None;
         copied.review_rounds = 0;
@@ -3698,6 +3699,15 @@ impl Operations {
                 "Task {task_id} not found. Agent not started."
             )));
         };
+        crate::core::runner_failure::clear(self.data_root(), task_id)?;
+        let mut task = task;
+        task.run_failure = None;
+        if !self.work_path().is_dir() {
+            let code = crate::core::runner_failure::REPO_MISSING;
+            let message = "нет клона или снапшота; можно перезапустить на другом узле";
+            crate::core::runner_failure::record(self.data_root(), task_id, code, message)?;
+            return Err(KanbanError::Invalid(format!("{code}: {message}")));
+        }
         let task = self.record_launch_settings(task)?;
         let task = self.prepare_worktree(task)?;
         // Owned so `roots` can borrow the worktree path for its lifetime.
@@ -3711,6 +3721,17 @@ impl Operations {
             Ok(started) => Ok(started),
             Err(err) => {
                 self.log_launch_failure(&task, session_id, &err.to_string());
+                if err
+                    .to_string()
+                    .contains(crate::core::runner_failure::BACKEND_MISSING)
+                {
+                    crate::core::runner_failure::record(
+                        self.data_root(),
+                        task_id,
+                        crate::core::runner_failure::BACKEND_MISSING,
+                        &format!("{err}; можно перезапустить на другом узле"),
+                    )?;
+                }
                 Err(err)
             }
         }
@@ -5009,12 +5030,41 @@ impl Operations {
             .logs_dir
             .join(format!("{session_id}.transcript.jsonl"));
         let Some(event) = reply::fatal_error_event(&transcript) else {
+            if let Some(message) = crate::core::runner_failure::login_diagnostic(&transcript)
+                .or_else(|| {
+                    crate::core::runner_failure::login_diagnostic(
+                        &self.storage.logs_dir.join(format!("{session_id}.log")),
+                    )
+                })
+            {
+                let _ = crate::core::runner_failure::record(
+                    self.data_root(),
+                    task_id,
+                    crate::core::runner_failure::BACKEND_MISSING,
+                    &format!(
+                        "{message}; требуется вход в backend на runner; можно перезапустить на другом узле"
+                    ),
+                );
+                return CrashRestart::Skip;
+            }
             return CrashRestart::Backoff;
         };
         let Some(err) = provenance::stream_error(&event) else {
             return CrashRestart::Backoff;
         };
         self.post_queue_note(task_id, &format!("✖ agent error: {}", err.message));
+        if crate::core::runner_failure::authentication_error(&event, &err.message) {
+            let _ = crate::core::runner_failure::record(
+                self.data_root(),
+                task_id,
+                crate::core::runner_failure::BACKEND_MISSING,
+                &format!(
+                    "{}; требуется вход в backend на runner; можно перезапустить на другом узле",
+                    err.message
+                ),
+            );
+            return CrashRestart::Skip;
+        }
         if !err.retryable {
             self.post_queue_note(
                 task_id,

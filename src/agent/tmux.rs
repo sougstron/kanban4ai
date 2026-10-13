@@ -25,6 +25,12 @@ pub fn spawn_plan<'a>(
     config: &AutoLaunchConfig,
 ) -> Result<bool> {
     let roots = roots.into();
+    if !command_available(&plan.command) {
+        return Err(KanbanError::Invalid(format!(
+            "RUNNER_BACKEND_MISSING: {} is missing or not executable",
+            plan.command
+        )));
+    }
     if let Some(parent) = plan.log_file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -358,6 +364,9 @@ fn resolve_callback_binary(exe: PathBuf) -> Option<PathBuf> {
 }
 
 fn command_available(command: &str) -> bool {
+    if Path::new(command).components().count() > 1 {
+        return Path::new(command).is_file() && is_executable(Path::new(command));
+    }
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
