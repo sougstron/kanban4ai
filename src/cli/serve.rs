@@ -93,44 +93,15 @@ pub(crate) fn runner_action(
 }
 
 pub(crate) fn runner_control(board: &Path, task: &str, action: &str) -> Result<bool> {
-    let Some(root) = board
-        .parent()
-        .filter(|p| p.file_name().is_some_and(|n| n == "projects"))
-        .and_then(Path::parent)
-    else {
-        return Ok(false);
-    };
-    if discovery::config(root)?.peers.is_empty() {
-        return Ok(false);
-    }
-    let storage = crate::core::storage::Storage::new(board);
-    let Some(current) = storage.load_task(task)? else {
-        return Ok(false);
-    };
-    if api::local_runner(board, current.runner.as_ref())?
-        && crate::core::sync::remote_runs(board, task)?.is_empty()
-    {
-        return Ok(false);
-    }
-    let id = board
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| invalid("Invalid project"))?;
-    let (root, id, task, action) = (
-        root.to_path_buf(),
-        id.to_owned(),
-        task.to_owned(),
-        action.to_owned(),
-    );
-    std::thread::spawn(move || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(KanbanError::Io)?
-            .block_on(api::runner_control(&root, &id, &task, &action))
-    })
-    .join()
-    .map_err(|_| invalid("Runner control worker panicked"))?
+    crate::core::sync::control::request(board, task, action)
+}
+
+pub(crate) fn remote_log(
+    board: &Path,
+    task: &str,
+    node: &str,
+) -> Result<crate::core::runner_log::Snapshot> {
+    api::remote_log(board, task, node)
 }
 
 pub(crate) fn local_runner(

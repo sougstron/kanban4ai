@@ -1,5 +1,4 @@
-//! Append-only, single-writer git refs. The repository contains only batches,
-//! never a checkout, snapshots, credentials or machine-local store files.
+//! Single-writer git refs for append-only sync batches and bounded runner tails.
 use super::*;
 use crate::core::project::ProjectStore;
 use sha2::{Digest, Sha256};
@@ -8,6 +7,8 @@ use std::time::{Duration, Instant};
 
 const PREFIX: &str = "refs/kanban/sync/";
 const FETCHED: &str = "refs/remotes/relay/";
+const LOG_PREFIX: &str = "refs/kanban/logs/";
+const LOG_FETCHED: &str = "refs/remotes/relay-logs/";
 
 #[derive(Clone, Deserialize)]
 #[serde(default)]
@@ -15,6 +16,8 @@ pub struct Settings {
     /// Explicit URL/path of a dedicated store remote; otherwise project remotes.
     pub relay_remote: Option<String>,
     pub relay_interval: u64,
+    pub log_interval: u64,
+    pub log_tail_bytes: usize,
     pub relay_encrypt: bool,
     pub max_skew: u64,
     pub peers: Vec<RelayPeer>,
@@ -24,6 +27,8 @@ impl Default for Settings {
         Self {
             relay_remote: None,
             relay_interval: 60,
+            log_interval: 60,
+            log_tail_bytes: 64 * 1024,
             relay_encrypt: false,
             max_skew: 300,
             peers: Vec::new(),
@@ -65,6 +70,11 @@ pub fn settings(store: &Path) -> Result<Settings> {
         .unwrap_or_default();
     if settings.relay_interval == 0 {
         return Err(invalid("sync.relay_interval must be positive"));
+    }
+    if settings.log_interval == 0 || !(1..=1024 * 1024).contains(&settings.log_tail_bytes) {
+        return Err(invalid(
+            "sync.log_interval must be positive and sync.log_tail_bytes must be 1..=1048576",
+        ));
     }
     if settings
         .relay_remote
@@ -322,12 +332,21 @@ fn exchange(
         fs::set_permissions(store.join("sync/relay"), fs::Permissions::from_mode(0o700))?;
     }
     let last: u64 = load(&directory.join("last.json"))?;
-    if !force && now_ms().saturating_sub(last) < config.relay_interval.saturating_mul(1000) {
-        return Ok(false);
-    }
+    let sync_due =
+        force || now_ms().saturating_sub(last) >= config.relay_interval.saturating_mul(1000);
     let repo = directory.join("git");
     if !repo.exists() {
         git(&repo, &["init", "--bare", "--quiet"], b"")?;
+    }
+    let logs_last: u64 = load(&directory.join("logs-last.json"))?;
+    let logs_due =
+        force || now_ms().saturating_sub(logs_last) >= config.log_interval.saturating_mul(1000);
+    if !sync_due {
+        if logs_due {
+            exchange_logs(store, journal, config, remote, &repo)?;
+            atomic_write_text_raw(&directory.join("logs-last.json"), &json(&now_ms())?)?;
+        }
+        return Ok(logs_due);
     }
     let mut cache: Cache = load(&directory.join("cache.json"))?;
     git(
@@ -535,6 +554,194 @@ fn exchange(
         cache.tips.insert(peer.node.node_id.clone(), head);
         atomic_write_text_raw(&directory.join("cache.json"), &json(&cache)?)?;
     }
+    if logs_due {
+        exchange_logs(store, journal, config, remote, &repo)?;
+        atomic_write_text_raw(&directory.join("logs-last.json"), &json(&now_ms())?)?;
+    }
     atomic_write_text_raw(&directory.join("last.json"), &json(&now_ms())?)?;
     Ok(true)
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LogEnvelope {
+    store_id: String,
+    snapshot: crate::core::runner_log::Snapshot,
+}
+
+fn read_log(store: &Path, repo: &Path, commit: &str, limit: usize) -> Result<LogEnvelope> {
+    let files = git(repo, &["ls-tree", "--name-only", commit], b"")?;
+    let name = match files.trim() {
+        "log.json" => "log.json",
+        "log.age" => "log.age",
+        _ => return Err(invalid("invalid relay log tree")),
+    };
+    let object = format!("{commit}:{name}");
+    let size: usize = git(repo, &["cat-file", "-s", &object], b"")?
+        .trim()
+        .parse()
+        .map_err(|_| invalid("invalid relay log size"))?;
+    // JSON escaping can expand a byte sixfold; armor adds further overhead.
+    let maximum = limit.saturating_mul(12).saturating_add(16 * 1024);
+    if size > maximum {
+        return Err(invalid("relay log exceeds configured tail bound"));
+    }
+    let data = git(repo, &["show", &object], b"")?;
+    let plain = if name == "log.age" {
+        let mut command = Command::new("age");
+        command
+            .args(["--decrypt", "--identity"])
+            .arg(store.join("sync/relay-age.key"));
+        execute(command, data.as_bytes())?
+    } else {
+        data.into_bytes()
+    };
+    if plain.len() > maximum {
+        return Err(invalid("relay log exceeds configured tail bound"));
+    }
+    serde_json::from_slice(&plain).map_err(|e| invalid(&e.to_string()))
+}
+
+fn fetch_logs(repo: &Path, remote: &str) -> Result<()> {
+    git(
+        repo,
+        &[
+            "fetch",
+            "--quiet",
+            "--prune",
+            "--no-tags",
+            remote,
+            &format!("+{LOG_PREFIX}*:{LOG_FETCHED}*"),
+        ],
+        b"",
+    )?;
+    Ok(())
+}
+
+fn exchange_logs(
+    store: &Path,
+    journal: &Journal,
+    config: &Settings,
+    remote: &str,
+    repo: &Path,
+) -> Result<()> {
+    use crate::core::runner_log::{cache_snapshot, local_tail, validate_snapshot};
+    use crate::core::storage::Storage;
+
+    fetch_logs(repo, remote)?;
+    let state = journal.state()?;
+    for (alias, project) in &state.project_uids {
+        node_component(project)?;
+        node_component(alias)?;
+        let board = store.join("projects").join(alias);
+        if !board.is_dir() {
+            continue;
+        }
+        for task in Storage::new(&board).list_tasks(None)? {
+            // A mirrored task has no local session, and therefore cannot publish
+            // another runner's log. local_tail also validates the run owner.
+            if task.session.is_none() {
+                continue;
+            }
+            let snapshot = match local_tail(&board, &task.id) {
+                Ok(snapshot) => snapshot,
+                Err(_) => continue,
+            };
+            if snapshot.node_id != journal.node.node_id || snapshot.project != *project {
+                return Err(invalid("invalid local relay log owner/project"));
+            }
+            let suffix = format!("{}/{}/{}", snapshot.node_id, project, snapshot.task);
+            let reference = format!("{LOG_PREFIX}{suffix}");
+            let fetched = format!("{LOG_FETCHED}{suffix}");
+            let remote_tip = tip(repo, &fetched)?;
+            let local_tip = tip(repo, &reference)?;
+            if remote_tip.is_some() && local_tip != remote_tip {
+                return Err(invalid(
+                    "SYNC_RELAY_LOG_WRITER_CONFLICT: node log ref changed",
+                ));
+            }
+            let envelope = LogEnvelope {
+                store_id: journal.node.store_id.clone(),
+                snapshot,
+            };
+            let plain = json(&envelope)?.into_bytes();
+            let (name, content) = if config.relay_encrypt {
+                ("log.age", encrypt(store, config, &plain)?)
+            } else {
+                ("log.json", plain)
+            };
+            let blob = git(repo, &["hash-object", "-w", "--stdin"], &content)?;
+            let tree = git(
+                repo,
+                &["mktree"],
+                format!("100644 blob {}\t{name}\n", blob.trim()).as_bytes(),
+            )?;
+            // No parent: only the bounded current snapshot is reachable.
+            let commit = git(repo, &["commit-tree", tree.trim()], b"kanban runner tail\n")?;
+            let expected = remote_tip.as_deref().unwrap_or("");
+            git(
+                repo,
+                &[
+                    "push",
+                    "--quiet",
+                    &format!("--force-with-lease={reference}:{expected}"),
+                    remote,
+                    &format!("{}:{reference}", commit.trim()),
+                ],
+                b"",
+            )?;
+            git(repo, &["update-ref", &reference, commit.trim()], b"")?;
+        }
+    }
+    fetch_logs(repo, remote)?;
+    let refs = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            LOG_FETCHED,
+        ],
+        b"",
+    )?;
+    for line in refs.lines() {
+        let Some((reference, commit)) = line.split_once(' ') else {
+            return Err(invalid("invalid relay log reference"));
+        };
+        let Some(suffix) = reference.strip_prefix(LOG_FETCHED) else {
+            continue;
+        };
+        let parts: Vec<_> = suffix.split('/').collect();
+        if parts.len() != 3 {
+            continue;
+        }
+        let (node, project, task) = (parts[0], parts[1], parts[2]);
+        if node == journal.node.node_id
+            || !config.peers.iter().any(|peer| {
+                peer.node.node_id == node && peer.node.store_id == journal.node.store_id
+            })
+        {
+            continue;
+        }
+        node_component(node)?;
+        node_component(project)?;
+        let envelope = read_log(store, repo, commit, config.log_tail_bytes)?;
+        if envelope.store_id != journal.node.store_id
+            || envelope.snapshot.node_id != node
+            || envelope.snapshot.project != project
+            || envelope.snapshot.task != task
+            || envelope.snapshot.at_ms.saturating_sub(now_ms())
+                > config.max_skew.saturating_mul(1000)
+        {
+            return Err(invalid("invalid relay log owner/store/project/task/clock"));
+        }
+        // A log ref can outlive its run or arrive before the slower sync stream.
+        // Such snapshots must not be cached, but are not transport failures.
+        if validate_snapshot(store, &envelope.snapshot).is_err() {
+            continue;
+        }
+        // Performs project/task existence and latest run-owner validation before
+        // touching the cache; aliases and task IDs alone are never identities.
+        cache_snapshot(store, &envelope.snapshot)?;
+    }
+    Ok(())
 }

@@ -488,16 +488,17 @@ runs:
   одинаковым `gen`. Подробности в сценарии 14.3.
 - **Управление с любого узла (TASK-436).** `stop`, `answer` и `rerun` на
   задаче, которая выполняется на другом узле, — обычные операции журнала
-  (stop — запрос `entity: run`-команды с `gen` целевого запуска, answer и
-  rerun — записи треда/задачи). Они доходят до runner любым транспортом;
-  runner применяет их как локальные: останавливает сессию, будит агента
-  после ответа (`resume_after_last_answer`) или перезапускает. Устаревшая
-  команда (другой `gen`) игнорируется. Прямой `POST …/stop` — лишь ускорение,
-  когда runner достижим.
+  (`stop` и `rerun` — `entity: run`, уникальный `id = op_id`,
+  `set.command = {task, node, generation, action}`; `answer` — правка сообщения
+  треда). Они доходят до runner любым транспортом, включая git-relay;
+  runner применяет их после durable apply вне sync/board locks. Команда другого
+  поколения игнорируется, локальные receipts исключают повторное исполнение.
+  HTTP stop/rerun на чужом узле также записывает intent, а не прямой proxy.
 - **Лог запуска с другого узла.** При прямом канале (LAN/tailnet) — live-follow
   `GET …/log?follow=1`. Иначе runner публикует хвост лога в
-  `refs/kanban/logs/<node>/TASK-N` (ограниченный размер, перезаписывается)
-  через git-relay (10.6), и пир показывает «лог на {ago}».
+  `refs/kanban/logs/<node UUID>/<project UID>/TASK-N` (ограниченный размер,
+  перезаписывается) через git-relay (10.6), и пир показывает возраст снимка.
+  UID проекта обязателен: номера задач уникальны только внутри проекта.
 - **«Продолжить на узле» (TASK-437).** Перенос работы между узлами: текущий
   runner коммитит WIP worktree в `refs/kanban/wip/TASK-N` и пушит в remote
   (или передаёт bundle), закрывает сессию с `finished`. Целевой узел создаёт
@@ -532,6 +533,26 @@ runs:
   назначается локальный heartbeat-deadline и не создаётся session-файл.
   Автоматические queue dispatch, crash-restart и wake после ответа не
   подхватывают задачу с чужим активным дескриптором.
+- `core/sync/control.rs` будит только владельца последнего запуска после
+  синхронизации последнего открытого вопроса. Сохраняются `auto_launch.enabled`,
+  `resume_after_last_answer`, slots и живой `ask --wait`; несколько ответов
+  одной пачки будят один раз. Более поздний stop того же поколения не отменяется
+  старым ответом. Перед wake/rerun закрепляется фактический runner, в том числе
+  для запуска, созданного до pairing. На сервере нужны и `serve`, и `daemon`.
+- Лог API возвращает `{text, at_ms, node_id, project, task, generation}`:
+  UTF-8 хвост до `sync.log_tail_bytes` (default 65536; 1…1048576).
+  `follow=1` — SSE `log` с полным ограниченным снимком при изменении,
+  keepalive 15 с, `end` при закрытии/смене сессии. Права токена обязательны;
+  symlink/special files не читаются, известные session ID и локальные пути
+  маскируются. Это не очистка произвольных секретов, напечатанных backend.
+- Relay публикует хвост раз в `sync.log_interval` (default 60 с), независимо
+  от `relay_interval`; log ref — root commit без цепочки истории с
+  force-with-lease только собственного ref. `relay_encrypt` применяет age
+  и к логам. Снимок проверяется по сопряжённому узлу, store, проекту, задаче
+  и поколению; локальный cache — `sync/logs/<node>/<project UID>/TASK-N.json`.
+  TUI `L` открывает лог чужого/завершённого запуска: direct snapshot polling
+  раз в секунду без блокировки UI, при отсутствии direct — relay cache с
+  возрастом. `q` возвращает в исходный экран.
 - Проверка доступности узла, онлайн-защита `RUN_ALREADY_RUNNING`,
   `POST …/launch` и `RUN_NODE_*` зависят от транспорта/статуса пиров и относятся
   к следующим задачам эпика. Локальный crash пока имеет `code: null`; пир не
@@ -678,9 +699,9 @@ runs:
   Relay-only availability не является HTTP endpoint: intent доставляется
   обычным синком. Пока доставка не подтверждена, выключение источника не
   гарантирует приём запроса; после приёма источник не нужен.
-- Stop выбирает активный дескриптор; пробуждение после последнего ответа
-  отправляет ответ/контекст runner и вызывает там обычный resume. Живой
-  `ask --wait` poller не заменяется. Таймаут или нечитаемый ответ после отправки
+- Stop и rerun адресуются поколению дескриптора через журнал (7.1); ответ
+  реплицируется вместе с тредом и вызывает обычный resume на владельце.
+  Живой `ask --wait` poller не заменяется. Таймаут или нечитаемый ответ после отправки
   launch возвращает `RUN_LAUNCH_UNCERTAIN`: mutation не повторяется, replacement
   intent не записывается. Проверять итог нужно по task/runs runner.
 - Успешный launch отвечает `{session, queued}`: `session: null, queued: true`
@@ -790,7 +811,7 @@ runs:
 | Транспорт | Пути | Что умеет |
 |---|---|---|
 | direct http | LAN; tailnet (system — напрямую по tailnet-IP, managed — через SOCKS5 `127.0.0.1:<socks_port>`) | всё из 10.5: vector/ops/stream, snapshot, `/git`, launch/stop, live-лог |
-| git-relay | `sync.relay_remote` или origin проектов | журнал операций и heartbeat; без snapshot, launch и live-лога |
+| git-relay | `sync.relay_remote` или origin проектов | журнал операций (включая stop/rerun/answer), heartbeat и bounded log tail; без snapshot/direct launch/live-follow |
 
 HTTP использует LAN → tailnet. Relay-воркер независимо публикует резервный
 журнал и heartbeat, поэтому работает без домашней сети и без Tailscale,
@@ -1118,14 +1139,15 @@ Sleep hook шлёт bye перед `sleep.target`, hello — при его ос�
 | GET | `/api/v1/projects/<p>/board` | колонки и карточки |
 | GET | `/api/v1/projects/<p>/tasks/<t>` | задача + дескриптор запуска + конфликты |
 | GET | `/api/v1/projects/<p>/tasks/<t>/thread` | тред |
-| GET | `/api/v1/projects/<p>/tasks/<t>/log?session=&follow=` | хвост лога, `follow=1` — live-follow (только на runner-узле, 7) |
+| GET | `/api/v1/projects/<p>/tasks/<t>/log?follow=` | ограниченный хвост; `follow=1` — SSE live-follow (только на runner-узле, 7.1) |
 | POST | `/api/v1/projects/<p>/tasks` | создать (в том числе `runner`) |
 | PATCH | `/api/v1/projects/<p>/tasks/<t>` | правка полей |
 | POST | `/api/v1/projects/<p>/tasks/<t>/move` | `{status}` |
 | POST | `/api/v1/projects/<p>/tasks/<t>/answer` | ответ на вопрос `{message, text}` |
 | POST | `/api/v1/projects/<p>/tasks/<t>/form` | ответ на ask-form |
 | POST | `/api/v1/projects/<p>/tasks/<t>/launch` | `{runner?, on_unavailable: ask\|queue\|other}` |
-| POST | `/api/v1/projects/<p>/tasks/<t>/stop` | остановить (проксируется на runner) |
+| POST | `/api/v1/projects/<p>/tasks/<t>/stop` | локальная остановка либо journal intent runner |
+| POST | `/api/v1/projects/<p>/tasks/<t>/rerun` | локальный rerun либо journal intent предыдущему runner |
 | POST | `/api/v1/conflicts/<id>/take-other` | взять проигравшую версию |
 | GET | `/events` | SSE изменений доски, статусов узлов, синка |
 
@@ -1159,16 +1181,14 @@ node-токен. Если runner недоступен и `on_unavailable=ask`, �
 - API-записи по умолчанию `human`, независимо от окружения процесса serve.
   Node-токен допускает `agent: true` для `move`/`ask`.
   Правила ролей и колонок проверяет operations.
-- `POST …/launch {runner?}` и `POST …/stop {}` вызывают локальные start/stop
-  либо отправляются сопряжённому runner через node-токен. `runner` задачи
-  сохраняется как имя конкретного узла (9.2); явный launch-runner меняет
-  размещение задачи. Stop выбирает активный дескриптор, затем runner задачи.
+- `POST …/launch {runner?}` отправляется сопряжённому runner через node-токен.
   До отправки проверяются LAN/tailnet, bye, идентичность, текущий store и
-  совместимость протокола. После таймаута записи повторной отправки нет:
-  запуск мог уже состояться. Наследование — TASK-417, runner-local очередь
-  и онлайн-защита от двойного запуска — TASK-419, варианты launch-409 — TASK-420.
-  Внутренний `POST …/resume {}` используется для пробуждения runner после
-  репликации ответа на последний вопрос; обычные role/session gates сохраняются.
+  совместимость протокола. После таймаута mutation не повторяется:
+  запуск мог уже состояться. Явный launch-runner меняет размещение задачи (9.2).
+- `POST …/stop {}` и `POST …/rerun {}` выполняются локально либо сохраняют
+  адресованный последнему runner journal intent (7.1). Ответ сообщает принятие
+  запроса, не подтверждает остановку/новый запуск. Реплицированный ответ на
+  вопрос сам запускает runner-local wake; HTTP resume для доставки не нужен.
 - `/events?project=<id>` — авторизованный SSE: `ready` при подключении,
   `board` с `{refresh: true}` при изменении задач, тредов, сессий, sync или
   presence. Клиент перечитывает нужный API; подключение не является журналом
@@ -1323,7 +1343,8 @@ Probe выбирает **путь** до пира, затем по нему — 
 6. `store_id` другой → `SYNC_STORE_MISMATCH`.
 7. Часы расходятся больше `max_skew` → `SYNC_CLOCK_SKEW`.
 8. Иначе `ONLINE` (с путём). На пути `relay` шаги 3–5 не выполняются:
-   статус — `ONLINE` через relay, launch/stop/live-лог недоступны.
+   статус — `ONLINE` через relay; journal stop/rerun/answer доступны,
+   прямой launch/live-лог недоступен (показывается cached tail).
 
 Для пира роли `mobile` любой не-`ONLINE` результат показывается нейтрально
 («Телефон: был в сети {ago}»), без кода (2.1).
@@ -1539,6 +1560,8 @@ namespace, соединённых с server через veth. Mobile — outbound
 | `sync.auto_wake` | реплицируется | false |
 | `sync.lease_reserve` | реплицируется | 200 |
 | `sync.relay_interval` | локально | 60 с |
+| `sync.log_interval` | локально | 60 с |
+| `sync.log_tail_bytes` | локально | 65536 (1…1048576) |
 | `sync.relay_remote` | локально | origin проектов |
 | `sync.relay_encrypt` | реплицируется | false |
 | `sync.clone_root` | локально | `<store>/clones/` |

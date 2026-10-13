@@ -39,6 +39,9 @@ pub enum Modal {
     KillSessionConfirm {
         session_id: String,
     },
+    StopTaskConfirm {
+        task_id: String,
+    },
     RestoreConfirm {
         task_id: String,
     },
@@ -985,6 +988,7 @@ impl ModalState {
             | Modal::RevertConfirm { .. }
             | Modal::BulkConfirm { .. }
             | Modal::KillSessionConfirm { .. }
+            | Modal::StopTaskConfirm { .. }
             | Modal::RestoreConfirm { .. } => &[DialogField::Confirm, DialogField::Cancel],
             Modal::AnswerQuestion { .. } => &[
                 DialogField::Question,
@@ -1493,6 +1497,7 @@ impl ModalState {
                 | Modal::RevertConfirm { .. }
                 | Modal::BulkConfirm { .. }
                 | Modal::KillSessionConfirm { .. }
+                | Modal::StopTaskConfirm { .. }
                 | Modal::RestoreConfirm { .. }
                 | Modal::DeleteProject { .. }
         )
@@ -2922,6 +2927,23 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
                 )),
                 Line::from(
                     "Stops the agent process and closes the session. The task keeps its status.",
+                ),
+            ],
+            &mut hitboxes,
+        ),
+        Modal::StopTaskConfirm { task_id } => render_simple_confirm(
+            frame,
+            app,
+            modal,
+            inner,
+            app.theme.err,
+            vec![
+                Line::from(format!(
+                    "Stop {} on its runner?",
+                    sanitize_terminal_text(task_id)
+                )),
+                Line::from(
+                    "The request is delivered through sync, including when the runner is offline.",
                 ),
             ],
             &mut hitboxes,
@@ -5691,6 +5713,7 @@ fn modal_title(modal: &Modal) -> &'static str {
         Modal::RevertConfirm { .. } => " Revert task ",
         Modal::BulkConfirm { .. } => " Confirm bulk action ",
         Modal::KillSessionConfirm { .. } => " Kill session ",
+        Modal::StopTaskConfirm { .. } => " Stop remote task ",
         Modal::RestoreConfirm { .. } => " Restore task ",
         Modal::AddMessage { .. } => " Add to thread ",
         Modal::AnswerQuestion { .. } => " Answer question ",

@@ -2955,9 +2955,6 @@ impl Operations {
         if !self.auto_launch_enabled()? || !self.config.get_rule("resume_after_last_answer")? {
             return Ok(None);
         }
-        if crate::cli::serve::runner_control(self.data_root(), task_id, "resume")? {
-            return self.get_task(task_id);
-        }
         if !crate::core::sync::remote_runs(&self.storage.project_path, task_id)?.is_empty() {
             return Ok(None);
         }
@@ -3512,6 +3509,9 @@ impl Operations {
         session_id: Option<&str>,
         mode: RunMode,
     ) -> Result<Option<Task>> {
+        if crate::core::sync::control::request(self.data_root(), task_id, "rerun")? {
+            return self.get_task(task_id);
+        }
         if mode == RunMode::Queued {
             return self.queue_run(task_id);
         }
@@ -3573,6 +3573,9 @@ impl Operations {
         session_id: Option<&str>,
         mode: RunMode,
     ) -> Result<Option<Task>> {
+        if crate::core::sync::control::request(self.data_root(), task_id, "rerun")? {
+            return self.get_task(task_id);
+        }
         if let Some(session_id) = session_id {
             SessionManager::validate_session_id(session_id)?;
         }

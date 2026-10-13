@@ -305,3 +305,231 @@ fn automatic_queue_and_retry_do_not_adopt_a_foreign_run() {
         RunState::Running
     );
 }
+
+fn control_board(store: &std::path::Path) -> Storage {
+    let storage = board(store);
+    atomic_write_text(
+        &storage.project_path.join("project.yaml"),
+        &format!(
+            "id: demo\nname: Demo\nwork_path: {}\ncreated_at: {}\n",
+            storage.project_path.display(),
+            timefmt::format(&timefmt::now())
+        ),
+    )
+    .unwrap();
+    storage
+}
+
+#[test]
+fn laptop_stop_is_durable_duplicate_safe_and_cannot_stop_new_generation() {
+    use kanban4ai::core::operations::Operations;
+    let server = tempfile::tempdir().unwrap();
+    let laptop = tempfile::tempdir().unwrap();
+    let storage = control_board(server.path());
+    let journal = Journal::open(server.path()).unwrap();
+    let laptop_journal = peer(laptop.path(), &journal);
+    let mut task = storage.create_task(NewTask::titled("remote stop")).unwrap();
+    task.status = TaskStatus::InProgress;
+    task.session = Some("ses-server".into());
+    storage.save_task(&task).unwrap();
+    let sessions = SessionManager::new(&storage.project_path);
+    sessions.link_session(&task.id, "ses-server").unwrap();
+    laptop_journal
+        .apply_remote(&operations(server.path(), &journal.node.node_id), 300_000)
+        .unwrap();
+    let frontend = Operations::new(laptop.path().join("projects/demo"));
+    frontend.stop_task(&task.id).unwrap();
+    // Writing intent on an offline frontend must not touch the runner's session.
+    assert_eq!(
+        sessions.load_session("ses-server").unwrap().status,
+        SessionStatus::Active
+    );
+    let stop = operations(laptop.path(), &laptop_journal.node.node_id);
+    journal.apply_remote(&stop, 300_000).unwrap();
+    assert_eq!(
+        sessions.load_session("ses-server").unwrap().status,
+        SessionStatus::Closed
+    );
+    assert_eq!(
+        journal.runs("demo", &task.id).unwrap()[&journal.node.node_id].state,
+        RunState::Finished
+    );
+    task.session = Some("ses-replacement".into());
+    storage.save_task(&task).unwrap();
+    sessions.link_session(&task.id, "ses-replacement").unwrap();
+    journal.apply_remote(&stop, 300_000).unwrap();
+    assert_eq!(
+        sessions.load_session("ses-replacement").unwrap().status,
+        SessionStatus::Active
+    );
+    // A second stale request has a fresh op ID but still targets generation 1.
+    frontend.stop_task(&task.id).unwrap();
+    journal
+        .apply_remote(
+            &operations(laptop.path(), &laptop_journal.node.node_id),
+            300_000,
+        )
+        .unwrap();
+    assert_eq!(
+        sessions.load_session("ses-replacement").unwrap().status,
+        SessionStatus::Active
+    );
+}
+
+#[test]
+fn mobile_synced_last_answer_wakes_only_server_and_duplicate_does_not_replace_queue() {
+    use kanban4ai::core::models::{MessageKind, MessageRole};
+    use kanban4ai::core::operations::{Operations, QuestionRef};
+    use kanban4ai::core::thread::ThreadManager;
+    let server = tempfile::tempdir().unwrap();
+    let mobile = tempfile::tempdir().unwrap();
+    let storage = control_board(server.path());
+    let journal = Journal::open(server.path()).unwrap();
+    let mobile_journal = peer(mobile.path(), &journal);
+    atomic_write_text(&storage.project_path.join(".kanban/config.yaml"),
+        "auto_launch:\n  enabled: true\norchestration:\n  queue_enabled: true\n  max_running_total: 1\nrules:\n  resume_after_last_answer: true\n").unwrap();
+    let mut task = storage
+        .create_task(NewTask::titled("remote answer"))
+        .unwrap();
+    task.status = TaskStatus::InProgress;
+    task.session = Some("ses-server-wait".into());
+    task.has_questions = true;
+    storage.save_task(&task).unwrap();
+    let sessions = SessionManager::new(&storage.project_path);
+    sessions.link_session(&task.id, "ses-server-wait").unwrap();
+    sessions
+        .set_wait(
+            "ses-server-wait",
+            timefmt::now() + chrono::Duration::hours(1),
+            Some("question".into()),
+        )
+        .unwrap();
+    sessions.mark_wait_exited("ses-server-wait").unwrap();
+    let mut occupant = storage
+        .create_task(NewTask::titled("occupied runner slot"))
+        .unwrap();
+    occupant.status = TaskStatus::InProgress;
+    occupant.session = Some("ses-occupant".into());
+    storage.save_task(&occupant).unwrap();
+    sessions.link_session(&occupant.id, "ses-occupant").unwrap();
+    let tm = ThreadManager::new(&storage.project_path).unwrap();
+    let first = tm
+        .post(
+            &task.id,
+            MessageRole::Agent,
+            MessageKind::Question,
+            "first?",
+            None,
+            vec![],
+            Some("agent".into()),
+        )
+        .unwrap();
+    let last = tm
+        .post(
+            &task.id,
+            MessageRole::Agent,
+            MessageKind::Question,
+            "last?",
+            None,
+            vec![],
+            Some("agent".into()),
+        )
+        .unwrap();
+    mobile_journal
+        .apply_remote(&operations(server.path(), &journal.node.node_id), 300_000)
+        .unwrap();
+    let frontend = Operations::new(mobile.path().join("projects/demo"));
+    frontend
+        .answer_question(&task.id, QuestionRef::MsgId(first.id), "one")
+        .unwrap();
+    journal
+        .apply_remote(
+            &operations(mobile.path(), &mobile_journal.node.node_id),
+            300_000,
+        )
+        .unwrap();
+    assert_eq!(
+        sessions.load_session("ses-server-wait").unwrap().status,
+        SessionStatus::Active
+    );
+    frontend
+        .answer_question(&task.id, QuestionRef::MsgId(last.id), "two")
+        .unwrap();
+    let answer = operations(mobile.path(), &mobile_journal.node.node_id);
+    journal.apply_remote(&answer, 300_000).unwrap();
+    let woken = storage.load_task(&task.id).unwrap().unwrap();
+    assert_eq!(woken.run_phase, Some(RunPhase::Queued));
+    assert!(woken.session.is_none());
+    assert_eq!(woken.runner.as_ref().unwrap().as_str(), journal.node.name);
+    assert_eq!(
+        sessions.load_session("ses-server-wait").unwrap().status,
+        SessionStatus::Closed
+    );
+    assert!(
+        SessionManager::new(frontend.data_root())
+            .list_active_sessions()
+            .is_empty()
+    );
+    let generation = journal.runs("demo", &task.id).unwrap()[&journal.node.node_id].generation;
+    journal.apply_remote(&answer, 300_000).unwrap();
+    assert_eq!(
+        journal.runs("demo", &task.id).unwrap()[&journal.node.node_id].generation,
+        generation
+    );
+}
+
+#[test]
+fn remote_rerun_routes_to_previous_runner_without_frontend_session() {
+    use kanban4ai::core::models::RunMode;
+    use kanban4ai::core::operations::Operations;
+    let server = tempfile::tempdir().unwrap();
+    let laptop = tempfile::tempdir().unwrap();
+    let storage = control_board(server.path());
+    let journal = Journal::open(server.path()).unwrap();
+    let frontend_journal = peer(laptop.path(), &journal);
+    atomic_write_text(
+        &storage.project_path.join(".kanban/config.yaml"),
+        "auto_launch:\n  enabled: true\norchestration:\n  queue_enabled: true\n",
+    )
+    .unwrap();
+    let mut task = storage
+        .create_task(NewTask::titled("remote rerun"))
+        .unwrap();
+    task.status = TaskStatus::Review;
+    task.session = Some("ses-finished".into());
+    storage.save_task(&task).unwrap();
+    let sessions = SessionManager::new(&storage.project_path);
+    sessions.link_session(&task.id, "ses-finished").unwrap();
+    sessions.close_session("ses-finished").unwrap();
+    frontend_journal
+        .apply_remote(&operations(server.path(), &journal.node.node_id), 300_000)
+        .unwrap();
+    let frontend = Operations::new(laptop.path().join("projects/demo"));
+    frontend
+        .rerun_review_task(&task.id, None, RunMode::Queued)
+        .unwrap();
+    assert_eq!(
+        storage.load_task(&task.id).unwrap().unwrap().status,
+        TaskStatus::Review
+    );
+    journal
+        .apply_remote(
+            &operations(laptop.path(), &frontend_journal.node.node_id),
+            300_000,
+        )
+        .unwrap();
+    let queued = storage.load_task(&task.id).unwrap().unwrap();
+    assert_eq!(queued.status, TaskStatus::InProgress);
+    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
+    assert!(
+        !queued
+            .session
+            .as_deref()
+            .is_some_and(|id| sessions.is_session_active(id))
+    );
+    assert!(
+        SessionManager::new(frontend.data_root())
+            .list_active_sessions()
+            .is_empty()
+    );
+}

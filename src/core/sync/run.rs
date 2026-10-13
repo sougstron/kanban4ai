@@ -120,6 +120,9 @@ fn decode_fields(fields: Option<&FieldState>) -> Result<BTreeMap<String, RunDesc
 }
 
 pub(super) fn validate(op: &Operation) -> Result<()> {
+    if op.set.contains_key("command") {
+        return super::control::validate(op);
+    }
     for component in [&op.project, &op.id, &op.hlc.2] {
         if component.is_empty()
             || component == "."

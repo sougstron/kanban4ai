@@ -1,6 +1,7 @@
 //! Versioned remote operations. Disk work runs on blocking threads; rules stay in Operations.
 use super::*;
 use crate::core::operations::{Operations, QuestionRef, TaskPatch};
+use crate::core::runner_log::{self, Snapshot as LogSnapshot};
 use crate::core::storage::{NewTask, Storage};
 use crate::core::sync::{Journal, NodeRole};
 use crate::core::thread::ThreadManager;
@@ -24,6 +25,7 @@ pub(super) fn routes(root: PathBuf) -> Router {
             "/api/v1/projects/{project}/tasks/{task}/thread",
             get(thread),
         )
+        .route("/api/v1/projects/{project}/tasks/{task}/log", get(log))
         .route(
             "/api/v1/projects/{project}/tasks/{task}/{action}",
             axum::routing::post(action),
@@ -194,6 +196,312 @@ async fn thread(
         .await,
     )
 }
+
+fn log_failure(e: KanbanError) -> Response {
+    match &e {
+        KanbanError::Invalid(message) if message == "Not found" => error(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "Task or project was not found",
+        ),
+        KanbanError::Permission(_) => error(
+            StatusCode::FORBIDDEN,
+            "OPERATION_FORBIDDEN",
+            "Runner log access is forbidden",
+        ),
+        _ => error(
+            StatusCode::CONFLICT,
+            "RUNNER_LOG_UNAVAILABLE",
+            "Runner log is unavailable",
+        ),
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    follow: u8,
+}
+
+async fn log(
+    State(root): State<PathBuf>,
+    Params((id, task)): Params<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<LogQuery>,
+) -> Response {
+    let read_task = task.clone();
+    let initial = blocking(move || {
+        valid_task(&read_task)?;
+        let board = project(&root, &id)?.data_root;
+        let _guard = Storage::new(&board).lock()?;
+        let snapshot = runner_log::local_tail(&board, &read_task)?;
+        let token = runner_log::local_follow_token(&board, &read_task)?;
+        Ok((board, snapshot, token))
+    })
+    .await;
+    let (board, initial, token) = match initial {
+        Ok(value) => value,
+        Err(e) => return log_failure(e),
+    };
+    if query.follow != 1 {
+        return Json(initial).into_response();
+    }
+    let stream = futures_util::stream::unfold(
+        (board, task, token, initial, true, false, 0u32),
+        |(board, task, token, mut previous, first, ended, mut idle)| async move {
+            if ended {
+                return None;
+            }
+            if first {
+                let event = format!("event: log\ndata: {}\n\n", json!(previous));
+                return Some((
+                    Ok::<_, std::convert::Infallible>(event),
+                    (board, task, token, previous, false, false, 0),
+                ));
+            }
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let (read_board, read_task, read_token) =
+                    (board.clone(), task.clone(), token.clone());
+                let current = blocking(move || {
+                    runner_log::local_follow_tail(&read_board, &read_task, &read_token)
+                })
+                .await;
+                let (snapshot, running) = match current {
+                    Ok(value) => value,
+                    Err(_) => return Some((Ok("event: error\ndata: {\"code\":\"RUNNER_LOG_UNAVAILABLE\",\"message\":\"Runner log cannot be read\"}\n\n".into()),
+                        (board, task, token, previous, false, true, 0))),
+                };
+                if let Some(snapshot) = snapshot
+                    && snapshot.text != previous.text
+                {
+                    previous = snapshot;
+                    let mut event = format!("event: log\ndata: {}\n\n", json!(previous));
+                    if !running {
+                        event.push_str("event: end\ndata: {}\n\n");
+                    }
+                    return Some((
+                        Ok(event),
+                        (board, task, token, previous, false, !running, 0),
+                    ));
+                }
+                if !running {
+                    return Some((
+                        Ok("event: end\ndata: {}\n\n".into()),
+                        (board, task, token, previous, false, true, 0),
+                    ));
+                }
+                idle += 1;
+                if idle == 30 {
+                    return Some((
+                        Ok(": keepalive\n\n".into()),
+                        (board, task, token, previous, false, false, 0),
+                    ));
+                }
+            }
+        },
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+/// Run in a separate thread so TUI workers and blocking HTTP handlers can both
+/// use the paired LAN/tailnet transport without nesting Tokio runtimes.
+pub(crate) fn remote_log(board: &Path, task: &str, node_id: &str) -> Result<LogSnapshot> {
+    valid_task(task)?;
+    let root = crate::core::sync::store_for_board(board)
+        .ok_or_else(|| invalid("RUNNER_LOG_UNAVAILABLE: Project is not registered"))?;
+    let id = board
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("Invalid project identifier"))?;
+    if Journal::open(root)?.node.node_id == node_id {
+        return runner_log::local_tail(board, task);
+    }
+    let (root, id, task_owned, node) = (
+        root.to_path_buf(),
+        id.to_owned(),
+        task.to_owned(),
+        node_id.to_owned(),
+    );
+    let result = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(KanbanError::Io)?
+            .block_on(fetch_log(&root, &id, &task_owned, &node))
+    })
+    .join()
+    .map_err(|_| invalid("Runner log worker panicked"))?;
+    match result {
+        Ok(snapshot) => Ok(snapshot),
+        Err(e) if matches!(&e, KanbanError::Invalid(message) if message.starts_with("NODE_UNREACHABLE:") || message.starts_with("NODE_OUT_OF_LAN:") || message.starts_with("NODE_POWERED_OFF:") || message.starts_with("NET_")) => {
+            runner_log::cached_tail(board, task, node_id)
+                .map_err(|cached| invalid(format!("{e}; {cached}")))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn bounded_log_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<T> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| invalid("NODE_UNREACHABLE: Runner log transfer failed"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(invalid(
+                "NODE_SERVICE_DOWN: Runner log response exceeds configured limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("NODE_SERVICE_DOWN: Invalid runner log response"))
+}
+
+async fn fetch_log(root: &Path, id: &str, task: &str, node_id: &str) -> Result<LogSnapshot> {
+    let config = discovery::config(root)?;
+    if !discovery::network_available(root, &config)? {
+        return Err(invalid("NODE_OUT_OF_LAN: Runner network is unavailable"));
+    }
+    let peer = config
+        .peers
+        .iter()
+        .find(|peer| peer.node.node_id == node_id)
+        .ok_or_else(|| invalid("NODE_AUTH_FAILED: Runner is not paired"))?;
+    let credentials: Vec<discovery::Credential> = discovery::load(&root.join("sync/peers.yaml"))?;
+    let secret = credentials
+        .iter()
+        .find(|entry| entry.node_id == node_id)
+        .ok_or_else(|| invalid("NODE_AUTH_FAILED: Runner credentials are missing"))?;
+    let presence: BTreeMap<String, discovery::Presence> =
+        discovery::load(&root.join("sync/presence.yaml"))?;
+    let presence = presence.get(node_id).cloned().unwrap_or_default();
+    if presence.bye.is_some() {
+        return Err(invalid(
+            "NODE_POWERED_OFF: Runner announced shutdown or sleep",
+        ));
+    }
+    let addresses = discovery::peer_addresses(root, peer, Some(secret), &presence, &config)?;
+    let journal = Journal::open(root)?;
+    let uid = journal
+        .state()?
+        .project_uids
+        .get(id)
+        .cloned()
+        .ok_or_else(|| invalid("Runner log project is not registered"))?;
+    let limit = crate::core::sync::relay::settings(root)?
+        .log_tail_bytes
+        .saturating_mul(6)
+        .saturating_add(4096);
+    for address in addresses {
+        let timeout = Duration::from_secs(config.probe_timeout);
+        let http = match discovery::peer_client(root, &address, timeout, Some(timeout)) {
+            Ok(http) => http,
+            Err(KanbanError::Invalid(message)) if message.starts_with("NET_") => {
+                return Err(invalid(message));
+            }
+            Err(_) => continue,
+        };
+        let probe = match http
+            .get(format!("http://{address}/node"))
+            .bearer_auth(&secret.token)
+            .send()
+            .await
+        {
+            Ok(probe) => probe,
+            Err(_) => continue,
+        };
+        if probe.status() == StatusCode::UNAUTHORIZED || probe.status() == StatusCode::FORBIDDEN {
+            return Err(invalid("NODE_AUTH_FAILED: Runner rejected its node token"));
+        }
+        if !probe.status().is_success() {
+            continue;
+        }
+        let card: Value = bounded_log_json(probe, 16384).await?;
+        if card["node_id"] != node_id || card["store_id"] != journal.node.store_id {
+            return Err(invalid(
+                "SYNC_STORE_MISMATCH: Runner identity or store does not match",
+            ));
+        }
+        if card["proto"]
+            .as_u64()
+            .is_none_or(|proto| proto < u64::from(MIN_PROTO))
+            || card["min_proto"]
+                .as_u64()
+                .is_none_or(|proto| proto > u64::from(PROTO))
+        {
+            return Err(invalid(
+                "NODE_VERSION_MISMATCH: Runner protocol is incompatible",
+            ));
+        }
+        if peer.node.store_id != journal.node.store_id {
+            refresh_peer_store(root, node_id, &journal.node.store_id)?;
+        }
+        let mut url = reqwest::Url::parse(&format!("http://{address}/"))
+            .map_err(|_| invalid("Invalid paired runner address"))?;
+        url.path_segments_mut()
+            .map_err(|_| invalid("Invalid paired runner address"))?
+            .extend(["api", "v1", "projects", id, "tasks", task, "log"]);
+        let response = match http.get(url).bearer_auth(&secret.token).send().await {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        if response.status() == StatusCode::UNAUTHORIZED
+            || response.status() == StatusCode::FORBIDDEN
+        {
+            return Err(invalid("NODE_AUTH_FAILED: Runner rejected log access"));
+        }
+        if !response.status().is_success() {
+            return Err(invalid(
+                "RUNNER_LOG_UNAVAILABLE: Runner could not provide this task log",
+            ));
+        }
+        let snapshot: LogSnapshot = bounded_log_json(response, limit).await?;
+        if snapshot.node_id != node_id || snapshot.project != uid || snapshot.task != task {
+            return Err(invalid(
+                "SYNC_STORE_MISMATCH: Runner log identity does not match",
+            ));
+        }
+        runner_log::validate_snapshot(root, &snapshot)?;
+        runner_log::cache_snapshot(root, &snapshot)?;
+        return Ok(snapshot);
+    }
+    Err(invalid(
+        "NODE_UNREACHABLE: Runner log endpoint is unreachable",
+    ))
+}
+
+pub(super) fn refresh_peer_store(root: &Path, node_id: &str, store_id: &str) -> Result<()> {
+    let _lock = crate::core::storage::lock_file_reentrant(&root.join("sync/.lock"))?;
+    let path = root.join("config.yaml");
+    let mut config: serde_yaml_ng::Value = discovery::load(&path)?;
+    let mut changed = false;
+    if let Some(peers) = config["sync"]["peers"].as_sequence_mut() {
+        for paired in peers {
+            if paired["node_id"].as_str() == Some(node_id)
+                && paired["store_id"].as_str() != Some(store_id)
+            {
+                paired["store_id"] = serde_yaml_ng::Value::String(store_id.to_owned());
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    crate::core::storage::atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&config)?)
+}
 fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|e| invalid(e.to_string()))
 }
@@ -321,13 +629,6 @@ async fn action(
     if let Err(e) = valid_task(&task) {
         return failure(e);
     }
-    if matches!(action.as_str(), "stop" | "resume") {
-        match target(&root, &id, &task, request.runner.clone(), &action).await {
-            Ok(Some(node)) => return proxy(&root, &node, &id, &task, &action, &request).await,
-            Ok(None) => {}
-            Err(e) => return failure(e),
-        }
-    }
     respond(blocking(move || crate::core::sync::with_actor(if request.agent { "agent" } else { "human" }, || {
         let p = if action == "launch" {
             crate::core::code::for_launch(&root, &id)?
@@ -357,10 +658,16 @@ async fn action(
                     Ok(json!({"queued": session.is_none(), "session": session}))
                 }
             },
-            "resume" => {
+            "rerun" => {
+                use crate::core::models::{RunMode, TaskStatus};
                 let current = found(ops.get_task(&task)?)?;
-                let resumed = ops.resume_answered_agent(&task, current.session.as_deref())?;
-                Ok(json!({"task": task_wire(found(ops.get_task(&task)?)?)?, "resumed": resumed.is_some()}))
+                let mode = if ops.queue_can_dispatch()? { RunMode::Queued } else { RunMode::Immediate };
+                let updated = if current.status == TaskStatus::Review {
+                    ops.rerun_review_task(&task, current.session.as_deref(), mode)?
+                } else {
+                    ops.rerun_in_progress_task(&task, current.session.as_deref(), mode)?
+                };
+                task_wire(found(updated)?)
             },
             "stop" => task_wire(found(ops.stop_task(&task)?)?),
             _ => Err(invalid("Unknown action")),
@@ -372,7 +679,6 @@ async fn target(
     id: &str,
     task_id: &str,
     requested: Option<crate::core::config::Runner>,
-    action: &str,
 ) -> Result<Option<String>> {
     use crate::core::config::Runner;
     let project = project(root, id)?;
@@ -385,15 +691,6 @@ async fn target(
         return Ok(None);
     }
     let journal = Journal::open(root)?;
-    if matches!(action, "stop" | "resume") {
-        if let Some(run) = journal
-            .runs(id, task_id)?
-            .into_values()
-            .find(|run| run.active())
-        {
-            return Ok((run.node_id != journal.node.node_id).then_some(run.name));
-        }
-    }
     let board = crate::core::config::Config::new(&project.data_root).load()?;
     let preference = requested.unwrap_or_else(|| board.runner_for(task.runner.clone()));
     // A reserved role spelling can also be a concrete paired node name.
@@ -437,14 +734,12 @@ async fn target(
     } else {
         choose(&preference).ok_or_else(|| invalid("NODE_UNREACHABLE: Runner is not paired"))?
     };
-    if action == "launch" {
-        let _guard = storage.lock()?;
-        let mut current = storage
-            .load_task(task_id)?
-            .ok_or_else(|| invalid("Not found"))?;
-        current.runner = Some(Runner::Node(node.clone()));
-        storage.save_task(&current)?;
-    }
+    let _guard = storage.lock()?;
+    let mut current = storage
+        .load_task(task_id)?
+        .ok_or_else(|| invalid("Not found"))?;
+    current.runner = Some(Runner::Node(node.clone()));
+    storage.save_task(&current)?;
     Ok((node != journal.node.name).then_some(node))
 }
 
@@ -460,7 +755,7 @@ pub(super) async fn runner_action(
         .load()?
         .runner_for(before.runner)
         == crate::core::config::Runner::Auto;
-    let Some(node) = target(root, id, task, None, "launch").await? else {
+    let Some(node) = target(root, id, task, None).await? else {
         return Ok(None);
     };
     let response = proxy(root, &node, id, task, "launch", &Action::default()).await;
@@ -527,37 +822,6 @@ pub(super) async fn runner_action(
             .as_str()
             .unwrap_or("Runner launch failed")
     )))
-}
-
-pub(super) async fn runner_control(
-    root: &Path,
-    id: &str,
-    task: &str,
-    action: &str,
-) -> Result<bool> {
-    let Some(node) = target(root, id, task, None, action).await? else {
-        return Ok(false);
-    };
-    let response = proxy(root, &node, id, task, action, &Action::default()).await;
-    let status = response.status();
-    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .map_err(|e| invalid(e.to_string()))?;
-    let value: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
-    if !status.is_success() {
-        return Err(invalid(format!(
-            "{}: {}",
-            value["error"]["code"], value["error"]["message"]
-        )));
-    }
-    if let Some(peer) = discovery::config(root)?
-        .peers
-        .iter()
-        .find(|peer| peer.node.name == node)
-    {
-        super::sync::catch_up(root, peer).await?;
-    }
-    Ok(true)
 }
 
 pub(super) fn local_runner(
@@ -715,23 +979,7 @@ async fn proxy(
             );
         }
         if peer.node.store_id != store_id {
-            let refreshed = (|| -> Result<()> {
-                let _lock = crate::core::storage::lock_file_reentrant(&root.join("sync/.lock"))?;
-                let path = root.join("config.yaml");
-                let mut config: serde_yaml_ng::Value = discovery::load(&path)?;
-                if let Some(peers) = config["sync"]["peers"].as_sequence_mut() {
-                    for paired in peers {
-                        if paired["node_id"].as_str() == Some(peer.node.node_id.as_str()) {
-                            paired["store_id"] = serde_yaml_ng::Value::String(store_id.clone());
-                        }
-                    }
-                }
-                crate::core::storage::atomic_write_text_raw(
-                    &path,
-                    &serde_yaml_ng::to_string(&config)?,
-                )
-            })();
-            if let Err(e) = refreshed {
+            if let Err(e) = refresh_peer_store(root, &peer.node.node_id, &store_id) {
                 return failure(e);
             }
         }
@@ -824,11 +1072,6 @@ async fn proxy(
                 Err(e) => {
                     return error(StatusCode::BAD_GATEWAY, "NODE_UNREACHABLE", &e.to_string());
                 }
-            }
-        }
-        if action == "resume" {
-            if let Err(e) = super::sync::catch_up(root, peer).await {
-                return failure(e);
             }
         }
         let url = format!("http://{address}/api/v1/projects/{id}/tasks/{task}/{action}");
@@ -1160,135 +1403,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_stop_closes_only_runner_session() {
-        let temp = tempfile::tempdir().unwrap();
-        let laptop = temp.path().join("laptop");
-        let runner = temp.path().join("runner");
-        let work = temp.path().join("work");
-        fs::create_dir_all(&work).unwrap();
-        fs::create_dir_all(&runner).unwrap();
-        atomic_write_text_raw(
-            &runner.join("config.yaml"),
-            "node:\n  name: server\n  role: server\n",
-        )
-        .unwrap();
-        let a = ProjectStore::at(&laptop).add(&work, None).unwrap().project;
-        let b = ProjectStore::at(&runner).add(&work, None).unwrap().project;
-        Storage::new(&a.data_root).init_board().unwrap();
-        Storage::new(&b.data_root).init_board().unwrap();
-        let local = Operations::for_project(&a)
-            .create_task(NewTask {
-                runner: Some(crate::core::config::Runner::Server),
-                ..NewTask::titled("Remote run")
-            })
-            .unwrap();
-        let remote = Operations::for_project(&b)
-            .create_task(NewTask::titled("Remote run"))
-            .unwrap();
-        assert_eq!(local.id, remote.id);
-        let session_id = "ses-task414-proxy";
-        let sessions = crate::core::session::SessionManager::new(&b.data_root);
-        sessions.link_session(&remote.id, session_id).unwrap();
-        Operations::for_project(&b)
-            .update_task(
-                &remote.id,
-                TaskPatch {
-                    session: Some(Some(session_id.into())),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let caller_node = Journal::open(&laptop).unwrap().node;
-        let mut runner_node = Journal::open(&runner).unwrap().node;
-        runner_node.store_id = caller_node.store_id.clone();
-        atomic_write_text_raw(
-            &runner.join("sync/node.yaml"),
-            &serde_yaml_ng::to_string(&runner_node).unwrap(),
-        )
-        .unwrap();
-        let secret = issue_token(&runner, TokenKind::Node).unwrap();
-        let client = issue_token(&laptop, TokenKind::Node).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let runner_router = super::super::router(runner.join("sync/tokens.yaml"));
-        let server = tokio::spawn(async move {
-            axum::serve(listener, runner_router).await.unwrap();
-        });
-        atomic_write_text_raw(
-            &laptop.join("config.yaml"),
-            &serde_yaml_ng::to_string(&json!({
-                "sync": { "home_networks": ["0.0.0.0/0"], "peers": [{
-                    "node_id":runner_node.node_id, "name":runner_node.name, "role":"server",
-                    "store_id":"pre-bootstrap-store", "address":address.to_string()
-                }]}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        atomic_write_text_raw(
-            &laptop.join("sync/peers.yaml"),
-            &serde_yaml_ng::to_string(&json!([{
-                "node_id":runner_node.node_id, "token":secret, "inbound_sha256":"unused"
-            }]))
-            .unwrap(),
-        )
-        .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let laptop_router = super::super::router(laptop.join("sync/tokens.yaml"));
-        let frontend = tokio::spawn(async move {
-            axum::serve(listener, laptop_router).await.unwrap();
-        });
-        let http = reqwest::Client::new();
-        let url = format!("{base}/api/v1/projects/{}/tasks/{}", a.id, local.id);
-        let conflict = http
-            .post(format!("{url}/launch"))
-            .bearer_auth(&client)
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            conflict.json::<Value>().await.unwrap()["error"]["code"],
-            "RUN_ALREADY_RUNNING"
-        );
-        assert_eq!(
-            discovery::config(&laptop).unwrap().peers[0].node.store_id,
-            runner_node.store_id
-        );
-        let stopped = http
-            .post(format!("{url}/stop"))
-            .bearer_auth(&client)
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            stopped.status(),
-            StatusCode::OK,
-            "{}",
-            stopped.text().await.unwrap()
-        );
-        assert_eq!(
-            sessions.load_session(session_id).unwrap().status,
-            crate::core::models::SessionStatus::Closed
-        );
-        assert!(
-            Operations::for_project(&a)
-                .get_task(&local.id)
-                .unwrap()
-                .unwrap()
-                .session
-                .is_none()
-        );
-        frontend.abort();
-        server.abort();
-        let _ = frontend.await;
-        let _ = server.await;
-    }
-
-    #[tokio::test]
     async fn placement_pins_here_and_distinguishes_same_role_nodes() {
         use crate::core::config::Runner;
         let temp = tempfile::tempdir().unwrap();
@@ -1320,7 +1434,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            target(&root, &p.id, &task.id, Some(Runner::Here), "launch")
+            target(&root, &p.id, &task.id, Some(Runner::Here))
                 .await
                 .unwrap(),
             None
@@ -1332,15 +1446,9 @@ mod tests {
         assert_eq!(pinned.runner.as_ref().unwrap().as_str(), "desk");
         assert!(local_runner(&p.data_root, pinned.runner.as_ref()).unwrap());
         assert_eq!(
-            target(
-                &root,
-                &p.id,
-                &task.id,
-                Some(Runner::Node("laptop".into())),
-                "launch"
-            )
-            .await
-            .unwrap(),
+            target(&root, &p.id, &task.id, Some(Runner::Node("laptop".into())),)
+                .await
+                .unwrap(),
             Some("laptop".into())
         );
         let pinned = Storage::new(&p.data_root)

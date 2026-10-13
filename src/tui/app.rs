@@ -378,6 +378,18 @@ pub struct LogViewState {
     /// Upper scroll bound, set by the renderer from the viewport height.
     pub max_scroll: u16,
     pub follow: bool,
+    pub return_screen: Screen,
+    remote: Option<RemoteLog>,
+}
+
+#[derive(Clone)]
+struct RemoteLog {
+    task: String,
+    node: String,
+    name: String,
+    last_poll: Option<Instant>,
+    pending:
+        Option<Arc<Mutex<std::sync::mpsc::Receiver<Result<crate::core::runner_log::Snapshot>>>>>,
 }
 
 /// Read-only pager over a static text block (a task's assembled prompt or its
@@ -1466,6 +1478,7 @@ impl App {
             (KeyCode::Char('v'), _) if self.screen == Screen::Detail => {
                 self.dispatch(UiAction::ViewContext)?
             }
+            (KeyCode::Char('L'), _) if action_screen => self.dispatch(UiAction::ViewLog)?,
             (KeyCode::Char('u'), _) if self.screen == Screen::Archive => {
                 self.dispatch(UiAction::Restore)?
             }
@@ -1915,9 +1928,14 @@ impl App {
     fn handle_log_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
+                self.screen = self
+                    .log_view
+                    .as_ref()
+                    .map_or(Screen::Sessions, |log| log.return_screen);
                 self.log_view = None;
-                self.screen = Screen::Sessions;
-                self.refresh_active_sessions()?;
+                if self.screen == Screen::Sessions {
+                    self.refresh_active_sessions()?;
+                }
             }
             KeyCode::Up => self.scroll_log(-1),
             KeyCode::Down => self.scroll_log(1),
@@ -3861,10 +3879,11 @@ impl App {
     /// Crashed sessions use recover; a cleanly closed session is already idle.
     pub(super) fn task_can_stop(&self, task: &Task) -> bool {
         task.status == TaskStatus::InProgress
-            && matches!(
-                self.board.session_states.get(&task.id),
-                Some(SessionState::Live | SessionState::Waiting)
-            )
+            && (self.board.remote_runs.contains_key(&task.id)
+                || matches!(
+                    self.board.session_states.get(&task.id),
+                    Some(SessionState::Live | SessionState::Waiting)
+                ))
     }
 
     fn current_task_id(&self) -> Option<String> {
@@ -5266,6 +5285,8 @@ impl App {
             return Ok(());
         }
         let from_review = task.status == TaskStatus::Review;
+        let remote = self.board.remote_runs.contains_key(&task.id)
+            || !crate::cli::serve::local_runner(self.ops.data_root(), task.runner.as_ref())?;
         // Same hard fallback as `r`: never park a re-run in a queue nothing
         // can drain (queue or auto-launch switched off) — start it directly.
         let mode = if self.ops.queue_can_dispatch()? {
@@ -5304,6 +5325,14 @@ impl App {
                     };
                 }
             };
+            if remote && reran {
+                return LaunchReport {
+                    status: Some(format!("Re-run requested for {task_id} on its runner")),
+                    refresh: true,
+                    redraw: true,
+                    ..LaunchReport::default()
+                };
+            }
             // Same pump as `r`: with free caps the re-run starts on the spot;
             // otherwise the task waits in the queue with the edits folded in.
             if reran && mode == RunMode::Queued {
@@ -5402,6 +5431,12 @@ impl App {
     }
 
     fn open_stop_confirm(&mut self) {
+        if let Some(task) = self.current_task()
+            && self.board.remote_runs.contains_key(&task.id)
+        {
+            self.modal = Some(ModalState::new(Modal::StopTaskConfirm { task_id: task.id }));
+            return;
+        }
         let session_id = self.current_task().and_then(|task| {
             if self.task_can_stop(&task) {
                 task.session.clone()
@@ -5418,6 +5453,46 @@ impl App {
     }
 
     fn open_log_view(&mut self) {
+        if self.screen != Screen::Sessions
+            && let Some(task) = self.current_task()
+            && let Ok(run) = crate::core::runner_log::latest_run(self.ops.data_root(), &task.id)
+            && crate::core::sync::store_for_board(self.ops.data_root())
+                .and_then(|store| crate::core::sync::Journal::open(store).ok())
+                .is_some_and(|journal| run.node_id != journal.node.node_id)
+        {
+            self.log_view = Some(LogViewState {
+                session_id: format!("{} on {}", task.id, run.name),
+                lines: vec!["Loading remote log…".into()],
+                scroll: 0,
+                max_scroll: u16::MAX,
+                follow: true,
+                return_screen: self.screen,
+                remote: Some(RemoteLog {
+                    task: task.id,
+                    node: run.node_id.clone(),
+                    name: run.name.clone(),
+                    last_poll: None,
+                    pending: None,
+                }),
+            });
+            self.screen = Screen::LogView;
+            self.refresh_log_view();
+            return;
+        }
+        if self.screen != Screen::Sessions
+            && let Some(task) = self.current_task()
+        {
+            if let Some(session) = task.session {
+                let return_screen = self.screen;
+                self.open_log_view_for(session);
+                if let Some(log) = self.log_view.as_mut() {
+                    log.return_screen = return_screen;
+                }
+            } else {
+                self.status = format!("No run log recorded for {}", task.id);
+            }
+            return;
+        }
         let Some(session_id) = self.selected_session_id() else {
             self.status = "No session selected".to_string();
             return;
@@ -5436,6 +5511,8 @@ impl App {
             // the first frame to the bottom regardless.
             max_scroll: u16::MAX,
             follow: true,
+            return_screen: Screen::Sessions,
+            remote: None,
         });
         self.screen = Screen::LogView;
         self.status = format!("Log of {session_id}");
@@ -5443,7 +5520,49 @@ impl App {
 
     fn refresh_log_view(&mut self) {
         if let Some(log) = self.log_view.as_mut() {
-            log.lines = load_log_tail(self.ops.data_root(), &log.session_id);
+            if let Some(remote) = log.remote.as_mut() {
+                if let Some(pending) = remote.pending.as_ref() {
+                    let result = pending.lock().unwrap_or_else(|e| e.into_inner()).try_recv();
+                    match result {
+                        Ok(Ok(snapshot)) => {
+                            log.lines = snapshot.text.lines().map(sanitize_terminal_text).collect();
+                            let age = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                            log.session_id = format!(
+                                "{} on {} · {}s ago",
+                                remote.task,
+                                remote.name,
+                                age.saturating_sub(snapshot.at_ms) / 1000
+                            );
+                            remote.pending = None;
+                        }
+                        Ok(Err(error)) => {
+                            self.status = error.to_string();
+                            remote.pending = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => remote.pending = None,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                }
+                if remote.pending.is_none()
+                    && remote
+                        .last_poll
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+                {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let (board, task, node) = (
+                        self.ops.data_root().to_path_buf(),
+                        remote.task.clone(),
+                        remote.node.clone(),
+                    );
+                    remote.pending = Some(Arc::new(Mutex::new(rx)));
+                    remote.last_poll = Some(Instant::now());
+                    std::thread::spawn(move || {
+                        let _ = tx.send(crate::cli::serve::remote_log(&board, &task, &node));
+                    });
+                }
+            } else {
+                log.lines = load_log_tail(self.ops.data_root(), &log.session_id);
+            }
         }
     }
 
@@ -6528,6 +6647,11 @@ impl App {
                     None => format!("Session {session_id} not found"),
                 };
             }
+            Modal::StopTaskConfirm { task_id } => {
+                self.ops.stop_task(&task_id)?;
+                self.status = format!("Stop requested for {task_id} on its runner");
+                self.refresh_after_action()?;
+            }
             Modal::RestoreConfirm { task_id } => {
                 let restored = self.ops.unarchive_task(&task_id)?;
                 self.refresh_after_action()?;
@@ -7573,6 +7697,7 @@ fn is_confirmation_modal(modal: &Modal) -> bool {
             | Modal::RevertConfirm { .. }
             | Modal::BulkConfirm { .. }
             | Modal::KillSessionConfirm { .. }
+            | Modal::StopTaskConfirm { .. }
             | Modal::RestoreConfirm { .. }
             | Modal::DeleteProject { .. }
     )
