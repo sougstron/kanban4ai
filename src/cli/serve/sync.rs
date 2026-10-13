@@ -1158,7 +1158,8 @@ mod tests {
             changed();
             let root = b.join("projects/demo");
             wait_for("laptop task on server", move || Storage::new(&root).list_tasks(None).unwrap().len() == 3).await;
-            assert_eq!(ja.vector().unwrap(), jb.vector().unwrap());
+            // The task file lands before the server's journal records the batch.
+            wait_for("vectors converge", || ja.vector().unwrap() == jb.vector().unwrap()).await;
             assert!(!server_id.is_empty());
             live.abort();
             sa.abort();
