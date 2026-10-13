@@ -9,7 +9,7 @@ expression: "render_at(&mut app, 100, 40)"
 │    /tmp/k4ai-sync-tab                                                                            │
 │                                                                                                  │
 │              ┌ Global settings ───────────────────────────────────────────────────┐              │
-│              │ Com │ Des │ Rev │ Exe │ Bck │ Prj │ Syn                            │              │
+│              │ Com │ Des │ Rev │ Exe │ Aut │ Bck │ Prj │ Syn                      │              │
 │              │────────────────────────────────────────────────────────────────────│              │
 │              │┌ Sync ────────────────────────────────────────────────────────────┐│              │
 │              ││This node                                                         ││              │
@@ -104,8 +104,10 @@ expression: "render_at(&mut app, 100, 40)"
 7:45-46 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 7:46-51 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 7:51-52 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-7:52-57 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
-7:57-84 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+7:52-57 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+7:57-58 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+7:58-63 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
+7:63-84 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 7:84-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 7:85-99 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 7:99-100 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)

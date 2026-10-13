@@ -84,7 +84,10 @@ session: the agent resolves the markers in the worktree and finishes with
 `kanban done`, which lands both sides' changes. `commit_all` in the worktree
 refuses to conclude a merge that still has unmerged index entries, so
 unresolved markers keep the landing re-conflicting instead of slipping the
-markered tree into the work folder.
+markered tree into the work folder. Auto mode (`docs/config.md`) behaves as
+`resolver` regardless of this setting, up to `auto_mode.max_resolver_runs`
+runs per task. On every board a conflict also holds the queue (see
+"Merge-conflict queue hold" in `docs/orchestration.md`).
 
 A conflicted landing also **advances the integration ref to its own snapshot
 W** — the one it merged into the worktree — even though nothing landed. That

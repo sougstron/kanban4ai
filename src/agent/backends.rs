@@ -10,6 +10,7 @@ use serde_yaml_ng::{Mapping, Value};
 use crate::agent::prompt::{build_agent_prompt, build_resume_prompt};
 use crate::core::config::{BoardConfig, BotSettings, Config, OrchestrationSettings};
 use crate::core::error::{KanbanError, Result};
+use crate::core::global::AutoQuestions;
 use crate::core::models::{Role, RunPhase, SessionStatus, Task};
 use crate::core::project::Roots;
 use crate::core::provenance;
@@ -250,15 +251,32 @@ pub fn build_launch_plan<'a>(
     } else {
         None
     };
+    // Auto mode: with `questions: decide` nobody answers, so the agent is
+    // briefed exactly like a silence-mode task; with an arbiter it may still
+    // ask, but is told no human reads the question.
+    let auto = loader.load_global().0.auto_mode();
+    let auto_task;
+    let task = if auto.enabled && auto.questions == AutoQuestions::Decide && !task.silence {
+        auto_task = Task {
+            silence: true,
+            ..task.clone()
+        };
+        &auto_task
+    } else {
+        task
+    };
     let role = Role::from_phase(task.run_phase);
     let resume = (!revert && matches!(backend.as_str(), "codex" | "pi" | "omp" | "grok" | "kimi"))
         .then(|| native_resume_candidate(roots.data_root, task, session_id, &backend))
         .flatten();
-    let prompt = if let Some((previous_session, _)) = &resume {
+    let mut prompt = if let Some((previous_session, _)) = &resume {
         build_resume_prompt(roots, task, session_id, previous_session, role)?
     } else {
         build_agent_prompt(roots, task, session_id, revert, role)?
     };
+    if auto.enabled {
+        prompt.push_str(auto_mode_note(auto.questions));
+    }
     let mut args = backend_args(
         &backend,
         &backend_config,
@@ -346,6 +364,21 @@ fn native_resume_candidate(
     })
 }
 
+/// The auto-mode paragraph closing every prompt while auto mode is on.
+pub(crate) fn auto_mode_note(questions: AutoQuestions) -> &'static str {
+    match questions {
+        AutoQuestions::Decide => {
+            "\nAuto mode: no human is watching this board. Work autonomously to the end of the \
+task; never wait for a person.\n"
+        }
+        AutoQuestions::Arbiter => {
+            "\nAuto mode: no human is watching this board. Questions are answered by an arbiter \
+agent from the task context, not by the human. Ask only when genuinely blocked; otherwise decide \
+yourself, record the decision with suggest, and work autonomously to the end of the task.\n"
+        }
+    }
+}
+
 pub fn auto_launch_config(config: &BoardConfig) -> AutoLaunchConfig {
     AutoLaunchConfig {
         enabled: mapping_bool(&config.auto_launch, "enabled", true),
@@ -388,7 +421,7 @@ pub fn backend_config(config: &BoardConfig, name: &str) -> Result<AgentBackendCo
     })
 }
 
-fn backend_args(
+pub(crate) fn backend_args(
     backend: &str,
     config: &AgentBackendConfig,
     model: Option<&str>,

@@ -31,6 +31,7 @@ use crate::core::context::ContextManager;
 use crate::core::daemon;
 use crate::core::error::{KanbanError, Result};
 use crate::core::executors::{self, Pool};
+use crate::core::global::AutoQuestions;
 use crate::core::limit_share;
 use crate::core::limits::LimitsSnapshot;
 use crate::core::models::{
@@ -2913,6 +2914,7 @@ impl App {
                         DialogField::Backend
                             | DialogField::DesignerBackend
                             | DialogField::ReviewerBackend
+                            | DialogField::ArbiterBackend
                     ) {
                         self.refresh_backend_options_for(&mut modal, slot);
                     } else if matches!(
@@ -2920,6 +2922,7 @@ impl App {
                         DialogField::Model
                             | DialogField::DesignerModel
                             | DialogField::ReviewerModel
+                            | DialogField::ArbiterModel
                     ) && let Some(config) = self.modal_config(&modal)
                     {
                         self.refresh_effort_options_for_slot(&mut modal, &config, slot);
@@ -4605,6 +4608,29 @@ impl App {
                 value: Some(crate::core::global::PROJECT_SORT_SMART_NAME.to_string()),
             },
         ]);
+        let auto = config.auto_mode();
+        modal.auto_mode_enabled = auto.enabled;
+        modal.auto_mode_arbiter = auto.questions == AutoQuestions::Arbiter;
+        modal.auto_mode_arbiter_timeout =
+            super::dialogs::one_line(&auto.arbiter_timeout_secs.to_string());
+        modal.auto_mode_max_resolver_runs =
+            super::dialogs::one_line(&auto.max_resolver_runs.to_string());
+        modal.set_backend_text_for(
+            AgentSlot::Arbiter,
+            auto.arbiter_backend.as_deref().unwrap_or(""),
+        );
+        modal.set_model_text_for(
+            AgentSlot::Arbiter,
+            auto.arbiter_model.as_deref().unwrap_or(""),
+        );
+        modal.set_effort_text_for(
+            AgentSlot::Arbiter,
+            auto.arbiter_effort.as_deref().unwrap_or(""),
+        );
+        modal.set_agent_text_for(
+            AgentSlot::Arbiter,
+            auto.arbiter_agent.as_deref().unwrap_or(""),
+        );
         self.fill_settings_form(&mut modal, &view);
         modal.capture_initial_values();
         self.modal = Some(modal);
@@ -5114,7 +5140,8 @@ impl App {
         }))
         .collect::<Vec<_>>();
         modal.set_backend_options_for(AgentSlot::Designer, role_backends.clone());
-        modal.set_backend_options_for(AgentSlot::Reviewer, role_backends);
+        modal.set_backend_options_for(AgentSlot::Reviewer, role_backends.clone());
+        modal.set_backend_options_for(AgentSlot::Arbiter, role_backends);
         modal.set_reviewer_on_changes_options(vec![
             SelectOption {
                 label: "Stay in Progress (re-queue)".to_string(),
@@ -6090,6 +6117,7 @@ impl App {
         if modal.is_settings_form() {
             self.refresh_slot_options_with_config(modal, config, AgentSlot::Designer);
             self.refresh_slot_options_with_config(modal, config, AgentSlot::Reviewer);
+            self.refresh_slot_options_with_config(modal, config, AgentSlot::Arbiter);
         }
     }
 
@@ -6554,6 +6582,15 @@ impl App {
                         return Ok(());
                     }
                 };
+                let auto = match parse_auto_mode(&modal) {
+                    Ok(auto) => auto,
+                    Err((field, message)) => {
+                        modal.focus_field(field);
+                        modal.error = Some(message);
+                        self.modal = Some(modal);
+                        return Ok(());
+                    }
+                };
                 let save_result = (|| -> Result<()> {
                     let Some(store) = &self.store else {
                         return Err(KanbanError::Invalid(
@@ -6569,6 +6606,7 @@ impl App {
                     config.set_update_check_on_open(modal.update_check_on_open);
                     config.set_hidden_projects(&modal.hidden_project_ids());
                     config.set_backend_order(&modal.backend_order);
+                    config.set_auto_mode(&auto);
                     config.set_project_sort(
                         &modal
                             .project_sort_text()
@@ -7851,6 +7889,8 @@ fn field_consumes_horizontal(field: DialogField) -> bool {
             | DialogField::MaxRunningPerBackendModel
             | DialogField::AutoRestartDelays
             | DialogField::ReviewerMaxRounds
+            | DialogField::AutoModeArbiterTimeout
+            | DialogField::AutoModeMaxResolverRuns
             | DialogField::ExecutorWeekThreshold
             | DialogField::ExecutorFiveHourThreshold
             | DialogField::Backend
@@ -7861,6 +7901,8 @@ fn field_consumes_horizontal(field: DialogField) -> bool {
             | DialogField::DesignerModel
             | DialogField::ReviewerBackend
             | DialogField::ReviewerModel
+            | DialogField::ArbiterBackend
+            | DialogField::ArbiterModel
             | DialogField::ExecutorMiddle1
             | DialogField::ExecutorMiddle2
             | DialogField::ExecutorMiddle3
@@ -7968,6 +8010,10 @@ fn slot_selection_snapshot(modal: &ModalState, field: DialogField) -> SlotSelect
             backend: modal.reviewer_backend_selected(),
             model: modal.reviewer_model_selected(),
         },
+        AgentSlot::Arbiter => SlotSelection {
+            backend: modal.arbiter_backend_selected(),
+            model: modal.arbiter_model_selected(),
+        },
     }
 }
 
@@ -8006,6 +8052,10 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::ReviewerModel => Some(modal.reviewer_model_selected()),
         DialogField::ReviewerEffort => Some(modal.reviewer.effort_selected),
         DialogField::ReviewerAgent => Some(modal.reviewer.agent_selected),
+        DialogField::ArbiterBackend => Some(modal.arbiter_backend_selected()),
+        DialogField::ArbiterModel => Some(modal.arbiter_model_selected()),
+        DialogField::ArbiterEffort => Some(modal.arbiter.effort_selected),
+        DialogField::ArbiterAgent => Some(modal.arbiter.agent_selected),
         DialogField::ReviewerOnChanges => Some(modal.reviewer_on_changes_selected),
         DialogField::ExecutorMiddle1
         | DialogField::ExecutorMiddle2
@@ -8020,6 +8070,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::AgentSettings
         | DialogField::DesignerAgentSettings
         | DialogField::ReviewerAgentSettings
+        | DialogField::ArbiterAgentSettings
         | DialogField::TaskOptions
         | DialogField::Readonly
         | DialogField::Silence
@@ -8045,6 +8096,10 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::DesignerEnabled
         | DialogField::ReviewerEnabled
         | DialogField::ReviewerMaxRounds
+        | DialogField::AutoModeEnabled
+        | DialogField::AutoModeArbiter
+        | DialogField::AutoModeArbiterTimeout
+        | DialogField::AutoModeMaxResolverRuns
         | DialogField::ExecutorWeekThreshold
         | DialogField::ExecutorFiveHourThreshold
         | DialogField::IsolationStatus
@@ -8531,6 +8586,43 @@ fn parse_orchestration_modal(
         reviewer_agent: modal.agent_text_for(AgentSlot::Reviewer),
         reviewer_on_changes,
         reviewer_max_rounds,
+    })
+}
+
+/// The Auto tab as auto-mode settings; both numbers must be integers, and
+/// the arbiter timeout positive.
+fn parse_auto_mode(
+    modal: &ModalState,
+) -> std::result::Result<crate::core::global::AutoMode, (DialogField, String)> {
+    let timeout = parse_cap_field(
+        &modal.auto_mode_arbiter_timeout,
+        DialogField::AutoModeArbiterTimeout,
+        "Arbiter timeout",
+    )?;
+    if timeout == 0 {
+        return Err((
+            DialogField::AutoModeArbiterTimeout,
+            "Arbiter timeout must be at least 1 second".to_string(),
+        ));
+    }
+    let resolver_runs = parse_cap_field(
+        &modal.auto_mode_max_resolver_runs,
+        DialogField::AutoModeMaxResolverRuns,
+        "Max resolver runs",
+    )?;
+    Ok(crate::core::global::AutoMode {
+        enabled: modal.auto_mode_enabled,
+        questions: if modal.auto_mode_arbiter {
+            AutoQuestions::Arbiter
+        } else {
+            AutoQuestions::Decide
+        },
+        arbiter_backend: modal.backend_text_for(AgentSlot::Arbiter),
+        arbiter_model: modal.model_text_for(AgentSlot::Arbiter),
+        arbiter_effort: modal.effort_text_for(AgentSlot::Arbiter),
+        arbiter_agent: modal.agent_text_for(AgentSlot::Arbiter),
+        arbiter_timeout_secs: timeout as u64,
+        max_resolver_runs: u32::try_from(resolver_runs).unwrap_or(u32::MAX),
     })
 }
 

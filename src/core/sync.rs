@@ -578,6 +578,9 @@ fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
             "crash_restarts",
             "restart_at",
             "auto_resumes",
+            "queued_at",
+            "conflict_held",
+            "resolver_runs",
         ],
         "project" => &["work_path", "migrated_from", "last_opened_at"],
         "config" if global => &[
@@ -587,6 +590,7 @@ fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
             "net",
             "daemon",
             "tui",
+            "auto_mode",
             "recent_models",
         ],
         _ => &[],

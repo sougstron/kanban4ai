@@ -24,6 +24,7 @@ use crate::core::compaction::{CompactionManager, CompactionStatus};
 use crate::core::config::Config;
 use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
+use crate::core::global::{AutoMode, AutoQuestions};
 use crate::core::limits;
 use crate::core::models::{RunMode, RunPhase, Task, TaskStatus};
 use crate::core::operations::{
@@ -476,6 +477,37 @@ enum Command {
         #[arg(long)]
         status: i32,
     },
+    /// Show or change auto mode: unattended work on every project. Agent
+    /// questions are decided by the agent itself or answered by an arbiter
+    /// agent, and conflicted landings go straight back to the same model.
+    #[command(name = "auto-mode")]
+    AutoMode {
+        /// `on` or `off`; omit to show the current settings.
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+        /// How questions are handled: the agent decides, or an arbiter agent answers.
+        #[arg(long, value_parser = ["decide", "arbiter"])]
+        questions: Option<String>,
+        /// Arbiter backend (blank: the default agent).
+        #[arg(long)]
+        arbiter_backend: Option<String>,
+        /// Arbiter model (blank: the backend default).
+        #[arg(long)]
+        arbiter_model: Option<String>,
+        /// Arbiter reasoning effort (blank: the backend default).
+        #[arg(long)]
+        arbiter_effort: Option<String>,
+        /// Seconds an arbiter run may take before the agent decides itself.
+        #[arg(long)]
+        arbiter_timeout: Option<u64>,
+        /// Automatic conflict-resolver runs per task before a human is needed.
+        #[arg(long)]
+        max_resolver_runs: Option<u32>,
+    },
+    /// Internal command started by auto mode: run the arbiter agent that
+    /// answers a task's open questions.
+    #[command(name = "arbiter", hide = true)]
+    Arbiter { task_id: String },
     #[command(name = "wait-resume", hide = true)]
     WaitResume {
         task_id: String,
@@ -769,6 +801,57 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Command::Update { check } => return run_update(check),
+        Command::AutoMode {
+            state,
+            questions,
+            arbiter_backend,
+            arbiter_model,
+            arbiter_effort,
+            arbiter_timeout,
+            max_resolver_runs,
+        } => {
+            let store = ProjectStore::open()?;
+            let changed = state.is_some()
+                || questions.is_some()
+                || arbiter_backend.is_some()
+                || arbiter_model.is_some()
+                || arbiter_effort.is_some()
+                || arbiter_timeout.is_some()
+                || max_resolver_runs.is_some();
+            let mode = if changed {
+                let _lock = store.lock()?;
+                let mut config = store.load_global_config()?;
+                let mut mode = config.auto_mode();
+                if let Some(state) = state {
+                    mode.enabled = state == "on";
+                }
+                if let Some(questions) = questions {
+                    mode.questions = AutoQuestions::parse(&questions);
+                }
+                for (value, slot) in [
+                    (arbiter_backend, &mut mode.arbiter_backend),
+                    (arbiter_model, &mut mode.arbiter_model),
+                    (arbiter_effort, &mut mode.arbiter_effort),
+                ] {
+                    if let Some(value) = value {
+                        *slot = Some(value).filter(|v| !v.trim().is_empty());
+                    }
+                }
+                if let Some(secs) = arbiter_timeout.filter(|secs| *secs > 0) {
+                    mode.arbiter_timeout_secs = secs;
+                }
+                if let Some(runs) = max_resolver_runs {
+                    mode.max_resolver_runs = runs;
+                }
+                config.set_auto_mode(&mode);
+                store.save_global_config(&config)?;
+                mode
+            } else {
+                store.load_global_config()?.auto_mode()
+            };
+            print_auto_mode(&mode);
+            return Ok(ExitCode::SUCCESS);
+        }
         Command::Net { command } => return net::run(command),
         Command::Tui => return launch_tui(cli.project.as_deref()),
         Command::Daemon { interval, once } => {
@@ -1576,11 +1659,34 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::WaitResume { task_id, session } => {
             wait_resume_monitor(&ops, &task_id, &session)?;
         }
-        Command::ResolveAgent { .. } | Command::FormatStream | Command::CheckoutWorktree => {
+        Command::Arbiter { task_id } => {
+            let fallback = crate::agent::arbiter::run_arbiter(&ops, &task_id)?;
+            if fallback > 0 {
+                println!("{fallback} question(s) on {task_id} fell back to the decide answer");
+            }
+        }
+        Command::ResolveAgent { .. }
+        | Command::FormatStream
+        | Command::CheckoutWorktree
+        | Command::AutoMode { .. } => {
             unreachable!("handled before resolve")
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_auto_mode(mode: &AutoMode) {
+    let blank = |value: &Option<String>| value.clone().unwrap_or_else(|| "default".to_string());
+    println!("Auto mode: {}", if mode.enabled { "on" } else { "off" });
+    println!("Questions: {}", mode.questions.as_str());
+    println!(
+        "Arbiter: backend={} model={} effort={} timeout={}s",
+        blank(&mode.arbiter_backend),
+        blank(&mode.arbiter_model),
+        blank(&mode.arbiter_effort),
+        mode.arbiter_timeout_secs
+    );
+    println!("Max resolver runs per task: {}", mode.max_resolver_runs);
 }
 
 /// Reformat a claude stream-json transcript (read line by line) into

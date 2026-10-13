@@ -1,6 +1,7 @@
 //! Phase 3 agent runtime: backend command construction, prompt generation,
 //! tmux/background process launch and log wiring.
 
+pub mod arbiter;
 mod backends;
 mod launcher;
 mod prompt;

@@ -329,6 +329,9 @@ fn pump_project(
         lines.push(format!("{ts} {} cleanup {task_id}", project.id));
     }
     if !orchestration.queue_enabled {
+        // `dispatch_queue` runs the auto-mode sweep on queue boards; a board
+        // without a queue still gets its questions answered.
+        let _ = ops.auto_mode_sweep();
         return Ok((lines, settle(project, &ops, false)?));
     }
 
