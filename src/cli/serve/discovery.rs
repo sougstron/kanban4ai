@@ -469,6 +469,7 @@ async fn probe_peer(
     }
     Ok(status(peer, presence, code, remote_version.as_ref()))
 }
+
 pub(super) async fn runner_online(root: &Path, peer: &PeerCard) -> Result<bool> {
     let config = config(root)?;
     let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;

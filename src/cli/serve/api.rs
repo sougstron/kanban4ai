@@ -736,6 +736,7 @@ async fn target(
         return Ok(None);
     }
     let journal = Journal::open(root)?;
+
     let board = crate::core::config::Config::new(&project.data_root).load()?;
     let preference = requested.unwrap_or_else(|| board.runner_for(task.runner.clone()));
     // A reserved role spelling can also be a concrete paired node name.
@@ -919,6 +920,7 @@ async fn proxy(
         Ok(available) => available,
         Err(e) => return failure(e),
     };
+
     let Some(peer) = config.peers.iter().find(|p| p.node.name == node) else {
         return error(
             StatusCode::CONFLICT,
@@ -1205,6 +1207,11 @@ async fn proxy(
                 Err(e) => {
                     return error(StatusCode::BAD_GATEWAY, "NODE_UNREACHABLE", &e.to_string());
                 }
+            }
+        }
+        if action == "resume" {
+            if let Err(e) = super::sync::catch_up(root, peer).await {
+                return failure(e);
             }
         }
         let url = format!("http://{address}/api/v1/projects/{id}/tasks/{task}/{action}");

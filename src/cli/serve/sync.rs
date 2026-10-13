@@ -847,6 +847,15 @@ pub(super) fn start(root: &Path) -> Running {
     Running { tasks }
 }
 
+pub(super) async fn catch_up(root: &Path, peer: &PeerCard) -> Result<()> {
+    let config = discovery::config(root)?;
+    let (link, _) = Link::connect(root, &config, peer).await?;
+    link.cycle()
+        .await?
+        .ok_or_else(|| invalid("Runner replica is not bootstrapped"))?;
+    Ok(())
+}
+
 /// The Sync tab's view of a reachable peer: the route that answered and
 /// the peer's own clone status for each project (`GET /git/<id>/status`).
 pub(super) async fn settings_peer(
@@ -870,15 +879,6 @@ pub(super) async fn settings_peer(
         });
     }
     Ok((route.into(), clones))
-}
-
-pub(super) async fn catch_up(root: &Path, peer: &PeerCard) -> Result<()> {
-    let config = discovery::config(root)?;
-    let (link, _) = Link::connect(root, &config, peer).await?;
-    link.cycle()
-        .await?
-        .ok_or_else(|| invalid("Runner replica is not bootstrapped"))?;
-    Ok(())
 }
 
 /// One catch-up cycle with every paired peer (`serve --sync`, and the tail
