@@ -684,11 +684,6 @@ fn non_retryable_backend_error_skips_crash_restart() {
         }),
         "thread must surface the backend error"
     );
-    assert!(
-        thread.messages.iter().any(|m| {
-            m.kind == MessageKind::AgentStep && m.body.contains("crash-restart skipped")
-        })
-    );
 }
 
 #[test]

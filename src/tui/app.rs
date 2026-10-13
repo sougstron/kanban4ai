@@ -378,6 +378,18 @@ pub struct LogViewState {
     /// Upper scroll bound, set by the renderer from the viewport height.
     pub max_scroll: u16,
     pub follow: bool,
+    pub return_screen: Screen,
+    remote: Option<RemoteLog>,
+}
+
+#[derive(Clone)]
+struct RemoteLog {
+    task: String,
+    node: String,
+    name: String,
+    last_poll: Option<Instant>,
+    pending:
+        Option<Arc<Mutex<std::sync::mpsc::Receiver<Result<crate::core::runner_log::Snapshot>>>>>,
 }
 
 /// Read-only pager over a static text block (a task's assembled prompt or its
@@ -524,6 +536,7 @@ struct LaunchJob {
 #[derive(Default)]
 struct LaunchReport {
     status: Option<String>,
+    modal: Option<Modal>,
     /// Close the detail screen if it still shows this task.
     close_detail_for: Option<String>,
     focus: Option<String>,
@@ -1466,6 +1479,7 @@ impl App {
             (KeyCode::Char('v'), _) if self.screen == Screen::Detail => {
                 self.dispatch(UiAction::ViewContext)?
             }
+            (KeyCode::Char('L'), _) if action_screen => self.dispatch(UiAction::ViewLog)?,
             (KeyCode::Char('u'), _) if self.screen == Screen::Archive => {
                 self.dispatch(UiAction::Restore)?
             }
@@ -1915,9 +1929,14 @@ impl App {
     fn handle_log_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => {
+                self.screen = self
+                    .log_view
+                    .as_ref()
+                    .map_or(Screen::Sessions, |log| log.return_screen);
                 self.log_view = None;
-                self.screen = Screen::Sessions;
-                self.refresh_active_sessions()?;
+                if self.screen == Screen::Sessions {
+                    self.refresh_active_sessions()?;
+                }
             }
             KeyCode::Up => self.scroll_log(-1),
             KeyCode::Down => self.scroll_log(1),
@@ -3521,6 +3540,9 @@ impl App {
         if let Some(task_id) = report.focus {
             let _ = self.focus_task(&task_id);
         }
+        if let Some(modal) = report.modal {
+            self.modal = Some(ModalState::new(modal));
+        }
         if let Some(status) = report.status {
             self.status = status;
         }
@@ -3861,10 +3883,11 @@ impl App {
     /// Crashed sessions use recover; a cleanly closed session is already idle.
     pub(super) fn task_can_stop(&self, task: &Task) -> bool {
         task.status == TaskStatus::InProgress
-            && matches!(
-                self.board.session_states.get(&task.id),
-                Some(SessionState::Live | SessionState::Waiting)
-            )
+            && (self.board.remote_runs.contains_key(&task.id)
+                || matches!(
+                    self.board.session_states.get(&task.id),
+                    Some(SessionState::Live | SessionState::Waiting)
+                ))
     }
 
     fn current_task_id(&self) -> Option<String> {
@@ -5108,6 +5131,9 @@ impl App {
             self.status = "No task selected".to_string();
             return Ok(());
         };
+        if crate::cli::serve::remote_runner_on_board(self.ops.data_root(), &task_id)?.is_some() {
+            return self.run_on_runner(&task_id, None, false);
+        }
         if !self.ops.queue_can_dispatch()? {
             return self.run_current_task_now_with_suffix(" (queue is off — started directly)");
         }
@@ -5153,6 +5179,9 @@ impl App {
             self.status = "No task selected".to_string();
             return Ok(());
         };
+        if crate::cli::serve::remote_runner_on_board(self.ops.data_root(), &task_id)?.is_some() {
+            return self.run_on_runner(&task_id, None, false);
+        }
         if self.launch_busy(&task_id) {
             return Ok(());
         }
@@ -5163,7 +5192,10 @@ impl App {
         self.spawn_launch(Some(task_id.clone()), move |ops| {
             let (status, started) = match ops.start_task(&task_id) {
                 Ok(Some(session_id)) => (format!("Started {task_id} → {session_id}{suffix}"), true),
-                Ok(None) => (format!("Task {task_id} not found"), false),
+                Ok(None) => match ops.get_task(&task_id) {
+                    Ok(Some(_)) => (format!("Queued {task_id} on its runner"), true),
+                    _ => (format!("Task {task_id} not found"), false),
+                },
                 Err(err) => (err.to_string(), false),
             };
             LaunchReport {
@@ -5173,6 +5205,74 @@ impl App {
                 redraw: true,
                 ..LaunchReport::default()
             }
+        });
+        Ok(())
+    }
+
+    fn run_on_runner(
+        &mut self,
+        task_id: &str,
+        runner: Option<crate::core::sync::NodeRole>,
+        queue: bool,
+    ) -> Result<()> {
+        if self.launch_busy(task_id) {
+            return Ok(());
+        }
+        let task_id = task_id.to_owned();
+        self.status = format!("Starting {task_id}…");
+        self.spawn_launch(Some(task_id.clone()), move |ops| {
+            let result =
+                crate::cli::serve::launch_on_board(ops.data_root(), &task_id, runner, queue);
+            let mut report = LaunchReport {
+                refresh: true,
+                redraw: true,
+                ..Default::default()
+            };
+            match result {
+                Ok(Some(value)) if value.get("alternatives").is_some() => {
+                    let roles = (
+                        serde_json::from_value(value["error"]["node"].clone()),
+                        serde_json::from_value(value["alternatives"][0]["node"].clone()),
+                    );
+                    if let (Ok(runner), Ok(other)) = roles {
+                        report.modal = Some(Modal::RunnerUnavailable {
+                            task_id,
+                            code: value["error"]["code"].as_str().unwrap_or("").into(),
+                            message: value["error"]["message"].as_str().unwrap_or("").into(),
+                            runner,
+                            other,
+                        });
+                    }
+                }
+                Ok(Some(value)) => {
+                    report.status = Some(if let Some(error) = value.get("error") {
+                        format!(
+                            "{}: {}",
+                            error["code"].as_str().unwrap_or(""),
+                            error["message"].as_str().unwrap_or("")
+                        )
+                    } else if value["queued"] == true {
+                        format!(
+                            "Queued {task_id} — ждёт {}",
+                            value["node"].as_str().unwrap_or("runner")
+                        )
+                    } else {
+                        format!(
+                            "Started {task_id} → {}",
+                            value["session"].as_str().unwrap_or("")
+                        )
+                    })
+                }
+                Ok(None) => {
+                    report.status = Some(match ops.start_task(&task_id) {
+                        Ok(Some(session)) => format!("Started {task_id} → {session}"),
+                        Ok(None) => format!("Task {task_id} not found"),
+                        Err(e) => e.to_string(),
+                    })
+                }
+                Err(e) => report.status = Some(e.to_string()),
+            }
+            report
         });
         Ok(())
     }
@@ -5263,6 +5363,8 @@ impl App {
             return Ok(());
         }
         let from_review = task.status == TaskStatus::Review;
+        let remote = self.board.remote_runs.contains_key(&task.id)
+            || !crate::cli::serve::local_runner(self.ops.data_root(), task.runner.as_ref())?;
         // Same hard fallback as `r`: never park a re-run in a queue nothing
         // can drain (queue or auto-launch switched off) — start it directly.
         let mode = if self.ops.queue_can_dispatch()? {
@@ -5301,6 +5403,14 @@ impl App {
                     };
                 }
             };
+            if remote && reran {
+                return LaunchReport {
+                    status: Some(format!("Re-run requested for {task_id} on its runner")),
+                    refresh: true,
+                    redraw: true,
+                    ..LaunchReport::default()
+                };
+            }
             // Same pump as `r`: with free caps the re-run starts on the spot;
             // otherwise the task waits in the queue with the edits folded in.
             if reran && mode == RunMode::Queued {
@@ -5324,6 +5434,7 @@ impl App {
                 focus: moved,
                 refresh: true,
                 redraw: true,
+                ..Default::default()
             }
         });
         Ok(())
@@ -5399,6 +5510,12 @@ impl App {
     }
 
     fn open_stop_confirm(&mut self) {
+        if let Some(task) = self.current_task()
+            && self.board.remote_runs.contains_key(&task.id)
+        {
+            self.modal = Some(ModalState::new(Modal::StopTaskConfirm { task_id: task.id }));
+            return;
+        }
         let session_id = self.current_task().and_then(|task| {
             if self.task_can_stop(&task) {
                 task.session.clone()
@@ -5415,6 +5532,46 @@ impl App {
     }
 
     fn open_log_view(&mut self) {
+        if self.screen != Screen::Sessions
+            && let Some(task) = self.current_task()
+            && let Ok(run) = crate::core::runner_log::latest_run(self.ops.data_root(), &task.id)
+            && crate::core::sync::store_for_board(self.ops.data_root())
+                .and_then(|store| crate::core::sync::Journal::open(store).ok())
+                .is_some_and(|journal| run.node_id != journal.node.node_id)
+        {
+            self.log_view = Some(LogViewState {
+                session_id: format!("{} on {}", task.id, run.name),
+                lines: vec!["Loading remote log…".into()],
+                scroll: 0,
+                max_scroll: u16::MAX,
+                follow: true,
+                return_screen: self.screen,
+                remote: Some(RemoteLog {
+                    task: task.id,
+                    node: run.node_id.clone(),
+                    name: run.name.clone(),
+                    last_poll: None,
+                    pending: None,
+                }),
+            });
+            self.screen = Screen::LogView;
+            self.refresh_log_view();
+            return;
+        }
+        if self.screen != Screen::Sessions
+            && let Some(task) = self.current_task()
+        {
+            if let Some(session) = task.session {
+                let return_screen = self.screen;
+                self.open_log_view_for(session);
+                if let Some(log) = self.log_view.as_mut() {
+                    log.return_screen = return_screen;
+                }
+            } else {
+                self.status = format!("No run log recorded for {}", task.id);
+            }
+            return;
+        }
         let Some(session_id) = self.selected_session_id() else {
             self.status = "No session selected".to_string();
             return;
@@ -5433,6 +5590,8 @@ impl App {
             // the first frame to the bottom regardless.
             max_scroll: u16::MAX,
             follow: true,
+            return_screen: Screen::Sessions,
+            remote: None,
         });
         self.screen = Screen::LogView;
         self.status = format!("Log of {session_id}");
@@ -5440,7 +5599,49 @@ impl App {
 
     fn refresh_log_view(&mut self) {
         if let Some(log) = self.log_view.as_mut() {
-            log.lines = load_log_tail(self.ops.data_root(), &log.session_id);
+            if let Some(remote) = log.remote.as_mut() {
+                if let Some(pending) = remote.pending.as_ref() {
+                    let result = pending.lock().unwrap_or_else(|e| e.into_inner()).try_recv();
+                    match result {
+                        Ok(Ok(snapshot)) => {
+                            log.lines = snapshot.text.lines().map(sanitize_terminal_text).collect();
+                            let age = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                            log.session_id = format!(
+                                "{} on {} · {}s ago",
+                                remote.task,
+                                remote.name,
+                                age.saturating_sub(snapshot.at_ms) / 1000
+                            );
+                            remote.pending = None;
+                        }
+                        Ok(Err(error)) => {
+                            self.status = error.to_string();
+                            remote.pending = None;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => remote.pending = None,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                }
+                if remote.pending.is_none()
+                    && remote
+                        .last_poll
+                        .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+                {
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let (board, task, node) = (
+                        self.ops.data_root().to_path_buf(),
+                        remote.task.clone(),
+                        remote.node.clone(),
+                    );
+                    remote.pending = Some(Arc::new(Mutex::new(rx)));
+                    remote.last_poll = Some(Instant::now());
+                    std::thread::spawn(move || {
+                        let _ = tx.send(crate::cli::serve::remote_log(&board, &task, &node));
+                    });
+                }
+            } else {
+                log.lines = load_log_tail(self.ops.data_root(), &log.session_id);
+            }
         }
     }
 
@@ -5994,6 +6195,26 @@ impl App {
         let Some(mut modal) = self.modal.take() else {
             return Ok(false);
         };
+        if matches!(modal.modal, Modal::RunnerUnavailable { .. }) {
+            match key.code {
+                KeyCode::Esc => {
+                    self.status = "Запуск отменён".into();
+                    return Ok(true);
+                }
+                KeyCode::Tab | KeyCode::Right | KeyCode::Down => modal.next_field(),
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Up => modal.prev_field(),
+                KeyCode::Enter => {
+                    let field = modal.active_field();
+                    if field == DialogField::Cancel {
+                        return Ok(true);
+                    }
+                    return self.submit_modal(modal).map(|_| true);
+                }
+                _ => {}
+            }
+            self.modal = Some(modal);
+            return Ok(true);
+        }
         let field_before = modal.active_field();
         let slot_before = slot_selection_snapshot(&modal, field_before);
         let inherit_before = modal.inherit;
@@ -6200,6 +6421,17 @@ impl App {
         let Some(mut modal) = self.modal.take() else {
             return Ok(());
         };
+        if matches!(modal.modal, Modal::RunnerUnavailable { .. }) {
+            if matches!(button, ModalButton::Cancel | ModalButton::No) {
+                return Ok(());
+            }
+            modal.focus_field(if button == ModalButton::Save {
+                DialogField::Variant
+            } else {
+                DialogField::Confirm
+            });
+            return self.submit_modal(modal);
+        }
         if modal.discard_confirm {
             return match button {
                 ModalButton::Yes => self.discard_modal(modal).map(|_| ()),
@@ -6391,6 +6623,15 @@ impl App {
                 self.refresh_after_action()?;
                 self.status = "Project settings saved".to_string();
             }
+            Modal::RunnerUnavailable {
+                ref task_id,
+                runner,
+                other,
+                ..
+            } => {
+                let queue = modal.active_field() == DialogField::Variant;
+                self.run_on_runner(task_id, Some(if queue { runner } else { other }), queue)?;
+            }
             Modal::NewTask { target_status } => {
                 let title = modal.title_text();
                 if title.trim().is_empty() {
@@ -6431,7 +6672,7 @@ impl App {
                     needs: None,
                     parent_task: None,
                     role_profile: None,
-                    runner: modal.runner,
+                    runner: modal.runner.clone(),
                 };
                 let target = target_status
                     .as_deref()
@@ -6481,7 +6722,7 @@ impl App {
                         use_orchestrator: Some(modal.use_orchestrator),
                         chained_to: Some(modal.chain_text()),
                         launch_at,
-                        runner: Some(modal.runner),
+                        runner: Some(modal.runner.clone()),
                         ..Default::default()
                     },
                 )?;
@@ -6524,6 +6765,11 @@ impl App {
                     Some(task) => format!("Stopped {session_id} (task {})", task.id),
                     None => format!("Session {session_id} not found"),
                 };
+            }
+            Modal::StopTaskConfirm { task_id } => {
+                self.ops.stop_task(&task_id)?;
+                self.status = format!("Stop requested for {task_id} on its runner");
+                self.refresh_after_action()?;
             }
             Modal::RestoreConfirm { task_id } => {
                 let restored = self.ops.unarchive_task(&task_id)?;
@@ -7570,6 +7816,7 @@ fn is_confirmation_modal(modal: &Modal) -> bool {
             | Modal::RevertConfirm { .. }
             | Modal::BulkConfirm { .. }
             | Modal::KillSessionConfirm { .. }
+            | Modal::StopTaskConfirm { .. }
             | Modal::RestoreConfirm { .. }
             | Modal::DeleteProject { .. }
     )
@@ -8492,7 +8739,12 @@ fn apply_settings_groups(
     if edits(InheritGroup::Placement) {
         config.runner.insert(
             Value::String("default".to_string()),
-            serde_yaml_ng::to_value(modal.runner.unwrap_or(crate::core::config::Runner::Auto))?,
+            serde_yaml_ng::to_value(
+                modal
+                    .runner
+                    .clone()
+                    .unwrap_or(crate::core::config::Runner::Auto),
+            )?,
         );
     }
     if edits(InheritGroup::Agent) {

@@ -1,5 +1,22 @@
 # Unreleased
 
+- **Completed code replication and per-node landing.** Finished isolated runs
+  retain immutable per-node/generation refs and publish results through the
+  project remote; delivery retries independently of HTTP connectivity.
+  Received Review branches use the existing race-guarded landing without
+  moving the user's HEAD or index. Replicated node-owned acknowledgements
+  drive “awaiting landing on laptop” badges. Offline duplicate runs preserve
+  both `kanban/TASK-N` and `kanban/TASK-N@<node>`; select a result in Review
+  with `integrate --branch`, without discarding the other branch.
+  A concurrent executor can finish after a peer has already entered Review;
+  active-session ownership remains enforced and duplicates stay in human review.
+
+- **Global Settings → Sync.** Node name/role, opt-in API user-unit switch,
+  one-time code/phone QR pairing, phone peer priority, live status explanations
+  and routes, confirmed exchange times, pending operations, conflicts and
+  local/remote Git clone status. Buttons work by keyboard and mouse; long
+  details wrap and PgUp/PgDn reaches the bottom of short dialogs.
+
 - **Git relay sync.** Paired laptop/server/mobile nodes can exchange operations
   through a bare git remote when LAN/tailnet is unavailable. Each node pushes
   only its append-only `refs/kanban/sync/<node_id>`; JSONL batches use the same

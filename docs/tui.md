@@ -147,6 +147,12 @@ the plain-letter hotkeys.
 - `d` / `Ctrl+d` / `Delete` / `Backspace`: Delete task
 - `m`: Move task
 - `w`: Open the answer-question dialog
+- `L`: Task log from Board/Detail. A foreign runner's bounded tail is fetched
+  asynchronously once per second over LAN/tailnet; offline uses the latest
+  relay snapshot. The pager header shows the runner and snapshot age; `q`
+  returns to the originating screen. Finished runs remain readable.
+  Remote stop confirmation and rerun enqueue journal requests; completion
+  depends on sync delivery and the runner's daemon, not a local session.
 - `y`: Approve — move a Review task to Done
 - `c`: Add a context/suggestion message to the task thread
 - `u`: Recover crashed task (restore to To Do); on an archived task (Archive

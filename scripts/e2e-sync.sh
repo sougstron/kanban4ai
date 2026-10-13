@@ -49,11 +49,12 @@ wait_for() { # wait_for SECONDS COMMAND...
 }
 
 ns_of() { case $1 in server) echo $NS_S ;; laptop) echo $NS_L ;; mobile) echo $NS_M ;; esac; }
+# Network namespaces share the host filesystem: isolate tmux sockets per node too.
 # kb NODE ARGS...: run the binary as NODE (its store, its namespace).
 kb() {
 	node=$1; shift
 	sudo ip netns exec "$(ns_of "$node")" sudo -u "$(id -un)" env \
-		HOME="$HOME" PATH="$PATH" KANBAN_HOME="$W/$node" \
+		HOME="$HOME" PATH="$PATH" KANBAN_HOME="$W/$node" TMUX_TMPDIR="$W/$node" \
 		FAKE_AGENT_LOG="$W/$node.agent.log" FAKE_AGENT_SECS="${FAKE_AGENT_SECS:-60}" \
 		GIT_AUTHOR_NAME=e2e GIT_AUTHOR_EMAIL=e2e@test GIT_COMMITTER_NAME=e2e \
 		GIT_COMMITTER_EMAIL=e2e@test \
@@ -112,6 +113,13 @@ status_on_both() {
 	for n in server laptop; do
 		[ "$(api "$n" GET "$P/$1" | json 'd["task"]["status"]')" = "$2" ] || return 1
 	done
+}
+duplicate_branches_on_both() {
+	server=$(git -C "$W/work" for-each-ref --format='%(refname) %(objectname)' 'refs/heads/kanban/TASK-006*')
+	laptop=$(git -C "$W/laptop-work" for-each-ref --format='%(refname) %(objectname)' 'refs/heads/kanban/TASK-006*')
+	[ "$server" = "$laptop" ] || return 1
+	printf '%s\n' "$server" | grep -q 'refs/heads/kanban/TASK-006@' || return 1
+	git -C "$W/work" rev-parse --verify refs/heads/kanban/TASK-006 >/dev/null
 }
 both_started() { grep -q '"session"' "$1" && grep -q '"session"' "$2"; }
 # Replicated task fields from the CLI: works for the mobile node, which has no API.
@@ -194,6 +202,10 @@ chmod +x "$W/fake-agent"
 
 git init -q -b master "$W/work"
 git -C "$W/work" -c user.name=e2e -c user.email=e2e@test commit -q --allow-empty -m init
+git init -q --bare "$W/code.git"
+git -C "$W/work" remote add origin "$W/code.git"
+git -C "$W/work" push -q -u origin master
+git -C "$W/code.git" symbolic-ref HEAD refs/heads/master
 (cd "$W/work" && kb server init >/dev/null)
 kb laptop project list >/dev/null 2>&1 || true
 kb mobile project list >/dev/null 2>&1 || true
@@ -222,6 +234,7 @@ kb laptop serve --pair "$IP_S:$PORT" --code "$code" --address "$IP_L:$PORT" >/de
 check "laptop bootstraps the server replica" \
 	wait_for 30 sh -c "grep -q 'replica bootstrapped' '$W/laptop.serve.log'"
 git clone -q "$W/work" "$W/laptop-work"
+git -C "$W/laptop-work" remote set-url origin "$W/code.git"
 kb laptop project set-path work "$W/laptop-work" >/dev/null
 code=$(kb server serve --pair-code | grep -o '[0-9]\{6\}' | head -n 1)
 kb mobile serve --pair "$IP_SM:$PORT" --code "$code" >/dev/null
@@ -287,6 +300,32 @@ check "conflicts only for the field edited on both sides" \
 api laptop GET "$P/$LAP1/thread" >"$W/lap1-thread.json"
 check "colliding MSG numbers get a node suffix" grep -q 'MSG-[0-9]*@' "$W/lap1-thread.json"
 
+# --- Runner 03 launch-only alternatives and wait queue ------------------------
+# A separate project keeps runner assertions independent of integration refs
+# changed by the duplicate-run scenario below.
+log "== Runner 03 explicit unavailable runner and recovery"
+git init -q -b master "$W/runner-check"
+git -C "$W/runner-check" -c user.name=e2e -c user.email=e2e@test commit -q --allow-empty -m init
+kb server init --path "$W/runner-check" >/dev/null
+kb server --project runner-check create "Runner recovery" >/dev/null
+R=/api/v1/projects/runner-check/tasks/TASK-001
+check "runner fixture reaches the laptop" wait_for 15 api_has laptop GET "$R" "" '"title":"Runner recovery"'
+git clone -q "$W/runner-check" "$W/laptop-runner-check"
+kb laptop project set-path runner-check "$W/laptop-runner-check" >/dev/null
+kb server serve --bye shutdown >/dev/null
+power_off server
+check "runner fallback sees the server powered off" wait_for 10 probe_is laptop NODE_POWERED_OFF
+check "the refusal offers alternatives" \
+	api_has laptop POST "$R/launch" '{"runner":"server"}' alternatives
+check "waiting keeps the explicit server runner queued" \
+	api_has laptop POST "$R/launch" '{"runner":"server","on_unavailable":"queue"}' '"queued":true'
+start_serve server
+check "the queued runner comes back ONLINE" wait_for 30 probe_is laptop ONLINE
+kb laptop --project runner-check check-sessions >"$W/runner-wait-dispatch.log"
+check "the waiting launch goes to the server after it returns" \
+	wait_for 15 api_has server GET "$R" "" '"state":"running"'
+api laptop POST "$R/stop" '{}' >"$W/runner-wait-stop.json"
+
 # --- 14.3 double launch -------------------------------------------------------
 log "== 14.3 double launch"
 api laptop POST "$P/TASK-005/launch" '{"runner":"server"}' >/dev/null
@@ -303,26 +342,26 @@ check "partitioned launches both start" both_started "$W/l6.json" "$W/s6.json"
 expect TASK-419 "concurrent runs on two nodes get distinct session ids" \
 	sh -c "! cmp -s '$W/l6.json' '$W/s6.json'"
 check "both run descriptors replicate" wait_for 20 runs_count_is laptop TASK-006 2
-expect TASK-421 "two runs of one generation are marked RUN_DUPLICATE" \
-	api_has laptop GET "$P/TASK-006" "" RUN_DUPLICATE
+check "two runs of one generation are marked RUN_DUPLICATE" \
+	wait_for 20 api_has laptop GET "$P/TASK-006" "" '"run_duplicate":true'
 check "both runs finish and the status converges to review" \
 	wait_for $((${FAKE_AGENT_SECS:-60} + 90)) status_on_both TASK-006 review
-expect TASK-422 "the second run's branch is kanban/TASK-006@<node>" \
-	sh -c "git -C '$W/work' branch -a | grep -q 'kanban/TASK-006@'"
+check "both completed branches have identical tips on both nodes" \
+	wait_for 30 duplicate_branches_on_both
 
 # --- 14.4 runner powered off mid-run ------------------------------------------
 log "== 14.4 runner powered off mid-run"
-api laptop POST "$P/TASK-007/launch" '{"runner":"server"}' >/dev/null
+api laptop POST "$P/TASK-007/launch" '{"runner":"server"}' >"$W/runner-launch.json"
 check "laptop sees the remote run" wait_for 15 api_has laptop GET "$P/TASK-007" "" '"state":"running"'
 kb server serve --bye shutdown >/dev/null
 power_off server
 check "laptop reports the server as NODE_POWERED_OFF" wait_for 10 probe_is laptop NODE_POWERED_OFF
 check "explicit launch on the powered-off server is refused" \
 	api_has laptop POST "$P/TASK-008/launch" '{"runner":"server"}' NODE_POWERED_OFF
-expect TASK-420 "the refusal offers alternatives" \
+check "the refusal offers alternatives" \
 	api_has laptop POST "$P/TASK-008/launch" '{"runner":"server"}' alternatives
-expect TASK-421 "the interrupted run carries RUN_NODE_POWERED_OFF" \
-	api_has laptop GET "$P/TASK-007" "" RUN_NODE_POWERED_OFF
+check "the interrupted run carries RUN_NODE_POWERED_OFF" \
+	wait_for 20 api_has laptop GET "$P/TASK-007" "" RUN_NODE_POWERED_OFF
 start_serve server
 check "server comes back ONLINE" wait_for 30 probe_is laptop ONLINE
 

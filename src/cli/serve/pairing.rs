@@ -486,7 +486,7 @@ pub(super) fn pair(
     if let Ok(socket) = address.parse() {
         reply.node_card.address = socket;
     } else {
-        reply.node_card.tailscale_address = Some(address.to_owned());
+        reply.node_card.tailscale_address = Some(address.into());
     }
     validate(root, &local, &reply.node_card)?;
     let _store_lock = lock_file_reentrant(&root.join(".lock"))?;

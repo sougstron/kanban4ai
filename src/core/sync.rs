@@ -13,6 +13,7 @@ use super::error::{KanbanError, Result};
 use super::storage::{atomic_write_text_raw, lock_file_reentrant};
 
 mod apply;
+pub(crate) mod control;
 mod lease;
 pub mod relay;
 mod run;
@@ -20,8 +21,8 @@ mod transport;
 pub use apply::Conflict;
 pub use lease::IdLease;
 pub(crate) use lease::allocate as allocate_task_id;
-pub use run::{RunDescriptor, RunState, remote_runs};
-pub(crate) use run::{remote_runs_for_tasks, store_for_board};
+pub use run::{LandingDescriptor, RunDescriptor, RunState, remote_runs};
+pub(crate) use run::{remote_runs_for_tasks, store_for_board, task_landings, task_runs};
 pub use transport::{Page, Snapshot, install_snapshot};
 
 type Fields = BTreeMap<String, Value>;
@@ -372,7 +373,11 @@ impl Journal {
         }
         file.sync_all()?;
         atomic_write_text_raw(&self.root.join("meta/state.json"), &json(&pending.state)?)?;
-        for op in pending.operations.iter().filter(|op| op.entity == "run") {
+        for op in pending
+            .operations
+            .iter()
+            .filter(|op| op.entity == "run" && !op.set.contains_key("command"))
+        {
             let fields = &pending.state.fields[&key(&op.project, "run", &op.id)];
             let (path, text) = run::projection(&self.root, &op.project, &op.id, fields)?;
             fs::create_dir_all(path.parent().expect("run parent"))?;
@@ -555,6 +560,8 @@ fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
             "branch",
             "base_commit",
             "integration",
+            "landing_pending",
+            "run_duplicate",
             "cleanup_retry_at",
             "run_phase",
             "crash_restarts",

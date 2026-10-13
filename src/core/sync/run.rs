@@ -28,6 +28,19 @@ pub struct RunDescriptor {
     pub branch: Option<String>,
     pub heartbeat: String,
     pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_hlc: Option<Hlc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tip: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LandingDescriptor {
+    pub name: String,
+    pub generation: u64,
+    pub tip: String,
+    pub pending: bool,
 }
 
 impl RunDescriptor {
@@ -55,17 +68,121 @@ pub(crate) fn store_for_board(board: &Path) -> Option<&Path> {
         .flatten()
 }
 
+pub(crate) fn task_runs(
+    state: &JournalState,
+    alias: &str,
+    task: &str,
+) -> Result<BTreeMap<String, RunDescriptor>> {
+    let Some(project) = state.project_uids.get(alias) else {
+        return Ok(BTreeMap::new());
+    };
+    decode_fields(state.fields.get(&key(project, "run", task)))
+}
+
+pub(crate) fn task_landings(
+    state: &JournalState,
+    alias: &str,
+    task: &str,
+) -> Result<BTreeMap<String, LandingDescriptor>> {
+    let Some(project) = state.project_uids.get(alias) else {
+        return Ok(BTreeMap::new());
+    };
+    state
+        .fields
+        .get(&key(project, "run", task))
+        .into_iter()
+        .flat_map(|f| &f.values)
+        .filter_map(|(field, value)| field.strip_prefix("landing:").map(|node| (node, value)))
+        .map(|(node, value)| {
+            Ok((
+                node.into(),
+                serde_json::from_value(value.clone()).map_err(|e| invalid(&e.to_string()))?,
+            ))
+        })
+        .collect()
+}
+
 impl Journal {
     pub fn runs(
         &self,
         project_alias: &str,
         task_id: &str,
     ) -> Result<BTreeMap<String, RunDescriptor>> {
-        let state = self.state()?;
-        let Some(project) = state.project_uids.get(project_alias) else {
-            return Ok(BTreeMap::new());
+        task_runs(&self.state()?, project_alias, task_id)
+    }
+
+    pub fn landings(&self, alias: &str, task: &str) -> Result<BTreeMap<String, LandingDescriptor>> {
+        task_landings(&self.state()?, alias, task)
+    }
+
+    /// Each node owns its own acknowledgement, independently of the runner.
+    pub(crate) fn record_landing(
+        &self,
+        board: &Path,
+        task: &str,
+        generation: u64,
+        tip: &str,
+        pending: bool,
+    ) -> Result<()> {
+        let _board = Storage::new(board).lock()?;
+        let _sync = lock_file_reentrant(&self.root.join(".lock"))?;
+        self.recover()?;
+        let mut state: JournalState = load(&self.root.join("meta/state.json"))?;
+        let alias = board
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| invalid("invalid board"))?;
+        let project = state
+            .project_uids
+            .get(alias)
+            .ok_or_else(|| invalid("unknown project"))?
+            .clone();
+        let field = format!("landing:{}", self.node.node_id);
+        let value = serde_json::to_value(LandingDescriptor {
+            name: self.node.name.clone(),
+            generation,
+            tip: tip.into(),
+            pending,
+        })
+        .map_err(|e| invalid(&e.to_string()))?;
+        let fields = state.fields.get(&key(&project, "run", task));
+        if fields.and_then(|f| f.values.get(&field)) == Some(&value) {
+            return Ok(());
+        }
+        let previous = fields.and_then(|f| f.clocks.get(&field)).cloned();
+        let seq = state
+            .vector
+            .get(&self.node.node_id)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| invalid("operation sequence exhausted"))?;
+        let clock: Hlc = load(&self.root.join("hlc"))?;
+        let operation = Operation {
+            op: format!("{}:{seq}", self.node.node_id),
+            id: task.into(),
+            hlc: clock.tick(now_ms(), &self.node.node_id)?,
+            store: self.node.store_id.clone(),
+            project,
+            entity: "run".into(),
+            set: BTreeMap::from([(field.clone(), value)]),
+            prev: previous
+                .map(|hlc| BTreeMap::from([(field, hlc)]))
+                .unwrap_or_default(),
+            actor: "kanban".into(),
         };
-        decode_fields(state.fields.get(&key(project, "run", task_id)))
+        validate(&operation)?;
+        apply_meta(&mut state, &operation);
+        let pending = Pending {
+            path: self.root.join("landing-intent.json"),
+            content: Some(json(&operation)?),
+            operations: vec![operation],
+            state,
+        };
+        atomic_write_text_raw(&self.root.join("pending.json"), &json(&pending)?)?;
+        self.finish(&pending, false)?;
+        fs::remove_file(self.root.join("pending.json"))?;
+        Ok(())
     }
 }
 
@@ -112,6 +229,7 @@ fn decode_fields(fields: Option<&FieldState>) -> Result<BTreeMap<String, RunDesc
     fields
         .into_iter()
         .flat_map(|f| &f.values)
+        .filter(|(field, _)| !field.starts_with("landing:"))
         .map(|(node, value)| {
             let run = serde_json::from_value(value.clone()).map_err(|e| invalid(&e.to_string()))?;
             Ok((node.clone(), run))
@@ -120,6 +238,9 @@ fn decode_fields(fields: Option<&FieldState>) -> Result<BTreeMap<String, RunDesc
 }
 
 pub(super) fn validate(op: &Operation) -> Result<()> {
+    if op.set.contains_key("command") {
+        return super::control::validate(op);
+    }
     for component in [&op.project, &op.id, &op.hlc.2] {
         if component.is_empty()
             || component == "."
@@ -128,6 +249,24 @@ pub(super) fn validate(op: &Operation) -> Result<()> {
         {
             return Err(invalid("invalid run path component"));
         }
+    }
+    let landing_field = format!("landing:{}", op.hlc.2);
+    if let Some(value) = op.set.get(&landing_field) {
+        let landing: LandingDescriptor =
+            serde_json::from_value(value.clone()).map_err(|e| invalid(&e.to_string()))?;
+        if op.set.len() != 1
+            || landing.generation == 0
+            || landing.name.is_empty()
+            || !landing
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || !matches!(landing.tip.len(), 40 | 64)
+            || !landing.tip.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Err(invalid("invalid landing acknowledgement"));
+        }
+        return Ok(());
     }
     if op.project.is_empty() || op.set.len() != 1 || !op.set.contains_key(&op.hlc.2) {
         return Err(invalid("run may only be written by its runner"));
@@ -152,6 +291,18 @@ pub(super) fn validate(op: &Operation) -> Result<()> {
     if let Some(start) = &run.started_at {
         timefmt::parse(start).map_err(|_| invalid("invalid run start"))?;
     }
+    if run.tip.as_deref().is_some_and(|tip| {
+        !matches!(tip.len(), 40 | 64) || !tip.bytes().all(|b| b.is_ascii_hexdigit())
+    }) {
+        return Err(invalid("invalid run commit"));
+    }
+    if run
+        .start_hlc
+        .as_ref()
+        .is_some_and(|clock| clock.2 != run.node_id)
+    {
+        return Err(invalid("run start clock belongs to another node"));
+    }
     if run
         .branch
         .as_deref()
@@ -174,7 +325,12 @@ pub(super) fn projection(
         .join(project)
         .join("runs")
         .join(format!("{task}.yaml"));
-    let text = serde_yaml_ng::to_string(&serde_json::json!({"runs": runs}))?;
+    let landings: BTreeMap<_, _> = fields
+        .values
+        .iter()
+        .filter(|(field, _)| field.starts_with("landing:"))
+        .collect();
+    let text = serde_yaml_ng::to_string(&serde_json::json!({"runs": runs, "landings": landings}))?;
     Ok((path, text))
 }
 
@@ -221,8 +377,19 @@ pub(super) fn capture(
     };
     let records = decode_fields(state.fields.get(&key(project, "run", &task_id)))?;
     let old = records.get(&journal.node.node_id);
-    let queued =
-        target.entity == "task" && task.get("run_phase").and_then(Value::as_str) == Some("queued");
+    // Waiting for an explicit remote runner does not claim a local run.
+    // Otherwise its replicated queued descriptor would exclude the real runner.
+    let queued = if target.entity == "task"
+        && task.get("run_phase").and_then(Value::as_str) == Some("queued")
+    {
+        let runner = task.get("runner").and_then(Value::as_str).map(|name| {
+            crate::core::config::Runner::parse(name)
+                .unwrap_or_else(|| crate::core::config::Runner::Node(name.to_owned()))
+        });
+        crate::cli::serve::local_runner(&board, runner.as_ref())?
+    } else {
+        false
+    };
     // An ordinary board edit on a peer must never create or claim a run.
     if target.entity == "task"
         && queued
@@ -279,6 +446,13 @@ pub(super) fn capture(
         .as_ref()
         .map(|s| timefmt::format(&s.last_seen))
         .unwrap_or_else(|| timefmt::format(&timefmt::now()));
+    let code = (state_of_run == RunState::Failed)
+        .then(|| {
+            task.get("run_failure")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .flatten();
     let mut run = RunDescriptor {
         node_id: journal.node.node_id.clone(),
         name: journal.node.name.clone(),
@@ -289,14 +463,27 @@ pub(super) fn capture(
             .map(|p| Role::from_phase(Some(p)).as_str().to_owned())
             .or_else(|| old.map(|r| r.phase.clone()))
             .unwrap_or_else(|| "executor".into()),
-        started_at,
+        started_at: started_at.clone(),
         branch: task
             .get("branch")
             .and_then(Value::as_str)
             .map(str::to_owned)
             .or_else(|| old.and_then(|r| r.branch.clone())),
         heartbeat,
-        code: None,
+        code,
+        start_hlc: if new_run || old.is_some_and(|r| r.started_at.is_none() && started_at.is_some())
+        {
+            Some(clock.tick(now_ms(), &journal.node.node_id)?)
+        } else {
+            old.and_then(|r| r.start_hlc.clone())
+        },
+        tip: crate::core::code::sealed_tip(&board, &task_id, started_at.as_deref())?.or_else(
+            || {
+                (!new_run)
+                    .then(|| old.and_then(|r| r.tip.clone()))
+                    .flatten()
+            },
+        ),
     };
     if let Some(old) = old {
         let config: Value = match fs::read_to_string(target.store.join("config.yaml")) {
