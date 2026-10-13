@@ -272,6 +272,25 @@ dialog (unregister by default; Space toggles
 returns to the board this list was opened from, or quits when the list is the
 entry screen.
 
+### Board synchronization and conflicts
+
+With paired peers, the board and task detail reserve one header row for sync:
+`синхронизировано с server 3 с назад`, or
+`server: офлайн с 18:02, 14 операций ждут · NODE_UNREACHABLE`.
+The timestamp comes from a confirmed exchange; pending counts come from the
+peer's acknowledged version vector. Probes run off the UI thread and refresh
+at the TUI refresh interval. Without peers, the header takes no space.
+An absent mobile peer stays neutral (`был в сети`), without an error code.
+
+Cards with active replicated task or message field conflicts show `⚠ sync`,
+separately from worktree integration conflicts. Task detail shows the winning
+and losing values and node IDs above the task panel. `Ctrl+←/→` or the `<` / `>`
+buttons select a conflict. **Взять другую версию** (`Ctrl+V`, or click) restores
+that field's losing value as a new human operation with a fresh HLC, including
+while offline. A stale choice is rejected rather than overwriting a newer edit.
+Resolved conflicts disappear from cards and the panel; their audit records
+and board notes remain available. Long values are truncated to terminal width.
+
 ### Global Settings → Sync
 
 From the Projects screen, `s` opens Global Settings. Select **Sync** in the

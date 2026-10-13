@@ -486,3 +486,45 @@ fn interrupted_remote_redo_is_finished_before_store_reads() {
         writes.values().next().unwrap().as_ref().unwrap().as_str()
     );
 }
+
+#[test]
+fn choosing_losing_version_is_a_replicated_edit_and_rejects_stale_choice() {
+    let mut laptop = op("a", 3, 3, "task", "TASK-001", json!({"title":"laptop"}));
+    laptop.prev.insert("title".into(), task().hlc);
+    let mut server = op("b", 1, 4, "task", "TASK-001", json!({"title":"server"}));
+    server.prev = laptop.prev.clone();
+    let originals = [project(), task(), laptop, server];
+    let (dir, journal) = apply(&originals);
+    let conflict = journal.conflicts().unwrap().remove(0);
+    journal.take_other_version(&conflict).unwrap();
+    let storage = Storage::new(dir.path().join("projects/demo"));
+    assert_eq!(
+        storage.load_task("TASK-001").unwrap().unwrap().title,
+        "laptop"
+    );
+    assert!(journal.conflicts().unwrap().is_empty());
+    assert!(journal.take_other_version(&conflict).is_err());
+    let state = journal.state().unwrap();
+    let edit = state
+        .operations
+        .values()
+        .find(|op| op.actor == "human")
+        .unwrap();
+    assert!(edit.hlc > conflict.winner);
+    assert_eq!(edit.prev["title"], conflict.winner);
+    assert_eq!(edit.hlc.2, journal.node.node_id);
+    let (replica_dir, replica) = apply(&originals);
+    let mut edit = edit.clone();
+    edit.store = replica.node.store_id.clone();
+    replica.apply_remote(&[edit.clone()], u64::MAX).unwrap();
+    replica.apply_remote(&[edit], u64::MAX).unwrap();
+    assert_eq!(
+        Storage::new(replica_dir.path().join("projects/demo"))
+            .load_task("TASK-001")
+            .unwrap()
+            .unwrap()
+            .title,
+        "laptop"
+    );
+    assert!(replica.conflicts().unwrap().is_empty());
+}

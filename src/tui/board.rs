@@ -35,8 +35,14 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(area);
     match app.screen {
-        Screen::Board => render_board(frame, app, chunks[0]),
-        Screen::Detail => detail::render(frame, app, chunks[0]),
+        Screen::Board => {
+            let body = render_sync_header(frame, app, chunks[0]);
+            render_board(frame, app, body);
+        }
+        Screen::Detail => {
+            let body = render_sync_header(frame, app, chunks[0]);
+            detail::render(frame, app, body);
+        }
         Screen::Sessions => sessions::render_sessions(frame, app, chunks[0]),
         Screen::Archive => sessions::render_archive(frame, app, chunks[0]),
         Screen::LogView => sessions::render_log_view(frame, app, chunks[0]),
@@ -64,6 +70,23 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
     limits::render(frame, app, chunks[1]);
     render_status(frame, app, chunks[2]);
     app.capture_and_highlight(frame.buffer_mut());
+}
+
+fn render_sync_header(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let Some(text) = app.sync_board.header(chrono::Utc::now()) else {
+        return area;
+    };
+    frame.render_widget(
+        Paragraph::new(truncate_display(&text, area.width as usize))
+            .style(Style::default().fg(app.theme.muted)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    )
 }
 
 fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {

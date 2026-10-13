@@ -92,7 +92,7 @@ pub(super) struct Status {
     pub(super) code: &'static str,
     pub(super) path: &'static str,
     pub(super) message: String,
-    since: Option<DateTime<Utc>>,
+    pub(super) since: Option<DateTime<Utc>>,
     pub(super) last_seen: Option<DateTime<Utc>>,
 }
 #[derive(Serialize, Deserialize)]
