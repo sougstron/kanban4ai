@@ -120,6 +120,9 @@ fn decode_fields(fields: Option<&FieldState>) -> Result<BTreeMap<String, RunDesc
 }
 
 pub(super) fn validate(op: &Operation) -> Result<()> {
+    if op.set.contains_key("command") {
+        return super::control::validate(op);
+    }
     for component in [&op.project, &op.id, &op.hlc.2] {
         if component.is_empty()
             || component == "."
@@ -223,15 +226,17 @@ pub(super) fn capture(
     let old = records.get(&journal.node.node_id);
     // Waiting for an explicit remote runner does not claim a local run.
     // Otherwise its replicated queued descriptor would exclude the real runner.
-    let remote_runner = task
-        .get("runner")
-        .and_then(Value::as_str)
-        .and_then(crate::core::config::Runner::parse)
-        .and_then(crate::core::config::Runner::node_role)
-        .is_some_and(|role| role != journal.node.role);
-    let queued = target.entity == "task"
+    let queued = if target.entity == "task"
         && task.get("run_phase").and_then(Value::as_str) == Some("queued")
-        && !remote_runner;
+    {
+        let runner = task.get("runner").and_then(Value::as_str).map(|name| {
+            crate::core::config::Runner::parse(name)
+                .unwrap_or_else(|| crate::core::config::Runner::Node(name.to_owned()))
+        });
+        crate::cli::serve::local_runner(&board, runner.as_ref())?
+    } else {
+        false
+    };
     // An ordinary board edit on a peer must never create or claim a run.
     if target.entity == "task"
         && queued

@@ -1115,6 +1115,13 @@ impl Operations {
         is_agent: bool,
         immediate: bool,
     ) -> Result<Option<Task>> {
+        if is_agent
+            && self.auto_launch_enabled()?
+            && self.config.get_rule("auto_launch_on_delegate")?
+            && crate::cli::serve::runner_action(self.data_root(), task_id, !immediate)?.is_some()
+        {
+            return self.get_task(task_id);
+        }
         let session_mgr = self.session_manager();
         SessionManager::validate_session_id(session_id)?;
         let (task, previous_status, queued) = {
@@ -1135,6 +1142,7 @@ impl Operations {
             }
 
             task.reset_human_restart();
+            task.runner_request = None;
             if self.config.get_rule("auto_move_on_assign")? {
                 task.status = TaskStatus::InProgress;
             }
@@ -1238,11 +1246,14 @@ impl Operations {
         Ok(Some(task))
     }
 
-    /// The human "Run" action: start a task on a fresh agent session
-    /// immediately, with no confirmation flow. Returns the new session id,
-    /// `Ok(None)` when the task does not exist, and an error when the task is
-    /// already running or the agent fails to launch.
+    /// The human "Run" action: start locally or hand off to the pinned runner.
+    /// Returns its new session id; `Ok(None)` means a missing task or an
+    /// accepted remote queue entry (callers distinguish by re-reading the task).
+    /// Existing runs and launch failures return an error.
     pub fn start_task(&self, task_id: &str) -> Result<Option<String>> {
+        if let Some(session) = crate::cli::serve::runner_action(self.data_root(), task_id, false)? {
+            return Ok(session);
+        }
         let session_mgr = self.session_manager();
         let session_id = {
             let _guard = self.storage.lock()?;
@@ -1287,6 +1298,15 @@ impl Operations {
     /// owns no session (`task.session` is left alone); the dispatcher pins
     /// one when it actually starts the run.
     pub fn queue_run(&self, task_id: &str) -> Result<Option<Task>> {
+        if crate::cli::serve::runner_action(self.data_root(), task_id, true)?.is_some() {
+            return self.get_task(task_id);
+        }
+        self.queue_local_run(task_id)
+    }
+
+    /// Human waiting queues are retried by the frontend, without publishing a
+    /// relay launch intent or claiming a run on behalf of the remote runner.
+    pub(crate) fn queue_local_run(&self, task_id: &str) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(None);
@@ -1325,6 +1345,7 @@ impl Operations {
             &stats::Tags::default(),
         );
         task.run_phase = Some(RunPhase::Queued);
+        task.runner_request = None;
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
         self.post_queue_note(&task.id, "⏸ queued — waiting for a free agent slot");
@@ -1417,6 +1438,9 @@ impl Operations {
     /// Stop the active agent session attached to a task. Missing tasks return
     /// `Ok(None)`; a task with no active session is an error.
     pub fn stop_task(&self, task_id: &str) -> Result<Option<Task>> {
+        if crate::cli::serve::runner_control(self.data_root(), task_id, "stop")? {
+            return self.get_task(task_id);
+        }
         let task = {
             let _guard = self.storage.lock()?;
             self.storage.load_task(task_id)?
@@ -2198,7 +2222,7 @@ impl Operations {
             // is copied and stays pinned.
             let inherit_explicit = candidate.is_none() && parent.explicit_assignment;
             let new_task = NewTask {
-                runner: parent.runner,
+                runner: parent.runner.clone(),
                 title: node.title.trim().to_string(),
                 description: node.description.trim().to_string(),
                 // A candidate is the node's whole assignment — a field it
@@ -2930,7 +2954,7 @@ impl Operations {
         }))
     }
 
-    fn resume_answered_agent(
+    pub(crate) fn resume_answered_agent(
         &self,
         task_id: &str,
         expected_session: Option<&str>,
@@ -2938,8 +2962,28 @@ impl Operations {
         if !self.auto_launch_enabled()? || !self.config.get_rule("resume_after_last_answer")? {
             return Ok(None);
         }
-        if !crate::core::sync::remote_runs(&self.storage.project_path, task_id)?.is_empty() {
-            return Ok(None);
+        if let Some(store) = crate::core::sync::store_for_board(self.data_root())
+            && store.join("sync/node.yaml").exists()
+        {
+            let journal = crate::core::sync::Journal::open(store)?;
+            let project = self
+                .data_root()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| KanbanError::Invalid("invalid board".into()))?;
+            let runs = journal.runs(project, task_id)?;
+            if runs
+                .values()
+                .any(|run| run.active() && run.node_id != journal.node.node_id)
+                || runs
+                    .values()
+                    .max_by_key(|run| (run.generation, &run.node_id))
+                    .is_some_and(|run| run.node_id != journal.node.node_id)
+            {
+                // Finished foreign runs still own answer wakes. Only their
+                // runner may replace them when the synced answer arrives.
+                return Ok(None);
+            }
         }
 
         let session_mgr = self.session_manager();
@@ -3492,8 +3536,14 @@ impl Operations {
         session_id: Option<&str>,
         mode: RunMode,
     ) -> Result<Option<Task>> {
+        if crate::core::sync::control::request(self.data_root(), task_id, "rerun")? {
+            return self.get_task(task_id);
+        }
         if mode == RunMode::Queued {
             return self.queue_run(task_id);
+        }
+        if crate::cli::serve::runner_action(self.data_root(), task_id, false)?.is_some() {
+            return self.get_task(task_id);
         }
         if let Some(session_id) = session_id {
             SessionManager::validate_session_id(session_id)?;
@@ -3550,6 +3600,9 @@ impl Operations {
         session_id: Option<&str>,
         mode: RunMode,
     ) -> Result<Option<Task>> {
+        if crate::core::sync::control::request(self.data_root(), task_id, "rerun")? {
+            return self.get_task(task_id);
+        }
         if let Some(session_id) = session_id {
             SessionManager::validate_session_id(session_id)?;
         }
@@ -3770,7 +3823,11 @@ impl Operations {
     /// so two tasks starting at once get strictly-descendant bases and their
     /// merge-base is the shared snapshot, not committed HEAD.
     fn prepare_worktree(&self, task: Task) -> Result<Task> {
-        let iso = &self.config.get_orchestration()?.isolation;
+        let mut iso = self.config.get_orchestration()?.isolation;
+        // A received code clone is a shared seed, never an agent's checkout.
+        if crate::core::code::managed_clone(self.data_root(), self.work_path())? {
+            iso.mode = IsolationMode::Required;
+        }
         if iso.mode == IsolationMode::Off {
             return Ok(task);
         }
@@ -3781,7 +3838,7 @@ impl Operations {
         {
             return Ok(task);
         }
-        match self.create_worktree(&task, iso) {
+        match self.create_worktree(&task, &iso) {
             Ok(updated) => Ok(updated),
             Err(reason) => {
                 if iso.mode == IsolationMode::Required {

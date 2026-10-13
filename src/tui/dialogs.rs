@@ -46,6 +46,9 @@ pub enum Modal {
     KillSessionConfirm {
         session_id: String,
     },
+    StopTaskConfirm {
+        task_id: String,
+    },
     RestoreConfirm {
         task_id: String,
     },
@@ -950,7 +953,7 @@ impl ModalState {
         state.interactive = task.interactive;
         state.readonly = task.readonly;
         state.silence = task.silence;
-        state.runner = task.runner;
+        state.runner = task.runner.clone();
         state.use_orchestrator = task.use_orchestrator;
         state.use_designer = task.use_designer;
         state.use_reviewer = task.use_reviewer;
@@ -997,6 +1000,7 @@ impl ModalState {
             | Modal::RevertConfirm { .. }
             | Modal::BulkConfirm { .. }
             | Modal::KillSessionConfirm { .. }
+            | Modal::StopTaskConfirm { .. }
             | Modal::RestoreConfirm { .. } => &[DialogField::Confirm, DialogField::Cancel],
             Modal::AnswerQuestion { .. } => &[
                 DialogField::Question,
@@ -1505,6 +1509,7 @@ impl ModalState {
                 | Modal::RevertConfirm { .. }
                 | Modal::BulkConfirm { .. }
                 | Modal::KillSessionConfirm { .. }
+                | Modal::StopTaskConfirm { .. }
                 | Modal::RestoreConfirm { .. }
                 | Modal::DeleteProject { .. }
         )
@@ -1858,7 +1863,7 @@ impl ModalState {
                     } else {
                         1
                     };
-                    self.runner = choices[(current + delta) % choices.len()];
+                    self.runner = choices[(current + delta) % choices.len()].clone();
                 }
             }
             DialogField::UseOrchestrator => toggle_on_space(&mut self.use_orchestrator, key),
@@ -2988,6 +2993,23 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
                 )),
                 Line::from(
                     "Stops the agent process and closes the session. The task keeps its status.",
+                ),
+            ],
+            &mut hitboxes,
+        ),
+        Modal::StopTaskConfirm { task_id } => render_simple_confirm(
+            frame,
+            app,
+            modal,
+            inner,
+            app.theme.err,
+            vec![
+                Line::from(format!(
+                    "Stop {} on its runner?",
+                    sanitize_terminal_text(task_id)
+                )),
+                Line::from(
+                    "The request is delivered through sync, including when the runner is offline.",
                 ),
             ],
             &mut hitboxes,
@@ -4253,6 +4275,7 @@ fn render_selector_field(
             };
             let value = modal
                 .runner
+                .as_ref()
                 .map(Runner::label)
                 .unwrap_or("Inherit from project");
             render_textarea(
@@ -5757,6 +5780,7 @@ fn modal_title(modal: &Modal) -> &'static str {
         Modal::RevertConfirm { .. } => " Revert task ",
         Modal::BulkConfirm { .. } => " Confirm bulk action ",
         Modal::KillSessionConfirm { .. } => " Kill session ",
+        Modal::StopTaskConfirm { .. } => " Stop remote task ",
         Modal::RestoreConfirm { .. } => " Restore task ",
         Modal::AddMessage { .. } => " Add to thread ",
         Modal::AnswerQuestion { .. } => " Answer question ",

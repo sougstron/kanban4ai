@@ -25,7 +25,7 @@ use crate::core::config::Config;
 use crate::core::context::ContextManager;
 use crate::core::error::{KanbanError, Result};
 use crate::core::limits;
-use crate::core::models::{RunMode, Task, TaskStatus};
+use crate::core::models::{RunMode, RunPhase, Task, TaskStatus};
 use crate::core::operations::{
     AgentExitOutcome, LandOutcome, Operations, QuestionRef, TaskPatch, Verdict, WaitWake,
 };
@@ -1129,6 +1129,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 RunMode::Queued
             };
             match ops.rerun_review_task(&task_id, session.as_deref(), mode)? {
+                Some(task)
+                    if task.session.is_none() && task.run_phase != Some(RunPhase::Queued) =>
+                {
+                    println!("Re-run requested for {task_id} on its runner");
+                }
                 Some(task) if mode == RunMode::Immediate => println!(
                     "Task {task_id} re-running ({})",
                     task.session.as_deref().unwrap_or("none")
@@ -1478,8 +1483,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         },
         Command::Stop { task_id } => match ops.stop_task(&task_id)? {
             Some(task) => {
-                let session = task.session.as_deref().unwrap_or("unknown");
-                println!("Stopped {task_id} session {session}");
+                if let Some(session) = task.session.as_deref() {
+                    println!("Stopped {task_id} session {session}");
+                } else {
+                    println!("Stop requested for {task_id} on its runner");
+                }
             }
             None => {
                 eprintln!("Task {task_id} not found");

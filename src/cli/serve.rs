@@ -39,6 +39,79 @@ mod sync;
 pub use discovery::DiscoveryOptions;
 pub use pairing::PairingOptions;
 
+/// Synchronous callers (TUI workers, CLI and daemon) share the HTTP runner path.
+/// A dedicated runtime thread also permits calls from axum's blocking workers.
+pub(crate) fn runner_action(
+    board: &Path,
+    task: &str,
+    queue: bool,
+) -> Result<Option<Option<String>>> {
+    let Some(projects) = board
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|n| n == "projects"))
+    else {
+        return Ok(None);
+    };
+    let Some(root) = projects.parent() else {
+        return Ok(None);
+    };
+    if discovery::config(root)?.peers.is_empty() {
+        return Ok(None);
+    }
+    let storage = crate::core::storage::Storage::new(board);
+    let Some(task_state) = storage.load_task(task)? else {
+        return Ok(None);
+    };
+    if api::local_runner(board, task_state.runner.as_ref())? {
+        let local = crate::core::sync::Journal::open(root)?.node;
+        if task_state
+            .runner
+            .as_ref()
+            .is_some_and(|runner| runner.as_str() != local.name)
+        {
+            let _guard = storage.lock()?;
+            if let Some(mut current) = storage.load_task(task)? {
+                current.runner = Some(crate::core::config::Runner::Node(local.name));
+                storage.save_task(&current)?;
+            }
+        }
+        return Ok(None);
+    }
+    let id = board
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| invalid("Invalid project"))?;
+    let (root, id, task) = (root.to_path_buf(), id.to_owned(), task.to_owned());
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(KanbanError::Io)?
+            .block_on(api::runner_action(&root, &id, &task, queue))
+    })
+    .join()
+    .map_err(|_| invalid("Runner dispatch worker panicked"))?
+}
+
+pub(crate) fn runner_control(board: &Path, task: &str, action: &str) -> Result<bool> {
+    crate::core::sync::control::request(board, task, action)
+}
+
+pub(crate) fn remote_log(
+    board: &Path,
+    task: &str,
+    node: &str,
+) -> Result<crate::core::runner_log::Snapshot> {
+    api::remote_log(board, task, node)
+}
+
+pub(crate) fn local_runner(
+    board: &Path,
+    runner: Option<&crate::core::config::Runner>,
+) -> Result<bool> {
+    api::local_runner(board, runner)
+}
+
 const PROTO: u32 = 1;
 const MIN_PROTO: u32 = 1;
 

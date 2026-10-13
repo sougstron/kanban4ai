@@ -2,6 +2,7 @@
 use super::*;
 use crate::core::config::Runner;
 use crate::core::operations::{Operations, QuestionRef, TaskPatch};
+use crate::core::runner_log::{self, Snapshot as LogSnapshot};
 use crate::core::storage::{NewTask, Storage};
 use crate::core::sync::{Journal, NodeRole};
 use crate::core::thread::ThreadManager;
@@ -25,6 +26,7 @@ pub(super) fn routes(root: PathBuf) -> Router {
             "/api/v1/projects/{project}/tasks/{task}/thread",
             get(thread),
         )
+        .route("/api/v1/projects/{project}/tasks/{task}/log", get(log))
         .route(
             "/api/v1/projects/{project}/tasks/{task}/{action}",
             axum::routing::post(action),
@@ -45,8 +47,16 @@ fn failure(e: KanbanError) -> Response {
     if let KanbanError::Invalid(message) = &e {
         for code in [
             "SYNC_NO_REMOTE",
+            "SYNC_STORE_MISMATCH",
             "RUNNER_REPO_MISSING",
             "RUNNER_BACKEND_MISSING",
+            "RUN_LAUNCH_UNCERTAIN",
+            "NODE_UNREACHABLE",
+            "NODE_POWERED_OFF",
+            "NODE_OUT_OF_LAN",
+            "NODE_AUTH_FAILED",
+            "NODE_SERVICE_DOWN",
+            "NODE_VERSION_MISMATCH",
         ] {
             if message.contains(code) {
                 return error(StatusCode::CONFLICT, code, message);
@@ -187,6 +197,312 @@ async fn thread(
         .await,
     )
 }
+
+fn log_failure(e: KanbanError) -> Response {
+    match &e {
+        KanbanError::Invalid(message) if message == "Not found" => error(
+            StatusCode::NOT_FOUND,
+            "NOT_FOUND",
+            "Task or project was not found",
+        ),
+        KanbanError::Permission(_) => error(
+            StatusCode::FORBIDDEN,
+            "OPERATION_FORBIDDEN",
+            "Runner log access is forbidden",
+        ),
+        _ => error(
+            StatusCode::CONFLICT,
+            "RUNNER_LOG_UNAVAILABLE",
+            "Runner log is unavailable",
+        ),
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct LogQuery {
+    #[serde(default)]
+    follow: u8,
+}
+
+async fn log(
+    State(root): State<PathBuf>,
+    Params((id, task)): Params<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<LogQuery>,
+) -> Response {
+    let read_task = task.clone();
+    let initial = blocking(move || {
+        valid_task(&read_task)?;
+        let board = project(&root, &id)?.data_root;
+        let _guard = Storage::new(&board).lock()?;
+        let snapshot = runner_log::local_tail(&board, &read_task)?;
+        let token = runner_log::local_follow_token(&board, &read_task)?;
+        Ok((board, snapshot, token))
+    })
+    .await;
+    let (board, initial, token) = match initial {
+        Ok(value) => value,
+        Err(e) => return log_failure(e),
+    };
+    if query.follow != 1 {
+        return Json(initial).into_response();
+    }
+    let stream = futures_util::stream::unfold(
+        (board, task, token, initial, true, false, 0u32),
+        |(board, task, token, mut previous, first, ended, mut idle)| async move {
+            if ended {
+                return None;
+            }
+            if first {
+                let event = format!("event: log\ndata: {}\n\n", json!(previous));
+                return Some((
+                    Ok::<_, std::convert::Infallible>(event),
+                    (board, task, token, previous, false, false, 0),
+                ));
+            }
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let (read_board, read_task, read_token) =
+                    (board.clone(), task.clone(), token.clone());
+                let current = blocking(move || {
+                    runner_log::local_follow_tail(&read_board, &read_task, &read_token)
+                })
+                .await;
+                let (snapshot, running) = match current {
+                    Ok(value) => value,
+                    Err(_) => return Some((Ok("event: error\ndata: {\"code\":\"RUNNER_LOG_UNAVAILABLE\",\"message\":\"Runner log cannot be read\"}\n\n".into()),
+                        (board, task, token, previous, false, true, 0))),
+                };
+                if let Some(snapshot) = snapshot
+                    && snapshot.text != previous.text
+                {
+                    previous = snapshot;
+                    let mut event = format!("event: log\ndata: {}\n\n", json!(previous));
+                    if !running {
+                        event.push_str("event: end\ndata: {}\n\n");
+                    }
+                    return Some((
+                        Ok(event),
+                        (board, task, token, previous, false, !running, 0),
+                    ));
+                }
+                if !running {
+                    return Some((
+                        Ok("event: end\ndata: {}\n\n".into()),
+                        (board, task, token, previous, false, true, 0),
+                    ));
+                }
+                idle += 1;
+                if idle == 30 {
+                    return Some((
+                        Ok(": keepalive\n\n".into()),
+                        (board, task, token, previous, false, false, 0),
+                    ));
+                }
+            }
+        },
+    );
+    (
+        [
+            (header::CONTENT_TYPE, "text/event-stream"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+/// Run in a separate thread so TUI workers and blocking HTTP handlers can both
+/// use the paired LAN/tailnet transport without nesting Tokio runtimes.
+pub(crate) fn remote_log(board: &Path, task: &str, node_id: &str) -> Result<LogSnapshot> {
+    valid_task(task)?;
+    let root = crate::core::sync::store_for_board(board)
+        .ok_or_else(|| invalid("RUNNER_LOG_UNAVAILABLE: Project is not registered"))?;
+    let id = board
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("Invalid project identifier"))?;
+    if Journal::open(root)?.node.node_id == node_id {
+        return runner_log::local_tail(board, task);
+    }
+    let (root, id, task_owned, node) = (
+        root.to_path_buf(),
+        id.to_owned(),
+        task.to_owned(),
+        node_id.to_owned(),
+    );
+    let result = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(KanbanError::Io)?
+            .block_on(fetch_log(&root, &id, &task_owned, &node))
+    })
+    .join()
+    .map_err(|_| invalid("Runner log worker panicked"))?;
+    match result {
+        Ok(snapshot) => Ok(snapshot),
+        Err(e) if matches!(&e, KanbanError::Invalid(message) if message.starts_with("NODE_UNREACHABLE:") || message.starts_with("NODE_OUT_OF_LAN:") || message.starts_with("NODE_POWERED_OFF:") || message.starts_with("NET_")) => {
+            runner_log::cached_tail(board, task, node_id)
+                .map_err(|cached| invalid(format!("{e}; {cached}")))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn bounded_log_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<T> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| invalid("NODE_UNREACHABLE: Runner log transfer failed"))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(invalid(
+                "NODE_SERVICE_DOWN: Runner log response exceeds configured limit",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|_| invalid("NODE_SERVICE_DOWN: Invalid runner log response"))
+}
+
+async fn fetch_log(root: &Path, id: &str, task: &str, node_id: &str) -> Result<LogSnapshot> {
+    let config = discovery::config(root)?;
+    if !discovery::network_available(root, &config)? {
+        return Err(invalid("NODE_OUT_OF_LAN: Runner network is unavailable"));
+    }
+    let peer = config
+        .peers
+        .iter()
+        .find(|peer| peer.node.node_id == node_id)
+        .ok_or_else(|| invalid("NODE_AUTH_FAILED: Runner is not paired"))?;
+    let credentials: Vec<discovery::Credential> = discovery::load(&root.join("sync/peers.yaml"))?;
+    let secret = credentials
+        .iter()
+        .find(|entry| entry.node_id == node_id)
+        .ok_or_else(|| invalid("NODE_AUTH_FAILED: Runner credentials are missing"))?;
+    let presence: BTreeMap<String, discovery::Presence> =
+        discovery::load(&root.join("sync/presence.yaml"))?;
+    let presence = presence.get(node_id).cloned().unwrap_or_default();
+    if presence.bye.is_some() {
+        return Err(invalid(
+            "NODE_POWERED_OFF: Runner announced shutdown or sleep",
+        ));
+    }
+    let addresses = discovery::peer_addresses(root, peer, Some(secret), &presence, &config)?;
+    let journal = Journal::open(root)?;
+    let uid = journal
+        .state()?
+        .project_uids
+        .get(id)
+        .cloned()
+        .ok_or_else(|| invalid("Runner log project is not registered"))?;
+    let limit = crate::core::sync::relay::settings(root)?
+        .log_tail_bytes
+        .saturating_mul(6)
+        .saturating_add(4096);
+    for address in addresses {
+        let timeout = Duration::from_secs(config.probe_timeout);
+        let http = match discovery::peer_client(root, &address, timeout, Some(timeout)) {
+            Ok(http) => http,
+            Err(KanbanError::Invalid(message)) if message.starts_with("NET_") => {
+                return Err(invalid(message));
+            }
+            Err(_) => continue,
+        };
+        let probe = match http
+            .get(format!("http://{address}/node"))
+            .bearer_auth(&secret.token)
+            .send()
+            .await
+        {
+            Ok(probe) => probe,
+            Err(_) => continue,
+        };
+        if probe.status() == StatusCode::UNAUTHORIZED || probe.status() == StatusCode::FORBIDDEN {
+            return Err(invalid("NODE_AUTH_FAILED: Runner rejected its node token"));
+        }
+        if !probe.status().is_success() {
+            continue;
+        }
+        let card: Value = bounded_log_json(probe, 16384).await?;
+        if card["node_id"] != node_id || card["store_id"] != journal.node.store_id {
+            return Err(invalid(
+                "SYNC_STORE_MISMATCH: Runner identity or store does not match",
+            ));
+        }
+        if card["proto"]
+            .as_u64()
+            .is_none_or(|proto| proto < u64::from(MIN_PROTO))
+            || card["min_proto"]
+                .as_u64()
+                .is_none_or(|proto| proto > u64::from(PROTO))
+        {
+            return Err(invalid(
+                "NODE_VERSION_MISMATCH: Runner protocol is incompatible",
+            ));
+        }
+        if peer.node.store_id != journal.node.store_id {
+            refresh_peer_store(root, node_id, &journal.node.store_id)?;
+        }
+        let mut url = reqwest::Url::parse(&format!("http://{address}/"))
+            .map_err(|_| invalid("Invalid paired runner address"))?;
+        url.path_segments_mut()
+            .map_err(|_| invalid("Invalid paired runner address"))?
+            .extend(["api", "v1", "projects", id, "tasks", task, "log"]);
+        let response = match http.get(url).bearer_auth(&secret.token).send().await {
+            Ok(response) => response,
+            Err(_) => continue,
+        };
+        if response.status() == StatusCode::UNAUTHORIZED
+            || response.status() == StatusCode::FORBIDDEN
+        {
+            return Err(invalid("NODE_AUTH_FAILED: Runner rejected log access"));
+        }
+        if !response.status().is_success() {
+            return Err(invalid(
+                "RUNNER_LOG_UNAVAILABLE: Runner could not provide this task log",
+            ));
+        }
+        let snapshot: LogSnapshot = bounded_log_json(response, limit).await?;
+        if snapshot.node_id != node_id || snapshot.project != uid || snapshot.task != task {
+            return Err(invalid(
+                "SYNC_STORE_MISMATCH: Runner log identity does not match",
+            ));
+        }
+        runner_log::validate_snapshot(root, &snapshot)?;
+        runner_log::cache_snapshot(root, &snapshot)?;
+        return Ok(snapshot);
+    }
+    Err(invalid(
+        "NODE_UNREACHABLE: Runner log endpoint is unreachable",
+    ))
+}
+
+pub(super) fn refresh_peer_store(root: &Path, node_id: &str, store_id: &str) -> Result<()> {
+    let _lock = crate::core::storage::lock_file_reentrant(&root.join("sync/.lock"))?;
+    let path = root.join("config.yaml");
+    let mut config: serde_yaml_ng::Value = discovery::load(&path)?;
+    let mut changed = false;
+    if let Some(peers) = config["sync"]["peers"].as_sequence_mut() {
+        for paired in peers {
+            if paired["node_id"].as_str() == Some(node_id)
+                && paired["store_id"].as_str() != Some(store_id)
+            {
+                paired["store_id"] = serde_yaml_ng::Value::String(store_id.to_owned());
+                changed = true;
+            }
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    crate::core::storage::atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&config)?)
+}
 fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|e| invalid(e.to_string()))
 }
@@ -308,6 +624,7 @@ struct Action {
     text: Option<String>,
     variants: Vec<String>,
     runner: Option<Runner>,
+    queue: bool,
     agent: bool,
     on_unavailable: OnUnavailable,
 }
@@ -323,10 +640,25 @@ async fn action(
     if let Err(e) = valid_task(&task) {
         return failure(e);
     }
-    if matches!(action.as_str(), "launch" | "stop") {
-        match target(&root, &id, &task, request.runner, &action).await {
-            Ok(Some(role)) => return proxy(&root, role, &id, &task, &action, &request).await,
-            Ok(None) => {}
+    // Explicit launches preserve unavailable-runner choices; auto launches use
+    // the shared Operations dispatcher and its durable relay intent.
+    if action == "launch" {
+        let preference = (|| -> Result<Runner> {
+            let p = project(&root, &id)?;
+            let ops = Operations::for_project(&p);
+            let current = found(ops.get_task(&task)?)?;
+            Ok(request
+                .runner
+                .clone()
+                .unwrap_or(ops.config.load()?.runner_for(current.runner)))
+        })();
+        match preference {
+            Ok(Runner::Auto) => {}
+            Ok(runner) => match target(&root, &id, &task, Some(runner), false).await {
+                Ok(Some(node)) => return proxy(&root, &node, &id, &task, "launch", &request).await,
+                Ok(None) => {}
+                Err(e) => return failure(e),
+            },
             Err(e) => return failure(e),
         }
     }
@@ -348,6 +680,9 @@ async fn action(
             project(&root, &id)?
         };
         let ops = Operations::for_project(&p);
+        if action == "launch" && let Some(runner) = request.runner {
+            found(ops.update_task(&task, TaskPatch { runner: Some(Some(runner)), ..Default::default() })?)?;
+        }
         match action.as_str() {
             "move" => task_wire(found(ops.move_task(&task, request.status.as_deref().ok_or_else(|| invalid("status is required"))?, request.agent)?)?),
             "ask" => task_wire(found(ops.ask_question(&task, request.text.as_deref().ok_or_else(|| invalid("text is required"))?, if request.agent { "agent" } else { "human" }, request.variants)?)?),
@@ -356,15 +691,27 @@ async fn action(
                 Ok(json!({"task": task_wire(outcome.task)?, "remaining": outcome.remaining, "resumed_session": outcome.resumed_session, "queued": outcome.queued}))
             },
             "launch" => {
-                let session = found(ops.start_task(&task)?)?;
-                if let Some(runner) = request.runner {
-                    let runner = match runner {
-                        Runner::Auto | Runner::Here => role_runner(Journal::open(&root)?.node.role),
-                        runner => runner,
-                    };
-                    found(ops.update_task(&task, TaskPatch { runner: Some(Some(runner)), ..Default::default() })?)?;
+                if request.queue && ops.queue_can_dispatch()? {
+                    found(ops.queue_run(&task)?)?;
+                    ops.dispatch_queue()?;
+                    let task = found(ops.get_task(&task)?)?;
+                    Ok(json!({"session": task.session, "queued": task.runner_request.is_some() || task.run_phase == Some(crate::core::models::RunPhase::Queued)}))
+                } else {
+                    let session = ops.start_task(&task)?;
+                    found(ops.get_task(&task)?)?;
+                    Ok(json!({"queued": session.is_none(), "session": session}))
                 }
-                Ok(json!({"session": session}))
+            },
+            "rerun" => {
+                use crate::core::models::{RunMode, TaskStatus};
+                let current = found(ops.get_task(&task)?)?;
+                let mode = if ops.queue_can_dispatch()? { RunMode::Queued } else { RunMode::Immediate };
+                let updated = if current.status == TaskStatus::Review {
+                    ops.rerun_review_task(&task, current.session.as_deref(), mode)?
+                } else {
+                    ops.rerun_in_progress_task(&task, current.session.as_deref(), mode)?
+                };
+                task_wire(found(updated)?)
             },
             "stop" => task_wire(found(ops.stop_task(&task)?)?),
             _ => Err(invalid("Unknown action")),
@@ -374,47 +721,191 @@ async fn action(
 async fn target(
     root: &Path,
     id: &str,
-    task: &str,
-    requested: Option<Runner>,
-    action: &str,
-) -> Result<Option<NodeRole>> {
-    let (root, id, task, action) = (
-        root.to_path_buf(),
-        id.to_owned(),
-        task.to_owned(),
-        action.to_owned(),
-    );
-    blocking(move || {
-        let p = project(&root, &id)?;
-        let task = found(Operations::for_project(&p).get_task(&task)?)?;
-        let journal = Journal::open(&root)?;
-        let active = journal
-            .runs(&id, &task.id)?
-            .into_values()
-            .find(|run| run.active());
-        let role = if action == "stop" {
-            active
-                .map(|run| run.role)
-                .or(task.runner.and_then(crate::core::config::Runner::node_role))
-        } else if discovery::config(&root)?.peers.is_empty() {
-            None
+    task_id: &str,
+    requested: Option<crate::core::config::Runner>,
+    pin: bool,
+) -> Result<Option<String>> {
+    use crate::core::config::Runner;
+    let project = project(root, id)?;
+    let storage = crate::core::storage::Storage::new(&project.data_root);
+    let Some(task) = storage.load_task(task_id)? else {
+        return Err(invalid("Not found"));
+    };
+    let config = discovery::config(root)?;
+    if config.peers.is_empty() {
+        return Ok(None);
+    }
+    let journal = Journal::open(root)?;
+    let board = crate::core::config::Config::new(&project.data_root).load()?;
+    let preference = requested.unwrap_or_else(|| board.runner_for(task.runner.clone()));
+    // A reserved role spelling can also be a concrete paired node name.
+    // Prefer that identity before matching a role, which may repeat.
+    let choose = |preference: &Runner| {
+        let name = preference.as_str();
+        if name == journal.node.name || matches!(preference, Runner::Here) {
+            return Some(journal.node.name.clone());
+        }
+        if let Some(peer) = config.peers.iter().find(|p| p.node.name == name) {
+            return Some(peer.node.name.clone());
+        }
+        if preference.node_role() == Some(journal.node.role) {
+            Some(journal.node.name.clone())
         } else {
-            match requested {
-                Some(runner) => runner,
-                None => Operations::for_project(&p)
-                    .config
-                    .load()?
-                    .runner_for(task.runner),
+            config
+                .peers
+                .iter()
+                .find(|p| preference.node_role() == Some(p.node.role))
+                .map(|p| p.node.name.clone())
+        }
+    };
+    let node = if preference == Runner::Auto {
+        let mut chosen = None;
+        for candidate in board.runner_auto_order() {
+            let Some(name) = choose(&candidate) else {
+                continue;
+            };
+            if name == journal.node.name
+                || discovery::runner_online(
+                    root,
+                    config.peers.iter().find(|p| p.node.name == name).unwrap(),
+                )
+                .await?
+            {
+                chosen = Some(name);
+                break;
             }
-            .node_role()
-        };
-        Ok(role.filter(|role| *role != journal.node.role))
-    })
-    .await
+        }
+        chosen.unwrap_or_else(|| journal.node.name.clone())
+    } else {
+        choose(&preference).ok_or_else(|| invalid("NODE_UNREACHABLE: Runner is not paired"))?
+    };
+    if pin {
+        let _guard = storage.lock()?;
+        let mut current = storage
+            .load_task(task_id)?
+            .ok_or_else(|| invalid("Not found"))?;
+        current.runner = Some(Runner::Node(node.clone()));
+        storage.save_task(&current)?;
+    }
+    Ok((node != journal.node.name).then_some(node))
+}
+
+pub(super) async fn runner_action(
+    root: &Path,
+    id: &str,
+    task: &str,
+    queue: bool,
+) -> Result<Option<Option<String>>> {
+    let p = project(root, id)?;
+    let before = found(Operations::for_project(&p).get_task(task)?)?;
+    let automatic = crate::core::config::Config::new(&p.data_root)
+        .load()?
+        .runner_for(before.runner)
+        == crate::core::config::Runner::Auto;
+    let Some(node) = target(root, id, task, None, true).await? else {
+        return Ok(None);
+    };
+    let response = proxy(root, &node, id, task, "launch", &Action::default()).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .map_err(|e| invalid(e.to_string()))?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?;
+    if status.is_success() {
+        // CLI callers have no long-lived sync worker. Read back the runner's
+        // replicated status/descriptor, without turning a failed readback
+        // into a failed (and potentially repeated) committed launch.
+        if let Ok(config) = discovery::config(root)
+            && let Some(peer) = config.peers.iter().find(|peer| peer.node.name == node)
+        {
+            let _ = super::sync::catch_up(root, peer).await;
+        }
+        return Ok(Some(value["session"].as_str().map(str::to_owned)));
+    }
+    let code = value["error"]["code"]
+        .as_str()
+        .unwrap_or("NODE_UNREACHABLE");
+    if (queue || automatic)
+        && matches!(
+            code,
+            "NODE_UNREACHABLE" | "NODE_POWERED_OFF" | "NODE_OUT_OF_LAN" | "NODE_SERVICE_DOWN"
+        )
+    {
+        // Publish code before the replicated intent: a relay-only runner must
+        // never consume a request for a snapshot which has not been published.
+        let (code_root, code_id) = (root.to_path_buf(), id.to_owned());
+        blocking(move || {
+            let remote = crate::core::code::status(&code_root, &code_id)?
+                .remote
+                .ok_or_else(|| {
+                    invalid("SYNC_NO_REMOTE: offline runner queue needs a git remote")
+                })?;
+            crate::core::code::publish_live(&code_root, &code_id, &remote)?;
+            Ok(())
+        })
+        .await?;
+        let p = project(root, id)?;
+        let storage = crate::core::storage::Storage::new(&p.data_root);
+        {
+            let _guard = storage.lock()?;
+            let mut task = storage
+                .load_task(task)?
+                .ok_or_else(|| invalid("Not found"))?;
+            task.runner_request = Some(format!(
+                "{}:{}",
+                Journal::open(root)?.node.node_id,
+                chrono::Utc::now().format("%Y%m%d%H%M%S%9f")
+            ));
+            task.updated_at = crate::core::timefmt::now();
+            storage.save_task(&task)?;
+        }
+        // Durable intent survives the caller shutting down after publication.
+        let _ = super::sync::once(root, true).await;
+        return Ok(Some(None));
+    }
+    Err(invalid(format!(
+        "{code}: {}",
+        value["error"]["message"]
+            .as_str()
+            .unwrap_or("Runner launch failed")
+    )))
+}
+
+pub(super) fn local_runner(
+    board: &Path,
+    runner: Option<&crate::core::config::Runner>,
+) -> Result<bool> {
+    // Only a concrete name or explicit local role may own a queued claim.
+    let Some(root) = board
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|n| n == "projects"))
+        .and_then(Path::parent)
+    else {
+        return Ok(true);
+    };
+    if discovery::config(root)?.peers.is_empty() {
+        return Ok(true);
+    }
+    let local = Journal::open(root)?.node;
+    let Some(runner) = runner else {
+        return Ok(false);
+    };
+    let name = runner.as_str();
+    if name == local.name {
+        return Ok(true);
+    }
+    if discovery::config(root)?
+        .peers
+        .iter()
+        .any(|peer| peer.node.name == name)
+    {
+        return Ok(false);
+    }
+    Ok(runner.node_role() == Some(local.role))
 }
 async fn proxy(
     root: &Path,
-    role: NodeRole,
+    node: &str,
     id: &str,
     task: &str,
     action: &str,
@@ -428,10 +919,17 @@ async fn proxy(
         Ok(available) => available,
         Err(e) => return failure(e),
     };
+    let Some(peer) = config.peers.iter().find(|p| p.node.name == node) else {
+        return error(
+            StatusCode::CONFLICT,
+            "NODE_UNREACHABLE",
+            "Runner не сопряжён",
+        );
+    };
     if !available {
         return unavailable(
             root,
-            role,
+            peer.node.role,
             id,
             task,
             action,
@@ -442,20 +940,7 @@ async fn proxy(
         )
         .await;
     }
-    let Some(peer) = config.peers.iter().find(|p| p.node.role == role) else {
-        return unavailable(
-            root,
-            role,
-            id,
-            task,
-            action,
-            request,
-            "NODE_UNREACHABLE",
-            None,
-            "Runner не сопряжён".into(),
-        )
-        .await;
-    };
+    let role = peer.node.role;
     let credentials: Vec<discovery::Credential> =
         match discovery::load(&root.join("sync/peers.yaml")) {
             Ok(c) => c,
@@ -569,7 +1054,13 @@ async fn proxy(
                 .await;
             }
         };
-        if card["node_id"] != peer.node.node_id || card["store_id"] != peer.node.store_id {
+        let store_id = match Journal::open(root) {
+            Ok(journal) => journal.node.store_id,
+            Err(e) => return failure(e),
+        };
+        // Pairing an empty replica precedes its adoption of our store UUID.
+        // The stale paired card is not the post-bootstrap store authority.
+        if card["node_id"] != peer.node.node_id || card["store_id"] != store_id {
             return error(
                 StatusCode::CONFLICT,
                 "SYNC_STORE_MISMATCH",
@@ -588,6 +1079,11 @@ async fn proxy(
                 "NODE_VERSION_MISMATCH",
                 "Runner protocol is incompatible",
             );
+        }
+        if peer.node.store_id != store_id {
+            if let Err(e) = refresh_peer_store(root, &peer.node.node_id, &store_id) {
+                return failure(e);
+            }
         }
         if action == "launch" {
             // Preserve launch exclusion before touching the runner's repository.
@@ -612,11 +1108,15 @@ async fn proxy(
                     return error(StatusCode::BAD_GATEWAY, "NODE_SERVICE_DOWN", &e.to_string());
                 }
             };
-            if !status.is_success() {
+            if !status.is_success() && status != StatusCode::NOT_FOUND {
                 return (status, Json(value)).into_response();
             }
             let runs: BTreeMap<String, crate::core::sync::RunDescriptor> =
-                match decode(value["runs"].clone()) {
+                match decode(if status == StatusCode::NOT_FOUND {
+                    json!({})
+                } else {
+                    value["runs"].clone()
+                }) {
                     Ok(runs) => runs,
                     Err(e) => return failure(e),
                 };
@@ -626,6 +1126,24 @@ async fn proxy(
                     "RUN_ALREADY_RUNNING",
                     "Task is already running",
                 );
+            }
+            if let Err(e) = (|| -> Result<()> {
+                let p = project(root, id)?;
+                found(Operations::for_project(&p).update_task(
+                    task,
+                    TaskPatch {
+                        runner: Some(Some(Runner::Node(node.to_owned()))),
+                        ..Default::default()
+                    },
+                )?)?;
+                Ok(())
+            })() {
+                return failure(e);
+            }
+            // Catch up only after excluding an existing run. Newly created
+            // tasks need not have reached the runner before this request.
+            if let Err(e) = super::sync::catch_up(root, peer).await {
+                return failure(e);
             }
             let (code_root, code_id) = (root.to_path_buf(), id.to_owned());
             let transfer = match blocking(move || {
@@ -693,7 +1211,16 @@ async fn proxy(
         match http
             .post(url)
             .bearer_auth(&secret.token)
-            .json(request)
+            .json(&Action {
+                runner: Some(crate::core::config::Runner::Node(node.to_owned())),
+                queue: action == "launch",
+                status: request.status.clone(),
+                message: request.message.clone(),
+                text: request.text.clone(),
+                variants: request.variants.clone(),
+                agent: request.agent,
+                on_unavailable: request.on_unavailable,
+            })
             .send()
             .await
         {
@@ -701,7 +1228,15 @@ async fn proxy(
                 let status = response.status();
                 return match response.json::<Value>().await {
                     Ok(value) => (status, Json(value)).into_response(),
-                    Err(e) => error(StatusCode::BAD_GATEWAY, "NODE_SERVICE_DOWN", &e.to_string()),
+                    Err(e) => error(
+                        StatusCode::BAD_GATEWAY,
+                        if action == "launch" {
+                            "RUN_LAUNCH_UNCERTAIN"
+                        } else {
+                            "NODE_SERVICE_DOWN"
+                        },
+                        &e.to_string(),
+                    ),
                 };
             }
             // A response timeout may follow a committed launch: never retry a mutation.
@@ -709,7 +1244,11 @@ async fn proxy(
             Err(e) => {
                 return error(
                     StatusCode::GATEWAY_TIMEOUT,
-                    "NODE_UNREACHABLE",
+                    if action == "launch" {
+                        "RUN_LAUNCH_UNCERTAIN"
+                    } else {
+                        "NODE_UNREACHABLE"
+                    },
                     &e.to_string(),
                 );
             }
@@ -718,7 +1257,7 @@ async fn proxy(
     let message = last.unwrap_or_else(|| "No LAN or tailnet runner address".into());
     unavailable(
         root,
-        role,
+        peer.node.role,
         id,
         task,
         action,
@@ -807,14 +1346,24 @@ async fn unavailable(
         OnUnavailable::Queue => {
             let (root, id, task) = (root.to_path_buf(), id.to_owned(), task.to_owned());
             let actor = if request.agent { "agent" } else { "human" };
+            let requested = request.runner.clone();
             respond(
                 blocking(move || {
                     crate::core::sync::with_actor(actor, || {
                         let p = project(&root, &id)?;
                         let ops = Operations::for_project(&p);
-                        let runner = role_runner(role);
+                        let config = discovery::config(&root)?;
                         let current = found(ops.get_task(&task)?)?;
-                        if current.runner != Some(runner) {
+                        let preference = requested
+                            .unwrap_or(ops.config.load()?.runner_for(current.runner.clone()));
+                        let node = config
+                            .peers
+                            .iter()
+                            .find(|peer| peer.node.name == preference.as_str())
+                            .or_else(|| config.peers.iter().find(|peer| peer.node.role == role))
+                            .ok_or_else(|| invalid("NODE_UNREACHABLE: Runner is not paired"))?;
+                        let runner = Runner::Node(node.node.name.clone());
+                        if current.runner.as_ref().map(Runner::as_str) != Some(runner.as_str()) {
                             found(ops.update_task(
                                 &task,
                                 TaskPatch {
@@ -824,7 +1373,7 @@ async fn unavailable(
                             )?)?;
                         }
                         if current.run_phase != Some(crate::core::models::RunPhase::Queued) {
-                            found(ops.queue_run(&task)?)?;
+                            found(ops.queue_local_run(&task)?)?;
                         }
                         Ok(json!({"queued": true, "node": role}))
                     })
@@ -1102,10 +1651,7 @@ mod tests {
                     .values()
                     .all(|run| !run.active())
             );
-            assert_eq!(
-                queued.runner.unwrap().node_role().unwrap(),
-                serde_json::from_value::<NodeRole>(json!(target_role)).unwrap()
-            );
+            assert_eq!(queued.runner.as_ref().unwrap().as_str(), target_role);
             atomic_write_text_raw(
                 &p.data_root.join(".kanban/config.yaml"),
                 "auto_launch:\n  enabled: true\norchestration:\n  queue_enabled: true\n",
@@ -1325,127 +1871,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_stop_closes_only_runner_session() {
+    async fn placement_pins_here_and_distinguishes_same_role_nodes() {
+        use crate::core::config::Runner;
         let temp = tempfile::tempdir().unwrap();
-        let laptop = temp.path().join("laptop");
-        let runner = temp.path().join("runner");
+        let root = temp.path().join("store");
         let work = temp.path().join("work");
+        fs::create_dir_all(&root).unwrap();
         fs::create_dir_all(&work).unwrap();
-        fs::create_dir_all(&runner).unwrap();
         atomic_write_text_raw(
-            &runner.join("config.yaml"),
-            "node:\n  name: server\n  role: server\n",
+            &root.join("config.yaml"),
+            "node:\n  name: desk\n  role: laptop\n",
         )
         .unwrap();
-        let a = ProjectStore::at(&laptop).add(&work, None).unwrap().project;
-        let b = ProjectStore::at(&runner).add(&work, None).unwrap().project;
-        Storage::new(&a.data_root).init_board().unwrap();
-        Storage::new(&b.data_root).init_board().unwrap();
-        let local = Operations::for_project(&a)
-            .create_task(NewTask {
-                runner: Some(crate::core::config::Runner::Server),
-                ..NewTask::titled("Remote run")
-            })
+        let p = ProjectStore::at(&root).add(&work, None).unwrap().project;
+        Storage::new(&p.data_root).init_board().unwrap();
+        let task = Operations::for_project(&p)
+            .create_task(NewTask::titled("Placement"))
             .unwrap();
-        let remote = Operations::for_project(&b)
-            .create_task(NewTask::titled("Remote run"))
-            .unwrap();
-        assert_eq!(local.id, remote.id);
-        let session_id = "ses-task414-proxy";
-        let sessions = crate::core::session::SessionManager::new(&b.data_root);
-        sessions.link_session(&remote.id, session_id).unwrap();
-        Operations::for_project(&b)
-            .update_task(
-                &remote.id,
-                TaskPatch {
-                    session: Some(Some(session_id.into())),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let caller_node = Journal::open(&laptop).unwrap().node;
-        let mut runner_node = Journal::open(&runner).unwrap().node;
-        runner_node.store_id = caller_node.store_id.clone();
+        let local = Journal::open(&root).unwrap().node;
         atomic_write_text_raw(
-            &runner.join("sync/node.yaml"),
-            &serde_yaml_ng::to_string(&runner_node).unwrap(),
-        )
-        .unwrap();
-        let secret = issue_token(&runner, TokenKind::Node).unwrap();
-        let client = issue_token(&laptop, TokenKind::Node).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let runner_router = super::super::router(runner.join("sync/tokens.yaml"));
-        let server = tokio::spawn(async move {
-            axum::serve(listener, runner_router).await.unwrap();
-        });
-        atomic_write_text_raw(
-            &laptop.join("config.yaml"),
+            &root.join("config.yaml"),
             &serde_yaml_ng::to_string(&json!({
-                "sync": { "home_networks": ["0.0.0.0/0"], "peers": [{
-                    "node_id":runner_node.node_id, "name":runner_node.name, "role":"server",
-                    "store_id":runner_node.store_id, "address":address.to_string()
+                "node": {"name":"desk", "role":"laptop"},
+                "sync": {"peers": [{
+                    "node_id":"other-node", "name":"laptop", "role":"laptop",
+                    "store_id":local.store_id, "address":"127.0.0.1:1"
                 }]}
             }))
             .unwrap(),
         )
         .unwrap();
-        atomic_write_text_raw(
-            &laptop.join("sync/peers.yaml"),
-            &serde_yaml_ng::to_string(&json!([{
-                "node_id":runner_node.node_id, "token":secret, "inbound_sha256":"unused"
-            }]))
+        assert_eq!(
+            target(&root, &p.id, &task.id, Some(Runner::Here), true)
+                .await
+                .unwrap(),
+            None
+        );
+        let pinned = Storage::new(&p.data_root)
+            .load_task(&task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.runner.as_ref().unwrap().as_str(), "desk");
+        assert!(local_runner(&p.data_root, pinned.runner.as_ref()).unwrap());
+        assert_eq!(
+            target(
+                &root,
+                &p.id,
+                &task.id,
+                Some(Runner::Node("laptop".into())),
+                true
+            )
+            .await
             .unwrap(),
-        )
-        .unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let laptop_router = super::super::router(laptop.join("sync/tokens.yaml"));
-        let frontend = tokio::spawn(async move {
-            axum::serve(listener, laptop_router).await.unwrap();
-        });
-        let http = reqwest::Client::new();
-        let url = format!("{base}/api/v1/projects/{}/tasks/{}", a.id, local.id);
-        let conflict = http
-            .post(format!("{url}/launch"))
-            .bearer_auth(&client)
-            .json(&json!({}))
-            .send()
-            .await
+            Some("laptop".into())
+        );
+        let pinned = Storage::new(&p.data_root)
+            .load_task(&task.id)
+            .unwrap()
             .unwrap();
-        assert_eq!(conflict.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            conflict.json::<Value>().await.unwrap()["error"]["code"],
-            "RUN_ALREADY_RUNNING"
-        );
-        let stopped = http
-            .post(format!("{url}/stop"))
-            .bearer_auth(&client)
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            stopped.status(),
-            StatusCode::OK,
-            "{}",
-            stopped.text().await.unwrap()
-        );
-        assert_eq!(
-            sessions.load_session(session_id).unwrap().status,
-            crate::core::models::SessionStatus::Closed
-        );
-        assert!(
-            Operations::for_project(&a)
-                .get_task(&local.id)
-                .unwrap()
-                .unwrap()
-                .session
-                .is_none()
-        );
-        frontend.abort();
-        server.abort();
-        let _ = frontend.await;
-        let _ = server.await;
+        assert!(!local_runner(&p.data_root, pinned.runner.as_ref()).unwrap());
+        assert!(pinned.session.is_none());
     }
 }

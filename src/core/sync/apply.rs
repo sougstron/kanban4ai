@@ -63,7 +63,7 @@ pub(super) fn recover_remote(root: &Path) -> Result<()> {
 }
 
 impl Journal {
-    /// Apply trusted peer operations without author/column gates or launch side effects.
+    /// Apply trusted operations durably, then execute runner-owned effects outside locks.
     /// max_skew_ms comes from the caller's sync configuration.
     pub fn apply_remote(
         &self,
@@ -71,6 +71,16 @@ impl Journal {
         max_skew_ms: u64,
     ) -> Result<Vec<Conflict>> {
         recover_remote(&self.root)?;
+        let conflicts = self.apply_remote_transaction(operations, max_skew_ms)?;
+        super::control::process_store(self.root.parent().expect("sync parent"))?;
+        Ok(conflicts)
+    }
+
+    fn apply_remote_transaction(
+        &self,
+        operations: &[Operation],
+        max_skew_ms: u64,
+    ) -> Result<Vec<Conflict>> {
         let store = self.root.parent().expect("sync parent");
         let _store = lock_file_reentrant(&store.join(".lock"))?;
         // Local writers lock board before sync. Lock all existing and prospective
@@ -517,6 +527,7 @@ fn project_files(
             continue;
         }
         let path = match entity.as_str() {
+            "run" if fields.values.contains_key("command") => continue,
             "run" => {
                 let (path, text) = run::projection(&store.join("sync"), &project, &id, fields)?;
                 writes.insert(path, Some(text));
