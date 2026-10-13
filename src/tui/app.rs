@@ -3053,6 +3053,11 @@ impl App {
         self.fs_change_generation
     }
 
+    /// The latest change generation while a reload is still pending.
+    pub fn pending_fs_change(&self) -> Option<u64> {
+        self.pending_fs_reload.then_some(self.fs_change_generation)
+    }
+
     pub fn reload_debounced_change(&mut self, generation: u64) -> Result<()> {
         if !self.pending_fs_reload || generation != self.fs_change_generation {
             return Ok(());
@@ -7485,11 +7490,22 @@ pub(super) fn load_log_tail(project_path: &Path, session_id: &str) -> Vec<String
         .join(".kanban")
         .join("logs")
         .join(format!("{session_id}.log"));
-    let Ok(bytes) = fs::read(&log_file) else {
+    // The pager re-reads every tick while following, and agent logs grow
+    // without bound, so only the shown tail is read.
+    let tail = (|| {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = fs::File::open(&log_file)?;
+        let len = file.metadata()?.len();
+        let skipped = len.saturating_sub(LOG_TAIL_BYTES as u64);
+        file.seek(SeekFrom::Start(skipped))?;
+        let mut bytes = Vec::with_capacity((len - skipped) as usize);
+        file.read_to_end(&mut bytes)?;
+        std::io::Result::Ok((skipped, bytes))
+    })();
+    let Ok((skipped, bytes)) = tail else {
         return vec!["(no log file for this session)".to_string()];
     };
-    let skipped = bytes.len().saturating_sub(LOG_TAIL_BYTES);
-    let text = String::from_utf8_lossy(&bytes[skipped..]);
+    let text = String::from_utf8_lossy(&bytes);
     let mut lines = text.lines().map(sanitize_terminal_text).collect::<Vec<_>>();
     if skipped > 0 {
         if !lines.is_empty() {

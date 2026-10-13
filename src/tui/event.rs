@@ -57,6 +57,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
     let _watcher = start_watcher(app.watch_root(), threads.tx.clone());
     app.enable_background_launches(threads.tx.clone());
     let mut window_title = String::new();
+    let mut debounce_armed = false;
 
     refresh_limits(app);
     app.poll_update_banner();
@@ -74,11 +75,29 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
             AppEvent::Input(input) => handle_input(app, input)?,
             AppEvent::PasteShortcut(key, clipboard) => app.handle_paste_shortcut(key, clipboard)?,
             AppEvent::InputError(message) => app.stop_after_input_error(message),
+            // Nothing visible changes until the debounced reload, so no
+            // frame is drawn, and one timer serves a whole burst instead of
+            // a thread per event.
             AppEvent::FsChanged => {
                 let generation = app.note_fs_changed();
-                spawn_debounce_timer(threads.tx.clone(), generation);
+                if !debounce_armed {
+                    debounce_armed = true;
+                    spawn_debounce_timer(threads.tx.clone(), generation);
+                }
+                continue;
             }
-            AppEvent::FsDebounced(generation) => app.reload_debounced_change(generation)?,
+            AppEvent::FsDebounced(generation) => {
+                debounce_armed = false;
+                match app.pending_fs_change() {
+                    // Changes kept arriving: wait for the burst to settle.
+                    Some(current) if current != generation => {
+                        debounce_armed = true;
+                        spawn_debounce_timer(threads.tx.clone(), current);
+                        continue;
+                    }
+                    _ => app.reload_debounced_change(generation)?,
+                }
+            }
             AppEvent::LaunchDone => app.poll_launches(),
             AppEvent::Tick => {
                 if let Err(error) = network.tick() {

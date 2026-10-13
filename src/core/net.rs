@@ -625,11 +625,31 @@ fn login(
     }
 }
 
+/// Longest gap between full supervision passes. A pass parses the config,
+/// re-secures the state tree and runs `tailscale status`, and the TUI ticks
+/// every second on its UI thread; in between, a tick only `stat`s the inputs
+/// and checks the owned sidecar's `/proc` entry, so an edit, a handover or a
+/// crashed daemon still triggers a pass on the next tick.
+const SUPERVISE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Modification times of everything a pass reads that another process may
+/// change: the global config, node identity, the sidecar record and the
+/// `net down` marker.
+type NetStamp = [Option<std::time::SystemTime>; 4];
+
+struct Supervised {
+    at: Instant,
+    stamp: NetStamp,
+    /// The sidecar this manager owned after the pass, if any.
+    sidecar: Option<Record>,
+}
+
 pub struct Manager {
     root: PathBuf,
     paths: Paths,
     owner: Option<File>,
     child: Option<Child>,
+    supervised: Option<Supervised>,
 }
 
 impl Manager {
@@ -652,10 +672,46 @@ impl Manager {
             paths,
             owner,
             child: None,
+            supervised: None,
         })
     }
 
+    /// Keep the managed sidecar running. Cheap unless something changed or
+    /// [`SUPERVISE_INTERVAL`] passed; see there.
     pub fn tick(&mut self) -> Result<()> {
+        if self.supervised.as_ref().is_some_and(|last| {
+            last.at.elapsed() < SUPERVISE_INTERVAL
+                && last.stamp == self.stamp()
+                && last
+                    .sidecar
+                    .as_ref()
+                    .is_none_or(|rec| live(rec, &self.paths))
+        }) {
+            return Ok(());
+        }
+        let result = self.supervise();
+        self.supervised = Some(Supervised {
+            at: Instant::now(),
+            stamp: self.stamp(),
+            sidecar: self
+                .owner
+                .as_ref()
+                .and_then(|_| record(&self.paths).ok().flatten()),
+        });
+        result
+    }
+
+    fn stamp(&self) -> NetStamp {
+        [
+            self.root.join("config.yaml"),
+            self.root.join("sync/node.yaml"),
+            self.paths.record(),
+            self.paths.stopped(),
+        ]
+        .map(|path| fs::metadata(path).and_then(|m| m.modified()).ok())
+    }
+
+    fn supervise(&mut self) -> Result<()> {
         let config = settings(&self.root)?;
         if config.mode != Mode::Managed {
             self.stop_owned()?;

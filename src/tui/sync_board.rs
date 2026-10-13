@@ -1,7 +1,7 @@
 //! Board sync status and task/message conflict controls. All probes run off-thread.
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local, Utc};
 use ratatui::Frame;
@@ -15,6 +15,14 @@ use super::card::{sanitize_terminal_text, truncate_display};
 use crate::cli::serve::settings::{self, BoardPeer};
 use crate::core::sync::{Conflict, Journal};
 
+/// Peer probes go over the network and the serve monitor already runs them
+/// every `sync.interval`, so the header refreshes them far less often than
+/// the board ticks.
+const PEER_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// `(len, mtime)` of the journal files the conflict list is derived from.
+type JournalStamp = [Option<(u64, SystemTime)>; 2];
+
 #[derive(Default)]
 pub(crate) struct SyncBoard {
     pub peers: Vec<BoardPeer>,
@@ -23,15 +31,16 @@ pub(crate) struct SyncBoard {
     pub error: Option<String>,
     pub selected: usize,
     board: PathBuf,
-    last_poll: Option<Instant>,
+    last_probe: Option<Instant>,
+    journal_stamp: Option<JournalStamp>,
     job: Option<JoinHandle<Result<Snapshot, String>>>,
 }
 
+/// One worker's result; a part is `None` when it was not due this round.
 struct Snapshot {
     board: PathBuf,
-    peers: Vec<BoardPeer>,
-    conflicts: Vec<Conflict>,
-    tasks: Vec<String>,
+    peers: Option<Vec<BoardPeer>>,
+    conflicts: Option<(Vec<Conflict>, Vec<String>)>,
 }
 
 impl Drop for SyncBoard {
@@ -43,6 +52,9 @@ impl Drop for SyncBoard {
 }
 
 impl SyncBoard {
+    /// Called every tick. The conflict list is re-read only when the journal
+    /// changed on disk, and peers are probed at most every
+    /// [`PEER_PROBE_INTERVAL`], so an idle board costs two `stat`s per tick.
     pub fn poll(&mut self, root: &Path, board: &Path, interval: Duration) {
         if self.board != board {
             self.board = board.into();
@@ -50,33 +62,57 @@ impl SyncBoard {
             self.conflicts.clear();
             self.tasks.clear();
             self.error = None;
-            self.last_poll = None;
+            self.last_probe = None;
+            self.journal_stamp = None;
         }
         if self.job.as_ref().is_some_and(|job| job.is_finished()) {
             match self.job.take().expect("finished job").join() {
                 Ok(Ok(snapshot)) if snapshot.board == self.board => {
-                    self.peers = snapshot.peers;
-                    self.conflicts = snapshot.conflicts;
-                    self.tasks = snapshot.tasks;
+                    if let Some(peers) = snapshot.peers {
+                        self.peers = peers;
+                    }
+                    if let Some((conflicts, tasks)) = snapshot.conflicts {
+                        self.conflicts = conflicts;
+                        self.tasks = tasks;
+                    }
                     self.error = None;
                 }
-                Ok(Err(error)) => self.error = Some(error),
-                Err(_) => self.error = Some("sync status worker failed".into()),
+                Ok(Err(error)) => {
+                    self.error = Some(error);
+                    self.journal_stamp = None;
+                }
+                Err(_) => {
+                    self.error = Some("sync status worker failed".into());
+                    self.journal_stamp = None;
+                }
                 _ => {}
             }
         }
-        if self.job.is_some() || self.last_poll.is_some_and(|at| at.elapsed() < interval) {
+        if self.job.is_some() {
             return;
         }
         // Legacy in-place boards and stores without sync remain unchanged.
         if !root.join("sync/node.yaml").exists() {
             return;
         }
-        self.last_poll = Some(Instant::now());
+        let stamp = journal_stamp(root);
+        let reload_conflicts = self.journal_stamp != Some(stamp);
+        let probe = self
+            .last_probe
+            .is_none_or(|at| at.elapsed() >= PEER_PROBE_INTERVAL.max(interval));
+        if !reload_conflicts && !probe {
+            return;
+        }
+        if reload_conflicts {
+            self.journal_stamp = Some(stamp);
+        }
+        if probe {
+            self.last_probe = Some(Instant::now());
+        }
         let root = root.to_path_buf();
         let board = board.to_path_buf();
         self.job = Some(std::thread::spawn(move || {
-            load(&root, &board).map_err(|e| e.to_string())
+            load(&root, &board, reload_conflicts, probe).map_err(|e| e.to_string())
         }));
     }
 
@@ -134,7 +170,32 @@ impl SyncBoard {
     }
 }
 
-fn load(root: &Path, board: &Path) -> crate::core::error::Result<Snapshot> {
+fn journal_stamp(root: &Path) -> JournalStamp {
+    ["sync/meta/state.json", "sync/meta/conflicts.jsonl"].map(|file| {
+        let meta = std::fs::metadata(root.join(file)).ok()?;
+        Some((meta.len(), meta.modified().ok()?))
+    })
+}
+
+fn load(
+    root: &Path,
+    board: &Path,
+    reload_conflicts: bool,
+    probe: bool,
+) -> crate::core::error::Result<Snapshot> {
+    Ok(Snapshot {
+        board: board.into(),
+        peers: probe.then(|| settings::board_peers(root)).transpose()?,
+        conflicts: reload_conflicts
+            .then(|| load_conflicts(root, board))
+            .transpose()?,
+    })
+}
+
+fn load_conflicts(
+    root: &Path,
+    board: &Path,
+) -> crate::core::error::Result<(Vec<Conflict>, Vec<String>)> {
     let journal = Journal::open(root)?;
     let state = journal.state()?;
     let alias = board.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -164,12 +225,7 @@ fn load(root: &Path, board: &Path) -> crate::core::error::Result<Snapshot> {
             conflicts.push(conflict);
         }
     }
-    Ok(Snapshot {
-        board: board.into(),
-        peers: settings::board_peers(root)?,
-        conflicts,
-        tasks,
-    })
+    Ok((conflicts, tasks))
 }
 
 pub(crate) fn render_conflicts(frame: &mut Frame<'_>, app: &mut App, task: &str, area: Rect) {
