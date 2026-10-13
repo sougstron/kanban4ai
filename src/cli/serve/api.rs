@@ -51,6 +51,10 @@ fn failure(e: KanbanError) -> Response {
             "RUNNER_REPO_MISSING",
             "RUNNER_BACKEND_MISSING",
             "RUN_LAUNCH_UNCERTAIN",
+            "RUN_ALREADY_RUNNING",
+            "RUN_DUPLICATE",
+            "RUN_STOP_UNSUPPORTED",
+            "WIP_SOURCE_UNAVAILABLE",
             "NODE_UNREACHABLE",
             "NODE_POWERED_OFF",
             "NODE_OUT_OF_LAN",
@@ -627,6 +631,8 @@ struct Action {
     queue: bool,
     agent: bool,
     on_unavailable: OnUnavailable,
+    generation: Option<u64>,
+    last_published: bool,
 }
 async fn action(
     State(root): State<PathBuf>,
@@ -639,6 +645,9 @@ async fn action(
     };
     if let Err(e) = valid_task(&task) {
         return failure(e);
+    }
+    if action == "continue" {
+        return continue_task(root, id, task, request).await;
     }
     // Explicit launches preserve unavailable-runner choices; auto launches use
     // the shared Operations dispatcher and its durable relay intent.
@@ -791,6 +800,17 @@ async fn target(
     Ok((node != journal.node.name).then_some(node))
 }
 
+fn publish_launch_code(root: &Path, id: &str, task: &str, remote: &str) -> Result<()> {
+    let project = project(root, id)?;
+    let task = found(Storage::new(project.data_root).load_task(task)?)?;
+    if task.continue_from.is_none() {
+        crate::core::code::publish_live(root, id, remote)?;
+    }
+    // Continuations already published their exact WIP; never reseed them from
+    // this frontend's potentially divergent human working directory.
+    Ok(())
+}
+
 pub(super) async fn runner_action(
     root: &Path,
     id: &str,
@@ -834,14 +854,14 @@ pub(super) async fn runner_action(
     {
         // Publish code before the replicated intent: a relay-only runner must
         // never consume a request for a snapshot which has not been published.
-        let (code_root, code_id) = (root.to_path_buf(), id.to_owned());
+        let (code_root, code_id, code_task) = (root.to_path_buf(), id.to_owned(), task.to_owned());
         blocking(move || {
             let remote = crate::core::code::status(&code_root, &code_id)?
                 .remote
                 .ok_or_else(|| {
                     invalid("SYNC_NO_REMOTE: offline runner queue needs a git remote")
                 })?;
-            crate::core::code::publish_live(&code_root, &code_id, &remote)?;
+            publish_launch_code(&code_root, &code_id, &code_task, &remote)?;
             Ok(())
         })
         .await?;
@@ -1088,6 +1108,14 @@ async fn proxy(
             }
         }
         if action == "launch" {
+            if project(root, id)
+                .ok()
+                .and_then(|p| Storage::new(p.data_root).load_task(task).ok().flatten())
+                .is_some_and(|task| task.continue_from.is_some())
+                && let Err(e) = super::sync::catch_up(root, peer).await
+            {
+                return failure(e);
+            }
             // Preserve launch exclusion before touching the runner's repository.
             // The runner still enforces it at mutation time (this is not a lock).
             let preflight = match http
@@ -1122,7 +1150,14 @@ async fn proxy(
                     Ok(runs) => runs,
                     Err(e) => return failure(e),
                 };
-            if runs.values().any(|run| run.active()) {
+            let continuing = project(root, id)
+                .ok()
+                .and_then(|p| Storage::new(p.data_root).load_task(task).ok().flatten())
+                .is_some_and(|task| task.continue_from.is_some());
+            if runs
+                .values()
+                .any(|run| run.active() && (!continuing || run.node_id == peer.node.node_id))
+            {
                 return error(
                     StatusCode::CONFLICT,
                     "RUN_ALREADY_RUNNING",
@@ -1147,14 +1182,15 @@ async fn proxy(
             if let Err(e) = super::sync::catch_up(root, peer).await {
                 return failure(e);
             }
-            let (code_root, code_id) = (root.to_path_buf(), id.to_owned());
+            let (code_root, code_id, code_task) =
+                (root.to_path_buf(), id.to_owned(), task.to_owned());
             let transfer = match blocking(move || {
                 let remote = crate::core::code::status(&code_root, &code_id)?.remote;
                 if role == NodeRole::Mobile && remote.is_none() {
                     return Err(invalid("SYNC_NO_REMOTE"));
                 }
                 if let Some(remote) = remote {
-                    crate::core::code::publish_live(&code_root, &code_id, &remote)?;
+                    publish_launch_code(&code_root, &code_id, &code_task, &remote)?;
                     Ok((None, Some(remote)))
                 } else {
                     let (bundle, _) = crate::core::code::export(&code_root, &code_id, &[])?;
@@ -1219,7 +1255,11 @@ async fn proxy(
             .post(url)
             .bearer_auth(&secret.token)
             .json(&Action {
-                runner: Some(crate::core::config::Runner::Node(node.to_owned())),
+                runner: if action == "continue" {
+                    request.runner.clone()
+                } else {
+                    Some(crate::core::config::Runner::Node(node.to_owned()))
+                },
                 queue: action == "launch",
                 status: request.status.clone(),
                 message: request.message.clone(),
@@ -1227,6 +1267,8 @@ async fn proxy(
                 variants: request.variants.clone(),
                 agent: request.agent,
                 on_unavailable: request.on_unavailable,
+                generation: request.generation,
+                last_published: request.last_published,
             })
             .send()
             .await
@@ -1441,6 +1483,205 @@ pub(crate) fn launch_on_board(
             serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))?,
         ))
     })
+}
+
+async fn continue_task(root: PathBuf, id: String, task_id: String, request: Action) -> Response {
+    let prepared = (|| -> Result<(String, u64)> {
+        if request.agent {
+            return Err(invalid("Only the user can continue on another node"));
+        }
+        let generation = request
+            .generation
+            .ok_or_else(|| invalid("generation is required"))?;
+        let runner = request
+            .runner
+            .as_ref()
+            .ok_or_else(|| invalid("runner is required"))?;
+        let config = discovery::config(&root)?;
+        let local = Journal::open(&root)?.node;
+        let name = runner.as_str();
+        if name != local.name && !config.peers.iter().any(|p| p.node.name == name) {
+            return Err(invalid("NODE_UNREACHABLE: target must name a paired node"));
+        }
+        let runs = Journal::open(&root)?.runs(&id, &task_id)?;
+        let active: Vec<_> = runs.values().filter(|run| run.active()).collect();
+        if active.len() != 1 {
+            return Err(invalid(
+                "RUN_DUPLICATE: continuation requires one active source run",
+            ));
+        }
+        let source = active[0];
+        if source.generation != generation || source.name == name {
+            return Err(invalid(
+                "RUN_ALREADY_RUNNING: source generation changed or target is the source",
+            ));
+        }
+        Ok((source.name.clone(), generation))
+    })();
+    let (source, generation) = match prepared {
+        Ok(value) => value,
+        Err(e) => return failure(e),
+    };
+    let local = match Journal::open(&root) {
+        Ok(j) => j.node.name,
+        Err(e) => return failure(e),
+    };
+    if source != local {
+        let config = match discovery::config(&root) {
+            Ok(c) => c,
+            Err(e) => return failure(e),
+        };
+        let Some(peer) = config.peers.iter().find(|p| p.node.name == source) else {
+            return failure(invalid("NODE_UNREACHABLE: source is not paired"));
+        };
+        match discovery::runner_online(&root, peer).await {
+            Ok(true) => return proxy(&root, &source, &id, &task_id, "continue", &request).await,
+            Err(e) => return failure(e),
+            Ok(false) => {}
+        }
+        if !request.last_published {
+            return failure(invalid(
+                "WIP_SOURCE_UNAVAILABLE: исходный runner недоступен; доступен только последний опубликованный WIP. Неопубликованные изменения не перенесутся; старая сессия не будет остановлена.",
+            ));
+        }
+        let (r, i, t) = (root.clone(), id.clone(), task_id.clone());
+        let source_id = peer.node.node_id.clone();
+        let runner = request.runner.expect("validated target");
+        let adopted = blocking(move || {
+            let project = crate::core::code::prepare(&r, &i)?;
+            let storage = Storage::new(&project.data_root);
+            let _guard = storage.lock()?;
+            let mut task = found(storage.load_task(&t)?)?;
+            let repo = crate::core::vcs::detect(&project.work_path).ok_or_else(|| invalid("RUNNER_REPO_MISSING"))?;
+            let reference = format!("refs/kanban/wip-runs/{t}/{generation}/{source_id}");
+            let remote = crate::core::code::status(&r, &i)?.remote.ok_or_else(|| invalid("SYNC_NO_REMOTE"))?;
+            repo.fetch_run(&remote, &reference)?;
+            let tip = repo.read_ref(&reference)?.ok_or_else(|| invalid("No published WIP for this source generation"))?;
+            task.continue_from = Some(tip.as_str().into());
+            task.runner = Some(runner);
+            task.runner_request = None;
+            task.run_phase = None;
+            task.reset_auto_restart();
+            task.launch_at = None;
+            task.updated_at = crate::core::timefmt::now();
+            storage.save_task(&task)?;
+            crate::core::thread::ThreadManager::new(&project.data_root)?.post_board_note(&t,
+                "Продолжение с последнего опубликованного WIP: исходный runner недоступен, неопубликованные изменения не перенесены; старая сессия не остановлена.")?;
+            Ok(())
+        }).await;
+        if let Err(e) = adopted {
+            return failure(e);
+        }
+        return launch_continuation(root, id, task_id).await;
+    }
+    let (release_root, release_id, release_task) = (root.clone(), id.clone(), task_id.clone());
+    let runner = request.runner.expect("validated target");
+    let release = blocking(move || {
+        let project = project(&release_root, &release_id)?;
+        let storage = Storage::new(&project.data_root);
+        let _guard = storage.lock()?;
+        let runs = Journal::open(&release_root)?.runs(&release_id, &release_task)?;
+        let node = Journal::open(&release_root)?.node;
+        let run = runs.get(&node.node_id).ok_or_else(|| invalid("local run missing"))?;
+        if !run.active() || run.generation != generation {
+            return Err(invalid("RUN_ALREADY_RUNNING: source generation changed"));
+        }
+        let mut task = found(storage.load_task(&release_task)?)?;
+        let session = task.session.clone().ok_or_else(|| invalid("source session missing"))?;
+        // A checkpoint is published before closing; publication failure leaves the source running.
+        crate::core::wip::checkpoint(&project, &task)?;
+        crate::agent::stop_for_handoff(&project.data_root, &session, || {
+            crate::core::session::SessionManager::new(&project.data_root).close_session(&session)
+        })?;
+        // Capture edits made between the periodic checkpoint and actual stop.
+        let tip = crate::core::wip::checkpoint(&project, &task)?;
+        crate::core::wip::retire(&project, &mut task)?;
+        task.continue_from = Some(tip);
+        task.runner = Some(runner);
+        task.runner_request = None;
+        task.run_phase = None;
+        task.reset_auto_restart();
+        task.launch_at = None;
+        task.updated_at = crate::core::timefmt::now();
+        storage.save_task(&task)?;
+        crate::core::thread::ThreadManager::new(&project.data_root)?.post_board_note(
+            &release_task, "Продолжение на другом узле: опубликован WIP; запускается новая сессия с контекстом треда. Живая сессия агента не переносится.")?;
+        Ok(())
+    }).await;
+    if let Err(e) = release {
+        return failure(e);
+    }
+    launch_continuation(root, id, task_id).await
+}
+
+async fn launch_continuation(root: PathBuf, id: String, task: String) -> Response {
+    respond(
+        blocking(move || {
+            let project = project(&root, &id)?;
+            let session = match crate::cli::serve::runner_action(&project.data_root, &task, true)? {
+                Some(session) => session,
+                None => Operations::for_project(&project).start_task(&task)?,
+            };
+            Ok(json!({"session": session, "queued": session.is_none()}))
+        })
+        .await,
+    )
+}
+
+pub(crate) fn continue_on_board(
+    board: &Path,
+    task: &str,
+    node: &str,
+    last_published: bool,
+) -> Result<Value> {
+    let root = crate::core::sync::store_for_board(board)
+        .ok_or_else(|| invalid("not a synchronized board"))?;
+    let id = board
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| invalid("invalid board"))?;
+    let runs = Journal::open(root)?.runs(id, task)?;
+    let generation = runs
+        .values()
+        .filter(|r| r.active())
+        .map(|r| r.generation)
+        .max()
+        .ok_or_else(|| invalid("No active run to continue"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let response = continue_task(
+            root.to_path_buf(),
+            id.into(),
+            task.into(),
+            Action {
+                runner: Some(Runner::Node(node.into())),
+                generation: Some(generation),
+                last_published,
+                ..Default::default()
+            },
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|e| invalid(e.to_string()))?;
+        serde_json::from_slice(&bytes).map_err(|e| invalid(e.to_string()))
+    })
+}
+
+pub(crate) fn continuation_nodes(board: &Path) -> Result<Vec<String>> {
+    let root = crate::core::sync::store_for_board(board)
+        .ok_or_else(|| invalid("not a synchronized board"))?;
+    let local = Journal::open(root)?.node.name;
+    let mut nodes = vec![local];
+    nodes.extend(
+        discovery::config(root)?
+            .peers
+            .into_iter()
+            .map(|p| p.node.name),
+    );
+    Ok(nodes)
 }
 
 pub(crate) fn remote_runner_on_board(board: &Path, task: &str) -> Result<Option<NodeRole>> {

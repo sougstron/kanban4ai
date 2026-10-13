@@ -520,6 +520,7 @@ impl Operations {
         copied.worktree = None;
         copied.branch = None;
         copied.base_commit = None;
+        copied.continue_from = None;
         copied.integration = IntegrationState::None;
         self.storage.save_task(&copied)?;
 
@@ -3847,6 +3848,9 @@ impl Operations {
         if crate::core::code::managed_clone(self.data_root(), self.work_path())? {
             iso.mode = IsolationMode::Required;
         }
+        if task.continue_from.is_some() {
+            iso.mode = IsolationMode::Required;
+        }
         if iso.mode == IsolationMode::Off {
             return Ok(task);
         }
@@ -3854,6 +3858,7 @@ impl Operations {
             .worktree
             .as_deref()
             .is_some_and(|rel| self.storage.worktrees_dir.join(rel).is_dir())
+            && (task.continue_from.is_none() || task.continue_from == task.base_commit)
         {
             return Ok(task);
         }
@@ -3899,8 +3904,16 @@ impl Operations {
         let base = self
             .isolation_base_commit(&repo, task, iso)
             .map_err(|e| e.to_string())?;
-        let branch = format!("{}{}", iso.branch_prefix, task.id);
-        let rel = task.id.clone();
+        let rel = if task.continue_from.is_some() {
+            format!(
+                "{}-continue-{}",
+                task.id,
+                chrono::Utc::now().format("%Y%m%d%H%M%S%9f")
+            )
+        } else {
+            task.id.clone()
+        };
+        let branch = format!("{}{}", iso.branch_prefix, rel);
         let path = self.storage.worktrees_dir.join(&rel);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -3957,6 +3970,24 @@ impl Operations {
         task: &Task,
         iso: &IsolationSettings,
     ) -> Result<vcs::Oid> {
+        if let Some(seed) = task.continue_from.as_deref() {
+            if !matches!(seed.len(), 40 | 64) || !seed.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(KanbanError::Invalid("Invalid WIP object id".into()));
+            }
+            let commit = format!("{seed}^{{commit}}");
+            if repo.read_ref(&commit)?.is_none() {
+                let root = crate::core::sync::store_for_board(self.data_root())
+                    .ok_or_else(|| KanbanError::Invalid("not a synchronized board".into()))?;
+                let remote =
+                    crate::core::code::status(root, self.project_id.as_deref().unwrap_or(""))?
+                        .remote
+                        .ok_or_else(|| KanbanError::Invalid("SYNC_NO_REMOTE".into()))?;
+                repo.fetch_run(&remote, &crate::core::wip::reference(&task.id))?;
+            }
+            return repo
+                .read_ref(&commit)?
+                .ok_or_else(|| KanbanError::Invalid("Published WIP object missing".into()));
+        }
         match iso.seed {
             IsolationSeed::Head => repo.head_oid(),
             IsolationSeed::Live => {

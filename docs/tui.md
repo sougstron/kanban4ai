@@ -153,6 +153,12 @@ the plain-letter hotkeys.
   returns to the originating screen. Finished runs remain readable.
   Remote stop confirmation and rerun enqueue journal requests; completion
   depends on sync delivery and the runner's daemon, not a local session.
+- `Ctrl+W` opens **Продолжить на узле** for the selected task: publishes WIP,
+  releases the source runner and creates a new session with thread context on
+  the chosen node. The dialog warns that a live session is not transferred.
+  An unavailable source requires a second confirmation to use its last
+  published WIP; unpublished edits and stopping the old session are not possible.
+  Normal TUI exit forces a final WIP publication (see `sync.md` §7.3).
 - `y`: Approve — move a Review task to Done
 - `c`: Add a context/suggestion message to the task thread
 - `u`: Recover crashed task (restore to To Do); on an archived task (Archive

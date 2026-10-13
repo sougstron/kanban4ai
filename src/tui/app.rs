@@ -1427,6 +1427,9 @@ impl App {
             (KeyCode::Char('r'), KeyModifiers::CONTROL) if action_screen => {
                 self.dispatch(UiAction::Rerun)?
             }
+            (KeyCode::Char('w'), KeyModifiers::CONTROL) if action_screen => {
+                self.open_continue_dialog()?
+            }
             (KeyCode::Char('/'), _) => self.dispatch(UiAction::Search)?,
             (KeyCode::Enter, _)
                 if self.screen == Screen::Detail
@@ -4584,6 +4587,72 @@ impl App {
         }
     }
 
+    fn open_continue_dialog(&mut self) -> Result<()> {
+        let Some(task) = self.current_task() else {
+            return Ok(());
+        };
+        let runs = crate::core::sync::remote_runs(self.ops.data_root(), &task.id)?;
+        let nodes = crate::cli::serve::continuation_nodes(self.ops.data_root())?;
+        let source = runs
+            .iter()
+            .find(|run| run.active())
+            .map(|run| run.name.as_str())
+            .or_else(|| nodes.first().map(String::as_str));
+        let options = nodes
+            .iter()
+            .filter(|name| Some(name.as_str()) != source)
+            .map(|name| SelectOption {
+                label: format!("Продолжить на {name}"),
+                value: Some(name.clone()),
+            })
+            .collect();
+        let mut modal = ModalState::new(Modal::ContinueTask {
+            task_id: task.id.clone(),
+        });
+        modal.set_status_options(options, None);
+        modal.capture_initial_values();
+        self.modal = Some(modal);
+        Ok(())
+    }
+
+    fn continue_on_runner(&mut self, task_id: String, node: String, last_published: bool) {
+        if self.launch_busy(&task_id) {
+            return;
+        }
+        self.status = format!("Перенос {task_id} → {node}…");
+        self.spawn_launch(Some(task_id.clone()), move |ops| {
+            let mut report = LaunchReport {
+                refresh: true,
+                redraw: true,
+                ..Default::default()
+            };
+            report.status = Some(
+                match crate::cli::serve::continue_on_board(
+                    ops.data_root(),
+                    &task_id,
+                    &node,
+                    last_published,
+                ) {
+                    Ok(value)
+                        if value["error"]["code"] == "WIP_SOURCE_UNAVAILABLE"
+                            && !last_published =>
+                    {
+                        report.modal = Some(Modal::ContinuePublishedConfirm { task_id, node });
+                        "Исходный runner недоступен".into()
+                    }
+                    Ok(value) if value.get("error").is_some() => format!(
+                        "{}: {}",
+                        value["error"]["code"].as_str().unwrap_or(""),
+                        value["error"]["message"].as_str().unwrap_or("")
+                    ),
+                    Ok(_) => format!("Продолжено {task_id} на {node}; новая сессия"),
+                    Err(e) => e.to_string(),
+                },
+            );
+            report
+        });
+    }
+
     fn open_delete_dialog(&mut self) {
         if let Some(task_id) = self.current_task_id() {
             self.modal = Some(ModalState::new(Modal::DeleteConfirm { task_id }));
@@ -6743,6 +6812,18 @@ impl App {
                 self.ops.move_task(&task_id, &target, false)?;
                 self.refresh_after_action()?;
                 self.status = format!("Moved {task_id} to {target}");
+            }
+            Modal::ContinueTask { task_id } => {
+                let node = modal.target_text();
+                if node.is_empty() {
+                    modal.error = Some("Нет целевого узла".into());
+                    self.modal = Some(modal);
+                    return Ok(());
+                }
+                self.continue_on_runner(task_id, node, false);
+            }
+            Modal::ContinuePublishedConfirm { task_id, node } => {
+                self.continue_on_runner(task_id, node, true);
             }
             Modal::DeleteConfirm { task_id } => {
                 self.ops.abandon_task(&task_id)?;

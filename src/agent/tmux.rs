@@ -187,14 +187,86 @@ fn post_launch_note(roots: Roots<'_>, plan: &LaunchPlan, body: &str) {
 fn spawn_background<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> Result<bool> {
     let roots = roots.into();
     let script = wrapper_script(roots, plan);
-    Command::new("bash")
+    let mut command = Command::new("bash");
+    command
         .args(["-c", &script])
         .current_dir(roots.work_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    if let Some(ticks) = process_start(child.id()) {
+        let record = format!("{} {ticks}", child.id());
+        if let Err(e) =
+            crate::core::storage::atomic_write_text(&plan.log_file.with_extension("pid"), &record)
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    }
     Ok(true)
+}
+
+fn process_start(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm may contain spaces or parentheses; field 22 follows the final ')'.
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// A handoff must stop the actual host before taking its final checkpoint.
+pub fn stop_for_handoff(
+    board: &Path,
+    session: &str,
+    before_stop: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::core::session::SessionManager::validate_session_id(session)?;
+    if session_exists(session) {
+        before_stop()?;
+        kill_session(session)?;
+        return Ok(());
+    }
+    let path = board.join(".kanban/logs").join(format!("{session}.pid"));
+    let record = std::fs::read_to_string(&path).map_err(|_| {
+        KanbanError::Invalid(
+            "RUN_STOP_UNSUPPORTED: cannot safely stop untracked background source; handoff refused"
+                .into(),
+        )
+    })?;
+    let mut fields = record.split_whitespace();
+    let pid: u32 = fields
+        .next()
+        .and_then(|s| s.parse().ok())
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| KanbanError::Invalid("Invalid background PID record".into()))?;
+    let ticks: u64 = fields
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| KanbanError::Invalid("Invalid background PID record".into()))?;
+    if process_start(pid) != Some(ticks) {
+        return Err(KanbanError::Invalid(
+            "RUN_STOP_UNSUPPORTED: source process identity is no longer known".into(),
+        ));
+    }
+    before_stop()?;
+    #[cfg(unix)]
+    {
+        // The group was created for this exact wrapper; start ticks exclude PID reuse.
+        if unsafe { libc::kill(-(pid as i32), libc::SIGKILL) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(())
 }
 
 fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String {

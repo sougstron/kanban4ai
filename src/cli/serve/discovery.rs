@@ -705,6 +705,18 @@ async fn hello(State(state): State<HttpState>, Extension(hash): Extension<String
 }
 pub(super) async fn notify(root: &Path, reason: Option<&str>) -> Result<()> {
     let config = config(root)?;
+    if reason.is_some() {
+        let checkpoint_root = root.to_path_buf();
+        let interval = config.run_heartbeat;
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            crate::core::wip::publish(&checkpoint_root, interval, true)
+        })
+        .await
+        .map_err(|e| invalid(e.to_string()))?
+        {
+            eprintln!("WIP before bye: {e}");
+        }
+    }
     if !network_available(root, &config)? {
         return Ok(());
     }

@@ -586,6 +586,40 @@ runs:
   Пир не начинает чужую задачу автоматически: предложение другого узла
   требует явного запуска. Новый локальный запуск очищает текущий код.
 
+### 7.3 Продолжить на другом узле (TASK-437)
+
+- `kanban continue TASK-N --node <имя>` и `Ctrl+W` на Board/Detail выбирают
+  конкретный сопряжённый узел. Диалог явно сообщает: живая сессия не переносится,
+  запускается новая сессия с контекстом треда.
+- Sync-воркер сохраняет dirty tracked и untracked файлы активного изолированного
+  worktree раз в `sync.run_heartbeat`; нормальный выход TUI/daemon/serve и
+  `serve --bye shutdown|sleep` принудительно сохраняют последний WIP.
+  Нужен git remote проекта. Коммиты машинно-авторские, не требуют настроенной
+  пользовательской Git identity; HEAD, пользовательский index и checkout не меняются.
+- Публикуются `refs/kanban/wip/TASK-N` и отдельный checkpoint источника
+  `refs/kanban/wip-runs/TASK-N/<gen>/<node UUID>`; оба namespace входят в
+  code bundle/fetch. Локальная отметка успешной публикации —
+  `.kanban/wip/TASK-N.published`, не реплицируется.
+- `POST /api/v1/projects/<p>/tasks/<t>/continue` принимает
+  `{runner: "<имя>", generation: <gen>, last_published: false}`.
+  Устаревшее поколение даёт `RUN_ALREADY_RUNNING`, несколько активных
+  источников — `RUN_DUPLICATE`. Онлайн-источник публикует WIP, закрывает session,
+  останавливает tmux либо проверенную по PID/start-time background process group,
+  затем публикует окончательный WIP и отпускает runner.
+  Непроверяемый legacy background-процесс даёт `RUN_STOP_UNSUPPORTED`:
+  handoff не запускает второй агент вместо безопасной остановки первого.
+- Реплицируемый `continue_from` хранит SHA checkpoint, `runner` — новое
+  закрепление. Цель создаёт отдельные ветку/worktree от checkpoint; старый
+  checkout сохранён, каноническая ветка источника переименована в retained-ветку.
+  Поколение растёт. Outbound-only mobile забирает durable launch-intent
+  через sync и запускает его через daemon/TUI даже при `queue_enabled: false`.
+  Двойные результаты после разделения сети сохраняются для Review (§14.3).
+- Недоступный источник без подтверждения даёт `WIP_SOURCE_UNAVAILABLE`.
+  `--last-published` либо отдельное подтверждение TUI разрешает использовать
+  последний checkpoint именно исходного поколения/узла. Предупреждение:
+  неопубликованные изменения не перенесутся, недоступная старая сессия не
+  остановлена; её результат не выбрасывается при последующем слиянии.
+
 
 ## 8. Код: git между узлами
 
