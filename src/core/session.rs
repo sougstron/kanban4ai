@@ -462,7 +462,15 @@ impl SessionManager {
 }
 
 /// Approximate token count parsed from the agent's `.kanban/logs/<session>.log`.
+///
+/// Called on every TUI tick for a live agent whose transcript reports no
+/// usage, and agent logs grow without bound, so the scan is incremental: each
+/// call reads only the lines appended since the last one (see [`LogTokenScan`]).
 pub fn estimate_session_tokens(project_path: &Path, session_id: &str) -> Option<i64> {
+    use std::collections::HashMap;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::sync::Mutex;
+
     if SessionManager::validate_session_id(session_id).is_err() {
         return None;
     }
@@ -470,32 +478,91 @@ pub fn estimate_session_tokens(project_path: &Path, session_id: &str) -> Option<
         .join(".kanban")
         .join("logs")
         .join(format!("{session_id}.log"));
-    let text = fs::read_to_string(&log_file).ok()?;
+    let mut file = fs::File::open(&log_file).ok()?;
+    let len = file.metadata().ok()?.len();
 
-    // Called on every TUI tick for a live agent whose transcript reports no
-    // usage, so the patterns are compiled once per process.
-    static PATTERNS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
-        [
-            r"(?i)(?:total\s+)?tokens(?:\s+used)?\s*[:=]\s*([\d,]+)",
-            r"(?i)([\d,]+)\s+(?:total\s+)?tokens\b",
-            r"(?i)input\s+tokens\s*[:=]\s*([\d,]+)",
-            r"(?i)output\s+tokens\s*[:=]\s*([\d,]+)",
-        ]
-        .map(|pattern| Regex::new(pattern).expect("valid token pattern"))
-    });
-    let [total, trailing, input, output] = &*PATTERNS;
-    for pattern in [total, trailing] {
-        if let Some(value) = last_capture(&text, pattern) {
-            return parse_int(&value);
+    static SCANS: LazyLock<Mutex<HashMap<PathBuf, LogTokenScan>>> = LazyLock::new(Default::default);
+    let mut scans = SCANS.lock().unwrap_or_else(|poison| poison.into_inner());
+    scans.retain(|path, scan| path == &log_file || scan.used.elapsed() < LOG_SCAN_IDLE);
+    let scan = scans.entry(log_file).or_default();
+    scan.used = std::time::Instant::now();
+    if len < scan.offset {
+        // Truncated or replaced: start over.
+        *scan = LogTokenScan::default();
+    }
+    let mut fresh = Vec::new();
+    file.seek(SeekFrom::Start(scan.offset)).ok()?;
+    file.read_to_end(&mut fresh).ok()?;
+    // Whole lines only, so a number still being written is not cut short; the
+    // unterminated tail is folded into this answer alone.
+    let complete = fresh
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    scan.feed(&String::from_utf8_lossy(&fresh[..complete]));
+    scan.offset += complete as u64;
+    let mut latest = scan.clone();
+    latest.feed(&String::from_utf8_lossy(&fresh[complete..]));
+    latest.estimate()
+}
+
+/// Entries unread this long are dropped from the [`estimate_session_tokens`] memo.
+const LOG_SCAN_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How far one log was scanned and the last capture of each token pattern in
+/// it — all a whole-file "last match" scan needs to answer again.
+#[derive(Clone)]
+struct LogTokenScan {
+    offset: u64,
+    /// Last capture of `[total, trailing, input, output]`.
+    latest: [Option<String>; 4],
+    used: std::time::Instant,
+}
+
+impl Default for LogTokenScan {
+    fn default() -> Self {
+        Self {
+            offset: 0,
+            latest: Default::default(),
+            used: std::time::Instant::now(),
+        }
+    }
+}
+
+impl LogTokenScan {
+    fn feed(&mut self, text: &str) {
+        static PATTERNS: LazyLock<[Regex; 4]> = LazyLock::new(|| {
+            [
+                r"(?i)(?:total\s+)?tokens(?:\s+used)?\s*[:=]\s*([\d,]+)",
+                r"(?i)([\d,]+)\s+(?:total\s+)?tokens\b",
+                r"(?i)input\s+tokens\s*[:=]\s*([\d,]+)",
+                r"(?i)output\s+tokens\s*[:=]\s*([\d,]+)",
+            ]
+            .map(|pattern| Regex::new(pattern).expect("valid token pattern"))
+        });
+        if text.is_empty() {
+            return;
+        }
+        for (latest, pattern) in self.latest.iter_mut().zip(PATTERNS.iter()) {
+            if let Some(value) = last_capture(text, pattern) {
+                *latest = Some(value);
+            }
         }
     }
 
-    let input = last_capture(&text, input).and_then(|v| parse_int(&v));
-    let output = last_capture(&text, output).and_then(|v| parse_int(&v));
-    if input.is_some() || output.is_some() {
-        return Some(input.unwrap_or(0) + output.unwrap_or(0));
+    /// A total wins over the input/output pair, as in a whole-file scan.
+    fn estimate(&self) -> Option<i64> {
+        let [total, trailing, input, output] = &self.latest;
+        if let Some(value) = total.as_ref().or(trailing.as_ref()) {
+            return parse_int(value);
+        }
+        let input = input.as_deref().and_then(parse_int);
+        let output = output.as_deref().and_then(parse_int);
+        if input.is_some() || output.is_some() {
+            return Some(input.unwrap_or(0) + output.unwrap_or(0));
+        }
+        None
     }
-    None
 }
 
 fn last_capture(text: &str, re: &Regex) -> Option<String> {
@@ -507,4 +574,38 @@ fn last_capture(text: &str, re: &Regex) -> Option<String> {
 
 fn parse_int(value: &str) -> Option<i64> {
     value.replace(',', "").parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::estimate_session_tokens;
+
+    #[test]
+    fn token_estimate_follows_appends_and_rewrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join(".kanban/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("ses-scan.log");
+        std::fs::write(&path, "tokens used: 1,000\n").unwrap();
+        assert_eq!(estimate_session_tokens(dir.path(), "ses-scan"), Some(1000));
+
+        // Appended lines are scanned on top of what was already seen, and an
+        // unterminated tail counts until its line completes.
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(file, "tokens used: 1,500").unwrap();
+        assert_eq!(estimate_session_tokens(dir.path(), "ses-scan"), Some(1500));
+        write!(file, "tokens used: 7").unwrap();
+        assert_eq!(estimate_session_tokens(dir.path(), "ses-scan"), Some(7));
+        writeln!(file, "0").unwrap();
+        assert_eq!(estimate_session_tokens(dir.path(), "ses-scan"), Some(70));
+
+        // A truncated log is read again from the start.
+        std::fs::write(&path, "output tokens: 3\n").unwrap();
+        assert_eq!(estimate_session_tokens(dir.path(), "ses-scan"), Some(3));
+    }
 }
