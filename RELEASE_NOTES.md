@@ -1,3 +1,17 @@
+# kanban4ai 0.8.2
+
+- **Responsive project switching.** Opening a project or returning to the
+  projects list transfers in-flight launch and sync workers instead of waiting
+  for them. Background work still finishes safely when the TUI exits.
+- **Faster board loading.** Suggestion badge counts load concurrently with
+  session and sync information, reuse unchanged thread counts, and split cold
+  thread reads across CPU cores. Project-open timestamps are saved off the UI
+  thread.
+- **Cheaper runner-failure sweeps.** Each sweep reads the replicated run state
+  once instead of parsing the sync journal separately for every task.
+- **Complete release deployment.** The maintainer release workflow now checks
+  and updates both the laptop's serve binary and the kanban-server sync node.
+
 # kanban4ai 0.8.1
 
 - **Continue work on another node.** `kanban continue TASK-N --node <name>`
