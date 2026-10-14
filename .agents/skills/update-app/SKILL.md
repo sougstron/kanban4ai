@@ -1,7 +1,7 @@
 ---
 name: update-app
-description: "Execute the maintainer-only, end-to-end kanban4ai release requested as ‘Update app to X.Y.Z’: prepare notes and version, run every gate, publish the canonical Git commit/tag and GitHub release, update both stable AUR packages, update this laptop, verify every target, and only then clear release inputs. Use whenever the user asks to bump, release, publish, or deploy kanban4ai to a specific version. A commit/push/deploy request without an exact target version does not authorize this workflow."
-compatibility: "Linux/Arch maintainer workstation with git, Rust, gh, curl, makepkg/updpkgsums, SSH access to the kanban4ai AUR repositories, and GitHub release permissions."
+description: "Execute the maintainer-only, end-to-end kanban4ai release requested as ‘Update app to X.Y.Z’: prepare notes and version, run every gate, publish the canonical Git commit/tag and GitHub release, update both stable AUR packages, update this laptop and the kanban-server sync node, verify every target, and only then clear release inputs. Use whenever the user asks to bump, release, publish, or deploy kanban4ai to a specific version. A commit/push/deploy request without an exact target version does not authorize this workflow."
+compatibility: "Linux/Arch maintainer workstation with git, Rust, gh, curl, makepkg/updpkgsums, SSH access to the kanban4ai AUR repositories and to the Proxmox host root@192.168.0.128, and GitHub release permissions."
 ---
 
 # Update kanban4ai to X.Y.Z
@@ -17,9 +17,11 @@ from the first incomplete boundary.
   version. Ask when it is absent or ambiguous.
 - A request to commit, push, or deploy without that exact version is not release
   authorization.
-- Treat the release as one transaction with four required outcomes: canonical
-  Git/GitHub, `kanban4ai` AUR, `kanban4ai-bin` AUR, and the effective
-  installation on this laptop. Do not report success after only some outcomes.
+- Treat the release as one transaction with five required outcomes: canonical
+  Git/GitHub, `kanban4ai` AUR, `kanban4ai-bin` AUR, the effective
+  installation on this laptop, and the kanban-server sync node (CT 104). Do
+  not report success after only some outcomes: peers on mismatched versions
+  can stall sync (a newer journal record field rejected by an older server).
 - Keep `kanban4ai-git` unchanged: it follows the canonical branch.
 - Obey the active harness/session safety rules, including backup-before-edit
   and kanban callback rules. Never bypass a higher-priority restriction.
@@ -86,7 +88,21 @@ from the first incomplete boundary.
    command -v yay || command -v paru || true
    ```
 
-   Note shadowed extra copies, but do not remove them.
+   Note shadowed extra copies, but do not remove them. Also record the binary
+   the laptop's `kanban4ai-serve` user unit actually runs; it may be a separate
+   copy (e.g. `~/.local/share/kanban4ai/runtime/bin/kanban4ai`):
+
+   ```sh
+   systemctl --user cat kanban4ai-serve.service | grep '^ExecStart='
+   systemctl --user is-active kanban4ai-serve.service
+   ```
+
+   Inventory the server node too (see phase 7 for its layout):
+
+   ```sh
+   ssh -o BatchMode=yes -o ConnectTimeout=8 root@192.168.0.128 \
+     'pct exec 104 -- /usr/local/bin/kanban4ai --version'
+   ```
 
 5. Before any externally visible release mutation, verify tools, credentials,
    and all destinations:
@@ -100,10 +116,13 @@ from the first incomplete boundary.
    git ls-remote origin HEAD >/dev/null
    git ls-remote ssh://aur@aur.archlinux.org/kanban4ai.git HEAD >/dev/null
    git ls-remote ssh://aur@aur.archlinux.org/kanban4ai-bin.git HEAD >/dev/null
+   ssh -o BatchMode=yes -o ConnectTimeout=8 root@192.168.0.128 \
+     'pct status 104' | grep -q 'status: running'
    ```
 
    If GitHub or either AUR repository is unavailable or in maintenance, stop
-   before publishing anything.
+   before publishing anything. If the server CT is unreachable, ask before
+   publishing: a release that cannot reach the server leaves sync split.
 
 6. Build a state table for retry safety: local/remote `v$VERSION`, GitHub
    release and assets, tracked package versions, both AUR remote versions, and
@@ -270,7 +289,54 @@ kb --version
 
 Running sessions may continue on the old inode; verify through a fresh process.
 
-## 7. Close only after end-to-end verification
+If the laptop serve unit's `ExecStart` binary (recorded in preflight) is not
+the effective binary, refresh that copy atomically from the updated effective
+binary (copy to a sibling temp file, then `mv`), keeping its `kanban`/`kb`
+symlinks. Then restart the unit and verify the running process:
+
+```sh
+systemctl --user restart kanban4ai-serve.service
+systemctl --user is-active kanban4ai-serve.service
+"$(systemctl --user show -p ExecStart --value kanban4ai-serve.service | sed -n 's/.*path=\([^ ;]*\).*/\1/p')" --version
+```
+
+## 7. Update the kanban-server sync node
+
+The replicated-store server is Debian LXC CT 104 (`kanban-server`,
+192.168.0.13, x86_64) on Proxmox `root@192.168.0.128`; reach it only through
+`ssh ... root@192.168.0.128 'pct exec 104 -- ...'`. It runs an unmanaged
+`/usr/local/bin/kanban4ai` (root-owned, with `kanban`/`kb` symlinks) under the
+`kanban` user's systemd unit `kanban4ai-serve.service`; its store is
+`/home/kanban/.local/share/kanban4ai`. Never touch `sync/tokens.yaml`,
+`sync/peers.yaml`, or the journal.
+
+1. Install the x86_64 asset already verified in phase 3; do not rebuild or
+   fetch an unverified copy. Push it into the CT and replace atomically:
+
+   ```sh
+   SSH='ssh -o BatchMode=yes -o ConnectTimeout=8 root@192.168.0.128'
+   scp -o BatchMode=yes "$ASSET_DIR/kanban4ai" root@192.168.0.128:/tmp/kanban4ai-$VERSION
+   $SSH "pct push 104 /tmp/kanban4ai-$VERSION /usr/local/bin/.kanban4ai.new --perms 0755 \
+     && rm -f /tmp/kanban4ai-$VERSION \
+     && pct exec 104 -- sh -c '/usr/local/bin/.kanban4ai.new --version | grep -qF $VERSION \
+       && mv -f /usr/local/bin/.kanban4ai.new /usr/local/bin/kanban4ai'"
+   ```
+
+   `$ASSET_DIR` is the directory where the x86_64 archive was extracted.
+2. Restart and verify the server unit and sync:
+
+   ```sh
+   $SSH 'pct exec 104 -- systemctl --user -M kanban@ restart kanban4ai-serve.service'
+   $SSH 'pct exec 104 -- systemctl --user -M kanban@ is-active kanban4ai-serve.service'
+   $SSH 'pct exec 104 -- /usr/local/bin/kanban4ai --version'
+   $SSH "pct exec 104 -- su - kanban -c 'kanban4ai serve --sync'"
+   kanban4ai serve --probe
+   ```
+
+   `serve --sync` must finish without decode errors, and the laptop probe must
+   report the server ONLINE.
+
+## 8. Close only after end-to-end verification
 
 Verify and report:
 
@@ -279,6 +345,9 @@ Verify and report:
 - successful GitHub release URL and all four verified assets;
 - `kanban4ai` and `kanban4ai-bin` AUR commit IDs and package versions;
 - effective laptop path, ownership mode, and `VERSION` output;
+- laptop serve unit active on a binary reporting `VERSION`;
+- CT 104 `/usr/local/bin/kanban4ai` reports `VERSION`, its serve unit is
+  active, and `serve --sync` / `serve --probe` succeed;
 - required checks and post-packaging check passed.
 
 Only now revisit the release-input manifest from preflight. Delete only the
