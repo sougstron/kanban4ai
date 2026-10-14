@@ -3470,10 +3470,23 @@ impl Operations {
         task_id: &str,
         cached: Option<SuggestionCount>,
     ) -> Result<SuggestionCount> {
-        let tm = self.thread_manager()?;
+        Ok(Self::suggestion_count_in(
+            &self.thread_manager()?,
+            task_id,
+            cached,
+        ))
+    }
+
+    /// [`Self::suggestion_count`] against a given thread manager, so board
+    /// loads can count from several threads at once.
+    pub fn suggestion_count_in(
+        tm: &ThreadManager,
+        task_id: &str,
+        cached: Option<SuggestionCount>,
+    ) -> SuggestionCount {
         let stamp = tm.stamp(task_id);
         if let Some(cached) = cached.filter(|cached| cached.stamp == stamp) {
-            return Ok(cached);
+            return cached;
         }
         let count = match stamp {
             Some(_) => tm
@@ -3482,7 +3495,7 @@ impl Operations {
                 .unwrap_or(0),
             None => 0,
         };
-        Ok(SuggestionCount { stamp, count })
+        SuggestionCount { stamp, count }
     }
 
     /// Earliest open question on a task, for board-card previews. Read-only:

@@ -5482,6 +5482,53 @@ fn run_hotkey_launches_on_a_worker_without_blocking_the_ui() {
 }
 
 #[test]
+fn project_switch_hands_off_in_flight_launches_instead_of_waiting() {
+    let (_dir, mut app, _) = queue_run_app();
+    let launcher = GatedLauncher::default();
+    app.ops = Operations::with_launcher(app.ops.data_root(), Box::new(launcher.clone()));
+    let _release = OpenOnDrop(launcher.clone());
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    app.enable_background_launches(wake_tx.clone());
+    app.ops
+        .create_task(NewTask::titled("Slow start"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Char('r'))).expect("run");
+    assert!(launcher.spy.calls().is_empty(), "launch is still gated");
+
+    // Switching screens drops the old app while its launch is parked on the
+    // gate; joining it there would block this test until the watchdog fires.
+    let next_dir = tempfile::tempdir().expect("tempdir");
+    Storage::new(next_dir.path())
+        .init_board()
+        .expect("init board");
+    let mut next = App::new(next_dir.path()).expect("next app");
+    next.enable_background_launches(wake_tx);
+    let watchdog = launcher.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(10));
+        watchdog.open();
+    });
+    let started = Instant::now();
+    app.hand_off_background(&mut next);
+    drop(app);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "switch waited {:?} for a background launch",
+        started.elapsed()
+    );
+
+    // The next screen reaps the inherited worker once it finishes.
+    launcher.open();
+    wake_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("worker wakes the event loop");
+    next.poll_launches();
+    assert_eq!(launcher.spy.calls().len(), 1);
+}
+
+#[test]
 fn run_hotkey_leaves_task_queued_when_caps_are_full() {
     let (dir, mut app, spy) = queue_run_app();
     occupy_the_only_slot(dir.path(), &mut app);

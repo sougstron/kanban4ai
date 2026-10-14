@@ -2,7 +2,7 @@
 use crate::core::error::Result;
 use crate::core::project::ProjectStore;
 use crate::core::storage::Storage;
-use crate::core::sync::{Journal, NodeRole};
+use crate::core::sync::{Journal, NodeRole, task_runs};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 use std::path::Path;
@@ -66,11 +66,15 @@ pub fn observe(
         return Ok(());
     }
     let now = timefmt::now();
+    // One parse for the whole sweep: the journal state is megabytes of JSON
+    // read under the store-wide sync lock, and `record`/`clear` below only
+    // touch task and thread files, never the run fields read here.
+    let state = journal.state()?;
     for project in ProjectStore::at(root).list()? {
         let storage = Storage::new(&project.data_root);
         let _guard = storage.lock()?;
         for task in storage.list_unarchived_tasks()? {
-            let Some(run) = journal.runs(&project.id, &task.id)?.remove(node_id) else {
+            let Some(run) = task_runs(&state, &project.id, &task.id)?.remove(node_id) else {
                 continue;
             };
             let heartbeat = timefmt::parse(&run.heartbeat)

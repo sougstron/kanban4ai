@@ -603,6 +603,28 @@ fn task_started_after_queue_run(ops: &Operations, task_id: &str) -> bool {
         .is_some_and(|task| task.run_phase != Some(RunPhase::Queued) && task.session.is_some())
 }
 
+impl App {
+    /// Pass this screen's in-flight background work to `next` before this
+    /// app is dropped on a project switch. Joining here instead would freeze
+    /// the switch until a store pump finishes, which can take seconds; `next`
+    /// reaps the workers as they finish and still joins them on quit. The
+    /// pump state moves too, so `next` keeps skipping quiet boards instead of
+    /// pumping the whole store again from scratch.
+    pub fn hand_off_background(&mut self, next: &mut App) {
+        next.launches.append(&mut self.launches);
+        next.store_pump_state = Arc::clone(&self.store_pump_state);
+        next.last_store_pump = self.last_store_pump;
+        self.sync_board.hand_off(&mut next.sync_board);
+        // Warm per-project counts make the next projects list a few `stat`s.
+        if let Some(cache) = self.project_cache.take() {
+            next.project_cache = Some(cache);
+        }
+        // A project-list scan only reads; nothing is left half-done if it is
+        // abandoned, so it is detached rather than joined.
+        drop(self.project_scan.take());
+    }
+}
+
 impl Drop for App {
     /// Let in-flight launches finish so quitting never abandons a
     /// half-created worktree or an unrecorded tmux session.
@@ -987,7 +1009,17 @@ impl App {
         let mut app = Self::from_ops(Operations::for_project(&project))?;
         app.settings.project_name = project.name.clone();
         let store = ProjectStore::open()?;
-        let _ = store.touch_opened(&project.id);
+        // The open stamp only feeds the projects list's recency sort, but
+        // writing it takes the store lock and a synced write: off the UI
+        // thread, joined on quit like any other background job.
+        let touch = store.clone();
+        let id = project.id.clone();
+        app.launches.push(LaunchJob {
+            task_id: None,
+            handle: thread::spawn(move || {
+                let _ = touch.touch_opened(&id);
+            }),
+        });
         app.project = Some(project);
         app.store = Some(store);
         Ok(app)
@@ -7246,13 +7278,22 @@ impl BoardSnapshot {
         sort_tasks(&mut tasks, sort_by, order);
         sort_tasks(&mut archived, "updated", "desc");
         let task_refs: Vec<&Task> = tasks.iter().collect();
-        let sessions = SessionView::load(ops, &task_refs)?;
-        let extras = Self::load_extras(ops, &task_refs, &sessions.states)?;
-        let mut suggestions = HashMap::new();
-        for task in &tasks {
-            let cached = previous.and_then(|board| board.suggestions.get(&task.id).copied());
-            suggestions.insert(task.id.clone(), ops.suggestion_count(&task.id, cached)?);
-        }
+        // Every task's thread file is read for its suggestion badge; on a
+        // cold open that dominates, so it runs on worker threads while this
+        // one reads sessions and the sync journal.
+        let threads = ops.thread_manager()?;
+        let (sessions, suggestions) = thread::scope(|scope| {
+            let suggestions = scope.spawn(|| suggestion_counts(&threads, &tasks, previous));
+            let sessions = SessionView::load(ops, &task_refs).and_then(|sessions| {
+                let extras = Self::load_extras(ops, &task_refs, &sessions.states)?;
+                Ok((sessions, extras))
+            });
+            let suggestions = suggestions
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (sessions, suggestions)
+        });
+        let (sessions, extras) = sessions?;
         for task in tasks {
             grouped
                 .entry(task.status.as_str().to_string())
@@ -7344,6 +7385,38 @@ impl BoardSnapshot {
         }
         Ok(extras)
     }
+}
+
+/// Suggestion badge counts for `tasks`, reusing `previous` for unchanged
+/// thread files. A cold open parses every thread, so the tasks are split
+/// across cores; a reload is mostly `stat`s.
+fn suggestion_counts(
+    threads: &ThreadManager,
+    tasks: &[Task],
+    previous: Option<&BoardSnapshot>,
+) -> HashMap<String, SuggestionCount> {
+    const MIN_CHUNK: usize = 16;
+    let workers = thread::available_parallelism().map_or(1, |n| n.get());
+    let chunk = tasks.len().div_ceil(workers).max(MIN_CHUNK);
+    let count = |task: &Task| {
+        let cached = previous.and_then(|board| board.suggestions.get(&task.id).copied());
+        let count = Operations::suggestion_count_in(threads, &task.id, cached);
+        (task.id.clone(), count)
+    };
+    thread::scope(|scope| {
+        let workers: Vec<_> = tasks
+            .chunks(chunk)
+            .map(|chunk| scope.spawn(move || chunk.iter().map(count).collect::<Vec<_>>()))
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    })
 }
 
 /// Per-task session state, liveness deadlines and wait notes of a board.
