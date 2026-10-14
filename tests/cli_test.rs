@@ -1653,3 +1653,92 @@ fn integrate_reports_tasks_without_an_isolated_branch() {
         .success()
         .stderr(predicate::str::contains("not found"));
 }
+
+#[test]
+fn auto_mode_command_shows_and_changes_store_settings() {
+    let dir = board();
+    kanban(&dir)
+        .arg("auto-mode")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Auto mode: off"));
+    kanban(&dir)
+        .args([
+            "auto-mode",
+            "on",
+            "--questions",
+            "arbiter",
+            "--arbiter-backend",
+            "claude",
+            "--max-resolver-runs",
+            "2",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Auto mode: on"))
+        .stdout(predicate::str::contains("Questions: arbiter"))
+        .stdout(predicate::str::contains("backend=claude"))
+        .stdout(predicate::str::contains("per task: 2"));
+    let global = std::fs::read_to_string(dir.store().join("config.yaml")).unwrap();
+    assert!(global.contains("auto_mode:"), "{global}");
+    kanban(&dir)
+        .args(["auto-mode", "off"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Auto mode: off"))
+        .stdout(predicate::str::contains("Questions: arbiter"));
+}
+
+/// The arbiter runs the configured backend with the task context; the
+/// backend answers through `kanban answer`. A stub backend stands in for the
+/// model: it answers the first question id it finds in its prompt.
+#[cfg(unix)]
+#[test]
+fn arbiter_answers_open_questions_through_its_backend() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = board();
+    let stub = dir.work().join("arbiter-stub.sh");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nfor last; do :; done\nid=$(printf '%s\\n' \"$last\" | sed -n 's/^- \\(MSG-[^:]*\\):.*/\\1/p' | head -n1)\n\"$KANBAN_CMD\" answer \"$KANBAN_TASK_ID\" \"$id\" \"take b\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = dir.kanban().join("config.yaml");
+    let mut yaml = std::fs::read_to_string(&config).unwrap();
+    yaml.push_str(&format!(
+        "agents:\n  stub:\n    command: {}\n",
+        stub.display()
+    ));
+    std::fs::write(&config, yaml).unwrap();
+
+    kanban(&dir).args(["create", "Ask me"]).assert().success();
+    kanban(&dir)
+        .args(["ask", "TASK-001", "a or b?", "--agent"])
+        .assert()
+        .success();
+    kanban(&dir)
+        .args([
+            "auto-mode",
+            "on",
+            "--questions",
+            "arbiter",
+            "--arbiter-backend",
+            "stub",
+        ])
+        .assert()
+        .success();
+    kanban(&dir)
+        .args(["arbiter", "TASK-001"])
+        .assert()
+        .success();
+
+    let thread = std::fs::read_to_string(dir.kanban().join("threads/TASK-001.yaml")).unwrap();
+    assert!(thread.contains("answer: take b"), "{thread}");
+    assert!(!dir.kanban().join("arbiter/TASK-001.run").exists());
+    kanban(&dir)
+        .args(["questions", "TASK-001"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("a or b?").not());
+}

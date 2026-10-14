@@ -423,7 +423,7 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
 /// that reading), and it is by construction the *superseded* build. Handing
 /// agents that copy makes every callback run an outdated binary, which
 /// silently drops task fields it does not know.
-fn resolve_callback_binary(exe: PathBuf) -> Option<PathBuf> {
+pub(crate) fn resolve_callback_binary(exe: PathBuf) -> Option<PathBuf> {
     if let Some(stripped) = exe
         .to_str()
         .and_then(|path| path.strip_suffix(" (deleted)"))

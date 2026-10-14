@@ -174,7 +174,6 @@ mod tests {
                         remaining_percent: *remaining,
                         resets_at: *resets_at,
                         rolling: false,
-                        spent_usd: None,
                     })
                     .collect();
                 limits

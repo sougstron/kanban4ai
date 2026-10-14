@@ -161,6 +161,24 @@ The new chain mode groups only To Do cards; it does not change the dispatcher’
 In Progress newest-first order. Changing the board sort therefore changes the queue priority. Only
 queued tasks with no pending `restart_at` in the future are candidates.
 
+**Merge-conflict queue hold** (every board, auto mode or not). While any
+In Progress or Review task has `integration: conflict`, new work does not
+start: parallel runs would only multiply conflicts and resolver runs. New
+work is a queue entry stamped `queued_at` — `r` Run, `Q`, a review re-run, a
+chain or dependency hand-off, a planned launch, or `take --agent` (which
+queues instead of launching while the hold is on). Resumes of runs that
+already started (expired waits, crash restarts, answered questions, reviewer
+bounces) and the conflicted tasks themselves are never held, and running
+agents are never stopped. A held task gets `conflict_held: true`, the card
+badge `⏸ conflict hold`, and one thread note naming the conflicts. The
+first conflict latches the board into conflict mode (`.kanban/conflict_mode`,
+written by the conflicted landing or the dispatcher), which lasts until there
+are no conflicts **and** no live agent (each running task could still land
+into a new conflict) — even if the conflict was resolved before anything was
+queued; then
+the held tasks start first, in the order they entered the queue
+(`queued_at`, FIFO), ahead of the board order.
+
 **Caps.** For each candidate the dispatcher resolves the launch settings and
 the phase it would enter (`upcoming_run_plan`: `design` when the designer is
 enabled and no review bounce has happened yet, else `execute`), then asks

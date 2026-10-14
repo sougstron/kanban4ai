@@ -15,7 +15,7 @@ use chrono::NaiveDateTime;
 use crate::agent::{resolve_launch_settings, upcoming_run_plan};
 use crate::core::config::{BoardConfig, OrchestrationSettings};
 use crate::core::error::{KanbanError, Result};
-use crate::core::models::{Role, RunPhase, TaskStatus};
+use crate::core::models::{IntegrationState, Role, RunPhase, TaskStatus};
 use crate::core::operations::{Operations, PoolOutcome, safe_session_component, sort_tasks};
 use crate::core::session::{SessionManager, SessionState};
 use crate::core::stats;
@@ -291,11 +291,15 @@ impl Operations {
         }
         let _ = self.due_restarts()?;
         let _ = self.due_launches()?;
+        // Auto mode answers open questions and re-dispatches conflicted
+        // landings whether or not the queue itself is on.
+        let _ = self.auto_mode_sweep();
 
         let orch = self.config.get_orchestration()?;
         if !orch.queue_enabled || !self.auto_launch_enabled()? {
             return Ok(Vec::new());
         }
+        let hold = self.conflict_hold()?;
 
         let config = self.config.load()?;
         let mut slots = Slots::measure(self)?;
@@ -306,9 +310,27 @@ impl Operations {
         });
         let (by, order) = task_sort_args(&config);
         sort_tasks(&mut candidates, by, order);
+        // Tasks a merge-conflict hold parked go first, in the order they
+        // entered the queue; everything else keeps the board order.
+        let (mut released, rest): (Vec<_>, Vec<_>) =
+            candidates.into_iter().partition(|task| task.conflict_held);
+        released.sort_by(|a, b| {
+            (a.queued_at.unwrap_or(a.updated_at), &a.id)
+                .cmp(&(b.queued_at.unwrap_or(b.updated_at), &b.id))
+        });
+        let candidates = released.into_iter().chain(rest);
 
         let mut dispatched = Vec::new();
         for candidate in candidates {
+            if let Some(conflicts) = &hold
+                && candidate.queued_at.is_some()
+                && candidate.integration != IntegrationState::Conflict
+            {
+                if !candidate.conflict_held {
+                    self.mark_conflict_held(&candidate.id, conflicts)?;
+                }
+                continue;
+            }
             if !crate::core::sync::remote_runs(&self.storage.project_path, &candidate.id)?
                 .is_empty()
             {
@@ -427,6 +449,8 @@ impl Operations {
             }
             let new_session_id = self.fresh_session_id(&safe_session_component(&settings.backend));
             stats::record_exit(&self.storage.project_path, &task.id, stats::Phase::Queued);
+            task.queued_at = None;
+            task.conflict_held = false;
             task.session = Some(new_session_id.clone());
             task.updated_at = timefmt::now();
             session_mgr.link_named_session(&task.id, &new_session_id, &task.title)?;
@@ -447,6 +471,29 @@ impl Operations {
             }
         };
         Ok(Some(claimed_run))
+    }
+
+    /// Park one queued task behind the merge-conflict hold (see
+    /// [`Self::conflict_hold`]) and say why on its thread, once.
+    fn mark_conflict_held(&self, task_id: &str, conflicts: &[String]) -> Result<()> {
+        {
+            let _guard = self.storage.lock()?;
+            let Some(mut task) = self.storage.load_task(task_id)? else {
+                return Ok(());
+            };
+            if task.run_phase != Some(RunPhase::Queued) || task.conflict_held {
+                return Ok(());
+            }
+            task.conflict_held = true;
+            self.storage.save_task(&task)?;
+        }
+        let reason = if conflicts.is_empty() {
+            "running tasks to finish after a merge conflict".to_string()
+        } else {
+            format!("merge conflict resolution ({})", conflicts.join(", "))
+        };
+        self.post_queue_note(task_id, &format!("⏸ queue held — waiting for {reason}"));
+        Ok(())
     }
 
     /// Whether the dispatcher could actually start a queued task: the queue

@@ -329,6 +329,9 @@ fn pump_project(
         lines.push(format!("{ts} {} cleanup {task_id}", project.id));
     }
     if !orchestration.queue_enabled {
+        // Runner requests return from dispatch before its auto-mode sweep.
+        // Sweep here too so queue-disabled boards still get questions answered.
+        let _ = ops.auto_mode_sweep();
         let pending_here = ops.storage.get_all_tasks()?.iter().any(|task| {
             task.runner_request.is_some()
                 && crate::cli::serve::local_runner(&project.data_root, task.runner.as_ref())

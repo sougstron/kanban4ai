@@ -447,13 +447,15 @@ impl SyncTab {
 
     /// Collect a finished background job; called from the app tick.
     pub fn poll(&mut self, root: &Path, interval: Duration, active: bool) {
+        // Each status runs the tailscale CLI; the page does not need it per tick.
+        const NETWORK_STATUS_INTERVAL: Duration = Duration::from_secs(5);
         if active
             && self.view.is_some()
             && !self.busy()
             && self.request.is_none()
             && self
                 .last_network_poll
-                .is_none_or(|at| at.elapsed() >= interval)
+                .is_none_or(|at| at.elapsed() >= interval.max(NETWORK_STATUS_INTERVAL))
         {
             self.request = Some(Request::Network(NetworkAction::Status));
         }

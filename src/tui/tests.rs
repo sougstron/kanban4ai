@@ -184,7 +184,7 @@ fn chain_selector_height_clamps_and_description_grows_taller() {
 }
 
 /// The description follows its own text: soft wrap at the current width sets
-/// the height (wider window, fewer rows), edits grow it up to the 20-row cap,
+/// the height (wider window, fewer rows), edits grow it up to the 15-row cap,
 /// deleting shrinks it back to the 5-row minimum, and the caret survives the
 /// measurement.
 #[test]
@@ -236,8 +236,8 @@ fn task_description_height_follows_its_text() {
     let _ = render_at(&mut app, 120, 80);
     assert_eq!(
         description_height(&app),
-        20,
-        "31 lines must clamp at the 20-row cap"
+        15,
+        "31 lines must clamp at the 15-row cap"
     );
 
     let caret;
@@ -258,7 +258,7 @@ fn task_description_height_follows_its_text() {
 }
 
 #[test]
-fn task_description_shows_five_to_twenty_text_rows_before_scrolling() {
+fn task_description_shows_five_to_fifteen_text_rows_before_scrolling() {
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     app.modal
@@ -276,12 +276,12 @@ fn task_description_shows_five_to_twenty_text_rows_before_scrolling() {
         }
         let screen = render_at(&mut app, 120, 80);
         let field = modal_hitbox(&app, HitAction::ModalField(DialogField::Description));
-        let visible_rows = count.clamp(5, 20);
+        let visible_rows = count.clamp(5, 15);
         assert_eq!(field.height.saturating_sub(2), visible_rows);
         for line in 1..=count {
             assert_eq!(
                 screen.contains(&format!("visible-line-{line:02}")),
-                line > count.saturating_sub(20),
+                line > count.saturating_sub(15),
                 "line {line} at {count} text rows"
             );
         }
@@ -638,6 +638,89 @@ fn renders_empty_and_populated_boards_in_both_themes() {
     insta::assert_snapshot!("populated_board", render_snapshot(&mut app));
 }
 
+#[test]
+fn portrait_board_snapshots() {
+    for width in [40, 50, 60] {
+        let (_dir, mut app) = plain_tasks_app(3);
+        app.ops
+            .create_task(NewTask::titled(
+                "Длинное название задачи для телефона 界界界",
+            ))
+            .unwrap();
+        app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+        insta::assert_snapshot!(
+            format!("portrait_board_{width}"),
+            render_at(&mut app, width, 24)
+        );
+        app.handle_key(key(KeyCode::Char('n'))).unwrap();
+        insta::assert_snapshot!(
+            format!("portrait_dialog_{width}"),
+            render_at(&mut app, width, 24)
+        );
+    }
+}
+
+#[test]
+fn portrait_navigation_scrolling_and_taps() {
+    for width in [40, 50, 60, 69] {
+        let (_dir, mut app) = plain_tasks_app(30);
+        let _ = render_at(&mut app, width, 12);
+        let hits = card_hits(&app);
+        assert!(
+            hits.iter().all(|(column, _, area)| *column == 0
+                && area.height == 1
+                && area.width == width - 2)
+        );
+        let second = hits[1].2;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            second.x + 1,
+            second.y,
+        ))
+        .unwrap();
+        assert_eq!(app.focused_card, 1);
+        app.handle_mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            second.x + 1,
+            second.y,
+        ))
+        .unwrap();
+        assert_eq!(app.current_task().unwrap().title, "Plain task 2");
+        assert_eq!(app.screen, Screen::Detail);
+        app.handle_key(key(KeyCode::Esc)).unwrap();
+        for _ in 0..15 {
+            app.handle_key(key(KeyCode::Down)).unwrap();
+        }
+        let _ = render_at(&mut app, width, 12);
+        assert!(app.column_offsets[0] > 0);
+        assert!(
+            card_hits(&app)
+                .iter()
+                .any(|(_, card, _)| *card == app.focused_card)
+        );
+        app.handle_key(key(KeyCode::Right)).unwrap();
+        let _ = render_at(&mut app, width, 12);
+        assert_eq!(app.focused_column, 1);
+        assert!(card_hits(&app).is_empty());
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), width - 1, 0))
+            .unwrap();
+        assert_eq!(app.focused_column, 2);
+        let _ = render_at(&mut app, width, 12);
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0))
+            .unwrap();
+        assert_eq!(app.focused_column, 1);
+        app.handle_key(key(KeyCode::Left)).unwrap();
+        let _ = render_at(&mut app, 70, 24);
+        assert_eq!(
+            app.hitboxes
+                .iter()
+                .filter(|hit| matches!(hit.action, HitAction::ColumnFocus(_)))
+                .count(),
+            app.board.columns.len()
+        );
+    }
+}
+
 fn review_card_border(app: &mut App) -> Style {
     app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
     let _ = render_at(app, 96, 28);
@@ -767,11 +850,6 @@ fn project_badge_degrades_instead_of_colliding_with_a_column_title() {
     let medium = rendered_lines(&mut app, 96, 28);
     assert!(medium[0].contains("▸ Long P…"), "{}", medium[0]);
     assert!(medium[0].contains("Done (0)"), "{}", medium[0]);
-
-    // Too little room left for a readable label: the frame stays clean.
-    let narrow = rendered_lines(&mut app, 60, 28);
-    assert!(!narrow[0].contains('▸'), "{}", narrow[0]);
-    assert!(narrow[0].contains("Done"), "{}", narrow[0]);
 }
 
 /// The badge sits inside the last column's area, so it has to be hit-tested
@@ -2047,7 +2125,6 @@ fn settings_tab_pages_render() {
         remaining_percent: remaining,
         resets_at: Some(now + 3_600),
         rolling: false,
-        spent_usd: None,
     };
     crate::core::limits::set_cached_snapshot_for_tests(crate::core::limits::LimitsSnapshot {
         fetched_at: now,
@@ -2136,7 +2213,6 @@ fn settings_executor_tab_annotates_slots_with_live_quota() {
         remaining_percent: remaining,
         resets_at: Some(now + 3_600),
         rolling: false,
-        spent_usd: None,
     };
     crate::core::limits::set_cached_snapshot_for_tests(crate::core::limits::LimitsSnapshot {
         fetched_at: now,
@@ -3483,6 +3559,7 @@ fn mouse_backend_selection_refreshes_each_role_popup() {
             AgentSlot::Primary => DialogField::Model,
             AgentSlot::Designer => DialogField::DesignerModel,
             AgentSlot::Reviewer => DialogField::ReviewerModel,
+            AgentSlot::Arbiter => DialogField::ArbiterModel,
         };
         assert!(modal.options_for(model_field).len() > 1);
     }
@@ -3838,22 +3915,99 @@ fn drag_selects_card_text_without_moving_or_opening_it() {
 }
 
 #[test]
-fn ctrl_c_copies_the_focused_task_without_quitting() {
-    let (_dir, mut app) = app_with_board();
-    let source = app
-        .ops
-        .create_task(NewTask::titled("Copy this task"))
-        .expect("create source task");
-    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
+fn ctrl_c_copies_only_the_viewed_task_to_todo_from_every_column() {
+    for status in ["todo", "in_progress", "review", "done", "archive"] {
+        let (_dir, mut app) = app_with_board();
+        let source = app
+            .ops
+            .create_task(NewTask::titled("Copy this task"))
+            .expect("create source task");
+        app.ops.move_task(&source.id, status, false).unwrap();
+        app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+        if status == "archive" {
+            app.handle_key(key(KeyCode::Char('a'))).unwrap();
+        } else {
+            app.focused_column = app
+                .board
+                .columns
+                .iter()
+                .position(|column| column.id == status)
+                .unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(app.screen, Screen::Detail);
+        assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
 
-    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-        .expect("copy focused task");
+        app.handle_key(ctrl_key(KeyCode::Char('c'))).unwrap();
 
-    let copied = app.focused_task().expect("focus copied task");
-    assert_ne!(copied.id, source.id);
-    assert_eq!(copied.title, source.title);
-    assert!(!app.should_quit);
-    assert_eq!(app.status, format!("Copied {} → {}", source.id, copied.id));
+        let copied = app.focused_task().expect("focus copied task");
+        assert_ne!(copied.id, source.id);
+        assert_eq!(copied.title, source.title);
+        assert_eq!(copied.status, TaskStatus::Todo);
+        assert!(copied.completed_at.is_none());
+        assert_eq!(app.screen, Screen::Board);
+        assert!(!app.should_quit);
+        assert_eq!(
+            app.ops
+                .get_task(&source.id)
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
+            status
+        );
+    }
+}
+
+#[test]
+fn ctrl_c_exits_without_copying_on_board_dialogs_and_detail_text_panels() {
+    for context in ["board", "new", "edit", "review_edits", "answer", "search"] {
+        let (_dir, mut app) = app_with_board();
+        let source = app.ops.create_task(NewTask::titled("Do not copy")).unwrap();
+        if context == "review_edits" {
+            app.ops.move_task(&source.id, "review", false).unwrap();
+        } else if context == "answer" {
+            app.ops
+                .ask_question(&source.id, "Question?", "agent", vec![])
+                .unwrap();
+        }
+        app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+        let status = app.ops.get_task(&source.id).unwrap().unwrap().status;
+        app.focused_column = app
+            .board
+            .columns
+            .iter()
+            .position(|column| column.id == status.as_str())
+            .unwrap();
+        match context {
+            "new" => app.dispatch(UiAction::NewTask).unwrap(),
+            "edit" => app.dispatch(UiAction::EditTask).unwrap(),
+            "review_edits" | "answer" => {
+                app.handle_key(key(KeyCode::Enter)).unwrap();
+                app.detail.as_mut().unwrap().focus = if context == "answer" {
+                    DetailFocus::Answer
+                } else {
+                    DetailFocus::Edits
+                };
+            }
+            "search" => app.handle_key(key(KeyCode::Char('/'))).unwrap(),
+            _ => {}
+        }
+        app.handle_key(ctrl_key(KeyCode::Char('c'))).unwrap();
+        assert!(!app.should_quit, "{context}");
+        app.handle_key(ctrl_key(KeyCode::Char('c'))).unwrap();
+        assert!(app.should_quit, "{context}");
+        assert_eq!(
+            app.ops
+                .list_tasks(None, None, "created", "asc")
+                .unwrap()
+                .into_iter()
+                .map(|task| task.id)
+                .collect::<Vec<_>>(),
+            vec![source.id],
+            "{context}"
+        );
+    }
 }
 
 #[test]
@@ -5970,23 +6124,6 @@ fn phase_five_search_popup_escape_clears_and_enter_preserves_filter() {
         .expect("ignore board escape");
     assert!(!app.should_quit);
 
-    let task_count = app
-        .ops
-        .list_tasks(None, None, "created", "asc")
-        .expect("count source tasks")
-        .len();
-    app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
-        .expect("ctrl-c copies focused task");
-    assert!(!app.should_quit);
-    assert_eq!(
-        app.ops
-            .list_tasks(None, None, "created", "asc")
-            .expect("count copied tasks")
-            .len(),
-        task_count + 1
-    );
-    assert!(app.status.starts_with("Copied "));
-
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('/')))
         .expect("open search");
@@ -6000,10 +6137,6 @@ fn phase_five_search_popup_escape_clears_and_enter_preserves_filter() {
     app.handle_key(key(KeyCode::Char('q')))
         .expect("q does not quit from board");
     assert!(!app.should_quit);
-    assert_eq!(
-        app.status,
-        "Press ctrl + C twice to close when no task is selected"
-    );
     assert_eq!(app.search.text(), "kept", "q must not clear the filter");
 }
 
@@ -8270,6 +8403,67 @@ fn text_pager_arrow_scroll_steps() {
     assert_eq!(scroll(&app), 0);
 }
 
+#[test]
+fn board_and_thread_arrow_scroll_acceleration() {
+    let (dir, mut app) = app_with_board();
+    for index in 0..24 {
+        app.ops
+            .create_task(NewTask::titled(format!("Scroll task {index}")))
+            .unwrap();
+    }
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    let task_id = app.current_task().unwrap().id.clone();
+    ThreadManager::new(dir.path())
+        .unwrap()
+        .post(
+            &task_id,
+            crate::core::models::MessageRole::Agent,
+            crate::core::models::MessageKind::Context,
+            &(0..80)
+                .map(|i| format!("Thread row {i}\n"))
+                .collect::<String>(),
+            None,
+            Vec::new(),
+            Some("agent".to_string()),
+        )
+        .unwrap();
+
+    for screen in [Screen::Board, Screen::Detail] {
+        if screen == Screen::Detail {
+            app.handle_key(key(KeyCode::Enter)).unwrap();
+        }
+        let _ = render_at(&mut app, 96, 20);
+        app.handle_key(key(KeyCode::Home)).unwrap();
+        let position = |app: &App| match screen {
+            Screen::Board => app.focused_card as u16,
+            _ => app.detail.as_ref().unwrap().scroll,
+        };
+        for (code, modifiers, expected) in [
+            (KeyCode::Down, KeyModifiers::NONE, 1),
+            (KeyCode::Down, KeyModifiers::SHIFT, 4),
+            (KeyCode::Down, KeyModifiers::CONTROL, 14),
+            (KeyCode::Up, KeyModifiers::CONTROL | KeyModifiers::SHIFT, 4),
+            (KeyCode::Up, KeyModifiers::SHIFT, 1),
+            (KeyCode::Up, KeyModifiers::CONTROL, 0),
+            (KeyCode::Up, KeyModifiers::SHIFT, 0),
+        ] {
+            app.handle_key(KeyEvent::new(code, modifiers)).unwrap();
+            let _ = render_at(&mut app, 96, 20);
+            assert_eq!(
+                position(&app),
+                expected,
+                "{screen:?} {code:?} {modifiers:?}"
+            );
+        }
+        app.handle_key(key(KeyCode::End)).unwrap();
+        let bottom = position(&app);
+        app.handle_key(ctrl_key(KeyCode::Down)).unwrap();
+        assert_eq!(position(&app), bottom, "{screen:?} must clamp at the end");
+        app.handle_key(key(KeyCode::Home)).unwrap();
+    }
+}
+
 /// A task with neither a prompt dump nor provenance hides both viewer buttons.
 #[test]
 fn viewer_buttons_absent_without_prompt_or_provenance() {
@@ -9701,6 +9895,64 @@ fn global_settings_backends_tab_reorders_backend_pickers() {
 }
 
 #[test]
+fn global_settings_auto_tab_saves_auto_mode() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-glob-auto");
+    let _ = std::fs::remove_dir_all(&work);
+    let (store_dir, mut app) = projects_app(&work, None);
+
+    // Left from Common wraps onto Sync, Projects, Backends, then Auto.
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open global settings");
+    for _ in 0..4 {
+        app.handle_key(key(KeyCode::Left)).expect("previous tab");
+    }
+    let modal = app.modal.as_ref().expect("global settings modal");
+    assert_eq!(modal.settings_tab, SettingsTab::Auto);
+    assert_eq!(modal.active_field(), DialogField::AutoModeEnabled);
+    assert!(!modal.auto_mode_enabled);
+
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("enable auto mode");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::AutoModeArbiter);
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("arbiter answers");
+    insta::assert_snapshot!("global_settings_auto_tab", render_at(&mut app, 100, 30));
+
+    // The arbiter picker is its own agent slot with the backend catalog.
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::ArbiterAgentSettings);
+    app.handle_key(key(KeyCode::Enter))
+        .expect("open arbiter picker");
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.agent_popup_slot(), Some(AgentSlot::Arbiter));
+    assert!(modal.options_for(DialogField::ArbiterBackend).len() > 1);
+    app.handle_key(key(KeyCode::Esc))
+        .expect("close arbiter picker");
+    assert!(app.modal.as_ref().unwrap().agent_popup_slot().is_none());
+
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+    assert!(app.modal.is_none());
+    let mode = ProjectStore::at(store_dir.path())
+        .load_global_config()
+        .unwrap()
+        .auto_mode();
+    assert!(mode.enabled);
+    assert_eq!(mode.questions, crate::core::global::AutoQuestions::Arbiter);
+    assert_eq!(mode.arbiter_timeout_secs, 900);
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
 fn task_form_backend_picker_follows_the_global_backend_order() {
     let (_dir, mut app) = populated_app();
     app.settings.backend_order = vec!["codex".to_string(), "claude".to_string()];
@@ -10079,7 +10331,6 @@ fn limits_fixture() -> std::sync::Arc<crate::core::limits::LimitsSnapshot> {
         remaining_percent: remaining,
         resets_at: Some(now + resets_in),
         rolling: false,
-        spent_usd: None,
     };
     std::sync::Arc::new(LimitsSnapshot {
         fetched_at: now,
@@ -10154,56 +10405,6 @@ fn limits_row_sits_above_the_status_bar_and_lists_every_provider() {
     );
 }
 
-/// gemini mixes a Code Assist quota window (a percentage) with the spend pi
-/// logged for its API key, which has no ceiling and so prints as dollars.
-#[test]
-fn limits_row_shows_gemini_quota_and_spend() {
-    use crate::core::limits::{LimitWindow, LimitsSnapshot, ProviderLimits, ProviderState};
-
-    let (_dir, mut app) = populated_app();
-    let now = chrono::Utc::now().timestamp();
-    let spend = |label: &str, usd: f64| LimitWindow {
-        label: label.to_string(),
-        remaining_percent: 100.0,
-        resets_at: None,
-        rolling: false,
-        spent_usd: Some(usd),
-    };
-    app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
-        fetched_at: now,
-        providers: vec![ProviderLimits {
-            provider: "gemini".to_string(),
-            state: ProviderState::Ready,
-            windows: vec![
-                LimitWindow {
-                    label: "pro".to_string(),
-                    remaining_percent: 12.0,
-                    resets_at: Some(now + 2 * 3600 + 1830),
-                    rolling: false,
-                    spent_usd: None,
-                },
-                spend("24h", 0.0031),
-                spend("30d", 4.5),
-            ],
-            observed_at: None,
-        }],
-    }));
-
-    let lines = rendered_lines(&mut app, 120, 28);
-    let upper = &lines[lines.len() - 3];
-    let lower = &lines[lines.len() - 2];
-    assert!(
-        upper.contains("✧ gemini pro 12% ↻2h30m · 24h <$0.01"),
-        "{upper}"
-    );
-    assert!(lower.contains("30d $4.50"), "{lower}");
-    let narrow = rendered_lines(&mut app, 20, 20);
-    let narrow_upper = &narrow[narrow.len() - 3];
-    let narrow_lower = &narrow[narrow.len() - 2];
-    assert!(narrow_upper.contains("✧ 12% · <$0.01"), "{narrow_upper}");
-    assert!(narrow_lower.contains("$4.50"), "{narrow_lower}");
-}
-
 #[test]
 fn limits_row_stacks_weekly_windows_under_short_ones_snapshot() {
     let (_dir, mut app) = populated_app();
@@ -10255,7 +10456,6 @@ fn limits_row_drops_windows_that_have_already_reset() {
         remaining_percent: remaining,
         resets_at: Some(resets_at),
         rolling: false,
-        spent_usd: None,
     };
     app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
         fetched_at: now,
@@ -10341,7 +10541,6 @@ fn limits_row_registers_refresh_hitboxes_on_every_provider() {
         remaining_percent: remaining,
         resets_at: Some(now + 86_400),
         rolling: false,
-        spent_usd: None,
     };
     app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
         fetched_at: now,
@@ -13107,4 +13306,68 @@ fn global_settings_network_mode_is_immediate_and_system_is_read_only() {
             .get("auth_key")
             .is_none()
     );
+}
+
+#[test]
+fn sync_board_status_and_conflicts_snapshots() {
+    use crate::cli::serve::settings::BoardPeer;
+    use crate::core::sync::{Conflict, Hlc};
+    let (_dir, mut app) = populated_app();
+    let at = chrono::DateTime::parse_from_rfc3339("2026-10-13T18:02:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    app.sync_board.peers = vec![BoardPeer {
+        name: "server".into(),
+        role: crate::core::sync::NodeRole::Server,
+        code: "NODE_UNREACHABLE".into(),
+        exchange: Some(at),
+        since: Some(at),
+        pending: 14,
+    }];
+    let id = app.board.columns[0].tasks[0].id.clone();
+    app.sync_board.tasks = vec![id.clone()];
+    app.sync_board.conflicts = vec![Conflict {
+        project: "demo".into(),
+        entity: "task".into(),
+        id,
+        field: "title".into(),
+        winner: Hlc(4, 0, "server".into()),
+        loser: Hlc(3, 0, "laptop".into()),
+        winner_value: serde_json::json!("Fix login"),
+        loser_value: serde_json::json!("Fix auth"),
+    }];
+    // Freeze local-clock formatting without assuming the machine timezone.
+    let mut offline = render_snapshot(&mut app);
+    offline = offline.replace(
+        &at.with_timezone(&chrono::Local).format("%H:%M").to_string(),
+        "18:02",
+    );
+    insta::assert_snapshot!("sync_board_offline_conflict", offline);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    let mut detail = render_snapshot(&mut app);
+    detail = detail.replace(
+        &at.with_timezone(&chrono::Local).format("%H:%M").to_string(),
+        "18:02",
+    );
+    insta::assert_snapshot!("sync_detail_conflict", detail);
+    app.sync_board.conflicts.push(crate::core::sync::Conflict {
+        field: "description".into(),
+        ..app.sync_board.conflicts[0].clone()
+    });
+    app.sync_board.tasks.push(app.sync_board.tasks[0].clone());
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(render_snapshot(&mut app).contains("task / description"));
+    app.screen = Screen::Board;
+    app.sync_board.peers[0].code = "ONLINE".into();
+    app.sync_board.peers[0].pending = 0;
+    assert_eq!(
+        app.sync_board
+            .header(at + chrono::Duration::seconds(3))
+            .unwrap(),
+        "синхронизировано с server 3 с назад"
+    );
+    // Future exchange clamps clock reversal to zero; stable snapshot.
+    app.sync_board.peers[0].exchange = Some(chrono::Utc::now() + chrono::Duration::days(1));
+    insta::assert_snapshot!("sync_board_online", render_snapshot(&mut app));
 }

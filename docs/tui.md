@@ -34,6 +34,23 @@ Linux requires `xdg-open` and a registered browser/mail handler; macOS uses
 
 ## TUI Keyboard Shortcuts
 
+### Phone portrait layout
+
+Below 70 terminal columns, the board shows only the focused column.
+Cards occupy one row (task ID and truncated title); `?` marks open questions
+and `●` marks unseen review updates. The selected row is inverted.
+`←`/`→` and `Tab`/`Shift+Tab` switch columns; `↑`/`↓` and the wheel
+scroll cards as on the desktop board. Resize to 70 columns or wider to restore
+the side-by-side board without losing the selected column.
+
+The top `‹ 1/4 ›` pager is also tappable: its left half selects the previous
+column, its right half selects the next (wrapping at the ends). A card tap
+selects it and opens its detail on release. The terminal must translate taps
+into mouse events; no native touch/swipe protocol is required. Dialogs,
+including nested agent/options panels, use the full terminal width in portrait
+mode; forms keep their existing field scrolling and Save/Cancel controls.
+
+
 Action hotkeys work on both the board (focused card) and the open detail view.
 
 Detail type-to-edit: a Review task opens on the thread, so `Esc` closes the
@@ -52,6 +69,12 @@ textarea's own Alt bindings (`Alt+b/f/d/v`) are unavailable there — use
 the plain-letter hotkeys.
 
 - `↑/↓/←/→`: Move focus between tasks/columns
+- `Shift+↑/↓`: Move 3 tasks within the focused board column, or scroll 3
+  rendered rows while the detail thread is focused
+- `Ctrl+↑/↓`: Move 10 tasks within the focused board column, or scroll 10
+  rendered rows while the detail thread is focused. Ctrl takes precedence
+  over Shift; both stop at the beginning/end, matching the Stats text pager.
+  Answer/review text panels keep their editor arrow bindings
 - `Alt+↑/↓`: jump to the block above/below from anywhere — the detail's
   thread/answer/editor panels, a dialog's form fields (the nested
   agent-settings and Options popups included) — even out of a text caret or
@@ -142,7 +165,12 @@ the plain-letter hotkeys.
   Settings"): the same tabs minus Prompt and the inherit checkboxes, project
   name, theme and isolation row — they edit the global values the projects
   inherit. Its Common tab adds the machine-only settings (Updates section,
-  Esc-from-board, project sorting, update check on open).
+  Esc-from-board, project sorting, update check on open). Its **Auto** tab
+  edits auto mode (`docs/config.md`, "Auto mode"): the on/off switch,
+  **Questions** (ticked: an arbiter agent answers; unticked: the agent
+  decides itself), the arbiter's agent settings (same picker as the
+  designer/reviewer bots), the arbiter timeout and the resolver-run budget.
+  A queued card parked by the merge-conflict hold shows `⏸ conflict hold`.
 - `e`: Edit task
 - `d` / `Ctrl+d` / `Delete` / `Backspace`: Delete task
 - `m`: Move task
@@ -180,7 +208,12 @@ the plain-letter hotkeys.
 - `/`: Search
 - `?`: Help overlay (scrollable, sized to its content; lists mouse gestures)
 - `q`: Back from detail/secondary screens — on the Projects screen `q` quits
-  the TUI; quit the TUI with `Ctrl+C` twice
+  the TUI; quit the TUI with `Ctrl+C` twice (within three seconds)
+- `Ctrl+C` in an open task's thread: copy the task and its thread to a fresh
+  To Do task, regardless of the original column (including Archive).
+  The board selects the copy. Everywhere else, including the board, new/edit
+  dialogs and the detail's answer/review-edit inputs, `Ctrl+C` is for exiting,
+  not copying.
 
 Clipboard pastes use bracketed paste: the whole block is inserted into the
 focused text field in one edit (flattened to a single line for one-line fields
@@ -277,6 +310,25 @@ dialog (unregister by default; Space toggles
 “also delete board data”), `/` filters. `q` quits the TUI outright; `Esc`
 returns to the board this list was opened from, or quits when the list is the
 entry screen.
+
+### Board synchronization and conflicts
+
+With paired peers, the board and task detail reserve one header row for sync:
+`синхронизировано с server 3 с назад`, or
+`server: офлайн с 18:02, 14 операций ждут · NODE_UNREACHABLE`.
+The timestamp comes from a confirmed exchange; pending counts come from the
+peer's acknowledged version vector. Probes run off the UI thread and refresh
+at the TUI refresh interval. Without peers, the header takes no space.
+An absent mobile peer stays neutral (`был в сети`), without an error code.
+
+Cards with active replicated task or message field conflicts show `⚠ sync`,
+separately from worktree integration conflicts. Task detail shows the winning
+and losing values and node IDs above the task panel. `Ctrl+←/→` or the `<` / `>`
+buttons select a conflict. **Взять другую версию** (`Ctrl+V`, or click) restores
+that field's losing value as a new human operation with a fresh HLC, including
+while offline. A stale choice is rejected rather than overwriting a newer edit.
+Resolved conflicts disappear from cards and the panel; their audit records
+and board notes remain available. Long values are truncated to terminal width.
 
 ### Global Settings → Sync
 
@@ -439,9 +491,9 @@ and agents come from project settings. The Options summary names the toggles
 that are on (`silence`, `orchestrator`, `designer`, `reviewer`, `launch at
 HH:MM`), and a silence task shows a `🔇 silence` badge. The Description box sizes itself from its own text the way
 the option selectors size from their option count: at least 5 visible text rows,
-growing one row at a time with the soft-wrapped text up to 20 visible rows and
+growing one row at a time with the soft-wrapped text up to 15 visible rows and
 shrinking again on delete. The borders add two rows outside these limits.
-Content beyond 20 rows scrolls within the field; a short terminal still clips
+Content beyond 15 rows scrolls within the field; a short terminal still clips
 the field to the available space. Window size no longer stretches it — spare
 rows go to the selectors below instead. When the selected backend exposes no personas (no
 `agent_options`), the agent selector would offer only "Default agent", so the

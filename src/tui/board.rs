@@ -12,6 +12,8 @@ use super::app::{App, HitAction, Hitbox, Screen, UiAction};
 use super::card::{sanitize_terminal_text, truncate_display};
 use super::{card, detail, dialogs, limits, projects, search, sessions};
 
+pub(super) const PORTRAIT_WIDTH: u16 = 70;
+
 pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     // Reset the full frame so stale symbols from a previous frame (e.g. a
@@ -35,8 +37,14 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(area);
     match app.screen {
-        Screen::Board => render_board(frame, app, chunks[0]),
-        Screen::Detail => detail::render(frame, app, chunks[0]),
+        Screen::Board => {
+            let body = render_sync_header(frame, app, chunks[0]);
+            render_board(frame, app, body);
+        }
+        Screen::Detail => {
+            let body = render_sync_header(frame, app, chunks[0]);
+            detail::render(frame, app, body);
+        }
         Screen::Sessions => sessions::render_sessions(frame, app, chunks[0]),
         Screen::Archive => sessions::render_archive(frame, app, chunks[0]),
         Screen::LogView => sessions::render_log_view(frame, app, chunks[0]),
@@ -66,9 +74,60 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
     app.capture_and_highlight(frame.buffer_mut());
 }
 
+fn render_sync_header(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
+    let Some(text) = app.sync_board.header(chrono::Utc::now()) else {
+        return area;
+    };
+    frame.render_widget(
+        Paragraph::new(truncate_display(&text, area.width as usize))
+            .style(Style::default().fg(app.theme.muted)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    Rect::new(
+        area.x,
+        area.y.saturating_add(1),
+        area.width,
+        area.height.saturating_sub(1),
+    )
+}
+
 fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let mut hitboxes = Vec::new();
-    let column_count = app.board.columns.len().max(1) as u32;
+    let portrait = area.width < PORTRAIT_WIDTH;
+    let area = if portrait && !app.board.columns.is_empty() {
+        let last = app.board.columns.len() - 1;
+        let current = app.focused_column.min(last);
+        let previous = if current == 0 { last } else { current - 1 };
+        let next = if current == last { 0 } else { current + 1 };
+        let navigation = Rect::new(area.x, area.y, area.width, area.height.min(1));
+        frame.render_widget(
+            Paragraph::new(format!("‹   {}/{}   ›", current + 1, last + 1))
+                .centered()
+                .style(Style::default().fg(app.theme.focus)),
+            navigation,
+        );
+        let halves = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(navigation);
+        for (slot, column) in [(halves[0], previous), (halves[1], next)] {
+            hitboxes.push(Hitbox {
+                area: slot,
+                action: HitAction::ColumnFocus(column),
+            });
+        }
+        Rect::new(
+            area.x,
+            area.y.saturating_add(navigation.height),
+            area.width,
+            area.height.saturating_sub(navigation.height),
+        )
+    } else {
+        area
+    };
+    let column_count = if portrait {
+        1
+    } else {
+        app.board.columns.len().max(1)
+    } as u32;
     let constraints = (0..column_count)
         .map(|_| Constraint::Ratio(1, column_count))
         .collect::<Vec<_>>();
@@ -76,11 +135,18 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints(constraints)
         .split(area);
-    // The project badge goes on the rightmost column, whose top border row is
-    // the only one with a free right corner; it is drawn after the loop so the
-    // block cannot paint over it.
+    // Draw the project badge after the block so its border cannot erase it.
     let mut badge_slot = None;
-    for index in 0..app.board.columns.len() {
+    let columns = if portrait {
+        app.focused_column
+            ..app
+                .focused_column
+                .saturating_add(1)
+                .min(app.board.columns.len())
+    } else {
+        0..app.board.columns.len()
+    };
+    for (slot, index) in columns.enumerate() {
         let column = &app.board.columns[index];
         let focused = index == app.focused_column;
         // Every column the pointer crosses during a drag lights up as a bold
@@ -103,29 +169,33 @@ fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         } else {
             format!("({matching})")
         };
-        let title = column_title(&column.name, &count, areas[index].width.saturating_sub(2));
-        if index + 1 == app.board.columns.len() {
-            badge_slot = Some((areas[index], UnicodeWidthStr::width(title.as_str()) as u16));
+        let title = column_title(&column.name, &count, areas[slot].width.saturating_sub(2));
+        if portrait || index + 1 == app.board.columns.len() {
+            badge_slot = Some((areas[slot], UnicodeWidthStr::width(title.as_str()) as u16));
         }
         let block = Block::default()
             .title(title.clone())
             .borders(Borders::ALL)
             .border_style(border_style)
             .style(Style::default().bg(app.theme.bg).fg(app.theme.fg));
-        let inner = block.inner(areas[index]);
+        let inner = block.inner(areas[slot]);
         let capacity = card_capacity_with_indicators(
             inner,
-            app.settings.card_height_lines.max(1),
+            if portrait {
+                1
+            } else {
+                app.settings.card_height_lines.max(1)
+            },
             app.column_offsets.get(index).copied().unwrap_or(0),
             matching,
         );
         app.set_visible_card_capacity(index, capacity);
-        frame.render_widget(block, areas[index]);
+        frame.render_widget(block, areas[slot]);
         // Cards first: hitboxes are searched front-to-back, and the column
         // area encloses them.
-        hitboxes.extend(render_cards(frame, app, index, inner));
+        hitboxes.extend(render_cards(frame, app, index, inner, portrait));
         hitboxes.push(Hitbox {
-            area: areas[index],
+            area: areas[slot],
             action: HitAction::ColumnFocus(index),
         });
     }
@@ -267,7 +337,13 @@ fn column_title(name: &str, count: &str, available: u16) -> String {
     }
 }
 
-fn render_cards(frame: &mut Frame<'_>, app: &App, column_index: usize, area: Rect) -> Vec<Hitbox> {
+fn render_cards(
+    frame: &mut Frame<'_>,
+    app: &App,
+    column_index: usize,
+    area: Rect,
+    portrait: bool,
+) -> Vec<Hitbox> {
     let offset = app.column_offsets.get(column_index).copied().unwrap_or(0);
     let all_tasks = app.visible_tasks_for_column(column_index);
     let total = app.matching_task_count(column_index);
@@ -277,12 +353,16 @@ fn render_cards(frame: &mut Frame<'_>, app: &App, column_index: usize, area: Rec
     // minimum. `+2` accounts for the card border; the content count comes from
     // `card::card_line_count`.
     let base_height = app.settings.card_height_lines.max(1);
-    let card_height = all_tasks
-        .iter()
-        .map(|task| card::card_line_count(app, task).saturating_add(2))
-        .max()
-        .unwrap_or(0)
-        .max(base_height);
+    let card_height = if portrait {
+        1
+    } else {
+        all_tasks
+            .iter()
+            .map(|task| card::card_line_count(app, task).saturating_add(2))
+            .max()
+            .unwrap_or(0)
+            .max(base_height)
+    };
     let visible = card_capacity_with_indicators(area, card_height, offset, total);
     let tasks = all_tasks
         .into_iter()
@@ -743,11 +823,17 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  5h windows on the upper line, weekly/monthly on the lower"),
         Line::from("  hide the row with tui.show_limits: false · kanban limits prints it"),
         Line::from(""),
-        Line::from("?: toggle help · q/Esc: back · Ctrl+C: copy task"),
+        Line::from("?: toggle help · q/Esc: back · Ctrl+C twice: quit"),
+        Line::from("Ctrl+C on the task thread: copy task to To Do"),
     ]
 }
 
 pub fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let percent_x = if area.width < PORTRAIT_WIDTH {
+        100
+    } else {
+        percent_x
+    };
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

@@ -159,6 +159,10 @@ struct TranscriptCache;
 /// Bytes before the read offset compared on every re-read to detect a rewrite.
 const TAIL_PROBE: usize = 64;
 
+/// Entries unread this long are dropped, so a TUI left open for weeks keeps
+/// parser state only for the agents still running, not every one it saw.
+const TRANSCRIPT_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+
 struct CachedTranscript {
     dialect: Dialect,
     /// Offset just past the last complete line fed to `parser`.
@@ -166,6 +170,7 @@ struct CachedTranscript {
     /// The file's bytes right before `offset` (up to [`TAIL_PROBE`]).
     tail: Vec<u8>,
     parser: Parser,
+    used: std::time::Instant,
 }
 
 impl TranscriptCache {
@@ -178,6 +183,7 @@ impl TranscriptCache {
             .get_or_init(Default::default)
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
+        cache.retain(|cached, entry| cached == path || entry.used.elapsed() < TRANSCRIPT_IDLE);
         let reusable = cache
             .get(path)
             .is_some_and(|entry| entry.dialect == dialect && entry.still_prefix_of(&mut file, len));
@@ -189,10 +195,12 @@ impl TranscriptCache {
                     offset: 0,
                     tail: Vec::new(),
                     parser: Parser::new(dialect),
+                    used: std::time::Instant::now(),
                 },
             );
         }
         let entry = cache.get_mut(path)?;
+        entry.used = std::time::Instant::now();
         let mut fresh = Vec::new();
         file.seek(SeekFrom::Start(entry.offset)).ok()?;
         file.read_to_end(&mut fresh).ok()?;

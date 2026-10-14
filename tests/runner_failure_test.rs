@@ -204,7 +204,7 @@ fn missing_backend_fails_before_spawning_and_records_recoverable_task() {
     storage.init_board().unwrap();
     atomic_write_text(
         &storage.kanban_dir.join("config.yaml"),
-        "agents:\n  default: omp\n  omp:\n    command: /nonexistent/TASK-421-backend\n",
+        "auto_launch:\n  default_agent: omp\nagents:\n  omp:\n    command: /nonexistent/TASK-421-backend\n",
     )
     .unwrap();
     let task = storage

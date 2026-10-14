@@ -31,6 +31,7 @@ use crate::core::context::ContextManager;
 use crate::core::daemon;
 use crate::core::error::{KanbanError, Result};
 use crate::core::executors::{self, Pool};
+use crate::core::global::AutoQuestions;
 use crate::core::limit_share;
 use crate::core::limits::LimitsSnapshot;
 use crate::core::models::{
@@ -170,6 +171,8 @@ pub struct Hitbox {
 /// What a mouse press (or wheel, for column targeting) on a region maps to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HitAction {
+    SyncConflict(usize),
+    SyncConflictSelect(isize),
     FocusCard {
         column: usize,
         card: usize,
@@ -495,6 +498,7 @@ pub struct App {
     /// Backends whose warmed model catalog has already been reflected into an
     /// open modal, so `tick` refreshes options at most once per backend.
     catalog_ready: HashSet<String>,
+    pub(crate) sync_board: super::sync_board::SyncBoard,
     pub project: Option<Project>,
     pub projects: Vec<ProjectRow>,
     project_cache: Option<projects::ProjectCache>,
@@ -902,6 +906,7 @@ impl App {
         };
         let (launch_tx, launch_rx) = mpsc::channel();
         Ok(Self {
+            sync_board: Default::default(),
             ops,
             screen: Screen::Board,
             board,
@@ -1068,6 +1073,7 @@ impl App {
             last_store_pump: None,
             store_pump_state: Arc::new(Mutex::new(daemon::PumpState::default())),
             catalog_ready: HashSet::new(),
+            sync_board: Default::default(),
             project: None,
             projects,
             project_cache: Some(projects::ProjectCache::default()),
@@ -1336,8 +1342,12 @@ impl App {
     fn handle_key_inner(&mut self, key: KeyEvent) -> Result<()> {
         if is_ctrl_c(key) {
             if self.modal.is_none()
-                && matches!(self.screen, Screen::Board | Screen::Detail)
-                && self.current_task_id().is_some()
+                && !self.search.active
+                && self.screen == Screen::Detail
+                && self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| detail.focus == DetailFocus::Thread)
             {
                 return self.dispatch(UiAction::CopyTask);
             }
@@ -1386,6 +1396,22 @@ impl App {
         }
         let action_screen = matches!(self.screen, Screen::Board | Screen::Detail);
         match (key.code, key.modifiers) {
+            (KeyCode::Char('v'), KeyModifiers::CONTROL) if self.screen == Screen::Detail => {
+                if let Some(hit) = self
+                    .hitboxes
+                    .iter()
+                    .find(|hit| matches!(hit.action, HitAction::SyncConflict(_)))
+                    .copied()
+                {
+                    self.click_at(hit.area.x, hit.area.y)?;
+                }
+            }
+            (KeyCode::Left, KeyModifiers::CONTROL) if self.screen == Screen::Detail => {
+                self.sync_board.selected = self.sync_board.selected.saturating_sub(1);
+            }
+            (KeyCode::Right, KeyModifiers::CONTROL) if self.screen == Screen::Detail => {
+                self.sync_board.selected = self.sync_board.selected.saturating_add(1);
+            }
             (KeyCode::Esc, _) if self.screen == Screen::Board && !self.search.text().is_empty() => {
                 self.clear_search();
             }
@@ -1404,8 +1430,7 @@ impl App {
                     self.screen = Screen::Board;
                     self.detail = None;
                 } else {
-                    self.status =
-                        "Press ctrl + C twice to close when no task is selected".to_string();
+                    self.status = "Press ctrl + C twice to close".to_string();
                 }
             }
             (KeyCode::Esc, _) if matches!(self.screen, Screen::Archive | Screen::Help) => {
@@ -1508,6 +1533,22 @@ impl App {
                 if self.screen == Screen::Board && !m.contains(KeyModifiers::ALT) =>
             {
                 self.focus_next_column()
+            }
+            (KeyCode::Up | KeyCode::Down, _)
+                if matches!(self.screen, Screen::Board | Screen::Detail) =>
+            {
+                let step = self.arrow_scroll_step(&key);
+                let delta = if key.code == KeyCode::Up { -step } else { step };
+                if self.screen == Screen::Board {
+                    let len = self.visible_tasks_for_column(self.focused_column).len();
+                    self.focused_card = self
+                        .focused_card
+                        .saturating_add_signed(delta as isize)
+                        .min(len.saturating_sub(1));
+                    self.ensure_focused_visible();
+                } else {
+                    self.scroll_detail(delta as isize);
+                }
             }
             (KeyCode::Up, _) => self.focus_up(),
             (KeyCode::Down, _) => self.focus_down(),
@@ -2364,6 +2405,8 @@ impl App {
             Some(
                 HitAction::OpenAnswer { .. }
                 | HitAction::Action(_)
+                | HitAction::SyncConflict(_)
+                | HitAction::SyncConflictSelect(_)
                 | HitAction::ModalField(_)
                 | HitAction::ModalTab(_)
                 | HitAction::ModalOption { .. }
@@ -2691,6 +2734,8 @@ impl App {
             | Some(HitAction::ColumnFocus(column)) => Some(column),
             Some(
                 HitAction::Action(_)
+                | HitAction::SyncConflict(_)
+                | HitAction::SyncConflictSelect(_)
                 | HitAction::ModalField(_)
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
@@ -2746,6 +2791,28 @@ impl App {
                 Ok(())
             }
             Some(HitAction::Action(action)) => self.dispatch(action),
+            Some(HitAction::SyncConflictSelect(delta)) => {
+                self.sync_board.selected = self.sync_board.selected.saturating_add_signed(delta);
+                Ok(())
+            }
+            Some(HitAction::SyncConflict(index)) => {
+                let conflict = self.sync_board.conflicts.get(index).cloned();
+                if let (Some(conflict), Some(store)) = (conflict, &self.store) {
+                    match crate::core::sync::Journal::open(store.root())
+                        .and_then(|journal| journal.take_other_version(&conflict))
+                    {
+                        Ok(()) => {
+                            self.sync_board.conflicts.remove(index);
+                            self.sync_board.tasks.remove(index);
+                            self.refresh_after_action()?;
+                            self.status =
+                                "Взята другая версия; изменение будет синхронизировано".into();
+                        }
+                        Err(error) => self.status = error.to_string(),
+                    }
+                }
+                Ok(())
+            }
             Some(HitAction::DetailAnswerOption { index }) => {
                 if let Some(detail) = self.detail.as_mut() {
                     detail.variant_selected = index;
@@ -2850,6 +2917,7 @@ impl App {
                         DialogField::Backend
                             | DialogField::DesignerBackend
                             | DialogField::ReviewerBackend
+                            | DialogField::ArbiterBackend
                     ) {
                         self.refresh_backend_options_for(&mut modal, slot);
                     } else if matches!(
@@ -2857,6 +2925,7 @@ impl App {
                         DialogField::Model
                             | DialogField::DesignerModel
                             | DialogField::ReviewerModel
+                            | DialogField::ArbiterModel
                     ) && let Some(config) = self.modal_config(&modal)
                     {
                         self.refresh_effort_options_for_slot(&mut modal, &config, slot);
@@ -2920,6 +2989,8 @@ impl App {
             ) => column,
             Some(
                 HitAction::Action(_)
+                | HitAction::SyncConflict(_)
+                | HitAction::SyncConflictSelect(_)
                 | HitAction::ModalField(_)
                 | HitAction::ModalOption { .. }
                 | HitAction::ModalButton(_)
@@ -2983,6 +3054,11 @@ impl App {
         self.pending_fs_reload = true;
         self.fs_change_generation = self.fs_change_generation.wrapping_add(1);
         self.fs_change_generation
+    }
+
+    /// The latest change generation while a reload is still pending.
+    pub fn pending_fs_change(&self) -> Option<u64> {
+        self.pending_fs_reload.then_some(self.fs_change_generation)
     }
 
     pub fn reload_debounced_change(&mut self, generation: u64) -> Result<()> {
@@ -3066,6 +3142,13 @@ impl App {
     pub fn tick(&mut self) -> Result<()> {
         self.poll_launches();
         self.reload_if_changed()?;
+        if let Some(store) = &self.store {
+            self.sync_board.poll(
+                store.root(),
+                self.ops.data_root(),
+                self.settings.refresh_interval,
+            );
+        }
         self.refresh_modal_after_catalog_warm();
         let now = Instant::now();
         self.expire_ctrl_c_prompt_at(now);
@@ -4298,23 +4381,9 @@ impl App {
             return Ok(());
         };
         self.detail = None;
-        self.screen = if copied.status == TaskStatus::Archive {
-            Screen::Archive
-        } else {
-            Screen::Board
-        };
+        self.screen = Screen::Board;
         self.refresh_after_action()?;
-        if self.screen == Screen::Archive {
-            if let Some(index) = self
-                .archived_tasks
-                .iter()
-                .position(|task| task.id == copied.id)
-            {
-                self.archive_selected = index;
-            }
-        } else {
-            let _ = self.focus_task(&copied.id);
-        }
+        let _ = self.focus_task(&copied.id);
         self.status = format!("Copied {source_id} → {}", copied.id);
         Ok(())
     }
@@ -4547,6 +4616,29 @@ impl App {
                 value: Some(crate::core::global::PROJECT_SORT_SMART_NAME.to_string()),
             },
         ]);
+        let auto = config.auto_mode();
+        modal.auto_mode_enabled = auto.enabled;
+        modal.auto_mode_arbiter = auto.questions == AutoQuestions::Arbiter;
+        modal.auto_mode_arbiter_timeout =
+            super::dialogs::one_line(&auto.arbiter_timeout_secs.to_string());
+        modal.auto_mode_max_resolver_runs =
+            super::dialogs::one_line(&auto.max_resolver_runs.to_string());
+        modal.set_backend_text_for(
+            AgentSlot::Arbiter,
+            auto.arbiter_backend.as_deref().unwrap_or(""),
+        );
+        modal.set_model_text_for(
+            AgentSlot::Arbiter,
+            auto.arbiter_model.as_deref().unwrap_or(""),
+        );
+        modal.set_effort_text_for(
+            AgentSlot::Arbiter,
+            auto.arbiter_effort.as_deref().unwrap_or(""),
+        );
+        modal.set_agent_text_for(
+            AgentSlot::Arbiter,
+            auto.arbiter_agent.as_deref().unwrap_or(""),
+        );
         self.fill_settings_form(&mut modal, &view);
         modal.capture_initial_values();
         self.modal = Some(modal);
@@ -5122,7 +5214,8 @@ impl App {
         }))
         .collect::<Vec<_>>();
         modal.set_backend_options_for(AgentSlot::Designer, role_backends.clone());
-        modal.set_backend_options_for(AgentSlot::Reviewer, role_backends);
+        modal.set_backend_options_for(AgentSlot::Reviewer, role_backends.clone());
+        modal.set_backend_options_for(AgentSlot::Arbiter, role_backends);
         modal.set_reviewer_on_changes_options(vec![
             SelectOption {
                 label: "Stay in Progress (re-queue)".to_string(),
@@ -5843,8 +5936,8 @@ impl App {
                     self.refresh_active_sessions()?;
                 }
             }
-            KeyCode::Up => self.scroll_text_view(-self.text_view_step(&key)),
-            KeyCode::Down => self.scroll_text_view(self.text_view_step(&key)),
+            KeyCode::Up => self.scroll_text_view(-self.arrow_scroll_step(&key)),
+            KeyCode::Down => self.scroll_text_view(self.arrow_scroll_step(&key)),
             KeyCode::PageUp => self.scroll_text_view(-10),
             KeyCode::PageDown => self.scroll_text_view(10),
             KeyCode::Home => {
@@ -5875,9 +5968,9 @@ impl App {
         }
     }
 
-    /// Arrow-key row step for the text pager: Ctrl scrolls x10 rows, Shift x3,
-    /// plain arrows x1 — the fast path for long reports such as the stats view.
-    fn text_view_step(&self, key: &KeyEvent) -> i32 {
+    /// Shared arrow step for board cards, thread rows and text-pager rows:
+    /// Ctrl moves x10, Shift x3, plain arrows x1; Ctrl takes precedence.
+    fn arrow_scroll_step(&self, key: &KeyEvent) -> i32 {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             10
         } else if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -6098,6 +6191,7 @@ impl App {
         if modal.is_settings_form() {
             self.refresh_slot_options_with_config(modal, config, AgentSlot::Designer);
             self.refresh_slot_options_with_config(modal, config, AgentSlot::Reviewer);
+            self.refresh_slot_options_with_config(modal, config, AgentSlot::Arbiter);
         }
     }
 
@@ -6562,6 +6656,15 @@ impl App {
                         return Ok(());
                     }
                 };
+                let auto = match parse_auto_mode(&modal) {
+                    Ok(auto) => auto,
+                    Err((field, message)) => {
+                        modal.focus_field(field);
+                        modal.error = Some(message);
+                        self.modal = Some(modal);
+                        return Ok(());
+                    }
+                };
                 let save_result = (|| -> Result<()> {
                     let Some(store) = &self.store else {
                         return Err(KanbanError::Invalid(
@@ -6577,6 +6680,7 @@ impl App {
                     config.set_update_check_on_open(modal.update_check_on_open);
                     config.set_hidden_projects(&modal.hidden_project_ids());
                     config.set_backend_order(&modal.backend_order);
+                    config.set_auto_mode(&auto);
                     config.set_project_sort(
                         &modal
                             .project_sort_text()
@@ -7467,11 +7571,22 @@ pub(super) fn load_log_tail(project_path: &Path, session_id: &str) -> Vec<String
         .join(".kanban")
         .join("logs")
         .join(format!("{session_id}.log"));
-    let Ok(bytes) = fs::read(&log_file) else {
+    // The pager re-reads every tick while following, and agent logs grow
+    // without bound, so only the shown tail is read.
+    let tail = (|| {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = fs::File::open(&log_file)?;
+        let len = file.metadata()?.len();
+        let skipped = len.saturating_sub(LOG_TAIL_BYTES as u64);
+        file.seek(SeekFrom::Start(skipped))?;
+        let mut bytes = Vec::with_capacity((len - skipped) as usize);
+        file.read_to_end(&mut bytes)?;
+        std::io::Result::Ok((skipped, bytes))
+    })();
+    let Ok((skipped, bytes)) = tail else {
         return vec!["(no log file for this session)".to_string()];
     };
-    let skipped = bytes.len().saturating_sub(LOG_TAIL_BYTES);
-    let text = String::from_utf8_lossy(&bytes[skipped..]);
+    let text = String::from_utf8_lossy(&bytes);
     let mut lines = text.lines().map(sanitize_terminal_text).collect::<Vec<_>>();
     if skipped > 0 {
         if !lines.is_empty() {
@@ -7871,6 +7986,8 @@ fn field_consumes_horizontal(field: DialogField) -> bool {
             | DialogField::MaxRunningPerBackendModel
             | DialogField::AutoRestartDelays
             | DialogField::ReviewerMaxRounds
+            | DialogField::AutoModeArbiterTimeout
+            | DialogField::AutoModeMaxResolverRuns
             | DialogField::ExecutorWeekThreshold
             | DialogField::ExecutorFiveHourThreshold
             | DialogField::Backend
@@ -7881,6 +7998,8 @@ fn field_consumes_horizontal(field: DialogField) -> bool {
             | DialogField::DesignerModel
             | DialogField::ReviewerBackend
             | DialogField::ReviewerModel
+            | DialogField::ArbiterBackend
+            | DialogField::ArbiterModel
             | DialogField::ExecutorMiddle1
             | DialogField::ExecutorMiddle2
             | DialogField::ExecutorMiddle3
@@ -7988,6 +8107,10 @@ fn slot_selection_snapshot(modal: &ModalState, field: DialogField) -> SlotSelect
             backend: modal.reviewer_backend_selected(),
             model: modal.reviewer_model_selected(),
         },
+        AgentSlot::Arbiter => SlotSelection {
+            backend: modal.arbiter_backend_selected(),
+            model: modal.arbiter_model_selected(),
+        },
     }
 }
 
@@ -8026,6 +8149,10 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::ReviewerModel => Some(modal.reviewer_model_selected()),
         DialogField::ReviewerEffort => Some(modal.reviewer.effort_selected),
         DialogField::ReviewerAgent => Some(modal.reviewer.agent_selected),
+        DialogField::ArbiterBackend => Some(modal.arbiter_backend_selected()),
+        DialogField::ArbiterModel => Some(modal.arbiter_model_selected()),
+        DialogField::ArbiterEffort => Some(modal.arbiter.effort_selected),
+        DialogField::ArbiterAgent => Some(modal.arbiter.agent_selected),
         DialogField::ReviewerOnChanges => Some(modal.reviewer_on_changes_selected),
         DialogField::ExecutorMiddle1
         | DialogField::ExecutorMiddle2
@@ -8040,6 +8167,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::AgentSettings
         | DialogField::DesignerAgentSettings
         | DialogField::ReviewerAgentSettings
+        | DialogField::ArbiterAgentSettings
         | DialogField::TaskOptions
         | DialogField::Readonly
         | DialogField::Silence
@@ -8065,6 +8193,10 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::DesignerEnabled
         | DialogField::ReviewerEnabled
         | DialogField::ReviewerMaxRounds
+        | DialogField::AutoModeEnabled
+        | DialogField::AutoModeArbiter
+        | DialogField::AutoModeArbiterTimeout
+        | DialogField::AutoModeMaxResolverRuns
         | DialogField::ExecutorWeekThreshold
         | DialogField::ExecutorFiveHourThreshold
         | DialogField::IsolationStatus
@@ -8551,6 +8683,43 @@ fn parse_orchestration_modal(
         reviewer_agent: modal.agent_text_for(AgentSlot::Reviewer),
         reviewer_on_changes,
         reviewer_max_rounds,
+    })
+}
+
+/// The Auto tab as auto-mode settings; both numbers must be integers, and
+/// the arbiter timeout positive.
+fn parse_auto_mode(
+    modal: &ModalState,
+) -> std::result::Result<crate::core::global::AutoMode, (DialogField, String)> {
+    let timeout = parse_cap_field(
+        &modal.auto_mode_arbiter_timeout,
+        DialogField::AutoModeArbiterTimeout,
+        "Arbiter timeout",
+    )?;
+    if timeout == 0 {
+        return Err((
+            DialogField::AutoModeArbiterTimeout,
+            "Arbiter timeout must be at least 1 second".to_string(),
+        ));
+    }
+    let resolver_runs = parse_cap_field(
+        &modal.auto_mode_max_resolver_runs,
+        DialogField::AutoModeMaxResolverRuns,
+        "Max resolver runs",
+    )?;
+    Ok(crate::core::global::AutoMode {
+        enabled: modal.auto_mode_enabled,
+        questions: if modal.auto_mode_arbiter {
+            AutoQuestions::Arbiter
+        } else {
+            AutoQuestions::Decide
+        },
+        arbiter_backend: modal.backend_text_for(AgentSlot::Arbiter),
+        arbiter_model: modal.model_text_for(AgentSlot::Arbiter),
+        arbiter_effort: modal.effort_text_for(AgentSlot::Arbiter),
+        arbiter_agent: modal.agent_text_for(AgentSlot::Arbiter),
+        arbiter_timeout_secs: timeout as u64,
+        max_resolver_runs: u32::try_from(resolver_runs).unwrap_or(u32::MAX),
     })
 }
 

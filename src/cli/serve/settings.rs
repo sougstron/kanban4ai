@@ -104,6 +104,49 @@ fn pending(local: &VersionVector, acknowledged: &VersionVector) -> u64 {
         .sum()
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BoardPeer {
+    pub name: String,
+    pub role: NodeRole,
+    pub code: String,
+    pub exchange: Option<chrono::DateTime<chrono::Utc>>,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    pub pending: u64,
+}
+
+/// Lightweight board status: no systemd or clone subprocesses.
+pub(crate) fn board_peers(root: &Path) -> Result<Vec<BoardPeer>> {
+    let config = discovery::config(root)?;
+    if config.peers.is_empty() {
+        return Ok(Vec::new());
+    }
+    let local = Journal::open(root)?.vector()?;
+    let exchanges: BTreeMap<String, Exchange> = discovery::load(&root.join("sync/exchanges.yaml"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let statuses = runtime.block_on(discovery::probes(root))?;
+    Ok(config
+        .peers
+        .iter()
+        .map(|peer| {
+            let status = statuses.iter().find(|s| s.node == peer.node.node_id);
+            let exchange = exchanges.get(&peer.node.node_id);
+            BoardPeer {
+                name: peer.node.name.clone(),
+                role: peer.node.role,
+                code: status.map_or("OFFLINE", |s| s.code).into(),
+                exchange: exchange.and_then(|e| e.at),
+                since: status.and_then(|s| s.since.or(s.last_seen)),
+                pending: pending(
+                    &local,
+                    &exchange.map(|e| e.acknowledged.clone()).unwrap_or_default(),
+                ),
+            }
+        })
+        .collect())
+}
+
 pub(super) fn clone_line(value: &Value) -> String {
     let text = |key| value[key].as_str().unwrap_or("—");
     let state = text("state");

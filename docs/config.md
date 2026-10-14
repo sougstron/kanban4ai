@@ -128,6 +128,40 @@ they are edited: press `s` on the Projects screen. Saved under the store
 - `net.tailscale.socks_port`: `1055`, loopback SOCKS5 listener in managed mode.
 - `net.tailscale.auth_key_file`: null, or a one-time key file path (relative paths resolve under the store). Used by `net up` and managed startup; chmod 0600, deleted only after confirmed login. No key content is stored in config or passed in process arguments. These settings and `<store>/net/` stay machine-local; see `docs/sync.md` §11.5.
 
+### Auto mode (`auto_mode:`)
+One machine-wide switch for unattended, long autonomous work on every
+project; turned on and off only here (Global Settings → Auto tab, or
+`kanban auto-mode on|off`). It may be switched while tasks run or already
+have open questions — every queue pump (`dispatch_queue`, from the TUI tick,
+the daemon, `check-sessions` and agent exits) runs `auto_mode_sweep` and
+handles what is already on the board.
+- `auto_mode.enabled`: false.
+- `auto_mode.questions`: `decide` (default) or `arbiter`.
+  - `decide`: agent questions (`ask`, `ask-form`, `ask --wait`) are refused
+    and the prompt is the silence-mode prompt; questions already open are
+    answered by the system with "decide yourself, record it with
+    `kanban suggest`".
+  - `arbiter`: questions are accepted, but never move the task to Review.
+    A detached `kanban arbiter <TASK-ID>` runs the arbiter bot with the task
+    description, context and open questions; it answers through
+    `kanban answer`, and the answer resumes the run as usual. A question the
+    arbiter leaves open, an arbiter that cannot start, or one that outlives
+    `arbiter_timeout` (marker `.kanban/arbiter/<TASK-ID>.run`) falls back to
+    the `decide` answer, so no question waits for a human.
+  - Human-authored questions and the executor-pool quota question are never
+    answered. A task an earlier question parked in Review is handed back to
+    the queue once its questions are answered.
+- `auto_mode.arbiter.{backend,model,effort,agent}`: the arbiter bot; blanks
+  inherit the default agent and that backend's defaults (like the
+  designer/reviewer bots).
+- `auto_mode.arbiter_timeout`: 900 seconds.
+- `auto_mode.max_resolver_runs`: 3 - a conflicted landing goes straight back
+  to the same task model for resolution (as `isolation.on_conflict:
+  resolver` does), also for conflicts already sitting in Review, until this
+  many resolver runs did not clear it; then it is left for the human. The
+  count (`Task.resolver_runs`) resets on a clean landing or a human restart.
+- `auto_mode` stays machine-local under sync.
+
 ### Inheriting settings from the global config
 Project settings come in eight groups, each of which either follows the
 global config or uses the project's own keys. The project file records the

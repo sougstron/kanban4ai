@@ -81,8 +81,8 @@ fn copy_task_creates_an_independent_task_and_thread() {
     assert_eq!(copied.description, source.description);
     assert_eq!(copied.ai_model, source.ai_model);
     assert_eq!(copied.interactive, source.interactive);
-    assert_eq!(copied.status, TaskStatus::Review);
-    assert!(copied.completed_at.is_some());
+    assert_eq!(copied.status, TaskStatus::Todo);
+    assert!(copied.completed_at.is_none());
     assert!(!copied.designed);
     assert!(copied.session.is_none());
     assert!(copied.worktree.is_none());
@@ -4660,7 +4660,6 @@ fn window_of(label: &str, remaining: f64, resets_at: i64) -> LimitWindow {
         remaining_percent: remaining,
         resets_at: Some(resets_at),
         rolling: false,
-        spent_usd: None,
     }
 }
 

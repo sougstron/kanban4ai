@@ -483,6 +483,26 @@ pub struct Task {
     /// Published WIP seed for a fresh session after a node handoff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_from: Option<String>,
+    /// When this task entered the queue as new work (a human run, a queue
+    /// action, a chain or dependency hand-off — not a resume of a run that
+    /// already started). Only such entries are held while the board has a
+    /// merge conflict, and held ones are released first-in first-out.
+    /// Cleared when the dispatcher claims the task. Omitted while unset.
+    #[serde(
+        default,
+        with = "timefmt::serde_naive_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub queued_at: Option<NaiveDateTime>,
+    /// The dispatcher is holding this queued task until every merge conflict
+    /// on the board is resolved. Omitted while false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub conflict_held: bool,
+    /// Automatic conflict-resolver runs dispatched since the task last
+    /// landed cleanly or a human restarted it; auto mode stops re-dispatching
+    /// at `auto_mode.max_resolver_runs`. Omitted while zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub resolver_runs: u32,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -550,6 +570,9 @@ impl Task {
             runner: None,
             runner_request: None,
             continue_from: None,
+            queued_at: None,
+            conflict_held: false,
+            resolver_runs: 0,
         }
     }
 
@@ -571,6 +594,7 @@ impl Task {
     pub fn reset_human_restart(&mut self) {
         self.reset_auto_restart();
         self.review_rounds = 0;
+        self.resolver_runs = 0;
     }
 }
 

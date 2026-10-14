@@ -15,7 +15,7 @@
 //!
 //! Every provider segment is clickable: a click refreshes that provider on
 //! the spot (claude force-polls the usage endpoint; grok renews its token via
-//! the grok CLI; zai, synthetic, kimi, and gemini re-fetch — see
+//! the grok CLI; zai, synthetic, and kimi re-fetch — see
 //! [`crate::core::limits::refresh_provider_async`]).
 
 use ratatui::Frame;
@@ -55,7 +55,6 @@ fn provider_color(app: &App, provider: &str) -> Color {
         "zai" => Color::Rgb(112, 145, 219),
         "synthetic" => Color::Rgb(178, 142, 212),
         "kimi" => Color::Rgb(232, 196, 104),
-        "gemini" => Color::Rgb(96, 156, 250),
         _ => app.theme.fg,
     }
 }
@@ -68,7 +67,6 @@ pub fn provider_icon(provider: &str) -> &'static str {
         "zai" => "◆",
         "synthetic" => "✦",
         "kimi" => "☾",
-        "gemini" => "✧",
         _ => "•",
     }
 }
@@ -262,14 +260,10 @@ fn provider_block(
                 Style::default().fg(app.theme.muted),
             ));
         }
-        // A spend tally (gemini's API key) has no ceiling: show the amount.
-        line.push(match window.spent_usd {
-            Some(usd) => Span::styled(limits::format_usd(usd), Style::default().fg(app.theme.fg)),
-            None => Span::styled(
-                format!("{:.0}%", window.remaining_percent),
-                Style::default().fg(percent_color(app, window.remaining_percent)),
-            ),
-        });
+        line.push(Span::styled(
+            format!("{:.0}%", window.remaining_percent),
+            Style::default().fg(percent_color(app, window.remaining_percent)),
+        ));
         if detail == Detail::Full
             && let Some(seconds) = window.resets_in(now)
         {
@@ -305,14 +299,12 @@ fn provider_block(
     })
 }
 
-/// Windows of a day or less go on the upper line: hour/minute lengths and
-/// gemini's daily per-model quotas. Weekly, monthly, and anything else go
-/// below.
+/// Hour/minute windows go on the upper line. Weekly, monthly, and anything
+/// else go below.
 fn is_short_window(label: &str) -> bool {
-    matches!(label, "pro" | "flash" | "lite" | "quota")
-        || label
-            .strip_suffix(['m', 'h'])
-            .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+    label
+        .strip_suffix(['m', 'h'])
+        .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn state_label(state: &ProviderState, detail: Detail) -> &'static str {

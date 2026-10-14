@@ -274,8 +274,9 @@ impl Journal {
         load(&self.root.join("meta/state.json"))
     }
 
-    /// Field conflicts the last remote apply recorded (`meta/conflicts.jsonl`).
+    /// Active field conflicts; historical records remain in `meta/conflicts.jsonl`.
     pub fn conflicts(&self) -> Result<Vec<Conflict>> {
+        let state = self.state()?;
         let text = match fs::read_to_string(self.root.join("meta/conflicts.jsonl")) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -283,7 +284,17 @@ impl Journal {
         };
         text.lines()
             .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str(line).map_err(|e| invalid(&e.to_string())))
+            .map(|line| serde_json::from_str::<Conflict>(line).map_err(|e| invalid(&e.to_string())))
+            .filter(|conflict| match conflict {
+                Ok(c) => {
+                    state
+                        .fields
+                        .get(&key(&c.project, &c.entity, &c.id))
+                        .and_then(|field| field.clocks.get(&c.field))
+                        == Some(&c.winner)
+                }
+                Err(_) => true,
+            })
             .collect()
     }
 
@@ -567,6 +578,9 @@ fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
             "crash_restarts",
             "restart_at",
             "auto_resumes",
+            "queued_at",
+            "conflict_held",
+            "resolver_runs",
         ],
         "project" => &["work_path", "migrated_from", "last_opened_at"],
         "config" if global => &[
@@ -576,6 +590,7 @@ fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
             "net",
             "daemon",
             "tui",
+            "auto_mode",
             "recent_models",
         ],
         _ => &[],

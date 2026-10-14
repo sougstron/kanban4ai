@@ -1,4 +1,36 @@
-# Unreleased
+# kanban4ai 0.8.0
+
+Multi-node release: a laptop, a home server and a phone can now share one
+replicated board store. Sync is opt-in — without paired peers boards behave as
+in 0.7.x and existing on-disk boards are read unchanged. The full design is in
+`docs/sync.md`; phone setup is in `docs/android.md`.
+
+- **Replicated board store.** Each node has an identity, a hybrid logical
+  clock and an append-only operation journal. Remote operations are merged
+  per field (last writer wins) with recorded conflicts; task IDs come from
+  leased blocks so offline nodes never collide, with a reserve kept for phones.
+  Local session state is separated from replicated run descriptors.
+
+- **Runner placement and remote runs.** A `runner:` setting (global → project →
+  task; `auto`, `server`, `here`, `laptop`, `mobile`) decides which node runs an
+  agent. Launches are routed to the chosen node together with the task, thread
+  and a code snapshot; finished branches replicate back and land on either node.
+  When the runner is unavailable a dialog offers another node, waiting for it,
+  or cancel. Replicated failure codes (`RUN_NODE_POWERED_OFF`,
+  `RUN_NODE_UNREACHABLE`, `RUNNER_BACKEND_MISSING`, `RUNNER_REPO_MISSING`)
+  explain node-caused failures. Stop, answer and rerun work on a foreign run,
+  and `L` streams its log over LAN/tailnet or shows the latest relay snapshot.
+
+- **Sync header and conflict badges.** With paired peers the board and task
+  detail show a sync status row (last confirmed exchange, offline time, pending
+  operations, reason code). Cards with replicated field conflicts show
+  `⚠ sync`; task detail lists winning/losing values and **Взять другую
+  версию** restores the other value as a new operation.
+
+- **Removed Gemini limits.** Gemini no longer appears in the status row or
+  `kanban limits`, including when loading an older cache. Removed Code Assist
+  quota/OAuth requests, pi spend and exhaustion tracking, and Gemini quota
+  gating for executor pools. Gemini models remain available to agent backends.
 
 - **Continue work on another node.** Periodic and exit/bye checkpoints publish
   dirty worktree files under `refs/kanban/wip/TASK-N` without changing HEAD or
@@ -33,11 +65,7 @@
   early push on local writes, fresh relay availability in probe, dedicated
   store remote or project origins, and optional age encryption with paired
   public keys. Machine-local credentials and Tailscale state are excluded.
-- **Global Settings → Sync.** Node name/role, opt-in API user-unit switch,
-  one-time code/phone QR pairing, phone peer priority, live status explanations
-  and routes, confirmed exchange times, pending operations, conflicts and
-  local/remote Git clone status. Buttons work by keyboard and mouse; long
-  details wrap and PgUp/PgDn reaches the bottom of short dialogs.
+
 - **Settings → Sync → Network.** Immediate Off/System/Managed mode selection,
   live account/IP/online-peer/direct/DERP status, managed Connect/Disconnect/Logout,
   full-screen login URL/QR and masked, non-persisted one-time auth keys. Narrow
@@ -64,6 +92,34 @@
   requests with a configurable deadline, including unfinished HTTP headers.
   AUR packages and `install.sh --with-serve` install the opt-in
   `kanban4ai-serve.service` user unit.
+
+- **Phone portrait layout.** Below 70 columns the board shows one column at a
+  time with one-row cards, `←`/`→` (or tapping the `‹ 1/4 ›` pager) to switch
+  columns, tap-to-open cards and full-width dialogs.
+
+- **Auto mode.** Store-wide `auto_mode:` (Global Settings → Auto tab,
+  `kanban auto-mode on|off`): agent questions are either decided by the agent
+  itself or answered by a detached arbiter agent with its own backend/model and
+  timeout, falling back to “decide”. Conflicted landings go back to the same
+  model, capped by `max_resolver_runs`.
+
+- **Merge-conflict hold.** A merge conflict on a board latches a board-level
+  conflict mode: new queue entries are held (`⏸ conflict hold`) until no
+  conflicts remain and no agent is running, then released FIFO ahead of the
+  board order.
+
+- **TUI keys.** `Ctrl+C` in an open task's thread copies the task and its
+  thread to a fresh To Do task from any column, including Archive; everywhere
+  else `Ctrl+C` exits (twice within three seconds). Board columns and the
+  thread scroll faster with `Shift+↑/↓` (3 rows) and `Ctrl+↑/↓` (10 rows). The
+  growing description field now stops at 15 visible rows instead of 20.
+
+- **Lower idle CPU on long uptimes.** Peer probes, Tailscale supervision and the
+  Sync network status are rate-limited; token-log scraping is incremental; the
+  log pager reads only the shown tail; idle transcript/token caches are evicted.
+
+- **Documentation.** New `docs/sync.md` (design, pairing and server/laptop
+  setup) and `docs/android.md` (kanban4ai on a phone in proot Arch).
 
 # kanban4ai 0.7.6
 

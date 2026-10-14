@@ -33,7 +33,13 @@ pub fn render_card(
     } else {
         app.theme.border
     };
-    let line_width = area.width.saturating_sub(2).max(1) as usize;
+    let compact = area.height == 1;
+    let line_width = if compact {
+        area.width
+    } else {
+        area.width.saturating_sub(2)
+    }
+    .max(1) as usize;
     let query = app.search.text();
     let id_style = if focused || hovered {
         Style::default()
@@ -43,10 +49,23 @@ pub fn render_card(
         Style::default().fg(app.theme.muted)
     };
     let visible_id = truncate_display(&sanitize_terminal_text(&task.id), line_width);
-    let visible_title = truncate_display(&sanitize_terminal_text(&task.title), line_width);
+    let title_width = if compact {
+        line_width.saturating_sub(
+            UnicodeWidthStr::width(visible_id.as_str())
+                + 1
+                + 2 * usize::from(task.review_unseen)
+                + 2 * usize::from(task.has_questions),
+        )
+    } else {
+        line_width
+    };
+    let visible_title = truncate_display(&sanitize_terminal_text(&task.title), title_width);
     let mut title_spans = Vec::new();
     if task.review_unseen {
         title_spans.push(Span::styled("● ", Style::default().fg(app.theme.warn)));
+    }
+    if compact && task.has_questions {
+        title_spans.push(Span::styled("? ", Style::default().fg(app.theme.warn)));
     }
     title_spans.extend(highlight_matches(
         &visible_id,
@@ -61,6 +80,16 @@ pub fn render_card(
         Style::default(),
         app.theme.warn,
     ));
+    if compact {
+        let style = Style::default().bg(app.theme.bg).fg(app.theme.fg);
+        let style = if focused || hovered || dragging {
+            style.add_modifier(Modifier::REVERSED)
+        } else {
+            style
+        };
+        frame.render_widget(Paragraph::new(Line::from(title_spans)).style(style), area);
+        return;
+    }
     let mut lines = vec![Line::from(title_spans)];
     let extra = app.board.extras.get(&task.id);
     // The open question goes right under the title: it is the thing the
@@ -292,6 +321,9 @@ pub fn badges(
             badges.push((run.label(), app.theme.focus));
         }
     }
+    if app.sync_board.has_conflict(&task.id) {
+        badges.push(("⚠ sync".to_string(), app.theme.warn));
+    }
     // Conflict is the one blocking isolation state (the report sits in
     // review_edits and a human must resolve it), so it leads the card and
     // displaces the plain worktree badge it implies.
@@ -315,6 +347,8 @@ pub fn badges(
                 Some(crate::core::config::Runner::Server) => "⏸ ждёт server",
                 Some(crate::core::config::Runner::Laptop) => "⏸ ждёт laptop",
                 Some(crate::core::config::Runner::Mobile) => "⏸ ждёт mobile",
+                // Parked by the merge-conflict hold, not by a full board.
+                _ if task.conflict_held => "⏸ conflict hold",
                 _ => "⏸ queued",
             },
             app.theme.warn,

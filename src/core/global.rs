@@ -37,6 +37,86 @@ pub const DEFAULT_DAEMON_INTERVAL_SECS: u64 = 60;
 /// Default hours between automatic update checks (`updates.check_interval_hours`).
 pub const DEFAULT_CHECK_INTERVAL_HOURS: u64 = 24;
 
+/// Default seconds an arbiter run may take before its questions fall back to
+/// the `decide` answer (`auto_mode.arbiter_timeout`).
+pub const DEFAULT_ARBITER_TIMEOUT_SECS: u64 = 900;
+
+/// Default automatic conflict-resolver runs per task before auto mode leaves
+/// the conflict to the human (`auto_mode.max_resolver_runs`).
+pub const DEFAULT_MAX_RESOLVER_RUNS: u32 = 3;
+
+/// What auto mode does with an agent question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoQuestions {
+    /// Questions are refused (open ones are answered with a "decide
+    /// yourself" note): the agent works on its own judgment.
+    Decide,
+    /// A separate arbiter agent reads the task context and answers.
+    Arbiter,
+}
+
+impl AutoQuestions {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoQuestions::Decide => "decide",
+            AutoQuestions::Arbiter => "arbiter",
+        }
+    }
+
+    /// Unknown values read as `decide`, the mode that needs no extra agent.
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "arbiter" => AutoQuestions::Arbiter,
+            _ => AutoQuestions::Decide,
+        }
+    }
+}
+
+/// Auto mode: autonomous, unattended work on every project. Questions never
+/// wait for a human, and a conflicted landing is sent straight back to the
+/// same model for resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoMode {
+    pub enabled: bool,
+    pub questions: AutoQuestions,
+    /// The arbiter bot (`auto_mode.arbiter.{backend,model,effort,agent}`);
+    /// blanks inherit the default agent and its configured defaults.
+    pub arbiter_backend: Option<String>,
+    pub arbiter_model: Option<String>,
+    pub arbiter_effort: Option<String>,
+    pub arbiter_agent: Option<String>,
+    pub arbiter_timeout_secs: u64,
+    pub max_resolver_runs: u32,
+}
+
+impl Default for AutoMode {
+    fn default() -> Self {
+        AutoMode {
+            enabled: false,
+            questions: AutoQuestions::Decide,
+            arbiter_backend: None,
+            arbiter_model: None,
+            arbiter_effort: None,
+            arbiter_agent: None,
+            arbiter_timeout_secs: DEFAULT_ARBITER_TIMEOUT_SECS,
+            max_resolver_runs: DEFAULT_MAX_RESOLVER_RUNS,
+        }
+    }
+}
+
+impl AutoMode {
+    /// The arbiter as role-bot settings for launch resolution.
+    pub fn arbiter_bot(&self) -> super::config::BotSettings {
+        super::config::BotSettings {
+            enabled: true,
+            backend: self.arbiter_backend.clone(),
+            model: self.arbiter_model.clone(),
+            effort: self.arbiter_effort.clone(),
+            agent: self.arbiter_agent.clone(),
+        }
+    }
+}
+
 /// Map any stored value onto a known ordering; unknown values read as `name`.
 pub fn normalize_project_sort(value: &str) -> &'static str {
     match value {
@@ -72,6 +152,10 @@ pub struct GlobalConfig {
     pub orchestration: Mapping,
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
     pub runner: Mapping,
+    /// Machine-wide auto mode (see [`AutoMode`]): one switch for every
+    /// project, so it lives here rather than in any board's config.
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub auto_mode: Mapping,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
@@ -295,6 +379,100 @@ impl GlobalConfig {
     }
 }
 
+impl GlobalConfig {
+    /// The auto-mode section; missing or malformed keys read as defaults
+    /// (auto mode off).
+    pub fn auto_mode(&self) -> AutoMode {
+        let get = |key: &str| self.auto_mode.get(Value::String(key.to_string()));
+        let arbiter = get("arbiter").and_then(Value::as_mapping);
+        let arbiter_str = |key: &str| {
+            arbiter
+                .and_then(|m| m.get(Value::String(key.to_string())))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        AutoMode {
+            enabled: get("enabled").and_then(as_bool).unwrap_or(false),
+            questions: get("questions")
+                .and_then(Value::as_str)
+                .map(AutoQuestions::parse)
+                .unwrap_or(AutoQuestions::Decide),
+            arbiter_backend: arbiter_str("backend"),
+            arbiter_model: arbiter_str("model"),
+            arbiter_effort: arbiter_str("effort"),
+            arbiter_agent: arbiter_str("agent"),
+            arbiter_timeout_secs: get("arbiter_timeout")
+                .and_then(positive_u64)
+                .unwrap_or(DEFAULT_ARBITER_TIMEOUT_SECS),
+            max_resolver_runs: get("max_resolver_runs")
+                .and_then(|v| match v {
+                    Value::Number(n) => n.as_u64(),
+                    Value::String(s) => s.trim().parse().ok(),
+                    _ => None,
+                })
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(DEFAULT_MAX_RESOLVER_RUNS),
+        }
+    }
+
+    /// Store `mode` as the auto-mode section. Unknown keys in the section
+    /// are kept; blank arbiter fields drop their key.
+    pub fn set_auto_mode(&mut self, mode: &AutoMode) {
+        let key = |k: &str| Value::String(k.to_string());
+        self.auto_mode
+            .insert(key("enabled"), Value::Bool(mode.enabled));
+        self.auto_mode.insert(
+            key("questions"),
+            Value::String(mode.questions.as_str().to_string()),
+        );
+        let mut arbiter = self
+            .auto_mode
+            .get(key("arbiter"))
+            .and_then(Value::as_mapping)
+            .cloned()
+            .unwrap_or_default();
+        for (name, value) in [
+            ("backend", &mode.arbiter_backend),
+            ("model", &mode.arbiter_model),
+            ("effort", &mode.arbiter_effort),
+            ("agent", &mode.arbiter_agent),
+        ] {
+            match value.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                Some(v) => {
+                    arbiter.insert(key(name), Value::String(v.to_string()));
+                }
+                None => {
+                    arbiter.remove(key(name));
+                }
+            }
+        }
+        if arbiter.is_empty() {
+            self.auto_mode.remove(key("arbiter"));
+        } else {
+            self.auto_mode
+                .insert(key("arbiter"), Value::Mapping(arbiter));
+        }
+        if mode.arbiter_timeout_secs != DEFAULT_ARBITER_TIMEOUT_SECS
+            || self.auto_mode.contains_key(key("arbiter_timeout"))
+        {
+            self.auto_mode.insert(
+                key("arbiter_timeout"),
+                Value::Number(mode.arbiter_timeout_secs.into()),
+            );
+        }
+        if mode.max_resolver_runs != DEFAULT_MAX_RESOLVER_RUNS
+            || self.auto_mode.contains_key(key("max_resolver_runs"))
+        {
+            self.auto_mode.insert(
+                key("max_resolver_runs"),
+                Value::Number(mode.max_resolver_runs.into()),
+            );
+        }
+    }
+}
+
 /// Parse a global config file; a missing or blank file yields defaults.
 pub fn read_global_config(path: &Path) -> Result<GlobalConfig> {
     match fs::read_to_string(path) {
@@ -360,6 +538,45 @@ impl ProjectStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_mode_defaults_round_trip_and_unknown_values() {
+        let dir = tempfile::tempdir().expect("store");
+        let store = ProjectStore::at(dir.path());
+        let config = store.load_global_config().unwrap();
+        assert_eq!(config.auto_mode(), AutoMode::default());
+
+        let mut config = store.load_global_config().unwrap();
+        config.set_auto_mode(&AutoMode {
+            enabled: true,
+            questions: AutoQuestions::Arbiter,
+            arbiter_backend: Some("claude".into()),
+            arbiter_model: Some("opus".into()),
+            arbiter_effort: Some(" ".into()),
+            arbiter_agent: None,
+            arbiter_timeout_secs: 120,
+            max_resolver_runs: 5,
+        });
+        store.save_global_config(&config).expect("save");
+        let mode = store.load_global_config().unwrap().auto_mode();
+        assert!(mode.enabled);
+        assert_eq!(mode.questions, AutoQuestions::Arbiter);
+        assert_eq!(mode.arbiter_backend.as_deref(), Some("claude"));
+        assert_eq!(mode.arbiter_model.as_deref(), Some("opus"));
+        assert_eq!(mode.arbiter_effort, None);
+        assert_eq!(mode.arbiter_timeout_secs, 120);
+        assert_eq!(mode.max_resolver_runs, 5);
+
+        std::fs::write(
+            store.global_config_path(),
+            "auto_mode:\n  enabled: yes\n  questions: bogus\n  arbiter_timeout: 0\n",
+        )
+        .expect("seed");
+        let mode = store.load_global_config().unwrap().auto_mode();
+        assert!(mode.enabled);
+        assert_eq!(mode.questions, AutoQuestions::Decide);
+        assert_eq!(mode.arbiter_timeout_secs, DEFAULT_ARBITER_TIMEOUT_SECS);
+    }
 
     #[test]
     fn missing_file_yields_defaults() {

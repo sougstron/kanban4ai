@@ -113,6 +113,7 @@ pub enum DialogField {
     AgentSettings,
     DesignerAgentSettings,
     ReviewerAgentSettings,
+    ArbiterAgentSettings,
     TaskOptions,
     Backend,
     Model,
@@ -163,6 +164,16 @@ pub enum DialogField {
     ReviewerAgent,
     ReviewerOnChanges,
     ReviewerMaxRounds,
+    ArbiterBackend,
+    ArbiterModel,
+    ArbiterEffort,
+    ArbiterAgent,
+    /// Global Settings Auto page: the machine-wide auto-mode switch.
+    AutoModeEnabled,
+    /// Auto mode: an arbiter agent answers questions (off: agents decide).
+    AutoModeArbiter,
+    AutoModeArbiterTimeout,
+    AutoModeMaxResolverRuns,
     ExecutorMiddle1,
     ExecutorMiddle2,
     ExecutorMiddle3,
@@ -226,6 +237,8 @@ pub enum SettingsTab {
     Projects,
     /// Global Settings only: this node, its peers and replication state.
     Sync,
+    /// Global Settings only: machine-wide auto mode.
+    Auto,
 }
 
 impl SettingsTab {
@@ -239,11 +252,12 @@ impl SettingsTab {
 
     /// The Global Settings strip: every project tab plus Backends, Projects
     /// and Sync.
-    pub const GLOBAL: [SettingsTab; 7] = [
+    pub const GLOBAL: [SettingsTab; 8] = [
         SettingsTab::Common,
         SettingsTab::Designer,
         SettingsTab::Reviewer,
         SettingsTab::Executor,
+        SettingsTab::Auto,
         SettingsTab::Backends,
         SettingsTab::Projects,
         SettingsTab::Sync,
@@ -259,6 +273,7 @@ impl SettingsTab {
             SettingsTab::Backends => "Backends",
             SettingsTab::Projects => "Projects",
             SettingsTab::Sync => "Sync",
+            SettingsTab::Auto => "Auto",
         }
     }
 
@@ -273,6 +288,7 @@ impl SettingsTab {
             SettingsTab::Backends => "Bck",
             SettingsTab::Projects => "Prj",
             SettingsTab::Sync => "Syn",
+            SettingsTab::Auto => "Aut",
         }
     }
 
@@ -397,6 +413,17 @@ const GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS: [DialogField; 3] = [
     DialogField::Cancel,
 ];
 
+/// The Global Settings Auto page: machine-wide auto mode.
+const GLOBAL_SETTINGS_PAGE_AUTO_FIELDS: [DialogField; 7] = [
+    DialogField::AutoModeEnabled,
+    DialogField::AutoModeArbiter,
+    DialogField::ArbiterAgentSettings,
+    DialogField::AutoModeArbiterTimeout,
+    DialogField::AutoModeMaxResolverRuns,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
 /// The Global Settings Sync page. Its changes apply at once; Save and
 /// Cancel still close the dialog as on every other tab.
 const GLOBAL_SETTINGS_PAGE_SYNC_FIELDS: [DialogField; 3] = [
@@ -410,9 +437,11 @@ const GLOBAL_SETTINGS_PAGE_SYNC_FIELDS: [DialogField; 3] = [
 /// Global Settings never shows Instructions; it falls back to Common too.
 pub(crate) fn settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
     match tab {
-        SettingsTab::Common | SettingsTab::Backends | SettingsTab::Projects | SettingsTab::Sync => {
-            &SETTINGS_PAGE_COMMON_FIELDS
-        }
+        SettingsTab::Common
+        | SettingsTab::Backends
+        | SettingsTab::Projects
+        | SettingsTab::Sync
+        | SettingsTab::Auto => &SETTINGS_PAGE_COMMON_FIELDS,
         SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS,
         SettingsTab::Reviewer => &SETTINGS_PAGE_REVIEWER_FIELDS,
         SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS,
@@ -430,6 +459,7 @@ pub(crate) fn global_settings_page_fields(tab: SettingsTab) -> &'static [DialogF
         SettingsTab::Backends => &GLOBAL_SETTINGS_PAGE_BACKENDS_FIELDS,
         SettingsTab::Projects => &GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS,
         SettingsTab::Sync => &GLOBAL_SETTINGS_PAGE_SYNC_FIELDS,
+        SettingsTab::Auto => &GLOBAL_SETTINGS_PAGE_AUTO_FIELDS,
     }
 }
 
@@ -483,6 +513,11 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         DialogField::BackendOrder => Some(SettingsTab::Backends),
         DialogField::ProjectVisibility => Some(SettingsTab::Projects),
         DialogField::SyncPanel => Some(SettingsTab::Sync),
+        DialogField::AutoModeEnabled
+        | DialogField::AutoModeArbiter
+        | DialogField::ArbiterAgentSettings
+        | DialogField::AutoModeArbiterTimeout
+        | DialogField::AutoModeMaxResolverRuns => Some(SettingsTab::Auto),
         _ => None,
     }
 }
@@ -576,6 +611,15 @@ const REVIEWER_AGENT_FIELDS: [DialogField; 6] = [
     DialogField::Cancel,
 ];
 
+const ARBITER_AGENT_FIELDS: [DialogField; 6] = [
+    DialogField::ArbiterBackend,
+    DialogField::ArbiterModel,
+    DialogField::ArbiterEffort,
+    DialogField::ArbiterAgent,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalButton {
     Save,
@@ -592,6 +636,8 @@ pub enum AgentSlot {
     Primary,
     Designer,
     Reviewer,
+    /// Global Settings only: the auto-mode arbiter.
+    Arbiter,
 }
 
 /// Compact one-line-per-entry map editors live in these textareas:
@@ -823,6 +869,11 @@ pub struct ModalState {
     pub executor_five_hour_threshold: TextArea<'static>,
     pub reviewer_on_changes_selected: usize,
     pub reviewer_max_rounds: TextArea<'static>,
+    pub(crate) arbiter: AgentPicker,
+    pub auto_mode_enabled: bool,
+    pub auto_mode_arbiter: bool,
+    pub auto_mode_arbiter_timeout: TextArea<'static>,
+    pub auto_mode_max_resolver_runs: TextArea<'static>,
     /// Availability probe for the current project, taken once when the
     /// settings dialog opens (the probe runs git subprocesses).
     pub isolation_status: Option<Availability>,
@@ -933,6 +984,11 @@ impl ModalState {
             reviewer_on_changes_options: Vec::new(),
             reviewer_on_changes_selected: 0,
             reviewer_max_rounds: one_line("3"),
+            arbiter: AgentPicker::new(),
+            auto_mode_enabled: false,
+            auto_mode_arbiter: false,
+            auto_mode_arbiter_timeout: one_line("900"),
+            auto_mode_max_resolver_runs: one_line("3"),
             isolation_status: None,
             inherit: InheritFlags::all(false),
             global_view: None,
@@ -1198,6 +1254,8 @@ impl ModalState {
             DialogField::MaxRunningPerBackendModel => &mut self.max_running_per_backend_model,
             DialogField::AutoRestartDelays => &mut self.auto_restart_delays,
             DialogField::ReviewerMaxRounds => &mut self.reviewer_max_rounds,
+            DialogField::AutoModeArbiterTimeout => &mut self.auto_mode_arbiter_timeout,
+            DialogField::AutoModeMaxResolverRuns => &mut self.auto_mode_max_resolver_runs,
             DialogField::ExecutorWeekThreshold => &mut self.executor_week_threshold,
             DialogField::ExecutorFiveHourThreshold => &mut self.executor_five_hour_threshold,
             _ => return None,
@@ -1261,6 +1319,10 @@ impl ModalState {
             | DialogField::ReviewerModel
             | DialogField::ReviewerEffort
             | DialogField::ReviewerAgent => Some(AgentSlot::Reviewer),
+            DialogField::ArbiterBackend
+            | DialogField::ArbiterModel
+            | DialogField::ArbiterEffort
+            | DialogField::ArbiterAgent => Some(AgentSlot::Arbiter),
             _ => None,
         }
     }
@@ -1270,6 +1332,7 @@ impl ModalState {
             DialogField::AgentSettings => Some(AgentSlot::Primary),
             DialogField::DesignerAgentSettings => Some(AgentSlot::Designer),
             DialogField::ReviewerAgentSettings => Some(AgentSlot::Reviewer),
+            DialogField::ArbiterAgentSettings => Some(AgentSlot::Arbiter),
             _ => None,
         }
     }
@@ -1385,6 +1448,7 @@ impl ModalState {
             },
             AgentSlot::Designer => self.designer.clone(),
             AgentSlot::Reviewer => self.reviewer.clone(),
+            AgentSlot::Arbiter => self.arbiter.clone(),
         }
     }
 
@@ -1408,6 +1472,7 @@ impl ModalState {
             }
             AgentSlot::Designer => self.designer = picker,
             AgentSlot::Reviewer => self.reviewer = picker,
+            AgentSlot::Arbiter => self.arbiter = picker,
         }
     }
 
@@ -1416,6 +1481,7 @@ impl ModalState {
             AgentSlot::Primary => None,
             AgentSlot::Designer => Some(&self.designer),
             AgentSlot::Reviewer => Some(&self.reviewer),
+            AgentSlot::Arbiter => Some(&self.arbiter),
         }
     }
 
@@ -1424,6 +1490,7 @@ impl ModalState {
             AgentSlot::Primary => None,
             AgentSlot::Designer => Some(&mut self.designer),
             AgentSlot::Reviewer => Some(&mut self.reviewer),
+            AgentSlot::Arbiter => Some(&mut self.arbiter),
         }
     }
 
@@ -1443,11 +1510,20 @@ impl ModalState {
         self.reviewer.model_selected
     }
 
+    pub fn arbiter_backend_selected(&self) -> usize {
+        self.arbiter.backend_selected
+    }
+
+    pub fn arbiter_model_selected(&self) -> usize {
+        self.arbiter.model_selected
+    }
+
     pub fn backend_text_for(&self, slot: AgentSlot) -> Option<String> {
         match slot {
             AgentSlot::Primary => self.backend_text(),
             AgentSlot::Designer => non_empty(textarea_text(&self.designer.backend)),
             AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.backend)),
+            AgentSlot::Arbiter => non_empty(textarea_text(&self.arbiter.backend)),
         }
     }
 
@@ -1456,6 +1532,7 @@ impl ModalState {
             AgentSlot::Primary => self.model_text(),
             AgentSlot::Designer => non_empty(textarea_text(&self.designer.model)),
             AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.model)),
+            AgentSlot::Arbiter => non_empty(textarea_text(&self.arbiter.model)),
         }
     }
 
@@ -1464,6 +1541,7 @@ impl ModalState {
             AgentSlot::Primary => self.effort_text(),
             AgentSlot::Designer => non_empty(textarea_text(&self.designer.effort)),
             AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.effort)),
+            AgentSlot::Arbiter => non_empty(textarea_text(&self.arbiter.effort)),
         }
     }
 
@@ -1472,6 +1550,7 @@ impl ModalState {
             AgentSlot::Primary => self.agent_text(),
             AgentSlot::Designer => non_empty(textarea_text(&self.designer.agent)),
             AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.agent)),
+            AgentSlot::Arbiter => non_empty(textarea_text(&self.arbiter.agent)),
         }
     }
 
@@ -1480,6 +1559,7 @@ impl ModalState {
             AgentSlot::Primary => self.backend = one_line(value),
             AgentSlot::Designer => self.designer.backend = one_line(value),
             AgentSlot::Reviewer => self.reviewer.backend = one_line(value),
+            AgentSlot::Arbiter => self.arbiter.backend = one_line(value),
         }
     }
 
@@ -1488,6 +1568,7 @@ impl ModalState {
             AgentSlot::Primary => self.model = one_line(value),
             AgentSlot::Designer => self.designer.model = one_line(value),
             AgentSlot::Reviewer => self.reviewer.model = one_line(value),
+            AgentSlot::Arbiter => self.arbiter.model = one_line(value),
         }
     }
 
@@ -1496,6 +1577,7 @@ impl ModalState {
             AgentSlot::Primary => self.effort = one_line(value),
             AgentSlot::Designer => self.designer.effort = one_line(value),
             AgentSlot::Reviewer => self.reviewer.effort = one_line(value),
+            AgentSlot::Arbiter => self.arbiter.effort = one_line(value),
         }
     }
 
@@ -1504,6 +1586,7 @@ impl ModalState {
             AgentSlot::Primary => self.agent = one_line(value),
             AgentSlot::Designer => self.designer.agent = one_line(value),
             AgentSlot::Reviewer => self.reviewer.agent = one_line(value),
+            AgentSlot::Arbiter => self.arbiter.agent = one_line(value),
         }
     }
 
@@ -1695,7 +1778,9 @@ impl ModalState {
             DialogField::DesignerBackend => Some(self.designer.backend_filter.as_str()),
             DialogField::DesignerModel => Some(self.designer.model_filter.as_str()),
             DialogField::ReviewerBackend => Some(self.reviewer.backend_filter.as_str()),
+            DialogField::ArbiterBackend => Some(self.arbiter.backend_filter.as_str()),
             DialogField::ReviewerModel => Some(self.reviewer.model_filter.as_str()),
+            DialogField::ArbiterModel => Some(self.arbiter.model_filter.as_str()),
             DialogField::ExecutorMiddle1
             | DialogField::ExecutorMiddle2
             | DialogField::ExecutorMiddle3
@@ -1716,7 +1801,9 @@ impl ModalState {
             DialogField::DesignerBackend => Some(&mut self.designer.backend_filter),
             DialogField::DesignerModel => Some(&mut self.designer.model_filter),
             DialogField::ReviewerBackend => Some(&mut self.reviewer.backend_filter),
+            DialogField::ArbiterBackend => Some(&mut self.arbiter.backend_filter),
             DialogField::ReviewerModel => Some(&mut self.reviewer.model_filter),
+            DialogField::ArbiterModel => Some(&mut self.arbiter.model_filter),
             DialogField::ExecutorMiddle1
             | DialogField::ExecutorMiddle2
             | DialogField::ExecutorMiddle3
@@ -1745,9 +1832,13 @@ impl ModalState {
             DialogField::DesignerEffort => &self.designer.effort_options,
             DialogField::DesignerAgent => &self.designer.agent_options,
             DialogField::ReviewerBackend => &self.reviewer.backend_options,
+            DialogField::ArbiterBackend => &self.arbiter.backend_options,
             DialogField::ReviewerModel => &self.reviewer.model_options,
+            DialogField::ArbiterModel => &self.arbiter.model_options,
             DialogField::ReviewerEffort => &self.reviewer.effort_options,
+            DialogField::ArbiterEffort => &self.arbiter.effort_options,
             DialogField::ReviewerAgent => &self.reviewer.agent_options,
+            DialogField::ArbiterAgent => &self.arbiter.agent_options,
             DialogField::ReviewerOnChanges => &self.reviewer_on_changes_options,
             DialogField::ExecutorMiddle1
             | DialogField::ExecutorMiddle2
@@ -1842,6 +1933,7 @@ impl ModalState {
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings
+            | DialogField::ArbiterAgentSettings
             | DialogField::TaskOptions => {}
             DialogField::Runner => {
                 use ratatui::crossterm::event::KeyCode;
@@ -1935,13 +2027,25 @@ impl ModalState {
             DialogField::DesignerAgent => self.input_select(key, SelectorKind::Agent),
             DialogField::ReviewerEnabled => toggle_on_space(&mut self.reviewer_enabled, key),
             DialogField::ReviewerBackend => self.input_select(key, SelectorKind::Backend),
+            DialogField::ArbiterBackend => self.input_select(key, SelectorKind::Backend),
             DialogField::ReviewerModel => self.input_select(key, SelectorKind::Model),
+            DialogField::ArbiterModel => self.input_select(key, SelectorKind::Model),
             DialogField::ReviewerEffort => self.input_select(key, SelectorKind::Effort),
+            DialogField::ArbiterEffort => self.input_select(key, SelectorKind::Effort),
             DialogField::ReviewerAgent => self.input_select(key, SelectorKind::Agent),
+            DialogField::ArbiterAgent => self.input_select(key, SelectorKind::Agent),
             DialogField::ReviewerOnChanges => {
                 self.input_select(key, SelectorKind::ReviewerOnChanges)
             }
             DialogField::ReviewerMaxRounds => input_single_line(&mut self.reviewer_max_rounds, key),
+            DialogField::AutoModeEnabled => toggle_on_space(&mut self.auto_mode_enabled, key),
+            DialogField::AutoModeArbiter => toggle_on_space(&mut self.auto_mode_arbiter, key),
+            DialogField::AutoModeArbiterTimeout => {
+                input_single_line(&mut self.auto_mode_arbiter_timeout, key)
+            }
+            DialogField::AutoModeMaxResolverRuns => {
+                input_single_line(&mut self.auto_mode_max_resolver_runs, key)
+            }
             DialogField::ExecutorMiddle1
             | DialogField::ExecutorMiddle2
             | DialogField::ExecutorMiddle3
@@ -2001,6 +2105,8 @@ impl ModalState {
                 | DialogField::MaxRunningPerBackendModel
                 | DialogField::AutoRestartDelays
                 | DialogField::ReviewerMaxRounds
+                | DialogField::AutoModeArbiterTimeout
+                | DialogField::AutoModeMaxResolverRuns
                 | DialogField::ExecutorWeekThreshold
                 | DialogField::ExecutorFiveHourThreshold
         )
@@ -2056,6 +2162,14 @@ impl ModalState {
             DialogField::ReviewerMaxRounds => {
                 self.reviewer_max_rounds.insert_str(text.replace('\n', " "));
             }
+            DialogField::AutoModeArbiterTimeout => {
+                self.auto_mode_arbiter_timeout
+                    .insert_str(text.replace('\n', " "));
+            }
+            DialogField::AutoModeMaxResolverRuns => {
+                self.auto_mode_max_resolver_runs
+                    .insert_str(text.replace('\n', " "));
+            }
             DialogField::ExecutorWeekThreshold => {
                 self.executor_week_threshold
                     .insert_str(text.replace('\n', " "));
@@ -2085,6 +2199,7 @@ impl ModalState {
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
             | DialogField::ReviewerAgentSettings
+            | DialogField::ArbiterAgentSettings
             | DialogField::TaskOptions
             | DialogField::Readonly
             | DialogField::Silence
@@ -2118,11 +2233,17 @@ impl ModalState {
             DialogField::DesignerEffort => &mut self.designer.effort,
             DialogField::DesignerAgent => &mut self.designer.agent,
             DialogField::ReviewerBackend => &mut self.reviewer.backend,
+            DialogField::ArbiterBackend => &mut self.arbiter.backend,
             DialogField::ReviewerModel => &mut self.reviewer.model,
+            DialogField::ArbiterModel => &mut self.arbiter.model,
             DialogField::ReviewerEffort => &mut self.reviewer.effort,
+            DialogField::ArbiterEffort => &mut self.arbiter.effort,
             DialogField::ReviewerAgent => &mut self.reviewer.agent,
+            DialogField::ArbiterAgent => &mut self.arbiter.agent,
             DialogField::ReviewerOnChanges => &mut self.reviewer_on_changes,
             DialogField::ReviewerMaxRounds => &mut self.reviewer_max_rounds,
+            DialogField::AutoModeArbiterTimeout => &mut self.auto_mode_arbiter_timeout,
+            DialogField::AutoModeMaxResolverRuns => &mut self.auto_mode_max_resolver_runs,
             DialogField::ExecutorWeekThreshold => &mut self.executor_week_threshold,
             DialogField::ExecutorFiveHourThreshold => &mut self.executor_five_hour_threshold,
             DialogField::ExecutorMiddle1
@@ -2138,6 +2259,8 @@ impl ModalState {
             | DialogField::AutoRestartEnabled
             | DialogField::DesignerEnabled
             | DialogField::ReviewerEnabled
+            | DialogField::AutoModeEnabled
+            | DialogField::AutoModeArbiter
             | DialogField::IsolationStatus
             | DialogField::InheritAgent
             | DialogField::InheritLimits
@@ -2216,7 +2339,7 @@ impl ModalState {
     pub fn set_backend_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
         match slot {
             AgentSlot::Primary => self.set_backend_options(options),
-            AgentSlot::Designer | AgentSlot::Reviewer => {
+            AgentSlot::Designer | AgentSlot::Reviewer | AgentSlot::Arbiter => {
                 let current = self.backend_text_for(slot);
                 let picker = self.picker_mut(slot).expect("role picker");
                 picker.backend_options = options;
@@ -2225,6 +2348,7 @@ impl ModalState {
                 let field = match slot {
                     AgentSlot::Designer => DialogField::DesignerBackend,
                     AgentSlot::Reviewer => DialogField::ReviewerBackend,
+                    AgentSlot::Arbiter => DialogField::ArbiterBackend,
                     AgentSlot::Primary => unreachable!(),
                 };
                 self.apply_selection_for(field, SelectorKind::Backend);
@@ -2236,7 +2360,7 @@ impl ModalState {
     pub fn set_model_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
         match slot {
             AgentSlot::Primary => self.set_model_options(options),
-            AgentSlot::Designer | AgentSlot::Reviewer => {
+            AgentSlot::Designer | AgentSlot::Reviewer | AgentSlot::Arbiter => {
                 let current = self.model_text_for(slot);
                 let picker = self.picker_mut(slot).expect("role picker");
                 picker.model_options = options;
@@ -2244,6 +2368,7 @@ impl ModalState {
                 let field = match slot {
                     AgentSlot::Designer => DialogField::DesignerModel,
                     AgentSlot::Reviewer => DialogField::ReviewerModel,
+                    AgentSlot::Arbiter => DialogField::ArbiterModel,
                     AgentSlot::Primary => unreachable!(),
                 };
                 self.apply_selection_for(field, SelectorKind::Model);
@@ -2255,7 +2380,7 @@ impl ModalState {
     pub fn set_effort_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
         match slot {
             AgentSlot::Primary => self.set_effort_options(options),
-            AgentSlot::Designer | AgentSlot::Reviewer => {
+            AgentSlot::Designer | AgentSlot::Reviewer | AgentSlot::Arbiter => {
                 let current = self.effort_text_for(slot);
                 let picker = self.picker_mut(slot).expect("role picker");
                 picker.effort_options = options;
@@ -2264,6 +2389,7 @@ impl ModalState {
                 let field = match slot {
                     AgentSlot::Designer => DialogField::DesignerEffort,
                     AgentSlot::Reviewer => DialogField::ReviewerEffort,
+                    AgentSlot::Arbiter => DialogField::ArbiterEffort,
                     AgentSlot::Primary => unreachable!(),
                 };
                 self.apply_selection_for(field, SelectorKind::Effort);
@@ -2274,7 +2400,7 @@ impl ModalState {
     pub fn set_agent_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
         match slot {
             AgentSlot::Primary => self.set_agent_options(options),
-            AgentSlot::Designer | AgentSlot::Reviewer => {
+            AgentSlot::Designer | AgentSlot::Reviewer | AgentSlot::Arbiter => {
                 let current = self.agent_text_for(slot);
                 let picker = self.picker_mut(slot).expect("role picker");
                 picker.agent_options = options;
@@ -2282,6 +2408,7 @@ impl ModalState {
                 let field = match slot {
                     AgentSlot::Designer => DialogField::DesignerAgent,
                     AgentSlot::Reviewer => DialogField::ReviewerAgent,
+                    AgentSlot::Arbiter => DialogField::ArbiterAgent,
                     AgentSlot::Primary => unreachable!(),
                 };
                 self.apply_selection_for(field, SelectorKind::Agent);
@@ -2767,16 +2894,28 @@ impl ModalState {
             self.designer.agent_selected.to_string(),
             self.reviewer_enabled.to_string(),
             raw_textarea_text(&self.reviewer.backend),
+            raw_textarea_text(&self.arbiter.backend),
             raw_textarea_text(&self.reviewer.model),
+            raw_textarea_text(&self.arbiter.model),
             raw_textarea_text(&self.reviewer.effort),
+            raw_textarea_text(&self.arbiter.effort),
             raw_textarea_text(&self.reviewer.agent),
+            raw_textarea_text(&self.arbiter.agent),
             self.reviewer.backend_selected.to_string(),
+            self.arbiter.backend_selected.to_string(),
             self.reviewer.model_selected.to_string(),
+            self.arbiter.model_selected.to_string(),
             self.reviewer.effort_selected.to_string(),
+            self.arbiter.effort_selected.to_string(),
             self.reviewer.agent_selected.to_string(),
+            self.arbiter.agent_selected.to_string(),
             raw_textarea_text(&self.reviewer_on_changes),
             self.reviewer_on_changes_selected.to_string(),
             raw_textarea_text(&self.reviewer_max_rounds),
+            self.auto_mode_enabled.to_string(),
+            self.auto_mode_arbiter.to_string(),
+            raw_textarea_text(&self.auto_mode_arbiter_timeout),
+            raw_textarea_text(&self.auto_mode_max_resolver_runs),
             self.executor_selected
                 .iter()
                 .map(|index| index.to_string())
@@ -2810,6 +2949,7 @@ fn agent_fields(slot: AgentSlot) -> &'static [DialogField] {
         AgentSlot::Primary => &PRIMARY_AGENT_FIELDS,
         AgentSlot::Designer => &DESIGNER_AGENT_FIELDS,
         AgentSlot::Reviewer => &REVIEWER_AGENT_FIELDS,
+        AgentSlot::Arbiter => &ARBITER_AGENT_FIELDS,
     }
 }
 
@@ -2833,18 +2973,22 @@ enum SelectorKind {
 
 fn selector_kind(field: DialogField) -> Option<SelectorKind> {
     match field {
-        DialogField::Backend | DialogField::DesignerBackend | DialogField::ReviewerBackend => {
-            Some(SelectorKind::Backend)
-        }
-        DialogField::Model | DialogField::DesignerModel | DialogField::ReviewerModel => {
-            Some(SelectorKind::Model)
-        }
-        DialogField::Effort | DialogField::DesignerEffort | DialogField::ReviewerEffort => {
-            Some(SelectorKind::Effort)
-        }
-        DialogField::Agent | DialogField::DesignerAgent | DialogField::ReviewerAgent => {
-            Some(SelectorKind::Agent)
-        }
+        DialogField::Backend
+        | DialogField::DesignerBackend
+        | DialogField::ReviewerBackend
+        | DialogField::ArbiterBackend => Some(SelectorKind::Backend),
+        DialogField::Model
+        | DialogField::DesignerModel
+        | DialogField::ReviewerModel
+        | DialogField::ArbiterModel => Some(SelectorKind::Model),
+        DialogField::Effort
+        | DialogField::DesignerEffort
+        | DialogField::ReviewerEffort
+        | DialogField::ArbiterEffort => Some(SelectorKind::Effort),
+        DialogField::Agent
+        | DialogField::DesignerAgent
+        | DialogField::ReviewerAgent
+        | DialogField::ArbiterAgent => Some(SelectorKind::Agent),
         DialogField::ChainTo => Some(SelectorKind::ChainTo),
         DialogField::ReviewerOnChanges => Some(SelectorKind::ReviewerOnChanges),
         DialogField::ExecutorMiddle1
@@ -2881,10 +3025,7 @@ pub(super) fn filtered_indices(options: &[SelectOption], filter: &str) -> Vec<us
 }
 
 pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Rect) -> Vec<Hitbox> {
-    let area = if matches!(modal.modal, Modal::GlobalSettings)
-        && modal.settings_tab == SettingsTab::Sync
-        && frame.area().width <= 60
-    {
+    let area = if frame.area().width < super::board::PORTRAIT_WIDTH {
         Rect {
             height: frame.area().height.saturating_sub(1),
             ..frame.area()
@@ -3121,7 +3262,15 @@ fn render_sub_popup(
     view: SubPopupView<'_>,
     hitboxes: &mut Vec<Hitbox>,
 ) {
-    let area = centered_percent(88, 90, parent_area);
+    let area = if frame.area().width < super::board::PORTRAIT_WIDTH {
+        Rect {
+            x: frame.area().x,
+            width: frame.area().width,
+            ..parent_area
+        }
+    } else {
+        centered_percent(88, 90, parent_area)
+    };
     frame.render_widget(Clear, area);
     let block = Block::default()
         .title(view.title)
@@ -3216,6 +3365,7 @@ fn agent_slot_name(slot: AgentSlot) -> &'static str {
         AgentSlot::Primary => "Primary",
         AgentSlot::Designer => "Designer",
         AgentSlot::Reviewer => "Reviewer",
+        AgentSlot::Arbiter => "Arbiter",
     }
 }
 
@@ -3847,7 +3997,7 @@ fn selector_form_rows_from_scroll(
 /// Minimum visible text rows, excluding the textarea's borders.
 const DESCRIPTION_MIN_ROWS: u16 = 5;
 /// Maximum visible text rows; additional content scrolls within the field.
-const DESCRIPTION_MAX_ROWS: u16 = 20;
+const DESCRIPTION_MAX_ROWS: u16 = 15;
 
 fn task_field_min_height(field: DialogField) -> u16 {
     match field {
@@ -3855,6 +4005,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::AgentSettings
         | DialogField::DesignerAgentSettings
         | DialogField::ReviewerAgentSettings
+        | DialogField::ArbiterAgentSettings
         | DialogField::TaskOptions
         | DialogField::Silence
         | DialogField::Runner
@@ -3870,6 +4021,10 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::AutoRestartEnabled
         | DialogField::DesignerEnabled
         | DialogField::ReviewerEnabled
+        | DialogField::AutoModeEnabled
+        | DialogField::AutoModeArbiter
+        | DialogField::AutoModeArbiterTimeout
+        | DialogField::AutoModeMaxResolverRuns
         | DialogField::MaxRunningTotal
         | DialogField::MaxRunningDesigner
         | DialogField::MaxRunningReviewer
@@ -3900,7 +4055,9 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::DesignerBackend
         | DialogField::DesignerModel
         | DialogField::ReviewerBackend
+        | DialogField::ArbiterBackend
         | DialogField::ReviewerModel
+        | DialogField::ArbiterModel
         | DialogField::ExecutorMiddle1
         | DialogField::ExecutorMiddle2
         | DialogField::ExecutorMiddle3
@@ -3954,9 +4111,13 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         | DialogField::ExecutorCheap2
         | DialogField::ExecutorCheap3 => modal.executor_slot_options.len(),
         DialogField::ReviewerBackend => modal.reviewer.backend_options.len(),
+        DialogField::ArbiterBackend => modal.arbiter.backend_options.len(),
         DialogField::ReviewerModel => modal.reviewer.model_options.len(),
+        DialogField::ArbiterModel => modal.arbiter.model_options.len(),
         DialogField::ReviewerEffort => modal.reviewer.effort_options.len(),
+        DialogField::ArbiterEffort => modal.arbiter.effort_options.len(),
         DialogField::ReviewerAgent => modal.reviewer.agent_options.len(),
+        DialogField::ArbiterAgent => modal.arbiter.agent_options.len(),
         DialogField::ReviewerOnChanges => modal.reviewer_on_changes_options.len(),
         DialogField::TargetStatus => modal.status_options.len(),
         _ => return task_field_min_height(field),
@@ -4235,6 +4396,14 @@ fn render_selector_field(
             AgentSlot::Reviewer,
             area,
             "Reviewer agent settings",
+        ),
+        DialogField::ArbiterAgentSettings => render_agent_launcher(
+            frame,
+            app,
+            modal,
+            AgentSlot::Arbiter,
+            area,
+            "Arbiter agent settings",
         ),
         DialogField::TaskOptions => render_options_launcher(frame, app, modal, area),
         DialogField::Backend => render_select_filtered(
@@ -4597,6 +4766,17 @@ fn render_selector_field(
             Some(&modal.reviewer.backend_filter),
             modal.filter_error == Some(field),
         ),
+        DialogField::ArbiterBackend => render_select_filtered(
+            frame,
+            app,
+            "Arbiter · Backend",
+            &modal.arbiter.backend_options,
+            modal.arbiter.backend_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.arbiter.backend_filter),
+            modal.filter_error == Some(field),
+        ),
         DialogField::ReviewerModel => render_select_filtered(
             frame,
             app,
@@ -4608,6 +4788,17 @@ fn render_selector_field(
             Some(&modal.reviewer.model_filter),
             modal.filter_error == Some(field),
         ),
+        DialogField::ArbiterModel => render_select_filtered(
+            frame,
+            app,
+            "Arbiter · Model",
+            &modal.arbiter.model_options,
+            modal.arbiter.model_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.arbiter.model_filter),
+            modal.filter_error == Some(field),
+        ),
         DialogField::ReviewerEffort => render_select(
             frame,
             app,
@@ -4617,12 +4808,30 @@ fn render_selector_field(
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
+        DialogField::ArbiterEffort => render_select(
+            frame,
+            app,
+            "Arbiter · Effort",
+            &modal.arbiter.effort_options,
+            modal.arbiter.effort_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
         DialogField::ReviewerAgent => render_select(
             frame,
             app,
             "Reviewer · Agent",
             &modal.reviewer.agent_options,
             modal.reviewer.agent_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::ArbiterAgent => render_select(
+            frame,
+            app,
+            "Arbiter · Agent",
+            &modal.arbiter.agent_options,
+            modal.arbiter.agent_selected,
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
@@ -4641,6 +4850,42 @@ fn render_selector_field(
             &modal.reviewer_max_rounds,
             area,
             "Reviewer · Max bounce rounds (0 = unlimited)",
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::AutoModeEnabled => render_checkbox(
+            frame,
+            app,
+            area,
+            "Auto mode",
+            "work unattended on every project",
+            modal.auto_mode_enabled,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::AutoModeArbiter => render_checkbox(
+            frame,
+            app,
+            area,
+            "Questions",
+            "arbiter agent answers (off: agent decides)",
+            modal.auto_mode_arbiter,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::AutoModeArbiterTimeout => render_textarea(
+            frame,
+            app,
+            &modal.auto_mode_arbiter_timeout,
+            area,
+            "Arbiter · Timeout, seconds",
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::AutoModeMaxResolverRuns => render_textarea(
+            frame,
+            app,
+            &modal.auto_mode_max_resolver_runs,
+            area,
+            "Conflicts · Max resolver runs per task",
             modal.active_field() == field,
             app.is_hovered(HitAction::ModalField(field)),
         ),
@@ -4789,6 +5034,7 @@ fn render_agent_launcher(
         AgentSlot::Primary => DialogField::AgentSettings,
         AgentSlot::Designer => DialogField::DesignerAgentSettings,
         AgentSlot::Reviewer => DialogField::ReviewerAgentSettings,
+        AgentSlot::Arbiter => DialogField::ArbiterAgentSettings,
     };
     let values = [
         modal.backend_text_for(slot),
@@ -4918,17 +5164,33 @@ fn register_task_options(
             modal.reviewer.backend_options.len(),
             modal.reviewer.backend_selected,
         ),
+        DialogField::ArbiterBackend => (
+            modal.arbiter.backend_options.len(),
+            modal.arbiter.backend_selected,
+        ),
         DialogField::ReviewerModel => (
             modal.reviewer.model_options.len(),
             modal.reviewer.model_selected,
+        ),
+        DialogField::ArbiterModel => (
+            modal.arbiter.model_options.len(),
+            modal.arbiter.model_selected,
         ),
         DialogField::ReviewerEffort => (
             modal.reviewer.effort_options.len(),
             modal.reviewer.effort_selected,
         ),
+        DialogField::ArbiterEffort => (
+            modal.arbiter.effort_options.len(),
+            modal.arbiter.effort_selected,
+        ),
         DialogField::ReviewerAgent => (
             modal.reviewer.agent_options.len(),
             modal.reviewer.agent_selected,
+        ),
+        DialogField::ArbiterAgent => (
+            modal.arbiter.agent_options.len(),
+            modal.arbiter.agent_selected,
         ),
         DialogField::ReviewerOnChanges => (
             modal.reviewer_on_changes_options.len(),
@@ -5152,9 +5414,13 @@ fn select_field_from_title(title: &str) -> Option<DialogField> {
         "Designer · Effort" => Some(DialogField::DesignerEffort),
         "Designer · Agent" => Some(DialogField::DesignerAgent),
         "Reviewer · Backend" => Some(DialogField::ReviewerBackend),
+        "Arbiter · Backend" => Some(DialogField::ArbiterBackend),
         "Reviewer · Model" => Some(DialogField::ReviewerModel),
+        "Arbiter · Model" => Some(DialogField::ArbiterModel),
         "Reviewer · Effort" => Some(DialogField::ReviewerEffort),
+        "Arbiter · Effort" => Some(DialogField::ArbiterEffort),
         "Reviewer · Agent" => Some(DialogField::ReviewerAgent),
+        "Arbiter · Agent" => Some(DialogField::ArbiterAgent),
         "Chain to" => Some(DialogField::ChainTo),
         "Theme" => Some(DialogField::Theme),
         "Task sorting" => Some(DialogField::TaskSort),
@@ -5871,9 +6137,13 @@ fn field_owns_vertical_arrows(field: DialogField) -> bool {
             | DialogField::DesignerEffort
             | DialogField::DesignerAgent
             | DialogField::ReviewerBackend
+            | DialogField::ArbiterBackend
             | DialogField::ReviewerModel
+            | DialogField::ArbiterModel
             | DialogField::ReviewerEffort
+            | DialogField::ArbiterEffort
             | DialogField::ReviewerAgent
+            | DialogField::ArbiterAgent
             | DialogField::ReviewerOnChanges
             | DialogField::ExecutorMiddle1
             | DialogField::ExecutorMiddle2
