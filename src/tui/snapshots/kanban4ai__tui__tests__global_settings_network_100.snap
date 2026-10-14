@@ -10,28 +10,28 @@ expression: "render_at(&mut app, width, 36)"
 │              ┌ Global settings ───────────────────────────────────────────────────┐              │
 │              │ Com │ Des │ Rev │ Exe │ Aut │ Bck │ Prj │ Syn                      │              │
 │              │────────────────────────────────────────────────────────────────────│              │
-│              │┌ Sync ────────────────────────────────────────────────────────────┐│              │
-│              ││This node                                                         ││              │
-│              ││  Name: laptop  (Enter renames)                                   ││              │
-│              ││  Role: ◀ laptop ▶  (Space changes)                               ││              │
-│              ││  ☐ API server enabled (user unit) · state unknown                ││              │
-│              ││                                                                  ││              │
-│              ││Сеть / Network                                                    ││              │
-│              ││› Mode: ◀ Managed ▶                                               ││              │
-│              ││      Status: Running                                             ││              │
-│              ││      Account: example@example.com                                ││              │
-│              ││      Tailnet IP: 100.64.0.7                                      ││              │
-│              ││      Peers online: 2                                             ││              │
-│              ││      server: direct                                              ││              │
-│              ││      phone: DERP (fra)                                           ││              │
-│              ││  Auth key: empty (one-time)                                      ││              │
-│              ││  [ Подключить / Connect ]                                        ││              │
-│              ││  [ Отключить / Disconnect ]                                      ││              │
-│              ││  [ Выйти из аккаунта / Logout ]                                  ││              │
-│              ││                                                                  ││              │
-│              ││Nodes in phone priority order (Shift+↑/↓ or K/J moves)            ││              │
-│              ││  1. server (server)                                              ││              │
-│              │└──────────────────────────────────────────────────────────────────┘│              │
+│              │┏ Sync ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓│              │
+│              │┃This node                                                         ┃│              │
+│              │┃  Name: laptop  (Enter renames)                                   ┃│              │
+│              │┃  Role: ◀ laptop ▶  (Space changes)                               ┃│              │
+│              │┃  ☐ API server enabled (user unit) · state unknown                ┃│              │
+│              │┃                                                                  ┃│              │
+│              │┃Сеть / Network                                                    ┃│              │
+│              │┃› Mode: ◀ Managed ▶                                               ┃│              │
+│              │┃      Status: Running                                             ┃│              │
+│              │┃      Account: example@example.com                                ┃│              │
+│              │┃      Tailnet IP: 100.64.0.7                                      ┃│              │
+│              │┃      Peers online: 2                                             ┃│              │
+│              │┃      server: direct                                              ┃│              │
+│              │┃      phone: DERP (fra)                                           ┃│              │
+│              │┃  Auth key: empty (one-time)                                      ┃│              │
+│              │┃  [ Подключить / Connect ]                                        ┃│              │
+│              │┃  [ Отключить / Disconnect ]                                      ┃│              │
+│              │┃  [ Выйти из аккаунта / Logout ]                                  ┃│              │
+│              │┃                                                                  ┃│              │
+│              │┃Nodes in phone priority order (Shift+↑/↓ or K/J moves)            ┃│              │
+│              │┃  1. server (server)                                              ┃│              │
+│              │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛│              │
 │              └────────────────────────────────────────────────────────────────────┘              │
 │                                                                                                  │
 │                                                                                                  │

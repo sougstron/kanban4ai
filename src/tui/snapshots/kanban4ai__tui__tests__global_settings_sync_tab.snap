@@ -13,7 +13,7 @@ expression: "render_at(&mut app, 100, 40)"
 │              │────────────────────────────────────────────────────────────────────│              │
 │              │┌ Sync ────────────────────────────────────────────────────────────┐│              │
 │              ││This node                                                         ││              │
-│              ││› Name: laptop  (Enter renames)                                   ││              │
+│              ││  Name: laptop  (Enter renames)                                   ││              │
 │              ││  Role: ◀ laptop ▶  (Space changes)                               ││              │
 │              ││  ☑ API server enabled (user unit) · running                      ││              │
 │              ││                                                                  ││              │
@@ -134,7 +134,8 @@ expression: "render_at(&mut app, 100, 40)"
 11:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 11:1-15 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 11:15-19 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-11:19-48 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
+11:19-31 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+11:31-48 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 11:48-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 11:83-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 11:85-99 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)

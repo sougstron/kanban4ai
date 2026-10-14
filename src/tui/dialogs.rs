@@ -667,6 +667,7 @@ struct AgentPopupState {
     slot: AgentSlot,
     parent_field_index: usize,
     parent_form_scroll: usize,
+    parent_editing: bool,
     field_index: usize,
     form_scroll: usize,
     original: AgentPicker,
@@ -685,6 +686,7 @@ struct OptionsSnapshot {
 struct OptionsPopupState {
     parent_field_index: usize,
     parent_form_scroll: usize,
+    parent_editing: bool,
     field_index: usize,
     form_scroll: usize,
     original: OptionsSnapshot,
@@ -726,10 +728,18 @@ impl SubPopup {
         }
     }
 
-    fn parent_view(&self) -> (usize, usize) {
+    fn parent_view(&self) -> (usize, usize, bool) {
         match self {
-            SubPopup::Agent(popup) => (popup.parent_field_index, popup.parent_form_scroll),
-            SubPopup::Options(popup) => (popup.parent_field_index, popup.parent_form_scroll),
+            SubPopup::Agent(popup) => (
+                popup.parent_field_index,
+                popup.parent_form_scroll,
+                popup.parent_editing,
+            ),
+            SubPopup::Options(popup) => (
+                popup.parent_field_index,
+                popup.parent_form_scroll,
+                popup.parent_editing,
+            ),
         }
     }
 }
@@ -767,6 +777,11 @@ pub struct ModalState {
     pub settings_tab: SettingsTab,
     pub modal: Modal,
     pub field_index: usize,
+    /// Block navigation (task and settings forms): `false` while the arrows
+    /// pick a block, `true` once Enter stepped inside the focused one. Tab
+    /// keeps it, so Tab/Shift+Tab hop straight into the next block's inside.
+    /// Blocks with nothing inside (buttons, launchers) ignore it.
+    pub editing: bool,
     pub title: TextArea<'static>,
     pub description: TextArea<'static>,
     pub backend: TextArea<'static>,
@@ -896,6 +911,7 @@ impl ModalState {
             modal,
             settings_tab: SettingsTab::Common,
             field_index: 0,
+            editing: false,
             title: one_line(""),
             description: if wraps_description {
                 wrapped_description(Vec::new())
@@ -1262,6 +1278,71 @@ impl ModalState {
         })
     }
 
+    /// Whether this dialog splits its keys between picking a block and
+    /// working inside it (see [`ModalState::editing`]). The task and settings
+    /// forms do, nested popups included; small dialogs keep flat focus.
+    pub fn block_navigation(&self) -> bool {
+        matches!(
+            self.modal,
+            Modal::NewTask { .. }
+                | Modal::EditTask { .. }
+                | Modal::Settings
+                | Modal::GlobalSettings
+        )
+    }
+
+    /// Whether keys go inside the focused block: always in flat dialogs, and
+    /// in block-navigated ones only after Enter stepped into a block that has
+    /// an inside. Carets and selection highlights follow this.
+    pub fn is_editing(&self) -> bool {
+        !self.block_navigation() || (self.editing && block_has_inside(self.active_field()))
+    }
+
+    /// Enter (or a click) on the focused block: step inside it. Returns
+    /// `false` for blocks with no inside — buttons and popup launchers.
+    pub fn enter_block(&mut self) -> bool {
+        let enterable = block_has_inside(self.active_field());
+        if enterable {
+            self.editing = true;
+        }
+        enterable
+    }
+
+    /// Enter inside a block: a newline in multiline text, commit a filtered
+    /// selector's match, flip a flag or the focused checklist row, press the
+    /// Sync page's focused control. Focus never leaves the block.
+    pub fn enter_inside_block(&mut self) {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let field = self.active_field();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        if self.enter_inserts_newline()
+            || matches!(
+                field,
+                DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel
+            )
+            || field == DialogField::SyncPanel
+        {
+            self.input(key(KeyCode::Enter));
+        } else if selector_kind(field).is_some() {
+            self.enter_field();
+        } else if is_flag_field(field) || field == DialogField::ProjectVisibility {
+            self.input(key(KeyCode::Char(' ')));
+        }
+    }
+
+    /// Esc inside a block: back to picking blocks. The selector filter goes
+    /// with the visit that typed it.
+    pub fn leave_block(&mut self) {
+        let field = self.active_field();
+        if let Some(filter) = self.field_filter_mut(field) {
+            filter.clear();
+        }
+        if self.filter_error == Some(field) {
+            self.filter_error = None;
+        }
+        self.editing = false;
+    }
+
     /// Project or global settings — the two dialogs sharing the tabbed form.
     pub fn is_settings_form(&self) -> bool {
         matches!(self.modal, Modal::Settings | Modal::GlobalSettings)
@@ -1364,10 +1445,12 @@ impl ModalState {
             slot,
             parent_field_index: self.field_index,
             parent_form_scroll: self.form_scroll,
+            parent_editing: self.editing,
             field_index: 0,
             form_scroll: 0,
             original,
         })));
+        self.editing = false;
         self.filter_error = None;
     }
 
@@ -1378,6 +1461,7 @@ impl ModalState {
         self.sub_popup = Some(SubPopup::Options(Box::new(OptionsPopupState {
             parent_field_index: self.field_index,
             parent_form_scroll: self.form_scroll,
+            parent_editing: self.editing,
             field_index: 0,
             form_scroll: 0,
             original: OptionsSnapshot {
@@ -1389,6 +1473,7 @@ impl ModalState {
                 launch_time: self.launch_time.clone(),
             },
         })));
+        self.editing = false;
         self.filter_error = None;
     }
 
@@ -1422,9 +1507,10 @@ impl ModalState {
                 }
             }
         }
-        let (parent_field_index, parent_form_scroll) = popup.parent_view();
+        let (parent_field_index, parent_form_scroll, parent_editing) = popup.parent_view();
         self.field_index = parent_field_index;
         self.form_scroll = parent_form_scroll;
+        self.editing = parent_editing;
         self.filter_error = None;
     }
 
@@ -1623,6 +1709,8 @@ impl ModalState {
             .position(|candidate| *candidate == field)
         {
             self.set_field_index(index);
+            // Focus jumps pick the block; a click steps inside on its own.
+            self.editing = false;
         }
     }
 
@@ -1644,6 +1732,7 @@ impl ModalState {
         self.settings_tab = tab;
         self.field_index = 0;
         self.form_scroll = 0;
+        self.editing = false;
     }
 
     /// The tab strip this dialog shows: Projects is Global Settings only.
@@ -3024,7 +3113,44 @@ pub(super) fn filtered_indices(options: &[SelectOption], filter: &str) -> Vec<us
         .collect()
 }
 
+thread_local! {
+    /// Block-navigation state of the dialog being drawn, so the shared field
+    /// widgets can tell a block picked from the outside from one being worked
+    /// inside without threading it through every call.
+    static RENDER_FOCUS: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, true)) };
+}
+
+/// Whether a focused field shows its caret and coloured selection: always in
+/// flat dialogs, only from inside the block in block-navigated ones.
+fn shows_inside(focused: bool) -> bool {
+    let (block_nav, editing) = RENDER_FOCUS.with(std::cell::Cell::get);
+    if block_nav {
+        focused && editing
+    } else {
+        focused
+    }
+}
+
+/// Selection highlights stay coloured in flat dialogs; block-navigated ones
+/// colour them only inside the focused block.
+fn highlight_coloured(focused: bool) -> bool {
+    let (block_nav, _) = RENDER_FOCUS.with(std::cell::Cell::get);
+    !block_nav || shows_inside(focused)
+}
+
+/// A block being worked inside gets a thick border; one merely picked keeps
+/// the plain focus border.
+fn inside_border(block: Block<'static>, focused: bool) -> Block<'static> {
+    let (block_nav, _) = RENDER_FOCUS.with(std::cell::Cell::get);
+    if block_nav && shows_inside(focused) {
+        block.border_type(ratatui::widgets::BorderType::Thick)
+    } else {
+        block
+    }
+}
+
 pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Rect) -> Vec<Hitbox> {
+    RENDER_FOCUS.with(|focus| focus.set((modal.block_navigation(), modal.is_editing())));
     let area = if frame.area().width < super::board::PORTRAIT_WIDTH {
         Rect {
             height: frame.area().height.saturating_sub(1),
@@ -3436,7 +3562,8 @@ fn render_settings_form(
     } else if matches!(modal.modal, Modal::GlobalSettings) && tab == SettingsTab::Sync {
         let field = DialogField::SyncPanel;
         let active = modal.active_field() == field;
-        super::sync_tab::render(frame, app, &modal.sync, active, form_area, hitboxes);
+        let inside = active && modal.is_editing();
+        super::sync_tab::render(frame, app, &modal.sync, active, inside, form_area, hitboxes);
         hitboxes.push(Hitbox {
             area: form_area,
             action: HitAction::ModalField(field),
@@ -4491,7 +4618,7 @@ fn render_selector_field(
                 app,
                 &one_line(value),
                 area,
-                &format!("{label} · ←/→ or Space"),
+                &format!("{label} · Space cycles, ←/→ inside"),
                 modal.active_field() == field,
                 app.is_hovered(HitAction::ModalField(field)),
             );
@@ -5291,6 +5418,8 @@ fn render_select_filtered(
     error: bool,
 ) {
     let field = select_field_from_title(title);
+    // Hover lights the border; only real focus counts as being inside.
+    let focused = active;
     let active = field
         .map(|field| active || select_field_hovered(app, field, options.len()))
         .unwrap_or(active);
@@ -5330,12 +5459,25 @@ fn render_select_filtered(
         .position(|index| *index == selected)
         .unwrap_or(0);
     let border = select_border(app, active, error);
-    let block = Block::default()
-        .title(format!(" {title} "))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border));
+    let coloured = highlight_coloured(focused);
+    let block = inside_border(
+        Block::default()
+            .title(format!(" {title} "))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border)),
+        focused,
+    );
     let Some(filter) = filter else {
-        render_list_in(frame, app, items, highlight, area, Some(block), true);
+        render_list_in(
+            frame,
+            app,
+            items,
+            highlight,
+            area,
+            Some(block),
+            true,
+            coloured,
+        );
         return;
     };
     let inner = block.inner(area);
@@ -5356,6 +5498,7 @@ fn render_select_filtered(
         },
         None,
         matched,
+        coloured,
     );
 }
 
@@ -5457,12 +5600,24 @@ fn render_list(
         .title(title.to_string())
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border));
-    render_list_in(frame, app, items, selected, area, Some(block), true);
+    render_list_in(
+        frame,
+        app,
+        items,
+        selected,
+        area,
+        Some(block),
+        true,
+        highlight_coloured(active),
+    );
 }
 
 /// Render list items into `area`. `block` is `None` when the caller already
 /// drew the surrounding border (filterable selectors reserve a row inside it),
 /// and `highlight` is false when there is nothing selectable to point at.
+/// `coloured` paints the pointed-at row in the focus colour; otherwise only
+/// the marker shows which row is current.
+#[allow(clippy::too_many_arguments)]
 fn render_list_in(
     frame: &mut Frame<'_>,
     app: &App,
@@ -5471,6 +5626,7 @@ fn render_list_in(
     area: Rect,
     block: Option<Block<'static>>,
     highlight: bool,
+    coloured: bool,
 ) {
     let mut state = ListState::default();
     let selected = selected.min(items.len().saturating_sub(1));
@@ -5481,11 +5637,16 @@ fn render_list_in(
         items.len(),
         area.height.saturating_sub(chrome) as usize,
     );
-    let mut list = List::new(items).highlight_symbol("› ").highlight_style(
+    let highlight_style = if coloured {
         Style::default()
             .fg(app.theme.focus)
-            .add_modifier(Modifier::BOLD),
-    );
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let mut list = List::new(items)
+        .highlight_symbol("› ")
+        .highlight_style(highlight_style);
     if let Some(block) = block {
         list = list.block(block);
     }
@@ -5590,11 +5751,15 @@ fn render_buttons(
     let right_style = button_style(app, right_active);
     let content = if left == "Save" && right == "Cancel" {
         let save_hint = "(Ctrl + S)";
-        // Enter walks forward like Tab now, so the hint has to name it.
-        let nav_hint = "use Tab, Enter or Shift + Tab to navigate";
+        let (block_nav, editing) = RENDER_FOCUS.with(std::cell::Cell::get);
+        let nav_hint = match (block_nav, editing) {
+            (false, _) => "use Tab, Enter or Shift + Tab to navigate",
+            (true, false) => "↑/↓ pick block · Enter edit · Tab next",
+            (true, true) => "Esc back to blocks · Tab/Shift+Tab next",
+        };
         let hint_width = area.width.saturating_sub(2) as usize;
         let hint_gap = hint_width
-            .saturating_sub(save_hint.len() + nav_hint.len())
+            .saturating_sub(save_hint.len() + nav_hint.chars().count())
             .max(1);
         vec![
             Line::from(vec![
@@ -5731,12 +5896,13 @@ fn render_checkbox(
     };
     let mark = if checked { "☑" } else { "☐" };
     frame.render_widget(
-        Paragraph::new(format!("{mark} {label} (Space toggles)")).block(
+        Paragraph::new(format!("{mark} {label} (Space toggles)")).block(inside_border(
             Block::default()
                 .title(format!(" {title} "))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border)),
-        ),
+            active,
+        )),
         area,
     );
 }
@@ -5760,10 +5926,14 @@ fn render_project_visibility(frame: &mut Frame<'_>, app: &App, modal: &ModalStat
             })
             .collect()
     };
-    let block = Block::default()
-        .title(" Show in projects list (Space toggles) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(select_border(app, active, false)));
+    let focused = modal.active_field() == field;
+    let block = inside_border(
+        Block::default()
+            .title(" Show in projects list (Space toggles) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(select_border(app, active, false))),
+        focused,
+    );
     render_list_in(
         frame,
         app,
@@ -5772,6 +5942,7 @@ fn render_project_visibility(frame: &mut Frame<'_>, app: &App, modal: &ModalStat
         area,
         Some(block),
         true,
+        highlight_coloured(focused),
     );
 }
 
@@ -5793,10 +5964,14 @@ fn render_backend_order(frame: &mut Frame<'_>, app: &App, modal: &ModalState, ar
             })
             .collect()
     };
-    let block = Block::default()
-        .title(" Backend order (Shift+↑/↓ or K/J moves) ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(select_border(app, active, false)));
+    let focused = modal.active_field() == field;
+    let block = inside_border(
+        Block::default()
+            .title(" Backend order (Shift+↑/↓ or K/J moves) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(select_border(app, active, false))),
+        focused,
+    );
     render_list_in(
         frame,
         app,
@@ -5805,6 +5980,7 @@ fn render_backend_order(frame: &mut Frame<'_>, app: &App, modal: &ModalState, ar
         area,
         Some(block),
         true,
+        highlight_coloured(focused),
     );
 }
 
@@ -5825,12 +6001,13 @@ fn render_escape_to_projects(frame: &mut Frame<'_>, app: &App, modal: &ModalStat
         Paragraph::new(format!(
             "{mark} Esc from board opens projects (Space toggles)"
         ))
-        .block(
+        .block(inside_border(
             Block::default()
                 .title(" Escape ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(border)),
-        ),
+            active,
+        )),
         area,
     );
 }
@@ -5862,13 +6039,14 @@ fn render_textarea(
         app.theme.border
     };
     let mut widget = textarea.clone();
-    set_cursor_visible(&mut widget, focused);
-    widget.set_block(
+    set_cursor_visible(&mut widget, shows_inside(focused));
+    widget.set_block(inside_border(
         Block::default()
             .title(format!(" {title} "))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border)),
-    );
+        focused,
+    ));
     frame.render_widget(&widget, area);
 }
 
@@ -5891,8 +6069,8 @@ fn render_description_textarea(
     } else {
         " Description (Ctrl+V paste, Enter newline) "
     };
-    set_cursor_visible(&mut modal.description, focused);
-    modal.description.set_block(
+    set_cursor_visible(&mut modal.description, shows_inside(focused));
+    modal.description.set_block(inside_border(
         Block::default()
             // Enter, Shift+Enter, and Alt+Enter all insert a newline. The
             // title names Enter because that is the key every terminal can
@@ -5900,7 +6078,8 @@ fn render_description_textarea(
             .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border)),
-    );
+        focused,
+    ));
     frame.render_widget(&modal.description, area);
 }
 
@@ -6065,13 +6244,14 @@ fn render_labeled_textarea(
     } else {
         app.theme.border
     };
-    set_cursor_visible(textarea, focused);
-    textarea.set_block(
+    set_cursor_visible(textarea, shows_inside(focused));
+    textarea.set_block(inside_border(
         Block::default()
             .title(format!(" {title} "))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border)),
-    );
+        focused,
+    ));
     frame.render_widget(&*textarea, area);
 }
 
@@ -6110,6 +6290,55 @@ pub(crate) fn wrapped_description(lines: Vec<String>) -> TextArea<'static> {
     let mut textarea = TextArea::new(lines);
     textarea.set_wrap_mode(WrapMode::WordOrGlyph);
     textarea
+}
+
+/// Blocks with an inside to step into. Buttons and popup launchers act on
+/// Enter directly; the isolation line is read-only.
+pub(crate) fn block_has_inside(field: DialogField) -> bool {
+    !matches!(
+        field,
+        DialogField::Confirm
+            | DialogField::Cancel
+            | DialogField::AgentSettings
+            | DialogField::DesignerAgentSettings
+            | DialogField::ReviewerAgentSettings
+            | DialogField::ArbiterAgentSettings
+            | DialogField::TaskOptions
+            | DialogField::IsolationStatus
+    )
+}
+
+/// Switch-like blocks: Space flips them straight from block selection, and
+/// Enter flips them once inside. The runner counts — it cycles its values.
+pub(crate) fn is_flag_field(field: DialogField) -> bool {
+    matches!(
+        field,
+        DialogField::Readonly
+            | DialogField::Silence
+            | DialogField::PlannedLaunch
+            | DialogField::UseOrchestrator
+            | DialogField::UseDesigner
+            | DialogField::UseReviewer
+            | DialogField::Runner
+            | DialogField::EscapeToProjects
+            | DialogField::UpdateCheckOnOpen
+            | DialogField::HideKanbanMessages
+            | DialogField::QueueEnabled
+            | DialogField::AutoRestartEnabled
+            | DialogField::DesignerEnabled
+            | DialogField::ReviewerEnabled
+            | DialogField::AutoModeEnabled
+            | DialogField::AutoModeArbiter
+            | DialogField::PurgeData
+            | DialogField::InheritAgent
+            | DialogField::InheritLimits
+            | DialogField::InheritCommon
+            | DialogField::InheritTaskSort
+            | DialogField::InheritPlacement
+            | DialogField::InheritDesigner
+            | DialogField::InheritReviewer
+            | DialogField::InheritExecutor
+    )
 }
 
 /// Fields whose Up/Down already move a selection (selectors and lists), so

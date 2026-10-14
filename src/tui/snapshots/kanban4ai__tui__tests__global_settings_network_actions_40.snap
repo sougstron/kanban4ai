@@ -5,25 +5,25 @@ expression: "render_at(&mut app, 40, 24)"
 ┌ Global settings ─────────────────────┐
 │ Syn                                  │
 │──────────────────────────────────────│
-│┌ Sync ──────────────────────────────┐│
-││  Role: ◀ laptop ▶  (Space changes) ││
-││  ☐ API server enabled (user unit) ·││
-││state unknown                       ││
-││                                    ││
-││Сеть / Network                      ││
-││  Mode: ◀ Managed ▶                 ││
-││      Status: Running               ││
-││      Account: example@example.com  ││
-││      Tailnet IP: 100.64.0.7        ││
-││      Peers online: 2               ││
-││      server: direct                ││
-││      phone: DERP (fra)             ││
-││  Auth key: empty (one-time)        ││
-││  [ Подключить / Connect ]          ││
-││  [ Отключить / Disconnect ]        ││
-││› [ Выйти из аккаунта / Logout ]    ││
-││                                    ││
-│└────────────────────────────────────┘│
+│┏ Sync ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓│
+│┃  Role: ◀ laptop ▶  (Space changes) ┃│
+│┃  ☐ API server enabled (user unit) ·┃│
+│┃state unknown                       ┃│
+│┃                                    ┃│
+│┃Сеть / Network                      ┃│
+│┃  Mode: ◀ Managed ▶                 ┃│
+│┃      Status: Running               ┃│
+│┃      Account: example@example.com  ┃│
+│┃      Tailnet IP: 100.64.0.7        ┃│
+│┃      Peers online: 2               ┃│
+│┃      server: direct                ┃│
+│┃      phone: DERP (fra)             ┃│
+│┃  Auth key: empty (one-time)        ┃│
+│┃  [ Подключить / Connect ]          ┃│
+│┃  [ Отключить / Disconnect ]        ┃│
+│┃› [ Выйти из аккаунта / Logout ]    ┃│
+│┃                                    ┃│
+│┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛│
 └──────────────────────────────────────┘
  Projects │ Enter open · n new · ? help 
 

@@ -5,37 +5,37 @@ expression: "render_at(&mut app, width, 36)"
 ┌ Global settings ─────────────────────┐
 │ Syn                                  │
 │──────────────────────────────────────│
-│┌ Sync ──────────────────────────────┐│
-││This node                           ││
-││  Name: laptop  (Enter renames)     ││
-││  Role: ◀ laptop ▶  (Space changes) ││
-││  ☐ API server enabled (user unit) ·││
-││state unknown                       ││
-││                                    ││
-││Сеть / Network                      ││
-││› Mode: ◀ Managed ▶                 ││
-││      Status: Running               ││
-││      Account: example@example.com  ││
-││      Tailnet IP: 100.64.0.7        ││
-││      Peers online: 2               ││
-││      server: direct                ││
-││      phone: DERP (fra)             ││
-││  Auth key: empty (one-time)        ││
-││  [ Подключить / Connect ]          ││
-││  [ Отключить / Disconnect ]        ││
-││  [ Выйти из аккаунта / Logout ]    ││
-││                                    ││
-││Nodes in phone priority order       ││
-││(Shift+↑/↓ or K/J moves)            ││
-││  1. server (server)                ││
-││      Not probed yet — press Refresh││
-││      not probed · never exchanged ·││
-││1 op(s) waiting                     ││
-││  2. phone (mobile)                 ││
-││      Not probed yet — press Refresh││
-││      phone dials in · never        ││
-││exchanged · 1 op(s) waiting         ││
-│└────────────────────────────────────┘│
+│┏ Sync ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓│
+│┃This node                           ┃│
+│┃  Name: laptop  (Enter renames)     ┃│
+│┃  Role: ◀ laptop ▶  (Space changes) ┃│
+│┃  ☐ API server enabled (user unit) ·┃│
+│┃state unknown                       ┃│
+│┃                                    ┃│
+│┃Сеть / Network                      ┃│
+│┃› Mode: ◀ Managed ▶                 ┃│
+│┃      Status: Running               ┃│
+│┃      Account: example@example.com  ┃│
+│┃      Tailnet IP: 100.64.0.7        ┃│
+│┃      Peers online: 2               ┃│
+│┃      server: direct                ┃│
+│┃      phone: DERP (fra)             ┃│
+│┃  Auth key: empty (one-time)        ┃│
+│┃  [ Подключить / Connect ]          ┃│
+│┃  [ Отключить / Disconnect ]        ┃│
+│┃  [ Выйти из аккаунта / Logout ]    ┃│
+│┃                                    ┃│
+│┃Nodes in phone priority order       ┃│
+│┃(Shift+↑/↓ or K/J moves)            ┃│
+│┃  1. server (server)                ┃│
+│┃      Not probed yet — press Refresh┃│
+│┃      not probed · never exchanged ·┃│
+│┃1 op(s) waiting                     ┃│
+│┃  2. phone (mobile)                 ┃│
+│┃      Not probed yet — press Refresh┃│
+│┃      phone dials in · never        ┃│
+│┃exchanged · 1 op(s) waiting         ┃│
+│┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛│
 └──────────────────────────────────────┘
  Projects │ Enter open · n new · ? help 
 

@@ -30,7 +30,7 @@ expression: rendered
 │             │└────────────────────────────────────────────────────────────────┘│             │
 │             │┌────────────────────────────────────────────────────────────────┐│             │
 │             ││[ Save ]  [ Cancel ]                                            ││             │
-│             ││(Ctrl + S)             use Tab, Enter or Shift + Tab to navigate││             │
+│             ││(Ctrl + S)                ↑/↓ pick block · Enter edit · Tab next││             │
 │             │└────────────────────────────────────────────────────────────────┘│             │
 │             └──────────────────────────────────────────────────────────────────┘             │
 │                                                                                              │
@@ -148,7 +148,7 @@ expression: rendered
 16:1-14 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 16:14-15 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 16:15-16 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-16:16-80 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
+16:16-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 16:80-81 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 16:81-82 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 16:82-95 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
@@ -248,8 +248,8 @@ expression: rendered
 28:14-15 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 28:15-16 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 28:16-26 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-28:26-39 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-28:39-80 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+28:26-42 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+28:42-80 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 28:80-81 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 28:81-82 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 28:82-95 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
