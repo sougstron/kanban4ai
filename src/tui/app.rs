@@ -56,7 +56,7 @@ use super::card::{
 };
 use super::dialogs::{
     AgentSlot, BulkAction, DialogField, Modal, ModalButton, ModalState, QuestionChoice,
-    SelectOption, SettingsTab, executor_slot_index,
+    SelectOption, SettingsTab, executor_slot_index, is_flag_field,
 };
 use super::event::{AppEvent, LoopOutcome};
 use super::image;
@@ -1223,8 +1223,12 @@ impl App {
             return Ok(());
         }
         if let Some(mut modal) = self.modal.take() {
-            let inserted =
-                !modal.discard_confirm && !is_confirmation_modal(&modal.modal) && modal.paste(text);
+            let pasteable = !modal.discard_confirm && !is_confirmation_modal(&modal.modal);
+            // Pasting into a block picked from the outside steps inside it.
+            if pasteable && modal.block_navigation() && modal.accepts_paste() {
+                modal.enter_block();
+            }
+            let inserted = pasteable && modal.paste(text);
             self.modal = Some(modal);
             if !inserted {
                 self.status = "Nothing pasted: focus a text field first".to_string();
@@ -2904,6 +2908,8 @@ impl App {
             Some(HitAction::ModalField(field)) => {
                 if let Some(modal) = self.modal.as_mut() {
                     modal.focus_field(field);
+                    // A click picks the block and steps inside it at once.
+                    modal.enter_block();
                     if let Some(slot) = ModalState::launcher_slot(field) {
                         modal.open_agent_settings(slot);
                     } else if field == DialogField::TaskOptions {
@@ -2924,6 +2930,7 @@ impl App {
             }) => {
                 if let Some(mut modal) = self.modal.take() {
                     modal.focus_field(DialogField::SyncPanel);
+                    modal.enter_block();
                     modal.sync.selected = index;
                     modal
                         .sync
@@ -2937,6 +2944,7 @@ impl App {
                 if let Some(modal) = self.modal.as_mut() {
                     let previous = selector_index(modal, field);
                     modal.focus_field(field);
+                    modal.enter_block();
                     modal.select_option(field, index);
                     changed = selector_index(modal, field) != previous;
                 }
@@ -6466,6 +6474,87 @@ impl App {
                 }
                 _ => {}
             }
+        } else if modal.block_navigation() {
+            // Two levels: the arrows pick a block, Enter steps inside it and
+            // Esc steps back out. Inside, every key belongs to the block —
+            // only Tab/Shift+Tab (into the next block's inside) and Esc leave.
+            let field = modal.active_field();
+            let editing = modal.is_editing();
+            let typing_target =
+                modal.text_field_mut(field).is_some() || modal.field_filter(field).is_some();
+            match key.code {
+                KeyCode::Char('s')
+                    if key.modifiers == KeyModifiers::CONTROL && modal.popup_open() =>
+                {
+                    modal.save_popup();
+                }
+                KeyCode::Char('s')
+                    if key.modifiers == KeyModifiers::CONTROL && modal.submit_on_ctrl_s() =>
+                {
+                    return self.submit_modal(modal).map(|_| true);
+                }
+                // The Sync page's input forms and pairing code close first.
+                KeyCode::Esc if editing && modal.sync_overlay_open() => modal.sync.close_overlay(),
+                KeyCode::Esc if editing => modal.leave_block(),
+                KeyCode::Esc if modal.popup_open() => modal.cancel_popup(),
+                KeyCode::Esc => return self.request_modal_close(modal),
+                KeyCode::Tab => modal.next_field(),
+                KeyCode::BackTab => modal.prev_field(),
+                KeyCode::Enter if editing => modal.enter_inside_block(),
+                _ if editing => modal.input(key),
+                KeyCode::Up | KeyCode::Down => {
+                    modal.editing = false;
+                    modal.arrow_field(if key.code == KeyCode::Up { -1 } else { 1 });
+                }
+                KeyCode::Left | KeyCode::Right
+                    if modal.is_settings_form() && !modal.popup_open() =>
+                {
+                    let current = modal.settings_tab;
+                    let tabs = modal.settings_tabs();
+                    modal.set_settings_tab(if key.code == KeyCode::Left {
+                        current.prev(tabs)
+                    } else {
+                        current.next(tabs)
+                    });
+                }
+                KeyCode::Left | KeyCode::Right
+                    if matches!(field, DialogField::Confirm | DialogField::Cancel) =>
+                {
+                    modal.focus_field(if field == DialogField::Confirm {
+                        DialogField::Cancel
+                    } else {
+                        DialogField::Confirm
+                    });
+                }
+                KeyCode::Enter => match field {
+                    DialogField::Confirm if modal.popup_open() => modal.save_popup(),
+                    DialogField::Cancel if modal.popup_open() => modal.cancel_popup(),
+                    DialogField::Confirm => return self.submit_modal(modal).map(|_| true),
+                    DialogField::Cancel => return self.request_modal_close(modal),
+                    DialogField::TaskOptions => modal.open_options(),
+                    _ => {
+                        if let Some(slot) = ModalState::launcher_slot(field) {
+                            modal.open_agent_settings(slot);
+                        } else {
+                            modal.enter_block();
+                        }
+                    }
+                },
+                // Flags flip straight from block selection.
+                KeyCode::Char(' ') if is_flag_field(field) => modal.input(key),
+                // Typing into a text field or a filterable selector steps
+                // inside it, so the first keystroke is never lost.
+                KeyCode::Char(_)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && typing_target =>
+                {
+                    modal.enter_block();
+                    modal.input(key);
+                }
+                _ => {}
+            }
         } else {
             match key.code {
                 KeyCode::Esc if modal.popup_open() => {
@@ -6499,40 +6588,6 @@ impl App {
                 KeyCode::Tab => modal.next_field(),
                 KeyCode::BackTab => modal.prev_field(),
                 KeyCode::Up | KeyCode::Down if modal.vertical_arrow(key) => {}
-                // In the settings dialog the arrows walk the tab strip —
-                // except where a field owns them (text carets, filtered
-                // selectors), and while an agent popup is open. Alt+Left/
-                // Right switch tabs from any field, owning ones included,
-                // while a popup is open only its own window is in play.
-                // Forms without tabs leave the chord unused. Tab/BackTab
-                // still reach the Save/Cancel buttons from any field.
-                KeyCode::Left | KeyCode::Right
-                    if key.modifiers.contains(KeyModifiers::ALT)
-                        && !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && modal.is_settings_form()
-                        && !modal.popup_open() =>
-                {
-                    let current = modal.settings_tab;
-                    let tabs = modal.settings_tabs();
-                    modal.set_settings_tab(if key.code == KeyCode::Left {
-                        current.prev(tabs)
-                    } else {
-                        current.next(tabs)
-                    });
-                }
-                KeyCode::Left | KeyCode::Right
-                    if modal.is_settings_form()
-                        && !modal.popup_open()
-                        && !field_consumes_horizontal(modal.active_field()) =>
-                {
-                    let current = modal.settings_tab;
-                    let tabs = modal.settings_tabs();
-                    modal.set_settings_tab(if key.code == KeyCode::Left {
-                        current.prev(tabs)
-                    } else {
-                        current.next(tabs)
-                    });
-                }
                 KeyCode::Left | KeyCode::Right
                     if !key.modifiers.contains(KeyModifiers::ALT)
                         && matches!(
@@ -8040,46 +8095,6 @@ fn planned_launch_from_modal(modal: &ModalState) -> PlannedLaunchInput {
         Some(time) => PlannedLaunchInput::Some(timefmt::next_launch_at(time)),
         None => PlannedLaunchInput::Invalid,
     }
-}
-
-/// Whether a dialog field already owns Left/Right: a text caret or a
-/// filtered selector (where Left/Right move the selection). On those the
-/// settings tab strip must not steal the arrows.
-fn field_consumes_horizontal(field: DialogField) -> bool {
-    matches!(
-        field,
-        DialogField::Title
-            | DialogField::Description
-            | DialogField::Answer
-            | DialogField::MaxRunningTotal
-            | DialogField::MaxRunningDesigner
-            | DialogField::MaxRunningReviewer
-            | DialogField::MaxRunningExecutor
-            | DialogField::MaxRunningPerBackend
-            | DialogField::MaxRunningPerBackendModel
-            | DialogField::AutoRestartDelays
-            | DialogField::ReviewerMaxRounds
-            | DialogField::AutoModeArbiterTimeout
-            | DialogField::AutoModeMaxResolverRuns
-            | DialogField::ExecutorWeekThreshold
-            | DialogField::ExecutorFiveHourThreshold
-            | DialogField::Backend
-            | DialogField::Model
-            | DialogField::ChainTo
-            | DialogField::LaunchTime
-            | DialogField::DesignerBackend
-            | DialogField::DesignerModel
-            | DialogField::ReviewerBackend
-            | DialogField::ReviewerModel
-            | DialogField::ArbiterBackend
-            | DialogField::ArbiterModel
-            | DialogField::ExecutorMiddle1
-            | DialogField::ExecutorMiddle2
-            | DialogField::ExecutorMiddle3
-            | DialogField::ExecutorCheap1
-            | DialogField::ExecutorCheap2
-            | DialogField::ExecutorCheap3
-    )
 }
 
 fn is_confirmation_modal(modal: &Modal) -> bool {

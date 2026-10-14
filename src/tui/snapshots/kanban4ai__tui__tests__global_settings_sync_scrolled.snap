@@ -9,18 +9,18 @@ expression: rendered
 │    /tmp/k4┌ Global settings ─────────────────────────────────────┐           │
 │           │ Com │ Des │ Rev │ Exe │ Aut │ Bck │ Prj │ Syn        │           │
 │           │──────────────────────────────────────────────────────│           │
-│           │┌ Sync ──────────────────────────────────────────────┐│           │
-│           ││  [ Pair with a node… ]                             ││           │
-│           ││  [ Show a pairing code / phone QR… ]               ││           │
-│           ││  [ Refresh status ]  (r)                           ││           │
-│           ││                                                    ││           │
-│           ││Conflicts (1)                                       ││           │
-│           ││  demo/task TASK-001 · title: kept «Fix login», lost││           │
-│           ││«Fix auth»                                          ││           │
-│           ││                                                    ││           │
-│           ││Project clones on this node                         ││           │
-│           ││  demo: missing · /tmp/k4ai-sync-tab · integration —││           │
-│           │└────────────────────────────────────────────────────┘│           │
+│           │┏ Sync ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓│           │
+│           │┃  [ Pair with a node… ]                             ┃│           │
+│           │┃  [ Show a pairing code / phone QR… ]               ┃│           │
+│           │┃  [ Refresh status ]  (r)                           ┃│           │
+│           │┃                                                    ┃│           │
+│           │┃Conflicts (1)                                       ┃│           │
+│           │┃  demo/task TASK-001 · title: kept «Fix login», lost┃│           │
+│           │┃«Fix auth»                                          ┃│           │
+│           │┃                                                    ┃│           │
+│           │┃Project clones on this node                         ┃│           │
+│           │┃  demo: missing · /tmp/k4ai-sync-tab · integration —┃│           │
+│           │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛│           │
 │           └──────────────────────────────────────────────────────┘           │
 │                                                                              │
 │                                                                              │

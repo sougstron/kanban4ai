@@ -22,7 +22,7 @@ expression: "render_at(&mut app, width, 24)"
 │└──────────────────────────────────────────────┘│
 │┌──────────────────────────────────────────────┐│
 ││[ Save ]  [ Cancel ]                          ││
-││(Ctrl + S) use Tab, Enter or Shift + Tab to na││
+││(Ctrl + S) ↑/↓ pick block · Enter edit · Tab n││
 │└──────────────────────────────────────────────┘│
 └────────────────────────────────────────────────┘
  TUI ready │ n new · r queue · Q queue · ? help   
@@ -31,8 +31,7 @@ expression: "render_at(&mut app, width, 24)"
 0:0-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 1:0-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 2:0-2 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-2:2-3 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).reversed()
-2:3-48 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+2:2-48 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 2:48-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 3:0-50 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 4:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
