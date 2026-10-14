@@ -296,6 +296,8 @@ impl GitRepo {
             s("HEAD"),
             s("--branches"),
             s(INTEGRATION_REF),
+            s("--glob=refs/kanban/wip/*"),
+            s("--glob=refs/kanban/wip-runs/*"),
         ];
         let exclusions: Vec<String> = have
             .iter()
@@ -365,6 +367,8 @@ impl GitRepo {
             remote,
             "+refs/heads/*:refs/remotes/kanban-code/*",
             "+refs/heads/kanban/*:refs/heads/kanban/*",
+            "+refs/kanban/wip/*:refs/kanban/wip/*",
+            "+refs/kanban/wip-runs/*:refs/kanban/wip-runs/*",
         ];
         args.extend(exclusions.iter().map(String::as_str));
         require(self.git(&args)?, "fetch code")?;
@@ -423,6 +427,12 @@ impl GitRepo {
             self.git(&["fetch", "--no-tags", "--", remote, &spec])?,
             "fetch completed run",
         )?;
+        Ok(())
+    }
+    /// WIP refs are moving checkpoints, unlike immutable completed-run refs.
+    pub fn push_checkpoint(&self, remote: &str, reference: &str) -> Result<()> {
+        let spec = format!("+{reference}:{reference}");
+        require(self.git(&["push", "--", remote, &spec])?, "push WIP")?;
         Ok(())
     }
 
@@ -496,7 +506,10 @@ impl GitRepo {
             if oid_from(oid).is_none() {
                 return Err(KanbanError::Invalid("Invalid bundle object ID".into()));
             }
-            if (name == INTEGRATION_REF || name.starts_with("refs/heads/kanban/TASK-"))
+            if (name == INTEGRATION_REF
+                || name.starts_with("refs/heads/kanban/TASK-")
+                || name.starts_with("refs/kanban/wip/")
+                || name.starts_with("refs/kanban/wip-runs/"))
                 && !checked_out.contains(name)
             {
                 // Git itself validates the complete ref syntax.
@@ -594,6 +607,32 @@ impl GitRepo {
     /// content matches `parent`; the resulting tree is identical. Any
     /// seeding failure falls back to the empty throwaway index.
     pub fn snapshot(&self, parent: &str, message: &str) -> Result<Oid> {
+        let tree = self.snapshot_tree(parent)?;
+        self.commit_tree(&tree, &[parent], message)
+    }
+
+    /// Machine-authored WIP checkpoints also work in fresh clones without user identity.
+    pub fn snapshot_wip(&self, parent: &str) -> Result<Oid> {
+        let tree = self.snapshot_tree(parent)?;
+        let out = require(
+            self.git(&[
+                "-c",
+                "user.name=kanban4ai",
+                "-c",
+                "user.email=kanban4ai@localhost",
+                "commit-tree",
+                tree.as_str(),
+                "-p",
+                parent,
+                "-m",
+                "kanban: WIP checkpoint",
+            ])?,
+            "commit-tree",
+        )?;
+        parse_oid(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    fn snapshot_tree(&self, parent: &str) -> Result<Oid> {
         let tmp = NamedTempFile::new()?;
         let index = Some(tmp.path());
         let seeded = self.seed_index(tmp.path())
@@ -606,8 +645,7 @@ impl GitRepo {
         }
         require(run(&self.root, &["add", "-A"], index)?, "add -A")?;
         let out = require(run(&self.root, &["write-tree"], index)?, "write-tree")?;
-        let tree = parse_oid(&String::from_utf8_lossy(&out.stdout))?;
-        self.commit_tree(&tree, &[parent], message)
+        parse_oid(&String::from_utf8_lossy(&out.stdout))
     }
 
     /// Create a dangling commit from `tree` — never on any branch, so the

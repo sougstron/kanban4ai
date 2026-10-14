@@ -777,6 +777,13 @@ pub(super) fn start(root: &Path) -> Running {
             if let Err(e) = blocking(move || crate::core::code::reconcile(&root)).await {
                 eprintln!("code replication: {e}");
             }
+            let root = monitor_root.clone();
+            let checkpoint_interval = discovery::config(&root).map_or(60, |c| c.run_heartbeat);
+            if let Err(e) =
+                blocking(move || crate::core::wip::publish(&root, checkpoint_interval, false)).await
+            {
+                eprintln!("WIP publication: {e}");
+            }
             let interval = discovery::config(&monitor_root).map_or(30, |c| c.interval);
             tokio::time::sleep(Duration::from_secs(interval)).await;
         }

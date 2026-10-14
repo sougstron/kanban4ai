@@ -49,6 +49,13 @@ pub enum Modal {
     StopTaskConfirm {
         task_id: String,
     },
+    ContinueTask {
+        task_id: String,
+    },
+    ContinuePublishedConfirm {
+        task_id: String,
+        node: String,
+    },
     RestoreConfirm {
         task_id: String,
     },
@@ -1036,7 +1043,7 @@ impl ModalState {
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
-            Modal::MoveTask { .. } => &[
+            Modal::MoveTask { .. } | Modal::ContinueTask { .. } => &[
                 DialogField::TargetStatus,
                 DialogField::Confirm,
                 DialogField::Cancel,
@@ -1057,6 +1064,7 @@ impl ModalState {
             | Modal::BulkConfirm { .. }
             | Modal::KillSessionConfirm { .. }
             | Modal::StopTaskConfirm { .. }
+            | Modal::ContinuePublishedConfirm { .. }
             | Modal::RestoreConfirm { .. } => &[DialogField::Confirm, DialogField::Cancel],
             Modal::AnswerQuestion { .. } => &[
                 DialogField::Question,
@@ -3100,6 +3108,9 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
         Modal::MoveTask { task_id } => {
             render_move(frame, app, modal, inner, task_id, &mut hitboxes)
         }
+        Modal::ContinueTask { task_id } => {
+            render_move(frame, app, modal, inner, task_id, &mut hitboxes)
+        }
         Modal::DeleteConfirm { task_id } => render_confirm(
             frame,
             app,
@@ -3152,6 +3163,22 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
                 Line::from(
                     "The request is delivered through sync, including when the runner is offline.",
                 ),
+            ],
+            &mut hitboxes,
+        ),
+        Modal::ContinuePublishedConfirm { task_id, node } => render_simple_confirm(
+            frame,
+            app,
+            modal,
+            inner,
+            app.theme.warn,
+            vec![
+                Line::from(format!("Продолжить {task_id} на {node} с последнего WIP?")),
+                Line::from(
+                    "Исходный runner недоступен; неопубликованные изменения не перенесутся.",
+                ),
+                Line::from("Старая сессия не будет остановлена. Живая сессия не переносится."),
+                Line::from("При двойном продолжении обе ветки сохранятся для выбора в Review."),
             ],
             &mut hitboxes,
         ),
@@ -4112,20 +4139,32 @@ fn render_move(
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(2),
+            Constraint::Length(if matches!(modal.modal, Modal::ContinueTask { .. }) {
+                5
+            } else {
+                2
+            }),
             Constraint::Length(task_selector_max_height(modal, DialogField::TargetStatus)),
             Constraint::Length(4),
             Constraint::Length(4),
         ])
         .split(area);
     frame.render_widget(
-        Paragraph::new(format!("Move {task_id} to status id:")),
+        Paragraph::new(if matches!(modal.modal, Modal::ContinueTask { .. }) {
+            format!("Продолжить {task_id} на узле:\nWIP будет опубликован; исходный runner отпустит задачу.\nЖивая сессия не переносится — новая сессия получит контекст треда.")
+        } else {
+            format!("Move {task_id} to status id:")
+        }).wrap(Wrap { trim: false }),
         rows[0],
     );
     render_select(
         frame,
         app,
-        "Status",
+        if matches!(modal.modal, Modal::ContinueTask { .. }) {
+            "Узел"
+        } else {
+            "Status"
+        },
         &modal.status_options,
         modal.status_selected,
         rows[1],
@@ -6042,6 +6081,8 @@ fn modal_title(modal: &Modal) -> &'static str {
         Modal::EditTask { .. } => " Edit task ",
         Modal::RunnerUnavailable { .. } => " Runner недоступен ",
         Modal::MoveTask { .. } => " Move task ",
+        Modal::ContinueTask { .. } => " Продолжить на узле ",
+        Modal::ContinuePublishedConfirm { .. } => " Последний опубликованный WIP ",
         Modal::DeleteConfirm { .. } => " Delete permanently ",
         Modal::RevertConfirm { .. } => " Revert task ",
         Modal::BulkConfirm { .. } => " Confirm bulk action ",

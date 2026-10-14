@@ -22,4 +22,4 @@ pub use backends::{
 };
 pub use launcher::KanbanLauncher;
 pub use prompt::build_agent_prompt;
-pub use tmux::{kill_session, session_exists};
+pub use tmux::{kill_session, session_exists, stop_for_handoff};

@@ -255,10 +255,31 @@ impl Operations {
                 .ok_or_else(|| KanbanError::Invalid("Invalid runner project".into()))?;
             let project = crate::core::code::prepare(root, id)?;
             let prepared = Operations::for_project(&project);
-            for task in requests {
-                prepared.queue_run(&task.id)?;
+            if prepared.queue_can_dispatch()? {
+                for task in requests {
+                    prepared.queue_run(&task.id)?;
+                }
+                return prepared.dispatch_queue();
             }
-            return prepared.dispatch_queue();
+            // A durable human launch is not an automated queue entry. An
+            // outbound runner must honor it even when its queue is disabled.
+            let mut dispatched = Vec::new();
+            for task in requests {
+                if let Some(session_id) = prepared.start_task(&task.id)? {
+                    let current = prepared
+                        .get_task(&task.id)?
+                        .ok_or_else(|| KanbanError::Invalid("Launched task missing".into()))?;
+                    dispatched.push(Dispatched {
+                        task_id: task.id,
+                        session_id,
+                        backend: current.agent_backend.ok_or_else(|| {
+                            KanbanError::Invalid("Launched backend missing".into())
+                        })?,
+                        role: Role::from_phase(current.run_phase).as_str(),
+                    });
+                }
+            }
+            return Ok(dispatched);
         }
         // Reap sessions whose process is gone before counting, exactly like
         // `kanban check-sessions`: otherwise a dead session would hold its

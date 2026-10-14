@@ -92,6 +92,19 @@ impl Embedded {
                     if let Err(e) = discovery::notify(&root, Some("shutdown")).await {
                         eprintln!("sync bye: {e}");
                     }
+                } else {
+                    // A TUI using another process's sync worker still checkpoints
+                    // on exit, but must not announce that the live node went away.
+                    let interval = discovery::config(&root).map_or(60, |c| c.run_heartbeat);
+                    match tokio::task::spawn_blocking(move || {
+                        crate::core::wip::publish(&root, interval, true)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => (),
+                        Ok(Err(e)) => eprintln!("WIP on exit: {e}"),
+                        Err(e) => eprintln!("WIP on exit: {e}"),
+                    }
                 }
                 drop(ownership);
                 drop(service);

@@ -32,6 +32,15 @@ in 0.7.x and existing on-disk boards are read unchanged. The full design is in
   quota/OAuth requests, pi spend and exhaustion tracking, and Gemini quota
   gating for executor pools. Gemini models remain available to agent backends.
 
+- **Continue work on another node.** Periodic and exit/bye checkpoints publish
+  dirty worktree files under `refs/kanban/wip/TASK-N` without changing HEAD or
+  index. `kanban continue --node` and TUI `Ctrl+W` release the source runner and
+  create a fresh session from WIP with thread context, including outbound-only
+  mobile targets with automatic queue disabled. The UI explicitly warns that
+  live sessions are not transferred; offline continuation requires confirmation
+  and retains partitioned duplicate results for Review. TUI exit also publishes
+  its final checkpoint when a separate daemon owns the sync worker, without
+  announcing that the still-running node went offline.
 - **Completed code replication and per-node landing.** Finished isolated runs
   retain immutable per-node/generation refs and publish results through the
   project remote; delivery retries independently of HTTP connectivity.

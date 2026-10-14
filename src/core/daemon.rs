@@ -329,9 +329,22 @@ fn pump_project(
         lines.push(format!("{ts} {} cleanup {task_id}", project.id));
     }
     if !orchestration.queue_enabled {
-        // `dispatch_queue` runs the auto-mode sweep on queue boards; a board
-        // without a queue still gets its questions answered.
+        // Runner requests return from dispatch before its auto-mode sweep.
+        // Sweep here too so queue-disabled boards still get questions answered.
         let _ = ops.auto_mode_sweep();
+        let pending_here = ops.storage.get_all_tasks()?.iter().any(|task| {
+            task.runner_request.is_some()
+                && crate::cli::serve::local_runner(&project.data_root, task.runner.as_ref())
+                    .unwrap_or(false)
+        });
+        if pending_here {
+            for item in ops.dispatch_queue()? {
+                lines.push(format!(
+                    "{ts} {} dispatch {} → {} ({})",
+                    project.id, item.task_id, item.session_id, item.backend
+                ));
+            }
+        }
         return Ok((lines, settle(project, &ops, false)?));
     }
 

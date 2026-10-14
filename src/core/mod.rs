@@ -33,3 +33,4 @@ pub mod thread;
 pub mod timefmt;
 pub mod update;
 pub mod vcs;
+pub mod wip;

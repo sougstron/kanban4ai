@@ -438,6 +438,15 @@ enum Command {
     },
     /// Stop the running agent session for a task (leaves the task In Progress).
     Stop { task_id: String },
+    /// Continue WIP on a paired node in a new agent session.
+    Continue {
+        task_id: String,
+        #[arg(long)]
+        node: String,
+        /// Accept loss of unpublished edits when the source runner is unreachable.
+        #[arg(long)]
+        last_published: bool,
+    },
 
     /// List active sessions.
     Sessions,
@@ -1581,6 +1590,22 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::FAILURE);
             }
         },
+        Command::Continue {
+            task_id,
+            node,
+            last_published,
+        } => {
+            let value = serve::continue_on_board(ops.data_root(), &task_id, &node, last_published)?;
+            if let Some(error) = value.get("error") {
+                eprintln!(
+                    "{}: {}",
+                    error["code"].as_str().unwrap_or(""),
+                    error["message"].as_str().unwrap_or("")
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+            println!("{value}");
+        }
         Command::Sessions => {
             let session_mgr = SessionManager::new(ops.data_root());
             let active = session_mgr.list_active_sessions();

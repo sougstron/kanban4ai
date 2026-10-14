@@ -480,6 +480,9 @@ pub struct Task {
     /// Durable remote queue intent. Only the pinned runner consumes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_request: Option<String>,
+    /// Published WIP seed for a fresh session after a node handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_from: Option<String>,
     /// When this task entered the queue as new work (a human run, a queue
     /// action, a chain or dependency hand-off — not a resume of a run that
     /// already started). Only such entries are held while the board has a
@@ -566,6 +569,7 @@ impl Task {
             run_duplicate: false,
             runner: None,
             runner_request: None,
+            continue_from: None,
             queued_at: None,
             conflict_held: false,
             resolver_runs: 0,
