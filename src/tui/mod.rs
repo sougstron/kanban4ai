@@ -334,10 +334,12 @@ pub fn run(start: TuiStart) -> Result<()> {
             LoopOutcome::OpenProject(project) => {
                 let mut next = app::App::for_project(project)?;
                 next.apply_global_settings();
+                app.hand_off_background(&mut next);
                 app = next;
             }
             LoopOutcome::ShowProjects { return_to } => {
-                let next = app::App::projects_only(return_to)?;
+                let mut next = app::App::projects_only(return_to)?;
+                app.hand_off_background(&mut next);
                 app = next;
             }
         }
@@ -367,6 +369,6 @@ pub fn run_in_place(project_path: impl AsRef<Path>) -> Result<()> {
 }
 
 pub fn run_project(project: Project) -> Result<()> {
-    let _ = ProjectStore::open()?.touch_opened(&project.id);
+    // `App::for_project` stamps the open in the background.
     run(TuiStart::Project(project))
 }

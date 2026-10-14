@@ -52,6 +52,17 @@ impl Drop for SyncBoard {
 }
 
 impl SyncBoard {
+    /// Give an in-flight status worker to the next screen's sync state
+    /// instead of joining it on drop: a peer probe can wait out network
+    /// timeouts, and a project switch must not. `next` reaps it on its next
+    /// poll (a result for another board is discarded) and starts no second
+    /// probe while it runs.
+    pub fn hand_off(&mut self, next: &mut SyncBoard) {
+        if next.job.is_none() {
+            next.job = self.job.take();
+        }
+    }
+
     /// Called every tick. The conflict list is re-read only when the journal
     /// changed on disk, and peers are probed at most every
     /// [`PEER_PROBE_INTERVAL`], so an idle board costs two `stat`s per tick.
