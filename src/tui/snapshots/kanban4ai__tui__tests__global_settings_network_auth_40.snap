@@ -5,25 +5,25 @@ expression: text
 ┌ Global settings ─────────────────────┐
 │ Syn                                  │
 │──────────────────────────────────────│
-│┌ Sync ──────────────────────────────┐│
-││This node                           ││
-││  Name: laptop  (Enter renames)     ││
-││  Role: ◀ laptop ▶  (Space changes) ││
-││  ☐ API server enabled (user unit) ·││
-││state unknown                       ││
-││┌ One-time Tailscale auth key ─────┐││
-│││Auth key (one-time, never saved)  │││
-│││••••••••••••••••••••••••••••••••▏ │││
-│││Enter: next / confirm · ↑/↓: field│││
-│││· Esc: cancel                     │││
-││└──────────────────────────────────┘││
-││      Peers online: 2               ││
-││      server: direct                ││
-││      phone: DERP (fra)             ││
-││› Auth key: empty (one-time)        ││
-││  [ Подключить / Connect ]          ││
-││  [ Отключить / Disconnect ]        ││
-│└────────────────────────────────────┘│
+│┏ Sync ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓│
+│┃This node                           ┃│
+│┃  Name: laptop  (Enter renames)     ┃│
+│┃  Role: ◀ laptop ▶  (Space changes) ┃│
+│┃  ☐ API server enabled (user unit) ·┃│
+│┃state unknown                       ┃│
+│┃┌ One-time Tailscale auth key ─────┐┃│
+│┃│Auth key (one-time, never saved)  │┃│
+│┃│••••••••••••••••••••••••••••••••▏ │┃│
+│┃│Enter: next / confirm · ↑/↓: field│┃│
+│┃│· Esc: cancel                     │┃│
+│┃└──────────────────────────────────┘┃│
+│┃      Peers online: 2               ┃│
+│┃      server: direct                ┃│
+│┃      phone: DERP (fra)             ┃│
+│┃› Auth key: empty (one-time)        ┃│
+│┃  [ Подключить / Connect ]          ┃│
+│┃  [ Отключить / Disconnect ]        ┃│
+│┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛│
 └──────────────────────────────────────┘
  Projects │ Enter open · n new · ? help 
 

@@ -839,6 +839,7 @@ pub(crate) fn render(
     app: &App,
     tab: &SyncTab,
     active: bool,
+    inside: bool,
     area: Rect,
     hitboxes: &mut Vec<Hitbox>,
 ) {
@@ -847,10 +848,14 @@ pub(crate) fn render(
     } else {
         app.theme.border
     };
-    let block = Block::default()
+    // The row cursor shows only once Enter stepped inside the panel.
+    let mut block = Block::default()
         .title(" Sync ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border));
+    if inside {
+        block = block.border_type(ratatui::widgets::BorderType::Thick);
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let Some(view) = &tab.view else {
@@ -865,7 +870,7 @@ pub(crate) fn render(
         );
         return;
     };
-    let (text, cursor, controls) = lines(app, tab, view, active);
+    let (text, cursor, controls) = lines(app, tab, view, inside);
     let notice_height = u16::from(tab.notice.is_some() && inner.height > 2);
     let body = Rect {
         height: inner.height.saturating_sub(notice_height),

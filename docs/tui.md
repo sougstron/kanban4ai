@@ -75,17 +75,16 @@ the plain-letter hotkeys.
   rendered rows while the detail thread is focused. Ctrl takes precedence
   over Shift; both stop at the beginning/end, matching the Stats text pager.
   Answer/review text panels keep their editor arrow bindings
-- `Alt+↑/↓`: jump to the block above/below from anywhere — the detail's
-  thread/answer/editor panels, a dialog's form fields (the nested
-  agent-settings and Options popups included) — even out of a text caret or
-  a selector/card selection, where the plain arrows keep their local
-  meaning. No wrapping: `Tab` stays the wrapping cycle
-- Plain `↑/↓` in a dialog leave a field from its edge: a text field from its
-  top line/end, a selector (chain-to, backend/model/effort/agent, the
-  Executor middle/cheap slots, sort/theme/status pickers) from its first or
-  last visible option; inside, they move the caret or selection
-- `Alt+←/→`: switch the settings dialog's tabs from any field (text inputs
-  and filtered selectors included). Where no tabs own the chord it deletes a
+- `Alt+↑/↓`: jump to the block above/below from anywhere in the detail —
+  thread/answer/editor panels — even out of a text caret or a card
+  selection, where the plain arrows keep their local meaning, and between
+  the fields of the small flat dialogs (move, add message, answer). The task
+  and settings forms use block navigation instead (see *Dialog block
+  navigation*)
+- Plain `↑/↓` in a flat dialog leave a field from its edge: a text field
+  from its top line/end, a selector from its first or last visible option;
+  inside, they move the caret or selection
+- `Alt+←/→`: where no tabs own the chord it deletes a
   word: in the detail's text panels and in every dialog text field `Alt+←`
   removes the word before the caret and `Alt+→` the one after it (the board
   keeps its columns plain-arrow only, and Yes/No confirmation prompts ignore
@@ -128,10 +127,8 @@ the plain-letter hotkeys.
 - `s`: Open Project Settings from Board or Detail. The dialog is split into
   five **tabs** — `Common │ Designer │ Reviewer │ Executor │ Prompt` — rendered as a
   labelled strip with a rule under it. **Left/Right switch tabs** (wrapping at
-  the ends) whenever the focused field does not own those arrows — i.e.
-  everywhere except text inputs, the per-backend cap lists, and the filtered
-  selectors (backend/model/chain-to and the Executor slots); **`Alt+←/→`
-  switch tabs from those fields too**; Tab/BackTab keep
+  the ends) while picking blocks, from any field; inside a block they belong
+  to the block (see *Dialog block navigation*). Tab/BackTab keep
   cycling inside the active tab, and a tab label is also clickable with the
   mouse. Each tab shows only its own page, but Save/Cancel sit under every
   tab and persist the **whole** dialog, so switching tabs never loses an
@@ -333,7 +330,8 @@ and board notes remain available. Long values are truncated to terminal width.
 ### Global Settings → Sync
 
 From the Projects screen, `s` opens Global Settings. Select **Sync** in the
-tab strip (`←/→`, `Alt+←/→`, or a click). The page shows this node's name and
+tab strip (`←/→` while picking blocks, or a click). The page is one block:
+Enter steps inside it to walk and press its rows. The page shows this node's name and
 role (`laptop`, `server`, `mobile`), the API user-unit switch, Tailscale mode,
 paired nodes in phone connection priority order, last confirmed exchanges,
 unconfirmed operation counts, field conflicts and project clone statuses.
@@ -515,7 +513,8 @@ so the detail view and usage stats show the concrete values instead of
 `-`/`default`/`unknown`. The selector labels still show what Default would
 resolve to.
 
-The task form's **Runner** row cycles with Left/Right or Space through
+The task form's **Runner** row cycles with Space (or, inside the block, Enter
+and Left/Right) through
 **Inherit from project / Auto / Сервер / Это устройство / Laptop / Mobile**.
 Create and Edit use the same control; inherit leaves no task-level override.
 Global Settings has **Default runner**; Project Settings has **Runner** and
@@ -523,19 +522,34 @@ Global Settings has **Default runner**; Project Settings has **Runner** and
 until the checkbox is unticked. These controls save placement preferences;
 remote execution/availability selection belongs to Runner 02.
 
-Dialog fields advance on Enter as well as Tab, except in multi-line text
-areas (task Description, Add-message body, custom Answer): those insert a
-newline on Enter, Shift+Enter, and Alt+Enter. Many terminals — and tmux
-without `extended-keys` — deliver Shift+Enter as a bare Enter, so the field
-must treat that the same as the modified chords. Tab still leaves the field.
-Enter only submits once focus has reached the Save button (`Ctrl+S` submits
-from anywhere). Checkboxes toggle on Space only.
+#### Dialog block navigation
 
-Up/Down also walk the dialog fields (without wrapping; Confirm/Cancel count
-as one row). In a text field Down first moves the caret down and then to the
-very end, Up to the very top; only from that edge (or in an empty field) does
-the arrow leave for the next/previous field. Selectors and lists keep Up/Down
-for their selection. In the task detail, Up from the top of the review editor
+The New task / Edit task forms, Project Settings and Global Settings (and
+their nested Agent settings / Options popups) split the keys into two levels:
+
+- **Picking a block** (the dialog opens here): `↑/↓` walk the blocks without
+  wrapping (Confirm/Cancel count as one row) and ignore what is inside them;
+  `←/→` switch settings tabs (in the task form they flip Save/Cancel on the
+  button row); `Tab`/`Shift+Tab` move to the next/previous block, wrapping.
+  `Space` flips a flag (checkboxes, inherit boxes) or cycles the Runner
+  straight away. `Enter` steps inside the picked block — or opens a popup
+  launcher, or presses Save/Cancel. `Esc` closes the popup or the dialog.
+  Typing into a text field or a filterable selector steps inside it with that
+  first keystroke, and so does a paste or a mouse click on a field.
+- **Inside a block** (thick border; only here do text carets and the coloured
+  selection highlight show): every key belongs to the block — arrows move the
+  caret or selection and stop at the edges, `Enter` inserts a newline in
+  multi-line text, commits a filter match in a selector, flips a flag, cycles
+  the Runner, ticks the focused checklist row or presses the Sync page's
+  focused control. Only `Tab`/`Shift+Tab` (straight into the next/previous
+  block's inside) and `Esc` (back to picking; the Sync page closes its open
+  form first) leave. `Ctrl+S` saves from either level.
+
+The small flat dialogs (move, add message, answer, project dialogs) keep one
+level: Enter advances like Tab except in multi-line text, and Up/Down leave a
+field from its edge. Multi-line text inserts a newline on Enter, Shift+Enter,
+and Alt+Enter — many terminals, and tmux without `extended-keys`, deliver
+Shift+Enter as a bare Enter. In the task detail, Up from the top of the review editor
 climbs to the answer panel (or thread), and the answer panel's variant list
 hands off to the thread above and the review editor below. The TUI requests
 `DISAMBIGUATE_ESCAPE_CODES` at startup where the terminal supports it
@@ -546,16 +560,15 @@ line (shown as `/ …`). Typing narrows the list case-insensitively on the optio
 label, including the leading "Default …" / "No chain" entry; Backspace edits
 the filter and Delete clears it. Arrow keys step only through visible matches,
 and the selection follows the filter, so narrowing to a single match leaves it
-selected and one Enter both picks it and advances. Enter on a filter that
+selected and Enter picks it. Enter on a filter that
 matches nothing is an error: the section border and filter row turn the theme's
 error colour and focus stays put, cleared again by any edit to the filter or
-any selection. A selector that has no options at all is not an error — Enter
-walks past it. The remaining selectors (effort, agent, status, theme, sorting)
+any selection. A selector that has no options at all is not an error. The remaining selectors (effort, agent, status, theme, sorting)
 have no filter row: their lists are short and fixed, so the row would cost a
 line of the dialog without saving a keystroke.
 
 A filter lasts only as long as the visit that typed it. Every focus change —
-Tab, Enter, Shift+Tab, or a click on another field — clears the filter of the
+Tab, Shift+Tab, Esc out of the block, or a click on another field — clears the filter of the
 field being left along with any error it was showing, so returning to a
 selector always starts from the full list rather than a stale narrowing. The
 option that was picked while filtered stays selected.

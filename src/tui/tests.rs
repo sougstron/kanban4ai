@@ -1115,6 +1115,8 @@ fn task_form_move_and_answer_selectors_follow_keyboard_contract() {
     app.handle_key(key(KeyCode::Tab)).expect("description");
     app.handle_key(key(KeyCode::Tab)).expect("agent settings");
     app.handle_key(key(KeyCode::Enter)).expect("open popup");
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into backend");
     app.handle_key(key(KeyCode::Down)).expect("select backend");
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.active_field(), DialogField::Backend);
@@ -1614,48 +1616,53 @@ fn settings_tabs_split_fields_and_keep_buttons_on_every_tab() {
     }
 }
 
-/// Left/Right walk the tab strip from plain fields (checkboxes, the
-/// isolation row) but never steal the arrows from a text caret or a
-/// filtered selector. Tab/BackTab keep cycling inside the active tab.
+/// While picking blocks Left/Right walk the tab strip from any field — text
+/// fields and selectors included. Inside a block they belong to the block.
 #[test]
-fn settings_arrows_switch_tabs_unless_the_field_owns_them() {
+fn settings_arrows_switch_tabs_while_picking_blocks() {
     let (_dir, mut app) = settings_app();
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open settings");
 
-    // From Title (text caret): arrows stay in the field.
-    app.handle_key(key(KeyCode::Right))
-        .expect("caret right in title");
+    // Title picked from the outside: Right switches the tab.
+    app.handle_key(key(KeyCode::Right)).expect("next tab");
+    assert_eq!(
+        app.modal.as_ref().unwrap().settings_tab,
+        SettingsTab::Designer
+    );
+    app.handle_key(key(KeyCode::Left)).expect("previous tab");
     assert_eq!(
         app.modal.as_ref().unwrap().settings_tab,
         SettingsTab::Common
     );
 
-    // From the QueueEnabled checkbox: Right lands on Designer.
-    app.modal
-        .as_mut()
-        .unwrap()
-        .focus_field(DialogField::QueueEnabled);
+    // Inside Title the arrows move the caret and never leave the page.
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into title");
+    assert!(app.modal.as_ref().unwrap().is_editing());
+    app.handle_key(key(KeyCode::Left)).expect("caret left");
+    app.handle_key(key(KeyCode::Right)).expect("caret right");
+    app.handle_key(key(KeyCode::Up)).expect("caret up");
+    app.handle_key(key(KeyCode::Down)).expect("caret down");
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.settings_tab, SettingsTab::Common);
+    assert_eq!(modal.active_field(), DialogField::Title);
+
+    // Esc steps back out; Right switches tabs again.
+    app.handle_key(key(KeyCode::Esc)).expect("back to blocks");
+    assert!(app.modal.is_some(), "Esc inside a block keeps the dialog");
+    assert!(!app.modal.as_ref().unwrap().is_editing());
     app.handle_key(key(KeyCode::Right)).expect("next tab");
     assert_eq!(
         app.modal.as_ref().unwrap().settings_tab,
         SettingsTab::Designer
     );
 
-    // From IsolationStatus (Common): Right walks Common→Designer.
-    let modal = app.modal.as_mut().unwrap();
-    modal.set_settings_tab(SettingsTab::Common);
-    modal.focus_field(DialogField::IsolationStatus);
-    app.handle_key(key(KeyCode::Right)).expect("next tab again");
-    assert_eq!(
-        app.modal.as_ref().unwrap().settings_tab,
-        SettingsTab::Designer
-    );
-
-    // MaxRunningPerBackend is a textarea: its arrows must not switch tabs.
+    // MaxRunningPerBackend is a textarea: inside, its arrows stay put.
     let modal = app.modal.as_mut().unwrap();
     modal.set_settings_tab(SettingsTab::Common);
     modal.focus_field(DialogField::MaxRunningPerBackend);
+    app.handle_key(key(KeyCode::Enter)).expect("step inside");
     app.handle_key(key(KeyCode::Left)).expect("caret left");
     app.handle_key(key(KeyCode::Right)).expect("caret right");
     assert_eq!(
@@ -1682,11 +1689,7 @@ fn settings_tab_arrows_wrap_and_tab_stays_in_page() {
         app.modal.as_ref().unwrap().settings_tab,
         SettingsTab::Instructions
     );
-    // Right from the last tab wraps back to the first. The Instructions page
-    // opens on a textarea that owns the arrows, so Confirm — which
-    // surrendered them to the tab strip — is the vantage point here.
-    let modal = app.modal.as_mut().unwrap();
-    modal.focus_field(DialogField::Confirm);
+    // Right from the last tab wraps back to the first.
     app.handle_key(key(KeyCode::Right)).expect("wrap right");
     assert_eq!(
         app.modal.as_ref().unwrap().settings_tab,
@@ -1813,11 +1816,11 @@ fn settings_alt_arrows_switch_tabs_from_owning_fields() {
     );
 }
 
-/// Plain Up/Down inside a selector move the selection and only leave the
-/// field from its first (Up) or last (Down) visible option, like a text
-/// caret at its edge.
+/// While picking blocks Up/Down walk the form without wrapping and ignore
+/// what is inside a block; once inside a selector they move its selection
+/// and never leave it, at either edge.
 #[test]
-fn plain_arrows_leave_a_selector_from_its_edge_options() {
+fn arrows_pick_blocks_outside_and_stay_inside_a_selector() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     app.modal
@@ -1833,41 +1836,52 @@ fn plain_arrows_leave_a_selector_from_its_edge_options() {
     app.modal
         .as_mut()
         .unwrap()
-        .select_option(DialogField::ChainTo, visible[0]);
+        .select_option(DialogField::ChainTo, visible[1]);
 
+    // Picking: the arrows walk blocks and leave the selection alone.
     app.handle_key(key(KeyCode::Up)).expect("up");
     assert_eq!(
         app.modal.as_ref().unwrap().active_field(),
-        DialogField::Readonly,
-        "Up on the first option leaves upward"
+        DialogField::Readonly
     );
+    app.handle_key(key(KeyCode::Down)).expect("down");
     app.handle_key(key(KeyCode::Down)).expect("down");
     assert_eq!(
         app.modal.as_ref().unwrap().active_field(),
-        DialogField::ChainTo
+        DialogField::TaskOptions
     );
-    for _ in 1..visible.len() {
-        app.handle_key(key(KeyCode::Down)).expect("down");
-        assert_eq!(
-            app.modal.as_ref().unwrap().active_field(),
-            DialogField::ChainTo,
-            "Down inside the list moves the selection"
-        );
+    assert_eq!(app.modal.as_ref().unwrap().chain_selected, visible[1]);
+    app.handle_key(key(KeyCode::Up)).expect("back up");
+
+    // Inside: the arrows move the selection and stop at both edges.
+    app.handle_key(key(KeyCode::Enter)).expect("step inside");
+    for _ in 0..visible.len() + 2 {
+        app.handle_key(key(KeyCode::Up)).expect("up");
     }
-    assert_eq!(
-        app.modal.as_ref().unwrap().chain_selected,
-        *visible.last().unwrap()
-    );
-    app.handle_key(key(KeyCode::Down)).expect("down");
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.active_field(), DialogField::ChainTo);
+    assert_eq!(modal.chain_selected, visible[0]);
+    for _ in 0..visible.len() + 2 {
+        app.handle_key(key(KeyCode::Down)).expect("down");
+    }
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.active_field(), DialogField::ChainTo);
+    assert_eq!(modal.chain_selected, *visible.last().unwrap());
+    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
     assert_eq!(
         app.modal.as_ref().unwrap().active_field(),
-        DialogField::TaskOptions,
-        "Down on the last option leaves downward"
+        DialogField::ChainTo,
+        "no chord walks out of a block"
     );
 
-    // The agent popup's selectors follow the same rule: Backend opens on
-    // its first option, so Up stays (nothing above) and Down at the last
-    // backend steps on to Model.
+    // Esc steps out; the selection stays.
+    app.handle_key(key(KeyCode::Esc)).expect("out");
+    let modal = app.modal.as_ref().unwrap();
+    assert!(!modal.is_editing());
+    assert_eq!(modal.chain_selected, *visible.last().unwrap());
+
+    // The agent popup nests the same two levels: Backend is picked, Down
+    // walks to Model without touching the backend.
     app.modal
         .as_mut()
         .unwrap()
@@ -1875,42 +1889,36 @@ fn plain_arrows_leave_a_selector_from_its_edge_options() {
     app.handle_key(key(KeyCode::Enter)).expect("open popup");
     let modal = app.modal.as_ref().unwrap();
     assert_eq!(modal.active_field(), DialogField::Backend);
-    let backends = modal.visible_options(DialogField::Backend).len();
-    for _ in 0..backends {
-        app.handle_key(key(KeyCode::Down)).expect("down");
-    }
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Model
-    );
-    app.handle_key(key(KeyCode::Up)).expect("up");
+    assert!(!modal.is_editing());
+    let backend = modal.backend_selected;
+    app.handle_key(key(KeyCode::Down)).expect("down");
     let modal = app.modal.as_ref().unwrap();
-    if modal.model_selected == modal.visible_options(DialogField::Model)[0] {
-        assert_eq!(modal.active_field(), DialogField::Backend);
-    }
+    assert_eq!(modal.active_field(), DialogField::Model);
+    assert_eq!(modal.backend_selected, backend);
+    // Esc while picking closes the popup, not the dialog.
+    app.handle_key(key(KeyCode::Esc)).expect("close popup");
+    let modal = app.modal.as_ref().unwrap();
+    assert!(!modal.popup_open());
+    assert_eq!(modal.active_field(), DialogField::AgentSettings);
 }
 
-/// `Alt+Up/Down` walk a dialog's fields from anywhere — out of a text caret
-/// and out of a selector that owns the plain arrows — without wrapping;
-/// Tab remains the wrapping cycle and the button row is not stepped over.
+/// Inside a block Tab/Shift+Tab hop straight into the next/previous block's
+/// inside; while picking they only move the pick.
 #[test]
-fn dialog_alt_up_down_walk_fields_from_text_and_selectors() {
+fn tab_keeps_the_level_it_was_pressed_on() {
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
-    // NewTask fields: Title, Description, AgentSettings, Readonly, ChainTo,
-    // TaskOptions, Confirm, Cancel.
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Title
-    );
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.active_field(), DialogField::Title);
+    assert!(!modal.is_editing(), "the form opens picking blocks");
 
-    // Park the caret inside a multi-line description: the plain arrows stay
-    // local, Alt+Up leaves the field.
     app.handle_key(key(KeyCode::Tab)).unwrap();
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Description
-    );
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.active_field(), DialogField::Description);
+    assert!(!modal.is_editing());
+
+    app.handle_key(key(KeyCode::Enter))
+        .expect("inside description");
     for c in "first line\nsecond line".chars() {
         let k = if c == '\n' {
             key(KeyCode::Enter)
@@ -1920,34 +1928,53 @@ fn dialog_alt_up_down_walk_fields_from_text_and_selectors() {
         app.handle_key(k).unwrap();
     }
     app.handle_key(key(KeyCode::Up)).unwrap();
-    assert_eq!(
-        app.modal.as_ref().unwrap().description.cursor(),
-        (0, 10),
-        "plain Up stays inside the text"
-    );
-    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Title
-    );
+    app.handle_key(key(KeyCode::Up)).unwrap();
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.description.cursor().0, 0);
+    assert_eq!(modal.active_field(), DialogField::Description);
 
-    // From the ChainTo selector (owns the plain arrows) Alt walks the
-    // ladder one field at a time without wrapping; Confirm and Cancel
-    // share a row.
+    app.handle_key(key(KeyCode::BackTab)).unwrap();
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.active_field(), DialogField::Title);
+    assert!(modal.is_editing(), "Shift+Tab lands inside the title");
+    app.handle_key(key(KeyCode::Char('x'))).unwrap();
+    assert_eq!(app.modal.as_ref().unwrap().title_text(), "x");
+
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.active_field(), DialogField::AgentSettings);
+    assert!(!modal.is_editing());
+}
+
+/// A flag flips on Space while picking, and on Enter (or Space) once
+/// inside.
+#[test]
+fn flags_flip_on_space_outside_and_enter_inside() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     app.modal
         .as_mut()
         .unwrap()
-        .focus_field(DialogField::ChainTo);
-    app.handle_key(alt_key(KeyCode::Up)).expect("alt up");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::Readonly
-    );
-    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::ChainTo
-    );
+        .focus_field(DialogField::Readonly);
+    app.handle_key(key(KeyCode::Char(' '))).unwrap();
+    let modal = app.modal.as_ref().unwrap();
+    assert!(modal.readonly);
+    assert!(!modal.is_editing());
+    app.handle_key(key(KeyCode::Enter)).expect("inside");
+    assert!(app.modal.as_ref().unwrap().is_editing());
+    app.handle_key(key(KeyCode::Enter)).expect("flip");
+    assert!(!app.modal.as_ref().unwrap().readonly);
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.active_field(), DialogField::Readonly);
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.active_field(), DialogField::ChainTo);
+    assert!(modal.is_editing());
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(!app.modal.as_ref().unwrap().is_editing());
 }
 
 /// Without tabs `Alt+Left/Right` does nothing: not on the board's columns,
@@ -2345,6 +2372,8 @@ fn task_form_default_backend_inherits_settings_agent() {
     app.handle_key(key(KeyCode::Tab)).expect("description");
     app.handle_key(key(KeyCode::Tab)).expect("agent settings");
     app.handle_key(key(KeyCode::Enter)).expect("open popup");
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into backend");
     app.handle_key(key(KeyCode::Up)).expect("to opencode");
     app.handle_key(key(KeyCode::Up)).expect("to default");
     assert_eq!(app.modal.as_ref().expect("modal").backend_text(), None);
@@ -2401,6 +2430,7 @@ fn description_ctrl_delete_and_backspace_remove_words() {
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     let modal = app.modal.as_mut().expect("modal");
     modal.focus_field(DialogField::Description);
+    modal.enter_block();
     modal.description.insert_str("hello world foo");
 
     app.handle_key(key(KeyCode::End)).expect("end");
@@ -2426,6 +2456,7 @@ fn description_ctrl_delete_removes_next_word_after_wrap_render() {
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     let modal = app.modal.as_mut().expect("modal");
     modal.focus_field(DialogField::Description);
+    modal.enter_block();
     modal.description.insert_str("hello world foo");
     let _ = render_at(&mut app, 72, 40);
 
@@ -2459,6 +2490,7 @@ fn multiline_up_at_top_and_down_at_bottom_reach_line_edges() {
     {
         let modal = app.modal.as_mut().expect("modal");
         modal.description = TextArea::from(["first", "second", "third"]);
+        modal.enter_block();
     }
 
     app.handle_key(key(KeyCode::Down)).expect("down");
@@ -2552,6 +2584,8 @@ fn settings_hotkey_navigates_fields_and_reloads_backend_defaults() {
     );
     app.handle_key(key(KeyCode::Enter))
         .expect("open agent settings");
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into backend");
     app.handle_key(key(KeyCode::Down)).expect("choose claude");
     let modal = app.modal.as_ref().expect("settings modal");
     assert_eq!(modal.active_field(), DialogField::Backend);
@@ -2646,6 +2680,8 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     }
     app.handle_key(key(KeyCode::Enter))
         .expect("open agent settings");
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into backend");
     app.handle_key(key(KeyCode::Down)).expect("claude");
     app.handle_key(key(KeyCode::Tab)).expect("model");
     app.handle_key(key(KeyCode::Left)).expect("clear model");
@@ -2657,11 +2693,15 @@ fn settings_save_persists_effective_keys_clears_nulls_and_applies_theme() {
     app.handle_key(ctrl_key(KeyCode::Char('s')))
         .expect("stage agent settings");
     app.modal.as_mut().unwrap().focus_field(DialogField::Theme);
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into theme");
     app.handle_key(key(KeyCode::Up)).expect("dark theme");
     app.modal
         .as_mut()
         .unwrap()
         .focus_field(DialogField::TaskSort);
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into sorting");
     app.handle_key(key(KeyCode::Down))
         .expect("task number down");
     app.handle_key(key(KeyCode::Down))
@@ -6449,6 +6489,7 @@ fn russian_layout_maps_commands_without_changing_text_input() {
     app.handle_key(key(KeyCode::Char('т')))
         .expect("title text input");
     assert_eq!(app.modal.as_ref().expect("new modal").title_text(), "т");
+    app.handle_key(key(KeyCode::Esc)).expect("out of the title");
     app.handle_key(key(KeyCode::Esc)).expect("discard prompt");
     app.handle_key(key(KeyCode::Char('y'))).expect("discard");
 
@@ -8039,6 +8080,11 @@ fn phase_four_forms_scroll_validate_and_protect_dirty_input() {
     app.modal.as_mut().unwrap().focus_field(DialogField::Title);
     app.handle_key(key(KeyCode::Char('x'))).unwrap();
     app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(
+        !app.modal.as_ref().unwrap().discard_confirm,
+        "Esc leaves the title first"
+    );
+    app.handle_key(key(KeyCode::Esc)).unwrap();
     assert!(app.modal.as_ref().unwrap().discard_confirm);
     app.handle_key(key(KeyCode::Char('n'))).unwrap();
     assert_eq!(app.modal.as_ref().unwrap().title_text(), "x");
@@ -8054,6 +8100,7 @@ fn phase_four_dirty_escape_preserves_whitespace_only_input() {
     app.handle_key(key(KeyCode::Char(' '))).unwrap();
     assert!(app.modal.as_ref().unwrap().is_dirty());
 
+    app.handle_key(key(KeyCode::Esc)).unwrap();
     app.handle_key(key(KeyCode::Esc)).unwrap();
     assert!(app.modal.as_ref().unwrap().discard_confirm);
     app.handle_key(key(KeyCode::Char('n'))).unwrap();
@@ -8072,6 +8119,7 @@ fn phase_four_scrolled_selector_click_uses_visible_option_index() {
         .as_mut()
         .unwrap()
         .focus_field(DialogField::ChainTo);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
     for _ in 0..4 {
         app.handle_key(key(KeyCode::Down)).unwrap();
     }
@@ -8232,8 +8280,13 @@ fn phase_four_modal_mouse_routes_fields_options_and_add_message_buttons() {
         Some("opencode")
     );
     assert_eq!((app.focused_column, app.focused_card), original_focus);
+    // The click stepped inside Backend: Esc leaves it, Esc closes the
+    // popup, Esc closes the clean dialog.
+    assert!(app.modal.as_ref().unwrap().is_editing());
     app.handle_key(key(KeyCode::Esc)).unwrap();
     app.handle_key(key(KeyCode::Esc)).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(app.modal.is_none());
 
     app.handle_key(key(KeyCode::Char('c'))).unwrap();
     let output = render_at(&mut app, 96, 28);
@@ -9850,6 +9903,8 @@ fn global_settings_projects_tab_hides_and_restores_a_project() {
     assert_eq!(modal.settings_tab, SettingsTab::Projects);
     assert_eq!(modal.active_field(), DialogField::ProjectVisibility);
     assert!(modal.project_visibility[0].visible);
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into the list");
     app.handle_key(key(KeyCode::Char(' '))).expect("untick");
     insta::assert_snapshot!("global_settings_projects_tab", render_at(&mut app, 80, 24));
     app.modal
@@ -9876,7 +9931,9 @@ fn global_settings_projects_tab_hides_and_restores_a_project() {
     app.handle_key(key(KeyCode::Left)).expect("sync tab");
     app.handle_key(key(KeyCode::Left)).expect("projects tab");
     assert!(!app.modal.as_ref().unwrap().project_visibility[0].visible);
-    app.handle_key(key(KeyCode::Char(' '))).expect("tick");
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into the list");
+    app.handle_key(key(KeyCode::Enter)).expect("tick");
     app.modal
         .as_mut()
         .unwrap()
@@ -9913,6 +9970,8 @@ fn global_settings_backends_tab_reorders_backend_pickers() {
     assert!(before.len() >= 2, "{before:?}");
 
     // Carry the first backend down one place, then the (new) last one up.
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into the list");
     app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
         .expect("move down");
     let modal = app.modal.as_ref().unwrap();
@@ -10310,6 +10369,7 @@ fn projects_screen_global_settings_project_sort_persists_to_the_store() {
 
     // Tab onto the selector, then pick the third option (Smart).
     app.handle_key(key(KeyCode::Tab)).expect("focus sort");
+    app.handle_key(key(KeyCode::Enter)).expect("step inside");
     app.handle_key(key(KeyCode::Down)).expect("newest");
     app.handle_key(key(KeyCode::Down)).expect("smart");
     assert_eq!(
@@ -10830,7 +10890,7 @@ fn chain_filter_matches_the_default_entry_too() {
 }
 
 #[test]
-fn enter_on_a_single_filter_match_selects_it_and_advances() {
+fn enter_on_a_single_filter_match_selects_it_and_stays() {
     let (_dir, mut app) = populated_app();
     open_new_task_on_chain(&mut app);
     type_text(&mut app, "question");
@@ -10840,8 +10900,8 @@ fn enter_on_a_single_filter_match_selects_it_and_advances() {
     assert_eq!(modal.chain_text().as_deref(), Some("TASK-001"));
     assert_eq!(
         modal.active_field(),
-        DialogField::TaskOptions,
-        "Enter moves on like Tab"
+        DialogField::ChainTo,
+        "Enter commits the match without leaving the block"
     );
     assert_eq!(modal.filter_error, None);
 }
@@ -10870,16 +10930,17 @@ fn enter_without_filter_matches_marks_the_section_and_holds_focus() {
 }
 
 #[test]
-fn enter_walks_past_a_selector_that_has_no_options_at_all() {
+fn enter_on_a_selector_with_no_options_raises_no_error() {
     let (_dir, mut app) = populated_app();
     open_new_task_on_chain(&mut app);
-    // An empty list is not a filter miss, so Enter must not trap focus here.
+    // An empty list is not a filter miss: Enter inside raises no error.
     app.modal.as_mut().expect("modal").set_chain_options(vec![]);
+    app.handle_key(key(KeyCode::Enter)).expect("step inside");
     app.handle_key(key(KeyCode::Enter)).expect("enter");
 
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.filter_error, None);
-    assert_ne!(modal.active_field(), DialogField::ChainTo, "focus moved on");
+    assert_eq!(modal.active_field(), DialogField::ChainTo);
 }
 
 #[test]
@@ -10963,7 +11024,14 @@ fn backend_filters_like_the_other_long_selectors() {
     app.handle_key(key(KeyCode::Enter)).expect("enter");
     let modal = app.modal.as_ref().expect("modal");
     assert_eq!(modal.backend_selected, 0);
-    assert_eq!(modal.active_field(), DialogField::Model, "Enter moves on");
+    assert_eq!(
+        modal.active_field(),
+        DialogField::Backend,
+        "Enter stays inside"
+    );
+    app.handle_key(key(KeyCode::Esc)).expect("leave the block");
+    let modal = app.modal.as_ref().expect("modal");
+    assert!(modal.popup_open(), "Esc inside a block keeps the popup");
     assert_eq!(modal.backend_filter, "");
 }
 
@@ -11026,11 +11094,17 @@ fn filtered_selector_click_resolves_to_the_unfiltered_option_index() {
 }
 
 #[test]
-fn title_enter_walks_on_and_description_enter_writes_a_newline() {
+fn title_enter_stays_and_description_enter_writes_a_newline() {
     let (_dir, mut app) = populated_app();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     type_text(&mut app, "Title text");
     app.handle_key(key(KeyCode::Enter)).expect("enter on title");
+    assert_eq!(
+        app.modal.as_ref().expect("modal").active_field(),
+        DialogField::Title,
+        "Enter never walks out of a block"
+    );
+    app.handle_key(key(KeyCode::Tab)).expect("into description");
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
         DialogField::Description
@@ -11083,7 +11157,7 @@ fn new_task_mode_toggles_save_on_the_task() {
         DialogField::Readonly
     );
     app.handle_key(key(KeyCode::Char(' '))).expect("space");
-    app.handle_key(key(KeyCode::Enter)).expect("enter");
+    app.handle_key(key(KeyCode::Down)).expect("down");
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
         DialogField::ChainTo
@@ -11109,7 +11183,7 @@ fn new_task_mode_toggles_save_on_the_task() {
         if toggle {
             app.handle_key(key(KeyCode::Char(' '))).expect("space");
         }
-        app.handle_key(key(KeyCode::Enter)).expect("enter");
+        app.handle_key(key(KeyCode::Down)).expect("down");
     }
     // Focus landed on the popup's Save button; Enter stages the options.
     assert_eq!(
@@ -11151,6 +11225,13 @@ fn task_runner_override_can_be_saved_and_cleared_to_inherit() {
     type_text(&mut app, "Runner override");
     app.modal.as_mut().unwrap().focus_field(DialogField::Runner);
     app.handle_key(key(KeyCode::Left)).unwrap();
+    assert_eq!(
+        app.modal.as_ref().unwrap().runner,
+        None,
+        "picking ignores ←"
+    );
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    app.handle_key(key(KeyCode::Left)).unwrap();
     app.modal
         .as_mut()
         .unwrap()
@@ -11171,6 +11252,7 @@ fn task_runner_override_can_be_saved_and_cleared_to_inherit() {
         &task,
     ));
     app.modal.as_mut().unwrap().focus_field(DialogField::Runner);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
     app.handle_key(key(KeyCode::Right)).unwrap();
     app.modal
         .as_mut()
@@ -12302,60 +12384,51 @@ fn detail_analytics_panel_shows_limit_shares_per_role() {
     insta::assert_snapshot!("detail_analytics_limit_shares", rendered);
 }
 
-/// Up/Down walk the dialog fields like BackTab/Tab, but a text field first
-/// carries the caret to its top or very end and only leaves from there.
+/// Inside a text field Up/Down only move the caret, at its edges too; while
+/// picking blocks they walk the form. Confirm and Cancel share a row.
 #[test]
-fn arrows_walk_dialog_fields_through_text_edges() {
+fn arrows_inside_text_never_leave_the_block() {
     let (_dir, mut app) = app_with_board();
     app.handle_key(key(KeyCode::Char('n'))).expect("new task");
     let active = |app: &App| app.modal.as_ref().expect("modal").active_field();
     assert_eq!(active(&app), DialogField::Title);
-
-    // Empty title: already at the end, so Down leaves at once; Up at the
-    // first field has nowhere to go.
     app.handle_key(key(KeyCode::Up)).expect("up on first");
     assert_eq!(active(&app), DialogField::Title);
-    type_text(&mut app, "Title");
-    app.handle_key(key(KeyCode::Home)).expect("home");
-    app.handle_key(key(KeyCode::Down)).expect("caret to end");
-    assert_eq!(active(&app), DialogField::Title);
-    assert_eq!(
-        app.modal.as_ref().unwrap().title.cursor(),
-        ratatui_textarea::DataCursor(0, 5)
-    );
-    app.handle_key(key(KeyCode::Down)).expect("leave title");
-    assert_eq!(active(&app), DialogField::Description);
 
-    // Two lines: Down steps a row, then to the end, then out.
+    // Typing steps inside the title; the arrows then stay there.
+    type_text(&mut app, "Title");
+    app.handle_key(key(KeyCode::Down)).expect("down");
+    app.handle_key(key(KeyCode::Down)).expect("down");
+    assert_eq!(active(&app), DialogField::Title);
+    app.handle_key(key(KeyCode::Esc)).expect("out");
+    app.handle_key(key(KeyCode::Down))
+        .expect("pick description");
+    assert_eq!(active(&app), DialogField::Description);
+    assert!(!app.modal.as_ref().unwrap().is_editing());
+
+    app.handle_key(key(KeyCode::Enter)).expect("inside");
     type_text(&mut app, "ab");
     app.handle_key(key(KeyCode::Enter)).expect("newline");
     type_text(&mut app, "cd");
-    app.handle_key(key(KeyCode::Up)).expect("row up");
-    app.handle_key(key(KeyCode::Home)).expect("home");
-    app.handle_key(key(KeyCode::Down)).expect("row down");
-    assert_eq!(active(&app), DialogField::Description);
-    app.handle_key(key(KeyCode::Down)).expect("to end");
-    assert_eq!(active(&app), DialogField::Description);
-    assert_eq!(
-        app.modal.as_ref().unwrap().description.cursor(),
-        ratatui_textarea::DataCursor(1, 2)
-    );
-    app.handle_key(key(KeyCode::Down))
-        .expect("leave description");
-    assert_eq!(active(&app), DialogField::AgentSettings);
-
-    // Back up: the caret re-enters at the end, climbs to the top, leaves.
-    app.handle_key(key(KeyCode::Up)).expect("into description");
-    assert_eq!(active(&app), DialogField::Description);
-    app.handle_key(key(KeyCode::Up)).expect("row up");
-    app.handle_key(key(KeyCode::Up)).expect("to top");
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Up)).expect("up");
+    }
     assert_eq!(active(&app), DialogField::Description);
     assert_eq!(
         app.modal.as_ref().unwrap().description.cursor(),
         ratatui_textarea::DataCursor(0, 0)
     );
-    app.handle_key(key(KeyCode::Up)).expect("leave description");
-    assert_eq!(active(&app), DialogField::Title);
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Down)).expect("down");
+    }
+    assert_eq!(active(&app), DialogField::Description);
+    assert_eq!(
+        app.modal.as_ref().unwrap().description.cursor(),
+        ratatui_textarea::DataCursor(1, 2)
+    );
+    app.handle_key(key(KeyCode::Esc)).expect("out");
+    app.handle_key(key(KeyCode::Down)).expect("next block");
+    assert_eq!(active(&app), DialogField::AgentSettings);
 
     // Confirm and Cancel share a row: Up from Cancel skips Confirm, Down
     // from the buttons stays put.
@@ -12367,18 +12440,6 @@ fn arrows_walk_dialog_fields_through_text_edges() {
         active(&app),
         DialogField::Confirm | DialogField::Cancel
     ));
-}
-
-/// Selectors keep Up/Down for their own selection.
-#[test]
-fn arrows_stay_inside_selector_fields() {
-    let (_dir, mut app) = populated_app();
-    open_new_task_on_chain(&mut app);
-    app.handle_key(key(KeyCode::Down)).expect("select next");
-    assert_eq!(
-        app.modal.as_ref().unwrap().active_field(),
-        DialogField::ChainTo
-    );
 }
 
 /// Up from the top of the review editor climbs back to the thread.
@@ -12794,6 +12855,9 @@ fn only_the_focused_text_field_draws_a_cursor() {
         })
     };
 
+    // Picked but not entered: no caret anywhere.
+    assert_eq!(styled_cells(&mut app, Modifier::REVERSED), [0, 0]);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
     assert_eq!(styled_cells(&mut app, Modifier::REVERSED), [1, 0]);
     app.handle_key(key(KeyCode::Char('x'))).unwrap();
     let [title, description] = styled_cells(&mut app, Modifier::UNDERLINED);
@@ -13093,7 +13157,10 @@ fn global_settings_sync_tab_snapshot() {
         probed: true,
     });
     insta::assert_snapshot!("global_settings_sync_tab", render_at(&mut app, 100, 40));
-    // At a small terminal size the lower read-only sections remain reachable.
+    // At a small terminal size the lower read-only sections remain reachable
+    // from inside the panel.
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into the sync panel");
     for _ in 0..10 {
         app.handle_key(key(KeyCode::PageDown)).unwrap();
     }
@@ -13106,6 +13173,8 @@ fn global_settings_sync_tab_snapshot() {
 #[test]
 fn global_settings_sync_tab_changes_node_and_peer_order() {
     let (store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-actions"));
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into the sync panel");
     let store = ProjectStore::at(store_dir.path());
     let root = store_dir.path();
 
@@ -13194,6 +13263,8 @@ fn global_settings_sync_tab_changes_node_and_peer_order() {
 #[test]
 fn global_settings_sync_tab_qr_needs_a_lan_address() {
     let (_store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-qr"));
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into the sync panel");
     app.handle_key(key(KeyCode::End)).expect("refresh row");
     app.handle_key(key(KeyCode::Up)).expect("code row");
     app.handle_key(key(KeyCode::Enter)).expect("code form");
@@ -13226,6 +13297,8 @@ fn global_settings_network_snapshots() {
     use super::sync_tab::Row;
     use crate::core::net::Mode;
     let (_store, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-network-snapshots"));
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into the sync panel");
     let tab = &mut app.modal.as_mut().unwrap().sync;
     tab.network_mode = Some(Mode::Managed);
     tab.network = Some(Ok(serde_json::json!({
@@ -13304,6 +13377,8 @@ fn global_settings_network_mode_is_immediate_and_system_is_read_only() {
     use super::sync_tab::Row;
     use crate::core::net::{self, Mode};
     let (store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-network-actions"));
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into the sync panel");
     let store = ProjectStore::at(store_dir.path());
     let mut config = store.load_global_config().unwrap();
     config.extras.insert(
@@ -13345,6 +13420,7 @@ fn global_settings_network_mode_is_immediate_and_system_is_read_only() {
         }
     }
     // Cancel closes the draft dialog, not these already-applied local controls.
+    app.handle_key(key(KeyCode::Esc)).unwrap();
     app.handle_key(key(KeyCode::Esc)).unwrap();
     assert!(app.modal.is_none());
     assert_eq!(net::settings(store_dir.path()).unwrap().mode, Mode::Off);
