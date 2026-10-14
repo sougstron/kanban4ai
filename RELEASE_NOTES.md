@@ -1,3 +1,21 @@
+# kanban4ai 0.8.1
+
+- **Continue work on another node.** `kanban continue TASK-N --node <name>`
+  and TUI `Ctrl+W` publish the source worktree's WIP, release its runner,
+  and start a fresh session on a paired node with thread context. Live
+  agent sessions are not transferred.
+- **WIP checkpoints.** Periodic and exit/bye publication preserves dirty
+  tracked and untracked files without changing HEAD or the index. Checkpoints
+  retain source node/generation refs; continuation keeps the stopped source
+  checkout and seeds a separate worktree from the published commit.
+- **Offline and mobile continuation.** An unavailable source requires explicit
+  confirmation to use its last published WIP; unpublished edits are omitted
+  and the old session cannot be stopped. Partitioned duplicate results remain
+  available for human Review. Outbound-only runners honor durable explicit
+  launch requests even when automatic queue dispatch is disabled.
+- **Final TUI checkpoint.** Exiting a TUI also publishes WIP when a separate
+  daemon owns sync, without announcing that the still-running node went offline.
+
 # kanban4ai 0.8.0
 
 Multi-node release: a laptop, a home server and a phone can now share one
