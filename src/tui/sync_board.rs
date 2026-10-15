@@ -1,7 +1,7 @@
 //! Board sync status and task/message conflict controls. All probes run off-thread.
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Utc};
 use ratatui::Frame;
@@ -20,9 +20,6 @@ use crate::core::sync::{Conflict, Journal};
 /// the board ticks.
 const PEER_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// `(len, mtime)` of the journal files the conflict list is derived from.
-type JournalStamp = [Option<(u64, SystemTime)>; 2];
-
 #[derive(Default)]
 pub(crate) struct SyncBoard {
     pub peers: Vec<BoardPeer>,
@@ -32,7 +29,7 @@ pub(crate) struct SyncBoard {
     pub selected: usize,
     board: PathBuf,
     last_probe: Option<Instant>,
-    journal_stamp: Option<JournalStamp>,
+    journal_stamp: Option<u64>,
     job: Option<JoinHandle<Result<Snapshot, String>>>,
 }
 
@@ -107,7 +104,7 @@ impl SyncBoard {
             return;
         }
         let stamp = journal_stamp(root);
-        let reload_conflicts = self.journal_stamp != Some(stamp);
+        let reload_conflicts = self.journal_stamp != stamp;
         let probe = self
             .last_probe
             .is_none_or(|at| at.elapsed() >= PEER_PROBE_INTERVAL.max(interval));
@@ -115,7 +112,7 @@ impl SyncBoard {
             return;
         }
         if reload_conflicts {
-            self.journal_stamp = Some(stamp);
+            self.journal_stamp = stamp;
         }
         if probe {
             self.last_probe = Some(Instant::now());
@@ -181,11 +178,8 @@ impl SyncBoard {
     }
 }
 
-fn journal_stamp(root: &Path) -> JournalStamp {
-    ["sync/meta/state.json", "sync/meta/conflicts.jsonl"].map(|file| {
-        let meta = std::fs::metadata(root.join(file)).ok()?;
-        Some((meta.len(), meta.modified().ok()?))
-    })
+fn journal_stamp(root: &Path) -> Option<u64> {
+    crate::core::sync::change_token(root)
 }
 
 fn load(

@@ -154,10 +154,11 @@ impl Journal {
                 continue;
             };
             let before_bytes = old.map(|old| self.blob(&old.hash)).transpose()?;
-            let file_value =
-                |hash: &str| json(&serde_json::json!({"path": target.id, "blob": hash}));
+            let file_value = |hash: &str, size: u64| {
+                json(&serde_json::json!({"path": target.id, "blob": hash, "size": size}))
+            };
             let before = if target.entity == "file" {
-                old.map(|old| file_value(&old.hash)).transpose()?
+                old.map(|old| file_value(&old.hash, old.size)).transpose()?
             } else {
                 before_bytes
                     .map(String::from_utf8)
@@ -167,7 +168,7 @@ impl Journal {
             let after = if target.entity == "file" {
                 current
                     .as_ref()
-                    .map(|(entry, _)| file_value(&entry.hash))
+                    .map(|(entry, _)| file_value(&entry.hash, entry.size))
                     .transpose()?
             } else {
                 current
@@ -286,10 +287,103 @@ pub(super) fn validate_file(id: &str, values: &Fields) -> Result<()> {
     if let Some(hash) = values.get("blob").filter(|v| !v.is_null()) {
         valid_hash(hash.as_str().ok_or_else(|| invalid("invalid blob hash"))?)?;
     }
+    if let Some(size) = values.get("size").filter(|v| !v.is_null()) {
+        if !size.is_number() {
+            return Err(invalid("invalid blob size"));
+        }
+    }
     Ok(())
 }
 
-fn repair_tail(path: &Path) -> Result<()> {
+/// One path, relative to the drift base. Does not take the store lock: recovery
+/// runs it while the board lock is already held.
+pub(super) fn reconcile_path(journal: &Journal, path: &Path) -> Result<()> {
+    let store = journal.root.parent().expect("sync parent");
+    let relative = match path.strip_prefix(store) {
+        Ok(relative) => relative
+            .to_str()
+            .ok_or_else(|| invalid("non-UTF8 drift path"))?
+            .to_owned(),
+        Err(_) => return Ok(()),
+    };
+    if relative.starts_with("sync/") || transport::allowed_path(&relative).is_err() {
+        return Ok(());
+    }
+    let index = index(journal)?;
+    let old = index.get(&relative);
+    let present = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => true,
+        Ok(_) => return Err(invalid("drift path is not a regular file")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e.into()),
+    };
+    if !present && old.is_none() {
+        return Ok(());
+    }
+    let current = if present {
+        let meta = fs::symlink_metadata(path)?;
+        let mtime = meta
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| invalid("mtime before epoch"))?
+            .as_nanos();
+        if old.is_some_and(|old| old.mtime == mtime && old.size == meta.len()) {
+            return Ok(());
+        }
+        let bytes = fs::read(path)?;
+        let digest = hash(&bytes);
+        if old.is_some_and(|old| old.hash == digest) {
+            return Ok(());
+        }
+        journal.put_blob(&digest, &bytes)?;
+        Some((
+            Entry {
+                mtime,
+                size: meta.len(),
+                hash: digest,
+            },
+            bytes,
+        ))
+    } else {
+        None
+    };
+    let Some(target) = target(path) else {
+        return Ok(());
+    };
+    let before_bytes = old.map(|old| journal.blob(&old.hash)).transpose()?;
+    let file_value = |hash: &str, size: u64| {
+        json(&serde_json::json!({"path": target.id, "blob": hash, "size": size}))
+    };
+    let before = if target.entity == "file" {
+        old.map(|old| file_value(&old.hash, old.size)).transpose()?
+    } else {
+        before_bytes
+            .map(String::from_utf8)
+            .transpose()
+            .map_err(|_| invalid("replicated text is not UTF-8"))?
+    };
+    let after = if target.entity == "file" {
+        current
+            .as_ref()
+            .map(|(entry, _)| file_value(&entry.hash, entry.size))
+            .transpose()?
+    } else {
+        current
+            .as_ref()
+            .map(|(_, bytes)| std::str::from_utf8(bytes).map(str::to_owned))
+            .transpose()
+            .map_err(|_| invalid("replicated text is not UTF-8"))?
+    };
+    capture_inner(
+        path,
+        after.as_deref(),
+        Some(before.as_deref()),
+        current.as_ref().map(|(entry, _)| entry.clone()),
+    )?;
+    Ok(())
+}
+
+pub(super) fn repair_tail(path: &Path) -> Result<()> {
     use std::io::{Seek, SeekFrom};
     let mut file = match OpenOptions::new().read(true).write(true).open(path) {
         Ok(file) => file,

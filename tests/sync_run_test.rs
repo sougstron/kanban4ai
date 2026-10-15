@@ -6,11 +6,10 @@ use kanban4ai::core::timefmt;
 use std::fs;
 
 fn operations(store: &std::path::Path, node: &str) -> Vec<Operation> {
-    fs::read_to_string(store.join("sync/journal").join(format!("{node}.jsonl")))
-        .unwrap_or_default()
-        .lines()
-        .map(|s| serde_json::from_str(s).unwrap())
-        .collect()
+    Journal::open(store)
+        .unwrap()
+        .operations(Some(node))
+        .unwrap()
 }
 
 fn board(store: &std::path::Path) -> Storage {
@@ -247,7 +246,9 @@ fn concurrent_runners_survive_reordered_delivery_and_next_generation_sees_both()
         2
     );
     let vector = journal.state().unwrap().vector;
-    journal.compact(&[vector]).unwrap();
+    journal
+        .prune(&std::collections::BTreeMap::from([("peer".into(), vector)]))
+        .unwrap();
     assert_eq!(
         Journal::open(a.path())
             .unwrap()

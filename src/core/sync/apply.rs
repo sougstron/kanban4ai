@@ -22,6 +22,14 @@ struct RemotePending {
     writes: BTreeMap<PathBuf, Option<String>>,
     #[serde(default)]
     blobs: BTreeMap<PathBuf, String>,
+    #[serde(default)]
+    operations: Vec<Operation>,
+    #[serde(default)]
+    uids: Option<projection::Uids>,
+    #[serde(default)]
+    conflicts: String,
+    #[serde(default)]
+    hlc: Option<Hlc>,
 }
 
 fn finish(root: &Path, pending: &RemotePending) -> Result<()> {
@@ -29,6 +37,42 @@ fn finish(root: &Path, pending: &RemotePending) -> Result<()> {
         root: root.to_path_buf(),
         node: serde_yaml_ng::from_str(&fs::read_to_string(root.join("node.yaml"))?)?,
     };
+    if !pending.operations.is_empty() {
+        let limits = format::JournalLimits::load(root.parent().unwrap_or(root))?;
+        let mut by_node: BTreeMap<String, Vec<Operation>> = BTreeMap::new();
+        for op in &pending.operations {
+            by_node
+                .entry(op.hlc.2.clone())
+                .or_default()
+                .push(op.clone());
+        }
+        for (node, ops) in &by_node {
+            let head = segments::head_seq(&root.join("journal").join(node)).unwrap_or(0);
+            let ahead = segments::ahead_seqs(root, node).unwrap_or_default();
+            let fresh: Vec<_> = ops
+                .iter()
+                .filter(|op| {
+                    sequence(op).ok().is_some_and(|seq| {
+                        seq > head && seq > journal_compacted(root, node) && !ahead.contains(&seq)
+                    })
+                })
+                .cloned()
+                .collect();
+            if !fresh.is_empty() {
+                segments::append(root, node, &fresh, &limits)?;
+            }
+        }
+    }
+    if let Some(uids) = &pending.uids {
+        fs::create_dir_all(root.join("meta"))?;
+        projection::atomic_write_json(&root.join("meta/uids.json"), uids)?;
+    }
+    if !pending.conflicts.is_empty() {
+        atomic_write_text_raw(&root.join("meta/conflicts.jsonl"), &pending.conflicts)?;
+    }
+    if let Some(clock) = &pending.hlc {
+        atomic_write_text_raw(&root.join("hlc"), &json(clock)?)?;
+    }
     for (path, hash) in &pending.blobs {
         transport::write_bytes(path, &journal.blob(hash)?)?;
         drift::record(&journal, path)?;
@@ -127,8 +171,10 @@ impl Journal {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| invalid("operation sequence exhausted"))?;
-        let clock: Hlc = load(&self.root.join("hlc"))?;
+        let clock: Hlc = self.clock()?;
         let operation = Operation {
+            v: OP_FORMAT,
+            extra: BTreeMap::new(),
             op: format!("{}:{seq}", self.node.node_id),
             hlc: clock.tick(now_ms(), &self.node.node_id)?,
             store: self.node.store_id.clone(),
@@ -179,42 +225,32 @@ impl Journal {
             .collect::<Result<_>>()?;
         let sync = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
-        let mut state: JournalState = load(&self.root.join("meta/state.json"))?;
+        let (mut state, prune_meta) = projection::load_state(&self.root)?;
         let previous_aliases = state.project_uids.clone();
-        let mut clock: Hlc = load(&self.root.join("hlc"))?;
+        let mut clock: Hlc = self.clock()?;
         for op in operations {
             clock.observe(&op.hlc, now_ms(), max_skew_ms)?;
         }
-        let mut changed = false;
+        let mut accepted = Vec::new();
         for op in operations {
-            if state.operations.contains_key(&op.op)
-                || sequence(op)? <= *state.compacted.get(&op.hlc.2).unwrap_or(&0)
-            {
+            let seq = sequence(op)?;
+            let node = &op.hlc.2;
+            let head = state.vector.get(node).copied().unwrap_or(0);
+            if seq <= head || seq <= state.compacted.get(node).copied().unwrap_or(0) {
+                continue;
+            }
+            if segments::ahead_seqs(&self.root, node)?.contains(&seq) {
                 continue;
             }
             apply_meta(&mut state, op);
-            changed = true;
+            accepted.push(op.clone());
         }
-        if !changed {
-            return conflicts(&state);
+        if accepted.is_empty() {
+            return prune::conflicts_of(&state, &self.retained_ops(&state)?);
         }
-        // A vector acknowledges only contiguous receipt, not the largest seen seq.
-        let nodes: BTreeSet<_> = state
-            .operations
-            .values()
-            .map(|op| op.hlc.2.clone())
-            .collect();
-        for node in nodes {
-            let mut through = *state.compacted.get(&node).unwrap_or(&0);
-            while state
-                .operations
-                .contains_key(&format!("{node}:{}", through + 1))
-            {
-                through += 1;
-            }
-            state.vector.insert(node, through);
-        }
-        let conflicts = conflicts(&state)?;
+        let mut history = self.retained_ops(&state)?;
+        history.extend(accepted.iter().cloned());
+        let conflicts = prune::conflicts_of(&state, &history)?;
         let mut writes = BTreeMap::new();
         project_aliases(&mut state)?;
         // Existing boards remain locked while calculating collision destinations.
@@ -257,43 +293,41 @@ impl Journal {
                 blobs.insert(path, hash.to_owned());
             }
         }
-        let mut logs: BTreeMap<String, Vec<&Operation>> = BTreeMap::new();
-        for op in state.operations.values() {
-            if op.hlc.2 != self.node.node_id
-                && sequence(op)? > *state.compacted.get(&op.hlc.2).unwrap_or(&0)
-            {
-                logs.entry(op.hlc.2.clone()).or_default().push(op);
+        writes.retain(|path, content| {
+            let text = path.to_string_lossy();
+            if text.contains("/sync/meta/state.json") || text.contains("/sync/journal/") {
+                return false;
             }
-        }
-        for (node, mut ops) in logs {
-            ops.sort_by_key(|op| sequence(op).expect("validated sequence"));
-            let mut text = String::new();
-            for op in ops {
-                text.push_str(&json(op)?);
-                text.push('\n');
+            match content {
+                Some(new) => !matches!(fs::read_to_string(path), Ok(old) if old == *new),
+                None => path.exists(),
             }
-            writes.insert(
-                self.root.join("journal").join(format!("{node}.jsonl")),
-                Some(text),
-            );
-        }
+        });
         let mut text = String::new();
         for conflict in &conflicts {
             text.push_str(&json(conflict)?);
             text.push('\n');
         }
-        writes.insert(self.root.join("meta/conflicts.jsonl"), Some(text));
-        writes.insert(self.root.join("meta/state.json"), Some(json(&state)?));
-        writes.insert(self.root.join("hlc"), Some(json(&clock)?));
         let pending = RemotePending {
             boards: boards.into_iter().collect(),
             writes,
             blobs,
+            operations: accepted,
+            uids: Some(projection::uids_of(&state)),
+            conflicts: text,
+            hlc: Some(clock),
         };
         let path = self.root.join("remote-pending.json");
         atomic_write_text_raw(&path, &json(&pending)?)?;
         finish(&self.root, &pending)?;
         fs::remove_file(path)?;
+        state.vector = segments::heads(&self.root, &state.compacted)?;
+        projection::note_ops(&self.root, pending.operations.len() as u64)?;
+        if projection::checkpoint(&self.root, &state, &prune_meta, false)?
+            && format::solo_store(store)
+        {
+            let _ = self.prune(&BTreeMap::new());
+        }
         fs::File::open(&self.root)?.sync_all()?;
         Ok(conflicts)
     }
@@ -306,7 +340,17 @@ fn component(value: &str) -> Result<&str> {
     Ok(value)
 }
 
+fn journal_compacted(root: &Path, node: &str) -> u64 {
+    projection::load_state(root)
+        .ok()
+        .and_then(|(state, _)| state.compacted.get(node).copied())
+        .unwrap_or(0)
+}
+
 pub(super) fn validate(op: &Operation, store: &str) -> Result<()> {
+    if op.v > OP_FORMAT {
+        return Err(invalid("SYNC_OP_FORMAT_TOO_NEW"));
+    }
     if op.store != store {
         return Err(invalid("SYNC_STORE_MISMATCH"));
     }
@@ -384,135 +428,13 @@ pub(super) fn validate(op: &Operation, store: &str) -> Result<()> {
     Ok(())
 }
 
-fn ancestor(
-    versions: &BTreeMap<&Hlc, &Operation>,
-    field: &str,
-    older: &Hlc,
-    newer: &Operation,
-) -> bool {
-    let mut cursor = newer.prev.get(field);
-    let mut seen = BTreeSet::new();
-    while let Some(clock) = cursor {
-        if clock == older {
-            return true;
-        }
-        if !seen.insert(clock) {
-            break;
-        }
-        cursor = versions.get(clock).and_then(|op| op.prev.get(field));
-    }
-    false
-}
-
-fn conflicts(state: &JournalState) -> Result<Vec<Conflict>> {
-    let mut result = Vec::new();
-    let ops: Vec<_> = state.operations.values().collect();
-    let mut groups: BTreeMap<(&str, &str, &str, &str), Vec<&Operation>> = BTreeMap::new();
-    for op in &ops {
-        // `updated_at` is stamped by every edit, so concurrent edits of
-        // different fields would otherwise always collide on it; it still
-        // merges by LWW, it just never counts as a user-visible conflict.
-        for field in op
-            .set
-            .keys()
-            .filter(|field| !matches!(field.as_str(), "draft" | "updated_at"))
-        {
-            groups
-                .entry((&op.project, &op.entity, &op.id, field))
-                .or_default()
-                .push(op);
-        }
-    }
-    for ((project, entity, id, field), versions) in groups {
-        let clocks = versions.iter().map(|op| (&op.hlc, *op)).collect();
-        for (i, a) in versions.iter().enumerate() {
-            for b in &versions[i + 1..] {
-                let av = &a.set[field];
-                let bv = &b.set[field];
-                if a.hlc.2 == b.hlc.2
-                    || av == bv
-                    || ancestor(&clocks, field, &a.hlc, b)
-                    || ancestor(&clocks, field, &b.hlc, a)
-                {
-                    continue;
-                }
-                let (winner, loser, winner_value, loser_value) = if a.hlc > b.hlc {
-                    (a, b, av, bv)
-                } else {
-                    (b, a, bv, av)
-                };
-                result.push(Conflict {
-                    project: project.into(),
-                    entity: entity.into(),
-                    id: id.into(),
-                    field: field.into(),
-                    winner: winner.hlc.clone(),
-                    loser: loser.hlc.clone(),
-                    winner_value: winner_value.clone(),
-                    loser_value: loser_value.clone(),
-                });
-            }
-        }
-    }
-    // A concurrent edit cannot resurrect a deleted entity, even with a newer HLC.
-    for deletion in ops.iter().filter(|op| op.entity == "tombstone") {
-        let entity = deletion
-            .set
-            .get("entity")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        for edit in ops.iter().filter(|op| {
-            op.project == deletion.project
-                && op.entity == entity
-                && op.id == deletion.id
-                && op.hlc > deletion.hlc
-        }) {
-            for (field, value) in &edit.set {
-                result.push(Conflict {
-                    project: edit.project.clone(),
-                    entity: entity.into(),
-                    id: edit.id.clone(),
-                    field: field.clone(),
-                    winner: deletion.hlc.clone(),
-                    loser: edit.hlc.clone(),
-                    winner_value: Value::Null,
-                    loser_value: value.clone(),
-                });
-            }
-        }
-    }
-    result.sort_by(|a, b| {
-        (&a.project, &a.entity, &a.id, &a.field, &a.winner, &a.loser)
-            .cmp(&(&b.project, &b.entity, &b.id, &b.field, &b.winner, &b.loser))
-    });
-    result.dedup();
-    Ok(result)
-}
-
 pub(super) fn deleted(state: &JournalState, project: &str, entity: &str, id: &str) -> bool {
-    let deletion = state
-        .operations
-        .values()
-        .filter(|op| {
-            op.project == project
-                && op.id == id
-                && op.entity == "tombstone"
-                && op.set.get("entity").and_then(Value::as_str) == Some(entity)
-        })
-        .map(|op| &op.hlc)
-        .max();
-    let restore = state
-        .operations
-        .values()
-        .filter(|op| {
-            op.project == project
-                && op.id == id
-                && op.entity == "restore"
-                && op.set.get("entity").and_then(Value::as_str) == Some(entity)
-        })
-        .map(|op| &op.hlc)
-        .max();
-    deletion.is_some_and(|d| restore.is_none_or(|r| d > r))
+    let Some(life) = state.lifecycle.get(&key(project, entity, id)) else {
+        return false;
+    };
+    life.deleted
+        .as_ref()
+        .is_some_and(|d| life.restored.as_ref().is_none_or(|r| d > r))
 }
 
 fn project_aliases(state: &mut JournalState) -> Result<()> {
@@ -531,12 +453,14 @@ fn project_aliases(state: &mut JournalState) -> Result<()> {
             .to_owned();
         component(&id)?;
         let created = state
-            .operations
-            .values()
-            .filter(|op| op.entity == "project" && op.project == project)
-            .map(|op| &op.hlc)
+            .lifecycle
+            .iter()
+            .filter_map(|(k, life)| {
+                let (uid, entity, _): (String, String, String) = serde_json::from_str(k).ok()?;
+                (entity == "project" && uid == project).then_some(life.created.clone())
+            })
+            .flatten()
             .min()
-            .cloned()
             .unwrap_or_default();
         projects.push((created, project, id));
     }
@@ -643,12 +567,9 @@ fn project_files(
             }
             component(task)?;
             let created = state
-                .operations
-                .values()
-                .filter(|op| op.entity == "message" && op.id == id && op.project == project)
-                .map(|op| &op.hlc)
-                .min()
-                .cloned()
+                .lifecycle
+                .get(&key(&project, "message", &id))
+                .and_then(|life| life.created.clone())
                 .unwrap_or_default();
             threads.entry((project, task.into())).or_default().push((
                 created,
@@ -843,16 +764,15 @@ fn project_files(
             threads.entry((project, uid)).or_default();
         }
     }
-    // Include empty threads for message tombstones so the last deletion is projected.
-    for op in state
-        .operations
-        .values()
-        .filter(|op| op.entity == "message")
-    {
-        if let Some(task) = op.set.get("task_id").and_then(Value::as_str) {
-            threads
-                .entry((op.project.clone(), task.into()))
-                .or_default();
+    // Include empty threads for deleted messages so the last deletion is projected.
+    for (k, fields) in &state.fields {
+        let Ok((project, entity, _)) = serde_json::from_str::<(String, String, String)>(k) else {
+            continue;
+        };
+        if entity == "message"
+            && let Some(task) = fields.values.get("task_id").and_then(Value::as_str)
+        {
+            threads.entry((project, task.into())).or_default();
         }
     }
     // Message display aliases are keyed by thread display id, which a

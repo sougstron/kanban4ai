@@ -1717,9 +1717,7 @@ fn event_state(root: &Path, selected: Option<&str>) -> Result<Value> {
     {
         boards.insert(p.id, (p.name, Storage::new(p.data_root).tui_fingerprint()));
     }
-    let sync = fs::metadata(root.join("sync/meta/state.json"))
-        .ok()
-        .and_then(|m| m.modified().ok());
+    let sync = crate::core::sync::change_token(root);
     let presence = fs::read_to_string(root.join("sync/presence.yaml")).unwrap_or_default();
     Ok(json!({"boards": boards, "sync": format!("{sync:?}"), "presence": presence}))
 }
@@ -2104,9 +2102,16 @@ mod tests {
             .find(|(k, _)| k.ends_with(&format!(",\"task\",\"{task_id}\"]")))
             .map(|(_, uid)| uid.clone())
             .unwrap();
-        assert!(state.operations.values().any(|op| op.id == uid
-            && op.actor == "human"
-            && op.set.get("title") == Some(&json!("Remote"))));
+        assert!(
+            Journal::open(&store)
+                .unwrap()
+                .operations(None)
+                .unwrap()
+                .iter()
+                .any(|op| op.id == uid
+                    && op.actor == "human"
+                    && op.set.get("title") == Some(&json!("Remote")))
+        );
         let missing = format!("{api}/TASK-999999");
         for action in ["launch", "stop"] {
             assert_eq!(

@@ -28,7 +28,22 @@ pub(super) fn acknowledge(root: &Path, peer: &str, vector: &VersionVector) -> Re
             acknowledged: vector.clone(),
         },
     );
-    atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&all)?)
+    atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&all)?)?;
+    drop(_guard);
+    // Prune outside the sync lock. A peer with no ack contributes an empty vector.
+    let journal = Journal::open(root)?;
+    let mut acks = BTreeMap::new();
+    if let Ok(config) = discovery::config(root) {
+        for peer in config.peers {
+            acks.insert(peer.node.node_id, VersionVector::new());
+        }
+    }
+    let saved: BTreeMap<String, Exchange> = discovery::load(&path)?;
+    for (peer, exchange) in saved {
+        acks.insert(peer, exchange.acknowledged);
+    }
+    journal.prune(&acks)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq)]

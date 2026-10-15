@@ -1,0 +1,18 @@
+runs:
+  runner-node:
+    node_id: runner-node
+    name: laptop
+    role: laptop
+    gen: 1
+    state: finished
+    phase: executor
+    started_at: 2026-01-01T00:00:00
+    branch: null
+    heartbeat: 2026-01-01T00:00:01
+    code: null
+landings:
+  landing:runner-node:
+    name: laptop
+    generation: 1
+    tip: 0123456789abcdef0123456789abcdef01234567
+    pending: false

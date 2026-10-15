@@ -1,0 +1,5 @@
+node:
+  node_id: 06589e6f-ddae-4501-9b64-b8f3cdcd0839
+  name: laptop
+  role: laptop
+  dial: inbound

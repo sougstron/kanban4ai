@@ -1,0 +1,245 @@
+agents:
+  claude:
+    command: claude
+    efforts:
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+    extra_args:
+    - --dangerously-skip-permissions
+    model: sonnet
+    models:
+    - fable
+    - opus
+    - sonnet
+    - haiku
+  codex:
+    command: codex
+    efforts:
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+    extra_args:
+    - --dangerously-bypass-approvals-and-sandbox
+    - --skip-git-repo-check
+    model: gpt-5.5
+    models:
+    - gpt-6-astra
+    - gpt-5.6-sol
+    - gpt-5.6-terra
+    - gpt-5.6-luna
+    - gpt-5.5
+  grok:
+    command: grok
+    efforts:
+    - low
+    - medium
+    - high
+    - xhigh
+    extra_args:
+    - --permission-mode
+    - bypassPermissions
+    model: grok-4.7
+    models:
+    - grok-4.7
+    - grok-4.7-build-fast
+    - grok-4.6
+    - grok-4.5
+  kimi:
+    command: kimi
+    efforts:
+    - thinking
+    - no-thinking
+    extra_args: []
+    model: kimi-code/kimi-for-coding
+    models:
+    - kimi-code/kimi-for-coding
+    - kimi-code/kimi-for-coding-highspeed
+    - kimi-code/k3
+    - kimi-code/k3-256k
+  omp:
+    command: omp
+    efforts:
+    - off
+    - minimal
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+    extra_args: []
+    models:
+    - openai-codex/gpt-5.6-sol
+    - xai-oauth/grok-4.5
+  opencode:
+    agent_options:
+    - sisyphus
+    - prometheus
+    - atlas
+    command: opencode
+    extra_args: []
+    model: openai/gpt-5.5
+    models:
+    - openai/gpt-5.5
+    - opencode/deepseek-v4-flash-free
+    - opencode-go/kimi-k2.7-code
+    - opencode-go/deepseek-v4-flash
+    - opencode-go/mimo-v2.5
+    - opencode-go/minimax-m3
+  pi:
+    command: pi
+    efforts:
+    - off
+    - minimal
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+    extra_args: []
+    models:
+    - anthropic/claude-sonnet-5
+    - openai-codex/gpt-5.6-sol
+auto_launch:
+  auto_complete_on_exit: false
+  default_agent: opencode
+  enabled: true
+  model: openai/gpt-5.5
+  models:
+  - openai/gpt-5.5
+  - opencode/deepseek-v4-flash-free
+  - opencode-go/kimi-k2.7-code
+  - opencode-go/deepseek-v4-flash
+  - opencode-go/mimo-v2.5
+  - opencode-go/minimax-m3
+  terminal_fallback: true
+  use_tmux: true
+columns:
+- name: To Do
+  id: todo
+- name: In Progress
+  id: in_progress
+- name: Review
+  id: review
+- name: Done
+  id: done
+inherit:
+  agent: true
+  common: true
+  designer: true
+  executor: true
+  limits: true
+  placement: true
+  reviewer: true
+  task_sort: true
+notifications:
+  chained_start: true
+  command: notify-send
+  completion: true
+  enabled: true
+  max_body_chars: 240
+  questions: true
+  timeout: 3
+  waiting: true
+orchestration:
+  auto_restart:
+    delays_minutes:
+    - 1
+    - 30
+    - 270
+    enabled: true
+  designer:
+    backend: claude
+    enabled: false
+    model: sonnet
+  executors:
+    ask_grace_secs: 60
+    cheap: []
+    middle: []
+    thresholds:
+      five_hour_percent: 15
+      week_percent: 5
+  isolation:
+    branch_prefix: kanban/
+    cleanup: on_land
+    commit_message: 'kanban: {task_id} {title}'
+    integration_ref: refs/kanban/integration
+    land: worktree
+    mode: auto
+    on_conflict: review
+    seed: live
+  max_running_per_backend:
+    claude: 2
+    codex: 2
+    grok: 2
+    kimi: 2
+    omp: 2
+    opencode: 2
+    pi: 2
+  max_running_per_backend_model: {}
+  max_running_per_role:
+    designer: 1
+    executor: 3
+    orchestrator: 1
+    reviewer: 1
+  max_running_total: 3
+  orchestrator:
+    default_role: cheap
+    max_subtasks: 12
+    upstream_budget_chars: 4000
+  queue_enabled: true
+  reviewer:
+    backend: claude
+    enabled: false
+    max_rounds: 3
+    model: sonnet
+    on_changes_requested: in_progress
+  roles: {}
+rules:
+  auto_launch_chained: true
+  auto_launch_on_delegate: true
+  auto_move_on_assign: true
+  auto_move_on_complete: true
+  one_task_per_instance: true
+  questions_go_to_review: false
+  resume_after_last_answer: true
+  user_only_review_to_done: true
+runner:
+  auto_order:
+  - server
+  - here
+  default: auto
+thresholds:
+  agent_reply_max_chars: 32768
+  agent_reply_message_max_chars: 8192
+  context_auto_compact: 102400
+  context_embed_max_size: 5120
+  context_summary_max_length: 5000
+  context_warning: 51200
+  deferred_cleanup_retry_interval: 600
+  limits_refresh_interval: 120
+  max_auto_resumes: 3
+  question_poll_interval: 3
+  question_wait_timeout: 600
+  session_heartbeat_timeout: 1800
+  tui_refresh_interval: 1
+  waiting_default_eta: 900
+  waiting_eta_multiplier: 2
+  waiting_max_eta: 604800
+  waiting_min_eta: 10
+  waiting_note_max_chars: 1000
+tui:
+  card_height_lines: 4
+  card_line_max_symbols: 40
+  hide_kanban_messages: false
+  max_tasks_per_column: 100
+  name: Kanban
+  show_limits: true
+  task_sort: task_number
+  theme: textual-dark
+verification:
+  block_on_failure: true

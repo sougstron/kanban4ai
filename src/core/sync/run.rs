@@ -129,7 +129,8 @@ impl Journal {
         let _board = Storage::new(board).lock()?;
         let _sync = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
-        let mut state: JournalState = load(&self.root.join("meta/state.json"))?;
+        let mut state = projection::load_state(&self.root)?.0;
+        let before_uids = projection::uids_of(&state);
         let alias = board
             .file_name()
             .and_then(|n| n.to_str())
@@ -161,11 +162,13 @@ impl Journal {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| invalid("operation sequence exhausted"))?;
-        let clock: Hlc = load(&self.root.join("hlc"))?;
+        let clock: Hlc = self.clock()?;
         let operation = Operation {
+            v: OP_FORMAT,
             op: format!("{}:{seq}", self.node.node_id),
             id: task.into(),
             hlc: clock.tick(now_ms(), &self.node.node_id)?,
+            extra: BTreeMap::new(),
             store: self.node.store_id.clone(),
             project,
             entity: "run".into(),
@@ -177,17 +180,7 @@ impl Journal {
         };
         validate(&operation)?;
         apply_meta(&mut state, &operation);
-        let pending = Pending {
-            path: self.root.join("landing-intent.json"),
-            content: Some(json(&operation)?),
-            external: false,
-            observed: None,
-            operations: vec![operation],
-            state,
-        };
-        atomic_write_text_raw(&self.root.join("pending.json"), &json(&pending)?)?;
-        self.finish(&pending, false)?;
-        fs::remove_file(self.root.join("pending.json"))?;
+        commit_local(self, &state, &before_uids, &[operation], None)?;
         Ok(())
     }
 }
@@ -534,8 +527,10 @@ pub(super) fn capture(
         .get(&key(project, "run", &run_id))
         .and_then(|f| f.clocks.get(&journal.node.node_id));
     let op = Operation {
+        v: OP_FORMAT,
         op: format!("{}:{seq}", journal.node.node_id),
         hlc: clock.clone(),
+        extra: BTreeMap::new(),
         store: journal.node.store_id.clone(),
         project: project.into(),
         entity: "run".into(),

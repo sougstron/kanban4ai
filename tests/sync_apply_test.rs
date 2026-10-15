@@ -6,6 +6,7 @@ use std::fs;
 
 fn op(node: &str, seq: u64, wall: u64, entity: &str, id: &str, set: Value) -> Operation {
     Operation {
+        v: 1,
         op: format!("{node}:{seq}"),
         hlc: Hlc(wall, 0, node.into()),
         store: String::new(),
@@ -15,6 +16,7 @@ fn op(node: &str, seq: u64, wall: u64, entity: &str, id: &str, set: Value) -> Op
         set: serde_json::from_value(set).unwrap(),
         prev: BTreeMap::new(),
         actor: "agent".into(),
+        extra: BTreeMap::new(),
     }
 }
 fn permutations(items: &mut [Operation], at: usize, visit: &mut impl FnMut(&[Operation])) {
@@ -504,10 +506,10 @@ fn choosing_losing_version_is_a_replicated_edit_and_rejects_stale_choice() {
     );
     assert!(journal.conflicts().unwrap().is_empty());
     assert!(journal.take_other_version(&conflict).is_err());
-    let state = journal.state().unwrap();
-    let edit = state
-        .operations
-        .values()
+    let edit = journal
+        .operations(None)
+        .unwrap()
+        .into_iter()
         .find(|op| op.actor == "human")
         .unwrap();
     assert!(edit.hlc > conflict.winner);

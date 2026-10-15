@@ -1,0 +1,98 @@
+task_id: TASK-001
+rev: 4
+messages:
+- id: MSG-001
+  role: system
+  kind: system
+  body: |-
+    Task created: base
+    Status: todo
+    Created at: 2026-10-15T20:56:41.416010
+  status: open
+  parent_id: null
+  variants: []
+  author: kanban
+  answer: null
+  created_at: 2026-10-15T20:56:41.416010
+  updated_at: 2026-10-15T20:56:41.416010
+- id: MSG-002
+  role: human
+  kind: task
+  body: (no description provided)
+  status: open
+  parent_id: null
+  variants: []
+  author: user
+  answer: null
+  created_at: 2026-10-15T20:56:41.416010
+  updated_at: 2026-10-15T20:56:41.416010
+- id: MSG-003
+  role: human
+  kind: question
+  body: question
+  status: open
+  parent_id: null
+  variants: []
+  author: user
+  answer: null
+  created_at: 2026-10-15T20:56:41.430719
+  updated_at: 2026-10-15T20:56:41.430719
+- id: MSG-004
+  role: human
+  kind: question
+  body: reply
+  status: open
+  parent_id: MSG-003
+  variants: []
+  author: user
+  answer: null
+  created_at: 2026-10-15T20:56:41.435925
+  updated_at: 2026-10-15T20:56:41.435925
+- id: NOTE-1792087001442-0-4
+  role: system
+  kind: system
+  body: 'Конфликт поля «description»: оставлено значение с 06589e6f-ddae-4501-9b64-b8f3cdcd0839 (2026-10-15T17:56:41.442000), на 06589e6f-ddae-4501-9b64-b8f3cdcd0839 было: "body"'
+  status: resolved
+  parent_id: null
+  variants: []
+  author: kanban
+  answer: null
+  created_at: 2026-10-15T17:56:41.442
+  updated_at: 2026-10-15T17:56:41.442
+  origin: kanban
+- id: NOTE-1792087001442-0-5
+  role: system
+  kind: system
+  body: 'Конфликт поля «id»: оставлено значение с 06589e6f-ddae-4501-9b64-b8f3cdcd0839 (2026-10-15T17:56:41.442000), на 06589e6f-ddae-4501-9b64-b8f3cdcd0839 было: "TASK-001"'
+  status: resolved
+  parent_id: null
+  variants: []
+  author: kanban
+  answer: null
+  created_at: 2026-10-15T17:56:41.442
+  updated_at: 2026-10-15T17:56:41.442
+  origin: kanban
+- id: NOTE-1792087001442-0-6
+  role: system
+  kind: system
+  body: 'Конфликт поля «status»: оставлено значение с 06589e6f-ddae-4501-9b64-b8f3cdcd0839 (2026-10-15T17:56:41.442000), на 06589e6f-ddae-4501-9b64-b8f3cdcd0839 было: "todo"'
+  status: resolved
+  parent_id: null
+  variants: []
+  author: kanban
+  answer: null
+  created_at: 2026-10-15T17:56:41.442
+  updated_at: 2026-10-15T17:56:41.442
+  origin: kanban
+- id: NOTE-1792087001442-0-7
+  role: system
+  kind: system
+  body: 'Конфликт поля «title»: оставлено значение с 06589e6f-ddae-4501-9b64-b8f3cdcd0839 (2026-10-15T17:56:41.442000), на 06589e6f-ddae-4501-9b64-b8f3cdcd0839 было: "restored"'
+  status: resolved
+  parent_id: null
+  variants: []
+  author: kanban
+  answer: null
+  created_at: 2026-10-15T17:56:41.442
+  updated_at: 2026-10-15T17:56:41.442
+  origin: kanban

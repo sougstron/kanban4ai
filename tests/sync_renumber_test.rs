@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 fn ops(journal: &Journal) -> Vec<Operation> {
-    journal.state().unwrap().operations.into_values().collect()
+    journal.operations(None).unwrap()
 }
 
 /// A second node of `a`'s store, holding an empty replica of its board.
@@ -121,7 +121,9 @@ fn creation_without_server_or_peers_always_succeeds_and_never_reuses_numbers() {
     fs::remove_file(board.tasks_dir.join("archive/TASK-040.md")).unwrap();
     let last = board.create_task(NewTask::titled("last")).unwrap();
     board.delete_task(&last.id).unwrap();
-    ja.compact(&[ja.state().unwrap().vector]).unwrap();
+    let vector = ja.state().unwrap().vector;
+    ja.prune(&std::collections::BTreeMap::from([("peer".into(), vector)]))
+        .unwrap();
     let reopened = Storage::new(a.path().join("projects/demo"));
     assert_eq!(
         reopened.create_task(NewTask::titled("after")).unwrap().id,
