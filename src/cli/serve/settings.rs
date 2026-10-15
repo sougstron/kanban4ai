@@ -467,40 +467,28 @@ pub(crate) fn set_api(root: &Path, enabled: bool) -> Result<()> {
     store.save_global_config(&config)
 }
 
-/// A one-time pairing code; with this node's LAN `address` also the phone
-/// QR payload rendered as terminal text.
-pub(crate) fn pairing_code(root: &Path, address: &str) -> Result<(String, Option<String>)> {
+/// A one-time pairing code; with this node's LAN or tailnet `address` also
+/// the phone's join command and its QR rendered as terminal text.
+pub(crate) fn pairing_code(
+    root: &Path,
+    address: &str,
+) -> Result<(String, Option<(String, String)>)> {
     let store = ProjectStore::at(root);
     let address = address.trim();
     if address.is_empty() {
         return Ok((pairing::create_code(&store)?, None));
     }
-    let address: SocketAddr = address
-        .parse()
-        .map_err(|_| invalid("This node's address: IP:port, e.g. 192.168.0.10:7420"))?;
-    if !allowed(address.ip(), &[]) || address.port() == 0 {
-        return Err(invalid("The phone QR needs this node's LAN address"));
-    }
-    let code = pairing::create_code(&store)?;
-    let node = Journal::open(root)?.node;
-    let payload = json!({
-        "address": address.ip().to_string(),
-        "port": address.port(),
-        "node_id": node.node_id,
-        "code": code,
-        "role": "mobile",
-        "dial": "outbound",
-    })
-    .to_string();
-    let qr = qrcode::QrCode::new(payload.as_bytes()).map_err(|e| invalid(e.to_string()))?;
-    Ok((
-        code,
-        Some(qr.render::<qrcode::render::unicode::Dense1x2>().build()),
-    ))
+    let invite = pairing::phone_invite(&store, address).map_err(|_| {
+        invalid("The phone QR needs this node's LAN or tailnet address, e.g. 192.168.0.10:7420")
+    })?;
+    Ok((invite.code, Some((invite.command, invite.qr))))
 }
 
 /// Pair with the node at `address` using the code it showed. Returns its name.
 pub(crate) fn pair(root: &Path, address: &str, code: &str, local: &str) -> Result<String> {
+    if code.trim().is_empty() && pairing::parse_invite(address).is_some() {
+        return pairing::join(root, address, None);
+    }
     let local = match local.trim() {
         "" => None,
         text => Some(

@@ -413,6 +413,15 @@ enum Command {
         #[command(subcommand)]
         command: net::NetCommand,
     },
+    /// Set this device up as a phone from an invite printed by
+    /// `serve --phone-qr`: mobile role, Tailscale if needed, pairing, first sync.
+    Join {
+        /// Invite `CODE@HOST:PORT`.
+        invite: String,
+        /// This node's name (default: keep a phone's name, else `phone`).
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Serve the local store over HTTP on LAN and loopback interfaces.
     Serve {
         /// Override store `serve.port` (default: 7420)
@@ -865,6 +874,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Tui => return launch_tui(cli.project.as_deref()),
         Command::Daemon { interval, once } => {
             return daemon::run(once, interval, cli.project.as_deref());
+        }
+        Command::Join { invite, name } => {
+            return serve::join(&invite, name.as_deref());
         }
         Command::Serve {
             port,
@@ -1643,6 +1655,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         | Command::Update { .. }
         | Command::StatuslineBridge
         | Command::Serve { .. }
+        | Command::Join { .. }
         | Command::Daemon { .. } => {
             unreachable!("handled before resolve")
         }

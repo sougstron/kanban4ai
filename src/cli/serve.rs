@@ -489,6 +489,25 @@ fn retire_client_tokens(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// `kanban4ai join`: set this node up as a phone from one invite, pair,
+/// then pull the shared board once.
+pub fn join(invite: &str, name: Option<&str>) -> Result<ExitCode> {
+    let store = ProjectStore::open()?;
+    let peer = pairing::join(store.root(), invite, name)?;
+    println!("Paired with {peer}");
+    let results = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(sync::once(store.root(), true))?;
+    for (peer, result) in results {
+        match result {
+            Ok(()) => println!("synced with {peer}"),
+            Err(e) => eprintln!("sync {peer}: {e} (the TUI or daemon retries)"),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn run(
     port: Option<u16>,
     token_kind: Option<&str>,
