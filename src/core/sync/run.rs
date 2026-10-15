@@ -180,6 +180,8 @@ impl Journal {
         let pending = Pending {
             path: self.root.join("landing-intent.json"),
             content: Some(json(&operation)?),
+            external: false,
+            observed: None,
             operations: vec![operation],
             state,
         };

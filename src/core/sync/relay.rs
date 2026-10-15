@@ -150,6 +150,11 @@ fn execute(mut command: Command, input: &[u8]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn git(repo: &Path, args: &[&str], input: &[u8]) -> Result<String> {
+    String::from_utf8(git_bytes(repo, args, input)?)
+        .map_err(|_| invalid("invalid relay git output"))
+}
+
+fn git_bytes(repo: &Path, args: &[&str], input: &[u8]) -> Result<Vec<u8>> {
     let mut command = Command::new("git");
     command
         .arg("--git-dir")
@@ -166,7 +171,7 @@ fn git(repo: &Path, args: &[&str], input: &[u8]) -> Result<String> {
         .env("GIT_AUTHOR_EMAIL", "relay@kanban4ai.local")
         .env("GIT_COMMITTER_NAME", "kanban4ai relay")
         .env("GIT_COMMITTER_EMAIL", "relay@kanban4ai.local");
-    String::from_utf8(execute(command, input)?).map_err(|_| invalid("invalid relay git output"))
+    execute(command, input)
 }
 fn tip(repo: &Path, reference: &str) -> Result<Option<String>> {
     let refs = git(
@@ -235,7 +240,12 @@ fn encrypt(store: &Path, config: &Settings, plain: &[u8]) -> Result<Vec<u8>> {
 }
 fn read_batch(store: &Path, repo: &Path, commit: &str) -> Result<(Heartbeat, Vec<Operation>)> {
     let files = git(repo, &["ls-tree", "--name-only", commit], b"")?;
-    let plain = match files.trim() {
+    let batch = if files.lines().any(|name| name == "batch.age") {
+        "batch.age"
+    } else {
+        "batch.jsonl"
+    };
+    let plain = match batch {
         "batch.jsonl" => git(repo, &["show", &format!("{commit}:batch.jsonl")], b"")?.into_bytes(),
         "batch.age" => {
             let data = git(repo, &["show", &format!("{commit}:batch.age")], b"")?;
@@ -254,6 +264,29 @@ fn read_batch(store: &Path, repo: &Path, commit: &str) -> Result<(Heartbeat, Vec
     let operations = lines
         .map(|line| serde_json::from_str(line).map_err(|e| invalid(&e.to_string())))
         .collect::<Result<Vec<Operation>>>()?;
+    let journal = Journal::open(store)?;
+    for hash in operations
+        .iter()
+        .filter_map(Operation::blob_hash)
+        .collect::<BTreeSet<_>>()
+    {
+        let name = if batch == "batch.age" {
+            format!("blob-{hash}.age")
+        } else {
+            format!("blob-{hash}")
+        };
+        let bytes = git_bytes(repo, &["show", &format!("{commit}:{name}")], b"")?;
+        let bytes = if batch == "batch.age" {
+            let mut command = Command::new("age");
+            command
+                .args(["--decrypt", "--identity"])
+                .arg(store.join("sync/relay-age.key"));
+            execute(command, &bytes)?
+        } else {
+            bytes
+        };
+        journal.put_blob(hash, &bytes)?;
+    }
     Ok((heartbeat, operations))
 }
 fn remotes(store: &Path, config: &Settings) -> Result<BTreeSet<String>> {
@@ -296,6 +329,7 @@ pub fn cycle(store: &Path, force: bool) -> Result<usize> {
         return Ok(0);
     }
     let journal = Journal::open(store)?;
+    journal.reconcile()?;
     node_component(&journal.node.node_id)?;
     let _lock = lock_file_reentrant(&store.join("sync/relay.lock"))?;
     let endpoints = remotes(store, &config)?;
@@ -416,6 +450,21 @@ fn exchange(
     };
     let mut batch = json(&heartbeat)?;
     batch.push('\n');
+    let mut tree_entries = String::new();
+    for hash in operations
+        .iter()
+        .filter_map(|op| op.blob_hash())
+        .collect::<BTreeSet<_>>()
+    {
+        let bytes = journal.blob(hash)?;
+        let (name, bytes) = if config.relay_encrypt {
+            (format!("blob-{hash}.age"), encrypt(store, config, &bytes)?)
+        } else {
+            (format!("blob-{hash}"), bytes)
+        };
+        let object = git(&repo, &["hash-object", "-w", "--stdin"], &bytes)?;
+        tree_entries.push_str(&format!("100644 blob {}\t{name}\n", object.trim()));
+    }
     for operation in operations {
         batch.push_str(&json(operation)?);
         batch.push('\n');
@@ -426,11 +475,8 @@ fn exchange(
         ("batch.jsonl", batch.into_bytes())
     };
     let blob = git(&repo, &["hash-object", "-w", "--stdin"], &content)?;
-    let tree = git(
-        &repo,
-        &["mktree"],
-        format!("100644 blob {}\t{name}\n", blob.trim()).as_bytes(),
-    )?;
+    tree_entries.push_str(&format!("100644 blob {}\t{name}\n", blob.trim()));
+    let tree = git(&repo, &["mktree"], tree_entries.as_bytes())?;
     let mut args = vec!["commit-tree", tree.trim()];
     if let Some(parent) = &parent {
         args.extend(["-p", parent]);

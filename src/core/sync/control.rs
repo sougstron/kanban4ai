@@ -104,6 +104,8 @@ pub(crate) fn request(board: &Path, task: &str, action: &str) -> Result<bool> {
     let pending = Pending {
         path: journal.root.join("control-intent.json"),
         content: Some(json(&operation)?),
+        external: false,
+        observed: None,
         operations: vec![operation],
         state,
     };

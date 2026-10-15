@@ -20,9 +20,19 @@ pub struct Conflict {
 struct RemotePending {
     boards: Vec<PathBuf>,
     writes: BTreeMap<PathBuf, Option<String>>,
+    #[serde(default)]
+    blobs: BTreeMap<PathBuf, String>,
 }
 
-fn finish(pending: &RemotePending) -> Result<()> {
+fn finish(root: &Path, pending: &RemotePending) -> Result<()> {
+    let journal = Journal {
+        root: root.to_path_buf(),
+        node: serde_yaml_ng::from_str(&fs::read_to_string(root.join("node.yaml"))?)?,
+    };
+    for (path, hash) in &pending.blobs {
+        transport::write_bytes(path, &journal.blob(hash)?)?;
+        drift::record(&journal, path)?;
+    }
     for (path, content) in &pending.writes {
         if let Some(text) = content {
             fs::create_dir_all(path.parent().expect("file parent"))?;
@@ -34,6 +44,7 @@ fn finish(pending: &RemotePending) -> Result<()> {
                 Err(e) => return Err(e.into()),
             }
         }
+        drift::record(&journal, path)?;
     }
     Ok(())
 }
@@ -56,7 +67,7 @@ pub(super) fn recover_remote(root: &Path) -> Result<()> {
         .map(|board| Storage::new(board).lock())
         .collect::<Result<_>>()?;
     let _sync = lock_file_reentrant(&root.join(".lock"))?;
-    finish(&pending)?;
+    finish(root, &pending)?;
     fs::remove_file(path)?;
     fs::File::open(root)?.sync_all()?;
     Ok(())
@@ -71,6 +82,7 @@ impl Journal {
         max_skew_ms: u64,
     ) -> Result<Vec<Conflict>> {
         recover_remote(&self.root)?;
+        self.reconcile()?;
         let conflicts = self.apply_remote_transaction(operations, max_skew_ms)?;
         super::control::process_store(self.root.parent().expect("sync parent"))?;
         Ok(conflicts)
@@ -222,6 +234,29 @@ impl Journal {
             &conflicts,
             &mut writes,
         )?;
+        let mut blobs = BTreeMap::new();
+        for (key, fields) in &state.fields {
+            let (project, entity, id): (String, String, String) =
+                serde_json::from_str(key).map_err(|e| invalid(&e.to_string()))?;
+            if entity != "file" {
+                continue;
+            }
+            drift::validate_file(&id, &fields.values)?;
+            let alias = state
+                .project_uids
+                .iter()
+                .find(|(_, uid)| **uid == project)
+                .map(|(alias, _)| alias)
+                .unwrap_or(&project);
+            let path = store.join("projects").join(component(alias)?).join(&id);
+            transport::no_symlinks(&path)?;
+            if deleted(&state, &project, "file", &id) {
+                writes.insert(path, None);
+            } else if let Some(hash) = fields.values.get("blob").and_then(Value::as_str) {
+                self.blob(hash)?;
+                blobs.insert(path, hash.to_owned());
+            }
+        }
         let mut logs: BTreeMap<String, Vec<&Operation>> = BTreeMap::new();
         for op in state.operations.values() {
             if op.hlc.2 != self.node.node_id
@@ -253,10 +288,11 @@ impl Journal {
         let pending = RemotePending {
             boards: boards.into_iter().collect(),
             writes,
+            blobs,
         };
         let path = self.root.join("remote-pending.json");
         atomic_write_text_raw(&path, &json(&pending)?)?;
-        finish(&pending)?;
+        finish(&self.root, &pending)?;
         fs::remove_file(path)?;
         fs::File::open(&self.root)?.sync_all()?;
         Ok(conflicts)
@@ -275,16 +311,37 @@ pub(super) fn validate(op: &Operation, store: &str) -> Result<()> {
         return Err(invalid("SYNC_STORE_MISMATCH"));
     }
     component(&op.hlc.2)?;
-    component(&op.id)?;
+    if op.entity == "file"
+        || (matches!(op.entity.as_str(), "tombstone" | "restore")
+            && op.set.get("entity").and_then(Value::as_str) == Some("file"))
+    {
+        drift::validate_file(&op.id, &op.set)?;
+    } else {
+        component(&op.id)?;
+    }
     if sequence(op)? == 0 || op.op.rsplit_once(':').map(|p| p.0) != Some(&op.hlc.2) {
         return Err(invalid("operation id does not match HLC node"));
     }
     if !matches!(
         op.entity.as_str(),
         // `lease` is inert: retired task-ID grants still present in old journals.
-        "task" | "message" | "project" | "config" | "tombstone" | "restore" | "lease" | "run"
+        "task"
+            | "message"
+            | "thread"
+            | "project"
+            | "config"
+            | "file"
+            | "tombstone"
+            | "restore"
+            | "lease"
+            | "run"
     ) {
         return Err(invalid("unsupported sync entity"));
+    }
+    if op.entity == "thread"
+        && (op.set.len() != 1 || !op.set.get("deleted").is_some_and(Value::is_boolean))
+    {
+        return Err(invalid("invalid thread lifecycle operation"));
     }
     if op.entity == "run" {
         run::validate(op)?;
@@ -292,7 +349,7 @@ pub(super) fn validate(op: &Operation, store: &str) -> Result<()> {
     if (op.entity == "tombstone" || op.entity == "restore")
         && !matches!(
             op.set.get("entity").and_then(Value::as_str),
-            Some("task" | "message" | "project")
+            Some("task" | "message" | "project" | "config" | "file")
         )
     {
         return Err(invalid("invalid tombstone/restore entity"));
@@ -432,7 +489,7 @@ fn conflicts(state: &JournalState) -> Result<Vec<Conflict>> {
     Ok(result)
 }
 
-fn deleted(state: &JournalState, project: &str, entity: &str, id: &str) -> bool {
+pub(super) fn deleted(state: &JournalState, project: &str, entity: &str, id: &str) -> bool {
     let deletion = state
         .operations
         .values()
@@ -556,6 +613,19 @@ fn project_files(
             .map(|(id, _)| id.as_str())
             .unwrap_or(&project);
         let old_root = store.join("projects").join(old_alias);
+        if entity == "thread" {
+            if fields.values.get("deleted") == Some(&Value::Bool(true)) {
+                let display = renames.display(&project, &id);
+                writes.insert(
+                    root.join(".kanban/threads")
+                        .join(format!("{}.yaml", component(&display)?)),
+                    None,
+                );
+            } else {
+                threads.entry((project, id)).or_default();
+            }
+            continue;
+        }
         if entity == "message" {
             if deleted(state, &project, "message", &id) {
                 continue;
@@ -563,6 +633,14 @@ fn project_files(
             let Some(task) = fields.values.get("task_id").and_then(Value::as_str) else {
                 continue;
             };
+            if state
+                .fields
+                .get(&key(&project, "thread", task))
+                .and_then(|f| f.values.get("deleted"))
+                == Some(&Value::Bool(true))
+            {
+                continue;
+            }
             component(task)?;
             let created = state
                 .operations
@@ -652,8 +730,18 @@ fn project_files(
                 }
                 root.join("project.yaml")
             }
-            "config" if project.is_empty() => store.join("config.yaml"),
-            "config" => root.join(".kanban/config.yaml"),
+            "config" => {
+                let path = if project.is_empty() {
+                    store.join("config.yaml")
+                } else {
+                    root.join(".kanban/config.yaml")
+                };
+                if deleted(state, &project, "config", &id) {
+                    writes.insert(path, None);
+                    continue;
+                }
+                path
+            }
             _ => continue,
         };
         let old_path = if entity == "config" && project.is_empty() {
