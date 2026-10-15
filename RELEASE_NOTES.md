@@ -1,3 +1,15 @@
+# kanban4ai 0.8.4
+
+- **One-step phone pairing.** `kanban4ai join CODE@HOST:PORT [--name NAME]`
+  sets a device up from a single invite: it switches the node to the `mobile`
+  role, brings up managed Tailscale when the host is a tailnet address, pairs,
+  and runs the first sync. The TUI Sync → Pair form accepts the same invite.
+- **Phone QR without typing an address.** `serve --phone-qr` now detects this
+  node's address (default-route LAN IPv4 first, links that are down last, else
+  MagicDNS) and prints the `kanban4ai join` command plus its QR.
+- Net unit tests no longer pick up a system-wide `tailscale` from PATH instead
+  of their stub binaries.
+
 # kanban4ai 0.8.3
 
 - **Two-level dialog navigation.** New/Edit task, Project Settings, Global

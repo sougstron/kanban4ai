@@ -16,8 +16,9 @@ pub struct PairingOptions {
     /// Revoke a token by its SHA-256 fingerprint.
     #[arg(long, conflicts_with_all = ["issue_token", "phone_qr"])]
     revoke_token: Option<String>,
-    /// Print a single-use pairing QR for an outbound mobile node.
-    #[arg(long, conflicts_with = "issue_token")]
+    /// Print a single-use phone invite and its QR; HOST:PORT defaults to
+    /// this node's LAN address, else its MagicDNS name.
+    #[arg(long, conflicts_with = "issue_token", num_args = 0..=1, default_missing_value = "", value_name = "HOST:PORT")]
     phone_qr: Option<String>,
     /// Single-use code displayed on the other node.
     #[arg(long, requires = "pair")]
@@ -346,15 +347,7 @@ fn accept_sync(root: &Path, request: PairRequest) -> Result<PairReply> {
     {
         return Err(invalid("Incorrect pairing code"));
     }
-    let global = store.load_global_config()?;
-    let settings: Settings = global
-        .extras
-        .get("serve")
-        .cloned()
-        .map(serde_yaml_ng::from_value)
-        .transpose()?
-        .unwrap_or_default();
-    let port = settings.port;
+    let port = serve_port(&store)?;
     let local = Card {
         node,
         address: addresses(&[], port)?
@@ -495,6 +488,146 @@ pub(super) fn pair(
     Ok(reply.node_card.node.name)
 }
 
+fn serve_port(store: &ProjectStore) -> Result<u16> {
+    Ok(store
+        .load_global_config()?
+        .extras
+        .get("serve")
+        .cloned()
+        .map(serde_yaml_ng::from_value::<Settings>)
+        .transpose()?
+        .unwrap_or_default()
+        .port)
+}
+
+/// The address a phone should dial: a LAN IPv4 first, then this node's
+/// MagicDNS name, then any tailnet IPv4 serve listens on. LAN addresses on
+/// the default-route interface win over other live links; addresses on
+/// links that are down (an idle VPN) are only a last resort.
+pub(super) fn phone_address(root: &Path) -> Result<String> {
+    let port = serve_port(&ProjectStore::at(root))?;
+    let networks = discovery::config(root)?.home_networks;
+    let defaults =
+        default_route_interfaces(&fs::read_to_string("/proc/net/route").unwrap_or_default());
+    let mut lan: Vec<(u8, SocketAddr)> = if_addrs::get_if_addrs()?
+        .into_iter()
+        .filter(|i| i.ip().is_ipv4() && !i.ip().is_loopback() && allowed(i.ip(), &networks))
+        .map(|i| {
+            let down = fs::read_to_string(format!("/sys/class/net/{}/operstate", i.name))
+                .is_ok_and(|state| state.trim() == "down");
+            let rank = if defaults.contains(&i.name) {
+                0
+            } else if down {
+                2
+            } else {
+                1
+            };
+            (rank, SocketAddr::new(i.ip(), port))
+        })
+        .collect();
+    lan.sort();
+    let tailnet = |a: &SocketAddr| crate::core::net::is_tailnet_address(&a.to_string());
+    if let Some((_, address)) = lan.iter().find(|(rank, a)| *rank < 2 && !tailnet(a)) {
+        return Ok(address.to_string());
+    }
+    if let Some(address) = tailnet_address(root, port)? {
+        return Ok(address);
+    }
+    lan.first()
+        .map(|(_, a)| a.to_string())
+        .ok_or_else(|| invalid("No LAN or tailnet address found; pass this node's HOST:PORT"))
+}
+
+/// Interfaces carrying a main-table IPv4 default route, lowest metric first,
+/// parsed from `/proc/net/route`. Policy-routing tables (VPN tunnels) are not
+/// listed there, so this names the physical uplink.
+fn default_route_interfaces(table: &str) -> Vec<String> {
+    let mut routes: Vec<(u32, String)> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let up = u16::from_str_radix(fields.get(3)?, 16).ok()? & 1 == 1;
+            (up && fields.get(1)? == &"00000000")
+                .then(|| Some((fields.get(6)?.parse().ok()?, fields[0].to_string())))
+                .flatten()
+        })
+        .collect();
+    routes.sort();
+    routes.into_iter().map(|(_, name)| name).collect()
+}
+
+/// A single-use phone invite: `CODE@HOST:PORT` carries everything
+/// `kanban4ai join` needs and is short enough to type by hand.
+pub(crate) struct PhoneInvite {
+    pub code: String,
+    /// The `{address, port, node_id, code, role, dial}` JSON payload.
+    pub payload: String,
+    /// `kanban4ai join CODE@HOST:PORT`, the text the QR encodes.
+    pub command: String,
+    pub qr: String,
+}
+
+pub(crate) fn phone_invite(store: &ProjectStore, address: &str) -> Result<PhoneInvite> {
+    let root = store.root();
+    let url = endpoint(root, address)?;
+    let node = Journal::open(root)?.node;
+    let code = create_code(store)?;
+    let payload = json!({"address":url.host_str().unwrap().trim_matches(['[', ']']),"port":url.port_or_known_default().unwrap(),"node_id":node.node_id,"code":code,"role":"mobile","dial":"outbound"}).to_string();
+    let command = format!("kanban4ai join {code}@{address}");
+    let qr = qrcode::QrCode::new(command.as_bytes()).map_err(|e| invalid(e.to_string()))?;
+    Ok(PhoneInvite {
+        code,
+        payload,
+        command,
+        qr: qr.render::<qrcode::render::unicode::Dense1x2>().build(),
+    })
+}
+
+/// Split an invite into `(code, host:port)`. A pasted whole command line
+/// (`kanban4ai join CODE@HOST:PORT`) is accepted too.
+pub(crate) fn parse_invite(text: &str) -> Option<(&str, &str)> {
+    let (code, address) = text.split_whitespace().last()?.split_once('@')?;
+    (code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()) && !address.is_empty())
+        .then_some((code, address))
+}
+
+/// Phone setup from one invite: become an outbound `mobile` node, bring up
+/// managed Tailscale when the invite names a tailnet host, then pair.
+/// Returns the peer's name.
+pub(crate) fn join(root: &Path, invite: &str, name: Option<&str>) -> Result<String> {
+    use crate::core::net::{self, Mode};
+    let (code, address) =
+        parse_invite(invite).ok_or_else(|| invalid("Expected an invite CODE@HOST:PORT"))?;
+    let node = Journal::open(root)?.node;
+    if node.role == NodeRole::Server {
+        return Err(invalid("The server node cannot join as a phone"));
+    }
+    if node.role != NodeRole::Mobile || name.is_some() {
+        let name = name.unwrap_or(if node.role == NodeRole::Mobile {
+            &node.name
+        } else {
+            "phone"
+        });
+        settings::save_node(root, name, NodeRole::Mobile)?;
+    }
+    if net::is_tailnet_address(address) {
+        if net::settings(root)?.mode == Mode::Off {
+            settings::set_network_mode(root, Mode::Managed)?;
+        }
+        if net::settings(root)?.mode == Mode::Managed {
+            if let Err(e) = net::up(root, None) {
+                if !e.to_string().contains("NET_TAILSCALE_MISSING") {
+                    return Err(e);
+                }
+                net::install(root)?;
+                net::up(root, None)?;
+            }
+        }
+    }
+    pair(&ProjectStore::at(root), address, code.into(), None)
+}
+
 pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool> {
     let root = store.root();
     if options.pair_code {
@@ -506,14 +639,14 @@ pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool
         save(&root.join("sync/tokens.yaml"), &tokens)?;
         println!("Token revoked");
     } else if let Some(address) = &options.phone_qr {
-        let url = endpoint(root, address)?;
-        let node = Journal::open(root)?.node;
-        let code = create_code(store)?;
-        let payload = json!({"address":url.host_str().unwrap().trim_matches(['[', ']']),"port":url.port_or_known_default().unwrap(),"node_id":node.node_id,"code":code,"role":"mobile","dial":"outbound"}).to_string();
-        let qr = qrcode::QrCode::new(payload.as_bytes()).map_err(|e| invalid(e.to_string()))?;
+        let address = match address.trim() {
+            "" => phone_address(root)?,
+            address => address.to_string(),
+        };
+        let invite = phone_invite(store, &address)?;
         println!(
-            "{payload}\n{}",
-            qr.render::<qrcode::render::unicode::Dense1x2>().build()
+            "{}\nOn the phone run: {}\n{}",
+            invite.payload, invite.command, invite.qr
         );
     } else if let Some(address) = &options.pair {
         let name = pair(
@@ -535,6 +668,16 @@ pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_route_interfaces_ignore_down_and_non_default_routes() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n\
+            wlan0\t00000000\t0100A8C0\t0003\t0\t0\t600\t00000000\n\
+            vpn0\t006E0B0A\t00000000\t0001\t0\t0\t4\t00FFFFFF\n\
+            eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\n\
+            old0\t00000000\t0100A8C0\t0002\t0\t0\t1\t00000000\n";
+        assert_eq!(default_route_interfaces(table), ["eth0", "wlan0"]);
+        assert!(default_route_interfaces("").is_empty());
+    }
     fn request(root: &Path, code: &str) -> PairRequest {
         let mut node = Journal::open(root).unwrap().node;
         node.node_id = "remote-node".into();
@@ -564,6 +707,26 @@ mod tests {
             },
         )
         .unwrap();
+    }
+    #[test]
+    fn invites_parse_bare_or_as_a_pasted_command() {
+        assert_eq!(
+            parse_invite("kanban4ai join 012345@192.168.0.10:7420"),
+            Some(("012345", "192.168.0.10:7420"))
+        );
+        assert_eq!(
+            parse_invite(" 012345@[fd00::1]:7420\n"),
+            Some(("012345", "[fd00::1]:7420"))
+        );
+        for bad in [
+            "",
+            "192.168.0.10:7420",
+            "12345@host:1",
+            "abcdef@host:1",
+            "012345@",
+        ] {
+            assert!(parse_invite(bad).is_none(), "{bad}");
+        }
     }
     #[test]
     fn code_is_single_use_and_both_directions_are_registered() {

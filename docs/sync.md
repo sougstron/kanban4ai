@@ -1165,13 +1165,19 @@ store lock, затем sync lock. Секретные файлы имеют пр�
 Параметры `sync.pairing.code_ttl_seconds` (1…300, по умолчанию 300) и
 `sync.pairing.code_max_attempts` (1…5, по умолчанию 5) позволяют ужесточить
 ограничения. Создание кода и отзыв не требуют перезапуска HTTP-сервиса.
-QR `--phone-qr` содержит `{address, port, node_id, code, role: "mobile",
-dial: "outbound"}`; `address` — LAN-IP или MagicDNS-имя, `code` — тот же
-одноразовый 6-значный код, адрес сервера в QR не шифруется. QR и одноразовые
-секреты следует передавать только владельцу телефона/узла. Телефон читает из
-QR адрес и код и сам выполняет `serve --pair` (11.2, TASK-432): kanban4ai
-камеру не сканирует, QR читается любым сканером или строкой payload,
-печатаемой над ним.
+`--phone-qr [HOST:PORT]` печатает строку payload `{address, port, node_id,
+code, role: "mobile", dial: "outbound"}`, затем команду для телефона
+`kanban4ai join CODE@HOST:PORT` и QR этой команды (TASK-499). `address` —
+LAN-IP или MagicDNS-имя (без аргумента: LAN IPv4 интерфейса с маршрутом по
+умолчанию, затем других поднятых интерфейсов, иначе MagicDNS),
+`code` — тот же одноразовый 6-значный код; приглашение не шифруется. QR и
+приглашение передавайте только владельцу телефона. kanban4ai камеру не
+сканирует: текст из QR копируется сканером телефона и вставляется в терминал
+или в TUI Sync → Pair with a node (поле адреса, код пустой). `join` делает
+узел `mobile`/outbound (имя `phone`, если не задано `--name` и узел ещё не
+mobile; на server отказ), для tailnet-адреса переводит `net.tailscale.mode`
+из off в managed и выполняет `net up` (при отсутствии бинарей — `net
+install`), затем `serve --pair` и один цикл sync.
 
 #### Реализация Serve 03 (TASK-412)
 

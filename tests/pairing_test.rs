@@ -26,6 +26,10 @@ fn phone_qr_uses_expiring_pair_code_not_bearer_credentials() {
     assert_eq!(payload["dial"], "outbound");
     assert!(payload.get("token").is_none());
     let code = payload["code"].as_str().unwrap();
+    assert_eq!(
+        text.lines().nth(1).unwrap(),
+        format!("On the phone run: kanban4ai join {code}@192.168.1.2:7420")
+    );
     let path = dir.path().join("sync/pair-code.yaml");
     let registry = std::fs::read_to_string(&path).unwrap();
     assert!(!registry.contains(code));
@@ -64,4 +68,73 @@ fn retiring_clients_preserves_existing_node_credentials() {
         .output()
         .unwrap();
     assert!(!rejected.status.success());
+}
+
+struct Server(std::process::Child);
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn phone_joins_from_one_invite_and_configures_itself() {
+    let server = tempfile::tempdir().unwrap();
+    let phone = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    std::fs::write(
+        server.path().join("config.yaml"),
+        format!("node:\n  name: srv\n  role: server\nserve:\n  port: {port}\n"),
+    )
+    .unwrap();
+    let _serve = Server(
+        command(server.path())
+            .arg("serve")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(std::time::Instant::now() < deadline, "serve did not start");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let output = command(server.path())
+        .args(["serve", "--phone-qr", &format!("127.0.0.1:{port}")])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    let invite = text
+        .lines()
+        .nth(1)
+        .and_then(|line| line.strip_prefix("On the phone run: kanban4ai join "))
+        .unwrap()
+        .to_string();
+    let joined = command(phone.path())
+        .args(["join", &invite])
+        .output()
+        .unwrap();
+    assert!(
+        joined.status.success(),
+        "{}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    assert!(String::from_utf8_lossy(&joined.stdout).contains("Paired with srv"));
+    let config = std::fs::read_to_string(phone.path().join("config.yaml")).unwrap();
+    assert!(config.contains("name: phone") && config.contains("role: mobile"));
+    assert!(config.contains("name: srv"));
+    assert!(phone.path().join("sync/peers.yaml").exists());
+    // The invite is single-use.
+    let again = command(phone.path())
+        .args(["join", &invite])
+        .output()
+        .unwrap();
+    assert!(!again.status.success());
 }

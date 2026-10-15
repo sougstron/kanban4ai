@@ -248,7 +248,9 @@ fn executable(path: &Path) -> bool {
 }
 
 fn binary(root: &Path, name: &str) -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("PATH") {
+    // Unit tests drive stub binaries under `<store>/net/bin`; a system-wide
+    // Tailscale on PATH would otherwise shadow them.
+    if let Some(path) = std::env::var_os("PATH").filter(|_| !cfg!(test)) {
         for dir in std::env::split_paths(&path) {
             let candidate = dir.join(name);
             if executable(&candidate) {

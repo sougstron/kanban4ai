@@ -13289,7 +13289,9 @@ fn global_settings_sync_tab_qr_needs_a_lan_address() {
         .pairing
         .clone()
         .expect("code");
-    assert!(qr.is_some_and(|qr| qr.lines().count() > 10));
+    let (command, qr) = qr.expect("phone invite");
+    assert!(command.starts_with("kanban4ai join ") && command.ends_with("@192.168.0.10:7420"));
+    assert!(qr.lines().count() > 10);
 }
 
 #[test]

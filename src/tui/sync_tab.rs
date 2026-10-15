@@ -106,8 +106,8 @@ pub(crate) struct SyncTab {
     pub form: Option<Form>,
     /// Extra pages below the selected control, for conflicts and clone details.
     pub page: usize,
-    /// A fresh pairing code and, for a phone, its QR.
-    pub pairing: Option<(String, Option<String>)>,
+    /// A fresh pairing code and, for a phone, its join command and QR.
+    pub pairing: Option<(String, Option<(String, String)>)>,
     /// The last action's result; `true` marks an error.
     pub notice: Option<(String, bool)>,
     pub request: Option<Request>,
@@ -173,7 +173,10 @@ impl SyncTab {
                     .unwrap_or_default(),
             )],
             FormKind::Pair => vec![
-                ("Peer address (IP:port)", String::new()),
+                (
+                    "Peer address (IP:port) or phone invite (CODE@HOST:PORT)",
+                    String::new(),
+                ),
                 ("Code shown by the peer", String::new()),
                 ("This node's LAN address (IP:port)", String::new()),
             ],
@@ -1013,7 +1016,7 @@ fn render_form(frame: &mut Frame<'_>, app: &App, form: &Form, area: Rect) {
 fn render_pairing(
     frame: &mut Frame<'_>,
     app: &App,
-    pairing: &(String, Option<String>),
+    pairing: &(String, Option<(String, String)>),
     area: Rect,
 ) {
     let (code, qr) = pairing;
@@ -1032,8 +1035,14 @@ fn render_pairing(
             Style::default().fg(app.theme.muted),
         )),
     ];
-    if let Some(qr) = qr {
-        lines.push(Line::from("Scan with the phone:"));
+    if let Some((command, qr)) = qr {
+        lines.push(Line::from(vec![
+            Span::raw("On the phone: "),
+            Span::styled(command.clone(), Style::default().fg(app.theme.focus)),
+        ]));
+        lines.push(Line::from(
+            "or paste the invite into Sync → Pair with a node, or scan:",
+        ));
         lines.extend(qr.lines().map(|line| Line::from(line.to_string())));
     }
     lines.push(Line::from(Span::styled(
