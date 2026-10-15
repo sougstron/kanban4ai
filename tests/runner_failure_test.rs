@@ -2,7 +2,7 @@ use kanban4ai::core::models::TaskStatus;
 use kanban4ai::core::runner_failure::{self, BACKEND_MISSING, POWERED_OFF, UNREACHABLE};
 use kanban4ai::core::session::SessionManager;
 use kanban4ai::core::storage::{NewTask, Storage, atomic_write_text};
-use kanban4ai::core::sync::{Journal, Operation};
+use kanban4ai::core::sync::Journal;
 use kanban4ai::core::thread::ThreadManager;
 use kanban4ai::core::timefmt;
 use std::fs;
@@ -22,16 +22,8 @@ fn board(root: &std::path::Path) -> Storage {
     storage.init_board().unwrap();
     storage
 }
-fn replicate(source: &std::path::Path, runner: &Journal, peer: &Journal) {
-    let ops: Vec<Operation> = fs::read_to_string(
-        source
-            .join("sync/journal")
-            .join(format!("{}.jsonl", runner.node.node_id)),
-    )
-    .unwrap()
-    .lines()
-    .map(|s| serde_json::from_str(s).unwrap())
-    .collect();
+fn replicate(runner: &Journal, peer: &Journal) {
+    let ops = runner.operations(Some(&runner.node.node_id)).unwrap();
     peer.apply_remote(&ops, 300_000).unwrap();
 }
 
@@ -57,7 +49,7 @@ fn peer_reports_expired_heartbeat_and_bye_without_claiming_run_and_recovers() {
     let mut session = kanban4ai::core::models::Session::new("ses-runner", &task.id);
     session.last_seen = timefmt::now() - chrono::Duration::minutes(5);
     sessions.save_session(&session).unwrap();
-    replicate(source.path(), &runner, &peer);
+    replicate(&runner, &peer);
     let remote = Storage::new(replica.path().join("projects/demo"));
     let original = peer.runs("demo", &task.id).unwrap();
     runner_failure::observe(replica.path(), &runner.node.node_id, false, None, 600).unwrap();
@@ -152,7 +144,7 @@ fn peer_reports_expired_heartbeat_and_bye_without_claiming_run_and_recovers() {
     session.last_seen = timefmt::now() + chrono::Duration::seconds(1);
     session.wait_until = None;
     sessions.save_session(&session).unwrap();
-    replicate(source.path(), &runner, &peer);
+    replicate(&runner, &peer);
     runner_failure::observe(replica.path(), &runner.node.node_id, true, None, 90).unwrap();
     assert!(
         remote

@@ -429,6 +429,33 @@ first (an answer or the deadline) runs the task; see
 limits snapshot only (`docs/limits.md`): a provider with no cached numbers is
 treated as usable, never as exhausted.
 
+## Sync journal (`<store>/config.yaml`, `sync.journal:`)
+
+Machine-local. A missing key uses the default. Zero or a non-integer is a
+config error.
+
+```yaml
+sync:
+  journal:
+    segment_bytes: 4194304
+    snapshot_ops: 1000
+    snapshot_secs: 300
+```
+
+- `segment_bytes`: seal the active JSONL segment and open the next one once
+  it reaches this size. Default 4 MiB. One batch may be larger; the roll is
+  decided before that batch, not in the middle of it.
+- `snapshot_ops`: rewrite `sync/meta/projection.json` after this many
+  operations since the previous snapshot. Default 1000. The counter lives in
+  `sync/meta/since.json`, so separate CLI processes share it.
+- `snapshot_secs`: also rewrite the projection after this many seconds.
+  Default 300. The first small write only starts the timer.
+
+Segments stay the source of operations. The projection is the field and
+lifecycle checkpoint. With no peers and no relay, a snapshot also prunes the
+journal down to about one segment (`docs/sync.md` §4.3–§4.6). A config file
+that fails to parse does not prune and does not fail the write.
+
 ## Git relay (`<store>/config.yaml`, `sync:`)
 
 ```yaml

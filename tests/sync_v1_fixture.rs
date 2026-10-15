@@ -20,6 +20,7 @@ fn op(
     set: Value,
 ) -> Operation {
     Operation {
+        v: 1,
         op: format!("{node}:{seq}"),
         hlc: Hlc(1_700_000_000_000 + seq, seq, node.into()),
         store: store.into(),
@@ -29,6 +30,7 @@ fn op(
         set: serde_json::from_value(set).unwrap(),
         prev: BTreeMap::new(),
         actor: "human".into(),
+        extra: BTreeMap::new(),
     }
 }
 
@@ -161,7 +163,7 @@ fn generate_sync_v1_fixture() {
     // Second node shares the project, claims TASK-001 before seeing ours, then
     // both journals meet. One display id becomes an alias.
     let other = tempfile::tempdir().unwrap();
-    let peer = Journal::open(other.path()).unwrap();
+    let _peer = Journal::open(other.path()).unwrap();
     let mut identity: NodeIdentity =
         serde_yaml_ng::from_str(&fs::read_to_string(other.path().join("sync/node.yaml")).unwrap())
             .unwrap();

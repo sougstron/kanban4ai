@@ -15,15 +15,27 @@ use super::storage::{atomic_write_text_raw, lock_file_reentrant};
 mod apply;
 pub(crate) mod control;
 mod drift;
+mod format;
 mod ids;
+mod migrate_v1;
+mod projection;
+mod prune;
 pub mod relay;
 mod run;
+mod segments;
 mod transport;
 pub use apply::Conflict;
+pub use format::{
+    MIN_SYNC_PROTOCOL, OP_FORMAT, STORE_FORMAT, SYNC_PROTOCOL, accept_store_protocol,
+    max_op_version, negotiate, protocol_bounds,
+};
 pub(crate) use ids::{historical_max, renamed as renamed_task};
 pub use ids::{task_display, task_uid};
+pub(crate) use projection::apply_meta;
+pub use projection::{Claim, Lifecycle};
 pub use run::{LandingDescriptor, RunDescriptor, RunState, remote_runs};
 pub(crate) use run::{remote_runs_for_tasks, store_for_board, task_landings, task_runs};
+pub use segments::change_token;
 pub use transport::{Page, Snapshot, install_snapshot};
 
 type Fields = BTreeMap<String, Value>;
@@ -106,8 +118,11 @@ impl Hlc {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Operation {
+    /// Operation format. Unknown newer versions are refused; unknown fields stay in `extra`.
+    #[serde(default = "format::default_op_version")]
+    pub v: u32,
     pub op: String,
     pub hlc: Hlc,
     pub store: String,
@@ -117,6 +132,9 @@ pub struct Operation {
     pub set: Fields,
     pub prev: BTreeMap<String, Hlc>,
     pub actor: String,
+    /// Forward-compatible fields this binary does not interpret.
+    #[serde(default, flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl Operation {
@@ -149,21 +167,32 @@ pub struct JournalState {
     #[serde(default)]
     pub task_aliases: BTreeMap<String, String>,
     pub compacted: VersionVector,
-    /// Retained causal versions make conflict detection independent of delivery order.
+    /// Commutative creation / claim / tombstone clocks. Delivery order does not matter.
     #[serde(default)]
-    pub operations: BTreeMap<String, Operation>,
+    pub lifecycle: BTreeMap<String, projection::Lifecycle>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct Pending {
+struct Intent {
     path: PathBuf,
-    content: Option<String>,
     #[serde(default)]
     external: bool,
     #[serde(default)]
     observed: Option<drift::Entry>,
-    operations: Vec<Operation>,
-    state: JournalState,
+    segment: String,
+    start_offset: u64,
+    through_seq: u64,
+    #[serde(default)]
+    uids: projection::UidsDelta,
+    #[serde(default)]
+    run_projection: bool,
+    /// A board file was written as part of this transaction.
+    #[serde(default)]
+    file: bool,
+}
+
+thread_local! {
+    static RECOVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub struct Journal {
@@ -215,6 +244,7 @@ impl Journal {
         let root = store.join("sync");
         fs::create_dir_all(&root)?;
         transport::recover_bootstrap(store)?;
+        format::ensure(store)?;
         apply::recover_remote(&root)?;
         let _guard = lock_file_reentrant(&root.join(".lock"))?;
         let path = root.join("node.yaml");
@@ -284,7 +314,9 @@ impl Journal {
             atomic_write_text_raw(&config_path, &serde_yaml_ng::to_string(&config)?)?;
         }
         let journal = Self { root, node };
-        journal.recover()?;
+        if !RECOVERING.get() {
+            journal.recover()?;
+        }
         Ok(journal)
     }
 
@@ -292,31 +324,42 @@ impl Journal {
         apply::recover_remote(&self.root)?;
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
-        load(&self.root.join("meta/state.json"))
+        Ok(projection::load_state(&self.root)?.0)
     }
 
-    /// Active field conflicts; historical records remain in `meta/conflicts.jsonl`.
+    /// Retained operations in HLC order. `node` limits the result to one writer.
+    /// Sequences at or below the compacted frontier are omitted.
+    pub fn operations(&self, node: Option<&str>) -> Result<Vec<Operation>> {
+        apply::recover_remote(&self.root)?;
+        let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
+        self.recover()?;
+        let state = projection::load_state(&self.root)?.0;
+        let nodes = match node {
+            Some(node) => vec![node.to_owned()],
+            None => segments::node_names(&self.root)?,
+        };
+        let mut ops = Vec::new();
+        for name in nodes {
+            let floor = state.compacted.get(&name).copied().unwrap_or(0);
+            ops.extend(segments::read_retained(&self.root, &name, floor)?);
+        }
+        ops.sort_by(|a, b| a.hlc.cmp(&b.hlc).then_with(|| a.op.cmp(&b.op)));
+        Ok(ops)
+    }
+
+    /// Active field conflicts. Archived rows stay visible while they still win the field.
     pub fn conflicts(&self) -> Result<Vec<Conflict>> {
         let state = self.state()?;
-        let text = match fs::read_to_string(self.root.join("meta/conflicts.jsonl")) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(e.into()),
-        };
-        text.lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| serde_json::from_str::<Conflict>(line).map_err(|e| invalid(&e.to_string())))
-            .filter(|conflict| match conflict {
-                Ok(c) => {
-                    state
-                        .fields
-                        .get(&key(&c.project, &c.entity, &c.id))
-                        .and_then(|field| field.clocks.get(&c.field))
-                        == Some(&c.winner)
-                }
-                Err(_) => true,
+        Ok(prune::stored_conflicts(&self.root)?
+            .into_iter()
+            .filter(|c| {
+                state
+                    .fields
+                    .get(&key(&c.project, &c.entity, &c.id))
+                    .and_then(|field| field.clocks.get(&c.field))
+                    == Some(&c.winner)
             })
-            .collect()
+            .collect())
     }
 
     pub fn observe(&self, remote: &Hlc, max_skew_ms: u64) -> Result<()> {
@@ -329,150 +372,108 @@ impl Journal {
     }
 
     fn recover(&self) -> Result<()> {
-        let path = self.root.join("pending.json");
+        if RECOVERING.get() {
+            return Ok(());
+        }
+        let path = self.root.join("intent.json");
         if !path.exists() {
             return Ok(());
         }
-        let pending: Pending = serde_json::from_str(&fs::read_to_string(&path)?)
+        let intent: Intent = serde_json::from_str(&fs::read_to_string(&path)?)
             .map_err(|e| invalid(&e.to_string()))?;
-        self.finish(&pending, true)?;
-        fs::remove_file(path)?;
+        let dir = self.root.join("journal").join(&self.node.node_id);
+        if let Some(active) = segments_active(&dir)? {
+            segments::repair_tail(&active)?;
+        }
+        let head = segments::head_seq(&dir).unwrap_or(0);
+        let committed = head >= intent.through_seq && intent.through_seq > 0;
+        if committed {
+            let (mut state, _meta) = projection::load_state(&self.root)?;
+            let mut uids = projection::uids_of(&state);
+            intent.uids.apply(&mut uids);
+            state.project_uids = uids.project_uids;
+            state.message_uids = uids.message_uids;
+            state.task_uids = uids.task_uids;
+            state.task_aliases = uids.task_aliases;
+            if !intent.uids.is_empty() {
+                projection::save_uids(&self.root, &state)?;
+            }
+            if intent.run_projection {
+                project_runs(self, &state)?;
+            }
+            if intent.file {
+                if intent.external {
+                    drift::record_observed(self, &intent.path, intent.observed.as_ref())?;
+                } else {
+                    drift::record(self, &intent.path)?;
+                }
+            }
+            fs::remove_file(&path)?;
+            return Ok(());
+        }
+        if !intent.segment.is_empty() {
+            let _ = segments::truncate(
+                &self.root,
+                &self.node.node_id,
+                &intent.segment,
+                intent.start_offset,
+            );
+        }
+        fs::remove_file(&path)?;
+        if intent.file {
+            RECOVERING.set(true);
+            let recovered = drift::reconcile_path(self, &intent.path);
+            RECOVERING.set(false);
+            recovered?;
+        }
         Ok(())
     }
 
-    fn finish(&self, pending: &Pending, recovering: bool) -> Result<()> {
-        if !pending.external {
-            match &pending.content {
-                Some(text) => {
-                    atomic_write_text_raw(&pending.path, text)?;
-                    if target(&pending.path).is_some_and(|t| t.entity == "task")
-                        && let Some(tasks) = pending.path.parent().and_then(Path::parent)
-                    {
-                        for entry in fs::read_dir(tasks)? {
-                            let other = entry?
-                                .path()
-                                .join(pending.path.file_name().expect("task filename"));
-                            if other != pending.path && other.is_file() {
-                                fs::remove_file(other)?;
-                            }
-                        }
-                    }
-                }
-                None => match fs::remove_file(&pending.path) {
-                    Ok(()) => (),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                    Err(e) => return Err(e.into()),
-                },
-            }
-        }
-        fs::create_dir_all(self.root.join("journal"))?;
-        fs::create_dir_all(self.root.join("meta"))?;
-        let path = self
-            .root
-            .join("journal")
-            .join(format!("{}.jsonl", self.node.node_id));
-        let mut seen = BTreeSet::new();
-        // Only recovery scans the journal; normal writes are append-only.
-        // A torn final line is truncated before replaying the redo record.
-        if recovering && path.exists() {
-            let file = fs::File::open(&path)?;
-            let mut reader = BufReader::new(file);
-            let mut offset = 0;
-            loop {
-                let mut line = String::new();
-                let count = reader.read_line(&mut line)?;
-                if count == 0 {
-                    break;
-                }
-                if !line.ends_with('\n') {
-                    OpenOptions::new()
-                        .write(true)
-                        .open(&path)?
-                        .set_len(offset)?;
-                    break;
-                }
-                let op: Operation =
-                    serde_json::from_str(&line).map_err(|e| invalid(&e.to_string()))?;
-                if pending.operations.iter().any(|pending| pending.op == op.op) {
-                    seen.insert(op.op);
-                }
-                offset += count as u64;
-            }
-        }
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        for op in &pending.operations {
-            if !seen.contains(&op.op) {
-                writeln!(file, "{}", json(op)?)?;
-            }
-        }
-        file.sync_all()?;
-        atomic_write_text_raw(&self.root.join("meta/state.json"), &json(&pending.state)?)?;
-        for op in pending
-            .operations
-            .iter()
-            .filter(|op| op.entity == "run" && !op.set.contains_key("command"))
+    fn clock(&self) -> Result<Hlc> {
+        let mut clock: Hlc = load(&self.root.join("hlc"))?;
+        if let Some(tail) = segments::tail_hlc(&self.root, &self.node.node_id)?
+            && tail > clock
         {
-            let fields = &pending.state.fields[&key(&op.project, "run", &op.id)];
-            let (path, text) = run::projection(&self.root, &op.project, &op.id, fields)?;
-            fs::create_dir_all(path.parent().expect("run parent"))?;
+            clock = tail;
+        }
+        Ok(clock)
+    }
+}
+
+fn project_runs(journal: &Journal, state: &JournalState) -> Result<()> {
+    for (k, fields) in &state.fields {
+        let Ok((project, entity, id)) = serde_json::from_str::<(String, String, String)>(k) else {
+            continue;
+        };
+        if entity == "run" && !fields.values.contains_key("command") {
+            let (path, text) = run::projection(&journal.root, &project, &id, fields)?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
             atomic_write_text_raw(&path, &text)?;
         }
-        if let Some(op) = pending.operations.last() {
-            atomic_write_text_raw(&self.root.join("hlc"), &json(&op.hlc)?)?;
-        }
-        if pending.external {
-            drift::record_observed(self, &pending.path, pending.observed.as_ref())?;
-        } else {
-            drift::record(self, &pending.path)?;
-        }
-        Ok(())
     }
+    Ok(())
+}
 
-    /// Compact only a prefix acknowledged by every known peer. The snapshot
-    /// is durable before replacing the journal, and includes field clocks and
-    /// tombstones. Callers must supply all paired peers, not just online peers.
-    pub fn compact(&self, peers: &[VersionVector]) -> Result<u64> {
-        apply::recover_remote(&self.root)?;
-        let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
-        self.recover()?;
-        let mut state: JournalState = load(&self.root.join("meta/state.json"))?;
-        let node = &self.node.node_id;
-        let own = *state.vector.get(node).unwrap_or(&0);
-        let through = peers
-            .iter()
-            .map(|v| *v.get(node).unwrap_or(&0))
-            .fold(own, u64::min);
-        if through <= *state.compacted.get(node).unwrap_or(&0) {
-            return Ok(through);
-        }
-        // Snapshot must describe exactly the compacted prefix, not later ops.
-        let snapshot_path = self.root.join("snapshot/state.json");
-        let mut snapshot: JournalState = load(&snapshot_path)?;
-        let journal_path = self.root.join("journal").join(format!("{node}.jsonl"));
-        let mut suffix = String::new();
-        for line in BufReader::new(fs::File::open(&journal_path)?).lines() {
-            let line = line?;
-            let op: Operation = serde_json::from_str(&line).map_err(|e| invalid(&e.to_string()))?;
-            let seq = sequence(&op)?;
-            if seq <= through {
-                apply_meta(&mut snapshot, &op);
-            } else {
-                suffix.push_str(&line);
-                suffix.push('\n');
-            }
-        }
-        snapshot.message_uids = state.message_uids.clone();
-        snapshot.project_uids = state.project_uids.clone();
-        snapshot.task_uids = state.task_uids.clone();
-        snapshot.task_aliases = state.task_aliases.clone();
-        snapshot.compacted.insert(node.clone(), through);
-        fs::create_dir_all(self.root.join("snapshot"))?;
-        atomic_write_text_raw(&snapshot_path, &json(&snapshot)?)?;
-        atomic_write_text_raw(&journal_path, &suffix)?;
-        state.compacted.insert(node.clone(), through);
-        atomic_write_text_raw(&self.root.join("meta/state.json"), &json(&state)?)?;
-        Ok(through)
+fn segments_active(dir: &Path) -> Result<Option<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(None);
     }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == "jsonl")
+            && path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.len() == 20)
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files.pop())
 }
 
 fn sequence(op: &Operation) -> Result<u64> {
@@ -487,21 +488,96 @@ fn key(project: &str, entity: &str, id: &str) -> String {
     serde_json::to_string(&(project, entity, id)).expect("string tuple")
 }
 
-fn apply_meta(state: &mut JournalState, op: &Operation) {
-    state.operations.insert(op.op.clone(), op.clone());
-    let fields = state
-        .fields
-        .entry(key(&op.project, &op.entity, &op.id))
-        .or_default();
-    for (field, value) in &op.set {
-        if fields.clocks.get(field).is_none_or(|clock| clock < &op.hlc) {
-            fields.values.insert(field.clone(), value.clone());
-            fields.clocks.insert(field.clone(), op.hlc.clone());
+fn commit_local(
+    journal: &Journal,
+    state: &JournalState,
+    before: &projection::Uids,
+    ops: &[Operation],
+    file: Option<FileWrite>,
+) -> Result<()> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let limits = format::JournalLimits::load(journal.root.parent().unwrap_or(&journal.root))?;
+    let prepared = segments::prepare(&journal.root, &journal.node.node_id, &limits)?;
+    let through = sequence(ops.last().expect("ops"))?;
+    let intent = Intent {
+        path: file.as_ref().map(|f| f.path.clone()).unwrap_or_default(),
+        external: file.as_ref().is_some_and(|f| f.external),
+        observed: file.as_ref().and_then(|f| f.observed.clone()),
+        segment: prepared.segment,
+        start_offset: prepared.start_offset,
+        through_seq: through,
+        uids: projection::uids_delta(before, &projection::uids_of(state)),
+        run_projection: ops
+            .iter()
+            .any(|op| op.entity == "run" && !op.set.contains_key("command")),
+        file: file.is_some(),
+    };
+    atomic_write_text_raw(&journal.root.join("intent.json"), &json(&intent)?)?;
+    if let Some(file) = &file {
+        if !file.external {
+            match &file.content {
+                Some(text) => {
+                    atomic_write_text_raw(&file.path, text)?;
+                    if target(&file.path).is_some_and(|t| t.entity == "task")
+                        && let Some(tasks) = file.path.parent().and_then(Path::parent)
+                    {
+                        for entry in fs::read_dir(tasks)? {
+                            let other = entry?
+                                .path()
+                                .join(file.path.file_name().expect("task filename"));
+                            if other != file.path && other.is_file() {
+                                fs::remove_file(other)?;
+                            }
+                        }
+                    }
+                }
+                None => match fs::remove_file(&file.path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                },
+            }
         }
     }
-    state
-        .vector
-        .insert(op.hlc.2.clone(), sequence(op).expect("generated operation"));
+    let span = segments::append(&journal.root, &journal.node.node_id, ops, &limits)?;
+    if span.end_offset < span.start_offset {
+        return Err(invalid("journal append shrank"));
+    }
+    if !intent.uids.is_empty() {
+        projection::save_uids(&journal.root, state)?;
+    }
+    if intent.run_projection {
+        project_runs(journal, state)?;
+    }
+    if let Some(file) = &file {
+        if file.external {
+            drift::record_observed(journal, &file.path, file.observed.as_ref())?;
+        } else {
+            drift::record(journal, &file.path)?;
+        }
+    }
+    match fs::remove_file(journal.root.join("intent.json")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    projection::note_ops(&journal.root, ops.len() as u64)?;
+    let meta = projection::load_prune(&journal.root)?;
+    if projection::checkpoint(&journal.root, state, &meta, false)?
+        && format::solo_store(journal.root.parent().unwrap_or(&journal.root))
+    {
+        let _ = journal.prune(&BTreeMap::new());
+    }
+    Ok(())
+}
+
+struct FileWrite {
+    path: PathBuf,
+    content: Option<String>,
+    external: bool,
+    observed: Option<drift::Entry>,
 }
 
 struct Target {
@@ -680,7 +756,8 @@ fn capture_inner(
     let journal = Journal::open(&target.store)?;
     let _guard = lock_file_reentrant(&journal.root.join(".lock"))?;
     journal.recover()?;
-    let mut state: JournalState = load(&journal.root.join("meta/state.json"))?;
+    let mut state = projection::load_state(&journal.root)?.0;
+    let before_uids = projection::uids_of(&state);
     let project = if target.project.is_empty() {
         String::new()
     } else {
@@ -733,7 +810,7 @@ fn capture_inner(
     } else {
         None
     };
-    let mut clock: Hlc = load(&journal.root.join("hlc"))?;
+    let mut clock: Hlc = journal.clock()?;
     let mut operations = Vec::new();
     run::capture(
         &journal,
@@ -855,6 +932,7 @@ fn capture_inner(
             .filter_map(|field| Some((field.clone(), previous?.clocks.get(field)?.clone())))
             .collect();
         let op = Operation {
+            v: OP_FORMAT,
             op: op_id,
             hlc: clock.clone(),
             store: journal.node.store_id.clone(),
@@ -863,6 +941,7 @@ fn capture_inner(
             id,
             set,
             prev,
+            extra: BTreeMap::new(),
             actor: REQUEST_ACTOR
                 .get()
                 .unwrap_or_else(|| {
@@ -891,6 +970,7 @@ fn capture_inner(
         {
             clock = clock.tick(now_ms(), &journal.node.node_id)?;
             let restore = Operation {
+                v: OP_FORMAT,
                 op: format!(
                     "{}:{}",
                     journal.node.node_id,
@@ -903,6 +983,7 @@ fn capture_inner(
                 id: operations.last().expect("operation").id.clone(),
                 set: BTreeMap::from([("entity".into(), Value::String(target.entity.into()))]),
                 prev: BTreeMap::new(),
+                extra: BTreeMap::new(),
                 actor: "human".into(),
             };
             apply_meta(&mut state, &restore);
@@ -920,6 +1001,7 @@ fn capture_inner(
                 .unwrap_or_default();
             clock = clock.tick(now_ms(), &journal.node.node_id)?;
             let op = Operation {
+                v: OP_FORMAT,
                 op: format!(
                     "{}:{}",
                     journal.node.node_id,
@@ -937,6 +1019,7 @@ fn capture_inner(
                 id,
                 set: BTreeMap::from([("deleted".into(), deleted)]),
                 prev,
+                extra: BTreeMap::new(),
                 actor: "human".into(),
             };
             apply_meta(&mut state, &op);
@@ -961,16 +1044,17 @@ fn capture_inner(
         }
         return Ok(true);
     }
-    let pending = Pending {
-        path: absolute,
-        content: content.map(str::to_owned),
-        external: before_override.is_some(),
-        observed,
-        operations,
-        state,
-    };
-    atomic_write_text_raw(&journal.root.join("pending.json"), &json(&pending)?)?;
-    journal.finish(&pending, false)?;
-    fs::remove_file(journal.root.join("pending.json"))?;
+    commit_local(
+        &journal,
+        &state,
+        &before_uids,
+        &operations,
+        Some(FileWrite {
+            path: absolute,
+            content: content.map(str::to_owned),
+            external: before_override.is_some(),
+            observed,
+        }),
+    )?;
     Ok(true)
 }

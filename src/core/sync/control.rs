@@ -64,7 +64,8 @@ pub(crate) fn request(board: &Path, task: &str, action: &str) -> Result<bool> {
     let _board = crate::core::storage::Storage::new(board).lock()?;
     let _sync = lock_file_reentrant(&journal.root.join(".lock"))?;
     journal.recover()?;
-    let mut state: JournalState = load(&journal.root.join("meta/state.json"))?;
+    let mut state = projection::load_state(&journal.root)?.0;
+    let before_uids = projection::uids_of(&state);
     let project = state
         .project_uids
         .get(alias)
@@ -77,7 +78,7 @@ pub(crate) fn request(board: &Path, task: &str, action: &str) -> Result<bool> {
         .unwrap_or(0)
         .checked_add(1)
         .ok_or_else(|| invalid("operation sequence exhausted"))?;
-    let clock: Hlc = load(&journal.root.join("hlc"))?;
+    let clock: Hlc = journal.clock()?;
     let id = format!("{}:{seq}", journal.node.node_id);
     let command = Command {
         task: super::ids::task_uid(&state, &project, task),
@@ -86,8 +87,10 @@ pub(crate) fn request(board: &Path, task: &str, action: &str) -> Result<bool> {
         action: action.into(),
     };
     let operation = Operation {
+        v: OP_FORMAT,
         op: id.clone(),
         id,
+        extra: BTreeMap::new(),
         hlc: clock.tick(now_ms(), &journal.node.node_id)?,
         store: journal.node.store_id.clone(),
         project,
@@ -101,17 +104,7 @@ pub(crate) fn request(board: &Path, task: &str, action: &str) -> Result<bool> {
     };
     validate(&operation)?;
     apply_meta(&mut state, &operation);
-    let pending = Pending {
-        path: journal.root.join("control-intent.json"),
-        content: Some(json(&operation)?),
-        external: false,
-        observed: None,
-        operations: vec![operation],
-        state,
-    };
-    atomic_write_text_raw(&journal.root.join("pending.json"), &json(&pending)?)?;
-    journal.finish(&pending, false)?;
-    fs::remove_file(journal.root.join("pending.json"))?;
+    commit_local(&journal, &state, &before_uids, &[operation], None)?;
     Ok(true)
 }
 

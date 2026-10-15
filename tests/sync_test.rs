@@ -4,12 +4,10 @@ use std::collections::BTreeMap;
 use std::fs;
 
 fn operations(store: &std::path::Path, node: &str) -> Vec<Operation> {
-    let path = store.join("sync/journal").join(format!("{node}.jsonl"));
-    fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect()
+    Journal::open(store)
+        .unwrap()
+        .operations(Some(node))
+        .unwrap()
 }
 
 #[test]
@@ -149,21 +147,33 @@ fn field_diffs_moves_local_exclusions_and_acknowledged_compaction() {
     .unwrap();
     assert_eq!(operations(dir.path(), node).len(), count);
     let vector = journal.state().unwrap().vector;
-    assert_eq!(journal.compact(&[BTreeMap::new()]).unwrap(), 0);
+    let held = journal
+        .prune(&BTreeMap::from([("peer".into(), BTreeMap::new())]))
+        .unwrap();
+    assert_eq!(held.get(node).copied().unwrap_or(0), 0);
     let seq = vector[node];
+    let held = journal
+        .prune(&BTreeMap::from([(
+            "peer".into(),
+            BTreeMap::from([(node.clone(), seq - 1)]),
+        )]))
+        .unwrap();
+    assert_eq!(held.get(node).copied().unwrap_or(0), seq - 1);
+    assert_eq!(operations(dir.path(), node).len(), 1);
     assert_eq!(
         journal
-            .compact(&[BTreeMap::from([(node.clone(), seq - 1)])])
-            .unwrap(),
+            .state()
+            .unwrap()
+            .compacted
+            .get(node)
+            .copied()
+            .unwrap_or(0),
         seq - 1
     );
-    assert_eq!(operations(dir.path(), node).len(), 1);
-    let snapshot: kanban4ai::core::sync::JournalState = serde_json::from_str(
-        &fs::read_to_string(dir.path().join("sync/snapshot/state.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(snapshot.vector[node], seq - 1);
-    assert_eq!(journal.compact(&[vector]).unwrap(), seq);
+    let held = journal
+        .prune(&BTreeMap::from([("peer".into(), vector.clone())]))
+        .unwrap();
+    assert_eq!(held.get(node).copied().unwrap_or(0), seq);
     assert!(operations(dir.path(), node).is_empty());
     storage.delete_task("TASK-001").unwrap();
     let deleted = operations(dir.path(), node).pop().unwrap();
@@ -320,33 +330,46 @@ fn redo_recovers_a_torn_append_and_never_duplicates_committed_operations() {
     let path = root.join(".kanban/tasks/todo/TASK-001.md");
     let text = "---\nid: TASK-001\ntitle: old\nstatus: todo\n---\nbody\n";
     atomic_write_text(&path, text).unwrap();
-    let mut state = journal.state().unwrap();
-    let mut op = operations(dir.path(), &journal.node.node_id).pop().unwrap();
-    let next = state.vector[&journal.node.node_id] + 1;
-    op.op = format!("{}:{next}", journal.node.node_id);
-    op.hlc = op.hlc.tick(0, &journal.node.node_id).unwrap();
-    op.set = BTreeMap::from([("title".into(), serde_json::json!("new"))]);
-    state.vector.insert(journal.node.node_id.clone(), next);
-    let pending = serde_json::json!({"path": path, "content": text.replace("title: old", "title: new"), "operations": [op], "state": state});
-    fs::write(dir.path().join("sync/pending.json"), pending.to_string()).unwrap();
-    let log = dir
-        .path()
-        .join("sync/journal")
-        .join(format!("{}.jsonl", journal.node.node_id));
+    let node = journal.node.node_id.clone();
+    let next = journal.state().unwrap().vector[&node] + 1;
+    let segment = fs::read_dir(dir.path().join("sync/journal").join(&node))
+        .unwrap()
+        .find_map(|entry| {
+            let path = entry.unwrap().path();
+            path.extension()
+                .is_some_and(|ext| ext == "jsonl")
+                .then_some(path)
+        })
+        .unwrap();
+    let start = fs::metadata(&segment).unwrap().len();
     use std::io::Write;
     std::fs::OpenOptions::new()
         .append(true)
-        .open(&log)
+        .open(&segment)
         .unwrap()
         .write_all(b"{\"op\":")
         .unwrap();
+    let updated = text.replace("title: old", "title: new");
+    fs::write(&path, &updated).unwrap();
+    let intent = serde_json::json!({
+        "path": path,
+        "external": false,
+        "segment": segment.file_name().unwrap().to_string_lossy(),
+        "start_offset": start,
+        "through_seq": next,
+        "file": true
+    });
+    fs::write(dir.path().join("sync/intent.json"), intent.to_string()).unwrap();
     Journal::open(dir.path()).unwrap();
     assert!(fs::read_to_string(&path).unwrap().contains("title: new"));
-    let count = operations(dir.path(), &journal.node.node_id).len();
-    assert_eq!(journal.state().unwrap().vector[&journal.node.node_id], next);
-    fs::write(dir.path().join("sync/pending.json"), pending.to_string()).unwrap();
+    let count = operations(dir.path(), &node).len();
+    assert_eq!(journal.state().unwrap().vector[&node], next);
+    assert!(!segment.file_name().unwrap().to_string_lossy().is_empty());
+    let segment_text = fs::read_to_string(&segment).unwrap();
+    assert!(!segment_text.contains("{\"op\":"));
+    fs::write(dir.path().join("sync/intent.json"), intent.to_string()).unwrap();
     Journal::open(dir.path()).unwrap();
-    assert_eq!(operations(dir.path(), &journal.node.node_id).len(), count);
+    assert_eq!(operations(dir.path(), &node).len(), count);
 }
 
 #[test]

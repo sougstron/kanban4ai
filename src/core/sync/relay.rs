@@ -52,11 +52,45 @@ pub struct Heartbeat {
     pub store_id: String,
     pub at_ms: u64,
     pub vector: VersionVector,
+    /// Sync protocol spoken by the publisher. Missing on older relays.
+    #[serde(default)]
+    pub protocol: u32,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Cache {
     /// Ref tips are persisted only after the whole fetched chain was applied.
     tips: BTreeMap<String, String>,
+}
+
+/// Peer ids from config (missing ack = empty vector) plus saved exchange vectors.
+fn acknowledged_peers(store: &Path) -> BTreeMap<String, VersionVector> {
+    let mut acks = BTreeMap::new();
+    if let Ok(text) = fs::read_to_string(store.join("config.yaml"))
+        && let Ok(config) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text)
+        && let Some(peers) = config
+            .get("sync")
+            .and_then(|sync| sync.get("peers"))
+            .and_then(|peers| peers.as_sequence())
+    {
+        for peer in peers {
+            if let Some(id) = peer.get("node_id").and_then(|value| value.as_str()) {
+                acks.insert(id.to_owned(), VersionVector::new());
+            }
+        }
+    }
+    if let Ok(text) = fs::read_to_string(store.join("sync/exchanges.yaml"))
+        && let Ok(all) = serde_yaml_ng::from_str::<BTreeMap<String, serde_yaml_ng::Value>>(&text)
+    {
+        for (peer, value) in all {
+            let vector = value
+                .get("acknowledged")
+                .cloned()
+                .and_then(|item| serde_yaml_ng::from_value(item).ok())
+                .unwrap_or_default();
+            acks.insert(peer, vector);
+        }
+    }
+    acks
 }
 
 pub fn settings(store: &Path) -> Result<Settings> {
@@ -417,27 +451,23 @@ fn exchange(
         .map(|(h, _)| h.vector.get(&journal.node.node_id).copied().unwrap_or(0))
         .unwrap_or(0);
     let state = journal.state()?;
-    if state
+    let compacted = state
         .compacted
         .get(&journal.node.node_id)
         .copied()
-        .unwrap_or(0)
-        > published
-    {
+        .unwrap_or(0);
+    // An existing relay chain must stay contiguous: compacting past the last
+    // published seq would drop operations a relay-only peer cannot fetch.
+    // The first commit has no parent. HTTP peers may already have acked, and
+    // therefore pruned, that prefix; peers who lack it still stop at
+    // `missing operations in relay chain` when they read the batch.
+    if parent.is_some() && compacted > published {
         return Err(invalid(
             "SYNC_RELAY_GAP: unpublished journal prefix was compacted",
         ));
     }
-    let mut operations: Vec<_> = state
-        .operations
-        .values()
-        .filter(|op| op.hlc.2 == journal.node.node_id)
-        .filter_map(|op| match sequence(op) {
-            Ok(seq) if seq > published => Some(Ok(op)),
-            Ok(_) => None,
-            Err(e) => Some(Err(e)),
-        })
-        .collect::<Result<_>>()?;
+    let mut operations = journal.operations(Some(&journal.node.node_id))?;
+    operations.retain(|op| sequence(op).is_ok_and(|seq| seq > published));
     operations.sort_by_key(|op| sequence(op).expect("validated sequence"));
     for operation in &operations {
         apply::validate(operation, &journal.node.store_id)?;
@@ -446,7 +476,8 @@ fn exchange(
         node_id: journal.node.node_id.clone(),
         store_id: journal.node.store_id.clone(),
         at_ms: now_ms(),
-        vector: state.vector,
+        vector: state.vector.clone(),
+        protocol: SYNC_PROTOCOL,
     };
     let mut batch = json(&heartbeat)?;
     batch.push('\n');
@@ -466,7 +497,7 @@ fn exchange(
         tree_entries.push_str(&format!("100644 blob {}\t{name}\n", object.trim()));
     }
     for operation in operations {
-        batch.push_str(&json(operation)?);
+        batch.push_str(&json(&operation)?);
         batch.push('\n');
     }
     let (name, content) = if config.relay_encrypt {
@@ -489,6 +520,15 @@ fn exchange(
         &["push", "--quiet", remote, &format!("{own_ref}:{own_ref}")],
         b"",
     )?;
+    // The published vector is a participant, so unpublished ops stay until the next push.
+    fs::create_dir_all(store.join("sync/meta"))?;
+    atomic_write_text_raw(
+        &store.join("sync/meta/relay-ack.json"),
+        &json(&state.vector)?,
+    )?;
+    let mut acks = acknowledged_peers(store);
+    acks.insert("relay".into(), state.vector.clone());
+    journal.prune(&acks)?;
     git(
         &repo,
         &[

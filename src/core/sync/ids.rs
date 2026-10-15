@@ -102,62 +102,63 @@ pub(super) fn assign(
 ) -> BTreeMap<String, (String, Option<String>)> {
     // Creation clock and claimed display id: the earliest operation, and the
     // earliest `id` value (legacy UIDs are their own claim).
-    type Claim<'a> = (&'a Hlc, Option<(&'a Hlc, &'a str)>);
-    let mut created: BTreeMap<&str, Claim> = BTreeMap::new();
+    let mut created: Vec<(Hlc, String, Option<String>)> = Vec::new();
     let mut claimed: BTreeSet<u64> = BTreeSet::new();
-    for op in state.operations.values().filter(|op| op.project == project) {
-        if op.entity == "tombstone" {
-            // Numbers deleted before UIDs existed still count.
-            claimed.extend(number(&op.id));
-        }
-        if op.entity != "task" {
+    for (k, life) in &state.lifecycle {
+        let Ok((uid_project, entity, id)) = serde_json::from_str::<(String, String, String)>(k)
+        else {
+            continue;
+        };
+        if uid_project != project || entity != "task" {
             continue;
         }
-        let claim = op
-            .set
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| number(id).is_some())
-            .map(|id| (&op.hlc, id));
-        let entry = created.entry(op.id.as_str()).or_insert((&op.hlc, claim));
-        entry.0 = entry.0.min(&op.hlc);
-        if claim.is_some_and(|new| entry.1.is_none_or(|old| new.0 < old.0)) {
-            entry.1 = claim;
+        if life.deleted.is_some() {
+            claimed.extend(number(&id));
+            if let Some(claim) = &life.claim {
+                claimed.extend(number(&claim.id));
+            }
         }
+        let Some(hlc) = life.created.clone() else {
+            continue;
+        };
+        let display = life
+            .claim
+            .as_ref()
+            .map(|c| c.id.clone())
+            .or_else(|| number(&id).map(|_| id.clone()));
+        created.push((hlc, id, display));
     }
     let mut tasks: Vec<_> = created
         .into_iter()
-        .map(|(uid, (hlc, claim))| {
-            let display = claim.map(|(_, id)| id).or_else(|| number(uid).map(|_| uid));
+        .map(|(hlc, uid, display)| {
+            let display = display.or_else(|| number(&uid).map(|_| uid.clone()));
             (hlc, uid, display)
         })
         .collect();
     tasks.sort();
-    claimed.extend(tasks.iter().filter_map(|(_, _, d)| d.and_then(number)));
+    claimed.extend(
+        tasks
+            .iter()
+            .filter_map(|(_, _, d)| d.as_deref().and_then(number)),
+    );
     let mut result = BTreeMap::new();
     let mut taken = BTreeSet::new();
     let mut losers = Vec::new();
     for (_, uid, display) in tasks {
         match display {
-            Some(display) if taken.insert(number(display).expect("claimed number")) => {
-                result.insert(
-                    uid.to_owned(),
-                    (display.to_owned(), Some(display.to_owned())),
-                );
+            Some(display) if taken.insert(number(&display).expect("claimed number")) => {
+                result.insert(uid, (display.clone(), Some(display)));
             }
             display => losers.push((uid, display)),
         }
     }
     for (uid, display) in losers {
-        let mut next = display.and_then(number).unwrap_or(0) + 1;
+        let mut next = display.as_deref().and_then(number).unwrap_or(0) + 1;
         while claimed.contains(&next) {
             next += 1;
         }
         claimed.insert(next);
-        result.insert(
-            uid.to_owned(),
-            (format!("TASK-{next:03}"), display.map(str::to_owned)),
-        );
+        result.insert(uid.to_owned(), (format!("TASK-{next:03}"), display));
     }
     result
 }
@@ -220,10 +221,12 @@ pub(super) fn reassign(state: &mut JournalState) -> Displays {
         }
     }
     let projects: BTreeSet<String> = state
-        .operations
-        .values()
-        .filter(|op| op.entity == "task")
-        .map(|op| op.project.clone())
+        .lifecycle
+        .iter()
+        .filter_map(|(k, life)| {
+            let (project, entity, _): (String, String, String) = serde_json::from_str(k).ok()?;
+            (entity == "task" && life.created.is_some()).then_some(project)
+        })
         .collect();
     let mut current = BTreeMap::new();
     for project in projects {
@@ -289,18 +292,16 @@ pub(crate) fn historical_max(board: &Storage) -> Result<u64> {
                 .max(number(uid).unwrap_or(0));
         }
     }
-    for op in state
-        .operations
-        .values()
-        .filter(|op| op.project == *project)
-    {
-        if matches!(op.entity.as_str(), "task" | "tombstone") {
-            max = max.max(number(&op.id).unwrap_or(0));
+    for (k, life) in &state.lifecycle {
+        let Ok((p, entity, id)) = serde_json::from_str::<(String, String, String)>(k) else {
+            continue;
+        };
+        if p != *project || entity != "task" {
+            continue;
         }
-        if op.entity == "task"
-            && let Some(id) = op.set.get("id").and_then(Value::as_str)
-        {
-            max = max.max(number(id).unwrap_or(0));
+        max = max.max(number(&id).unwrap_or(0));
+        if let Some(claim) = &life.claim {
+            max = max.max(number(&claim.id).unwrap_or(0));
         }
     }
     Ok(max)

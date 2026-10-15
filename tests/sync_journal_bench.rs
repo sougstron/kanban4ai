@@ -33,12 +33,16 @@ fn median(samples: &mut [u128]) -> u128 {
     samples[samples.len() / 2]
 }
 
+struct Seed<'a> {
+    node: &'a str,
+    store: &'a str,
+    project: &'a str,
+    id: &'a str,
+}
+
 fn remote_op(
-    node: &str,
+    seed: &Seed<'_>,
     seq: u64,
-    store: &str,
-    project: &str,
-    id: &str,
     field: &str,
     value: Value,
     prev: Option<&Hlc>,
@@ -47,16 +51,19 @@ fn remote_op(
     if let Some(clock) = prev {
         prev_map.insert(field.into(), clock.clone());
     }
+    let node = seed.node;
     Operation {
+        v: 1,
         op: format!("{node}:{seq}"),
         hlc: Hlc(1_700_000_000_000 + seq, 0, node.into()),
-        store: store.into(),
-        project: project.into(),
+        store: seed.store.into(),
+        project: seed.project.into(),
         entity: "task".into(),
-        id: id.into(),
+        id: seed.id.into(),
         set: BTreeMap::from([(field.into(), value)]),
         prev: prev_map,
         actor: "human".into(),
+        extra: BTreeMap::new(),
     }
 }
 
@@ -73,6 +80,11 @@ fn journal_write_and_page_at_10k() {
     )
     .unwrap();
     let journal = Journal::open(dir.path()).unwrap();
+    let mut config = fs::read_to_string(dir.path().join("config.yaml")).unwrap_or_default();
+    config.push_str(
+        "\nsync:\n  journal:\n    segment_bytes: 4194304\n    snapshot_ops: 1000000\n    snapshot_secs: 864000\n",
+    );
+    fs::write(dir.path().join("config.yaml"), config).unwrap();
     let mut task = storage.create_task(NewTask::titled("seed")).unwrap();
     let state = journal.state().unwrap();
     let project = state.project_uids.get("demo").expect("project uid").clone();
@@ -96,11 +108,13 @@ fn journal_write_and_page_at_10k() {
                 Value::String(format!("{node}-{seq}"))
             };
             let op = remote_op(
-                node,
+                &Seed {
+                    node,
+                    store: &store_id,
+                    project: &project,
+                    id: &task_uid,
+                },
                 seq,
-                &store_id,
-                &project,
-                &task_uid,
                 field,
                 value,
                 prev.as_ref(),
@@ -155,11 +169,13 @@ fn journal_write_and_page_at_10k() {
     for n in 0..rounds {
         cursor += 1;
         let op = remote_op(
-            "peer-b",
+            &Seed {
+                node: "peer-b",
+                store: &store_id,
+                project: &project,
+                id: &task_uid,
+            },
             cursor,
-            &store_id,
-            &project,
-            &task_uid,
             "description",
             Value::String(format!("one-{n}")),
             None,

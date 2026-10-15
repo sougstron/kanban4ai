@@ -4,10 +4,13 @@
 //! stays in `core::sync`; this module only moves pages over HTTP.
 use super::discovery::{self, Config, Credential, PeerCard, Presence};
 use super::*;
-use crate::core::sync::{Journal, Operation, Page, Snapshot, VersionVector, install_snapshot};
+use crate::core::sync::{
+    Journal, MIN_SYNC_PROTOCOL, Operation, Page, SYNC_PROTOCOL, Snapshot, VersionVector,
+    accept_store_protocol, change_token, install_snapshot, max_op_version,
+};
 use axum::Extension;
 use axum::extract::DefaultBodyLimit;
-use axum::http::Uri;
+use axum::http::{HeaderMap, Uri};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::sync::LazyLock;
@@ -37,6 +40,12 @@ struct VectorReply {
     /// No registered projects: a bootstrap target rather than a store mismatch.
     empty: bool,
     vector: VersionVector,
+    /// Highest protocol this node speaks. Absent on a 0.8 peer; treat that as 1.
+    #[serde(default)]
+    protocol: u32,
+    /// Lowest protocol this node still accepts.
+    #[serde(default)]
+    min_protocol: u32,
 }
 #[derive(Serialize, Deserialize)]
 struct Push {
@@ -125,7 +134,14 @@ async fn apply(root: &Path, operations: Vec<Operation>) -> Result<VersionVector>
 
 fn failure(e: KanbanError) -> Response {
     let text = e.to_string();
-    for code in ["SYNC_STORE_MISMATCH", "SYNC_CLOCK_SKEW"] {
+    for code in [
+        "SYNC_STORE_MISMATCH",
+        "SYNC_CLOCK_SKEW",
+        "SYNC_STORE_TOO_NEW",
+        "SYNC_OP_FORMAT_TOO_NEW",
+        "SYNC_PROTOCOL_MISMATCH",
+        "SYNC_SNAPSHOT_REQUIRED",
+    ] {
         if text.contains(code) {
             return error(StatusCode::CONFLICT, code, &text);
         }
@@ -200,6 +216,8 @@ async fn vector(State(root): State<PathBuf>, Extension(hash): Extension<String>)
             store_id: journal.node.store_id.clone(),
             empty: ProjectStore::at(&root).list()?.is_empty(),
             vector: journal.vector()?,
+            protocol: SYNC_PROTOCOL,
+            min_protocol: MIN_SYNC_PROTOCOL,
         })
     })
     .await;
@@ -209,7 +227,21 @@ async fn vector(State(root): State<PathBuf>, Extension(hash): Extension<String>)
     }
 }
 
-async fn pull(State(root): State<PathBuf>, uri: Uri) -> Response {
+fn advertised_protocol(headers: &HeaderMap) -> u32 {
+    headers
+        .get("x-kanban-sync-protocol")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn cap_page(mut page: Page, protocol: u32) -> Page {
+    let max_v = max_op_version(if protocol == 0 { 1 } else { protocol });
+    page.operations.retain(|op| op.v <= max_v);
+    page
+}
+
+async fn pull(State(root): State<PathBuf>, headers: HeaderMap, uri: Uri) -> Response {
     let result = async {
         let after = decode_vector(query(&uri, "after").unwrap_or(""))?;
         let limit = match query(&uri, "limit") {
@@ -220,7 +252,10 @@ async fn pull(State(root): State<PathBuf>, uri: Uri) -> Response {
                 .ok_or_else(|| invalid("limit must be 1..=1000"))?,
             None => PAGE,
         };
-        blocking(move || Journal::open(&root)?.operations_after(&after, limit)).await
+        let protocol = advertised_protocol(&headers);
+        blocking(move || Journal::open(&root)?.operations_after(&after, limit))
+            .await
+            .map(|page| cap_page(page, protocol))
     }
     .await;
     match result {
@@ -271,7 +306,8 @@ async fn snapshot(State(root): State<PathBuf>) -> Response {
 }
 
 /// SSE: every operation after `after`, then live pages as the store changes.
-async fn stream(State(root): State<PathBuf>, uri: Uri) -> Response {
+async fn stream(State(root): State<PathBuf>, headers: HeaderMap, uri: Uri) -> Response {
+    let protocol = advertised_protocol(&headers);
     let after = match decode_vector(query(&uri, "after").unwrap_or("")) {
         Ok(after) => after,
         Err(e) => return failure(e),
@@ -280,8 +316,8 @@ async fn stream(State(root): State<PathBuf>, uri: Uri) -> Response {
     let changes = CHANGED.subscribe();
     let stopping = STOPPING.subscribe();
     let body = futures_util::stream::unfold(
-        (root, after, changes, stopping),
-        |(root, mut cursor, mut changes, mut stopping)| async move {
+        (root, after, changes, stopping, protocol),
+        |(root, mut cursor, mut changes, mut stopping, protocol)| async move {
             loop {
                 if *stopping.borrow() {
                     return None;
@@ -291,6 +327,7 @@ async fn stream(State(root): State<PathBuf>, uri: Uri) -> Response {
                 let page: Page =
                     match blocking(move || Journal::open(&read)?.operations_after(&after, PAGE))
                         .await
+                        .map(|page| cap_page(page, protocol))
                     {
                         Ok(page) => page,
                         Err(e) => {
@@ -304,7 +341,7 @@ async fn stream(State(root): State<PathBuf>, uri: Uri) -> Response {
                     let event = format!("event: ops\ndata: {data}\n\n");
                     return Some((
                         Ok::<_, Infallible>(event),
-                        (root, cursor, changes, stopping),
+                        (root, cursor, changes, stopping, protocol),
                     ));
                 }
                 tokio::select! {
@@ -313,7 +350,7 @@ async fn stream(State(root): State<PathBuf>, uri: Uri) -> Response {
                         Ok(Err(_)) => return None,
                         Err(_) => return Some((
                             Ok(": keepalive\n\n".to_owned()),
-                            (root, cursor, changes, stopping),
+                            (root, cursor, changes, stopping, protocol),
                         )),
                     },
                     _ = stopping.changed() => return None,
@@ -377,6 +414,7 @@ impl Link {
             };
             match link.vector().await {
                 Ok(reply) if reply.node_id == link.peer => {
+                    accept_store_protocol(reply.protocol, reply.min_protocol)?;
                     discovery::update_presence(root, &link.peer, |p| {
                         p.last_seen = Some(chrono::Utc::now());
                         p.bye = None;
@@ -396,6 +434,7 @@ impl Link {
     ) -> Result<T> {
         let reply = request
             .bearer_auth(&self.token)
+            .header("x-kanban-sync-protocol", SYNC_PROTOCOL.to_string())
             .send()
             .await
             .map_err(|e| invalid(format!("{}: NODE_UNREACHABLE: {e}", self.name)))?;
@@ -724,11 +763,6 @@ async fn worker(root: PathBuf, peer: String) {
     }
 }
 
-fn fingerprint(path: &Path) -> Option<(u64, std::time::SystemTime)> {
-    let meta = fs::metadata(path).ok()?;
-    Some((meta.len(), meta.modified().ok()?))
-}
-
 pub(super) struct Running {
     tasks: JoinSet<()>,
 }
@@ -745,14 +779,14 @@ impl Running {
 pub(super) fn start(root: &Path) -> Running {
     STOPPING.send_replace(false);
     let mut tasks = JoinSet::new();
-    let state = root.join("sync/meta/state.json");
+    let watched = root.to_path_buf();
     tasks.spawn(async move {
         // Writers are other processes (TUI, agents' $KANBAN_CMD), so watch
-        // the replicated state rather than an in-process event.
-        let mut last = fingerprint(&state);
+        // the journal files rather than an in-process event.
+        let mut last = change_token(&watched);
         loop {
             tokio::time::sleep(POLL).await;
-            let now = fingerprint(&state);
+            let now = change_token(&watched);
             if now != last {
                 last = now;
                 changed();

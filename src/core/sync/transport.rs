@@ -14,6 +14,9 @@ pub struct Snapshot {
     pub store_id: String,
     pub vector: VersionVector,
     pub hlc: Hlc,
+    /// Store format of `files`. Missing on older snapshots, which are format 1.
+    #[serde(default = "super::format::snapshot_format_v1")]
+    pub format: u32,
     /// Store-relative path -> base64 content.
     pub files: BTreeMap<String, String>,
 }
@@ -45,25 +48,46 @@ impl Journal {
     /// Tombstones lead the page (section 10.2).
     pub fn operations_after(&self, after: &VersionVector, limit: usize) -> Result<Page> {
         let state = self.state()?;
-        let mut ops = Vec::new();
-        for op in state.operations.values() {
-            if sequence(op)? > after.get(&op.hlc.2).copied().unwrap_or(0) {
-                ops.push(op);
+        for (node, compacted) in &state.compacted {
+            if *compacted > 0 && after.get(node).copied().unwrap_or(0) < *compacted {
+                return Err(invalid("SYNC_SNAPSHOT_REQUIRED"));
             }
         }
-        ops.sort_by(|a, b| a.hlc.cmp(&b.hlc));
-        let more = ops.len() > limit.max(1);
-        ops.truncate(limit.max(1));
+        let limit = limit.max(1);
+        let nodes = segments::node_names(&self.root)?;
+        // k-way merge by HLC. Ahead-of-sequence ops are not part of the vector.
+        let mut heads: Vec<(Hlc, usize, Operation)> = Vec::new();
+        let mut cursors: Vec<std::vec::IntoIter<Operation>> = Vec::new();
+        for node in &nodes {
+            let mut ops =
+                segments::read_after(&self.root, node, after.get(node).copied().unwrap_or(0))?;
+            ops.sort_by(|a, b| a.hlc.cmp(&b.hlc).then_with(|| a.op.cmp(&b.op)));
+            let mut iter = ops.into_iter();
+            if let Some(op) = iter.next() {
+                heads.push((op.hlc.clone(), cursors.len(), op));
+            }
+            cursors.push(iter);
+        }
+        let mut ops = Vec::new();
+        while ops.len() <= limit && !heads.is_empty() {
+            heads.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.op.cmp(&a.2.op)));
+            let (_, slot, op) = heads.pop().expect("head");
+            ops.push(op);
+            if let Some(next) = cursors[slot].next() {
+                heads.push((next.hlc.clone(), slot, next));
+            }
+        }
+        let more = ops.len() > limit;
+        ops.truncate(limit);
         let mut next = after.clone();
         for op in &ops {
             let seq = sequence(op)?;
             let entry = next.entry(op.hlc.2.clone()).or_default();
             *entry = (*entry).max(seq);
         }
-        // Stable: HLC order is kept inside both groups.
         ops.sort_by_key(|op| op.entity != "tombstone");
         Ok(Page {
-            operations: ops.into_iter().cloned().collect(),
+            operations: ops,
             next,
             more,
         })
@@ -92,8 +116,7 @@ impl Journal {
             .collect::<Result<_>>()?;
         let _sync = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
-        let state_path = self.root.join("meta/state.json");
-        let mut state: JournalState = load(&state_path)?;
+        let (mut state, prune_meta) = projection::load_state(&self.root)?;
         // Untouched legacy boards have no UID yet; both replicas must share it.
         let mut assigned = false;
         for board in &boards {
@@ -107,9 +130,9 @@ impl Journal {
             }
         }
         if assigned {
-            fs::create_dir_all(self.root.join("meta"))?;
-            atomic_write_text_raw(&state_path, &json(&state)?)?;
+            projection::save_uids(&self.root, &state)?;
         }
+        projection::checkpoint(&self.root, &state, &prune_meta, true)?;
         let mut files = BTreeMap::new();
         let mut add = |path: &Path, bytes: Vec<u8>| -> Result<()> {
             let relative = path
@@ -138,27 +161,51 @@ impl Journal {
             add(&config, replicated(&text, "config", true)?.into_bytes())?;
         }
         for file in walk(&self.root.join("meta"))? {
+            let name = file.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if matches!(
+                name,
+                "index.json" | "state.json" | "since.json" | "relay-ack.json"
+            ) {
+                continue;
+            }
             add(&file, fs::read(&file)?)?;
         }
-        for file in read_files(&self.root.join("journal"))? {
-            if file.extension().is_some_and(|e| e == "jsonl") {
-                add(&file, fs::read(&file)?)?;
+        for node in segments::node_names(&self.root)? {
+            let dir = self.root.join("journal").join(&node);
+            for file in read_files(&dir)? {
+                if file.extension().is_some_and(|e| e == "jsonl") {
+                    add(&file, fs::read(&file)?)?;
+                }
             }
         }
-        for hash in state
-            .operations
-            .values()
-            .filter_map(Operation::blob_hash)
-            .collect::<BTreeSet<_>>()
-        {
-            add(&self.root.join("blobs").join(hash), self.blob(hash)?)?;
+        let mut hashes = BTreeSet::new();
+        for (k, fields) in &state.fields {
+            let Ok((_, entity, _)) = serde_json::from_str::<(String, String, String)>(k) else {
+                continue;
+            };
+            if entity == "file"
+                && let Some(hash) = fields.values.get("blob").and_then(Value::as_str)
+            {
+                hashes.insert(hash.to_owned());
+            }
         }
-        let clock: Hlc = load(&self.root.join("hlc"))?;
+        for node in segments::node_names(&self.root)? {
+            for op in segments::read_after(&self.root, &node, 0)? {
+                if let Some(hash) = op.blob_hash() {
+                    hashes.insert(hash.to_owned());
+                }
+            }
+        }
+        for hash in hashes {
+            add(&self.root.join("blobs").join(&hash), self.blob(&hash)?)?;
+        }
+        let clock = self.clock()?;
         Ok(Snapshot {
             node_id: self.node.node_id.clone(),
             store_id: self.node.store_id.clone(),
             vector: state.vector,
             hlc: clock,
+            format: STORE_FORMAT,
             files,
         })
     }
@@ -168,6 +215,12 @@ impl Journal {
 /// be replaced; the redo record makes an interrupted install finish on the
 /// next `Journal::open`.
 pub fn install_snapshot(store: &Path, snapshot: &Snapshot) -> Result<()> {
+    if snapshot.format > STORE_FORMAT {
+        return Err(invalid(&format!(
+            "SYNC_STORE_TOO_NEW: store format {}, binary supports {STORE_FORMAT}; upgrade kanban4ai",
+            snapshot.format
+        )));
+    }
     if snapshot.store_id.is_empty() || snapshot.store_id.contains(['/', '\\', '\0']) {
         return Err(invalid("invalid snapshot store"));
     }
@@ -272,6 +325,10 @@ pub(super) fn recover_bootstrap(store: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&node_path, fs::Permissions::from_mode(0o600))?;
     }
+    if snapshot.format >= STORE_FORMAT {
+        format::write_format(store, STORE_FORMAT)?;
+        format::write_stub(&root)?;
+    }
     fs::remove_file(&path)?;
     fs::File::open(&root)?.sync_all()?;
     Ok(())
@@ -286,6 +343,9 @@ pub(crate) fn allowed_path(path: &str) -> Result<()> {
     let ok = match parts.as_slice() {
         ["config.yaml"] => true,
         ["sync", "journal", _] => true,
+        ["sync", "journal", _, file] if file.ends_with(".jsonl") => true,
+        ["sync", "meta", "projection.json"] => true,
+        ["sync", "meta", "uids.json"] => true,
         ["sync", "meta", rest @ ..] => !rest.is_empty(),
         ["sync", "blobs", hash] => {
             hash.len() == 64
