@@ -340,22 +340,22 @@ impl Storage {
         self.get_task_path(task_id).is_some()
     }
 
-    /// Reserve the next ID durably on a leased board; on an unpaired board,
-    /// inspect max + 1 without consuming it. Caller creation holds this lock
-    /// through writing the task; failed leased writes deliberately leave a gap.
+    /// max(live, historical) + 1, always local and offline. Synced boards
+    /// also count deleted and replicated numbers; a concurrent claim of the
+    /// same number on another node is renumbered deterministically by sync.
+    /// Caller creation holds this lock through writing the task.
     pub fn get_next_id(&self) -> Result<String> {
         let _guard = self.lock()?;
-        if let Some(id) = crate::core::sync::allocate_task_id(self)? {
-            return Ok(id);
-        }
-        let max_num = self.max_task_number();
+        let max_num = self
+            .max_task_number()
+            .max(crate::core::sync::historical_max(self)?);
         let next = max_num
             .checked_add(1)
             .ok_or_else(|| KanbanError::Invalid("task IDs exhausted".into()))?;
         Ok(format!("TASK-{next:03}"))
     }
 
-    pub(crate) fn max_task_number(&self) -> u64 {
+    fn max_task_number(&self) -> u64 {
         let mut max_num: u64 = 0;
         for status_dir in self.status_dirs() {
             for num in task_numbers_in(&status_dir) {

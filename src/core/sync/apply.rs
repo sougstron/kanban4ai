@@ -183,7 +183,6 @@ impl Journal {
             apply_meta(&mut state, op);
             changed = true;
         }
-        lease::validate_state(&state)?;
         if !changed {
             return conflicts(&state);
         }
@@ -282,12 +281,10 @@ pub(super) fn validate(op: &Operation, store: &str) -> Result<()> {
     }
     if !matches!(
         op.entity.as_str(),
+        // `lease` is inert: retired task-ID grants still present in old journals.
         "task" | "message" | "project" | "config" | "tombstone" | "restore" | "lease" | "run"
     ) {
         return Err(invalid("unsupported sync entity"));
-    }
-    if op.entity == "lease" {
-        lease::validate_operation(op)?;
     }
     if op.entity == "run" {
         run::validate(op)?;
@@ -541,6 +538,7 @@ fn project_files(
     conflicts: &[Conflict],
     writes: &mut BTreeMap<PathBuf, Option<String>>,
 ) -> Result<()> {
+    let renames = ids::reassign(state);
     let mut threads = ThreadProjection::new();
     for (k, fields) in &state.fields {
         let (project, entity, id): (String, String, String) =
@@ -591,9 +589,12 @@ fn project_files(
             "task" => {
                 let tasks = old_root.join(".kanban/tasks");
                 let mut existing = None;
-                if tasks.exists() {
+                let display = renames.display(&project, &id);
+                if let Some(old) = renames.previous(&project, &id)
+                    && tasks.exists()
+                {
                     for entry in fs::read_dir(&tasks)? {
-                        let candidate = entry?.path().join(format!("{id}.md"));
+                        let candidate = entry?.path().join(format!("{old}.md"));
                         if candidate.is_file() {
                             existing = Some(candidate.clone());
                             writes.entry(candidate).or_insert(None);
@@ -613,15 +614,18 @@ fn project_files(
                 let path = root
                     .join(".kanban/tasks")
                     .join(component(status)?)
-                    .join(format!("{id}.md"));
+                    .join(format!("{}.md", component(&display)?));
                 let mut value = if let Some(old) = existing {
                     object_at(&old, "task")?
                 } else {
                     serde_json::json!({})
                 };
-                for (field, new) in &fields.values {
+                let mut values = fields.values.clone();
+                ids::references_to_displays(renames.project(&project), &mut values);
+                for (field, new) in &values {
                     set_path(&mut value, field, new);
                 }
+                set_path(&mut value, "id", &Value::String(display));
                 let description = value
                     .as_object_mut()
                     .expect("task map")
@@ -677,6 +681,37 @@ fn project_files(
         }
         writes.insert(path, Some(serde_yaml_ng::to_string(&value)?));
     }
+    // Local sessions follow their renumbered task; worktree and branch
+    // names stay recorded on the task itself.
+    for (project, _, old, new) in renames.renamed() {
+        let alias = state
+            .project_uids
+            .iter()
+            .find(|(_, uid)| **uid == project)
+            .map(|(id, _)| id.as_str())
+            .unwrap_or(&project);
+        let sessions = store.join("projects").join(alias).join(".kanban/sessions");
+        if !sessions.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&sessions)? {
+            let path = entry?.path();
+            // Already rebound by another renaming in this projection.
+            if path.extension().is_none_or(|e| e != "yaml") || writes.contains_key(&path) {
+                continue;
+            }
+            let mut session: serde_yaml_ng::Value =
+                serde_yaml_ng::from_str(&fs::read_to_string(&path)?)?;
+            if session
+                .get("task_id")
+                .and_then(serde_yaml_ng::Value::as_str)
+                == Some(old.as_str())
+            {
+                session["task_id"] = serde_yaml_ng::Value::String(new.clone());
+                writes.insert(path, Some(serde_yaml_ng::to_string(&session)?));
+            }
+        }
+    }
     for c in conflicts {
         let task = if c.entity == "task" {
             Some(c.id.as_str())
@@ -702,6 +737,24 @@ fn project_files(
             .or_default()
             .push((c.winner.clone(), uid, note));
     }
+    // A renumbered task carries its thread file along, even without messages.
+    for (project, uid, old, _) in renames.renamed() {
+        let alias = state
+            .project_uids
+            .iter()
+            .find(|(_, u)| **u == project)
+            .map(|(id, _)| id.as_str())
+            .unwrap_or(&project);
+        if store
+            .join("projects")
+            .join(alias)
+            .join(".kanban/threads")
+            .join(format!("{old}.yaml"))
+            .is_file()
+        {
+            threads.entry((project, uid)).or_default();
+        }
+    }
     // Include empty threads for message tombstones so the last deletion is projected.
     for op in state
         .operations
@@ -714,7 +767,39 @@ fn project_files(
                 .or_default();
         }
     }
-    for ((project, task), mut entries) in threads {
+    // Message display aliases are keyed by thread display id, which a
+    // renumbering moves: rebuild every touched thread's keys from scratch.
+    let old_uids = std::mem::take(&mut state.message_uids);
+    let touched: BTreeSet<(String, String)> = threads
+        .keys()
+        .flat_map(|(project, task)| {
+            [
+                Some(renames.display(project, task)),
+                renames.previous(project, task),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|display| (project.clone(), display))
+        })
+        .collect();
+    state.message_uids = old_uids
+        .iter()
+        .filter(|(k, _)| {
+            serde_json::from_str::<(String, String, String)>(k)
+                .is_ok_and(|(p, t, _)| !touched.contains(&(p, t)))
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for ((project, uid), mut entries) in threads {
+        // Messages may arrive before their task; project them once it exists.
+        // A legacy UID is also its display id.
+        if !renames.known(&project, &uid) && ids::number(&uid).is_none() {
+            continue;
+        }
+        let task = renames.display(&project, &uid);
+        let previous = renames
+            .previous(&project, &uid)
+            .or_else(|| (!renames.known(&project, &uid)).then(|| uid.clone()));
         let alias = state
             .project_uids
             .iter()
@@ -731,11 +816,13 @@ fn project_files(
             .find(|(_, uid)| **uid == project)
             .map(|(id, _)| id.as_str())
             .unwrap_or(&project);
-        let old_path = store
-            .join("projects")
-            .join(old_alias)
-            .join(".kanban/threads")
-            .join(format!("{task}.yaml"));
+        let old_path = previous.as_ref().map(|old| {
+            store
+                .join("projects")
+                .join(old_alias)
+                .join(".kanban/threads")
+                .join(format!("{old}.yaml"))
+        });
         entries.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
         let mut used = BTreeSet::new();
         let mut aliases = BTreeMap::new();
@@ -789,16 +876,15 @@ fn project_files(
             );
             clocks.insert(display.clone(), (hlc, uid.clone()));
         }
-        let mut current: Thread = match fs::read_to_string(&old_path) {
-            Ok(text) => serde_yaml_ng::from_str(&text)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Thread::new(&task),
-            Err(e) => return Err(e.into()),
+        let mut current: Thread = match old_path.as_ref().map(fs::read_to_string) {
+            Some(Ok(text)) => serde_yaml_ng::from_str(&text)?,
+            None => Thread::new(&task),
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => Thread::new(&task),
+            Some(Err(e)) => return Err(e.into()),
         };
+        let old_task = previous.as_deref().unwrap_or(&task);
         let replicated = |m: &&Message| {
-            state
-                .message_uids
-                .contains_key(&key(&project, &task, &m.id))
-                || m.id.starts_with("NOTE-")
+            old_uids.contains_key(&key(&project, old_task, &m.id)) || m.id.starts_with("NOTE-")
         };
         let changed = !current
             .messages
@@ -806,27 +892,23 @@ fn project_files(
             .filter(replicated)
             .eq(desired.messages.iter());
         current.messages.retain(|m| {
-            !state
-                .message_uids
-                .contains_key(&key(&project, &task, &m.id))
-                && !m.id.starts_with("NOTE-")
-        });
-        state.message_uids.retain(|k, _| {
-            serde_json::from_str::<(String, String, String)>(k)
-                .is_ok_and(|(p, t, _)| p != project || t != task)
+            !old_uids.contains_key(&key(&project, old_task, &m.id)) && !m.id.starts_with("NOTE-")
         });
         for (uid, display) in &aliases {
             state
                 .message_uids
                 .insert(key(&project, &task, display), uid.clone());
         }
-        if old_path != path {
+        if let Some(old_path) = old_path
+            && old_path != path
+        {
             writes.entry(old_path).or_insert(None);
         }
         // merge_threads supplies the existing by-id union; replicated entries already
         // have deterministic UID-derived display ids and LWW field values.
         let rev = current.rev;
         let mut merged = merge_threads(current, &desired);
+        merged.task_id = task.clone();
         merged.messages.sort_by(|a, b| {
             clocks
                 .get(&a.id)

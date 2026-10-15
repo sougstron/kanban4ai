@@ -42,7 +42,7 @@ impl Journal {
 
     /// Operations newer than `after`, oldest HLC first. A node's HLC grows
     /// with its sequence, so each node's slice of a page is a sequence prefix.
-    /// Leases and tombstones lead the page (section 10.2).
+    /// Tombstones lead the page (section 10.2).
     pub fn operations_after(&self, after: &VersionVector, limit: usize) -> Result<Page> {
         let state = self.state()?;
         let mut ops = Vec::new();
@@ -61,22 +61,12 @@ impl Journal {
             *entry = (*entry).max(seq);
         }
         // Stable: HLC order is kept inside both groups.
-        ops.sort_by_key(|op| !matches!(op.entity.as_str(), "lease" | "tombstone"));
+        ops.sort_by_key(|op| op.entity != "tombstone");
         Ok(Page {
             operations: ops.into_iter().cloned().collect(),
             next,
             more,
         })
-    }
-
-    /// Whether this node issues the next ID grants for project `uid`: the
-    /// current authority, otherwise the paired server (section 6).
-    pub fn issues_id_leases(&self, uid: &str) -> Result<bool> {
-        let state = self.state()?;
-        match lease::authority(&state, uid)? {
-            Some((issuer, _)) => Ok(issuer == self.node.node_id),
-            None => lease::fallback_issuer(self.root.parent().expect("sync parent"), &self.node),
-        }
     }
 
     /// Replicated store copy taken under the same locks as `apply_remote`.
@@ -164,9 +154,7 @@ impl Journal {
             add(&config, replicated(&text, "config", true)?.into_bytes())?;
         }
         for file in walk(&self.root.join("meta"))? {
-            if file.file_name().is_some_and(|n| n != "allocation.json") {
-                add(&file, fs::read(&file)?)?;
-            }
+            add(&file, fs::read(&file)?)?;
         }
         for file in read_files(&self.root.join("journal"))? {
             if file.extension().is_some_and(|e| e == "jsonl") {
@@ -299,7 +287,7 @@ pub(crate) fn allowed_path(path: &str) -> Result<()> {
     let ok = match parts.as_slice() {
         ["config.yaml"] => true,
         ["sync", "journal", _] => true,
-        ["sync", "meta", rest @ ..] => !rest.is_empty() && rest != ["allocation.json"],
+        ["sync", "meta", rest @ ..] => !rest.is_empty(),
         ["projects", _, "project.yaml"] => true,
         ["projects", _, ".kanban", "config.yaml"] => true,
         ["projects", _, ".kanban", "tasks", status, _] => STATUSES.contains(status),

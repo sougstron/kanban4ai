@@ -183,7 +183,11 @@ async fn task(
             };
             let conflicts: Vec<_> = conflicts
                 .into_iter()
-                .filter(|c| Some(&c.project) == uid && c.id == task)
+                .filter(|c| {
+                    uid.is_some_and(|uid| {
+                        c.project == *uid && c.id == crate::core::sync::task_uid(&state, uid, &task)
+                    })
+                })
                 .collect();
             Ok(json!({"task": task_wire(value)?, "runs": runs, "conflicts": conflicts}))
         })
@@ -2093,17 +2097,16 @@ mod tests {
             .unwrap();
         assert_eq!(result["task"]["title"], "External write");
         assert_eq!(result["task"]["description"], "Edited");
-        let journal = Journal::open(&store).unwrap();
-        assert!(
-            journal
-                .state()
-                .unwrap()
-                .operations
-                .values()
-                .any(|op| op.id == task_id
-                    && op.actor == "human"
-                    && op.set.get("title") == Some(&json!("Remote")))
-        );
+        let state = Journal::open(&store).unwrap().state().unwrap();
+        let uid = state
+            .task_uids
+            .iter()
+            .find(|(k, _)| k.ends_with(&format!(",\"task\",\"{task_id}\"]")))
+            .map(|(_, uid)| uid.clone())
+            .unwrap();
+        assert!(state.operations.values().any(|op| op.id == uid
+            && op.actor == "human"
+            && op.set.get("title") == Some(&json!("Remote"))));
         let missing = format!("{api}/TASK-999999");
         for action in ["launch", "stop"] {
             assert_eq!(

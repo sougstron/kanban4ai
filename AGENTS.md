@@ -44,7 +44,7 @@ Load only what the task touches:
 | `docs/agent-io.md` | Agent reply capture, live telemetry, image attachments |
 | `docs/stats.md` | Application-collected usage statistics (`core/stats.rs`): event schema, hooks, the Stats report |
 | `docs/releasing.md` | Updater internals (`core/update.rs`, `core/http.rs`, self-update behavior) |
-| `docs/sync.md` | Multi-node sync spec (laptop / server / mobile, Tailscale, git-relay): replication, HLC/LWW, ID leases, `serve` protocol, error codes |
+| `docs/sync.md` | Multi-node sync spec (laptop / server / mobile, Tailscale, git-relay): replication, HLC/LWW, local task IDs and renumbering, `serve` protocol, error codes |
 | [docs/android.md](docs/android.md) | Phone setup (aarch64 Arch/proot), Android process survival, managed Tailscale and offline/relay workflow |
 | `docs/token-profile.md` | Measured token cost of the board, and where to cut |
 

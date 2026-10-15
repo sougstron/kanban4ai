@@ -76,7 +76,8 @@ pub(crate) fn task_runs(
     let Some(project) = state.project_uids.get(alias) else {
         return Ok(BTreeMap::new());
     };
-    decode_fields(state.fields.get(&key(project, "run", task)))
+    let task = super::ids::task_uid(state, project, task);
+    decode_fields(state.fields.get(&key(project, "run", &task)))
 }
 
 pub(crate) fn task_landings(
@@ -87,9 +88,10 @@ pub(crate) fn task_landings(
     let Some(project) = state.project_uids.get(alias) else {
         return Ok(BTreeMap::new());
     };
+    let task = super::ids::task_uid(state, project, task);
     state
         .fields
-        .get(&key(project, "run", task))
+        .get(&key(project, "run", &task))
         .into_iter()
         .flat_map(|f| &f.values)
         .filter_map(|(field, value)| field.strip_prefix("landing:").map(|node| (node, value)))
@@ -137,6 +139,8 @@ impl Journal {
             .get(alias)
             .ok_or_else(|| invalid("unknown project"))?
             .clone();
+        let task = super::ids::task_uid(&state, &project, task);
+        let task = task.as_str();
         let field = format!("landing:{}", self.node.node_id);
         let value = serde_json::to_value(LandingDescriptor {
             name: self.node.name.clone(),
@@ -214,7 +218,8 @@ pub(crate) fn remote_runs_for_tasks<'a>(
         return Ok(result);
     };
     for task_id in task_ids {
-        let runs: Vec<_> = decode_fields(state.fields.get(&key(project, "run", task_id)))?
+        let uid = super::ids::task_uid(&state, project, task_id);
+        let runs: Vec<_> = decode_fields(state.fields.get(&key(project, "run", &uid)))?
             .into_values()
             .filter(|run| run.node_id != journal.node.node_id && run.active())
             .collect();
@@ -375,7 +380,8 @@ pub(super) fn capture(
             session,
         )
     };
-    let records = decode_fields(state.fields.get(&key(project, "run", &task_id)))?;
+    let run_id = super::ids::task_uid(state, project, &task_id);
+    let records = decode_fields(state.fields.get(&key(project, "run", &run_id)))?;
     let old = records.get(&journal.node.node_id);
     // Waiting for an explicit remote runner does not claim a local run.
     // Otherwise its replicated queued descriptor would exclude the real runner.
@@ -523,7 +529,7 @@ pub(super) fn capture(
     *clock = clock.tick(now_ms(), &journal.node.node_id)?;
     let previous = state
         .fields
-        .get(&key(project, "run", &task_id))
+        .get(&key(project, "run", &run_id))
         .and_then(|f| f.clocks.get(&journal.node.node_id));
     let op = Operation {
         op: format!("{}:{seq}", journal.node.node_id),
@@ -531,7 +537,7 @@ pub(super) fn capture(
         store: journal.node.store_id.clone(),
         project: project.into(),
         entity: "run".into(),
-        id: task_id,
+        id: run_id,
         set: BTreeMap::from([(
             journal.node.node_id.clone(),
             serde_json::to_value(run).map_err(|e| invalid(&e.to_string()))?,

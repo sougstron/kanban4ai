@@ -37,8 +37,6 @@ struct VectorReply {
     /// No registered projects: a bootstrap target rather than a store mismatch.
     empty: bool,
     vector: VersionVector,
-    /// Project UID -> unused task IDs leased to the replying node.
-    remaining: BTreeMap<String, u64>,
 }
 #[derive(Serialize, Deserialize)]
 struct Push {
@@ -50,10 +48,9 @@ struct Ack {
 }
 
 #[derive(Serialize, Deserialize)]
-struct LeaseRequest {
+struct AckRequest {
     store_id: String,
     vector: VersionVector,
-    remaining: BTreeMap<String, u64>,
 }
 
 async fn blocking<T: Send + 'static>(
@@ -94,12 +91,6 @@ fn query<'a>(uri: &'a Uri, name: &str) -> Option<&'a str> {
         .split('&')
         .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
 }
-/// `a` has seen everything `b` has seen.
-fn covers(a: &VersionVector, b: &VersionVector) -> bool {
-    b.iter()
-        .all(|(node, seq)| a.get(node).copied().unwrap_or(0) >= *seq)
-}
-
 fn max_skew_ms(root: &Path) -> Result<u64> {
     Ok(discovery::config(root)?.max_skew.saturating_mul(1000))
 }
@@ -134,11 +125,7 @@ async fn apply(root: &Path, operations: Vec<Operation>) -> Result<VersionVector>
 
 fn failure(e: KanbanError) -> Response {
     let text = e.to_string();
-    for code in [
-        "SYNC_STORE_MISMATCH",
-        "SYNC_CLOCK_SKEW",
-        "SYNC_LEASE_CONFLICT",
-    ] {
+    for code in ["SYNC_STORE_MISMATCH", "SYNC_CLOCK_SKEW"] {
         if text.contains(code) {
             return error(StatusCode::CONFLICT, code, &text);
         }
@@ -162,7 +149,7 @@ pub(super) fn routes(root: PathBuf) -> Router {
         )
         .route("/sync/stream", get(stream))
         .route("/sync/snapshot", get(snapshot))
-        .route("/sync/leases", axum::routing::post(lease_request))
+        .route("/sync/ack", axum::routing::post(ack_request))
         .with_state(root)
 }
 
@@ -176,16 +163,11 @@ async fn vector(State(root): State<PathBuf>, Extension(hash): Extension<String>)
             })?;
         }
         let journal = Journal::open(&root)?;
-        let mut remaining = BTreeMap::new();
-        for (alias, uid) in journal.project_uids()? {
-            remaining.insert(uid, journal.remaining_primary_task_ids(&alias)?);
-        }
         Ok(VectorReply {
             node_id: journal.node.node_id.clone(),
             store_id: journal.node.store_id.clone(),
             empty: ProjectStore::at(&root).list()?.is_empty(),
             vector: journal.vector()?,
-            remaining,
         })
     })
     .await;
@@ -222,10 +204,11 @@ async fn receive(State(root): State<PathBuf>, Json(push): Json<Push>) -> Respons
     }
 }
 
-async fn lease_request(
+/// An outbound peer reports what it holds; the server cannot dial it back.
+async fn ack_request(
     State(root): State<PathBuf>,
     Extension(hash): Extension<String>,
-    Json(request): Json<LeaseRequest>,
+    Json(request): Json<AckRequest>,
 ) -> Response {
     let result = blocking(move || {
         let peer = discovery::caller(&root, &hash)?;
@@ -236,27 +219,14 @@ async fn lease_request(
         // The outbound peer has now confirmed its post-bootstrap store identity.
         // Its original pairing card may still contain the empty store's UUID.
         super::api::refresh_peer_store(&root, &peer, &journal.node.store_id)?;
-        journal.confirm_id_leases(&peer, &request.vector)?;
-        settings::acknowledge(&root, &peer, &request.vector)?;
-        let mut operations = Vec::new();
-        for (alias, uid) in journal.project_uids()? {
-            if journal.issues_id_leases(&uid)? {
-                operations.extend(journal.prepare_id_leases(
-                    &alias,
-                    &peer,
-                    &request.vector,
-                    request.remaining.get(&uid).copied().unwrap_or(0),
-                )?);
-            }
-        }
-        Ok(Push { operations })
+        settings::acknowledge(&root, &peer, &request.vector)
     })
     .await;
     match result {
-        Ok(grants) => {
-            changed();
-            Json(grants).into_response()
-        }
+        Ok(()) => Json(Push {
+            operations: Vec::new(),
+        })
+        .into_response(),
         Err(e) => failure(e),
     }
 }
@@ -470,54 +440,8 @@ impl Link {
             }
         }
         let (root, peer, ack) = (self.root.clone(), self.peer.clone(), acknowledged.clone());
-        blocking(move || {
-            Journal::open(&root)?.confirm_id_leases(&peer, &ack)?;
-            settings::acknowledge(&root, &peer, &ack)
-        })
-        .await?;
+        blocking(move || settings::acknowledge(&root, &peer, &ack)).await?;
         Ok(acknowledged)
-    }
-
-    /// Issue or renew task-ID grants once both replicas hold the same vector.
-    async fn leases(
-        &self,
-        mut acknowledged: VersionVector,
-        remaining: &BTreeMap<String, u64>,
-    ) -> Result<()> {
-        let root = self.root.clone();
-        let (local, projects) = blocking(move || {
-            let journal = Journal::open(&root)?;
-            Ok((journal.vector()?, journal.project_uids()?))
-        })
-        .await?;
-        if !covers(&acknowledged, &local) || !covers(&local, &acknowledged) {
-            return Ok(());
-        }
-        for (alias, uid) in projects {
-            let (root, peer, ack) = (self.root.clone(), self.peer.clone(), acknowledged.clone());
-            let left = remaining.get(&uid).copied().unwrap_or(0);
-            let grants = blocking(move || {
-                let journal = Journal::open(&root)?;
-                let tasks = root.join("projects").join(&alias).join(".kanban/tasks");
-                if !tasks.is_dir() || !journal.issues_id_leases(&uid)? {
-                    return Ok(Vec::new());
-                }
-                journal.prepare_id_leases(&alias, &peer, &ack, left)
-            })
-            .await;
-            match grants {
-                Ok(grants) if !grants.is_empty() => {
-                    acknowledged = self.post(grants).await?;
-                    let (root, peer, ack) =
-                        (self.root.clone(), self.peer.clone(), acknowledged.clone());
-                    blocking(move || Journal::open(&root)?.confirm_id_leases(&peer, &ack)).await?;
-                }
-                Ok(_) => (),
-                // A write raced the handshake; the next cycle retries.
-                Err(e) => eprintln!("sync {}: task ID lease: {e}", self.name),
-            }
-        }
-        Ok(())
     }
 
     /// One catch-up cycle. `None` means the peer is waiting to bootstrap.
@@ -548,45 +472,32 @@ impl Link {
             }
             self.pull().await?;
             let acknowledged = self.push(reply.vector).await?;
-            self.leases(acknowledged, &reply.remaining).await?;
             if node.outbound_only() {
-                self.request_leases().await?;
+                self.report_vector().await?;
             }
-            // Leases may have advanced both vectors; report the fresh one.
-            return Ok(Some(self.vector().await?.vector));
+            return Ok(Some(acknowledged));
         }
     }
 
-    async fn request_leases(&self) -> Result<()> {
-        // The issuer cannot dial an outbound node. Request and acknowledge
-        // grants over the same outbound HTTP path instead.
-        for _ in 0..2 {
-            let root = self.root.clone();
-            let request = blocking(move || {
-                let journal = Journal::open(&root)?;
-                let mut remaining = BTreeMap::new();
-                for (alias, uid) in journal.project_uids()? {
-                    remaining.insert(uid, journal.remaining_primary_task_ids(&alias)?);
-                }
-                Ok(LeaseRequest {
-                    store_id: journal.node.store_id.clone(),
-                    vector: journal.vector()?,
-                    remaining,
-                })
+    async fn report_vector(&self) -> Result<()> {
+        // The server cannot dial an outbound node. Report the post-pull
+        // vector and store identity over the same outbound HTTP path instead.
+        let root = self.root.clone();
+        let request = blocking(move || {
+            let journal = Journal::open(&root)?;
+            Ok(AckRequest {
+                store_id: journal.node.store_id.clone(),
+                vector: journal.vector()?,
             })
+        })
+        .await?;
+        let _: Push = self
+            .send(
+                self.http
+                    .post(format!("{}/sync/ack", self.base))
+                    .json(&request),
+            )
             .await?;
-            let grants: Push = self
-                .send(
-                    self.http
-                        .post(format!("{}/sync/leases", self.base))
-                        .json(&request),
-                )
-                .await?;
-            if grants.operations.is_empty() {
-                break;
-            }
-            apply(&self.root, grants.operations).await?;
-        }
         Ok(())
     }
 
@@ -1091,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_server_bootstraps_then_leases_and_live_stream_converge() {
+    fn empty_server_bootstraps_then_live_stream_converges() {
         let _serial = NETWORK_TEST.blocking_lock();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
@@ -1146,12 +1057,9 @@ mod tests {
             assert!(discovery::config(&b).unwrap().peers.len() == 1);
             assert!(install_snapshot(&a, &ja.snapshot().unwrap()).unwrap_err().to_string().contains("SYNC_STORE_MISMATCH"));
 
-            // The server issues grants once both vectors match.
             let config = discovery::config(&a).unwrap();
             let (to_server, _) = Link::connect(&a, &config, &config.peers[0]).await.unwrap();
             let acknowledged = to_server.cycle().await.unwrap().unwrap();
-            assert!(jb.remaining_task_ids("demo").unwrap() > 0);
-            assert!(ja.remaining_task_ids("demo").unwrap() > 0);
             assert_eq!(ja.vector().unwrap(), jb.vector().unwrap());
 
             // Live: a server write reaches the laptop through the SSE stream.
@@ -1250,12 +1158,9 @@ mod tests {
             drop(follower);
             assert_eq!(hello.load(Ordering::SeqCst), 1);
             assert_eq!(bye.load(Ordering::SeqCst), 0);
-            wait_for("mobile lease", || {
-                Journal::open(a)
-                    .unwrap()
-                    .remaining_task_ids("demo")
-                    .unwrap()
-                    > 0
+            wait_for("mobile acknowledgement", || {
+                fs::read_to_string(b.join("sync/exchanges.yaml"))
+                    .is_ok_and(|text| text.contains(&mobile_id))
             })
             .await;
             let mobile_task = copy

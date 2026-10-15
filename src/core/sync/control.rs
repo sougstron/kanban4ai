@@ -21,11 +21,10 @@ pub(super) fn validate(op: &Operation) -> Result<()> {
         || op.set.len() != 1
         || command.generation == 0
         || command.node.is_empty()
-        || !command.task.strip_prefix("TASK-").is_some_and(|id| {
-            !id.is_empty()
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || b == b'@' || b == b'-' || b.is_ascii_lowercase())
+        // A task UID, or a legacy display id that is its own UID.
+        || command.task.is_empty()
+        || !command.task.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || b == b'@' || b == b'-'
         })
         || !matches!(command.action.as_str(), "stop" | "rerun")
     {
@@ -81,7 +80,7 @@ pub(crate) fn request(board: &Path, task: &str, action: &str) -> Result<bool> {
     let clock: Hlc = load(&journal.root.join("hlc"))?;
     let id = format!("{}:{seq}", journal.node.node_id);
     let command = Command {
-        task: task.into(),
+        task: super::ids::task_uid(&state, &project, task),
         node: target.node_id.clone(),
         generation: target.generation,
         action: action.into(),
@@ -147,13 +146,18 @@ pub(crate) fn process(ops: &Operations) -> Result<()> {
         if entity == "run"
             && let Some(value) = fields.values.get("command")
         {
-            let command: Command =
+            let mut command: Command =
                 serde_json::from_value(value.clone()).map_err(|e| invalid(&e.to_string()))?;
+            command.task = super::ids::task_display(&state, project, &command.task);
             if command.node == journal.node.node_id
                 && command.action == "stop"
                 && state
                     .fields
-                    .get(&key(project, "run", &command.task))
+                    .get(&key(
+                        project,
+                        "run",
+                        &super::ids::task_uid(&state, project, &command.task),
+                    ))
                     .and_then(|fields| fields.values.get(&journal.node.node_id))
                     .and_then(|run| run.get("gen"))
                     .and_then(Value::as_u64)
@@ -186,7 +190,7 @@ pub(crate) fn process(ops: &Operations) -> Result<()> {
                 && let Some(task) = fields.values.get("task_id").and_then(Value::as_str)
             {
                 answers
-                    .entry(task.to_owned())
+                    .entry(super::ids::task_display(&state, project, task))
                     .or_default()
                     .push((receipt, clock.clone()));
             }

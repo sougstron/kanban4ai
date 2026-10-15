@@ -14,13 +14,13 @@ use super::storage::{atomic_write_text_raw, lock_file_reentrant};
 
 mod apply;
 pub(crate) mod control;
-mod lease;
+mod ids;
 pub mod relay;
 mod run;
 mod transport;
 pub use apply::Conflict;
-pub use lease::IdLease;
-pub(crate) use lease::allocate as allocate_task_id;
+pub(crate) use ids::{historical_max, renamed as renamed_task};
+pub use ids::{task_display, task_uid};
 pub use run::{LandingDescriptor, RunDescriptor, RunState, remote_runs};
 pub(crate) use run::{remote_runs_for_tasks, store_for_board, task_landings, task_runs};
 pub use transport::{Page, Snapshot, install_snapshot};
@@ -131,6 +131,12 @@ pub struct JournalState {
     /// Local display-id -> creation op_id. Never written into thread YAML.
     pub message_uids: BTreeMap<String, String>,
     pub project_uids: BTreeMap<String, String>,
+    /// Local `(project, "task", display id)` -> replicated task UID.
+    #[serde(default)]
+    pub task_uids: BTreeMap<String, String>,
+    /// Retired display ids of renumbered tasks -> task UID, for old references.
+    #[serde(default)]
+    pub task_aliases: BTreeMap<String, String>,
     pub compacted: VersionVector,
     /// Retained causal versions make conflict detection independent of delivery order.
     #[serde(default)]
@@ -435,6 +441,8 @@ impl Journal {
         }
         snapshot.message_uids = state.message_uids.clone();
         snapshot.project_uids = state.project_uids.clone();
+        snapshot.task_uids = state.task_uids.clone();
+        snapshot.task_aliases = state.task_aliases.clone();
         snapshot.compacted.insert(node.clone(), through);
         fs::create_dir_all(self.root.join("snapshot"))?;
         atomic_write_text_raw(&snapshot_path, &json(&snapshot)?)?;
@@ -669,6 +677,16 @@ pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
         .map(|s| parse(s, target.entity))
         .transpose()?
         .unwrap_or(Value::Null);
+    let task_uid = if target.entity == "task" {
+        Some(ids::capture_uid(
+            &mut state,
+            &project,
+            &target.id,
+            before.is_null(),
+        )?)
+    } else {
+        None
+    };
     let mut clock: Hlc = load(&journal.root.join("hlc"))?;
     let mut operations = Vec::new();
     run::capture(
@@ -753,7 +771,10 @@ pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
             .checked_add(1)
             .ok_or_else(|| invalid("operation sequence exhausted"))?;
         let op_id = format!("{}:{seq}", journal.node.node_id);
-        let mut id = display_id.clone();
+        let mut id = task_uid.clone().unwrap_or_else(|| display_id.clone());
+        if target.entity == "task" {
+            ids::references_to_uids(&state, &project, &mut set);
+        }
         if target.entity == "message" {
             let alias = key(&project, &target.id, &display_id);
             id = state
@@ -768,7 +789,10 @@ pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
                     return Err(invalid("message parent has no sync uid"));
                 }
             }
-            set.insert("task_id".into(), Value::String(target.id.clone()));
+            set.insert(
+                "task_id".into(),
+                Value::String(ids::task_uid(&state, &project, &target.id)),
+            );
         }
         let entity = if after.is_null() {
             set.clear();
