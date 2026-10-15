@@ -119,7 +119,7 @@ dial: inbound               # inbound | outbound; mobile всегда outbound
 | Глобальный конфиг, кроме локальных секций | `<store>/config.yaml` | LWW по ключу |
 | Ролевые инструкции | `.kanban/instructions/<role>.md` | LWW по файлу |
 | Картинки | `.kanban/assets/images/` | content-addressed blob (sha256), только добавление |
-| Legacy-контекст | `.kanban/context/` | только чтение, копируется при bootstrap |
+| Legacy-контекст | `.kanban/context/` | локальный; не входит в bootstrap и не реплицируется |
 | Дескриптор запуска | `<store>/sync/meta/` | по ключу узла, пишет только runner (раздел 7) |
 | Аренды блоков ID | `<store>/sync/meta/` | раздел 6 |
 
@@ -930,11 +930,22 @@ runs:
   ждёт. Источник сначала назначает UID ещё не тронутым доскам. В снапшот
   входят `project.yaml` (без `work_path`, `migrated_from`, `last_opened_at`),
   конфиг проекта, задачи без локальных полей, треды, `instructions/`,
-  `assets/`, `context/`, глобальный конфиг без локальных секций,
+  `assets/images/`, глобальный конфиг без локальных секций,
   `sync/meta/` без `allocation.json` и журналы. Приёмник пишет redo
   `sync/bootstrap.json`, заменяет `sync/journal|meta|snapshot`, сохраняет свои
   секции `node/sync/serve/daemon/tui/recent_models` и последним принимает
   `store_id`; прерванная установка завершается при следующем `Journal::open`.
+  Другие файлы `assets/` (CSV, JSON, каталоги артефактов агентов) и весь
+  `context/` не обходятся и не передаются; приёмник также отклоняет такие пути.
+  Белый список store-relative путей — `core::sync::transport::allowed_path`;
+  его используют сборщик и установка снапшота. Изображения определяются
+  расположением под `assets/images/`, а не расширением файла.
+  Сейчас `instructions/` и `assets/images/` передаются только при bootstrap:
+  `sync::target()` не журналирует их изменения. LWW инструкций и
+  content-addressed blobs из раздела 3 — целевой контракт, не реализованная
+  инкрементальная доставка; сверка и генерация операций относятся к TASK-509,
+  blobs по хэшу — к TASK-511/514. Снапшот пока остаётся base64 JSON в памяти;
+  этот фильтр исключает артефакты, но не делает передачу потоковой.
 - `kanban serve --sync` — один полный цикл со всеми пирами (для скриптов);
   `--bye` перед уведомлением проталкивает хвост журнала, недоступный пир не
   блокирует сон.

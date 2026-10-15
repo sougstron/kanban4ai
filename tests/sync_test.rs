@@ -13,6 +13,78 @@ fn operations(store: &std::path::Path, node: &str) -> Vec<Operation> {
 }
 
 #[test]
+fn bootstrap_only_transfers_board_data_instructions_and_images() {
+    use kanban4ai::core::sync::install_snapshot;
+
+    let source = tempfile::tempdir().unwrap();
+    let board = source.path().join("projects/demo");
+    Storage::new(&board).init_board().unwrap();
+    fs::write(board.join("project.yaml"), "name: demo\n").unwrap();
+    let included = [
+        ("config.yaml", "name: demo\n"),
+        (
+            "tasks/todo/TASK-001.md",
+            "---\nid: TASK-001\ntitle: demo\nstatus: todo\n---\nbody\n",
+        ),
+        ("threads/TASK-001.yaml", "messages: []\n"),
+        ("instructions/executor.md", "Follow project rules\n"),
+        ("assets/images/nested/screenshot.png", "image bytes"),
+    ];
+    let excluded = [
+        "assets/report.csv",
+        "assets/TASK-051/result.json",
+        "assets/images-other/large.csv",
+        "context/TASK-001.md",
+    ];
+    for (relative, contents) in included {
+        let path = board.join(".kanban").join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    for relative in excluded {
+        let path = board.join(".kanban").join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "local-only").unwrap();
+    }
+    let snapshot = Journal::open(source.path()).unwrap().snapshot().unwrap();
+    for relative in excluded {
+        assert!(
+            !snapshot
+                .files
+                .contains_key(&format!("projects/demo/.kanban/{relative}")),
+            "snapshot leaked {relative}"
+        );
+    }
+    let receiver = tempfile::tempdir().unwrap();
+    Journal::open(receiver.path()).unwrap();
+    install_snapshot(receiver.path(), &snapshot).unwrap();
+    for (relative, contents) in included {
+        let path = receiver.path().join("projects/demo/.kanban").join(relative);
+        let actual = fs::read_to_string(path).unwrap();
+        if relative.starts_with("tasks/") {
+            assert!(actual.contains("title: demo"));
+            assert!(actual.contains("body"));
+        } else {
+            assert_eq!(actual, contents);
+        }
+    }
+    for relative in excluded {
+        assert!(
+            !receiver
+                .path()
+                .join("projects/demo/.kanban")
+                .join(relative)
+                .exists()
+        );
+        let mut forbidden = snapshot.clone();
+        forbidden
+            .files
+            .insert(format!("projects/demo/.kanban/{relative}"), "eA==".into());
+        assert!(install_snapshot(receiver.path(), &forbidden).is_err());
+    }
+}
+
+#[test]
 fn clock_survives_restart_and_rejects_skew_without_advancing() {
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open(dir.path()).unwrap();

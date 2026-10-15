@@ -27,7 +27,7 @@ pub struct Page {
     pub more: bool,
 }
 
-const BOARD_TREES: [&str; 3] = ["instructions", "assets", "context"];
+const BOARD_TREES: [&str; 2] = ["instructions", "assets/images"];
 const STATUSES: [&str; 5] = ["todo", "in_progress", "review", "done", "archive"];
 
 impl Journal {
@@ -126,6 +126,7 @@ impl Journal {
                 .ok()
                 .and_then(Path::to_str)
                 .ok_or_else(|| invalid("invalid snapshot path"))?;
+            allowed_path(relative)?;
             files.insert(relative.to_owned(), STANDARD.encode(bytes));
             Ok(())
         };
@@ -290,7 +291,7 @@ pub(super) fn recover_bootstrap(store: &Path) -> Result<()> {
 }
 
 /// Snapshot paths are store-relative and limited to replicated locations.
-fn allowed_path(path: &str) -> Result<()> {
+pub(crate) fn allowed_path(path: &str) -> Result<()> {
     let parts: Vec<&str> = path.split('/').collect();
     for part in &parts {
         component(part)?;
@@ -303,9 +304,10 @@ fn allowed_path(path: &str) -> Result<()> {
         ["projects", _, ".kanban", "config.yaml"] => true,
         ["projects", _, ".kanban", "tasks", status, _] => STATUSES.contains(status),
         ["projects", _, ".kanban", "threads", _] => true,
-        ["projects", _, ".kanban", tree, rest @ ..] => {
-            BOARD_TREES.contains(tree) && !rest.is_empty()
-        }
+        ["projects", _, ".kanban", rest @ ..] => BOARD_TREES.iter().any(|tree| {
+            let mut parts = rest.iter().copied();
+            tree.split('/').all(|part| parts.next() == Some(part)) && parts.next().is_some()
+        }),
         _ => false,
     };
     if ok {
