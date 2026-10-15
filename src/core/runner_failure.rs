@@ -61,6 +61,9 @@ pub fn observe(
     bye: Option<(chrono::DateTime<chrono::Utc>, &str)>,
     timeout: i64,
 ) -> Result<()> {
+    if !crate::core::sync::enabled(root) {
+        return Ok(());
+    }
     let journal = Journal::open(root)?;
     if journal.node.node_id == node_id {
         return Ok(());

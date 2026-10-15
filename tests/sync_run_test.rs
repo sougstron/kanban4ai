@@ -13,6 +13,7 @@ fn operations(store: &std::path::Path, node: &str) -> Vec<Operation> {
 }
 
 fn board(store: &std::path::Path) -> Storage {
+    kanban4ai::core::sync::enable_sync(store).unwrap();
     let root = store.join("projects/demo");
     fs::create_dir_all(&root).unwrap();
     atomic_write_text(&root.join("project.yaml"), "id: demo\nname: Demo\n").unwrap();
@@ -29,6 +30,7 @@ fn peer(store: &std::path::Path, source: &Journal) -> Journal {
         serde_yaml_ng::to_string(&node).unwrap(),
     )
     .unwrap();
+    kanban4ai::core::sync::enable_sync(store).unwrap();
     Journal::open(store).unwrap()
 }
 
@@ -154,12 +156,11 @@ fn queue_cancellation_and_heartbeat_setting_are_local() {
         journal.runs("demo", &task.id).unwrap()[node].state,
         RunState::Finished
     );
-    let config = fs::read_to_string(dir.path().join("config.yaml")).unwrap();
-    atomic_write_text(
-        &dir.path().join("config.yaml"),
-        &(config + "\nsync:\n  run_heartbeat: 5\n"),
-    )
-    .unwrap();
+    let path = dir.path().join("config.yaml");
+    let mut config: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    config["sync"]["run_heartbeat"] = serde_yaml_ng::Value::from(5);
+    atomic_write_text(&path, &serde_yaml_ng::to_string(&config).unwrap()).unwrap();
     task.run_phase = Some(RunPhase::Execute);
     storage.save_task(&task).unwrap();
     let sessions = SessionManager::new(&storage.project_path);

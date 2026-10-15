@@ -6,6 +6,7 @@ fn task(title: &str) -> String {
     format!("---\nid: TASK-001\ntitle: {title}\nstatus: todo\n---\nbody\n")
 }
 fn board(store: &Path) -> std::path::PathBuf {
+    kanban4ai::core::sync::enable_sync(store).unwrap();
     let board = store.join("projects/demo");
     Storage::new(&board).init_board().unwrap();
     atomic_write_text(

@@ -38,7 +38,7 @@ pub(crate) fn request(board: &Path, task: &str, action: &str) -> Result<bool> {
     let Some(store) = store_for_board(board) else {
         return Ok(false);
     };
-    if !store.join("sync/node.yaml").exists() {
+    if !enabled(store) {
         return Ok(false);
     }
     let journal = Journal::open(store)?;
@@ -113,7 +113,7 @@ pub(crate) fn process(ops: &Operations) -> Result<()> {
     let Some(store) = store_for_board(ops.data_root()) else {
         return Ok(());
     };
-    if !store.join("sync/node.yaml").exists() {
+    if !enabled(store) {
         return Ok(());
     }
     let journal = Journal::open(store)?;

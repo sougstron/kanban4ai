@@ -26,8 +26,8 @@ mod segments;
 mod transport;
 pub use apply::Conflict;
 pub use format::{
-    MIN_SYNC_PROTOCOL, OP_FORMAT, STORE_FORMAT, SYNC_PROTOCOL, accept_store_protocol,
-    max_op_version, negotiate, protocol_bounds,
+    MIN_SYNC_PROTOCOL, OP_FORMAT, STORE_FORMAT, SYNC_PROTOCOL, accept_store_protocol, enable_sync,
+    enabled, max_op_version, negotiate, node_role, protocol_bounds,
 };
 pub(crate) use ids::{historical_max, renamed as renamed_task};
 pub use ids::{task_display, task_uid};
@@ -628,7 +628,7 @@ fn target(path: &Path) -> Option<Target> {
             });
         }
     }
-    if path.file_name()? == "config.yaml" && path.parent()?.join("sync/node.yaml").exists() {
+    if path.file_name()? == "config.yaml" && path.parent().is_some_and(enabled) {
         return Some(Target {
             store: path.parent()?.to_path_buf(),
             project: String::new(),
@@ -735,10 +735,33 @@ fn fields(value: &Value, entity: &str, global: bool) -> Fields {
     result
 }
 
+/// Open the journal and fold on-disk files into it. Callers must not hold a
+/// board lock: reconcile takes store, then boards, then sync.
+pub fn activate(store: &Path) -> Result<usize> {
+    if !enabled(store) {
+        return Ok(0);
+    }
+    Journal::open(store)?.reconcile()
+}
+
 /// Called by the atomic writer, while its caller holds the board/store lock.
 pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
-    if target(path).is_some_and(|t| t.entity == "file") {
+    let Some(found) = target(path) else {
+        return Ok(false);
+    };
+    if found.entity == "file" {
         // Binary attachments and arbitrary instruction text are reconciled as blobs.
+        return Ok(false);
+    }
+    // A disabled store must not create sync/, take the journal lock, or fsync.
+    // Dropping the arm marker forces the next activation to reconcile first:
+    // capture reads "before" from disk, so a delta made while sync was off
+    // would otherwise be skipped forever.
+    if !enabled(&found.store) {
+        format::disarm(&found.store)?;
+        return Ok(false);
+    }
+    if !format::armed(&found.store) {
         return Ok(false);
     }
     capture_inner(path, content, None, None)
@@ -1057,4 +1080,34 @@ fn capture_inner(
         }),
     )?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod local_first_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn task_path(store: &Path) -> std::path::PathBuf {
+        store.join("projects/demo/.kanban/tasks/todo/TASK-001.md")
+    }
+
+    #[test]
+    fn capture_when_disabled_does_not_create_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = task_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(!capture(&path, Some("---\nid: TASK-001\n---\n")).unwrap());
+        assert!(!dir.path().join("sync").exists());
+    }
+
+    #[test]
+    fn capture_when_enabled_but_unarmed_skips_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.yaml"), "sync:\n  enabled: true\n").unwrap();
+        let path = task_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(!capture(&path, Some("---\nid: TASK-001\n---\n")).unwrap());
+        assert!(!dir.path().join("sync").exists());
+        assert!(!format::armed(dir.path()));
+    }
 }

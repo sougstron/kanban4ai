@@ -101,6 +101,8 @@ pub(crate) enum Outcome {
 
 #[derive(Default)]
 pub(crate) struct SyncTab {
+    /// Sync is off for this store: render the local-first notice, do not open the journal.
+    pub disabled: bool,
     pub view: Option<View>,
     pub selected: usize,
     pub form: Option<Form>,
@@ -861,6 +863,15 @@ pub(crate) fn render(
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    if tab.disabled {
+        frame.render_widget(
+            Paragraph::new("Sync выключен — добавьте peer (kanban serve pair / join) или relay")
+                .style(Style::default().fg(app.theme.muted))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
     let Some(view) = &tab.view else {
         let text = match &tab.notice {
             Some((text, true)) => text.clone(),

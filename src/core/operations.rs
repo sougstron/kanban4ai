@@ -3089,7 +3089,7 @@ impl Operations {
             return Ok(None);
         }
         if let Some(store) = crate::core::sync::store_for_board(self.data_root())
-            && store.join("sync/node.yaml").exists()
+            && crate::core::sync::enabled(store)
         {
             let journal = crate::core::sync::Journal::open(store)?;
             let project = self

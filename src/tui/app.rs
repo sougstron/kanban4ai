@@ -2834,6 +2834,10 @@ impl App {
             Some(HitAction::SyncConflict(index)) => {
                 let conflict = self.sync_board.conflicts.get(index).cloned();
                 if let (Some(conflict), Some(store)) = (conflict, &self.store) {
+                    if !crate::core::sync::enabled(store.root()) {
+                        self.status = "Sync выключен".into();
+                        return Ok(());
+                    }
                     match crate::core::sync::Journal::open(store.root())
                         .and_then(|journal| journal.take_other_version(&conflict))
                     {
@@ -4575,6 +4579,13 @@ impl App {
         };
         let root = store.root().to_path_buf();
         let sync = &mut modal.sync;
+        if !crate::core::sync::enabled(&root) {
+            sync.disabled = true;
+            sync.view = None;
+            sync.request = None;
+            return;
+        }
+        sync.disabled = false;
         sync.poll(
             &root,
             self.settings.refresh_interval,

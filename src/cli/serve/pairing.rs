@@ -367,6 +367,10 @@ fn accept_sync(root: &Path, request: PairRequest) -> Result<PairReply> {
     let token = secret()?;
     let reverse_token = secret()?;
     install(&store, &request.node_card, &token, &reverse_token)?;
+    drop(_sync_lock);
+    drop(_store_lock);
+    // Reconcile only after the store and sync locks are released.
+    crate::core::sync::activate(root)?;
     Ok(PairReply {
         node_card: local,
         token,
@@ -482,9 +486,12 @@ pub(super) fn pair(
         reply.node_card.tailscale_address = Some(address.into());
     }
     validate(root, &local, &reply.node_card)?;
-    let _store_lock = lock_file_reentrant(&root.join(".lock"))?;
-    let _sync_lock = lock_file_reentrant(&root.join("sync/.lock"))?;
-    install(store, &reply.node_card, &reply.reverse_token, &reply.token)?;
+    {
+        let _store_lock = lock_file_reentrant(&root.join(".lock"))?;
+        let _sync_lock = lock_file_reentrant(&root.join("sync/.lock"))?;
+        install(store, &reply.node_card, &reply.reverse_token, &reply.token)?;
+    }
+    crate::core::sync::activate(root)?;
     Ok(reply.node_card.node.name)
 }
 

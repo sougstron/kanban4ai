@@ -196,9 +196,15 @@ mod tests {
         assert_eq!(at.time(), ahead);
         assert!(at.date() - now.date() <= chrono::Duration::days(1));
 
-        // A time already past today rolls to tomorrow.
-        let past_hour = if now.hour() > 0 { now.hour() - 1 } else { 23 };
-        let past = NaiveTime::from_hms_opt(past_hour, now.minute(), 0).unwrap();
+        // A time already past today rolls to tomorrow. During the first
+        // minute of the day the exact-minute case below is the past moment.
+        let past = if now.minute() > 0 {
+            NaiveTime::from_hms_opt(now.hour(), now.minute() - 1, 0).unwrap()
+        } else if now.hour() > 0 {
+            NaiveTime::from_hms_opt(now.hour() - 1, 59, 0).unwrap()
+        } else {
+            NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+        };
         let rolled = next_launch_at(past);
         assert_eq!(rolled.date(), now.date() + chrono::Duration::days(1));
         assert_eq!(rolled.time(), past);

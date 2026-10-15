@@ -57,7 +57,7 @@ pub(crate) fn runner_action(
     let Some(root) = projects.parent() else {
         return Ok(None);
     };
-    if discovery::config(root)?.peers.is_empty() {
+    if !crate::core::sync::enabled(root) || discovery::config(root)?.peers.is_empty() {
         return Ok(None);
     }
     let storage = crate::core::storage::Storage::new(board);

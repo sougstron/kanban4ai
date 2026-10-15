@@ -822,14 +822,32 @@ pub(super) async fn runner_action(
     root: &Path,
     id: &str,
     task: &str,
-    queue: bool,
+    _queue: bool,
 ) -> Result<Option<Option<String>>> {
-    let p = project(root, id)?;
-    let before = found(Operations::for_project(&p).get_task(task)?)?;
-    let automatic = crate::core::config::Config::new(&p.data_root)
-        .load()?
-        .runner_for(before.runner)
-        == crate::core::config::Runner::Auto;
+    // Resolve without pinning. A down runner with no git remote cannot be
+    // queued, and that error must leave the task file untouched.
+    let Some(node) = target(root, id, task, None, false).await? else {
+        return Ok(None);
+    };
+    let (remote_root, remote_id) = (root.to_path_buf(), id.to_owned());
+    let has_remote = blocking(move || {
+        Ok(crate::core::code::status(&remote_root, &remote_id)?
+            .remote
+            .is_some())
+    })
+    .await?;
+    if !has_remote {
+        let config = discovery::config(root)?;
+        let offline = match config.peers.iter().find(|peer| peer.node.name == node) {
+            Some(peer) => !discovery::runner_online(root, peer).await?,
+            None => true,
+        };
+        if offline {
+            return Err(invalid(
+                "SYNC_NO_REMOTE: offline runner queue needs a git remote; pass --runner <local> to run here",
+            ));
+        }
+    }
     let Some(node) = target(root, id, task, None, true).await? else {
         return Ok(None);
     };
@@ -846,28 +864,34 @@ pub(super) async fn runner_action(
         if let Ok(config) = discovery::config(root)
             && let Some(peer) = config.peers.iter().find(|peer| peer.node.name == node)
         {
-            let _ = super::sync::catch_up(root, peer).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), super::sync::catch_up(root, peer))
+                .await;
         }
         return Ok(Some(value["session"].as_str().map(str::to_owned)));
     }
     let code = value["error"]["code"]
         .as_str()
         .unwrap_or("NODE_UNREACHABLE");
-    if (queue || automatic)
-        && matches!(
-            code,
-            "NODE_UNREACHABLE" | "NODE_POWERED_OFF" | "NODE_OUT_OF_LAN" | "NODE_SERVICE_DOWN"
-        )
-    {
+    // CLI and agents queue a pinned remote runner that is down. The TUI
+    // dialog uses `launch_on_board` (Ask vs Queue) and does not come through here.
+    if matches!(
+        code,
+        "NODE_UNREACHABLE" | "NODE_POWERED_OFF" | "NODE_OUT_OF_LAN" | "NODE_SERVICE_DOWN"
+    ) {
+        eprintln!(
+            "warning: runner {node} is unreachable ({code}); the task is queued until it reconnects. Pass --runner <local> to run here."
+        );
         // Publish code before the replicated intent: a relay-only runner must
         // never consume a request for a snapshot which has not been published.
         let (code_root, code_id, code_task) = (root.to_path_buf(), id.to_owned(), task.to_owned());
         blocking(move || {
-            let remote = crate::core::code::status(&code_root, &code_id)?
-                .remote
-                .ok_or_else(|| {
-                    invalid("SYNC_NO_REMOTE: offline runner queue needs a git remote")
-                })?;
+            let remote = crate::core::code::status(&code_root, &code_id)?.remote.ok_or_else(
+                || {
+                    invalid(
+                        "SYNC_NO_REMOTE: offline runner queue needs a git remote; pass --runner <local> to run here",
+                    )
+                },
+            )?;
             publish_launch_code(&code_root, &code_id, &code_task, &remote)?;
             Ok(())
         })
@@ -888,7 +912,8 @@ pub(super) async fn runner_action(
             storage.save_task(&task)?;
         }
         // Durable intent survives the caller shutting down after publication.
-        let _ = super::sync::once(root, true).await;
+        // Best-effort: a blackholed peer must not hold the CLI for the request timeout.
+        let _ = tokio::time::timeout(Duration::from_secs(5), super::sync::once(root, true)).await;
         return Ok(Some(None));
     }
     Err(invalid(format!(
@@ -1929,6 +1954,7 @@ mod tests {
         fs::create_dir_all(&work).unwrap();
         let p = ProjectStore::at(&store).add(&work, None).unwrap().project;
         Storage::new(&p.data_root).init_board().unwrap();
+        crate::core::sync::enable_sync(&store).unwrap();
         let client_token = issue_token(&store, TokenKind::Node).unwrap();
         let node_token = issue_token(&store, TokenKind::Node).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

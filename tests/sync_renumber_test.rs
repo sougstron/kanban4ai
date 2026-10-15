@@ -22,6 +22,7 @@ fn node(a: &Journal) -> (tempfile::TempDir, Journal) {
     )
     .unwrap();
     let journal = Journal::open(dir.path()).unwrap();
+    kanban4ai::core::sync::enable_sync(dir.path()).unwrap();
     Storage::new(dir.path().join("projects/demo"))
         .init_board()
         .unwrap();
@@ -40,6 +41,7 @@ fn origin() -> (tempfile::TempDir, Journal) {
         ),
     )
     .unwrap();
+    kanban4ai::core::sync::enable_sync(dir.path()).unwrap();
     let board = Storage::new(dir.path().join("projects/demo"));
     board.init_board().unwrap();
     atomic_write_text(
