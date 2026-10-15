@@ -501,23 +501,60 @@ fn serve_port(store: &ProjectStore) -> Result<u16> {
 }
 
 /// The address a phone should dial: a LAN IPv4 first, then this node's
-/// MagicDNS name, then any tailnet IPv4 serve listens on.
+/// MagicDNS name, then any tailnet IPv4 serve listens on. LAN addresses on
+/// the default-route interface win over other live links; addresses on
+/// links that are down (an idle VPN) are only a last resort.
 pub(super) fn phone_address(root: &Path) -> Result<String> {
     let port = serve_port(&ProjectStore::at(root))?;
-    let lan: Vec<SocketAddr> = addresses(&discovery::config(root)?.home_networks, port)?
+    let networks = discovery::config(root)?.home_networks;
+    let defaults =
+        default_route_interfaces(&fs::read_to_string("/proc/net/route").unwrap_or_default());
+    let mut lan: Vec<(u8, SocketAddr)> = if_addrs::get_if_addrs()?
         .into_iter()
-        .filter(|a| a.is_ipv4() && !a.ip().is_loopback())
+        .filter(|i| i.ip().is_ipv4() && !i.ip().is_loopback() && allowed(i.ip(), &networks))
+        .map(|i| {
+            let down = fs::read_to_string(format!("/sys/class/net/{}/operstate", i.name))
+                .is_ok_and(|state| state.trim() == "down");
+            let rank = if defaults.contains(&i.name) {
+                0
+            } else if down {
+                2
+            } else {
+                1
+            };
+            (rank, SocketAddr::new(i.ip(), port))
+        })
         .collect();
+    lan.sort();
     let tailnet = |a: &SocketAddr| crate::core::net::is_tailnet_address(&a.to_string());
-    if let Some(address) = lan.iter().find(|a| !tailnet(a)) {
+    if let Some((_, address)) = lan.iter().find(|(rank, a)| *rank < 2 && !tailnet(a)) {
         return Ok(address.to_string());
     }
     if let Some(address) = tailnet_address(root, port)? {
         return Ok(address);
     }
     lan.first()
-        .map(ToString::to_string)
+        .map(|(_, a)| a.to_string())
         .ok_or_else(|| invalid("No LAN or tailnet address found; pass this node's HOST:PORT"))
+}
+
+/// Interfaces carrying a main-table IPv4 default route, lowest metric first,
+/// parsed from `/proc/net/route`. Policy-routing tables (VPN tunnels) are not
+/// listed there, so this names the physical uplink.
+fn default_route_interfaces(table: &str) -> Vec<String> {
+    let mut routes: Vec<(u32, String)> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let up = u16::from_str_radix(fields.get(3)?, 16).ok()? & 1 == 1;
+            (up && fields.get(1)? == &"00000000")
+                .then(|| Some((fields.get(6)?.parse().ok()?, fields[0].to_string())))
+                .flatten()
+        })
+        .collect();
+    routes.sort();
+    routes.into_iter().map(|(_, name)| name).collect()
 }
 
 /// A single-use phone invite: `CODE@HOST:PORT` carries everything
@@ -631,6 +668,16 @@ pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_route_interfaces_ignore_down_and_non_default_routes() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n\
+            wlan0\t00000000\t0100A8C0\t0003\t0\t0\t600\t00000000\n\
+            vpn0\t006E0B0A\t00000000\t0001\t0\t0\t4\t00FFFFFF\n\
+            eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\n\
+            old0\t00000000\t0100A8C0\t0002\t0\t0\t1\t00000000\n";
+        assert_eq!(default_route_interfaces(table), ["eth0", "wlan0"]);
+        assert!(default_route_interfaces("").is_empty());
+    }
     fn request(root: &Path, code: &str) -> PairRequest {
         let mut node = Journal::open(root).unwrap().node;
         node.node_id = "remote-node".into();
