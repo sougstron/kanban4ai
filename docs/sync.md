@@ -1453,7 +1453,10 @@ LAN-IP или MagicDNS-имя (без аргумента: LAN IPv4 интерф�
 узел `mobile`/outbound (имя `phone`, если не задано `--name` и узел ещё не
 mobile; на server отказ), для tailnet-адреса переводит `net.tailscale.mode`
 из off в managed и выполняет `net up` (при отсутствии бинарей — `net
-install`), затем `serve --pair` и один цикл sync.
+install`), затем `serve --pair` и один цикл sync. `join --fresh` сначала
+переносит store с проектами в `<store>.pre-join-<время>` и сопрягается с
+пустым store; без флага чужая непустая база даёт `SYNC_STORE_MISMATCH` с
+подсказкой про `--fresh`.
 
 #### Реализация Serve 03 (TASK-412)
 

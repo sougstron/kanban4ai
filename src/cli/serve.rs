@@ -491,9 +491,35 @@ fn retire_client_tokens(root: &Path) -> Result<()> {
 
 /// `kanban4ai join`: set this node up as a phone from one invite, pair,
 /// then pull the shared board once.
-pub fn join(invite: &str, name: Option<&str>) -> Result<ExitCode> {
-    let store = ProjectStore::open()?;
-    let peer = pairing::join(store.root(), invite, name)?;
+/// `fresh` first moves a store that already holds projects aside, so the
+/// phone can adopt the server's board instead of failing with
+/// `SYNC_STORE_MISMATCH`.
+pub fn join(invite: &str, name: Option<&str>, fresh: bool) -> Result<ExitCode> {
+    let mut store = ProjectStore::open()?;
+    if fresh && !store.list()?.is_empty() {
+        let root = store.root().to_path_buf();
+        let stem = root
+            .file_name()
+            .ok_or_else(|| invalid("Store root has no name"))?
+            .to_string_lossy();
+        let backup = root.with_file_name(format!(
+            "{stem}.pre-join-{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        ));
+        fs::rename(&root, &backup)?;
+        println!("Previous store moved to {}", backup.display());
+        store = ProjectStore::open()?;
+    }
+    let peer = match pairing::join(store.root(), invite, name) {
+        Err(e) if e.to_string().contains("SYNC_STORE_MISMATCH") => {
+            return Err(invalid(format!(
+                "{e}\nThis store already holds another board. To replace it with the \
+                 server's board, rerun with a fresh invite: kanban4ai join --fresh CODE@HOST:PORT \
+                 (the current store is moved aside, not deleted)"
+            )));
+        }
+        other => other?,
+    };
     println!("Paired with {peer}");
     let results = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
