@@ -33,8 +33,10 @@ impl Embedded {
     }
 
     fn spawn(root: &Path, serving: bool) -> Result<Self> {
-        fs::create_dir_all(root.join("sync"))?;
-        let service = if serving {
+        // A disabled store must not create sync/ or take serve.lock. The
+        // singleton error is synchronous only once sync is already on.
+        let service = if serving && crate::core::sync::enabled(root) {
+            fs::create_dir_all(root.join("sync"))?;
             Some(
                 try_owner(&root.join("sync/serve.lock"))?
                     .ok_or_else(|| invalid("serve is already running"))?,
@@ -52,10 +54,37 @@ impl Embedded {
             runtime.block_on(async move {
                 let mut running: Option<sync::Running> = None;
                 let mut ownership: Option<File> = None;
+                let mut service = service;
                 loop {
+                    if !crate::core::sync::enabled(&root) {
+                        if let Some(worker) = running.take() {
+                            worker.stop().await;
+                        }
+                        ownership.take();
+                        service.take();
+                        tokio::select! {
+                            _ = stopped.changed() => break,
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => (),
+                        }
+                        continue;
+                    }
+                    if serving && service.is_none() {
+                        match (|| -> Result<Option<File>> {
+                            fs::create_dir_all(root.join("sync"))?;
+                            try_owner(&root.join("sync/serve.lock"))
+                        })() {
+                            Ok(Some(file)) => service = Some(file),
+                            Ok(None) => {
+                                eprintln!("serve is already running");
+                                break;
+                            }
+                            Err(e) => eprintln!("sync owner: {e}"),
+                        }
+                    }
                     let config = discovery::config(&root);
                     // Serve takes precedence even if a TUI/daemon started first.
                     let service_active = !serving
+                        && fs::create_dir_all(root.join("sync")).is_ok()
                         && try_owner(&root.join("sync/serve.lock"))
                             .is_ok_and(|lock| lock.is_none());
                     if service_active {
@@ -92,7 +121,7 @@ impl Embedded {
                     if let Err(e) = discovery::notify(&root, Some("shutdown")).await {
                         eprintln!("sync bye: {e}");
                     }
-                } else {
+                } else if crate::core::sync::enabled(&root) {
                     // A TUI using another process's sync worker still checkpoints
                     // on exit, but must not announce that the live node went away.
                     let interval = discovery::config(&root).map_or(60, |c| c.run_heartbeat);

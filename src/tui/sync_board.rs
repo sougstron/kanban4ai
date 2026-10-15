@@ -99,8 +99,8 @@ impl SyncBoard {
         if self.job.is_some() {
             return;
         }
-        // Legacy in-place boards and stores without sync remain unchanged.
-        if !root.join("sync/node.yaml").exists() {
+        // A store with sync off never opens the journal or probes peers.
+        if !crate::core::sync::enabled(root) {
             return;
         }
         let stamp = journal_stamp(root);

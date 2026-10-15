@@ -27,10 +27,10 @@ expression: "render_at(&mut app, width, 36)"
 │┃Nodes in phone priority order (Shift+↑/↓ or K/J moves)  ┃│
 │┃  1. server (server)                                    ┃│
 │┃      Not probed yet — press Refresh                    ┃│
-│┃      not probed · never exchanged · 1 op(s) waiting    ┃│
+│┃      not probed · never exchanged · 0 op(s) waiting    ┃│
 │┃  2. phone (mobile)                                     ┃│
 │┃      Not probed yet — press Refresh                    ┃│
-│┃      phone dials in · never exchanged · 1 op(s) waiting┃│
+│┃      phone dials in · never exchanged · 0 op(s) waiting┃│
 │┃  [ Pair with a node… ]                                 ┃│
 │┃  [ Show a pairing code / phone QR… ]                   ┃│
 │┃  [ Refresh status ]  (r)                               ┃│

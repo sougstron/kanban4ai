@@ -54,6 +54,7 @@ fn pair_with_role(manual: bool, role: &str) -> Pair {
     )
     .unwrap();
     Journal::open(&a).unwrap();
+    kanban4ai::core::sync::enable_sync(&a).unwrap();
     let work = temp.path().join("wa");
     fs::create_dir_all(&work).unwrap();
     git(&work, &["init", "-q", "-b", "main"]);
@@ -83,6 +84,7 @@ fn pair_with_role(manual: bool, role: &str) -> Pair {
     )
     .unwrap();
     Journal::open(&b).unwrap();
+    kanban4ai::core::sync::enable_sync(&b).unwrap();
     install_snapshot(&b, &Journal::open(&a).unwrap().snapshot().unwrap()).unwrap();
     let wb = temp.path().join("wb");
     git(

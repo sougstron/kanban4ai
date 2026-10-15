@@ -85,6 +85,7 @@ fn journal_write_and_page_at_10k() {
         "\nsync:\n  journal:\n    segment_bytes: 4194304\n    snapshot_ops: 1000000\n    snapshot_secs: 864000\n",
     );
     fs::write(dir.path().join("config.yaml"), config).unwrap();
+    kanban4ai::core::sync::enable_sync(dir.path()).unwrap();
     let mut task = storage.create_task(NewTask::titled("seed")).unwrap();
     let state = journal.state().unwrap();
     let project = state.project_uids.get("demo").expect("project uid").clone();

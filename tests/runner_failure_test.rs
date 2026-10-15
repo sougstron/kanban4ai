@@ -8,6 +8,7 @@ use kanban4ai::core::timefmt;
 use std::fs;
 
 fn board(root: &std::path::Path) -> Storage {
+    kanban4ai::core::sync::enable_sync(root).unwrap();
     let board = root.join("projects/demo");
     fs::create_dir_all(&board).unwrap();
     atomic_write_text(
@@ -41,6 +42,7 @@ fn peer_reports_expired_heartbeat_and_bye_without_claiming_run_and_recovers() {
     )
     .unwrap();
     let peer = Journal::open(replica.path()).unwrap();
+    kanban4ai::core::sync::enable_sync(replica.path()).unwrap();
     let mut task = storage.create_task(NewTask::titled("remote run")).unwrap();
     task.status = TaskStatus::InProgress;
     task.session = Some("ses-runner".into());

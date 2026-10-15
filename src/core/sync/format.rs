@@ -1,7 +1,9 @@
 //! Store, operation and protocol versions. `sync/FORMAT` is the commit point
 //! of a migration: readers newer than the file refuse to write anything.
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 use super::*;
 
@@ -231,6 +233,141 @@ pub fn accept_store_protocol(remote_protocol: u32, remote_min: u32) -> Result<u3
     .ok_or_else(|| invalid("SYNC_PROTOCOL_MISMATCH"))
 }
 
+/// `sync/armed` lives beside the journal, not under `sync/meta`: meta is part of
+/// the sessions fingerprint and of snapshots. The empty file means the drift
+/// index matches disk, so the next capture may append a delta safely.
+pub(super) fn armed_path(store: &Path) -> PathBuf {
+    store.join("sync/armed")
+}
+
+pub(super) fn armed(store: &Path) -> bool {
+    armed_path(store).is_file()
+}
+
+pub(super) fn mark_armed(store: &Path) -> Result<()> {
+    let path = armed_path(store);
+    if path.is_file() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::File::create(path)?;
+    Ok(())
+}
+
+pub(super) fn disarm(store: &Path) -> Result<()> {
+    match fs::remove_file(armed_path(store)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+struct EnabledCache {
+    mtime: Option<SystemTime>,
+    len: u64,
+    enabled: bool,
+}
+
+static ENABLED_CACHE: LazyLock<Mutex<std::collections::HashMap<PathBuf, EnabledCache>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Whether this store journals and exchanges operations.
+///
+/// `sync.enabled: false` is a kill switch. `sync.enabled: true` journals even
+/// before the first peer (tests, a server waiting to pair, an explicit
+/// request). A missing key is automatic: on when `sync.peers` or
+/// `sync.relay_remote` is non-empty. A missing or unreadable config is off.
+/// `sync.server` (a later star topology) belongs in this same predicate.
+pub fn enabled(store: &Path) -> bool {
+    let path = store.join("config.yaml");
+    let meta = fs::metadata(&path).ok();
+    let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+    let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+    let mut cache = ENABLED_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = cache.get(store)
+        && hit.mtime == mtime
+        && hit.len == len
+    {
+        return hit.enabled;
+    }
+    let enabled = read_enabled(&path);
+    cache.insert(
+        store.to_path_buf(),
+        EnabledCache {
+            mtime,
+            len,
+            enabled,
+        },
+    );
+    enabled
+}
+
+fn read_enabled(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(config) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(&text) else {
+        return false;
+    };
+    let Some(sync) = config.get("sync") else {
+        return false;
+    };
+    match sync.get("enabled") {
+        Some(serde_yaml_ng::Value::Bool(value)) => *value,
+        _ => auto_enabled(sync),
+    }
+}
+
+fn auto_enabled(sync: &serde_yaml_ng::Value) -> bool {
+    let peers = sync
+        .get("peers")
+        .and_then(|v| v.as_sequence())
+        .is_some_and(|s| !s.is_empty());
+    let relay = sync
+        .get("relay_remote")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty());
+    peers || relay
+}
+
+/// Test and setup helper: turn journaling on without discarding the rest of
+/// `config.yaml`, and arm capture. Production turns sync on by writing peers,
+/// `relay_remote`, or `sync.enabled` and then [`super::activate`].
+pub fn enable_sync(store: &Path) -> Result<()> {
+    let path = store.join("config.yaml");
+    let mut config: serde_yaml_ng::Value = match fs::read_to_string(&path) {
+        Ok(text) => serde_yaml_ng::from_str(&text)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            serde_yaml_ng::Value::Mapping(Default::default())
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if !config.is_mapping() {
+        config = serde_yaml_ng::Value::Mapping(Default::default());
+    }
+    if !config.get("sync").is_some_and(|sync| sync.is_mapping()) {
+        config["sync"] = serde_yaml_ng::Value::Mapping(Default::default());
+    }
+    config["sync"]["enabled"] = serde_yaml_ng::Value::Bool(true);
+    atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&config)?)?;
+    mark_armed(store)
+}
+
+/// Role recorded in `sync/node.yaml`, without creating identity or the journal.
+/// `None` means this store has no sync identity yet (treated as a laptop).
+pub fn node_role(store: &Path) -> Result<Option<super::NodeRole>> {
+    match fs::read_to_string(store.join("sync/node.yaml")) {
+        Ok(text) => {
+            let node: super::NodeIdentity = serde_yaml_ng::from_str(&text)?;
+            Ok(Some(node.role))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// True when this store has no paired peers and git relay is off.
 /// A config that does not parse still counts as "do not prune".
 pub(super) fn solo_store(store: &Path) -> bool {
@@ -252,4 +389,42 @@ pub(super) fn solo_store(store: &Path) -> bool {
         .and_then(|v| v.as_str())
         .is_some_and(|s| !s.is_empty());
     !peers && !relay
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_config(store: &Path, body: &str) {
+        fs::write(store.join("config.yaml"), body).unwrap();
+    }
+
+    #[test]
+    fn enabled_follows_the_kill_switch_and_auto_peers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path();
+        assert!(!enabled(store));
+        write_config(store, "tui: {}\n");
+        assert!(!enabled(store));
+        write_config(store, "sync: {}\n");
+        assert!(!enabled(store));
+        write_config(store, "sync:\n  peers: []\n");
+        assert!(!enabled(store));
+        write_config(store, "sync:\n  peers:\n    - {name: a}\n");
+        assert!(enabled(store));
+        write_config(store, "sync:\n  relay_remote: origin\n");
+        assert!(enabled(store));
+        write_config(store, "sync:\n  relay_remote: \"\"\n");
+        assert!(!enabled(store));
+        write_config(store, "sync:\n  enabled: true\n");
+        assert!(enabled(store));
+        write_config(
+            store,
+            "sync:\n  enabled: false\n  peers:\n    - {name: a}\n  relay_remote: origin\n",
+        );
+        assert!(!enabled(store));
+        write_config(store, "[\n");
+        assert!(!enabled(store));
+        assert!(node_role(store).unwrap().is_none());
+    }
 }

@@ -62,6 +62,11 @@ fn owned_latest_run(
     task: &str,
     node_id: &str,
 ) -> Result<RunDescriptor> {
+    if !super::sync::enabled(store) {
+        return Err(invalid(
+            "RUNNER_LOG_UNAVAILABLE: Runner has no run for this task",
+        ));
+    }
     let runs = Journal::open(store)?.runs(project, task)?;
     let run = runs
         .get(node_id)
@@ -88,6 +93,9 @@ fn identity(board: &Path) -> Result<(&Path, &str)> {
 pub fn latest_run(board: &Path, task: &str) -> Result<RunDescriptor> {
     component(task)?;
     let (store, alias) = identity(board)?;
+    if !super::sync::enabled(store) {
+        return Err(invalid("RUNNER_LOG_UNAVAILABLE: Task has no runner log"));
+    }
     Journal::open(store)?
         .runs(alias, task)?
         .into_values()
@@ -96,6 +104,9 @@ pub fn latest_run(board: &Path, task: &str) -> Result<RunDescriptor> {
 }
 
 pub fn validate_snapshot(store: &Path, snapshot: &Snapshot) -> Result<()> {
+    if !super::sync::enabled(store) {
+        return Err(invalid("Runner log owner is not paired with this store"));
+    }
     cache_path(store, &snapshot.node_id, &snapshot.project, &snapshot.task)?;
     let settings = super::sync::relay::settings(store)?;
     if snapshot.text.len() > settings.log_tail_bytes || snapshot.text.len() > MAX_TAIL_BYTES {
@@ -151,6 +162,11 @@ pub fn cache_snapshot(store: &Path, snapshot: &Snapshot) -> Result<()> {
 
 pub fn cached_tail(board: &Path, task: &str, node_id: &str) -> Result<Snapshot> {
     let (store, alias) = identity(board)?;
+    if !super::sync::enabled(store) {
+        return Err(invalid(
+            "RUNNER_LOG_UNAVAILABLE: No cached runner log is available",
+        ));
+    }
     let uid = Journal::open(store)?
         .state()?
         .project_uids
@@ -354,6 +370,7 @@ mod tests {
             format!("sync:\n  log_tail_bytes: {limit}\n"),
         )
         .unwrap();
+        crate::core::sync::enable_sync(&store).unwrap();
         let project = ProjectStore::at(&store).add(&work, None).unwrap().project;
         let storage = Storage::new(&project.data_root);
         storage.init_board().unwrap();

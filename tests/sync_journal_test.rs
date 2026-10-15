@@ -14,6 +14,7 @@ fn task(title: &str) -> String {
 }
 
 fn board(store: &Path) -> Storage {
+    kanban4ai::core::sync::enable_sync(store).unwrap();
     let root = store.join("projects/demo");
     let storage = Storage::new(&root);
     storage.init_board().unwrap();
@@ -26,11 +27,27 @@ fn board(store: &Path) -> Storage {
 }
 
 fn limits(store: &Path, segment_bytes: u64) {
-    let mut text = fs::read_to_string(store.join("config.yaml")).unwrap_or_default();
-    text.push_str(&format!(
-        "\nsync:\n  journal:\n    segment_bytes: {segment_bytes}\n    snapshot_ops: 1000000\n    snapshot_secs: 864000\n"
-    ));
-    fs::write(store.join("config.yaml"), text).unwrap();
+    let path = store.join("config.yaml");
+    let mut config: serde_yaml_ng::Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_yaml_ng::from_str(&text).ok())
+        .unwrap_or_else(|| serde_yaml_ng::Value::Mapping(Default::default()));
+    if !config.is_mapping() {
+        config = serde_yaml_ng::Value::Mapping(Default::default());
+    }
+    if !config.get("sync").is_some_and(|sync| sync.is_mapping()) {
+        config["sync"] = serde_yaml_ng::Value::Mapping(Default::default());
+    }
+    if !config["sync"]
+        .get("journal")
+        .is_some_and(|journal| journal.is_mapping())
+    {
+        config["sync"]["journal"] = serde_yaml_ng::Value::Mapping(Default::default());
+    }
+    config["sync"]["journal"]["segment_bytes"] = serde_yaml_ng::Value::Number(segment_bytes.into());
+    config["sync"]["journal"]["snapshot_ops"] = serde_yaml_ng::Value::Number(1_000_000.into());
+    config["sync"]["journal"]["snapshot_secs"] = serde_yaml_ng::Value::Number(864_000.into());
+    fs::write(&path, serde_yaml_ng::to_string(&config).unwrap()).unwrap();
 }
 
 fn peer_store(dir: &Path, source: &Journal) -> Journal {

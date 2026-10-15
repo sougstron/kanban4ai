@@ -29,11 +29,11 @@ expression: "render_at(&mut app, width, 36)"
 │┃K/J moves)                                    ┃│
 │┃  1. server (server)                          ┃│
 │┃      Not probed yet — press Refresh          ┃│
-│┃      not probed · never exchanged · 1 op(s)  ┃│
+│┃      not probed · never exchanged · 0 op(s)  ┃│
 │┃waiting                                       ┃│
 │┃  2. phone (mobile)                           ┃│
 │┃      Not probed yet — press Refresh          ┃│
-│┃      phone dials in · never exchanged · 1    ┃│
+│┃      phone dials in · never exchanged · 0    ┃│
 │┃op(s) waiting                                 ┃│
 │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛│
 └────────────────────────────────────────────────┘

@@ -633,8 +633,11 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     let startup = (|| -> Result<()> {
         let root = crate::core::project::store_root()?;
-        if root.join("sync/node.yaml").exists() {
+        if crate::core::sync::enabled(&root) {
             crate::core::sync::Journal::open(&root)?.reconcile()?;
+        } else if root.join("sync/intent.json").is_file() {
+            // A crash left a redo that still has to finish the board write.
+            crate::core::sync::Journal::open(&root)?;
         }
         Ok(())
     })();

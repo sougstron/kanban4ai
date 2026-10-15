@@ -200,7 +200,7 @@ pub(crate) fn remote_runs_for_tasks<'a>(
     let Some(store) = store_for_board(board) else {
         return Ok(result);
     };
-    if !store.join("sync/node.yaml").exists() {
+    if !enabled(store) {
         return Ok(result);
     }
     let journal = Journal::open(store)?;

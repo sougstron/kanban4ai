@@ -429,10 +429,24 @@ first (an answer or the deadline) runs the task; see
 limits snapshot only (`docs/limits.md`): a provider with no cached numbers is
 treated as usable, never as exhausted.
 
+## Sync (`<store>/config.yaml`, `sync.enabled`)
+
+Machine-local, like the rest of `sync.*` (it is not replicated).
+
+| value | meaning |
+|---|---|
+| key absent | automatic: on when `sync.peers` or `sync.relay_remote` is non-empty |
+| `true` | journal even before the first peer (a server waiting to pair, tests) |
+| `false` | kill-switch: no journal and no sync network, even if peers are listed |
+
+A missing or unreadable config is off. Turning sync on later reconciles the
+current whitelist into the journal (`docs/sync.md`, Local-first). While sync
+is off the store does not create `<store>/sync/`.
+
 ## Sync journal (`<store>/config.yaml`, `sync.journal:`)
 
 Machine-local. A missing key uses the default. Zero or a non-integer is a
-config error.
+config error. The journal is written only when sync is enabled (see above).
 
 ```yaml
 sync:

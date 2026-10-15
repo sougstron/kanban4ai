@@ -3,7 +3,7 @@ use super::{
     error::{KanbanError, Result},
     project::{Project, ProjectStore},
     storage::{Storage, atomic_write_text, lock_file_reentrant},
-    sync::{Journal, NodeRole, RunDescriptor, RunState},
+    sync::{Journal, NodeRole, RunDescriptor, RunState, node_role},
     vcs::{self, GitRepo},
 };
 use serde::{Deserialize, Serialize};
@@ -169,7 +169,7 @@ pub fn receive(
     let _store = ProjectStore::at(root).lock()?;
     let project = project(root, id)?;
     let _guard = lock_file_reentrant(&project.kanban_dir().join(".lock"))?;
-    if Journal::open(root)?.node.role == NodeRole::Mobile
+    if node_role(root)? == Some(NodeRole::Mobile)
         && source_remote.is_none()
         && remote(&project)?.is_none()
     {
@@ -218,7 +218,7 @@ pub fn receive(
 /// by the incoming transfer/preflight, not repeated after that transfer.
 pub fn for_launch(root: &Path, id: &str) -> Result<Project> {
     let project = project(root, id)?;
-    if Journal::open(root)?.node.role == NodeRole::Mobile && remote(&project)?.is_none() {
+    if node_role(root)? == Some(NodeRole::Mobile) && remote(&project)?.is_none() {
         return Err(invalid("SYNC_NO_REMOTE"));
     }
     if repository(&project).is_some() {
@@ -240,7 +240,7 @@ pub fn prepare(root: &Path, id: &str) -> Result<Project> {
     let project = project(root, id)?;
     let _guard = lock_file_reentrant(&project.kanban_dir().join(".lock"))?;
     let source = remote(&project)?;
-    if Journal::open(root)?.node.role == NodeRole::Mobile && source.is_none() {
+    if node_role(root)? == Some(NodeRole::Mobile) && source.is_none() {
         return Err(invalid("SYNC_NO_REMOTE"));
     }
     if let Some(repo) = repository(&project) {
@@ -301,7 +301,7 @@ pub(crate) fn seal_run(board: &Path, work: &Path, task: &super::models::Task) ->
     let Some(root) = super::sync::store_for_board(board) else {
         return Ok(());
     };
-    if !root.join("sync/node.yaml").exists() {
+    if !super::sync::enabled(root) {
         return Ok(());
     }
     let (Some(branch), Some(wt), Some(session)) = (&task.branch, &task.worktree, &task.session)
@@ -369,7 +369,7 @@ pub(crate) fn duplicate_run(board: &Path, task: &str) -> Result<bool> {
     let Some(root) = super::sync::store_for_board(board) else {
         return Ok(false);
     };
-    if !root.join("sync/node.yaml").exists() {
+    if !super::sync::enabled(root) {
         return Ok(false);
     }
     let alias = board
@@ -412,7 +412,7 @@ pub(crate) fn validate_review_branch(board: &Path, task: &str, branch: &str) -> 
 /// Remote exchange is retried by serve even with no HTTP peer reachable.
 /// Fetch only per-run refs: never replace this node's integration spine.
 pub fn reconcile(root: &Path) -> Result<()> {
-    if !root.join("sync/node.yaml").exists() {
+    if !super::sync::enabled(root) {
         return Ok(());
     }
     let _store = ProjectStore::at(root).lock()?;

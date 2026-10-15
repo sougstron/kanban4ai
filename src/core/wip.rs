@@ -95,7 +95,7 @@ pub fn retire(project: &Project, task: &mut Task) -> Result<()> {
 
 /// Serve's existing sync timer and the final bye call this; no independent job.
 pub fn publish(root: &Path, interval: u64, force: bool) -> Result<()> {
-    if !root.join("sync/node.yaml").exists() {
+    if !super::sync::enabled(root) {
         return Ok(());
     }
     let mut failure = None;

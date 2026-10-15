@@ -196,6 +196,8 @@ impl Journal {
             .collect::<Result<Vec<_>>>()?
             .join("\n");
         atomic_write_text_raw(&self.root.join("drift.jsonl"), &(text + "\n"))?;
+        // The index now matches disk, including writes that bypassed capture.
+        format::mark_armed(store)?;
         Ok(changed)
     }
 }

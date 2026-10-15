@@ -13171,6 +13171,21 @@ fn global_settings_sync_tab_snapshot() {
 }
 
 #[test]
+fn global_settings_sync_tab_disabled_snapshot() {
+    let (_store_dir, mut app) = projects_app(std::path::Path::new("/tmp/k4ai-sync-disabled"), None);
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open global settings");
+    app.handle_key(key(KeyCode::Left)).expect("sync tab");
+    let rendered = render_at(&mut app, 100, 40);
+    assert!(
+        rendered.contains("Sync выключен — добавьте peer (kanban serve pair / join) или relay"),
+        "{rendered}"
+    );
+    assert!(!_store_dir.path().join("sync").exists());
+    insta::assert_snapshot!("global_settings_sync_disabled", rendered);
+}
+
+#[test]
 fn global_settings_sync_tab_changes_node_and_peer_order() {
     let (store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-actions"));
     app.handle_key(key(KeyCode::Enter))

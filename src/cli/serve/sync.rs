@@ -801,18 +801,21 @@ pub(super) fn start(root: &Path) -> Running {
             }
             let root = monitor_root.clone();
             let drift_root = root.clone();
-            if let Err(e) = blocking(move || Journal::open(&drift_root)?.reconcile()).await {
-                eprintln!("drift reconciliation: {e}");
-            }
-            if let Err(e) = blocking(move || crate::core::code::reconcile(&root)).await {
-                eprintln!("code replication: {e}");
-            }
-            let root = monitor_root.clone();
-            let checkpoint_interval = discovery::config(&root).map_or(60, |c| c.run_heartbeat);
-            if let Err(e) =
-                blocking(move || crate::core::wip::publish(&root, checkpoint_interval, false)).await
-            {
-                eprintln!("WIP publication: {e}");
+            if crate::core::sync::enabled(&monitor_root) {
+                if let Err(e) = blocking(move || Journal::open(&drift_root)?.reconcile()).await {
+                    eprintln!("drift reconciliation: {e}");
+                }
+                if let Err(e) = blocking(move || crate::core::code::reconcile(&root)).await {
+                    eprintln!("code replication: {e}");
+                }
+                let root = monitor_root.clone();
+                let checkpoint_interval = discovery::config(&root).map_or(60, |c| c.run_heartbeat);
+                if let Err(e) =
+                    blocking(move || crate::core::wip::publish(&root, checkpoint_interval, false))
+                        .await
+                {
+                    eprintln!("WIP publication: {e}");
+                }
             }
             let interval = discovery::config(&monitor_root).map_or(30, |c| c.interval);
             tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -824,6 +827,12 @@ pub(super) fn start(root: &Path) -> Running {
         let mut force = false;
         let mut reported = None;
         loop {
+            if !crate::core::sync::enabled(&relay_root) {
+                let interval = crate::core::sync::relay::settings(&relay_root)
+                    .map_or(60, |config| config.relay_interval.min(config.log_interval));
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                continue;
+            }
             let root = relay_root.clone();
             match blocking(move || crate::core::sync::relay::cycle(&root, force)).await {
                 Ok(count) => {
@@ -925,6 +934,9 @@ pub(super) async fn settings_peer(
 /// One catch-up cycle with every paired peer (`serve --sync`, and the tail
 /// push before bye). With `full == false` only pushes local operations.
 pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<()>)>> {
+    if !crate::core::sync::enabled(root) {
+        return Ok(Vec::new());
+    }
     let drift_root = root.to_path_buf();
     blocking(move || Journal::open(&drift_root)?.reconcile()).await?;
     let config = discovery::config(root)?;
@@ -987,6 +999,7 @@ mod tests {
         )
         .unwrap();
         Journal::open(dir.path()).unwrap();
+        crate::core::sync::enable_sync(dir.path()).unwrap();
         (dir, id)
     }
 
@@ -1022,6 +1035,7 @@ mod tests {
             format!("tokens:\n- kind: node\n  sha256: {}\n", token_hash(inbound)),
         )
         .unwrap();
+        crate::core::sync::enable_sync(local).unwrap();
     }
     #[cfg(unix)]
     #[test]
@@ -1039,14 +1053,25 @@ mod tests {
             let (remote, remote_id) = node("server");
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let destination = listener.local_addr().unwrap();
-            let http_server = tokio::spawn(axum::serve(listener, router(remote.path().join("sync/tokens.yaml"))).into_future());
+            let http_server = tokio::spawn(
+                axum::serve(listener, router(remote.path().join("sync/tokens.yaml"))).into_future(),
+            );
             let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let unreachable = closed.local_addr().unwrap();
             drop(closed);
             let token = "a".repeat(64);
-            pair(local.path(), remote.path(), unreachable, &token, &"b".repeat(64));
-            fs::write(remote.path().join("sync/tokens.yaml"),
-                format!("tokens:\n- kind: node\n  sha256: {}\n", token_hash(&token))).unwrap();
+            pair(
+                local.path(),
+                remote.path(),
+                unreachable,
+                &token,
+                &"b".repeat(64),
+            );
+            fs::write(
+                remote.path().join("sync/tokens.yaml"),
+                format!("tokens:\n- kind: node\n  sha256: {}\n", token_hash(&token)),
+            )
+            .unwrap();
             let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = socks.local_addr().unwrap().port();
             let requested = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
@@ -1065,26 +1090,51 @@ mod tests {
                         incoming.write_all(&[5, 0]).await.unwrap();
                         let mut connect = [0; 5];
                         incoming.read_exact(&mut connect).await.unwrap();
-                        assert_eq!(&connect[..4], &[5, 1, 0, 3], "SOCKS5h must resolve MagicDNS at the proxy");
+                        assert_eq!(
+                            &connect[..4],
+                            &[5, 1, 0, 3],
+                            "SOCKS5h must resolve MagicDNS at the proxy"
+                        );
                         let mut host = vec![0; connect[4] as usize];
                         incoming.read_exact(&mut host).await.unwrap();
                         let mut port = [0; 2];
                         incoming.read_exact(&mut port).await.unwrap();
-                        recorded.lock().await.push((String::from_utf8(host).unwrap(), u16::from_be_bytes(port)));
-                        let mut outgoing = tokio::net::TcpStream::connect(destination).await.unwrap();
-                        incoming.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).await.unwrap();
+                        recorded
+                            .lock()
+                            .await
+                            .push((String::from_utf8(host).unwrap(), u16::from_be_bytes(port)));
+                        let mut outgoing =
+                            tokio::net::TcpStream::connect(destination).await.unwrap();
+                        incoming
+                            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+                            .await
+                            .unwrap();
                         let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
                     });
                 }
             });
-            let config_text = fs::read_to_string(local.path().join("config.yaml")).unwrap();
-            fs::write(local.path().join("config.yaml"), format!("{config_text}    tailscale_address: runner.example.ts.net:4242\nnet:\n  tailscale:\n    mode: managed\n    socks_port: {port}\n")).unwrap();
+            let mut config: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+                &fs::read_to_string(local.path().join("config.yaml")).unwrap(),
+            )
+            .unwrap();
+            config["sync"]["peers"][0]["tailscale_address"] =
+                serde_yaml_ng::Value::String("runner.example.ts.net:4242".into());
+            config["net"]["tailscale"]["mode"] = serde_yaml_ng::Value::String("managed".into());
+            config["net"]["tailscale"]["socks_port"] = serde_yaml_ng::Value::from(port);
+            fs::write(
+                local.path().join("config.yaml"),
+                serde_yaml_ng::to_string(&config).unwrap(),
+            )
+            .unwrap();
             let bin = local.path().join("net/bin");
             fs::create_dir_all(&bin).unwrap();
             fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
             for (name, script) in [
                 ("tailscaled", "#!/bin/sh\nwhile :; do sleep 1; done\n"),
-                ("tailscale", "#!/bin/sh\necho '{\"BackendState\":\"Running\"}'\n"),
+                (
+                    "tailscale",
+                    "#!/bin/sh\necho '{\"BackendState\":\"Running\"}'\n",
+                ),
             ] {
                 let path = bin.join(name);
                 fs::write(&path, script).unwrap();
@@ -1093,19 +1143,45 @@ mod tests {
             let mut manager = crate::core::net::Manager::new(local.path()).unwrap();
             manager.tick().unwrap();
             let config = discovery::config(local.path()).unwrap();
-            let (link, vector) = Link::connect(local.path(), &config, &config.peers[0]).await.unwrap();
+            let (link, vector) = Link::connect(local.path(), &config, &config.peers[0])
+                .await
+                .unwrap();
             assert_eq!(vector.node_id, remote_id);
             assert_eq!(link.base, "http://runner.example.ts.net:4242");
-            let mut response = tokio::time::timeout(KEEPALIVE + Duration::from_secs(3),
-                link.streaming.get(format!("{}/sync/stream", link.base)).bearer_auth(&token).send()).await.unwrap().unwrap();
+            let mut response = tokio::time::timeout(
+                KEEPALIVE + Duration::from_secs(3),
+                link.streaming
+                    .get(format!("{}/sync/stream", link.base))
+                    .bearer_auth(&token)
+                    .send(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()["content-type"], "text/event-stream");
-            assert!(tokio::time::timeout(KEEPALIVE + Duration::from_secs(3), response.chunk()).await.unwrap().unwrap().is_some());
+            assert!(
+                tokio::time::timeout(KEEPALIVE + Duration::from_secs(3), response.chunk())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_some()
+            );
             drop(response);
-            let rejected = link.http.get(format!("{}/sync/vector", link.base)).bearer_auth("revoked").send().await.unwrap();
+            let rejected = link
+                .http
+                .get(format!("{}/sync/vector", link.base))
+                .bearer_auth("revoked")
+                .send()
+                .await
+                .unwrap();
             assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
             let routes = requested.lock().await;
-            assert!(routes.iter().all(|(host, port)| host == "runner.example.ts.net" && *port == 4242));
+            assert!(
+                routes
+                    .iter()
+                    .all(|(host, port)| host == "runner.example.ts.net" && *port == 4242)
+            );
             drop(routes);
             drop(link);
             drop(manager);

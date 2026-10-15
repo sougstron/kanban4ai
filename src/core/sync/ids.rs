@@ -274,7 +274,7 @@ pub(crate) fn historical_max(board: &Storage) -> Result<u64> {
     let Some(target) = target(&path) else {
         return Ok(0);
     };
-    if !target.store.join("sync/node.yaml").exists() {
+    if !enabled(&target.store) {
         return Ok(0);
     }
     let journal = Journal::open(&target.store)?;
@@ -313,7 +313,7 @@ pub(crate) fn renamed(board: &Path, id: &str) -> Result<Option<String>> {
     let Some(store) = run::store_for_board(board) else {
         return Ok(None);
     };
-    if !store.join("sync/node.yaml").exists() {
+    if !enabled(store) {
         return Ok(None);
     }
     let alias = board

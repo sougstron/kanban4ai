@@ -116,6 +116,7 @@ fn clock_survives_restart_and_rejects_skew_without_advancing() {
 #[test]
 fn field_diffs_moves_local_exclusions_and_acknowledged_compaction() {
     let dir = tempfile::tempdir().unwrap();
+    kanban4ai::core::sync::enable_sync(dir.path()).unwrap();
     let root = dir.path().join("projects/demo");
     let storage = Storage::new(&root);
     storage.init_board().unwrap();
@@ -184,6 +185,7 @@ fn field_diffs_moves_local_exclusions_and_acknowledged_compaction() {
 #[test]
 fn message_uids_parent_links_and_dotted_config_diffs() {
     let dir = tempfile::tempdir().unwrap();
+    kanban4ai::core::sync::enable_sync(dir.path()).unwrap();
     let root = dir.path().join("projects/demo");
     let storage = Storage::new(&root);
     storage.init_board().unwrap();
@@ -251,6 +253,7 @@ fn runner_preferences_replicate_and_task_can_return_to_inherit() {
     use kanban4ai::core::config::{Config, Runner};
     use kanban4ai::core::storage::NewTask;
     let source = tempfile::tempdir().unwrap();
+    kanban4ai::core::sync::enable_sync(source.path()).unwrap();
     let a = Journal::open(source.path()).unwrap();
     let work = source.path().join("work");
     fs::create_dir(&work).unwrap();
@@ -263,9 +266,10 @@ fn runner_preferences_replicate_and_task_can_return_to_inherit() {
     storage.init_board().unwrap();
     atomic_write_text(
         &source.path().join("config.yaml"),
-        "runner:\n  default: server\n  auto_order: [mobile, here]\n",
+        "runner:\n  default: server\n  auto_order: [mobile, here]\nsync:\n  enabled: true\n",
     )
     .unwrap();
+    kanban4ai::core::sync::enable_sync(source.path()).unwrap();
     let config = Config::new(&root);
     let mut board = config.load_raw_fresh().unwrap();
     board.runner.insert("default".into(), "mobile".into());
@@ -324,6 +328,7 @@ fn runner_preferences_replicate_and_task_can_return_to_inherit() {
 #[test]
 fn redo_recovers_a_torn_append_and_never_duplicates_committed_operations() {
     let dir = tempfile::tempdir().unwrap();
+    kanban4ai::core::sync::enable_sync(dir.path()).unwrap();
     let journal = Journal::open(dir.path()).unwrap();
     let root = dir.path().join("projects/demo");
     Storage::new(&root).init_board().unwrap();
@@ -375,6 +380,7 @@ fn redo_recovers_a_torn_append_and_never_duplicates_committed_operations() {
 #[test]
 fn concurrent_board_writers_share_one_monotonic_node_sequence() {
     let dir = tempfile::tempdir().unwrap();
+    kanban4ai::core::sync::enable_sync(dir.path()).unwrap();
     let mut paths = Vec::new();
     for index in 0..8 {
         let root = dir.path().join(format!("projects/board-{index}"));
