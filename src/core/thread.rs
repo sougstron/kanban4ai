@@ -589,3 +589,16 @@ fn require_message<'a>(thread: &'a mut Thread, msg_id: &str) -> Result<&'a mut M
         .find(|m| m.id == msg_id)
         .ok_or_else(|| KanbanError::Invalid(format!("Message not found: {msg_id}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pyyaml_unquoted_space_separated_resolved_at() {
+        let raw = "task_id: TASK-415\nmessages:\n- id: MSG-007\n  kind: question\n  status: answered\n  created_at: '2026-10-12T14:21:37.477928'\n  updated_at: '2026-10-12T14:23:28.372600'\n  resolved_at: 2026-10-12 14:23:28.372600\n";
+        let thread = parse_thread(raw, "TASK-415").unwrap();
+        let resolved = thread.messages[0].resolved_at.unwrap();
+        assert_eq!(timefmt::format(&resolved), "2026-10-12T14:23:28.372600");
+    }
+}
