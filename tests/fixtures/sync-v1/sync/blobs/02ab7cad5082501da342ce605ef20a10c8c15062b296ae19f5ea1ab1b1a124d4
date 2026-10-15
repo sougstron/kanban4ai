@@ -1,0 +1,39 @@
+task_id: TASK-001
+rev: 2
+messages:
+- id: MSG-001
+  role: system
+  kind: system
+  body: |-
+    Task created: base
+    Status: todo
+    Created at: 2026-10-15T20:56:41.416010
+  status: open
+  parent_id: null
+  variants: []
+  author: kanban
+  answer: null
+  created_at: '2026-10-15T20:56:41.416010'
+  updated_at: '2026-10-15T20:56:41.416010'
+- id: MSG-002
+  role: human
+  kind: task
+  body: (no description provided)
+  status: open
+  parent_id: null
+  variants: []
+  author: user
+  answer: null
+  created_at: '2026-10-15T20:56:41.416010'
+  updated_at: '2026-10-15T20:56:41.416010'
+- id: MSG-003
+  role: human
+  kind: question
+  body: question
+  status: open
+  parent_id: null
+  variants: []
+  author: user
+  answer: null
+  created_at: '2026-10-15T20:56:41.430719'
+  updated_at: '2026-10-15T20:56:41.430719'
