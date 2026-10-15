@@ -16,7 +16,17 @@ pub fn human(dt: &NaiveDateTime) -> String {
     dt.format("%d.%m.%Y - %H:%M").to_string()
 }
 
+/// Accepts the `T` separator and also the space one PyYAML emits for unquoted
+/// `datetime` values (`2026-10-12 14:23:28.372600`), as `fromisoformat` does.
 pub fn parse(s: &str) -> Result<NaiveDateTime, chrono::ParseError> {
+    let normalized;
+    let s = match s.as_bytes().get(10) {
+        Some(b' ') => {
+            normalized = format!("{}T{}", &s[..10], &s[11..]);
+            normalized.as_str()
+        }
+        _ => s,
+    };
     NaiveDateTime::parse_from_str(s, FMT).or_else(|_| NaiveDateTime::parse_from_str(s, FMT_NO_FRAC))
 }
 
@@ -124,6 +134,13 @@ mod tests {
     fn parses_python_isoformat_with_microseconds() {
         let dt = parse("2026-07-01T10:13:22.036493").unwrap();
         assert_eq!(format(&dt), "2026-07-01T10:13:22.036493");
+    }
+
+    #[test]
+    fn parses_pyyaml_space_separated_datetime() {
+        let dt = parse("2026-10-12 14:23:28.372600").unwrap();
+        assert_eq!(format(&dt), "2026-10-12T14:23:28.372600");
+        assert!(parse("2026-10-12 14:23:28").is_ok());
     }
 
     #[test]
