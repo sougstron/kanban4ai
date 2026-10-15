@@ -954,6 +954,9 @@ impl Operations {
                 let done = self.move_task_to_done(&task)?;
                 (self.reset_moved_if_human(done, is_agent)?, false)
             } else {
+                if target_status == TaskStatus::Archive.as_str() {
+                    self.clear_task_session_logs(&task);
+                }
                 let moved = self.storage.move_task(task_id, target_status, is_agent)?;
                 let entered_review = moved.as_ref().is_some_and(|m| {
                     task.status != TaskStatus::Review && m.status == TaskStatus::Review
@@ -1040,6 +1043,9 @@ impl Operations {
             let result = if to == TaskStatus::Done {
                 self.move_task_to_done(&task)?
             } else {
+                if to == TaskStatus::Archive {
+                    self.clear_task_session_logs(&task);
+                }
                 self.storage.move_task(&task.id, to.as_str(), false)?
             };
             moved.extend(result);
@@ -5913,6 +5919,54 @@ impl Operations {
             let _ = fs::remove_file(kanban_dir.join("logs").join(format!("{session_id}.log")));
         }
         self.clear_task_detached(&task.id);
+    }
+
+    /// Delete every `.kanban/logs/` file of every session that worked the
+    /// task — `.log`, `.prompt.txt`, `.transcript.jsonl`, and the rest — plus
+    /// its arbiter runs. Archiving is the point where a task's run history is
+    /// no longer needed; Done keeps prompts and transcripts for review.
+    /// Sessions are found on the task, in the live session list, and in the
+    /// thread (`session=` launch/exit steps and `agent:<id>` origins), since
+    /// Done already unlinked their session files.
+    fn clear_task_session_logs(&self, task: &Task) {
+        let mut ids = self.task_session_ids(task);
+        if let Ok(thread) = self.thread_manager().and_then(|m| m.load(&task.id)) {
+            for message in &thread.messages {
+                let from_body = message
+                    .body
+                    .split_whitespace()
+                    .filter_map(|token| token.strip_prefix("session="));
+                let from_origin = message
+                    .origin
+                    .as_deref()
+                    .and_then(|origin| origin.strip_prefix("agent:"));
+                for id in from_body.chain(from_origin) {
+                    if !ids.iter().any(|known| known == id) {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+        let mut prefixes: Vec<String> = ids
+            .into_iter()
+            .filter(|id| SessionManager::validate_session_id(id).is_ok())
+            .map(|id| format!("{id}."))
+            .collect();
+        prefixes.push(format!("arbiter-{}-", task.id));
+        let Ok(entries) = fs::read_dir(&self.storage.logs_dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix.as_str()))
+                && entry.file_type().is_ok_and(|kind| kind.is_file())
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// Remove `.kanban/detached/` log/status files recorded for this task's

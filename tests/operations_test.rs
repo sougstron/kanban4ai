@@ -1763,6 +1763,47 @@ fn archive_done_and_mark_review_done() {
 }
 
 #[test]
+fn archiving_deletes_every_session_log_of_the_task() {
+    let (_dir, ops, _rec) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Logs")).unwrap();
+    let other = ops.create_task(NewTask::titled("Kept")).unwrap();
+    let logs = ops.data_root().join(".kanban/logs");
+    fs::create_dir_all(&logs).unwrap();
+    let names = [
+        "ses-old.log",
+        "ses-old.prompt.txt",
+        "ses-old.transcript.jsonl",
+        "ses-review.transcript.jsonl",
+        &format!("arbiter-{}-20261015-120000.prompt.txt", task.id),
+    ];
+    for name in names {
+        fs::write(logs.join(name), "x").unwrap();
+    }
+    let kept = logs.join("ses-other.transcript.jsonl");
+    fs::write(&kept, "x").unwrap();
+    // Done unlinks the session files, so the thread is the only record left.
+    let tm = ThreadManager::new(ops.data_root()).unwrap();
+    tm.post_board_note(&task.id, "▶ launch session=ses-old backend=claude")
+        .unwrap();
+    tm.post_board_note(&task.id, "■ exit session=ses-review code=0")
+        .unwrap();
+    tm.post_board_note(&other.id, "▶ launch session=ses-other backend=claude")
+        .unwrap();
+
+    ops.move_task(&task.id, "done", false).unwrap();
+    assert!(logs.join("ses-old.transcript.jsonl").exists());
+    ops.move_task(&other.id, "done", false).unwrap();
+    ops.move_task(&task.id, "archive", false).unwrap();
+
+    for name in names {
+        assert!(!logs.join(name).exists(), "{name} survived archiving");
+    }
+    assert!(kept.exists());
+    ops.archive_done_tasks().unwrap();
+    assert!(!kept.exists());
+}
+
+#[test]
 fn check_sessions_crashes_stale_heartbeats() {
     let (dir, ops, _rec) = ops_with_recorder(false);
     let task = ops.create_task(NewTask::titled("Heartbeat")).unwrap();

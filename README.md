@@ -264,7 +264,8 @@ kanban4ai limits
 ```
 
 `archive-done` moves all Done tasks to Archive, while `archive` lists archived
-tasks. `project list` shows every registered board; `project path` prints this
+tasks. Archiving deletes every session log of the task (`.log`, prompt dump,
+transcript). `project list` shows every registered board; `project path` prints this
 folder's work path. Point a command at another board with
 `--project <id|name|path>`, or set `$KANBAN_PROJECT`.
 
