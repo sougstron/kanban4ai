@@ -885,24 +885,75 @@ runs:
   входят `project.yaml` (без `work_path`, `migrated_from`, `last_opened_at`),
   конфиг проекта, задачи без локальных полей, треды, `instructions/`,
   `assets/images/`, глобальный конфиг без локальных секций,
-  `sync/meta/` и журналы. Приёмник пишет redo
+  `sync/meta/`, журналы и CAS blobs, на которые ссылаются file-операции. Приёмник пишет redo
   `sync/bootstrap.json`, заменяет `sync/journal|meta|snapshot`, сохраняет свои
   секции `node/sync/serve/daemon/tui/recent_models` и последним принимает
   `store_id`; прерванная установка завершается при следующем `Journal::open`.
   Другие файлы `assets/` (CSV, JSON, каталоги артефактов агентов) и весь
   `context/` не обходятся и не передаются; приёмник также отклоняет такие пути.
   Белый список store-relative путей — `core::sync::transport::allowed_path`;
-  его используют сборщик и установка снапшота. Изображения определяются
+  его используют snapshot и drift reconciliation. Изображения определяются
   расположением под `assets/images/`, а не расширением файла.
-  Сейчас `instructions/` и `assets/images/` передаются только при bootstrap:
-  `sync::target()` не журналирует их изменения. LWW инструкций и
-  content-addressed blobs из раздела 3 — целевой контракт, не реализованная
-  инкрементальная доставка; сверка и генерация операций относятся к TASK-509,
-  blobs по хэшу — к TASK-511/514. Снапшот пока остаётся base64 JSON в памяти;
-  этот фильтр исключает артефакты, но не делает передачу потоковой.
+  `instructions/` и `assets/images/` после bootstrap реплицируются file-операциями
+  с SHA-256 ссылками на CAS (TASK-509); байтов/base64 в журнале нет.
+  Снапшот пока остаётся base64 JSON в памяти: whitelist исключает артефакты,
+  но не делает bootstrap потоковым.
 - `kanban serve --sync` — один полный цикл со всеми пирами (для скриптов);
   `--bye` перед уведомлением проталкивает хвост журнала, недоступный пир не
   блокирует сон.
+
+#### Сверка внешних изменений (TASK-509)
+
+`Journal::reconcile()` вызывается при старте CLI (включая TUI/daemon/serve),
+перед HTTP sync cycle, выдачей vector/snapshot, приёмом remote-операций и
+раундом git-relay. В serve/TUI/daemon worker сверка повторяется с
+`sync.interval`, даже без HTTP-пиров. Inotify не требуется.
+
+Локальный `sync/drift.jsonl` хранит store-relative путь и `{mtime, size, hash}`
+последней захваченной версии. Capture дописывает одну запись, сверка сворачивает
+индекс. Она читает stat всех разрешённых файлов; содержимое хэшируется только
+при изменении mtime/size. Изменение одного mtime при прежнем хэше не создаёт
+операцию. Индекс не переносится между машинами: remote apply/bootstrap
+записывают собственные метаданные принятых файлов.
+
+Обход ограничен `project.yaml`, global/project config, `tasks/<status>/*.md`,
+`threads/*.yaml`, `instructions/` и `assets/images/`; общие snapshot helpers
+и `allowed_path` не допускают `context/` и остальные `assets/`.
+Неизменившаяся доска не порождает операций. Внешние create/edit/delete
+(редактор, checkout/restore, скрипт, восстановление бэкапа) проходят через
+тот же capture, HLC и field-LWW, что обычная запись. Предыдущие байты
+хранятся в локальном CAS, чтобы удаление YAML-поля стало delta `null`, а
+удаление файла — tombstone. Перенос task между статусами сохраняет UID;
+thread lifecycle отдельно передаёт удаление/создание даже пустого треда.
+
+Сканирования нет в горячем пути task write. Сверка берёт блокировки в порядке
+store → boards → sync; она не вызывается из write-lock задачи. Внешний capture
+не переписывает наблюдаемый файл, в том числе при redo после падения:
+последующая правка редактора остаётся для следующей сверки. Обычный capture
+и remote apply обновляют индекс вместе со своими redo-транзакциями.
+Разорванный последний append индекса отбрасывается при восстановлении.
+При первом запуске без индекса существующие файлы захватываются как baseline.
+Повреждённый YAML останавливает сверку с ошибкой, не объявляется удалением.
+Как у stat-first индекса, изменение байтов с принудительно сохранёнными
+**одновременно** mtime и размером не обнаруживается.
+
+Для инструкций и картинок `entity=file`, `id` — board-relative путь,
+`set.blob` — SHA-256; `set.path` фиксирует тот же путь при создании.
+CAS находится в `sync/blobs/<sha256>`; имя и содержимое проверяются.
+HTTP передаёт бинарные bytes через аутентифицированные
+`GET/PUT /sync/blobs/{hash}` (PUT ≤256 MiB), до отправки/применения операций.
+Pull и SSE сначала получают недостающие blobs; push сначала загружает их.
+Отсутствующий или повреждённый blob не подтверждается как применённая операция.
+Git-relay кладёт blobs отдельными Git objects рядом с batch; при
+`relay_encrypt=true` и batch, и blobs шифруются age. Хэши остаются ссылками,
+в journal/batch нет base64. CAS пока не удаляет старые версии автоматически:
+они нужны отставшим пирам и предыдущим baseline; GC требует отдельного
+retention-контракта.
+
+Приёмка: `cargo test --locked --test sync_drift_test`; HTTP/blob и encrypted
+relay покрыты существующими sync/relay integration suites. Бенчмарк:
+`cargo test --release --locked --test sync_drift_test benchmark_reconcile_2000_files -- --ignored --nocapture`.
+
 
 ### 10.6 Абстракция транспорта и git-relay (TASK-440)
 

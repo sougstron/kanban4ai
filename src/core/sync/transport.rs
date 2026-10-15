@@ -71,6 +71,7 @@ impl Journal {
 
     /// Replicated store copy taken under the same locks as `apply_remote`.
     pub fn snapshot(&self) -> Result<Snapshot> {
+        self.reconcile()?;
         apply::recover_remote(&self.root)?;
         let store = self.root.parent().expect("sync parent");
         let _store = lock_file_reentrant(&store.join(".lock"))?;
@@ -121,31 +122,14 @@ impl Journal {
             Ok(())
         };
         for board in &boards {
-            let project = board.join("project.yaml");
-            let text = fs::read_to_string(&project)?;
-            add(&project, replicated(&text, "project", false)?.into_bytes())?;
-            let kanban = board.join(".kanban");
-            let config = kanban.join("config.yaml");
-            if config.is_file() {
-                add(&config, fs::read(&config)?)?;
-            }
-            for status in read_dirs(&kanban.join("tasks"))? {
-                for task in read_files(&status)? {
-                    if task.extension().is_some_and(|e| e == "md") {
-                        let text = fs::read_to_string(&task)?;
-                        add(&task, replicated(&text, "task", false)?.into_bytes())?;
-                    }
-                }
-            }
-            for thread in read_files(&kanban.join("threads"))? {
-                if thread.extension().is_some_and(|e| e == "yaml") {
-                    add(&thread, fs::read(&thread)?)?;
-                }
-            }
-            for tree in BOARD_TREES {
-                for file in walk(&kanban.join(tree))? {
-                    add(&file, fs::read(&file)?)?;
-                }
+            for path in board_files(board)? {
+                let entity = target(&path).map(|t| t.entity);
+                let bytes = if matches!(entity, Some("task" | "project")) {
+                    replicated(&fs::read_to_string(&path)?, entity.unwrap(), false)?.into_bytes()
+                } else {
+                    fs::read(&path)?
+                };
+                add(&path, bytes)?;
             }
         }
         let config = store.join("config.yaml");
@@ -160,6 +144,14 @@ impl Journal {
             if file.extension().is_some_and(|e| e == "jsonl") {
                 add(&file, fs::read(&file)?)?;
             }
+        }
+        for hash in state
+            .operations
+            .values()
+            .filter_map(Operation::blob_hash)
+            .collect::<BTreeSet<_>>()
+        {
+            add(&self.root.join("blobs").join(hash), self.blob(hash)?)?;
         }
         let clock: Hlc = load(&self.root.join("hlc"))?;
         Ok(Snapshot {
@@ -233,7 +225,7 @@ pub(super) fn recover_bootstrap(store: &Path) -> Result<()> {
             Err(e) => return Err(e.into()),
         }
     }
-    for name in ["pending.json", "remote-pending.json"] {
+    for name in ["pending.json", "remote-pending.json", "drift.jsonl"] {
         match fs::remove_file(root.join(name)) {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
@@ -268,6 +260,13 @@ pub(super) fn recover_bootstrap(store: &Path) -> Result<()> {
     let mut node: NodeIdentity = serde_yaml_ng::from_str(&fs::read_to_string(&node_path)?)?;
     node.store_id = snapshot.store_id.clone();
     atomic_write_text_raw(&node_path, &serde_yaml_ng::to_string(&node)?)?;
+    let journal = Journal {
+        root: root.clone(),
+        node,
+    };
+    for relative in snapshot.files.keys().filter(|p| !p.starts_with("sync/")) {
+        drift::record(&journal, &store.join(relative))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -288,10 +287,18 @@ pub(crate) fn allowed_path(path: &str) -> Result<()> {
         ["config.yaml"] => true,
         ["sync", "journal", _] => true,
         ["sync", "meta", rest @ ..] => !rest.is_empty(),
+        ["sync", "blobs", hash] => {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        }
         ["projects", _, "project.yaml"] => true,
         ["projects", _, ".kanban", "config.yaml"] => true,
-        ["projects", _, ".kanban", "tasks", status, _] => STATUSES.contains(status),
-        ["projects", _, ".kanban", "threads", _] => true,
+        ["projects", _, ".kanban", "tasks", status, file] => {
+            STATUSES.contains(status) && file.ends_with(".md")
+        }
+        ["projects", _, ".kanban", "threads", file] => file.ends_with(".yaml"),
         ["projects", _, ".kanban", rest @ ..] => BOARD_TREES.iter().any(|tree| {
             let mut parts = rest.iter().copied();
             tree.split('/').all(|part| parts.next() == Some(part)) && parts.next().is_some()
@@ -381,8 +388,10 @@ fn merge_global(local_path: &Path, remote: &str) -> Result<String> {
     Ok(serde_yaml_ng::to_string(&merged)?)
 }
 
-fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(super) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    no_symlinks(path)?;
     let parent = path.parent().ok_or_else(|| invalid("missing parent"))?;
+    fs::create_dir_all(parent)?;
     let mut tmp = tempfile::Builder::new()
         .prefix(".tmp_")
         .tempfile_in(parent)?;
@@ -393,7 +402,17 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn no_symlinks(path: &Path) -> Result<()> {
+    if path.ancestors().any(Path::is_symlink) {
+        return Err(invalid("replicated path contains a symlink"));
+    }
+    Ok(())
+}
+
 fn entries(dir: &Path) -> Result<Vec<PathBuf>> {
+    if dir.is_symlink() {
+        return Ok(Vec::new());
+    }
     let mut result = Vec::new();
     match fs::read_dir(dir) {
         Ok(entries) => {
@@ -442,6 +461,51 @@ fn walk(dir: &Path) -> Result<Vec<PathBuf>> {
             files.extend(walk(&path)?);
         } else if kind.is_file() {
             files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+pub(super) fn boards(store: &Path) -> Result<Vec<PathBuf>> {
+    entries(&store.join("projects"))?
+        .into_iter()
+        .filter_map(|path| match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => Some(Ok(path)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e.into())),
+        })
+        .collect()
+}
+
+pub(super) fn board_files(board: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if board.join(".kanban").is_symlink() {
+        return Ok(files);
+    }
+    for path in [
+        board.join("project.yaml"),
+        board.join(".kanban/config.yaml"),
+    ] {
+        if path.is_file() && !path.is_symlink() {
+            files.push(path);
+        }
+    }
+    for status in read_dirs(&board.join(".kanban/tasks"))? {
+        files.extend(
+            read_files(&status)?
+                .into_iter()
+                .filter(|p| p.extension().is_some_and(|e| e == "md")),
+        );
+    }
+    files.extend(
+        read_files(&board.join(".kanban/threads"))?
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "yaml")),
+    );
+    for tree in BOARD_TREES {
+        let path = board.join(".kanban").join(tree);
+        if !path.is_symlink() && !path.parent().is_some_and(Path::is_symlink) {
+            files.extend(walk(&path)?);
         }
     }
     Ok(files)

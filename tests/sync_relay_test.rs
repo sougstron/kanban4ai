@@ -123,6 +123,9 @@ impl Network {
 fn convergence(encrypted: bool) {
     let network = Network::new(encrypted);
     let id = network.seed();
+    let image = ".kanban/assets/images/pasted-relay.png";
+    fs::create_dir_all(network.board(0).project_path.join(".kanban/assets/images")).unwrap();
+    fs::write(network.board(0).project_path.join(image), [255, 128, 0, 42]).unwrap();
     let initial = git(
         network.root.path(),
         &["rev-parse", &format!("refs/kanban/sync/{}", network.ids[0])],
@@ -156,6 +159,10 @@ fn convergence(encrypted: bool) {
         .vector()
         .unwrap();
     for i in 0..3 {
+        assert_eq!(
+            fs::read(network.board(i).project_path.join(image)).unwrap(),
+            [255, 128, 0, 42]
+        );
         let task = network.board(i).load_task(&id).unwrap().unwrap();
         assert_eq!(task.title, "laptop edit");
         assert_eq!(task.description, "server edit");
@@ -211,10 +218,6 @@ fn convergence(encrypted: bool) {
         } else {
             "batch.jsonl"
         };
-        assert_eq!(
-            git(network.root.path(), &["ls-tree", "--name-only", commit]).trim(),
-            name
-        );
         let content = git(network.root.path(), &["show", &format!("{commit}:{name}")]);
         for forbidden in [
             "top-secret-bearer",

@@ -631,7 +631,14 @@ fn env_session(explicit: Option<String>) -> String {
 
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
-    match dispatch(cli) {
+    let startup = (|| -> Result<()> {
+        let root = crate::core::project::store_root()?;
+        if root.join("sync/node.yaml").exists() {
+            crate::core::sync::Journal::open(&root)?.reconcile()?;
+        }
+        Ok(())
+    })();
+    match startup.and_then(|()| dispatch(cli)) {
         Ok(code) => code,
         Err(err) => {
             eprintln!("Error: {err}");

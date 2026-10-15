@@ -14,6 +14,7 @@ use super::storage::{atomic_write_text_raw, lock_file_reentrant};
 
 mod apply;
 pub(crate) mod control;
+mod drift;
 mod ids;
 pub mod relay;
 mod run;
@@ -118,6 +119,16 @@ pub struct Operation {
     pub actor: String,
 }
 
+impl Operation {
+    pub fn blob_hash(&self) -> Option<&str> {
+        if self.entity == "file" {
+            self.set.get("blob")?.as_str()
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FieldState {
     pub values: Fields,
@@ -147,6 +158,10 @@ pub struct JournalState {
 struct Pending {
     path: PathBuf,
     content: Option<String>,
+    #[serde(default)]
+    external: bool,
+    #[serde(default)]
+    observed: Option<drift::Entry>,
     operations: Vec<Operation>,
     state: JournalState,
 }
@@ -326,27 +341,29 @@ impl Journal {
     }
 
     fn finish(&self, pending: &Pending, recovering: bool) -> Result<()> {
-        match &pending.content {
-            Some(text) => {
-                atomic_write_text_raw(&pending.path, text)?;
-                if target(&pending.path).is_some_and(|t| t.entity == "task")
-                    && let Some(tasks) = pending.path.parent().and_then(Path::parent)
-                {
-                    for entry in fs::read_dir(tasks)? {
-                        let other = entry?
-                            .path()
-                            .join(pending.path.file_name().expect("task filename"));
-                        if other != pending.path && other.is_file() {
-                            fs::remove_file(other)?;
+        if !pending.external {
+            match &pending.content {
+                Some(text) => {
+                    atomic_write_text_raw(&pending.path, text)?;
+                    if target(&pending.path).is_some_and(|t| t.entity == "task")
+                        && let Some(tasks) = pending.path.parent().and_then(Path::parent)
+                    {
+                        for entry in fs::read_dir(tasks)? {
+                            let other = entry?
+                                .path()
+                                .join(pending.path.file_name().expect("task filename"));
+                            if other != pending.path && other.is_file() {
+                                fs::remove_file(other)?;
+                            }
                         }
                     }
                 }
+                None => match fs::remove_file(&pending.path) {
+                    Ok(()) => (),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                    Err(e) => return Err(e.into()),
+                },
             }
-            None => match fs::remove_file(&pending.path) {
-                Ok(()) => (),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e.into()),
-            },
         }
         fs::create_dir_all(self.root.join("journal"))?;
         fs::create_dir_all(self.root.join("meta"))?;
@@ -402,6 +419,11 @@ impl Journal {
         }
         if let Some(op) = pending.operations.last() {
             atomic_write_text_raw(&self.root.join("hlc"), &json(&op.hlc)?)?;
+        }
+        if pending.external {
+            drift::record_observed(self, &pending.path, pending.observed.as_ref())?;
+        } else {
+            drift::record(self, &pending.path)?;
         }
         Ok(())
     }
@@ -510,6 +532,11 @@ fn target(path: &Path) -> Option<Target> {
                 "message"
             } else if text.starts_with(".kanban/sessions/") && text.ends_with(".yaml") {
                 "session"
+            } else if (text.starts_with(".kanban/instructions/")
+                || text.starts_with(".kanban/assets/images/"))
+                && transport::allowed_path(&format!("projects/{project}/{text}")).is_ok()
+            {
+                "file"
             } else {
                 return None;
             };
@@ -517,7 +544,11 @@ fn target(path: &Path) -> Option<Target> {
                 store,
                 project,
                 entity,
-                id: path.file_stem()?.to_str()?.to_owned(),
+                id: if entity == "file" {
+                    text.to_owned()
+                } else {
+                    path.file_stem()?.to_str()?.to_owned()
+                },
             });
         }
     }
@@ -630,6 +661,19 @@ fn fields(value: &Value, entity: &str, global: bool) -> Fields {
 
 /// Called by the atomic writer, while its caller holds the board/store lock.
 pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
+    if target(path).is_some_and(|t| t.entity == "file") {
+        // Binary attachments and arbitrary instruction text are reconciled as blobs.
+        return Ok(false);
+    }
+    capture_inner(path, content, None, None)
+}
+
+fn capture_inner(
+    path: &Path,
+    content: Option<&str>,
+    before_override: Option<Option<&str>>,
+    observed: Option<drift::Entry>,
+) -> Result<bool> {
     let Some(target) = target(path) else {
         return Ok(false);
     };
@@ -645,7 +689,9 @@ pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
         }
         state.project_uids[&target.project].clone()
     };
-    let before_text = if target.entity == "task" && !path.exists() {
+    let before_text = if let Some(before) = before_override {
+        before.map(str::to_owned)
+    } else if target.entity == "task" && !path.exists() {
         let tasks = path
             .parent()
             .and_then(Path::parent)
@@ -835,21 +881,91 @@ pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
                 .remove(&key(&project, &target.id, &display_id));
         }
         operations.push(op);
+        if !after.is_null()
+            && apply::deleted(
+                &state,
+                &project,
+                target.entity,
+                &operations.last().expect("operation").id,
+            )
+        {
+            clock = clock.tick(now_ms(), &journal.node.node_id)?;
+            let restore = Operation {
+                op: format!(
+                    "{}:{}",
+                    journal.node.node_id,
+                    state.vector[&journal.node.node_id] + 1
+                ),
+                hlc: clock.clone(),
+                store: journal.node.store_id.clone(),
+                project: project.clone(),
+                entity: "restore".into(),
+                id: operations.last().expect("operation").id.clone(),
+                set: BTreeMap::from([("entity".into(), Value::String(target.entity.into()))]),
+                prev: BTreeMap::new(),
+                actor: "human".into(),
+            };
+            apply_meta(&mut state, &restore);
+            operations.push(restore);
+        }
     }
+    if target.entity == "message" {
+        let id = ids::task_uid(&state, &project, &target.id);
+        let deleted = Value::Bool(content.is_none());
+        let previous = state.fields.get(&key(&project, "thread", &id));
+        if previous.and_then(|f| f.values.get("deleted")) != Some(&deleted) {
+            let prev = previous
+                .and_then(|f| f.clocks.get("deleted"))
+                .map(|clock| BTreeMap::from([("deleted".into(), clock.clone())]))
+                .unwrap_or_default();
+            clock = clock.tick(now_ms(), &journal.node.node_id)?;
+            let op = Operation {
+                op: format!(
+                    "{}:{}",
+                    journal.node.node_id,
+                    state
+                        .vector
+                        .get(&journal.node.node_id)
+                        .copied()
+                        .unwrap_or(0)
+                        + 1
+                ),
+                hlc: clock.clone(),
+                store: journal.node.store_id.clone(),
+                project: project.clone(),
+                entity: "thread".into(),
+                id,
+                set: BTreeMap::from([("deleted".into(), deleted)]),
+                prev,
+                actor: "human".into(),
+            };
+            apply_meta(&mut state, &op);
+            operations.push(op);
+        }
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
     if operations.is_empty() {
-        return Ok(false);
+        if before_override.is_some() {
+            drift::record_observed(&journal, &absolute, observed.as_ref())?;
+        } else {
+            if let Some(text) = content {
+                atomic_write_text_raw(&absolute, text)?;
+            } else if absolute.exists() {
+                fs::remove_file(&absolute)?;
+            }
+            drift::record(&journal, &absolute)?;
+        }
+        return Ok(true);
     }
-    let absolute = path
-        .parent()
-        .ok_or_else(|| invalid("missing parent"))?
-        .canonicalize()?
-        .join(
-            path.file_name()
-                .ok_or_else(|| invalid("missing filename"))?,
-        );
     let pending = Pending {
         path: absolute,
         content: content.map(str::to_owned),
+        external: before_override.is_some(),
+        observed,
         operations,
         state,
     };

@@ -210,9 +210,11 @@ fn message_uids_parent_links_and_dotted_config_diffs() {
     let tombstones: Vec<_> = operations(dir.path(), &journal.node.node_id)
         .into_iter()
         .rev()
-        .take(2)
+        .take(3)
         .collect();
-    assert!(tombstones.iter().all(|op| op.entity == "tombstone"));
+    assert_eq!(tombstones[0].entity, "thread");
+    assert_eq!(tombstones[0].set["deleted"], true);
+    assert!(tombstones[1..].iter().all(|op| op.entity == "tombstone"));
     assert!(tombstones.iter().any(|op| op.id == reply.id));
     let config = root.join(".kanban/config.yaml");
     atomic_write_text(&config, "agents:\n  codex:\n    model: first\n").unwrap();

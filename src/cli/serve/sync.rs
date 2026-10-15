@@ -150,7 +150,38 @@ pub(super) fn routes(root: PathBuf) -> Router {
         .route("/sync/stream", get(stream))
         .route("/sync/snapshot", get(snapshot))
         .route("/sync/ack", axum::routing::post(ack_request))
+        .route(
+            "/sync/blobs/{hash}",
+            get(get_blob)
+                .put(put_blob)
+                .layer(DefaultBodyLimit::max(256 << 20)),
+        )
         .with_state(root)
+}
+
+async fn get_blob(
+    State(root): State<PathBuf>,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+) -> Response {
+    match blocking(move || Journal::open(&root)?.blob(&hash)).await {
+        Ok(bytes) => (
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => failure(e),
+    }
+}
+
+async fn put_blob(
+    State(root): State<PathBuf>,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+    bytes: axum::body::Bytes,
+) -> Response {
+    match blocking(move || Journal::open(&root)?.put_blob(&hash, &bytes)).await {
+        Ok(()) => Json(serde_json::json!({})).into_response(),
+        Err(e) => failure(e),
+    }
 }
 
 async fn vector(State(root): State<PathBuf>, Extension(hash): Extension<String>) -> Response {
@@ -163,6 +194,7 @@ async fn vector(State(root): State<PathBuf>, Extension(hash): Extension<String>)
             })?;
         }
         let journal = Journal::open(&root)?;
+        journal.reconcile()?;
         Ok(VectorReply {
             node_id: journal.node.node_id.clone(),
             store_id: journal.node.store_id.clone(),
@@ -389,6 +421,22 @@ impl Link {
     }
 
     async fn post(&self, operations: Vec<Operation>) -> Result<VersionVector> {
+        for hash in operations
+            .iter()
+            .filter_map(Operation::blob_hash)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let root = self.root.clone();
+            let digest = hash.to_owned();
+            let bytes = blocking(move || Journal::open(&root)?.blob(&digest)).await?;
+            let _: serde_json::Value = self
+                .send(
+                    self.http
+                        .put(format!("{}/sync/blobs/{hash}", self.base))
+                        .body(bytes),
+                )
+                .await?;
+        }
         let ack: Ack = self
             .send(
                 self.http
@@ -397,6 +445,35 @@ impl Link {
             )
             .await?;
         Ok(ack.vector)
+    }
+
+    async fn fetch_blobs(&self, operations: &[Operation]) -> Result<()> {
+        for hash in operations
+            .iter()
+            .filter_map(Operation::blob_hash)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let root = self.root.clone();
+            let digest = hash.to_owned();
+            if blocking(move || Ok(Journal::open(&root)?.blob(&digest).is_ok())).await? {
+                continue;
+            }
+            let bytes = self
+                .http
+                .get(format!("{}/sync/blobs/{hash}", self.base))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(|e| invalid(e.to_string()))?
+                .bytes()
+                .await
+                .map_err(|e| invalid(e.to_string()))?;
+            let root = self.root.clone();
+            let digest = hash.to_owned();
+            blocking(move || Journal::open(&root)?.put_blob(&digest, &bytes)).await?;
+        }
+        Ok(())
     }
 
     /// Steps 2 of 10.2: page through everything the peer has and we lack.
@@ -412,6 +489,7 @@ impl Link {
                 )))
                 .await?;
             if !page.operations.is_empty() {
+                self.fetch_blobs(&page.operations).await?;
                 apply(&self.root, page.operations).await?;
             }
             if !page.more || page.next == cursor {
@@ -446,6 +524,8 @@ impl Link {
 
     /// One catch-up cycle. `None` means the peer is waiting to bootstrap.
     async fn cycle(&self) -> Result<Option<VersionVector>> {
+        let root = self.root.clone();
+        blocking(move || Journal::open(&root)?.reconcile()).await?;
         loop {
             let reply = self.vector().await?;
             let root = self.root.clone();
@@ -567,6 +647,7 @@ impl Link {
                                     *entry = (*entry).max(seq);
                                 }
                             }
+                            self.fetch_blobs(&operations).await?;
                             apply(&self.root, operations).await?;
                         }
                     }
@@ -685,6 +766,10 @@ pub(super) fn start(root: &Path) -> Running {
                 eprintln!("runner availability: {e}");
             }
             let root = monitor_root.clone();
+            let drift_root = root.clone();
+            if let Err(e) = blocking(move || Journal::open(&drift_root)?.reconcile()).await {
+                eprintln!("drift reconciliation: {e}");
+            }
             if let Err(e) = blocking(move || crate::core::code::reconcile(&root)).await {
                 eprintln!("code replication: {e}");
             }
@@ -806,6 +891,8 @@ pub(super) async fn settings_peer(
 /// One catch-up cycle with every paired peer (`serve --sync`, and the tail
 /// push before bye). With `full == false` only pushes local operations.
 pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<()>)>> {
+    let drift_root = root.to_path_buf();
+    blocking(move || Journal::open(&drift_root)?.reconcile()).await?;
     let config = discovery::config(root)?;
     let mut results: Vec<(String, Result<()>)> = Vec::new();
     let network = discovery::network_available(root, &config)?;
@@ -1054,6 +1141,22 @@ mod tests {
                 fs::read(b.join("projects/demo/.kanban/assets/images/a.png")).unwrap(),
                 [0u8, 159, 146, 150]
             );
+            // Post-bootstrap attachments travel by hash over the authenticated blob route.
+            let image = ".kanban/assets/images/incremental.png";
+            fs::write(board.project_path.join(image), [255, 0, 128, 7]).unwrap();
+            to_laptop.cycle().await.unwrap();
+            assert_eq!(fs::read(copy.project_path.join(image)).unwrap(), [255, 0, 128, 7]);
+            let rules = ".kanban/instructions/executor.md";
+            fs::create_dir_all(copy.project_path.join(".kanban/instructions")).unwrap();
+            fs::write(copy.project_path.join(rules), "Remote instructions").unwrap();
+            to_laptop.cycle().await.unwrap();
+            assert_eq!(fs::read_to_string(board.project_path.join(rules)).unwrap(), "Remote instructions");
+            fs::remove_file(board.project_path.join(image)).unwrap();
+            to_laptop.cycle().await.unwrap();
+            assert!(!copy.project_path.join(image).exists());
+            let rejected = to_laptop.http.put(format!("{}/sync/blobs/{}", to_laptop.base, "0".repeat(64)))
+                .bearer_auth(&to_laptop.token).body("wrong bytes").send().await.unwrap();
+            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
             assert!(discovery::config(&b).unwrap().peers.len() == 1);
             assert!(install_snapshot(&a, &ja.snapshot().unwrap()).unwrap_err().to_string().contains("SYNC_STORE_MISMATCH"));
 
