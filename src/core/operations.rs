@@ -775,8 +775,21 @@ impl Operations {
         repo.prune_worktrees()?;
 
         let tasks = self.storage.list_tasks(None)?;
-        let live: std::collections::HashSet<&str> =
-            tasks.iter().map(|task| task.id.as_str()).collect();
+        let iso = self.config.get_orchestration()?.isolation;
+        // A task renumbered by sync keeps the worktree and branch it recorded.
+        let live: std::collections::HashSet<&str> = tasks
+            .iter()
+            .flat_map(|task| {
+                [
+                    Some(task.id.as_str()),
+                    task.worktree.as_deref(),
+                    task.branch
+                        .as_deref()
+                        .and_then(|branch| branch.strip_prefix(iso.branch_prefix.as_str())),
+                ]
+            })
+            .flatten()
+            .collect();
 
         if self.storage.worktrees_dir.is_dir() {
             for entry in fs::read_dir(&self.storage.worktrees_dir)?.flatten() {
@@ -792,7 +805,6 @@ impl Operations {
             }
         }
 
-        let iso = self.config.get_orchestration()?.isolation;
         for (branch, id) in repo.branches_with_prefix(&iso.branch_prefix)? {
             if live.contains(id.as_str()) {
                 continue;
@@ -814,7 +826,31 @@ impl Operations {
     }
 
     pub fn get_task(&self, task_id: &str) -> Result<Option<Task>> {
-        self.storage.load_task(task_id)
+        if let Some(task) = self.storage.load_task(task_id)? {
+            return Ok(Some(task));
+        }
+        match crate::core::sync::renamed_task(self.data_root(), task_id)? {
+            Some(current) => self.storage.load_task(&current),
+            None => Ok(None),
+        }
+    }
+
+    /// A task id retired by sync collision renumbering resolves to the
+    /// task's new id for the agent session bound to it, or once the old id
+    /// no longer names a live task. Otherwise the id is returned unchanged.
+    pub fn resolve_task_alias(&self, task_id: &str) -> Result<String> {
+        let Some(current) = crate::core::sync::renamed_task(self.data_root(), task_id)? else {
+            return Ok(task_id.to_owned());
+        };
+        let own = std::env::var("KANBAN_SESSION")
+            .ok()
+            .and_then(|id| self.session_manager().load_session(&id))
+            .is_some_and(|session| session.task_id == current);
+        if own || !self.storage.task_exists(task_id) {
+            Ok(current)
+        } else {
+            Ok(task_id.to_owned())
+        }
     }
 
     pub fn list_tasks(
@@ -3997,9 +4033,24 @@ impl Operations {
         let base = self
             .isolation_base_commit(&repo, task, iso)
             .map_err(|e| e.to_string())?;
+        // A task renumbered by sync may still hold this id's worktree/branch.
+        let held = || -> Result<bool> {
+            Ok(self.storage.list_tasks(None)?.iter().any(|other| {
+                other.id != task.id
+                    && (other.worktree.as_deref() == Some(task.id.as_str())
+                        || other.branch.as_deref()
+                            == Some(format!("{}{}", iso.branch_prefix, task.id).as_str()))
+            }))
+        };
         let rel = if task.continue_from.is_some() {
             format!(
                 "{}-continue-{}",
+                task.id,
+                chrono::Utc::now().format("%Y%m%d%H%M%S%9f")
+            )
+        } else if held().map_err(|e| e.to_string())? {
+            format!(
+                "{}-{}",
                 task.id,
                 chrono::Utc::now().format("%Y%m%d%H%M%S%9f")
             )

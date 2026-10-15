@@ -232,7 +232,11 @@ fn load_conflicts(
             None
         };
         if let Some(task) = task {
-            tasks.push(task);
+            tasks.push(crate::core::sync::task_display(
+                &state,
+                &conflict.project,
+                &task,
+            ));
             conflicts.push(conflict);
         }
     }

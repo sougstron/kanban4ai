@@ -561,6 +561,44 @@ enum Command {
     StatuslineBridge,
 }
 
+impl Command {
+    /// The task a board command addresses, so a renumbered id can be resolved.
+    fn task_id_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Command::AgentExit { task_id, .. }
+            | Command::Answer { task_id, .. }
+            | Command::Arbiter { task_id, .. }
+            | Command::Ask { task_id, .. }
+            | Command::AskForm { task_id, .. }
+            | Command::Chain { task_id, .. }
+            | Command::Compact { task_id, .. }
+            | Command::Context { task_id, .. }
+            | Command::Continue { task_id, .. }
+            | Command::Depends { task_id, .. }
+            | Command::Detach { task_id, .. }
+            | Command::Done { task_id, .. }
+            | Command::Edits { task_id, .. }
+            | Command::Integrate { task_id, .. }
+            | Command::Move { task_id, .. }
+            | Command::Plan { task_id, .. }
+            | Command::Questions { task_id, .. }
+            | Command::Recover { task_id, .. }
+            | Command::Reject { task_id, .. }
+            | Command::Rerun { task_id, .. }
+            | Command::Revert { task_id, .. }
+            | Command::Show { task_id, .. }
+            | Command::Stop { task_id, .. }
+            | Command::Suggest { task_id, .. }
+            | Command::Take { task_id, .. }
+            | Command::Unreject { task_id, .. }
+            | Command::Verdict { task_id, .. }
+            | Command::Waiting { task_id, .. }
+            | Command::WaitResume { task_id, .. } => Some(task_id),
+            _ => None,
+        }
+    }
+}
+
 /// Read a file named by an agent on the command line (`context --file`,
 /// `ask-form --file`).
 ///
@@ -889,6 +927,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         _ => {}
     }
     let ops = resolve::resolve_project(cli.project.as_deref())?.operations();
+    let mut command = command;
+    if let Some(task_id) = command.task_id_mut() {
+        *task_id = ops.resolve_task_alias(task_id)?;
+    }
     // Settings that loaded but will not do what they look like they do. On
     // stderr so it never contaminates a command's parseable stdout.
     if ops.config.load().is_ok() {
