@@ -98,10 +98,6 @@ impl Journal {
             }
         }
         let present = paths.clone();
-        let task_location = |path: &str| -> Option<String> {
-            let (board, rest) = path.split_once("/.kanban/tasks/")?;
-            Some(format!("{board}/{}", rest.rsplit('/').next()?))
-        };
         let task_paths: BTreeMap<_, _> = present
             .iter()
             .filter_map(|p| Some((task_location(p)?, p)))
@@ -405,13 +401,30 @@ pub(super) fn reconcile_path(journal: &Journal, path: &Path) -> Result<()> {
         return Ok(());
     }
     let index = index(journal)?;
-    let old = index.get(&relative);
     let present = match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() => true,
         Ok(_) => return Err(invalid("drift path is not a regular file")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(e.into()),
     };
+    // A task moved between columns outside capture keeps its identity, as in
+    // the full scan: the present copy inherits the vanished path's entry, and
+    // the vanished path is left for that copy to claim.
+    let moved_from = if present && !index.contains_key(&relative) {
+        task_location(&relative).and_then(|id| {
+            index.keys().find(|p| {
+                task_location(p).as_ref() == Some(&id) && !store.join(p.as_str()).exists()
+            })
+        })
+    } else {
+        None
+    };
+    if !present && task_location(&relative).is_some() && moved_copy(path).is_some() {
+        return Ok(());
+    }
+    let old = index
+        .get(&relative)
+        .or_else(|| moved_from.and_then(|p| index.get(p)));
     if !present && old.is_none() {
         return Ok(());
     }
@@ -475,7 +488,59 @@ pub(super) fn reconcile_path(journal: &Journal, path: &Path) -> Result<()> {
         Some(before.as_deref()),
         current.as_ref().map(|(entry, _)| entry.clone()),
     )?;
+    if let Some(vanished) = moved_from {
+        record_observed(journal, &store.join(vanished), None)?;
+    }
     Ok(())
+}
+
+/// Fold bypass writes into the journal before capture overwrites `path`.
+///
+/// Capture reads "before" from disk, so an edit made outside capture would be
+/// absorbed into the next captured write and never replicated. Checking the
+/// written path — plus the board metadata it depends on and, for a task, its
+/// copy in another column — replaces a full store scan on every CLI start.
+pub(super) fn reconcile_for_write(journal: &Journal, path: &Path) -> Result<()> {
+    if let Some(board) = board_dir(path) {
+        let project = board.join("project.yaml");
+        if project != path {
+            reconcile_path(journal, &project)?;
+        }
+    }
+    if let Some(other) = moved_copy(path) {
+        reconcile_path(journal, &other)?;
+    }
+    reconcile_path(journal, path)
+}
+
+fn task_location(path: &str) -> Option<String> {
+    let (board, rest) = path.split_once("/.kanban/tasks/")?;
+    Some(format!("{board}/{}", rest.rsplit('/').next()?))
+}
+
+/// `projects/<name>` for a path inside a store board.
+fn board_dir(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|a| {
+        a.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "projects")
+    })
+}
+
+/// The same task file in another column, when `path` is a task file.
+fn moved_copy(path: &Path) -> Option<std::path::PathBuf> {
+    let column = path.parent()?;
+    let tasks = column.parent()?;
+    if tasks.file_name()? != "tasks" || tasks.parent()?.file_name()? != ".kanban" {
+        return None;
+    }
+    let name = path.file_name()?;
+    fs::read_dir(tasks)
+        .ok()?
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|dir| dir != column)
+        .map(|dir| dir.join(name))
+        .find(|other| other.is_file())
 }
 
 pub(super) fn repair_tail(path: &Path) -> Result<()> {

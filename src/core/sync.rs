@@ -777,6 +777,22 @@ pub fn activate(store: &Path) -> Result<usize> {
     Journal::open(store)?.reconcile()
 }
 
+/// CLI start: finish a crashed write and arm a store that was never scanned.
+/// An armed store skips the full scan; capture folds bypass writes of each
+/// path it overwrites, and serve/TUI keep the periodic full scan.
+pub fn prepare(store: &Path) -> Result<()> {
+    if enabled(store) {
+        let journal = Journal::open(store)?;
+        if !format::armed(store) {
+            journal.reconcile()?;
+        }
+    } else if store.join("sync/intent.json").is_file() {
+        // A crash left a redo that still has to finish the board write.
+        Journal::open(store)?;
+    }
+    Ok(())
+}
+
 /// Called by the atomic writer, while its caller holds the board/store lock.
 pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
     let Some(found) = target(path) else {
@@ -838,6 +854,9 @@ fn capture_inner(
     let journal = Journal::open(&target.store)?;
     let _guard = lock_file_reentrant(&journal.root.join(".lock"))?;
     journal.recover()?;
+    if before_override.is_none() {
+        drift::reconcile_for_write(&journal, path)?;
+    }
     let scoped = scope_display(&target, path, content)?;
     let mut state = projection::load_tasks(&journal.root, |uids| {
         projection::task_scope(

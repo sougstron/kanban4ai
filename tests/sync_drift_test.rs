@@ -282,3 +282,71 @@ fn external_thread_and_config_deletion_replicate() {
             .contains("interactive: false")
     );
 }
+
+/// CLI starts no longer scan an armed store, so capture must fold a bypass
+/// edit of the path it overwrites (or the task's vacated column) first.
+#[test]
+fn capture_folds_bypass_edits_and_moves_of_the_written_task() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let board = board(a.path());
+    let path = board.join(".kanban/tasks/todo/TASK-001.md");
+    atomic_write_text(&path, &task("original")).unwrap();
+    let source = Journal::open(a.path()).unwrap();
+    source.reconcile().unwrap();
+    Journal::open(b.path()).unwrap();
+    install_snapshot(b.path(), &source.snapshot().unwrap()).unwrap();
+    let peer = Journal::open(b.path()).unwrap();
+    let peer_tasks = || {
+        Storage::new(b.path().join("projects/demo"))
+            .list_tasks(None)
+            .unwrap()
+    };
+
+    // Bypass edit, then a captured write that keeps it: both must replicate.
+    fs::write(&path, task("manual edit")).unwrap();
+    atomic_write_text(&path, &task("manual edit").replace("body", "captured body")).unwrap();
+    replicate(&source, &peer);
+    let tasks = peer_tasks();
+    assert_eq!(tasks[0].title, "manual edit");
+    assert!(tasks[0].description.contains("captured body"));
+
+    // Bypass move between columns, then a captured write to the new column.
+    let moved = board.join(".kanban/tasks/review/TASK-001.md");
+    fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace("status: todo", "status: review");
+    fs::write(&moved, &text).unwrap();
+    fs::remove_file(&path).unwrap();
+    atomic_write_text(&moved, &text.replace("manual edit", "after move")).unwrap();
+    replicate(&source, &peer);
+    let tasks = peer_tasks();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].title, "after move");
+    assert_eq!(tasks[0].status.to_string(), "review");
+    let vector = source.vector().unwrap();
+    assert_eq!(source.reconcile().unwrap(), 0);
+    assert_eq!(source.vector().unwrap(), vector);
+}
+
+#[test]
+fn prepare_scans_only_a_store_that_is_not_armed() {
+    let a = tempfile::tempdir().unwrap();
+    let board = board(a.path());
+    let path = board.join(".kanban/tasks/todo/TASK-001.md");
+    atomic_write_text(&path, &task("original")).unwrap();
+    let journal = Journal::open(a.path()).unwrap();
+    journal.reconcile().unwrap();
+    let vector = journal.vector().unwrap();
+    // Armed: an unrelated bypass write waits for serve/TUI's periodic scan.
+    fs::write(&path, task("manual edit")).unwrap();
+    kanban4ai::core::sync::prepare(a.path()).unwrap();
+    assert_eq!(journal.vector().unwrap(), vector);
+    // Not armed (first start, or sync was off): the full scan runs and arms.
+    fs::remove_file(a.path().join("sync/armed")).unwrap();
+    kanban4ai::core::sync::prepare(a.path()).unwrap();
+    assert_ne!(journal.vector().unwrap(), vector);
+    assert!(a.path().join("sync/armed").is_file());
+    assert_eq!(journal.reconcile().unwrap(), 0);
+}

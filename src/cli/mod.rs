@@ -631,16 +631,8 @@ fn env_session(explicit: Option<String>) -> String {
 
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
-    let startup = (|| -> Result<()> {
-        let root = crate::core::project::store_root()?;
-        if crate::core::sync::enabled(&root) {
-            crate::core::sync::Journal::open(&root)?.reconcile()?;
-        } else if root.join("sync/intent.json").is_file() {
-            // A crash left a redo that still has to finish the board write.
-            crate::core::sync::Journal::open(&root)?;
-        }
-        Ok(())
-    })();
+    let startup =
+        crate::core::project::store_root().and_then(|root| crate::core::sync::prepare(&root));
     match startup.and_then(|()| dispatch(cli)) {
         Ok(code) => code,
         Err(err) => {
