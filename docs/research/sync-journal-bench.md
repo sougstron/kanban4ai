@@ -95,3 +95,59 @@ choice: the file journal is enough for backup. A later task can pass the write
 bar either by one journal fsync plus crash repair of the task file from the
 projection, or by a single-commit store. That choice is not justified by the
 page time.
+
+## TASK-516: causal seed, cold CLI, real store
+
+The TASK-511 seed gave the remote ops 2023 clocks and no `prev`, so all
+3 000 `peer-b` edits lost to the local task creation. That run carried 3 007
+conflicts, a 1.3 MB thread of conflict notes and a 1.2 MB `uids.json`. The
+"~470 ms conflict walk" was mostly the cost of that artifact. `BENCH_SEED=legacy`
+still reproduces it. The default seed is now causal: peers build on the
+creation and on their own last edit. The local writer reloads the task first.
+The bench also runs the release binary as a fresh process per call (`show`
+and `context`), the way agents call it.
+
+Pair search in `prune` now uses entry/exit intervals of the `prev` forest. An
+ancestor check is O(1), and only concurrent pairs are visited. Before, each
+pair walked the chain.
+
+| measurement, 10k ops, median of 7 | legacy seed | causal seed |
+|---|---|---|
+| one `save_task` (warm) | 57.6 ms | 43.8–49.8 ms |
+| `operations_after` mid / empty | 1.7 / 1.6 ms | 1.1 / 0.6 ms |
+| `apply_remote` of one op | 311 ms (was 735–776) | 61–63 ms |
+| process start (`--version`) | 2.9 ms | 2.3–2.4 ms |
+| cold `show` | 28 ms | 20–22 ms |
+| cold `context` (two captures) | 530 ms | 107–115 ms |
+| conflicts / thread | 3 007 / 1.3 MB | 0 / 2 KB |
+
+On tmpfs the same cold `context` takes 15–25 ms. On disk the remainder is
+about 17 fsyncs: two captures × (intent, data file, journal, drift, directory
+syncs). That is the same floor as the warm write.
+
+### The real store is the scale problem
+
+The bench holds one task. A copy of the maintainer's store (about 1 800 tasks,
+36 boards, one peer configured, so sync is on) on the same btrfs disk gives a
+different picture:
+
+| step | time |
+|---|---|
+| first CLI call after an upgrade from 0.7.6 (no `drift.jsonl` yet) | about 20 min, all board locks held |
+| `meta/projection.json` afterwards | 38.7 MB (journal 24 MB, blobs 23 MB) |
+| `list` | 50 ms |
+| `show TASK-511` | about 520 ms |
+| `context` | about 1.6 s |
+
+Where `show` goes (strace): about 350 ms is the startup `reconcile` stat of
+every board file, and about 320 ms is each parse of the whole-store
+`projection.json`. `remote_runs` needs it for a single task. `context` pays
+the same parse plus two captures. The projection holds every field of every
+task and message, so each CLI process reads the whole store to touch one task.
+
+The append-only journal holds up at this size. The single whole-store
+projection and the per-process full reconcile do not. Either the projection is
+sharded (per board, or per entity, loaded lazily), or this is where SQLite/redb
+earns its place: point reads of one task without parsing the store. The first
+reconcile after an upgrade also needs a batched path (one state, no per-file
+clone and checkpoint) before 0.8.x reaches a store with peers.
