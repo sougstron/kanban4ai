@@ -190,15 +190,18 @@ pub struct RestoreRequest {
     pub mode: RestoreMode,
     pub project: Option<String>,
     pub identity: bool,
+    /// Confirms for `restore`; `restore_with` asks its callback instead.
     pub yes: bool,
     pub force: bool,
-    pub tty: bool,
     pub policy: BackupPolicy,
 }
 
-#[derive(Debug, Clone)]
+/// What a restore replaces. `restore_with` hands it to the confirm callback
+/// before anything is written, and returns it once the swap is done.
+#[derive(Debug, Clone, Default)]
 pub struct RestoreReport {
     pub mode: String,
+    pub projects: Vec<String>,
     pub tasks_added: usize,
     pub tasks_replaced: usize,
     pub tasks_removed: usize,
@@ -371,7 +374,6 @@ fn create_locked(store: &Path, request: &CreateRequest, _guard: &DirLock) -> Res
     )?;
     let core_path = archive_name(&request.dir, &stamp, request.kind, seq, Part::Core);
     pack(&core_manifest, &core_staged, &core_path)?;
-    let mut created_paths = vec![core_path.clone()];
     let artifacts = if with_artifacts {
         let mut skipped = Vec::new();
         let art_items = artifact_items(store, &boards)?;
@@ -387,14 +389,11 @@ fn create_locked(store: &Path, request: &CreateRequest, _guard: &DirLock) -> Res
         )?;
         let art_path = archive_name(&request.dir, &stamp, request.kind, seq, Part::Artifacts);
         pack(&art_manifest, &art_staged, &art_path)?;
-        created_paths.push(art_path.clone());
         Some(finish_archive(&art_path)?)
     } else {
         None
     };
     let core = finish_archive(&core_path)?;
-    // Keep the new archives if anything below fails; they verified.
-    let _keep = created_paths;
     prune_locked(&request.dir, &request.policy, false)?;
     Ok(Created {
         core,
@@ -449,23 +448,24 @@ pub fn verify(path: &Path) -> Result<Manifest> {
                 "MANIFEST.json is not the first archive entry".into(),
             ));
         }
-        let mut hasher = Sha256::new();
-        let mut buf = Vec::new();
-        entry
-            .read_to_end(&mut buf)
-            .map_err(|err| KanbanError::BackupVerifyFailed(format!("{rel}: {err}")))?;
-        hasher.update(&buf);
-        let hash = format!("{:x}", hasher.finalize());
+        // Hash as a stream; only the files `parse_entry` checks are buffered,
+        // so a large artifact never sits in memory whole.
         let mode = entry.header().mode().unwrap_or(0) & 0o777;
-        if seen
-            .insert(rel.clone(), (buf.len() as u64, hash, mode))
-            .is_some()
-        {
+        let mut hasher = HashingSink {
+            hasher: Sha256::new(),
+            kept: needs_parse(&rel).then(Vec::new),
+        };
+        let size = io::copy(&mut entry, &mut hasher)
+            .map_err(|err| KanbanError::BackupVerifyFailed(format!("{rel}: {err}")))?;
+        let hash = format!("{:x}", hasher.hasher.finalize());
+        if seen.insert(rel.clone(), (size, hash, mode)).is_some() {
             return Err(KanbanError::BackupVerifyFailed(format!(
                 "duplicate archive path {rel}"
             )));
         }
-        parse_entry(&rel, &buf)?;
+        if let Some(bytes) = hasher.kept {
+            parse_entry(&rel, &bytes)?;
+        }
     }
     let manifest = manifest
         .ok_or_else(|| KanbanError::BackupVerifyFailed("archive has no MANIFEST.json".into()))?;
@@ -519,6 +519,33 @@ fn check_format(manifest: &Manifest) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+struct HashingSink {
+    hasher: Sha256,
+    kept: Option<Vec<u8>>,
+}
+
+impl Write for HashingSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.hasher.update(buf);
+        if let Some(kept) = &mut self.kept {
+            kept.extend_from_slice(buf);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Paths `parse_entry` actually parses; everything else is only hashed.
+fn needs_parse(rel: &str) -> bool {
+    (rel.contains("/.kanban/tasks/") && rel.ends_with(".md"))
+        || (rel.contains("/.kanban/threads/") && (rel.ends_with(".yaml") || rel.ends_with(".yml")))
+        || rel == "store/config.yaml"
+        || rel.ends_with("/.kanban/config.yaml")
 }
 
 fn parse_entry(rel: &str, bytes: &[u8]) -> Result<()> {
@@ -849,17 +876,31 @@ fn week_key(time: DateTime<Utc>) -> (i32, u32) {
     (week.year(), week.week())
 }
 
+/// `restore_with` that proceeds only when `request.yes` is set.
 pub fn restore(store: &Path, request: &RestoreRequest) -> Result<RestoreReport> {
+    restore_with(store, request, &mut |_| Ok(request.yes))
+}
+
+/// Verify, check, then ask `confirm` with the pending report; nothing is
+/// written (not even the pre-restore snapshot) unless it returns `true`.
+pub fn restore_with(
+    store: &Path,
+    request: &RestoreRequest,
+    confirm: &mut dyn FnMut(&RestoreReport) -> Result<bool>,
+) -> Result<RestoreReport> {
     let _guard = DirLock::acquire(&request.dir, true)?.expect("blocking lock");
     let _clear_fail = FailGuard;
     let manifest = verify(&request.archive)?;
     if manifest.part == Part::Artifacts.as_str() {
         let projects: Vec<&ManifestProject> = manifest.projects.iter().collect();
         ensure_idle(store, &projects, request.force)?;
-        if !request.yes && !request.tty {
-            return Err(KanbanError::Invalid(
-                "restore requires --yes when stdin is not a terminal".into(),
-            ));
+        let pending = RestoreReport {
+            mode: "artifacts".into(),
+            projects: projects.iter().map(|p| p.id.clone()).collect(),
+            ..RestoreReport::default()
+        };
+        if !confirm(&pending)? {
+            return Err(cancelled());
         }
         create_locked(
             store,
@@ -871,7 +912,8 @@ pub fn restore(store: &Path, request: &RestoreRequest) -> Result<RestoreReport> 
             },
             &_guard,
         )?;
-        return restore_artifacts(store, request, &manifest);
+        restore_artifacts(store, &manifest, &request.archive)?;
+        return Ok(pending);
     }
     if manifest.part != Part::Core.as_str() {
         return Err(KanbanError::BackupVerifyFailed(
@@ -890,38 +932,11 @@ pub fn restore(store: &Path, request: &RestoreRequest) -> Result<RestoreReport> 
         ));
     }
     ensure_idle(store, &selected, request.force)?;
-    let mut counts = diff_counts(store, &request.archive, &selected)?;
+    let mut counts = diff_counts(store, &manifest, &selected)?;
     counts.mode = request.mode.as_str().to_string();
-    println!(
-        "restore {} from {}",
-        request.mode.as_str(),
-        request.archive.display()
-    );
-    println!(
-        "projects: {}",
-        selected
-            .iter()
-            .map(|p| p.id.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    println!(
-        "tasks: {} replaced, {} added, {} removed",
-        counts.tasks_replaced, counts.tasks_added, counts.tasks_removed
-    );
-    println!(
-        "threads: {} replaced, {} added, {} removed",
-        counts.threads_replaced, counts.threads_added, counts.threads_removed
-    );
-    if request.identity {
-        eprintln!(
-            "warning: --identity reuses the archived node_id; a second live machine with that id breaks HLC/LWW"
-        );
-    }
-    if !request.yes && !request.tty {
-        return Err(KanbanError::Invalid(
-            "restore requires --yes when stdin is not a terminal".into(),
-        ));
+    counts.projects = selected.iter().map(|p| p.id.clone()).collect();
+    if !confirm(&counts)? {
+        return Err(cancelled());
     }
     create_locked(
         store,
@@ -994,25 +1009,17 @@ pub fn restore(store: &Path, request: &RestoreRequest) -> Result<RestoreReport> 
     Ok(counts)
 }
 
-fn restore_artifacts(
-    store: &Path,
-    request: &RestoreRequest,
-    manifest: &Manifest,
-) -> Result<RestoreReport> {
-    let projects: Vec<&ManifestProject> = manifest.projects.iter().collect();
-    ensure_idle(store, &projects, request.force)?;
-    if !request.yes && !request.tty {
-        return Err(KanbanError::Invalid(
-            "restore requires --yes when stdin is not a terminal".into(),
-        ));
-    }
-    println!("restore artifacts from {}", request.archive.display());
+fn cancelled() -> KanbanError {
+    KanbanError::Invalid("restore cancelled; nothing was changed".into())
+}
+
+fn restore_artifacts(store: &Path, manifest: &Manifest, archive: &Path) -> Result<()> {
     let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let job = store.join(format!(".restore-{stamp}"));
     let staged_root = job.join("staged");
     fs::create_dir_all(&staged_root)?;
     let _job = TempDir::new(job);
-    extract(&request.archive, &staged_root)?;
+    extract(archive, &staged_root)?;
     for file in &manifest.files {
         let Some(dest) = artifact_dest(store, manifest, &file.path)? else {
             eprintln!(
@@ -1028,15 +1035,7 @@ fn restore_artifacts(
         fs::copy(&src, &dest)?;
         set_mode(&dest, file.mode)?;
     }
-    Ok(RestoreReport {
-        mode: "artifacts".into(),
-        tasks_added: 0,
-        tasks_replaced: 0,
-        tasks_removed: 0,
-        threads_added: 0,
-        threads_replaced: 0,
-        threads_removed: 0,
-    })
+    Ok(())
 }
 
 fn selected_projects<'a>(
@@ -1084,11 +1083,10 @@ fn store_has_tasks(store: &Path) -> bool {
 
 fn diff_counts(
     store: &Path,
-    archive: &Path,
+    manifest: &Manifest,
     selected: &[&ManifestProject],
 ) -> Result<RestoreReport> {
     // Counts come from the manifest paths, not a second extract.
-    let manifest = verify(archive)?;
     let mut tasks_added = 0;
     let mut tasks_replaced = 0;
     let mut tasks_removed = 0;
@@ -1099,14 +1097,14 @@ fn diff_counts(
         let live = live_root(store, project)?.unwrap_or_else(|| store.join("missing"));
         let (added, replaced, removed) = diff_set(
             &task_ids(&live.join(".kanban/tasks")),
-            &ids_in(&manifest, &project.id, "/.kanban/tasks/", ".md"),
+            &ids_in(manifest, &project.id, "/.kanban/tasks/", ".md"),
         );
         tasks_added += added;
         tasks_replaced += replaced;
         tasks_removed += removed;
         let (added, replaced, removed) = diff_set(
             &task_ids(&live.join(".kanban/threads")),
-            &ids_in(&manifest, &project.id, "/.kanban/threads/", ".yaml"),
+            &ids_in(manifest, &project.id, "/.kanban/threads/", ".yaml"),
         );
         threads_added += added;
         threads_replaced += replaced;
@@ -1114,6 +1112,7 @@ fn diff_counts(
     }
     Ok(RestoreReport {
         mode: "pending".into(),
+        projects: Vec::new(),
         tasks_added,
         tasks_replaced,
         tasks_removed,
@@ -1511,8 +1510,9 @@ fn reparse_tree(root: &Path) -> Result<()> {
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let bytes = fs::read(&path)?;
-            parse_entry(&rel, &bytes)?;
+            if needs_parse(&rel) {
+                parse_entry(&rel, &fs::read(&path)?)?;
+            }
         }
     }
     Ok(())
@@ -2039,7 +2039,11 @@ fn scan(dir: &Path) -> Result<Vec<ArchiveEntry>> {
     };
     for entry in read {
         let path = entry?.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()).map(str::to_owned) else {
+        let Some(name) = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+        else {
             continue;
         };
         let Some(parsed) = parse_archive_name(&name) else {
@@ -2434,7 +2438,6 @@ mod tests {
             identity,
             yes: true,
             force,
-            tty: false,
             policy: policy_at(&fix.dir),
         }
     }
@@ -2685,6 +2688,36 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, KanbanError::BackupVerifyFailed(_)), "{err}");
         assert_eq!(task_bytes(&fix.data_root, &task.id), before);
+    }
+
+    #[test]
+    fn declined_restore_writes_nothing() {
+        let fix = fix();
+        let storage = storage::Storage::new(&fix.data_root);
+        let task = storage.create_task(NewTask::titled("kept")).unwrap();
+        let created = create(&fix.store, &request(&fix.dir, false)).unwrap();
+        storage
+            .create_task(NewTask::titled("after backup"))
+            .unwrap();
+        let before = task_bytes(&fix.data_root, &task.id);
+        let archives = fs::read_dir(&fix.dir).unwrap().count();
+        let mut asked = None;
+        let err = restore_with(
+            &fix.store,
+            &restore_of(&fix, &created.core.path, RestoreMode::Board, false, false),
+            &mut |pending| {
+                asked = Some(pending.clone());
+                Ok(false)
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cancelled"), "{err}");
+        let asked = asked.expect("confirm was asked");
+        assert_eq!(asked.mode, "board");
+        assert_eq!((asked.tasks_replaced, asked.tasks_removed), (1, 1));
+        assert_eq!(task_bytes(&fix.data_root, &task.id), before);
+        assert_eq!(fs::read_dir(&fix.dir).unwrap().count(), archives);
+        assert_eq!(task_ids(&fix.data_root.join(".kanban/tasks")).len(), 2);
     }
 
     #[test]

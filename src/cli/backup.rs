@@ -3,6 +3,7 @@
 //! The command is a thin wrapper. Snapshot contents, locks, retention and
 //! restore live in [`crate::core::backup`].
 
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -37,7 +38,8 @@ pub enum BackupAction {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Restore a verified snapshot. Refuses without `--yes` when stdin is not a terminal.
+    /// Restore a verified snapshot. Prints what changes and asks first; `--yes`
+    /// skips the question and is required when stdin is not a terminal.
     Restore {
         /// Archive path, or `latest` (newest core snapshot).
         target: String,
@@ -50,7 +52,7 @@ pub enum BackupAction {
         /// Restore `node.yaml`, `peers.yaml` and `tokens.yaml` from the archive.
         #[arg(long)]
         identity: bool,
-        /// Required when stdin is not a terminal.
+        /// Do not ask; required when stdin is not a terminal.
         #[arg(long)]
         yes: bool,
         /// Restore over active agent sessions, or full-restore over existing tasks.
@@ -193,7 +195,9 @@ fn restore(
     let store = ProjectStore::open()?;
     let (policy, dir) = backup::resolve_dir(store.root(), dir.as_deref())?;
     let archive = backup::resolve_archive(&dir, target)?;
-    let report = backup::restore(
+    let tty = std::io::stdin().is_terminal();
+    let shown = archive.display().to_string();
+    let report = backup::restore_with(
         store.root(),
         &backup::RestoreRequest {
             archive,
@@ -203,8 +207,39 @@ fn restore(
             identity,
             yes,
             force,
-            tty: std::io::IsTerminal::is_terminal(&std::io::stdin()),
             policy,
+        },
+        &mut |pending| {
+            println!("restore {} from {shown}", pending.mode);
+            println!("projects: {}", pending.projects.join(", "));
+            if pending.mode != "artifacts" {
+                println!(
+                    "tasks: {} replaced, {} added, {} removed",
+                    pending.tasks_replaced, pending.tasks_added, pending.tasks_removed
+                );
+                println!(
+                    "threads: {} replaced, {} added, {} removed",
+                    pending.threads_replaced, pending.threads_added, pending.threads_removed
+                );
+            }
+            if identity {
+                eprintln!(
+                    "warning: --identity reuses the archived node_id; a second live machine with that id breaks HLC/LWW"
+                );
+            }
+            if yes {
+                return Ok(true);
+            }
+            if !tty {
+                return Err(KanbanError::Invalid(
+                    "restore requires --yes when stdin is not a terminal".into(),
+                ));
+            }
+            print!("Proceed? [y/N] ");
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
         },
     )?;
     println!(
