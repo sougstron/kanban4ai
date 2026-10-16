@@ -151,3 +151,39 @@ sharded (per board, or per entity, loaded lazily), or this is where SQLite/redb
 earns its place: point reads of one task without parsing the store. The first
 reconcile after an upgrade also needs a batched path (one state, no per-file
 clone and checkpoint) before 0.8.x reaches a store with peers.
+
+## TASK-516: projection sharded by task (store format 3)
+
+`meta/projection.json` is now `meta/projection/`: `head.json` (frontier,
+compaction, prune state), one `tasks/<hash>.json` per task (the task, its
+run, thread and messages, bodies included), and `misc.json` for everything
+else. A cold CLI process that touches one task (capture of a task, thread or
+session file, `remote_runs` for `show`, landing marks) reads the head,
+`misc.json`, that task's shard and the operations after the head that can
+touch it. Message bodies stay only in their task's shard, so a command on one
+task no longer parses the rest of the store's threads.
+
+Synthetic store, 1 800 tasks × 25 messages (a 54 MB format 2 file), median of
+5 on this btrfs disk, `projection_scale` in `projection.rs`:
+
+```sh
+TMPDIR=$PWD/target/bench-tmp CARGO_PROFILE_DEV_OPT_LEVEL=3 CARGO_TARGET_DIR=target/opt \
+  cargo test --lib projection_scale -- --ignored --nocapture
+```
+
+| measurement | format 2 | format 3 |
+|---|---|---|
+| state for one task (cold process) | 220–231 ms (whole file) | 0.1 ms (one 30 KB shard) |
+| whole-store load (serve/TUI, apply, prune) | 220–231 ms | 223–239 ms |
+| regular checkpoint | 153–158 ms (whole file) | 87–138 ms (dirty shards + head) |
+| first checkpoint after upgrade | — | 2.6 s once (1 800 shards, 8 fsync writers; 12 s serial) |
+
+A scoped state is never cached or checkpointed. When a checkpoint is due
+(`snapshot_ops`/`snapshot_secs`), that one write loads the whole store once,
+so a cold writer pays the old cost about every 1 000 operations or 5 minutes
+instead of on every call. The startup `reconcile` stat walk (~350 ms on the
+real store) is unchanged and is the next cost of a cold `show`.
+
+Store format 3 fences 0.8.x binaries off (`SYNC_STORE_TOO_NEW`), including a
+format 2 server receiving a format 3 bootstrap snapshot: the server node must
+be upgraded with the laptop.

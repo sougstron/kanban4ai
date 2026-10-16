@@ -110,11 +110,15 @@ impl Journal {
         project_alias: &str,
         task_id: &str,
     ) -> Result<BTreeMap<String, RunDescriptor>> {
-        task_runs(&self.state()?, project_alias, task_id)
+        task_runs(
+            &self.task_state(project_alias, &[task_id])?,
+            project_alias,
+            task_id,
+        )
     }
 
     pub fn landings(&self, alias: &str, task: &str) -> Result<BTreeMap<String, LandingDescriptor>> {
-        task_landings(&self.state()?, alias, task)
+        task_landings(&self.task_state(alias, &[task])?, alias, task)
     }
 
     /// Each node owns its own acknowledgement, independently of the runner.
@@ -129,12 +133,14 @@ impl Journal {
         let _board = Storage::new(board).lock()?;
         let _sync = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
-        let mut state = projection::load_state(&self.root)?.0;
-        let before_uids = projection::uids_of(&state);
         let alias = board
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| invalid("invalid board"))?;
+        let mut state = projection::load_tasks(&self.root, |uids| {
+            projection::task_scope(uids, alias, &[task])
+        })?;
+        let before_uids = projection::uids_of(&state);
         let project = state
             .project_uids
             .get(alias)
@@ -204,11 +210,12 @@ pub(crate) fn remote_runs_for_tasks<'a>(
         return Ok(result);
     }
     let journal = Journal::open(store)?;
-    let state = journal.state()?;
     let alias = board
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| invalid("invalid board path"))?;
+    let task_ids: Vec<&str> = task_ids.into_iter().collect();
+    let state = journal.task_state(alias, &task_ids)?;
     let Some(project) = state.project_uids.get(alias) else {
         return Ok(result);
     };
