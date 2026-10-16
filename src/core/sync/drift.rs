@@ -67,6 +67,11 @@ impl Journal {
     /// The scan is not part of task writes. Locks follow store -> board -> sync.
     pub fn reconcile(&self) -> Result<usize> {
         let store = self.root.parent().expect("sync parent");
+        // The common pass finds nothing; answer it without the board locks so
+        // the background scan and every CLI start never stall a board write.
+        if self.quiet(store) {
+            return Ok(0);
+        }
         let _store = lock_file_reentrant(&store.join(".lock"))?;
         let boards = transport::boards(store)?;
         let _boards = boards
@@ -231,6 +236,62 @@ impl Journal {
         // The index now matches disk, including writes that bypassed capture.
         format::mark_armed(store)?;
         Ok(changed)
+    }
+
+    /// Lock-free read of what the locked pass would conclude: true only when
+    /// the store is armed, no redo is pending, the index is compact, and every
+    /// board file matches it by mtime and size. Any doubt — a torn index line,
+    /// an odd path, a missing file — answers false and leaves the decision to
+    /// the locked pass, which also compacts the appended capture records.
+    fn quiet(&self, store: &Path) -> bool {
+        let check = || -> Result<bool> {
+            if !format::armed(store) || self.root.join("intent.json").exists() {
+                return Ok(false);
+            }
+            let Ok(text) = fs::read_to_string(self.root.join("drift.jsonl")) else {
+                return Ok(false);
+            };
+            let mut index = BTreeMap::new();
+            for line in text.lines() {
+                let Ok((path, Some(entry))) = serde_json::from_str::<(String, Option<Entry>)>(line)
+                else {
+                    return Ok(false);
+                };
+                if index.insert(path, entry).is_some() {
+                    return Ok(false);
+                }
+            }
+            let mut paths = Vec::new();
+            if store.join("config.yaml").is_file() {
+                paths.push(store.join("config.yaml"));
+            }
+            for board in transport::boards(store)? {
+                paths.extend(transport::board_files(&board)?);
+            }
+            if paths.len() != index.len() {
+                return Ok(false);
+            }
+            for path in paths {
+                let Some(entry) = path
+                    .strip_prefix(store)
+                    .ok()
+                    .and_then(Path::to_str)
+                    .and_then(|relative| index.get(relative))
+                else {
+                    return Ok(false);
+                };
+                let meta = fs::symlink_metadata(&path)?;
+                let mtime = meta
+                    .modified()?
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos());
+                if !meta.is_file() || entry.mtime != mtime || entry.size != meta.len() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        check().unwrap_or(false)
     }
 }
 
