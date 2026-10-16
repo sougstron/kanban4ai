@@ -26,6 +26,9 @@ impl Journal {
         state.compacted.clone_from(&h);
         let retained = self.retained_ops(&state)?;
         archive_conflicts(&self.root, &state, &h, &meta.frontier)?;
+        // The checkpoint finds its dirty shards in the operations after the
+        // old head, so it is written before any of them are dropped.
+        projection::write_checkpoint(&self.root, &state, &meta)?;
         for node in segments::node_names(&self.root)? {
             let through = h.get(&node).copied().unwrap_or(0);
             if through > 0 {
@@ -33,7 +36,6 @@ impl Journal {
             }
         }
         gc_blobs(&self.root, &state, &retained)?;
-        projection::write_checkpoint(&self.root, &state, &meta)?;
         let _ = segments::rebuild_index(&self.root);
         projection::remember(&self.root, &state, &meta);
         Ok(h)

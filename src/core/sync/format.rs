@@ -7,7 +7,10 @@ use std::time::SystemTime;
 
 use super::*;
 
-pub const STORE_FORMAT: u32 = 2;
+pub const STORE_FORMAT: u32 = 3;
+/// Append-only segments. Format 3 only shards `meta/projection.json` into
+/// `meta/projection/`, which the loader does on the next checkpoint.
+pub(super) const SEGMENTS_FORMAT: u32 = 2;
 pub const OP_FORMAT: u32 = 1;
 pub const SYNC_PROTOCOL: u32 = 2;
 pub const MIN_SYNC_PROTOCOL: u32 = 1;
@@ -174,7 +177,18 @@ pub(super) fn ensure(store: &Path) -> Result<()> {
                     "SYNC_STORE_TOO_NEW: store format {version}, binary supports {STORE_FORMAT}; upgrade kanban4ai"
                 )));
             }
-            crate::core::sync::migrate_v1::migrate(store)
+            if version < SEGMENTS_FORMAT {
+                crate::core::sync::migrate_v1::migrate(store)?;
+            } else if leftovers(&root)? {
+                crate::core::sync::migrate_v1::finish_v1_move(store)?;
+            }
+            // 2 -> 3: the format 2 projection stays readable until the next
+            // checkpoint shards it; FORMAT only fences older binaries off.
+            let _guard = lock_file_reentrant(&root.join(".lock"))?;
+            if read_format(store)?.is_some_and(|v| v < STORE_FORMAT) {
+                write_format(store, STORE_FORMAT)?;
+            }
+            Ok(())
         }
         None if v1_present(&root)? => crate::core::sync::migrate_v1::migrate(store),
         None => {

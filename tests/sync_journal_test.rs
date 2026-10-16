@@ -262,14 +262,18 @@ fn deleting_projection_or_index_rebuilds_the_same_state() {
     let journal = Journal::open(dir.path()).unwrap();
     journal.snapshot().unwrap();
     let before = serde_json::to_value(journal.state().unwrap()).unwrap();
-    let projection = fs::read(dir.path().join("sync/meta/projection.json")).unwrap();
-    fs::remove_file(dir.path().join("sync/meta/projection.json")).unwrap();
+    let shards = dir.path().join("sync/meta/projection");
+    let saved = tempfile::tempdir().unwrap();
+    copy_tree(&shards, saved.path());
+    fs::remove_dir_all(&shards).unwrap();
     fs::remove_file(dir.path().join("sync/meta/index.json")).unwrap();
     let after = serde_json::to_value(Journal::open(dir.path()).unwrap().state().unwrap()).unwrap();
     assert_eq!(before, after);
     atomic_write_text(&storage.tasks_dir.join("todo/TASK-001.md"), &task("later")).unwrap();
     let full = serde_json::to_value(journal.state().unwrap()).unwrap();
-    fs::write(dir.path().join("sync/meta/projection.json"), projection).unwrap();
+    // No checkpoint was due since the deletion, so the directory may be absent.
+    let _ = fs::remove_dir_all(&shards);
+    copy_tree(saved.path(), &shards);
     let replayed =
         serde_json::to_value(Journal::open(dir.path()).unwrap().state().unwrap()).unwrap();
     assert_eq!(replayed, full);
@@ -539,7 +543,7 @@ fn prune_bounds_acked_history_and_keeps_conflicts_and_fresh_blobs() {
 fn newer_store_format_is_refused_without_writes() {
     let dir = tempfile::tempdir().unwrap();
     let storage = board(dir.path());
-    fs::write(dir.path().join("sync/FORMAT"), "3\n").unwrap();
+    fs::write(dir.path().join("sync/FORMAT"), "4\n").unwrap();
     let stamp = |root: &Path| {
         let mut names = fs::read_dir(root.join("sync"))
             .unwrap()
@@ -634,7 +638,7 @@ fn v1_fixture_migrates_and_a_partial_migration_restarts() {
         fs::read_to_string(again.path().join("sync/FORMAT"))
             .unwrap()
             .trim(),
-        "2"
+        "3"
     );
 }
 

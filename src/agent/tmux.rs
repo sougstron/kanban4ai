@@ -386,6 +386,17 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
         "export KANBAN_DATA_DIR={}; ",
         shell_quote(&roots.kanban_dir().display().to_string())
     );
+    // The tmux server keeps the environment it was started with. Without the
+    // launcher's store, every callback would open the default store instead.
+    let store_export = crate::core::project::store_root()
+        .map(|root| {
+            format!(
+                "export {}={}; ",
+                crate::core::project::STORE_ROOT_ENV,
+                shell_quote(&root.display().to_string())
+            )
+        })
+        .unwrap_or_default();
     // Always the absolute log dir under data_root. A relative `.kanban/logs`
     // fallback would mkdir in the work folder after `cd` below.
     let mkdir_logs = plan
@@ -394,7 +405,7 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
         .map(|parent| format!("mkdir -p {}; ", shell_quote(&parent.display().to_string())))
         .unwrap_or_default();
     format!(
-        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; {project_export}{data_dir_export}{mkdir_logs}{}{}if {checkout_guard}true; then {run_pipeline}; status=${{PIPESTATUS[0]}}; else status=1; fi; kill $hb_pid 2>/dev/null; {}{}; exit $status",
+        "set -o pipefail; cd {}; export KANBAN_SESSION={}; export KANBAN_TASK_ID={}; export KANBAN_CMD={}; {store_export}{project_export}{data_dir_export}{mkdir_logs}{}{}if {checkout_guard}true; then {run_pipeline}; status=${{PIPESTATUS[0]}}; else status=1; fi; kill $hb_pid 2>/dev/null; {}{}; exit $status",
         shell_quote(&roots.work_path.display().to_string()),
         shell_quote(&plan.session_id),
         shell_quote(&plan.task_id),
@@ -535,6 +546,10 @@ mod tests {
             shell_quote(&work_path.path().display().to_string())
         )));
         assert!(script.contains("export KANBAN_PROJECT=my-project"));
+        assert!(script.contains(&format!(
+            "export KANBAN_HOME={}",
+            shell_quote(&crate::core::project::store_root().unwrap().display().to_string())
+        )));
         assert!(script.contains(&format!(
             "export KANBAN_DATA_DIR={}",
             shell_quote(&data_root.path().join(".kanban").display().to_string())

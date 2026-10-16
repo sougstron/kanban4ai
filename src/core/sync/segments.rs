@@ -695,6 +695,7 @@ pub fn change_token(store: &Path) -> Option<u64> {
     }
     for name in [
         "meta/projection.json",
+        "meta/projection/head.json",
         "meta/uids.json",
         "meta/conflicts.jsonl",
         "meta/conflicts-archive.jsonl",

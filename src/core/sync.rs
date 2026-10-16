@@ -170,6 +170,10 @@ pub struct JournalState {
     /// Commutative creation / claim / tombstone clocks. Delivery order does not matter.
     #[serde(default)]
     pub lifecycle: BTreeMap<String, projection::Lifecycle>,
+    /// Loaded from a few task shards only (`projection::load_tasks`). Never
+    /// checkpointed or cached as the whole store.
+    #[serde(skip)]
+    pub(crate) partial: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -325,6 +329,16 @@ impl Journal {
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
         Ok(projection::load_state(&self.root)?.0)
+    }
+
+    /// State scoped to a few tasks of one board (see `projection::load_tasks`).
+    pub(crate) fn task_state(&self, alias: &str, tasks: &[&str]) -> Result<JournalState> {
+        apply::recover_remote(&self.root)?;
+        let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
+        self.recover()?;
+        projection::load_tasks(&self.root, |uids| {
+            projection::task_scope(uids, alias, tasks)
+        })
     }
 
     /// Retained operations in HLC order. `node` limits the result to one writer.
@@ -576,7 +590,7 @@ fn commit_local(
     } else {
         false
     };
-    if !pruned {
+    if !pruned && !state.partial {
         if let Some(mut cached) = cached {
             let conflicts = prune::ingest(
                 state,
@@ -786,6 +800,32 @@ pub(crate) fn capture(path: &Path, content: Option<&str>) -> Result<bool> {
     capture_inner(path, content, None, None)
 }
 
+/// Display ids of the tasks a captured file can touch: the task itself, the
+/// thread's task, or a session's task.
+fn scope_display(target: &Target, path: &Path, content: Option<&str>) -> Result<Vec<String>> {
+    Ok(match target.entity {
+        "task" | "message" => vec![target.id.clone()],
+        "session" => {
+            let task_of = |text: &str| {
+                serde_yaml_ng::from_str::<Value>(text)
+                    .ok()
+                    .and_then(|v| v.get("task_id")?.as_str().map(str::to_owned))
+            };
+            let before = match fs::read_to_string(path) {
+                Ok(text) => task_of(&text),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.into()),
+            };
+            content
+                .and_then(task_of)
+                .into_iter()
+                .chain(before)
+                .collect()
+        }
+        _ => Vec::new(),
+    })
+}
+
 fn capture_inner(
     path: &Path,
     content: Option<&str>,
@@ -798,7 +838,14 @@ fn capture_inner(
     let journal = Journal::open(&target.store)?;
     let _guard = lock_file_reentrant(&journal.root.join(".lock"))?;
     journal.recover()?;
-    let mut state = projection::load_state(&journal.root)?.0;
+    let scoped = scope_display(&target, path, content)?;
+    let mut state = projection::load_tasks(&journal.root, |uids| {
+        projection::task_scope(
+            uids,
+            &target.project,
+            &scoped.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+    })?;
     let before_uids = projection::uids_of(&state);
     let project = if target.project.is_empty() {
         String::new()

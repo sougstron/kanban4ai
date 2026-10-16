@@ -57,12 +57,12 @@ struct V1Remote {
 
 pub(super) fn migrate(store: &Path) -> Result<()> {
     let root = store.join("sync");
-    if format::read_format(store)?.is_some_and(|v| v >= STORE_FORMAT) {
+    if format::read_format(store)?.is_some_and(|v| v >= format::SEGMENTS_FORMAT) {
         return finish_v1_move(store);
     }
     wipe_partial(&root)?;
     let _store = lock_file_reentrant(&store.join(".lock"))?;
-    if format::read_format(store)?.is_some_and(|v| v >= STORE_FORMAT) {
+    if format::read_format(store)?.is_some_and(|v| v >= format::SEGMENTS_FORMAT) {
         return finish_v1_move(store);
     }
     let mut boards = BTreeSet::new();
@@ -80,7 +80,7 @@ pub(super) fn migrate(store: &Path) -> Result<()> {
         .map(|p| Storage::new(p).lock())
         .collect::<Result<_>>()?;
     let _sync = lock_file_reentrant(&root.join(".lock"))?;
-    if format::read_format(store)?.is_some_and(|v| v >= STORE_FORMAT) {
+    if format::read_format(store)?.is_some_and(|v| v >= format::SEGMENTS_FORMAT) {
         return finish_v1_move(store);
     }
     wipe_partial(&root)?;
@@ -292,6 +292,9 @@ fn wipe_partial(root: &Path) -> Result<()> {
                 fs::remove_dir_all(path)?;
             }
         }
+    }
+    if root.join("meta/projection").exists() {
+        fs::remove_dir_all(root.join("meta/projection"))?;
     }
     for name in ["projection.json", "uids.json", "index.json", "since.json"] {
         match fs::remove_file(root.join("meta").join(name)) {
