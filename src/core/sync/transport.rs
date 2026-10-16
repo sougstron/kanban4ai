@@ -55,27 +55,41 @@ impl Journal {
         }
         let limit = limit.max(1);
         let nodes = segments::node_names(&self.root)?;
-        // k-way merge by HLC. Ahead-of-sequence ops are not part of the vector.
-        let mut heads: Vec<(Hlc, usize, Operation)> = Vec::new();
-        let mut cursors: Vec<std::vec::IntoIter<Operation>> = Vec::new();
+        // k-way merge by HLC. A node's clock grows with its sequence, so each
+        // cursor is read only until the page is full. Ahead-of-sequence ops
+        // are not part of the vector.
+        let mut cursors = Vec::with_capacity(nodes.len());
+        let mut heads = Vec::with_capacity(nodes.len());
         for node in &nodes {
-            let mut ops =
-                segments::read_after(&self.root, node, after.get(node).copied().unwrap_or(0))?;
-            ops.sort_by(|a, b| a.hlc.cmp(&b.hlc).then_with(|| a.op.cmp(&b.op)));
-            let mut iter = ops.into_iter();
-            if let Some(op) = iter.next() {
-                heads.push((op.hlc.clone(), cursors.len(), op));
-            }
-            cursors.push(iter);
+            let mut cursor =
+                segments::Cursor::open(&self.root, node, after.get(node).copied().unwrap_or(0))?;
+            heads.push(cursor.next_op()?);
+            cursors.push(cursor);
         }
         let mut ops = Vec::new();
-        while ops.len() <= limit && !heads.is_empty() {
-            heads.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.2.op.cmp(&a.2.op)));
-            let (_, slot, op) = heads.pop().expect("head");
-            ops.push(op);
-            if let Some(next) = cursors[slot].next() {
-                heads.push((next.hlc.clone(), slot, next));
+        while ops.len() <= limit {
+            let mut best: Option<usize> = None;
+            for (index, head) in heads.iter().enumerate() {
+                let Some(op) = head else {
+                    continue;
+                };
+                let older = match best {
+                    None => true,
+                    Some(chosen) => {
+                        let other = heads[chosen].as_ref().expect("chosen head");
+                        op.hlc < other.hlc || (op.hlc == other.hlc && op.op < other.op)
+                    }
+                };
+                if older {
+                    best = Some(index);
+                }
             }
+            let Some(slot) = best else {
+                break;
+            };
+            let op = heads[slot].take().expect("head");
+            ops.push(op);
+            heads[slot] = cursors[slot].next_op()?;
         }
         let more = ops.len() > limit;
         ops.truncate(limit);
@@ -449,6 +463,15 @@ fn merge_global(local_path: &Path, remote: &str) -> Result<String> {
 }
 
 pub(super) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_bytes_inner(path, bytes, true)
+}
+
+/// Visible to later reads in this store, without a durability barrier.
+pub(super) fn write_bytes_cached(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_bytes_inner(path, bytes, false)
+}
+
+fn write_bytes_inner(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
     no_symlinks(path)?;
     let parent = path.parent().ok_or_else(|| invalid("missing parent"))?;
     fs::create_dir_all(parent)?;
@@ -456,9 +479,15 @@ pub(super) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         .prefix(".tmp_")
         .tempfile_in(parent)?;
     tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
+    if durable {
+        tmp.as_file().sync_all()?;
+    } else {
+        std::io::Write::flush(&mut tmp)?;
+    }
     tmp.persist(path).map_err(|e| KanbanError::Io(e.error))?;
-    fs::File::open(parent)?.sync_all()?;
+    if durable {
+        fs::File::open(parent)?.sync_all()?;
+    }
     Ok(())
 }
 

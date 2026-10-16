@@ -461,7 +461,9 @@ sync:
   decided before that batch, not in the middle of it.
 - `snapshot_ops`: rewrite `sync/meta/projection.json` after this many
   operations since the previous snapshot. Default 1000. The counter lives in
-  `sync/meta/since.json`, so separate CLI processes share it.
+  `sync/meta/since.json`, so separate CLI processes share it. The counter is
+  not fsynced: a crash may repeat the window, and the next snapshot rewrites
+  the same projection.
 - `snapshot_secs`: also rewrite the projection after this many seconds.
   Default 300. The first small write only starts the timer.
 

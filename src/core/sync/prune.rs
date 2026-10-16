@@ -2,8 +2,10 @@
 //! A participant that has not acked anything contributes a zero vector, so a
 //! store never drops history a peer might still need. With no participants
 //! (only our own operations, no peers) the whole prefix is stable.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::projection::PruneMeta;
@@ -16,6 +18,7 @@ impl Journal {
     /// `acks` maps a participant id to the vector that participant has acknowledged.
     /// Returns the retained frontier `H` (sequences at or below `H` may be dropped).
     pub fn prune(&self, acks: &BTreeMap<String, VersionVector>) -> Result<VersionVector> {
+        forget_groups(&self.root);
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
         let (mut state, mut meta) = projection::load_state(&self.root)?;
@@ -32,6 +35,7 @@ impl Journal {
         gc_blobs(&self.root, &state, &retained)?;
         projection::write_checkpoint(&self.root, &state, &meta)?;
         let _ = segments::rebuild_index(&self.root);
+        projection::remember(&self.root, &state, &meta);
         Ok(h)
     }
 
@@ -278,6 +282,275 @@ fn write_conflicts(path: &std::path::Path, conflicts: &[Conflict]) -> Result<()>
     }
 }
 
+pub(super) type FieldGroups = BTreeMap<(String, String, String, String), Vec<Operation>>;
+
+pub(super) struct GroupsSlot {
+    token: u64,
+    pub groups: FieldGroups,
+    pub ops: Vec<Operation>,
+    pub conflicts: Vec<Conflict>,
+}
+
+static GROUPS: LazyLock<Mutex<HashMap<PathBuf, GroupsSlot>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn groups_cache() -> std::sync::MutexGuard<'static, HashMap<PathBuf, GroupsSlot>> {
+    GROUPS.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+pub(super) fn forget_groups(sync: &std::path::Path) {
+    groups_cache().remove(sync);
+}
+
+pub(super) fn take_groups(sync: &std::path::Path) -> Option<GroupsSlot> {
+    let parent = sync.parent()?;
+    let token = segments::change_token(parent)?;
+    let mut cache = groups_cache();
+    let fresh = cache.get(sync).is_some_and(|slot| slot.token == token);
+    if !fresh {
+        cache.remove(sync);
+        return None;
+    }
+    cache.remove(sync)
+}
+
+pub(super) fn store_groups(
+    sync: &std::path::Path,
+    groups: FieldGroups,
+    ops: Vec<Operation>,
+    conflicts: Vec<Conflict>,
+) {
+    let Some(parent) = sync.parent() else {
+        return;
+    };
+    let Some(token) = segments::change_token(parent) else {
+        return;
+    };
+    let mut cache = groups_cache();
+    if cache.len() > 32 {
+        cache.clear();
+    }
+    cache.insert(
+        sync.to_path_buf(),
+        GroupsSlot {
+            token,
+            groups,
+            ops,
+            conflicts,
+        },
+    );
+}
+
+pub(super) fn group_ops(ops: &[Operation]) -> FieldGroups {
+    let mut groups = FieldGroups::new();
+    for op in ops {
+        push_group(&mut groups, op);
+    }
+    groups
+}
+
+fn push_group(groups: &mut FieldGroups, op: &Operation) {
+    for field in op
+        .set
+        .keys()
+        .filter(|field| !matches!(field.as_str(), "draft" | "updated_at"))
+    {
+        groups
+            .entry((
+                op.project.clone(),
+                op.entity.clone(),
+                op.id.clone(),
+                field.clone(),
+            ))
+            .or_default()
+            .push(op.clone());
+    }
+}
+
+fn push_pair(
+    result: &mut Vec<Conflict>,
+    entity: (&str, &str, &str, &str),
+    clocks: &BTreeMap<&Hlc, &Operation>,
+    a: &Operation,
+    b: &Operation,
+) {
+    let (project, kind, id, field) = entity;
+    let (Some(av), Some(bv)) = (a.set.get(field), b.set.get(field)) else {
+        return;
+    };
+    if a.hlc.2 == b.hlc.2
+        || av == bv
+        || ancestor(clocks, field, &a.hlc, b)
+        || ancestor(clocks, field, &b.hlc, a)
+    {
+        return;
+    }
+    let (winner, loser, winner_value, loser_value) = if a.hlc > b.hlc {
+        (a, b, av, bv)
+    } else {
+        (b, a, bv, av)
+    };
+    result.push(Conflict {
+        project: project.into(),
+        entity: kind.into(),
+        id: id.into(),
+        field: field.into(),
+        winner: winner.hlc.clone(),
+        loser: loser.hlc.clone(),
+        winner_value: winner_value.clone(),
+        loser_value: loser_value.clone(),
+    });
+}
+
+fn live_deletion(state: &JournalState, op: &Operation) -> bool {
+    let Some(life) = state
+        .lifecycle
+        .get(&key(&op.project, real_entity_name(op), &op.id))
+    else {
+        return false;
+    };
+    life.deleted.as_ref().is_some_and(|deleted| {
+        life.restored
+            .as_ref()
+            .is_none_or(|restored| deleted > restored)
+    })
+}
+
+fn real_entity_name(op: &Operation) -> &str {
+    projection::real_entity(op)
+}
+
+/// Pairs that involve `new_ops`, unioned with `prior`. A tombstone or a live
+/// deletion recomputes from the retained set; delivery order stays irrelevant.
+pub(super) fn ingest(
+    state: &JournalState,
+    groups: &mut FieldGroups,
+    ops: &mut Vec<Operation>,
+    prior: &[Conflict],
+    new_ops: &[Operation],
+) -> Result<Vec<Conflict>> {
+    let fresh: Vec<&Operation> = new_ops
+        .iter()
+        .filter(|op| ops.iter().all(|old| old.op != op.op))
+        .collect();
+    if fresh.is_empty() {
+        return Ok(prior.to_vec());
+    }
+    let rebuild = fresh.iter().any(|op| {
+        matches!(op.entity.as_str(), "tombstone" | "restore") || live_deletion(state, op)
+    }) || ops.iter().any(|op| {
+        matches!(op.entity.as_str(), "tombstone" | "restore") || live_deletion(state, op)
+    });
+    if rebuild {
+        ops.extend(fresh.into_iter().cloned());
+        *groups = group_ops(ops);
+        return conflicts_of(state, ops);
+    }
+    let mut by_field: BTreeMap<(String, String, String, String), Vec<&Operation>> = BTreeMap::new();
+    for op in &fresh {
+        for field in op
+            .set
+            .keys()
+            .filter(|field| !matches!(field.as_str(), "draft" | "updated_at"))
+        {
+            by_field
+                .entry((
+                    op.project.clone(),
+                    op.entity.clone(),
+                    op.id.clone(),
+                    field.clone(),
+                ))
+                .or_default()
+                .push(*op);
+        }
+    }
+    let mut result = Vec::new();
+    for (key, fresh_ops) in &by_field {
+        let existing = groups.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        // The same node cannot conflict with itself. Skip the pairwise walk
+        // when this field has no other node and no conflict to revalidate.
+        let node = fresh_ops.first().map(|op| op.hlc.2.as_str());
+        if node.is_some_and(|node| {
+            fresh_ops.iter().all(|op| op.hlc.2 == node)
+                && existing.iter().all(|op| op.hlc.2 == node)
+                && prior.iter().all(|conflict| {
+                    (
+                        &conflict.project,
+                        &conflict.entity,
+                        &conflict.id,
+                        &conflict.field,
+                    ) != (&key.0, &key.1, &key.2, &key.3)
+                })
+        }) {
+            continue;
+        }
+        let mut versions: Vec<&Operation> = existing.iter().collect();
+        versions.extend(fresh_ops.iter().copied());
+        let clocks: BTreeMap<&Hlc, &Operation> = versions.iter().map(|op| (&op.hlc, *op)).collect();
+        for conflict in prior {
+            if (
+                &conflict.project,
+                &conflict.entity,
+                &conflict.id,
+                &conflict.field,
+            ) != (&key.0, &key.1, &key.2, &key.3)
+            {
+                continue;
+            }
+            let Some(winner) = versions.iter().find(|op| op.hlc == conflict.winner) else {
+                continue;
+            };
+            let Some(loser) = versions.iter().find(|op| op.hlc == conflict.loser) else {
+                continue;
+            };
+            push_pair(
+                &mut result,
+                (&key.0, &key.1, &key.2, &key.3),
+                &clocks,
+                winner,
+                loser,
+            );
+        }
+        for new_op in fresh_ops {
+            for old in existing {
+                push_pair(
+                    &mut result,
+                    (&key.0, &key.1, &key.2, &key.3),
+                    &clocks,
+                    old,
+                    new_op,
+                );
+            }
+        }
+        for (i, a) in fresh_ops.iter().enumerate() {
+            for b in &fresh_ops[i + 1..] {
+                push_pair(&mut result, (&key.0, &key.1, &key.2, &key.3), &clocks, a, b);
+            }
+        }
+    }
+    for conflict in prior {
+        let key = (
+            conflict.project.clone(),
+            conflict.entity.clone(),
+            conflict.id.clone(),
+            conflict.field.clone(),
+        );
+        if !by_field.contains_key(&key) {
+            result.push(conflict.clone());
+        }
+    }
+    for op in &fresh {
+        push_group(groups, op);
+    }
+    ops.extend(fresh.into_iter().cloned());
+    result.sort_by(|a, b| {
+        (&a.project, &a.entity, &a.id, &a.field, &a.winner, &a.loser)
+            .cmp(&(&b.project, &b.entity, &b.id, &b.field, &b.winner, &b.loser))
+    });
+    result.dedup();
+    Ok(result)
+}
+
 pub(super) fn conflicts_of(state: &JournalState, ops: &[Operation]) -> Result<Vec<Conflict>> {
     let mut result = Vec::new();
     let mut groups: BTreeMap<(&str, &str, &str, &str), Vec<&Operation>> = BTreeMap::new();
@@ -297,30 +570,7 @@ pub(super) fn conflicts_of(state: &JournalState, ops: &[Operation]) -> Result<Ve
         let clocks: BTreeMap<&Hlc, &Operation> = versions.iter().map(|op| (&op.hlc, *op)).collect();
         for (i, a) in versions.iter().enumerate() {
             for b in &versions[i + 1..] {
-                let av = &a.set[field];
-                let bv = &b.set[field];
-                if a.hlc.2 == b.hlc.2
-                    || av == bv
-                    || ancestor(&clocks, field, &a.hlc, b)
-                    || ancestor(&clocks, field, &b.hlc, a)
-                {
-                    continue;
-                }
-                let (winner, loser, winner_value, loser_value) = if a.hlc > b.hlc {
-                    (*a, *b, av, bv)
-                } else {
-                    (*b, *a, bv, av)
-                };
-                result.push(Conflict {
-                    project: project.into(),
-                    entity: entity.into(),
-                    id: id.into(),
-                    field: field.into(),
-                    winner: winner.hlc.clone(),
-                    loser: loser.hlc.clone(),
-                    winner_value: winner_value.clone(),
-                    loser_value: loser_value.clone(),
-                });
+                push_pair(&mut result, (project, entity, id, field), &clocks, a, b);
             }
         }
     }

@@ -1,8 +1,10 @@
 //! Periodic projection of field state and commutative per-entity lifecycle.
 //! Deleting `projection.json` rebuilds both by replaying the segments.
-use std::fs::{self, File};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use super::format::{JournalLimits, STORE_FORMAT};
 use super::*;
@@ -294,7 +296,70 @@ pub(super) fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<
     Ok(())
 }
 
+struct StateSlot {
+    token: u64,
+    state: JournalState,
+    prune: PruneMeta,
+}
+
+static STATE_CACHE: LazyLock<Mutex<HashMap<PathBuf, StateSlot>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn state_cache() -> std::sync::MutexGuard<'static, HashMap<PathBuf, StateSlot>> {
+    STATE_CACHE.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+pub(super) fn forget(sync: &Path) {
+    state_cache().remove(sync);
+}
+
+pub(super) fn cached_prune(sync: &Path) -> Option<PruneMeta> {
+    let parent = sync.parent()?;
+    let token = segments::change_token(parent)?;
+    let cache = state_cache();
+    let slot = cache.get(sync)?;
+    (slot.token == token).then(|| slot.prune.clone())
+}
+
+/// Remember a projection that already matches the files `change_token` watches.
+pub(super) fn remember(sync: &Path, state: &JournalState, prune: &PruneMeta) {
+    let Some(parent) = sync.parent() else {
+        return;
+    };
+    let Some(token) = segments::change_token(parent) else {
+        return;
+    };
+    let mut cache = state_cache();
+    if cache.len() > 32 {
+        cache.clear();
+    }
+    cache.insert(
+        sync.to_path_buf(),
+        StateSlot {
+            token,
+            state: state.clone(),
+            prune: prune.clone(),
+        },
+    );
+}
+
 pub(super) fn load_state(sync: &Path) -> Result<(JournalState, PruneMeta)> {
+    if let Some(parent) = sync.parent()
+        && let Some(token) = segments::change_token(parent)
+    {
+        let cache = state_cache();
+        if let Some(slot) = cache.get(sync)
+            && slot.token == token
+        {
+            return Ok((slot.state.clone(), slot.prune.clone()));
+        }
+    }
+    let loaded = load_state_disk(sync)?;
+    remember(sync, &loaded.0, &loaded.1);
+    Ok(loaded)
+}
+
+fn load_state_disk(sync: &Path) -> Result<(JournalState, PruneMeta)> {
     let stored = read_projection(sync)?.unwrap_or_default();
     let mut state = JournalState {
         fields: stored.fields,
@@ -333,13 +398,29 @@ struct Since {
 
 fn read_since(sync: &Path) -> Result<Since> {
     match fs::read_to_string(since_path(sync)) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| invalid(&e.to_string())),
+        Ok(text) => Ok(serde_json::from_str(&text).unwrap_or(Since {
+            ops: 0,
+            at_ms: now_ms(),
+        })),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Since {
             ops: 0,
             at_ms: now_ms(),
         }),
         Err(e) => Err(e.into()),
     }
+}
+
+fn write_since(sync: &Path, since: &Since) -> Result<()> {
+    fs::create_dir_all(sync.join("meta"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(since_path(sync))?;
+    writeln!(file, "{}", json(since)?)?;
+    // The counter is a hint shared by processes. A crash may repeat or skip a
+    // snapshot window; the projection itself is what recovery replays.
+    Ok(())
 }
 
 pub(super) fn checkpoint(
@@ -360,19 +441,18 @@ pub(super) fn checkpoint(
     // A first small write still records `since` so the window starts now.
     if !due && read_projection(sync)?.is_none() && since.ops < limits.snapshot_ops && !force {
         if !since_path(sync).exists() {
-            fs::create_dir_all(sync.join("meta"))?;
-            atomic_write_text_raw(
-                &since_path(sync),
-                &json(&Since {
+            write_since(
+                sync,
+                &Since {
                     ops: since.ops,
                     at_ms: now,
-                })?,
+                },
             )?;
         }
         return Ok(false);
     }
     write_checkpoint(sync, state, prune)?;
-    atomic_write_text_raw(&since_path(sync), &json(&Since { ops: 0, at_ms: now })?)?;
+    write_since(sync, &Since { ops: 0, at_ms: now })?;
     Ok(true)
 }
 
@@ -386,8 +466,7 @@ pub(super) fn note_ops(sync: &Path, count: u64) -> Result<()> {
         since.at_ms = now;
     }
     since.ops = since.ops.saturating_add(count);
-    fs::create_dir_all(sync.join("meta"))?;
-    atomic_write_text_raw(&since_path(sync), &json(&since)?)
+    write_since(sync, &since)
 }
 
 pub(super) fn write_checkpoint(sync: &Path, state: &JournalState, prune: &PruneMeta) -> Result<()> {
@@ -419,5 +498,8 @@ pub(super) fn write_checkpoint(sync: &Path, state: &JournalState, prune: &PruneM
 }
 
 pub(super) fn load_prune(sync: &Path) -> Result<PruneMeta> {
+    if let Some(prune) = cached_prune(sync) {
+        return Ok(prune);
+    }
     Ok(read_projection(sync)?.map(|p| p.prune).unwrap_or_default())
 }

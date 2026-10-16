@@ -64,8 +64,12 @@ fn finish(root: &Path, pending: &RemotePending) -> Result<()> {
         }
     }
     if let Some(uids) = &pending.uids {
-        fs::create_dir_all(root.join("meta"))?;
-        projection::atomic_write_json(&root.join("meta/uids.json"), uids)?;
+        let path = root.join("meta/uids.json");
+        let text = serde_json::to_string(uids).map_err(|e| invalid(&e.to_string()))?;
+        if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+            fs::create_dir_all(root.join("meta"))?;
+            projection::atomic_write_json(&path, uids)?;
+        }
     }
     if !pending.conflicts.is_empty() {
         atomic_write_text_raw(&root.join("meta/conflicts.jsonl"), &pending.conflicts)?;
@@ -226,6 +230,8 @@ impl Journal {
         let sync = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
         let (mut state, prune_meta) = projection::load_state(&self.root)?;
+        let cached = prune::take_groups(&self.root);
+        let warm = cached.is_some();
         let previous_aliases = state.project_uids.clone();
         let mut clock: Hlc = self.clock()?;
         for op in operations {
@@ -246,13 +252,50 @@ impl Journal {
             accepted.push(op.clone());
         }
         if accepted.is_empty() {
-            return prune::conflicts_of(&state, &self.retained_ops(&state)?);
+            let conflicts = if let Some(cached) = cached.as_ref() {
+                cached.conflicts.clone()
+            } else {
+                prune::conflicts_of(&state, &self.retained_ops(&state)?)?
+            };
+            if let Some(cached) = cached {
+                prune::store_groups(&self.root, cached.groups, cached.ops, cached.conflicts);
+            }
+            return Ok(conflicts);
         }
-        let mut history = self.retained_ops(&state)?;
-        history.extend(accepted.iter().cloned());
-        let conflicts = prune::conflicts_of(&state, &history)?;
+        let prior_conflicts = cached
+            .as_ref()
+            .map(|slot| slot.conflicts.clone())
+            .unwrap_or_default();
+        let (groups, retained, conflicts) = if let Some(mut slot) = cached {
+            let conflicts = prune::ingest(
+                &state,
+                &mut slot.groups,
+                &mut slot.ops,
+                &slot.conflicts,
+                &accepted,
+            )?;
+            (slot.groups, slot.ops, conflicts)
+        } else {
+            let mut history = self.retained_ops(&state)?;
+            history.extend(accepted.iter().cloned());
+            let mut groups = prune::FieldGroups::new();
+            let mut retained = Vec::new();
+            let conflicts = prune::ingest(&state, &mut groups, &mut retained, &[], &history)?;
+            (groups, retained, conflicts)
+        };
+        #[cfg(debug_assertions)]
+        {
+            let full = prune::conflicts_of(&state, &retained)?;
+            assert_eq!(
+                conflicts, full,
+                "incremental conflicts diverged from a full recompute"
+            );
+        }
+        let touched = touched_entity_keys(&accepted);
+        let note_threads = new_note_threads(&state, &prior_conflicts, &conflicts);
         let mut writes = BTreeMap::new();
         project_aliases(&mut state)?;
+        let include_all = !warm || previous_aliases != state.project_uids;
         // Existing boards remain locked while calculating collision destinations.
         // Release sync before locking newly allocated boards to preserve lock order.
         drop(sync);
@@ -269,9 +312,18 @@ impl Journal {
             &previous_aliases,
             &conflicts,
             &mut writes,
+            &ProjectScope {
+                touched: &touched,
+                note_threads: &note_threads,
+                include_all,
+            },
         )?;
         let mut blobs = BTreeMap::new();
-        for (key, fields) in &state.fields {
+        for (field_key, fields) in &state.fields {
+            if !include_all && !touched.contains(field_key) {
+                continue;
+            }
+            let key = field_key;
             let (project, entity, id): (String, String, String) =
                 serde_json::from_str(key).map_err(|e| invalid(&e.to_string()))?;
             if entity != "file" {
@@ -323,12 +375,18 @@ impl Journal {
         fs::remove_file(path)?;
         state.vector = segments::heads(&self.root, &state.compacted)?;
         projection::note_ops(&self.root, pending.operations.len() as u64)?;
-        if projection::checkpoint(&self.root, &state, &prune_meta, false)?
+        let pruned = if projection::checkpoint(&self.root, &state, &prune_meta, false)?
             && format::solo_store(store)
         {
             let _ = self.prune(&BTreeMap::new());
+            true
+        } else {
+            false
+        };
+        if !pruned {
+            prune::store_groups(&self.root, groups, retained, conflicts.clone());
+            projection::remember(&self.root, &state, &prune_meta);
         }
-        fs::File::open(&self.root)?.sync_all()?;
         Ok(conflicts)
     }
 }
@@ -512,16 +570,131 @@ fn set_path(value: &mut Value, path: &str, new: &Value) {
 
 type ThreadProjection = BTreeMap<(String, String), Vec<(Hlc, String, Value)>>;
 
+fn touched_entity_keys(ops: &[Operation]) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for op in ops {
+        let entity = projection::real_entity(op);
+        keys.insert(key(&op.project, entity, &op.id));
+        if op.entity != entity {
+            keys.insert(key(&op.project, &op.entity, &op.id));
+        }
+    }
+    keys
+}
+
+fn conflict_task(state: &JournalState, conflict: &Conflict) -> Option<(String, String)> {
+    if conflict.entity == "task" {
+        return Some((conflict.project.clone(), conflict.id.clone()));
+    }
+    if conflict.entity == "message" {
+        let task = state
+            .fields
+            .get(&key(&conflict.project, "message", &conflict.id))
+            .and_then(|fields| fields.values.get("task_id"))
+            .and_then(Value::as_str)?;
+        return Some((conflict.project.clone(), task.to_owned()));
+    }
+    None
+}
+
+fn new_note_threads(
+    state: &JournalState,
+    prior: &[Conflict],
+    conflicts: &[Conflict],
+) -> BTreeSet<(String, String)> {
+    let old: BTreeSet<_> = prior
+        .iter()
+        .map(|conflict| {
+            (
+                conflict.project.as_str(),
+                conflict.entity.as_str(),
+                conflict.id.as_str(),
+                conflict.field.as_str(),
+                &conflict.winner,
+                &conflict.loser,
+            )
+        })
+        .collect();
+    let mut threads = BTreeSet::new();
+    for conflict in conflicts {
+        let id = (
+            conflict.project.as_str(),
+            conflict.entity.as_str(),
+            conflict.id.as_str(),
+            conflict.field.as_str(),
+            &conflict.winner,
+            &conflict.loser,
+        );
+        if old.contains(&id) {
+            continue;
+        }
+        if let Some(task) = conflict_task(state, conflict) {
+            threads.insert(task);
+        }
+    }
+    threads
+}
+
+struct ProjectScope<'a> {
+    touched: &'a BTreeSet<String>,
+    note_threads: &'a BTreeSet<(String, String)>,
+    include_all: bool,
+}
+
 fn project_files(
     store: &Path,
     state: &mut JournalState,
     previous_aliases: &BTreeMap<String, String>,
     conflicts: &[Conflict],
     writes: &mut BTreeMap<PathBuf, Option<String>>,
+    scope: &ProjectScope<'_>,
 ) -> Result<()> {
+    let mut include_all = scope.include_all;
     let renames = ids::reassign(state);
+    if !renames.renamed().is_empty() {
+        include_all = true;
+    }
+    let mut include = scope.touched.clone();
+    let mut thread_ids = scope.note_threads.clone();
+    if !include_all {
+        for entity_key in scope.touched {
+            let Ok((project, entity, _)) =
+                serde_json::from_str::<(String, String, String)>(entity_key)
+            else {
+                continue;
+            };
+            if entity == "message"
+                && let Some(task) = state
+                    .fields
+                    .get(entity_key)
+                    .and_then(|fields| fields.values.get("task_id"))
+                    .and_then(Value::as_str)
+            {
+                thread_ids.insert((project, task.to_owned()));
+            }
+        }
+        let message_keys: Vec<String> = state
+            .fields
+            .iter()
+            .filter_map(|(entity_key, fields)| {
+                let (project, entity, _) =
+                    serde_json::from_str::<(String, String, String)>(entity_key).ok()?;
+                if entity != "message" {
+                    return None;
+                }
+                let task = fields.values.get("task_id")?.as_str()?;
+                thread_ids
+                    .contains(&(project, task.to_owned()))
+                    .then(|| entity_key.clone())
+            })
+            .collect();
+        include.extend(message_keys);
+    }
     let mut threads = ThreadProjection::new();
     for (k, fields) in &state.fields {
+        if !include_all && !include.contains(k) {
+            continue;
+        }
         let (project, entity, id): (String, String, String) =
             serde_json::from_str(k).map_err(|e| invalid(&e.to_string()))?;
         let alias = state
@@ -736,6 +909,9 @@ fn project_files(
         let Some(task) = task else {
             continue;
         };
+        if !include_all && !thread_ids.contains(&(c.project.clone(), task.to_owned())) {
+            continue;
+        }
         let uid = format!("sync-conflict:{}", json(c)?);
         let time = timestamp(&c.winner);
         let note = serde_json::json!({"id": uid, "role": "system", "kind": "system", "status": "resolved", "author": "kanban", "origin": "kanban",
@@ -770,6 +946,7 @@ fn project_files(
             continue;
         };
         if entity == "message"
+            && (include_all || include.contains(k))
             && let Some(task) = fields.values.get("task_id").and_then(Value::as_str)
         {
             threads.entry((project, task.into())).or_default();
