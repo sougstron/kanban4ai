@@ -1972,25 +1972,30 @@ fn pack(manifest: &Manifest, files: &[Staged], dest: &Path) -> Result<()> {
         opts.mode(0o600);
     }
     let file = opts.open(&partial)?;
-    set_mode(&partial, 0o600)?;
-    let encoder = GzEncoder::new(file, Compression::default());
-    let mut builder = Builder::new(encoder);
-    let body =
-        serde_json::to_vec_pretty(manifest).map_err(|err| KanbanError::Invalid(err.to_string()))?;
-    append_bytes(&mut builder, "MANIFEST.json", &body, 0o600)?;
-    for staged in files {
-        let mut header = Header::new_gnu();
-        header.set_path(&staged.archive_path)?;
-        header.set_size(staged.size);
-        header.set_mode(staged.mode);
-        header.set_cksum();
-        let mut file = File::open(&staged.path)?;
-        builder.append(&header, &mut file)?;
+    let written = (|| -> Result<()> {
+        set_mode(&partial, 0o600)?;
+        let encoder = GzEncoder::new(file, Compression::default());
+        let mut builder = Builder::new(encoder);
+        let body = serde_json::to_vec_pretty(manifest)
+            .map_err(|err| KanbanError::Invalid(err.to_string()))?;
+        append_bytes(&mut builder, "MANIFEST.json", &body, 0o600)?;
+        for staged in files {
+            let mut header = Header::new_gnu();
+            header.set_size(staged.size);
+            header.set_mode(staged.mode);
+            // `append_data` writes a GNU long-name entry for paths past the
+            // 100-byte header field (e.g. relay git mirrors under sync/).
+            builder.append_data(&mut header, &staged.archive_path, File::open(&staged.path)?)?;
+        }
+        let encoder = builder.into_inner()?;
+        let file = encoder.finish()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = written {
+        let _ = fs::remove_file(&partial);
+        return Err(err);
     }
-    let encoder = builder.into_inner()?;
-    let file = encoder.finish()?;
-    file.sync_all()?;
-    drop(file);
     fs::rename(&partial, dest)?;
     set_mode(dest, 0o600)?;
     if let Some(parent) = dest.parent() {
@@ -2006,11 +2011,9 @@ fn append_bytes<W: Write>(
     mode: u32,
 ) -> Result<()> {
     let mut header = Header::new_gnu();
-    header.set_path(path)?;
     header.set_size(bytes.len() as u64);
     header.set_mode(mode);
-    header.set_cksum();
-    builder.append(&header, bytes)?;
+    builder.append_data(&mut header, path, bytes)?;
     Ok(())
 }
 
@@ -2718,6 +2721,29 @@ mod tests {
         assert_eq!(task_bytes(&fix.data_root, &task.id), before);
         assert_eq!(fs::read_dir(&fix.dir).unwrap().count(), archives);
         assert_eq!(task_ids(&fix.data_root.join(".kanban/tasks")).len(), 2);
+    }
+
+    #[test]
+    fn paths_past_the_tar_name_field_round_trip() {
+        let fix = fix();
+        let images = fix.data_root.join(".kanban/assets/images");
+        fs::create_dir_all(&images).unwrap();
+        let name = format!("{}.png", "x".repeat(140));
+        fs::write(images.join(&name), b"png").unwrap();
+        let created = create(&fix.store, &request(&fix.dir, false)).unwrap();
+        let manifest = verify(&created.core.path).unwrap();
+        assert!(
+            manifest
+                .files
+                .iter()
+                .any(|file| file.path.len() > 100 && file.path.ends_with(&name))
+        );
+        let leftovers: Vec<_> = fs::read_dir(&fix.dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".partial"))
+            .collect();
+        assert!(leftovers.is_empty());
     }
 
     #[test]
