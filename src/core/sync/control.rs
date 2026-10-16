@@ -104,7 +104,7 @@ pub(crate) fn request(board: &Path, task: &str, action: &str) -> Result<bool> {
     };
     validate(&operation)?;
     apply_meta(&mut state, &operation);
-    commit_local(&journal, &state, &before_uids, &[operation], None)?;
+    commit_local(&journal, state, &before_uids, &[operation], None)?;
     Ok(true)
 }
 

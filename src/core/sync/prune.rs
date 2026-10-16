@@ -37,7 +37,7 @@ impl Journal {
         }
         gc_blobs(&self.root, &state, &retained)?;
         let _ = segments::rebuild_index(&self.root);
-        projection::remember(&self.root, &state, &meta);
+        projection::remember(&self.root, state, &meta);
         Ok(h)
     }
 

@@ -184,6 +184,10 @@ pub fn tick(
         .unwrap_or_else(|| Ok(crate::core::limits::DEFAULT_REFRESH_INTERVAL))
         .unwrap_or(crate::core::limits::DEFAULT_REFRESH_INTERVAL);
     crate::core::limits::refresh_if_stale(limits_ttl);
+    // Once a day, off the tick thread. A temp store (the test suite) is
+    // ignored inside `poke_auto` so a pump cannot write into the user's
+    // state directory or take locks on a fixture.
+    crate::core::backup::poke_auto(store.root());
 
     lines.append(&mut pump_all(projects, state));
     Ok(lines)

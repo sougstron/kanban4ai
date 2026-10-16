@@ -41,6 +41,15 @@ pub fn run(once: bool, interval: Option<u64>, project: Option<&str>) -> Result<E
         .enable_all()
         .build()?;
     runtime.block_on(async {
+        // `--once` returns as soon as the tick does; finish a snapshot that
+        // the tick only started, including when a later step errors.
+        struct JoinBackup;
+        impl Drop for JoinBackup {
+            fn drop(&mut self) {
+                crate::core::backup::join_auto();
+            }
+        }
+        let _join_backup = JoinBackup;
         let shutdown = super::serve::shutdown_signal()?;
         tokio::pin!(shutdown);
         let mut state = PumpState::default();

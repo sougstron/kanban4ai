@@ -215,15 +215,31 @@ pub(super) fn delta(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
 ) -> MapDelta {
+    // One merge walk over both sorted maps; this runs on every captured write.
     let mut out = MapDelta::default();
-    for (k, v) in after {
-        if before.get(k) != Some(v) {
-            out.set.insert(k.clone(), v.clone());
-        }
-    }
-    for k in before.keys() {
-        if !after.contains_key(k) {
-            out.remove.push(k.clone());
+    let (mut b, mut a) = (before.iter().peekable(), after.iter().peekable());
+    loop {
+        match (b.peek(), a.peek()) {
+            (None, None) => break,
+            (Some((bk, _)), Some((ak, _))) if bk < ak => {
+                out.remove.push((*bk).clone());
+                b.next();
+            }
+            (Some((bk, bv)), Some((ak, av))) if bk == ak => {
+                if bv != av {
+                    out.set.insert((*ak).clone(), (*av).clone());
+                }
+                b.next();
+                a.next();
+            }
+            (_, Some((ak, av))) => {
+                out.set.insert((*ak).clone(), (*av).clone());
+                a.next();
+            }
+            (Some((bk, _)), None) => {
+                out.remove.push((*bk).clone());
+                b.next();
+            }
         }
     }
     out
@@ -238,13 +254,30 @@ pub(super) fn uids_of(state: &JournalState) -> Uids {
     }
 }
 
-pub(super) fn uids_delta(before: &Uids, after: &Uids) -> UidsDelta {
+pub(super) fn uids_delta(before: &Uids, after: &JournalState) -> UidsDelta {
     UidsDelta {
         project: delta(&before.project_uids, &after.project_uids),
         message: delta(&before.message_uids, &after.message_uids),
         task: delta(&before.task_uids, &after.task_uids),
         alias: delta(&before.task_aliases, &after.task_aliases),
     }
+}
+
+/// Whether `state` still carries exactly the uid tables of `uids`.
+pub(super) fn same_uids(uids: &Uids, state: &JournalState) -> bool {
+    uids.project_uids == state.project_uids
+        && uids.message_uids == state.message_uids
+        && uids.task_uids == state.task_uids
+        && uids.task_aliases == state.task_aliases
+}
+
+/// `Uids` borrowed from a state, so saving them does not clone the tables.
+#[derive(Serialize)]
+struct UidsRef<'a> {
+    project_uids: &'a BTreeMap<String, String>,
+    message_uids: &'a BTreeMap<String, String>,
+    task_uids: &'a BTreeMap<String, String>,
+    task_aliases: &'a BTreeMap<String, String>,
 }
 
 fn apply_uids(state: &mut JournalState, uids: Uids) {
@@ -459,7 +492,15 @@ pub(super) fn load_uids(sync: &Path) -> Result<Uids> {
 
 pub(super) fn save_uids(sync: &Path, state: &JournalState) -> Result<()> {
     fs::create_dir_all(sync.join("meta"))?;
-    atomic_write_json(&uids_path(sync), &uids_of(state))
+    atomic_write_json(
+        &uids_path(sync),
+        &UidsRef {
+            project_uids: &state.project_uids,
+            message_uids: &state.message_uids,
+            task_uids: &state.task_uids,
+            task_aliases: &state.task_aliases,
+        },
+    )
 }
 
 /// Stream a JSON value to a temp file in the destination directory, then rename.
@@ -514,7 +555,9 @@ pub(super) fn cached_prune(sync: &Path) -> Option<PruneMeta> {
 }
 
 /// Remember a projection that already matches the files `change_token` watches.
-pub(super) fn remember(sync: &Path, state: &JournalState, prune: &PruneMeta) {
+/// Takes the state by value: a whole-store projection is large, and cloning it
+/// on every write made a full drift scan quadratic.
+pub(super) fn remember(sync: &Path, state: JournalState, prune: &PruneMeta) {
     if state.partial {
         return;
     }
@@ -532,7 +575,7 @@ pub(super) fn remember(sync: &Path, state: &JournalState, prune: &PruneMeta) {
         sync.to_path_buf(),
         StateSlot {
             token,
-            state: state.clone(),
+            state,
             prune: prune.clone(),
         },
     );
@@ -550,7 +593,7 @@ pub(super) fn load_state(sync: &Path) -> Result<(JournalState, PruneMeta)> {
         }
     }
     let loaded = load_state_disk(sync)?;
-    remember(sync, &loaded.0, &loaded.1);
+    remember(sync, loaded.0.clone(), &loaded.1);
     Ok(loaded)
 }
 
@@ -597,6 +640,32 @@ pub(super) fn load_tasks(
     {
         return Ok(slot.state.clone());
     }
+    load_tasks_cold(sync, scope)
+}
+
+/// `load_tasks` for a writer that hands the state back through `remember`
+/// (`commit_local` does): a warm whole-store state is moved out of the cache
+/// instead of cloned. A writer that fails or bails out without remembering
+/// leaves the cache empty, so the next load reads disk again.
+pub(super) fn take_tasks(
+    sync: &Path,
+    scope: impl FnOnce(&Uids) -> (String, Vec<String>),
+) -> Result<JournalState> {
+    if let Some(parent) = sync.parent()
+        && let Some(token) = segments::change_token(parent)
+    {
+        let mut cache = state_cache();
+        if cache.get(sync).is_some_and(|slot| slot.token == token) {
+            return Ok(cache.remove(sync).expect("cached slot").state);
+        }
+    }
+    load_tasks_cold(sync, scope)
+}
+
+fn load_tasks_cold(
+    sync: &Path,
+    scope: impl FnOnce(&Uids) -> (String, Vec<String>),
+) -> Result<JournalState> {
     if read_head(sync)?.is_none() {
         // A format 2 projection is one file; read it whole until it is sharded.
         return Ok(load_state_disk(sync)?.0);
@@ -824,6 +893,27 @@ mod tests {
 
     fn task(id: &str, title: &str) -> String {
         format!("---\nid: {id}\ntitle: {title}\nstatus: todo\n---\nbody\n")
+    }
+
+    #[test]
+    fn delta_walk_reports_sets_changes_and_removals() {
+        let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        let before = map(&[("a", "1"), ("b", "2"), ("d", "4"), ("f", "6")]);
+        let after = map(&[("b", "2"), ("c", "3"), ("d", "40"), ("g", "7")]);
+        let out = delta(&before, &after);
+        assert_eq!(out.set, map(&[("c", "3"), ("d", "40"), ("g", "7")]));
+        assert_eq!(out.remove, vec!["a".to_owned(), "f".to_owned()]);
+        let mut applied = before.clone();
+        out.apply(&mut applied);
+        assert_eq!(applied, after);
+        assert!(delta(&after, &after).is_empty());
+        assert_eq!(delta(&BTreeMap::new(), &after).set, after);
+        assert_eq!(delta(&before, &BTreeMap::new()).remove.len(), before.len());
     }
 
     fn thread(id: &str, bodies: &[&str]) -> String {

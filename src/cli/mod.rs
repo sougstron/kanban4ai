@@ -1,6 +1,7 @@
 //! The `kanban` command-line interface (clap). Output text mirrors the Python
 //! CLI so existing agent prompts and scripts keep working unchanged.
 
+mod backup;
 mod bridge;
 mod daemon;
 mod init;
@@ -116,6 +117,18 @@ enum Command {
     /// Manage registered projects.
     #[command(subcommand)]
     Project(ProjectCommand),
+    /// Snapshot the store, check an archive, or restore it.
+    #[command(args_conflicts_with_subcommands = true)]
+    Backup {
+        /// Include agent artifacts (`assets/` outside `images/`) in this snapshot.
+        #[arg(long)]
+        with_artifacts: bool,
+        /// Backup directory (default: backup.dir or $XDG_STATE_HOME/kanban4ai/backups).
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: Option<backup::BackupAction>,
+    },
     /// List all tasks.
     List {
         /// Filter by status
@@ -807,6 +820,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
     match command {
         Command::Init { path, copy, force } => return init::init(&path, copy, force),
         Command::Project(command) => return project::run(command),
+        Command::Backup {
+            with_artifacts,
+            dir,
+            action,
+        } => return backup::run(with_artifacts, dir, action),
         Command::ResolveAgent { requested, command } => {
             println!("{}", resolve_opencode_agent(&command, &requested));
             return Ok(ExitCode::SUCCESS);
@@ -1700,7 +1718,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         | Command::StatuslineBridge
         | Command::Serve { .. }
         | Command::Join { .. }
-        | Command::Daemon { .. } => {
+        | Command::Daemon { .. }
+        | Command::Backup { .. } => {
             unreachable!("handled before resolve")
         }
         Command::AgentExit {

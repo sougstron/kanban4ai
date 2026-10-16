@@ -137,7 +137,7 @@ impl Journal {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| invalid("invalid board"))?;
-        let mut state = projection::load_tasks(&self.root, |uids| {
+        let mut state = projection::take_tasks(&self.root, |uids| {
             projection::task_scope(uids, alias, &[task])
         })?;
         let before_uids = projection::uids_of(&state);
@@ -186,7 +186,7 @@ impl Journal {
         };
         validate(&operation)?;
         apply_meta(&mut state, &operation);
-        commit_local(self, &state, &before_uids, &[operation], None)?;
+        commit_local(self, state, &before_uids, &[operation], None)?;
         Ok(())
     }
 }

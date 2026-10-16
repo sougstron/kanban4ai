@@ -385,7 +385,7 @@ impl Journal {
         };
         if !pruned {
             prune::store_groups(&self.root, groups, retained, conflicts.clone());
-            projection::remember(&self.root, &state, &prune_meta);
+            projection::remember(&self.root, state, &prune_meta);
         }
         Ok(conflicts)
     }

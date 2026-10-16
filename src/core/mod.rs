@@ -1,5 +1,6 @@
 pub mod ask_form;
 pub mod auto_mode;
+pub mod backup;
 pub mod code;
 pub mod compaction;
 pub mod config;

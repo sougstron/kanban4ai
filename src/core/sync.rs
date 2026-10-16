@@ -506,7 +506,7 @@ fn key(project: &str, entity: &str, id: &str) -> String {
 
 fn commit_local(
     journal: &Journal,
-    state: &JournalState,
+    state: JournalState,
     before: &projection::Uids,
     ops: &[Operation],
     file: Option<FileWrite>,
@@ -525,7 +525,7 @@ fn commit_local(
         segment: prepared.segment,
         start_offset: prepared.start_offset,
         through_seq: through,
-        uids: projection::uids_delta(before, &projection::uids_of(state)),
+        uids: projection::uids_delta(before, &state),
         run_projection: ops
             .iter()
             .any(|op| op.entity == "run" && !op.set.contains_key("command")),
@@ -563,10 +563,10 @@ fn commit_local(
         return Err(invalid("journal append shrank"));
     }
     if !intent.uids.is_empty() {
-        projection::save_uids(&journal.root, state)?;
+        projection::save_uids(&journal.root, &state)?;
     }
     if intent.run_projection {
-        project_runs(journal, state)?;
+        project_runs(journal, &state)?;
     }
     if let Some(file) = &file {
         if file.external {
@@ -582,7 +582,7 @@ fn commit_local(
     }
     projection::note_ops(&journal.root, ops.len() as u64)?;
     let meta = projection::load_prune(&journal.root)?;
-    let pruned = if projection::checkpoint(&journal.root, state, &meta, false)?
+    let pruned = if projection::checkpoint(&journal.root, &state, &meta, false)?
         && format::solo_store(journal.root.parent().unwrap_or(&journal.root))
     {
         let _ = journal.prune(&BTreeMap::new());
@@ -593,7 +593,7 @@ fn commit_local(
     if !pruned && !state.partial {
         if let Some(mut cached) = cached {
             let conflicts = prune::ingest(
-                state,
+                &state,
                 &mut cached.groups,
                 &mut cached.ops,
                 &cached.conflicts,
@@ -711,6 +711,16 @@ fn flatten(value: &Value, prefix: &str, fields: &mut Fields) {
     }
 }
 
+/// Top-level `<store>/config.yaml` keys that stay on this machine.
+pub(crate) fn local_config_sections() -> &'static [&'static str] {
+    local_fields("config", true)
+}
+
+/// `project.yaml` keys that stay on this machine (not replicated).
+pub(crate) fn local_project_fields() -> &'static [&'static str] {
+    local_fields("project", false)
+}
+
 fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
     match entity {
         "task" => &[
@@ -740,6 +750,7 @@ fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
             "tui",
             "auto_mode",
             "recent_models",
+            "backup",
         ],
         _ => &[],
     }
@@ -858,7 +869,7 @@ fn capture_inner(
         drift::reconcile_for_write(&journal, path)?;
     }
     let scoped = scope_display(&target, path, content)?;
-    let mut state = projection::load_tasks(&journal.root, |uids| {
+    let mut state = projection::take_tasks(&journal.root, |uids| {
         projection::task_scope(
             uids,
             &target.project,
@@ -1150,11 +1161,17 @@ fn capture_inner(
             }
             drift::record(&journal, &absolute)?;
         }
+        // No operation means no field changed; a uid assigned along the way was
+        // never saved, so only an untouched uid table may go back to the cache.
+        if projection::same_uids(&before_uids, &state) {
+            let meta = projection::load_prune(&journal.root)?;
+            projection::remember(&journal.root, state, &meta);
+        }
         return Ok(true);
     }
     commit_local(
         &journal,
-        &state,
+        state,
         &before_uids,
         &operations,
         Some(FileWrite {

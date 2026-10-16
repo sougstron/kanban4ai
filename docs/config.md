@@ -127,6 +127,14 @@ they are edited: press `s` on the Projects screen. Saved under the store
 - `net.tailscale.hostname`: `kanban-<role>` from machine-local `sync/node.yaml`, falling back to `kanban-laptop`; DNS hostname label.
 - `net.tailscale.socks_port`: `1055`, loopback SOCKS5 listener in managed mode.
 - `net.tailscale.auth_key_file`: null, or a one-time key file path (relative paths resolve under the store). Used by `net up` and managed startup; chmod 0600, deleted only after confirmed login. No key content is stored in config or passed in process arguments. These settings and `<store>/net/` stay machine-local; see `docs/sync.md` §11.5.
+- `backup.auto`: true - write a daily core snapshot from the daemon/TUI tick when the newest `daily` archive is older than `backup.interval_hours`. Failures are warned once and do not fail the tick.
+- `backup.interval_hours`: 24 - minimum age of the newest daily archive before another automatic core snapshot. A non-positive value is ignored.
+- `backup.dir`: `$XDG_STATE_HOME/kanban4ai/backups` (else `~/.local/state/kanban4ai/backups`). Must be absolute and must not sit inside the store. Relative values are ignored.
+- `backup.keep_daily` / `backup.keep_weekly` / `backup.keep_monthly` / `backup.keep_manual`: 7 / 4 / 6 / 10. Grandfather-father-son counts. Zero is allowed and keeps none of that bucket. `pre-restore` archives are kept for 7 days and are not part of these counts.
+- `backup.max_total_mb`: 2048 - cap on core and artifact archives together. The newest verified core archive is never deleted to meet the cap. A non-positive value is ignored.
+- `backup.artifacts`: `weekly` (`off`, `weekly`, or `always`). `weekly` adds the artifacts archive when the newest one is at least 7 days old; `always` adds it to every due core snapshot. Unknown values read as `weekly`.
+
+`backup` is machine-local and is not replicated. Detail: `docs/backup.md`.
 
 ### Auto mode (`auto_mode:`)
 One machine-wide switch for unattended, long autonomous work on every
