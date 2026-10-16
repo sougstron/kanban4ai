@@ -530,3 +530,32 @@ fn choosing_losing_version_is_a_replicated_edit_and_rejects_stale_choice() {
     );
     assert!(replica.conflicts().unwrap().is_empty());
 }
+
+#[test]
+fn later_causal_edits_of_the_winner_do_not_reopen_the_lost_conflict() {
+    let mut laptop = op("a", 3, 3, "task", "TASK-001", json!({"title":"laptop"}));
+    laptop.prev.insert("title".into(), task().hlc);
+    let mut server = op("b", 1, 4, "task", "TASK-001", json!({"title":"server"}));
+    server.prev = laptop.prev.clone();
+    let mut first = op("b", 2, 5, "task", "TASK-001", json!({"title":"server 2"}));
+    first.prev.insert("title".into(), server.hlc.clone());
+    let mut second = op("b", 3, 6, "task", "TASK-001", json!({"title":"server 3"}));
+    second.prev.insert("title".into(), first.hlc.clone());
+    let mut ops = vec![task(), laptop, server, first, second];
+    permutations(&mut ops, 0, &mut |order| {
+        let mut order = order.to_vec();
+        order.insert(0, project());
+        let (dir, journal) = apply(&order);
+        let stored = fs::read_to_string(dir.path().join("sync/meta/conflicts.jsonl")).unwrap();
+        assert_eq!(stored.lines().count(), 1, "{stored}");
+        assert!(stored.contains("\"loser_value\":\"laptop\""));
+        assert!(stored.contains("\"winner_value\":\"server\""));
+        assert!(journal.conflicts().unwrap().is_empty());
+        let thread = fs::read_to_string(
+            dir.path()
+                .join("projects/demo/.kanban/threads/TASK-001.yaml"),
+        )
+        .unwrap();
+        assert_eq!(thread.matches("id: NOTE-").count(), 1, "{thread}");
+    });
+}

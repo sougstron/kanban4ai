@@ -38,6 +38,7 @@ struct Seed<'a> {
     store: &'a str,
     project: &'a str,
     id: &'a str,
+    wall: u64,
 }
 
 fn remote_op(
@@ -55,7 +56,7 @@ fn remote_op(
     Operation {
         v: 1,
         op: format!("{node}:{seq}"),
-        hlc: Hlc(1_700_000_000_000 + seq, 0, node.into()),
+        hlc: Hlc(seed.wall + seq, 0, node.into()),
         store: seed.store.into(),
         project: seed.project.into(),
         entity: "task".into(),
@@ -94,6 +95,23 @@ fn journal_write_and_page_at_10k() {
     let project = state.project_uids.get("demo").expect("project uid").clone();
     let task_uid = state.task_uids.values().next().expect("task uid").clone();
     let store_id = journal.node.store_id.clone();
+    // `legacy` reproduces the TASK-511 seed: remote clocks from 2023 with no
+    // `prev`, so every remote edit loses to the local creation and the seed
+    // carries ~3 000 conflicts and their thread notes. The default seed is
+    // causal: peers saw the creation, and later edits build on the last one.
+    let legacy = std::env::var("BENCH_SEED").is_ok_and(|seed| seed == "legacy");
+    let created = state
+        .fields
+        .values()
+        .find(|field| field.clocks.contains_key("title"))
+        .expect("task fields")
+        .clocks
+        .clone();
+    let wall = if legacy {
+        1_700_000_000_000
+    } else {
+        created["title"].0
+    };
     let local_target = std::env::var("BENCH_LOCAL")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -102,9 +120,14 @@ fn journal_write_and_page_at_10k() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(3_000);
+    let mut last_b = None;
     for (node, field) in [("peer-b", "description"), ("peer-c", "priority")] {
         let mut batch = Vec::new();
-        let mut prev = None;
+        let mut prev = if legacy {
+            None
+        } else {
+            created.get(field).cloned()
+        };
         for seq in 1..=remote_each {
             let value = if field == "priority" {
                 Value::from(seq)
@@ -117,6 +140,7 @@ fn journal_write_and_page_at_10k() {
                     store: &store_id,
                     project: &project,
                     id: &task_uid,
+                    wall,
                 },
                 seq,
                 field,
@@ -134,6 +158,12 @@ fn journal_write_and_page_at_10k() {
         if !batch.is_empty() {
             journal.apply_remote(&batch, u64::MAX).unwrap();
         }
+        if node == "peer-b" {
+            last_b = prev;
+        }
+    }
+    if !legacy {
+        task = storage.load_task(&task.id).unwrap().unwrap();
     }
     for n in 0..local_target {
         task.title = format!("local-{n}");
@@ -183,16 +213,64 @@ fn journal_write_and_page_at_10k() {
                 store: &store_id,
                 project: &project,
                 id: &task_uid,
+                wall,
             },
             cursor,
             "description",
             Value::String(format!("one-{n}")),
-            None,
+            if legacy { None } else { last_b.as_ref() },
         );
+        last_b = Some(op.hlc.clone());
         let started = Instant::now();
         journal.apply_remote(&[op], u64::MAX).unwrap();
         apply_one.push(started.elapsed().as_micros());
     }
+    // Cold path: a fresh CLI process per call, as agents run it. Nothing is
+    // cached in memory; each call loads the checkpoint and replays its tail.
+    let cli = |args: &[&str]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_kanban4ai"));
+        cmd.env("KANBAN_HOME", dir.path()).args(args);
+        for (key, _) in std::env::vars() {
+            if key.starts_with("KANBAN_") && key != "KANBAN_HOME" {
+                cmd.env_remove(key);
+            }
+        }
+        let started = Instant::now();
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        started.elapsed().as_micros()
+    };
+    let id = task.id.clone();
+    let mut cold_start = Vec::with_capacity(rounds);
+    let mut cold_read = Vec::with_capacity(rounds);
+    let mut cold_write = Vec::with_capacity(rounds);
+    for n in 0..rounds {
+        cold_start.push(cli(&["--version"]));
+        cold_read.push(cli(&["--project", "demo", "show", &id]));
+        let note = format!("cold-{n}");
+        cold_write.push(cli(&[
+            "--project",
+            "demo",
+            "context",
+            &id,
+            &note,
+            "--source",
+            "agent",
+        ]));
+    }
+    eprintln!(
+        "bench cold_start_us={} cold_show_us={} cold_context_us={}",
+        median(&mut cold_start),
+        median(&mut cold_read),
+        median(&mut cold_write),
+    );
+    let conflicts = fs::read_to_string(dir.path().join("sync/meta/conflicts.jsonl"))
+        .map(|text| text.lines().count())
+        .unwrap_or(0);
+    let thread_bytes = fs::metadata(board.join(".kanban/threads").join(format!("{id}.yaml")))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    eprintln!("bench conflicts={conflicts} thread_bytes={thread_bytes}");
     let meta = dir_bytes(&dir.path().join("sync/meta"));
     let journal_bytes = dir_bytes(&dir.path().join("sync/journal"));
     eprintln!(

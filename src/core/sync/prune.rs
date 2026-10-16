@@ -370,7 +370,7 @@ fn push_group(groups: &mut FieldGroups, op: &Operation) {
 fn push_pair(
     result: &mut Vec<Conflict>,
     entity: (&str, &str, &str, &str),
-    clocks: &BTreeMap<&Hlc, &Operation>,
+    lineage: &Lineage<'_>,
     a: &Operation,
     b: &Operation,
 ) {
@@ -380,8 +380,8 @@ fn push_pair(
     };
     if a.hlc.2 == b.hlc.2
         || av == bv
-        || ancestor(clocks, field, &a.hlc, b)
-        || ancestor(clocks, field, &b.hlc, a)
+        || lineage.ancestor(&a.hlc, &b.hlc)
+        || lineage.ancestor(&b.hlc, &a.hlc)
     {
         return;
     }
@@ -390,6 +390,9 @@ fn push_pair(
     } else {
         (b, a, bv, av)
     };
+    if covered(field, &loser.hlc, winner) {
+        return;
+    }
     result.push(Conflict {
         project: project.into(),
         entity: kind.into(),
@@ -486,7 +489,7 @@ pub(super) fn ingest(
         }
         let mut versions: Vec<&Operation> = existing.iter().collect();
         versions.extend(fresh_ops.iter().copied());
-        let clocks: BTreeMap<&Hlc, &Operation> = versions.iter().map(|op| (&op.hlc, *op)).collect();
+        let lineage = Lineage::new(&key.3, &versions);
         for conflict in prior {
             if (
                 &conflict.project,
@@ -497,16 +500,16 @@ pub(super) fn ingest(
             {
                 continue;
             }
-            let Some(winner) = versions.iter().find(|op| op.hlc == conflict.winner) else {
+            let Some(winner) = lineage.op(&conflict.winner) else {
                 continue;
             };
-            let Some(loser) = versions.iter().find(|op| op.hlc == conflict.loser) else {
+            let Some(loser) = lineage.op(&conflict.loser) else {
                 continue;
             };
             push_pair(
                 &mut result,
                 (&key.0, &key.1, &key.2, &key.3),
-                &clocks,
+                &lineage,
                 winner,
                 loser,
             );
@@ -516,7 +519,7 @@ pub(super) fn ingest(
                 push_pair(
                     &mut result,
                     (&key.0, &key.1, &key.2, &key.3),
-                    &clocks,
+                    &lineage,
                     old,
                     new_op,
                 );
@@ -524,7 +527,13 @@ pub(super) fn ingest(
         }
         for (i, a) in fresh_ops.iter().enumerate() {
             for b in &fresh_ops[i + 1..] {
-                push_pair(&mut result, (&key.0, &key.1, &key.2, &key.3), &clocks, a, b);
+                push_pair(
+                    &mut result,
+                    (&key.0, &key.1, &key.2, &key.3),
+                    &lineage,
+                    a,
+                    b,
+                );
             }
         }
     }
@@ -567,11 +576,9 @@ pub(super) fn conflicts_of(state: &JournalState, ops: &[Operation]) -> Result<Ve
         }
     }
     for ((project, entity, id, field), versions) in groups {
-        let clocks: BTreeMap<&Hlc, &Operation> = versions.iter().map(|op| (&op.hlc, *op)).collect();
-        for (i, a) in versions.iter().enumerate() {
-            for b in &versions[i + 1..] {
-                push_pair(&mut result, (project, entity, id, field), &clocks, a, b);
-            }
+        let lineage = Lineage::new(field, &versions);
+        for (a, b) in lineage.concurrent() {
+            push_pair(&mut result, (project, entity, id, field), &lineage, a, b);
         }
     }
     for deletion in ops.iter().filter(|op| op.entity == "tombstone") {
@@ -635,24 +642,94 @@ fn push_tombstone(
     }
 }
 
-fn ancestor(
-    versions: &BTreeMap<&Hlc, &Operation>,
-    field: &str,
-    older: &Hlc,
-    newer: &Operation,
-) -> bool {
-    let mut cursor = newer.prev.get(field);
-    let mut seen = BTreeSet::new();
-    while let Some(clock) = cursor {
-        if clock == older {
-            return true;
+/// Ancestry of one field as entry/exit intervals of a depth-first walk over
+/// the `prev` forest. "Is `older` an ancestor of `newer`" is then O(1) instead
+/// of a chain walk per pair, and only the concurrent pairs are visited. A
+/// `prev` outside the group (pruned or not yet delivered) starts a new root,
+/// exactly where a chain walk would stop.
+struct Lineage<'a> {
+    span: BTreeMap<&'a Hlc, (usize, usize)>,
+    order: Vec<&'a Operation>,
+}
+
+impl<'a> Lineage<'a> {
+    fn new(field: &str, versions: &[&'a Operation]) -> Self {
+        let by_clock: BTreeMap<&'a Hlc, &'a Operation> =
+            versions.iter().map(|op| (&op.hlc, *op)).collect();
+        let mut children: BTreeMap<&'a Hlc, Vec<&'a Hlc>> = BTreeMap::new();
+        let mut roots = Vec::new();
+        for (clock, op) in &by_clock {
+            match op
+                .prev
+                .get(field)
+                .and_then(|parent| by_clock.get_key_value(parent))
+                .filter(|(parent, _)| parent != &clock)
+            {
+                Some((parent, _)) => children.entry(*parent).or_default().push(*clock),
+                None => roots.push(*clock),
+            }
         }
-        if !seen.insert(clock) {
-            break;
+        let mut span = BTreeMap::new();
+        let mut order = Vec::with_capacity(by_clock.len());
+        // Roots first; a malformed `prev` cycle has none, so any clock left
+        // unvisited starts its own walk.
+        for start in roots.into_iter().chain(by_clock.keys().copied()) {
+            if span.contains_key(start) {
+                continue;
+            }
+            span.insert(start, (order.len(), order.len()));
+            order.push(by_clock[start]);
+            let mut stack = vec![(start, 0usize)];
+            while let Some(&(clock, next)) = stack.last() {
+                let child = children.get(clock).and_then(|kids| kids.get(next));
+                if let Some(child) = child {
+                    if let Some(top) = stack.last_mut() {
+                        top.1 += 1;
+                    }
+                    if !span.contains_key(child) {
+                        span.insert(*child, (order.len(), order.len()));
+                        order.push(by_clock[child]);
+                        stack.push((*child, 0));
+                    }
+                } else {
+                    stack.pop();
+                    if let Some(entry) = span.get_mut(clock) {
+                        entry.1 = order.len() - 1;
+                    }
+                }
+            }
         }
-        cursor = versions.get(clock).and_then(|op| op.prev.get(field));
+        Self { span, order }
     }
-    false
+
+    fn op(&self, clock: &Hlc) -> Option<&'a Operation> {
+        self.span.get(clock).map(|(entry, _)| self.order[*entry])
+    }
+
+    fn ancestor(&self, older: &Hlc, newer: &Hlc) -> bool {
+        match (self.span.get(older), self.span.get(newer)) {
+            (Some(a), Some(b)) => a.0 < b.0 && b.1 <= a.1,
+            _ => false,
+        }
+    }
+
+    /// Every pair where neither is an ancestor of the other, once each: a
+    /// later entry outside a version's subtree is neither its descendant nor
+    /// (entering later) its ancestor.
+    fn concurrent(&self) -> impl Iterator<Item = (&'a Operation, &'a Operation)> + '_ {
+        self.span.values().flat_map(|&(entry, exit)| {
+            let a = self.order[entry];
+            self.order[exit + 1..].iter().map(move |b| (a, *b))
+        })
+    }
+}
+
+/// The loser already lost to the version the winner was written on top of:
+/// that conflict was reported once, and the later edit superseded it.
+/// Re-pairing would post a fresh note for every causal edit. Clocks grow
+/// along a field chain, so the direct predecessor decides.
+fn covered(field: &str, loser: &Hlc, winner: &Operation) -> bool {
+    winner.prev.get(field).is_some_and(|prev| prev > loser)
 }
 
 fn gc_blobs(sync: &std::path::Path, state: &JournalState, ops: &[Operation]) -> Result<()> {
@@ -720,4 +797,80 @@ pub(super) fn stored_conflicts(sync: &std::path::Path) -> Result<Vec<Conflict>> 
     let mut all = read_conflicts(&sync.join("meta/conflicts.jsonl"))?;
     all.extend(read_conflicts(&sync.join("meta/conflicts-archive.jsonl"))?);
     Ok(all)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version(wall: u64, node: &str, prev: Option<(u64, &str)>) -> Operation {
+        Operation {
+            v: 1,
+            op: format!("{node}:{wall}"),
+            hlc: Hlc(wall, 0, node.into()),
+            store: String::new(),
+            project: "p".into(),
+            entity: "task".into(),
+            id: "t".into(),
+            set: BTreeMap::from([("title".into(), Value::from(wall))]),
+            prev: prev
+                .map(|(wall, node)| BTreeMap::from([("title".into(), Hlc(wall, 0, node.into()))]))
+                .unwrap_or_default(),
+            actor: "human".into(),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn walk(versions: &[&Operation], older: &Hlc, newer: &Operation) -> bool {
+        let mut cursor = newer.prev.get("title");
+        while let Some(clock) = cursor {
+            if clock == older {
+                return true;
+            }
+            cursor = versions
+                .iter()
+                .find(|op| &op.hlc == clock)
+                .and_then(|op| op.prev.get("title"));
+        }
+        false
+    }
+
+    #[test]
+    fn lineage_matches_a_chain_walk_on_a_branched_forest() {
+        let ops = [
+            version(1, "a", None),
+            version(2, "a", Some((1, "a"))),
+            version(3, "b", Some((1, "a"))),
+            version(4, "a", Some((2, "a"))),
+            version(5, "c", Some((3, "b"))),
+            version(6, "c", Some((99, "gone"))),
+            version(7, "b", Some((6, "c"))),
+        ];
+        let versions: Vec<&Operation> = ops.iter().collect();
+        let lineage = Lineage::new("title", &versions);
+        let mut expected = BTreeSet::new();
+        for a in &versions {
+            for b in &versions {
+                assert_eq!(
+                    lineage.ancestor(&a.hlc, &b.hlc),
+                    walk(&versions, &a.hlc, b),
+                    "{:?} -> {:?}",
+                    a.hlc,
+                    b.hlc
+                );
+                if a.hlc < b.hlc && !walk(&versions, &a.hlc, b) && !walk(&versions, &b.hlc, a) {
+                    expected.insert((a.hlc.clone(), b.hlc.clone()));
+                }
+            }
+        }
+        let found: BTreeSet<(Hlc, Hlc)> = lineage
+            .concurrent()
+            .map(|(a, b)| {
+                let (a, b) = (a.hlc.clone(), b.hlc.clone());
+                if a < b { (a, b) } else { (b, a) }
+            })
+            .collect();
+        assert_eq!(found, expected);
+        assert_eq!(lineage.concurrent().count(), expected.len());
+    }
 }
