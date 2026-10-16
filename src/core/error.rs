@@ -24,6 +24,18 @@ pub enum KanbanError {
         .0.display()
     )]
     ActiveSessions(PathBuf),
+
+    #[error("BACKUP_VERIFY_FAILED: {0}")]
+    BackupVerifyFailed(String),
+
+    #[error("BACKUP_FORMAT_NEWER: {0}")]
+    BackupFormatNewer(String),
+
+    #[error("BACKUP_DIR_INSIDE_STORE: {0}")]
+    BackupDirInsideStore(String),
+
+    #[error("BACKUP_ACTIVE_SESSIONS: {0}")]
+    BackupActiveSessions(String),
 }
 
 pub type Result<T> = std::result::Result<T, KanbanError>;

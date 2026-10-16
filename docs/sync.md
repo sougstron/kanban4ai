@@ -171,7 +171,8 @@ dial: inbound               # inbound | outbound; mobile всегда outbound
 | `recent_models`, `limits.json`, кэш лимитов | зависят от логинов этой машины |
 | поля задачи `session`, `run_phase`, `crash_restarts`, `restart_at`, `auto_resumes` | локальная сессия, очередь и автоматика перезапуска. Наружу их заменяет дескриптор запуска |
 | `rev` треда | локальный счётчик оптимистичной записи |
-| `<store>/config.yaml`: секции `node`, `sync`, `serve`, `daemon`, `tui`, `net` | идентичность, пиры, сеть, интервалы, отображение |
+| `<store>/config.yaml`: секции `node`, `sync`, `serve`, `daemon`, `tui`, `net`, `backup` | идентичность, пиры, сеть, интервалы, отображение, политика снимков |
+| каталог бэкапов (`backup.dir`, по умолчанию `$XDG_STATE_HOME/kanban4ai/backups`) | лежит вне store и не реплицируется |
 | `<store>/sync/node.yaml`, `peers.yaml`, `tokens.yaml` | секреты, права 0600 |
 | `sync/FORMAT`, заглушка `meta/state.json`, `meta/index.json`, `meta/since.json`, `sync/legacy-v1/` | версия этой машины, перестраиваемый кэш и перенесённые файлы v1 |
 | `<store>/net/tailscale/` | state dir managed tailscaled (каталоги 0700, файлы 0600), раздел 11.5 |
@@ -180,6 +181,10 @@ dial: inbound               # inbound | outbound; mobile всегда outbound
 Реплицируемые настройки, которые ссылаются на локальные вещи (например,
 `agents:` с путём к бинарю), применяются как есть. Если на узле бэкенда нет,
 запуск падает с `RUNNER_BACKEND_MISSING`, а не с ошибкой синхронизации.
+
+Реплика — не бэкап: удаление тоже уезжает на пиры. Снимок store и
+восстановление, которое воскрешает задачу операцией `restore`, делает
+`kanban backup` (`docs/backup.md`).
 
 ## 4. Журнал операций и HLC
 

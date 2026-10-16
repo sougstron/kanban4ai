@@ -1153,6 +1153,160 @@ impl ReviewerSettings {
     }
 }
 
+/// How often an automatic snapshot also archives agent artifacts
+/// (`backup.artifacts`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackupArtifacts {
+    Off,
+    #[default]
+    Weekly,
+    Always,
+}
+
+impl BackupArtifacts {
+    pub fn parse(value: &str) -> Self {
+        match value.trim() {
+            "off" => Self::Off,
+            "always" => Self::Always,
+            _ => Self::Weekly,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Weekly => "weekly",
+            Self::Always => "always",
+        }
+    }
+}
+
+/// Defaults for `backup:` in `<store>/config.yaml`. Business logic reads the
+/// loaded [`BackupPolicy`]; these constants are the fallback for a missing
+/// or unusable key.
+pub const BACKUP_INTERVAL_HOURS: u64 = 24;
+pub const BACKUP_KEEP_DAILY: usize = 7;
+pub const BACKUP_KEEP_WEEKLY: usize = 4;
+pub const BACKUP_KEEP_MONTHLY: usize = 6;
+pub const BACKUP_KEEP_MANUAL: usize = 10;
+pub const BACKUP_MAX_TOTAL_MB: u64 = 2048;
+pub const BACKUP_PRE_RESTORE_DAYS: i64 = 7;
+pub const BACKUP_ARTIFACT_WEEKLY_DAYS: i64 = 7;
+
+/// Machine-local backup policy. `dir: None` means [`default_backup_dir`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupPolicy {
+    pub auto: bool,
+    pub interval_hours: u64,
+    pub dir: Option<PathBuf>,
+    pub keep_daily: usize,
+    pub keep_weekly: usize,
+    pub keep_monthly: usize,
+    pub keep_manual: usize,
+    pub max_total_mb: u64,
+    pub artifacts: BackupArtifacts,
+}
+
+impl Default for BackupPolicy {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            interval_hours: BACKUP_INTERVAL_HOURS,
+            dir: None,
+            keep_daily: BACKUP_KEEP_DAILY,
+            keep_weekly: BACKUP_KEEP_WEEKLY,
+            keep_monthly: BACKUP_KEEP_MONTHLY,
+            keep_manual: BACKUP_KEEP_MANUAL,
+            max_total_mb: BACKUP_MAX_TOTAL_MB,
+            artifacts: BackupArtifacts::Weekly,
+        }
+    }
+}
+
+impl BackupPolicy {
+    /// Missing keys stay at the defaults. A non-positive interval or size
+    /// limit, or a relative `dir`, is ignored so a hand-edited file cannot
+    /// disable the cadence or point the snapshot at the working directory.
+    pub fn from_mapping(map: &Mapping) -> Self {
+        let mut policy = Self::default();
+        let get = |key: &str| map.get(Value::String(key.to_string()));
+        if let Some(value) = get("auto").and_then(as_bool) {
+            policy.auto = value;
+        }
+        if let Some(value) = get("interval_hours").and_then(positive_u64) {
+            policy.interval_hours = value;
+        }
+        if let Some(value) = get("dir").and_then(Value::as_str) {
+            let path = PathBuf::from(value.trim());
+            if path.is_absolute() {
+                policy.dir = Some(path);
+            }
+        }
+        if let Some(value) = get("keep_daily").and_then(non_negative_usize) {
+            policy.keep_daily = value;
+        }
+        if let Some(value) = get("keep_weekly").and_then(non_negative_usize) {
+            policy.keep_weekly = value;
+        }
+        if let Some(value) = get("keep_monthly").and_then(non_negative_usize) {
+            policy.keep_monthly = value;
+        }
+        if let Some(value) = get("keep_manual").and_then(non_negative_usize) {
+            policy.keep_manual = value;
+        }
+        if let Some(value) = get("max_total_mb").and_then(positive_u64) {
+            policy.max_total_mb = value;
+        }
+        if let Some(value) = get("artifacts").and_then(Value::as_str) {
+            policy.artifacts = BackupArtifacts::parse(value);
+        }
+        policy
+    }
+
+    pub fn max_total_bytes(&self) -> u64 {
+        self.max_total_mb.saturating_mul(1024 * 1024)
+    }
+}
+
+/// `$XDG_STATE_HOME/kanban4ai/backups`, else `~/.local/state/kanban4ai/backups`.
+/// Intentionally not under `KANBAN_HOME`: removing a scratch store must not
+/// remove its snapshots, and tests pass `--dir` or set `XDG_STATE_HOME`.
+pub fn default_backup_dir() -> PathBuf {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute());
+    let base = state.unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .map(|home| home.join(".local/state"))
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+    });
+    base.join("kanban4ai").join("backups")
+}
+
+fn positive_u64(value: &Value) -> Option<u64> {
+    let parsed = match value {
+        Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok())),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    };
+    parsed.filter(|n| *n > 0)
+}
+
+fn non_negative_usize(value: &Value) -> Option<usize> {
+    let parsed = match value {
+        Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_i64().and_then(|i| u64::try_from(i).ok())),
+        Value::String(s) => s.trim().parse::<u64>().ok(),
+        _ => None,
+    }?;
+    usize::try_from(parsed).ok()
+}
+
 pub(crate) fn as_bool(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(b) => Some(*b),

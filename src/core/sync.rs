@@ -678,6 +678,16 @@ fn flatten(value: &Value, prefix: &str, fields: &mut Fields) {
     }
 }
 
+/// Top-level `<store>/config.yaml` keys that stay on this machine.
+pub(crate) fn local_config_sections() -> &'static [&'static str] {
+    local_fields("config", true)
+}
+
+/// `project.yaml` keys that stay on this machine (not replicated).
+pub(crate) fn local_project_fields() -> &'static [&'static str] {
+    local_fields("project", false)
+}
+
 fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
     match entity {
         "task" => &[
@@ -707,6 +717,7 @@ fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
             "tui",
             "auto_mode",
             "recent_models",
+            "backup",
         ],
         _ => &[],
     }

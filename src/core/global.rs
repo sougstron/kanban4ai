@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value};
 
-use super::config::{BoardConfig, InheritGroup, as_bool, copy_group};
+use super::config::{BackupPolicy, BoardConfig, InheritGroup, as_bool, copy_group};
 use super::error::{KanbanError, Result};
 use super::project::ProjectStore;
 use super::storage::atomic_write_text;
@@ -156,6 +156,10 @@ pub struct GlobalConfig {
     /// project, so it lives here rather than in any board's config.
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
     pub auto_mode: Mapping,
+    /// Store snapshots (`backup.auto`, retention, directory). Machine-local
+    /// under sync, like `node` and `tui`.
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub backup: Mapping,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
@@ -380,6 +384,11 @@ impl GlobalConfig {
 }
 
 impl GlobalConfig {
+    /// `backup:` with missing or unusable keys replaced by [`BackupPolicy::default`].
+    pub fn backup_policy(&self) -> BackupPolicy {
+        BackupPolicy::from_mapping(&self.backup)
+    }
+
     /// The auto-mode section; missing or malformed keys read as defaults
     /// (auto mode off).
     pub fn auto_mode(&self) -> AutoMode {
