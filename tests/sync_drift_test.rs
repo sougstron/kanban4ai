@@ -97,6 +97,39 @@ fn external_edits_checkout_create_delete_and_repeat_replicate() {
 }
 
 #[test]
+fn quiet_scan_skips_board_locks_and_still_sees_bypass_writes() {
+    let a = tempfile::tempdir().unwrap();
+    let board = board(a.path());
+    let path = board.join(".kanban/tasks/todo/TASK-001.md");
+    atomic_write_text(&path, &task("original")).unwrap();
+    let journal = Journal::open(a.path()).unwrap();
+    journal.reconcile().unwrap();
+    // A writer elsewhere holds the board: an unchanged store must not wait on it.
+    let (held, release) = (
+        std::sync::mpsc::channel::<()>(),
+        std::sync::mpsc::channel::<()>(),
+    );
+    let holder = {
+        let board = board.clone();
+        let (held_tx, release_rx) = (held.0, release.1);
+        std::thread::spawn(move || {
+            let _lock = Storage::new(&board).lock().unwrap();
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        })
+    };
+    held.1.recv().unwrap();
+    let started = Instant::now();
+    assert_eq!(journal.reconcile().unwrap(), 0);
+    assert!(started.elapsed().as_secs() < 5);
+    release.0.send(()).unwrap();
+    holder.join().unwrap();
+    fs::write(&path, task("manual edit")).unwrap();
+    assert_eq!(journal.reconcile().unwrap(), 1);
+    assert_eq!(journal.reconcile().unwrap(), 0);
+}
+
+#[test]
 fn blobs_and_instructions_are_incremental_but_artifacts_are_not() {
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
