@@ -2288,7 +2288,7 @@ fn file_mode(meta: &fs::Metadata) -> u32 {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return meta.permissions().mode() & 0o777;
+        meta.permissions().mode() & 0o777
     }
     #[cfg(not(unix))]
     {
@@ -2412,9 +2412,10 @@ mod tests {
     }
 
     fn policy_at(dir: &Path) -> BackupPolicy {
-        let mut policy = BackupPolicy::default();
-        policy.dir = Some(dir.to_path_buf());
-        policy
+        BackupPolicy {
+            dir: Some(dir.to_path_buf()),
+            ..BackupPolicy::default()
+        }
     }
 
     fn request(dir: &Path, artifacts: bool) -> CreateRequest {
@@ -2540,7 +2541,7 @@ mod tests {
         assert!(differ.is_empty(), "allowlist mismatch: {differ:?}");
         assert_eq!(
             task_bytes(
-                &empty.join(&format!("projects/{}", fix.project_id)),
+                &empty.join(format!("projects/{}", fix.project_id)),
                 &task.id
             ),
             task_bytes(&fix.data_root, &task.id)
