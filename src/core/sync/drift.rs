@@ -28,6 +28,16 @@ fn valid_hash(hash: &str) -> Result<()> {
 impl Journal {
     /// Content-addressed bytes, verified on both ingress and egress.
     pub fn put_blob(&self, expected: &str, bytes: &[u8]) -> Result<()> {
+        self.store_blob(expected, bytes, true)
+    }
+
+    /// Page-cache copy of a blob. Drift rebuilds it from the file when the
+    /// hash still matches; callers that replicate the blob use `put_blob`.
+    fn put_blob_cached(&self, expected: &str, bytes: &[u8]) -> Result<()> {
+        self.store_blob(expected, bytes, false)
+    }
+
+    fn store_blob(&self, expected: &str, bytes: &[u8], durable: bool) -> Result<()> {
         valid_hash(expected)?;
         if hash(bytes) != expected {
             return Err(invalid("blob hash mismatch"));
@@ -35,7 +45,11 @@ impl Journal {
         let path = self.root.join("blobs").join(expected);
         if !path.exists() {
             fs::create_dir_all(path.parent().expect("blob parent"))?;
-            transport::write_bytes(&path, bytes)?;
+            if durable {
+                transport::write_bytes(&path, bytes)?;
+            } else {
+                transport::write_bytes_cached(&path, bytes)?;
+            }
         }
         Ok(())
     }
@@ -195,7 +209,25 @@ impl Journal {
             .map(|(path, entry)| json(&(path, Some(entry))))
             .collect::<Result<Vec<_>>>()?
             .join("\n");
-        atomic_write_text_raw(&self.root.join("drift.jsonl"), &(text + "\n"))?;
+        let compact = if text.is_empty() {
+            String::new()
+        } else {
+            format!("{text}\n")
+        };
+        let path = self.root.join("drift.jsonl");
+        let same = changed == 0
+            && fs::read_to_string(&path)
+                .ok()
+                .is_some_and(|current| current == compact);
+        if !same {
+            if compact.is_empty() {
+                if path.exists() {
+                    fs::remove_file(&path)?;
+                }
+            } else {
+                atomic_write_text_raw(&path, &compact)?;
+            }
+        }
         // The index now matches disk, including writes that bypassed capture.
         format::mark_armed(store)?;
         Ok(changed)
@@ -229,7 +261,7 @@ fn index(journal: &Journal) -> Result<BTreeMap<String, Entry>> {
 fn entry_for(journal: &Journal, path: &Path, bytes: &[u8]) -> Result<Entry> {
     let meta = fs::metadata(path)?;
     let hash = hash(bytes);
-    journal.put_blob(&hash, bytes)?;
+    journal.put_blob_cached(&hash, bytes)?;
     Ok(Entry {
         mtime: meta
             .modified()?

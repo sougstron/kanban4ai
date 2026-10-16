@@ -569,7 +569,9 @@ pub(super) fn rebuild_index(sync: &Path) -> Result<()> {
 }
 
 fn stamp(path: &Path, hash: &mut u64) {
+    mix(hash, path.to_string_lossy().as_bytes());
     let Ok(meta) = fs::metadata(path) else {
+        mix(hash, b"absent");
         return;
     };
     let modified = meta
@@ -578,9 +580,92 @@ fn stamp(path: &Path, hash: &mut u64) {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    mix(hash, path.to_string_lossy().as_bytes());
     mix(hash, &meta.len().to_le_bytes());
     mix(hash, &modified.to_le_bytes());
+}
+
+/// Sequential reader of contiguous operations with `seq > after`.
+/// One node's HLC grows with its sequence, so a caller can stop after a page.
+pub(super) struct Cursor {
+    pending: Vec<(PathBuf, u64)>,
+    at: usize,
+    reader: Option<BufReader<fs::File>>,
+    after: u64,
+}
+
+impl Cursor {
+    pub(super) fn open(sync: &Path, node: &str, after: u64) -> Result<Self> {
+        let dir = node_dir(sync, node);
+        let files = segments_of(&dir)?;
+        let index = load_index(sync).unwrap_or_default();
+        let infos = index.nodes.get(node);
+        let active = files.last().cloned();
+        if let Some(path) = &active {
+            repair_tail(path)?;
+        }
+        let mut pending = Vec::new();
+        for path in files {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            let first: u64 = name.trim_end_matches(".jsonl").parse().unwrap_or(1);
+            let info = infos.and_then(|list| list.iter().find(|s| s.file == name));
+            if Some(&path) != active.as_ref() && info.is_some_and(|s| s.last <= after) {
+                continue;
+            }
+            let seek = if first > after {
+                0
+            } else {
+                info.and_then(|segment| {
+                    segment
+                        .marks
+                        .iter()
+                        .rev()
+                        .find(|mark| mark.seq <= after.saturating_add(1))
+                        .map(|mark| mark.offset)
+                })
+                .unwrap_or(0)
+            };
+            pending.push((path, seek));
+        }
+        Ok(Self {
+            pending,
+            at: 0,
+            reader: None,
+            after,
+        })
+    }
+
+    pub(super) fn next_op(&mut self) -> Result<Option<Operation>> {
+        loop {
+            if self.reader.is_none() {
+                if self.at >= self.pending.len() {
+                    return Ok(None);
+                }
+                let seek = self.pending[self.at].1;
+                let path = self.pending[self.at].0.clone();
+                self.at += 1;
+                let mut file = fs::File::open(path)?;
+                file.seek(SeekFrom::Start(seek))?;
+                self.reader = Some(BufReader::new(file));
+            }
+            let reader = self.reader.as_mut().expect("open segment");
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                self.reader = None;
+                continue;
+            }
+            let line = line.trim_end_matches(['\n', '\r']);
+            if line.is_empty() {
+                continue;
+            }
+            let op: Operation = serde_json::from_str(line).map_err(|e| invalid(&e.to_string()))?;
+            if sequence(&op)? > self.after {
+                return Ok(Some(op));
+            }
+        }
+    }
 }
 
 fn mix(hash: &mut u64, bytes: &[u8]) {

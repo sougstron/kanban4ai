@@ -381,6 +381,8 @@ impl Journal {
         }
         let intent: Intent = serde_json::from_str(&fs::read_to_string(&path)?)
             .map_err(|e| invalid(&e.to_string()))?;
+        projection::forget(&self.root);
+        prune::forget_groups(&self.root);
         let dir = self.root.join("journal").join(&self.node.node_id);
         if let Some(active) = segments_active(&dir)? {
             segments::repair_tail(&active)?;
@@ -498,6 +500,7 @@ fn commit_local(
     if ops.is_empty() {
         return Ok(());
     }
+    let cached = prune::take_groups(&journal.root);
     let limits = format::JournalLimits::load(journal.root.parent().unwrap_or(&journal.root))?;
     let prepared = segments::prepare(&journal.root, &journal.node.node_id, &limits)?;
     let through = sequence(ops.last().expect("ops"))?;
@@ -565,10 +568,26 @@ fn commit_local(
     }
     projection::note_ops(&journal.root, ops.len() as u64)?;
     let meta = projection::load_prune(&journal.root)?;
-    if projection::checkpoint(&journal.root, state, &meta, false)?
+    let pruned = if projection::checkpoint(&journal.root, state, &meta, false)?
         && format::solo_store(journal.root.parent().unwrap_or(&journal.root))
     {
         let _ = journal.prune(&BTreeMap::new());
+        true
+    } else {
+        false
+    };
+    if !pruned {
+        if let Some(mut cached) = cached {
+            let conflicts = prune::ingest(
+                state,
+                &mut cached.groups,
+                &mut cached.ops,
+                &cached.conflicts,
+                ops,
+            )?;
+            prune::store_groups(&journal.root, cached.groups, cached.ops, conflicts);
+        }
+        projection::remember(&journal.root, state, &meta);
     }
     Ok(())
 }

@@ -38,10 +38,48 @@ impl Default for JournalLimits {
     }
 }
 
+struct LimitsCache {
+    mtime: Option<SystemTime>,
+    len: u64,
+    limits: JournalLimits,
+}
+
+static LIMITS_CACHE: LazyLock<Mutex<std::collections::HashMap<PathBuf, LimitsCache>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
 impl JournalLimits {
     pub(super) fn load(store: &Path) -> Result<Self> {
+        let path = store.join("config.yaml");
+        let meta = fs::metadata(&path).ok();
+        let mtime = meta.as_ref().and_then(|meta| meta.modified().ok());
+        let len = meta.as_ref().map(|meta| meta.len()).unwrap_or(0);
+        {
+            let cache = LIMITS_CACHE.lock().unwrap_or_else(|err| err.into_inner());
+            if let Some(hit) = cache.get(store)
+                && hit.mtime == mtime
+                && hit.len == len
+            {
+                return Ok(hit.limits.clone());
+            }
+        }
+        let limits = Self::read(&path)?;
+        LIMITS_CACHE
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .insert(
+                store.to_path_buf(),
+                LimitsCache {
+                    mtime,
+                    len,
+                    limits: limits.clone(),
+                },
+            );
+        Ok(limits)
+    }
+
+    fn read(path: &Path) -> Result<Self> {
         let mut limits = Self::default();
-        let text = match fs::read_to_string(store.join("config.yaml")) {
+        let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(limits),
             Err(e) => return Err(e.into()),
