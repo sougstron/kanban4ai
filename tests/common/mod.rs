@@ -14,6 +14,19 @@ pub fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
 }
 
+/// Exercise the same streamed snapshot and separate blob installation as a client.
+pub fn bootstrap(source: &Path, receiver: &Path) {
+    use kanban4ai::core::sync::{Journal, transport};
+    let spool = transport::snapshot_spool(source).unwrap();
+    let staged = transport::stage_snapshot(receiver, spool.path()).unwrap();
+    let source = Journal::open(source).unwrap();
+    let destination = Journal::open(receiver).unwrap();
+    for hash in &staged.blobs {
+        destination.put_blob(hash, &source.blob(hash).unwrap()).unwrap();
+    }
+    staged.install(receiver).unwrap();
+}
+
 /// Fresh initialized board in a temp dir.
 pub fn temp_board() -> (tempfile::TempDir, Storage) {
     let dir = tempfile::tempdir().expect("create temp dir");

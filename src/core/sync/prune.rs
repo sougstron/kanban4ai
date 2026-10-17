@@ -57,14 +57,9 @@ fn frontier(
     meta: &mut PruneMeta,
     acks: &BTreeMap<String, VersionVector>,
 ) -> Result<VersionVector> {
-    let me = &journal.node.node_id;
-    let mut participants = BTreeSet::new();
-    participants.extend(acks.keys().cloned());
-    for node in state.vector.keys() {
-        if node != me {
-            participants.insert(node.clone());
-        }
-    }
+    // Participants are active hub clients or the client's single server receipt.
+    // Origins in retained history are not acknowledgement participants.
+    let participants: BTreeSet<String> = acks.keys().cloned().collect();
     let stable = if participants.is_empty() {
         state.vector.clone()
     } else {

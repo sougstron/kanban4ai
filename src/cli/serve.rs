@@ -38,6 +38,7 @@ mod git;
 mod pairing;
 pub(crate) mod settings;
 mod sync;
+mod hub;
 pub use discovery::DiscoveryOptions;
 pub use pairing::PairingOptions;
 
@@ -57,7 +58,7 @@ pub(crate) fn runner_action(
     let Some(root) = projects.parent() else {
         return Ok(None);
     };
-    if !crate::core::sync::enabled(root) || discovery::config(root)?.peers.is_empty() {
+    if !crate::core::sync::enabled(root) || discovery::known_nodes(root)?.is_empty() {
         return Ok(None);
     }
     let storage = crate::core::storage::Storage::new(board);
@@ -114,8 +115,8 @@ pub(crate) fn local_runner(
     api::local_runner(board, runner)
 }
 
-const PROTO: u32 = 1;
-const MIN_PROTO: u32 = 1;
+const PROTO: u32 = 3;
+const MIN_PROTO: u32 = 3;
 
 #[derive(Deserialize)]
 struct Settings {
@@ -258,6 +259,17 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
 }
 
 async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: Next) -> Response {
+    let route=request.uri().path();
+    if matches!(route,"/sync/vector"|"/sync/ops"|"/sync/ack"|"/sync/stream"|"/sync/snapshot"|"/sync/hello"|"/sync/bye") {
+        return error(StatusCode::UPGRADE_REQUIRED,"SYNC_PROTOCOL_MISMATCH","обновите kanban4ai на всех узлах");
+    }
+    if route.starts_with("/sync/") && request.headers().get("x-kanban-sync-protocol").and_then(|v|v.to_str().ok())!=Some("3") {
+        return error(StatusCode::UPGRADE_REQUIRED,"SYNC_PROTOCOL_MISMATCH","обновите kanban4ai на всех узлах");
+    }
+    if route.starts_with("/sync/") || route.starts_with("/git/") {
+        let root=path.parent().and_then(Path::parent).unwrap_or(Path::new("."));
+        if let Err(e)=hub::require_server(root) { return sync::failure(e); }
+    }
     let secret = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -313,6 +325,10 @@ async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: N
             "Token is unknown or revoked",
         );
     };
+    if request.uri().path().starts_with("/sync/") {
+        let root=path.parent().and_then(Path::parent).unwrap_or(Path::new("."));
+        if hub::caller(root,&hash).is_err(){return error(StatusCode::UNAUTHORIZED,"NODE_AUTH_FAILED","Token is not bound to a paired node");}
+    }
     request.extensions_mut().insert(kind);
     request.extensions_mut().insert(hash);
     next.run(request).await
@@ -327,6 +343,7 @@ fn router(tokens: PathBuf) -> Router {
     let protected = Router::new()
         .merge(discovery::routes(root.clone()))
         .merge(sync::routes(root.clone()))
+        .merge(hub::routes(root.clone()))
         .merge(git::routes(root.clone()))
         .merge(api::routes(root))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "NOT_FOUND", "Unknown endpoint") })
@@ -393,6 +410,9 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
                     .map(|cidr| cidr.parse::<IpNet>().expect("static private CIDR")),
             );
         }
+    }
+    if crate::core::sync::Journal::open(root)?.node.role == crate::core::sync::NodeRole::Server {
+        hub::initialize(root)?;
     }
     let app = router(root.join("sync/tokens.yaml"));
     // Bind everything before starting any request handling: a failed bind
@@ -600,6 +620,7 @@ mod tests {
     fn authentication_is_fail_closed_and_revocation_is_immediate() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("sync")).unwrap();
+        fs::write(dir.path().join("config.yaml"),"node:\n  name: server\n  role: server\n").unwrap();
         let path = dir.path().join("sync/tokens.yaml");
         let node = "a".repeat(64);
         let app = router(path.clone());
@@ -609,7 +630,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let request = |path: &str, token: Option<&str>| {
-                let mut builder = axum::http::Request::builder().uri(path);
+                let mut builder = axum::http::Request::builder().uri(path).header("x-kanban-sync-protocol","3");
                 if let Some(token) = token {
                     builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
                 }

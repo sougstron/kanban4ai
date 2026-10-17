@@ -11,6 +11,7 @@ fn command(root: &std::path::Path) -> Command {
 fn phone_qr_uses_expiring_pair_code_not_bearer_credentials() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("config.yaml"),"node:\n  name: srv\n  role: server\n").unwrap();
     let output = command(dir.path())
         .args(["serve", "--phone-qr", "192.168.1.2:7420"])
         .output()
@@ -152,7 +153,7 @@ fn phone_joins_from_one_invite_and_configures_itself() {
     let config = std::fs::read_to_string(phone.path().join("config.yaml")).unwrap();
     assert!(config.contains("name: phone") && config.contains("role: mobile"));
     assert!(config.contains("name: srv"));
-    assert!(phone.path().join("sync/peers.yaml").exists());
+    assert!(phone.path().join("sync/server.yaml").exists());
     // The invite is single-use.
     let again = command(phone.path())
         .args(["join", &invite])
@@ -211,7 +212,7 @@ fn phone_with_another_board_joins_with_fresh() {
             .next()
             .is_some()
     );
-    assert!(phone.join("sync/peers.yaml").exists());
+    assert!(phone.join("sync/server.yaml").exists());
     assert!(stdout.contains("synced with srv"), "{stdout}");
     assert!(phone.join("projects").read_dir().unwrap().next().is_some());
 }

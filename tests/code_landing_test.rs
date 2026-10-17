@@ -6,7 +6,7 @@ use kanban4ai::core::{
     operations::Operations,
     project::{Project, ProjectStore},
     storage::{NewTask, Storage},
-    sync::{Journal, install_snapshot},
+    sync::Journal,
 };
 use std::{
     fs,
@@ -85,7 +85,7 @@ fn pair_with_role(manual: bool, role: &str) -> Pair {
     .unwrap();
     Journal::open(&b).unwrap();
     kanban4ai::core::sync::enable_sync(&b).unwrap();
-    install_snapshot(&b, &Journal::open(&a).unwrap().snapshot().unwrap()).unwrap();
+    common::bootstrap(&a, &b);
     let wb = temp.path().join("wb");
     git(
         temp.path(),

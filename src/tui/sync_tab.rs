@@ -1,5 +1,5 @@
-//! Global Settings → Sync (TASK-415): this node, the API switch, paired
-//! nodes in phone priority order, pairing, sync state and clone status.
+//! Global Settings → Sync (TASK-514 star): this node, the API switch, the
+//! sync server (outbox, cursor/head, error) and a read-only node list.
 //! Every change is a button or a switch and applies at once; Save/Cancel of
 //! the dialog never touch it. Store I/O lives in `cli::serve::settings` and
 //! `core::net`; this module owns page state, actions and rendering.
@@ -33,7 +33,6 @@ pub(crate) enum Row {
     Connect,
     Disconnect,
     Logout,
-    Peer(usize),
     Pair,
     Code,
     Refresh,
@@ -65,17 +64,12 @@ pub(crate) enum Request {
         role: NodeRole,
     },
     SetApi(bool),
-    MovePeer {
-        id: String,
-        offset: isize,
-    },
     PairingCode {
         address: String,
     },
     Pair {
         address: String,
         code: String,
-        local: String,
     },
     Network(NetworkAction),
 }
@@ -144,8 +138,6 @@ impl SyncTab {
             Row::Disconnect,
             Row::Logout,
         ];
-        let peers = self.view.as_ref().map_or(0, |view| view.peers.len());
-        rows.extend((0..peers).map(Row::Peer));
         rows.extend([Row::Pair, Row::Code, Row::Refresh]);
         rows
     }
@@ -176,11 +168,10 @@ impl SyncTab {
             )],
             FormKind::Pair => vec![
                 (
-                    "Peer address (IP:port) or phone invite (CODE@HOST:PORT)",
+                    "Server address (http(s)://host:port) or phone invite (CODE@HOST:PORT)",
                     String::new(),
                 ),
-                ("Code shown by the peer", String::new()),
-                ("This node's LAN address (IP:port)", String::new()),
+                ("Code shown by the server", String::new()),
             ],
             FormKind::Code => vec![(
                 "This node's LAN address for a phone QR (optional)",
@@ -243,13 +234,7 @@ impl SyncTab {
         }
         self.page = 0;
         let selected = self.selected.min(rows.len() - 1);
-        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match (key.code, rows[selected]) {
-            (KeyCode::Up | KeyCode::Down, Row::Peer(index)) if shift => {
-                self.move_peer(index, key.code == KeyCode::Up)
-            }
-            (KeyCode::Char('K'), Row::Peer(index)) => self.move_peer(index, true),
-            (KeyCode::Char('J'), Row::Peer(index)) => self.move_peer(index, false),
             (KeyCode::Up, _) => self.selected = selected.saturating_sub(1),
             (KeyCode::Down, _) => self.selected = (selected + 1).min(rows.len() - 1),
             (KeyCode::Home, _) => self.selected = 0,
@@ -258,22 +243,6 @@ impl SyncTab {
             (KeyCode::Enter | KeyCode::Char(' '), row) => self.activate(row),
             _ => {}
         }
-    }
-
-    fn move_peer(&mut self, index: usize, up: bool) {
-        let Some(view) = &self.view else { return };
-        let target = if up {
-            index.checked_sub(1)
-        } else {
-            (index + 1 < view.peers.len()).then_some(index + 1)
-        };
-        let Some(target) = target else { return };
-        self.request = Some(Request::MovePeer {
-            id: view.peers[index].id.clone(),
-            offset: if up { -1 } else { 1 },
-        });
-        // The cursor follows the node it moves.
-        self.selected = self.selected + target - index;
     }
 
     fn activate(&mut self, row: Row) {
@@ -312,7 +281,6 @@ impl SyncTab {
             )))),
             Row::Disconnect => Some(Request::Network(NetworkAction::Disconnect)),
             Row::Logout => Some(Request::Network(NetworkAction::Logout)),
-            Row::Peer(_) => return,
             Row::Pair => return self.open(FormKind::Pair),
             Row::Code => return self.open(FormKind::Code),
             Row::Refresh => Some(Request::Refresh),
@@ -334,7 +302,6 @@ impl SyncTab {
             FormKind::Pair => Request::Pair {
                 address: value(0),
                 code: value(1),
-                local: value(2),
             },
             FormKind::Code => Request::PairingCode { address: value(0) },
             FormKind::AuthKey => unreachable!(),
@@ -370,18 +337,14 @@ impl SyncTab {
                 self.spawn(move || {
                     Outcome::View(settings::refresh(&root).map_err(|e| e.to_string()))
                 });
-                self.notice = Some(("Probing paired nodes…".into(), false));
+                self.notice = Some(("Checking the sync server…".into(), false));
                 return;
             }
-            Request::Pair {
-                address,
-                code,
-                local,
-            } => {
+            Request::Pair { address, code } => {
                 let job_root = root.clone();
                 self.spawn(move || {
                     Outcome::Paired(
-                        settings::pair(&job_root, &address, &code, &local)
+                        settings::pair(&job_root, &address, &code)
                             .map_err(|e| e.to_string()),
                     )
                 });
@@ -397,9 +360,6 @@ impl SyncTab {
                     "API server stopped and disabled".to_string()
                 })
             }),
-            Request::MovePeer { id, offset } => {
-                settings::move_peer(&root, &id, offset).map(|()| None)
-            }
             Request::PairingCode { address } => {
                 settings::pairing_code(&root, &address).map(|pairing| {
                     self.pairing = Some(pairing);
@@ -434,12 +394,11 @@ impl SyncTab {
         match settings::local_view(root) {
             Ok(mut view) => {
                 if let Some(old) = self.view.take().filter(|old| old.probed) {
-                    for peer in &mut view.peers {
-                        if let Some(probed) = old.peers.iter().find(|p| p.id == peer.id) {
-                            peer.code = probed.code.clone();
-                            peer.message = probed.message.clone();
-                            peer.route = probed.route.clone();
-                            peer.clones = probed.clones.clone();
+                    for node in &mut view.nodes {
+                        if let Some(probed) = old.nodes.iter().find(|p| p.id == node.id) {
+                            node.code = probed.code.clone();
+                            node.message = probed.message.clone();
+                            node.route = probed.route.clone();
                         }
                     }
                     view.probed = true;
@@ -752,52 +711,101 @@ fn lines(
         vec![Span::raw("[ Выйти из аккаунта / Logout ]")],
     );
     out.push(Line::default());
-    out.push(heading(
-        app,
-        "Nodes in phone priority order (Shift+↑/↓ or K/J moves)",
-    ));
-    if view.peers.is_empty() {
-        out.push(Line::from(Span::styled("  No paired nodes yet", muted)));
+    out.push(heading(app, "Sync server"));
+    match &view.server {
+        Some(server) => {
+            let self_server = view.role == NodeRole::Server;
+            out.push(Line::from(vec![
+                Span::raw(format!(
+                    "{} · {}",
+                    sanitize_terminal_text(&server.name),
+                    if server.urls.is_empty() {
+                        "no address set".to_string()
+                    } else {
+                        server.urls.join(" · ")
+                    }
+                )),
+                Span::styled(
+                    format!("  · {}", sanitize_terminal_text(&server.route)),
+                    status_style(app, &server.code),
+                ),
+            ]));
+            if self_server {
+                out.push(detail(
+                    app,
+                    format!(
+                        "This node is the sync server · head {head} · compact floor —",
+                        head = server.head
+                    ),
+                ));
+            } else {
+                out.push(detail(
+                    app,
+                    format!(
+                        "Outbox: {pending} op(s) waiting · last_seq {last_seq} / head {head}",
+                        pending = server.pending,
+                        last_seq = server.last_seq,
+                        head = server.head
+                    ),
+                ));
+            }
+            if !server.message.is_empty() {
+                out.push(Line::from(Span::styled(
+                    sanitize_terminal_text(&server.message),
+                    status_style(app, &server.code),
+                )));
+            }
+        }
+        None => out.push(Line::from(Span::styled(
+            "No sync server — connect one (docs/sync-server.md)",
+            muted,
+        ))),
     }
-    for (index, peer) in view.peers.iter().enumerate() {
+    out.push(Line::default());
+    let nodes_heading = if view.role == NodeRole::Server {
+        "Connected clients (read-only)"
+    } else {
+        "Nodes (read-only)"
+    };
+    out.push(heading(app, nodes_heading));
+    if view.nodes.is_empty() {
+        out.push(Line::from(Span::styled(
+            "  No other nodes yet",
+            muted,
+        )));
+    }
+    for (index, node) in view.nodes.iter().enumerate() {
         let mut spans = vec![Span::raw(format!(
             "{}. {} ({})",
             index + 1,
-            sanitize_terminal_text(&peer.name),
-            role_label(peer.role)
+            sanitize_terminal_text(&node.name),
+            role_label(node.role)
         ))];
-        if !peer.code.is_empty() {
+        if !node.code.is_empty() {
             spans.push(Span::styled(
-                format!(" · {}", peer.code),
-                status_style(app, &peer.code),
+                format!(" · {}", node.code),
+                status_style(app, &node.code),
             ));
         }
-        row(&mut out, Row::Peer(index), spans);
+        out.push(Line::from(spans));
         out.push(Line::from(Span::styled(
-            format!("      {}", sanitize_terminal_text(&peer.message)),
-            status_style(app, &peer.code),
+            sanitize_terminal_text(&node.message),
+            status_style(app, &node.code),
         )));
         out.push(detail(
             app,
             format!(
-                "{} · {} · {} op(s) waiting",
-                peer.route,
-                peer.exchange
-                    .as_deref()
-                    .map_or("never exchanged".to_string(), |at| format!(
-                        "exchanged {at}"
-                    )),
-                peer.pending
+                "{} · cursor {} · {} op(s) waiting",
+                sanitize_terminal_text(&node.route),
+                node.cursor,
+                node.lag
             ),
         ));
-        for clone in &peer.clones {
-            out.push(detail(app, format!("clone {clone}")));
-        }
     }
     row(
         &mut out,
         Row::Pair,
-        vec![Span::raw("[ Pair with a node… ]")],
+        vec![Span::raw("[ Connect to the sync server… ]")],
     );
     row(
         &mut out,
@@ -865,7 +873,7 @@ pub(crate) fn render(
     frame.render_widget(block, area);
     if tab.disabled {
         frame.render_widget(
-            Paragraph::new("Sync выключен — добавьте peer (kanban serve pair / join) или relay")
+            Paragraph::new("Sync выключен — подключите sync server (kanban serve --pair)")
                 .style(Style::default().fg(app.theme.muted))
                 .wrap(Wrap { trim: false }),
             inner,
@@ -971,7 +979,7 @@ fn overlay(area: Rect, height: u16) -> Rect {
 fn render_form(frame: &mut Frame<'_>, app: &App, form: &Form, area: Rect) {
     let title = match form.kind {
         FormKind::Rename => " Rename this node ",
-        FormKind::Pair => " Pair with a node ",
+        FormKind::Pair => " Connect to the sync server ",
         FormKind::Code => " Pairing code ",
         FormKind::AuthKey => " One-time Tailscale auth key ",
     };
@@ -1042,7 +1050,7 @@ fn render_pairing(
             ),
         ]),
         Line::from(Span::styled(
-            "Enter it on the other node: Sync → Pair with a node.",
+            "Enter it on the other node: Sync → Connect to the sync server.",
             Style::default().fg(app.theme.muted),
         )),
     ];
@@ -1052,7 +1060,7 @@ fn render_pairing(
             Span::styled(command.clone(), Style::default().fg(app.theme.focus)),
         ]));
         lines.push(Line::from(
-            "or paste the invite into Sync → Pair with a node, or scan:",
+            "or paste the invite into Sync → Connect to the sync server, or scan:",
         ));
         lines.extend(qr.lines().map(|line| Line::from(line.to_string())));
     }

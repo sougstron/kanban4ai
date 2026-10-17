@@ -240,6 +240,28 @@ async fn log(
     Params((id, task)): Params<(String, String)>,
     axum::extract::Query(query): axum::extract::Query<LogQuery>,
 ) -> Response {
+    let remote=(|| -> Result<Option<(PathBuf,String,NodeRole)>> {
+        let board=project(&root,&id)?.data_root;
+        let journal=Journal::open(&root)?;
+        let run=runner_log::latest_run(&board,&task)?;
+        Ok((run.node_id!=journal.node.node_id).then_some((board,run.node_id,journal.node.role)))
+    })();
+    if let Ok(Some((board,node,role)))=remote {
+        if query.follow==1 && role!=NodeRole::Server {
+            return error(StatusCode::CONFLICT,"RUNNER_LOG_UNAVAILABLE","Follow the log on the runner or sync server");
+        }
+        let snapshot=match fetch_log(&root,&id,&task,&node).await {Ok(s)=>s,Err(e)=>return log_failure(e)};
+        if query.follow!=1 {return Json(snapshot).into_response();}
+        let stream=futures_util::stream::unfold((board,task,node,snapshot,true),|(board,task,node,mut previous,first)|async move{
+            if first {let event=format!("event: log\ndata: {}\n\n",json!(previous));return Some((Ok::<_,std::convert::Infallible>(event),(board,task,node,previous,false)));}
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let (b,t,n)=(board.clone(),task.clone(),node.clone());
+            let snapshot=blocking(move||runner_log::cached_tail(&b,&t,&n)).await.ok()?;
+            let event=if snapshot!=previous {previous=snapshot;format!("event: log\ndata: {}\n\n",json!(previous))}else{": keepalive\n\n".into()};
+            Some((Ok(event),(board,task,node,previous,false)))
+        });
+        return ([(header::CONTENT_TYPE,"text/event-stream"),(header::CACHE_CONTROL,"no-cache")],axum::body::Body::from_stream(stream)).into_response();
+    }
     let read_task = task.clone();
     let initial = blocking(move || {
         valid_task(&read_task)?;
@@ -382,138 +404,29 @@ async fn bounded_log_json<T: serde::de::DeserializeOwned>(
 }
 
 async fn fetch_log(root: &Path, id: &str, task: &str, node_id: &str) -> Result<LogSnapshot> {
-    let config = discovery::config(root)?;
-    if !discovery::network_available(root, &config)? {
-        return Err(invalid("NODE_OUT_OF_LAN: Runner network is unavailable"));
+    let journal=Journal::open(root)?;
+    let uid=journal.project_uids()?.get(id).cloned().ok_or_else(||invalid("Unknown project"))?;
+    if journal.node.role==NodeRole::Server {
+        return runner_log::cached_tail(&root.join("projects").join(id),task,node_id);
     }
-    let peer = config
-        .peers
-        .iter()
-        .find(|peer| peer.node.node_id == node_id)
-        .ok_or_else(|| invalid("NODE_AUTH_FAILED: Runner is not paired"))?;
-    let credentials: Vec<discovery::Credential> = discovery::load(&root.join("sync/peers.yaml"))?;
-    let secret = credentials
-        .iter()
-        .find(|entry| entry.node_id == node_id)
-        .ok_or_else(|| invalid("NODE_AUTH_FAILED: Runner credentials are missing"))?;
-    let presence: BTreeMap<String, discovery::Presence> =
-        discovery::load(&root.join("sync/presence.yaml"))?;
-    let presence = presence.get(node_id).cloned().unwrap_or_default();
-    if presence.bye.is_some() {
-        return Err(invalid(
-            "NODE_POWERED_OFF: Runner announced shutdown or sleep",
-        ));
+    let config=discovery::config(root)?;
+    let peer=config.target.as_ref().ok_or_else(||invalid("NODE_UNREACHABLE: No sync server"))?;
+    let credentials=discovery::server_credential(root)?;
+    let secret=credentials.as_ref().ok_or_else(||invalid("NODE_AUTH_FAILED"))?;
+    let presence: BTreeMap<String,discovery::Presence>=discovery::load(&root.join("sync/presence.yaml"))?;
+    let state=presence.get(&peer.node.node_id).cloned().unwrap_or_default();
+    for base in discovery::server_addresses(root,peer,Some(secret),&state,&config)? {
+        let timeout=Duration::from_secs(config.probe_timeout);
+        let http=discovery::server_client(root,&base,timeout,Some(timeout))?;
+        let response=match http.get(format!("{base}/sync/v3/logs/{uid}/{task}")).bearer_auth(&secret.token).header("x-kanban-sync-protocol","3").send().await {Ok(r)=>r,Err(_)=>continue};
+        if !response.status().is_success(){continue;}
+        let snapshot:LogSnapshot=bounded_log_json(response,8<<20).await?;
+        if snapshot.node_id!=node_id || snapshot.project!=uid || snapshot.task!=task{return Err(invalid("SYNC_STORE_MISMATCH: log identity differs"));}
+        runner_log::validate_snapshot(root,&snapshot)?;runner_log::cache_snapshot(root,&snapshot)?;return Ok(snapshot);
     }
-    let addresses = discovery::peer_addresses(root, peer, Some(secret), &presence, &config)?;
-    let journal = Journal::open(root)?;
-    let uid = journal
-        .state()?
-        .project_uids
-        .get(id)
-        .cloned()
-        .ok_or_else(|| invalid("Runner log project is not registered"))?;
-    let limit = crate::core::sync::relay::settings(root)?
-        .log_tail_bytes
-        .saturating_mul(6)
-        .saturating_add(4096);
-    for address in addresses {
-        let timeout = Duration::from_secs(config.probe_timeout);
-        let http = match discovery::peer_client(root, &address, timeout, Some(timeout)) {
-            Ok(http) => http,
-            Err(KanbanError::Invalid(message)) if message.starts_with("NET_") => {
-                return Err(invalid(message));
-            }
-            Err(_) => continue,
-        };
-        let probe = match http
-            .get(format!("http://{address}/node"))
-            .bearer_auth(&secret.token)
-            .send()
-            .await
-        {
-            Ok(probe) => probe,
-            Err(_) => continue,
-        };
-        if probe.status() == StatusCode::UNAUTHORIZED || probe.status() == StatusCode::FORBIDDEN {
-            return Err(invalid("NODE_AUTH_FAILED: Runner rejected its node token"));
-        }
-        if !probe.status().is_success() {
-            continue;
-        }
-        let card: Value = bounded_log_json(probe, 16384).await?;
-        if card["node_id"] != node_id || card["store_id"] != journal.node.store_id {
-            return Err(invalid(
-                "SYNC_STORE_MISMATCH: Runner identity or store does not match",
-            ));
-        }
-        if card["proto"]
-            .as_u64()
-            .is_none_or(|proto| proto < u64::from(MIN_PROTO))
-            || card["min_proto"]
-                .as_u64()
-                .is_none_or(|proto| proto > u64::from(PROTO))
-        {
-            return Err(invalid(
-                "NODE_VERSION_MISMATCH: Runner protocol is incompatible",
-            ));
-        }
-        if peer.node.store_id != journal.node.store_id {
-            refresh_peer_store(root, node_id, &journal.node.store_id)?;
-        }
-        let mut url = reqwest::Url::parse(&format!("http://{address}/"))
-            .map_err(|_| invalid("Invalid paired runner address"))?;
-        url.path_segments_mut()
-            .map_err(|_| invalid("Invalid paired runner address"))?
-            .extend(["api", "v1", "projects", id, "tasks", task, "log"]);
-        let response = match http.get(url).bearer_auth(&secret.token).send().await {
-            Ok(response) => response,
-            Err(_) => continue,
-        };
-        if response.status() == StatusCode::UNAUTHORIZED
-            || response.status() == StatusCode::FORBIDDEN
-        {
-            return Err(invalid("NODE_AUTH_FAILED: Runner rejected log access"));
-        }
-        if !response.status().is_success() {
-            return Err(invalid(
-                "RUNNER_LOG_UNAVAILABLE: Runner could not provide this task log",
-            ));
-        }
-        let snapshot: LogSnapshot = bounded_log_json(response, limit).await?;
-        if snapshot.node_id != node_id || snapshot.project != uid || snapshot.task != task {
-            return Err(invalid(
-                "SYNC_STORE_MISMATCH: Runner log identity does not match",
-            ));
-        }
-        runner_log::validate_snapshot(root, &snapshot)?;
-        runner_log::cache_snapshot(root, &snapshot)?;
-        return Ok(snapshot);
-    }
-    Err(invalid(
-        "NODE_UNREACHABLE: Runner log endpoint is unreachable",
-    ))
+    Err(invalid("NODE_UNREACHABLE: server log endpoint is unavailable"))
 }
 
-pub(super) fn refresh_peer_store(root: &Path, node_id: &str, store_id: &str) -> Result<()> {
-    let _lock = crate::core::storage::lock_file_reentrant(&root.join("sync/.lock"))?;
-    let path = root.join("config.yaml");
-    let mut config: serde_yaml_ng::Value = discovery::load(&path)?;
-    let mut changed = false;
-    if let Some(peers) = config["sync"]["peers"].as_sequence_mut() {
-        for paired in peers {
-            if paired["node_id"].as_str() == Some(node_id)
-                && paired["store_id"].as_str() != Some(store_id)
-            {
-                paired["store_id"] = serde_yaml_ng::Value::String(store_id.to_owned());
-                changed = true;
-            }
-        }
-    }
-    if !changed {
-        return Ok(());
-    }
-    crate::core::storage::atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&config)?)
-}
 fn decode<T: serde::de::DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value).map_err(|e| invalid(e.to_string()))
 }
@@ -657,7 +570,7 @@ async fn action(
         return continue_task(root, id, task, request).await;
     }
     // Explicit launches preserve unavailable-runner choices; auto launches use
-    // the shared Operations dispatcher and its durable relay intent.
+    // the shared Operations dispatcher and its durable journal intent.
     if action == "launch" {
         let preference = (|| -> Result<Runner> {
             let p = project(&root, &id)?;
@@ -748,10 +661,9 @@ async fn target(
         return Err(invalid("Not found"));
     };
     let config = discovery::config(root)?;
-    if config.peers.is_empty() {
-        return Ok(None);
-    }
     let journal = Journal::open(root)?;
+    let known=discovery::known_nodes(root)?;
+    if known.is_empty(){return Ok(None);}
 
     let board = crate::core::config::Config::new(&project.data_root).load()?;
     let preference = requested.unwrap_or_else(|| board.runner_for(task.runner.clone()));
@@ -762,37 +674,17 @@ async fn target(
         if name == journal.node.name || matches!(preference, Runner::Here) {
             return Some(journal.node.name.clone());
         }
-        if let Some(peer) = config.peers.iter().find(|p| p.node.name == name) {
-            return Some(peer.node.name.clone());
-        }
+        if let Some(node)=known.iter().find(|n|n.name==name){return Some(node.name.clone());}
         if preference.node_role() == Some(journal.node.role) {
             Some(journal.node.name.clone())
         } else {
-            config
-                .peers
-                .iter()
-                .find(|p| preference.node_role() == Some(p.node.role))
-                .map(|p| p.node.name.clone())
+            known.iter().find(|n|preference.node_role()==Some(n.role)).map(|n|n.name.clone())
         }
     };
     let node = if preference == Runner::Auto {
-        let mut chosen = None;
-        for candidate in board.runner_auto_order() {
-            let Some(name) = choose(&candidate) else {
-                continue;
-            };
-            if name == journal.node.name
-                || discovery::runner_online(
-                    root,
-                    config.peers.iter().find(|p| p.node.name == name).unwrap(),
-                )
-                .await?
-            {
-                chosen = Some(name);
-                break;
-            }
-        }
-        chosen.unwrap_or_else(|| journal.node.name.clone())
+        if let Some(server)=config.target.as_ref() {
+            if discovery::runner_online(root,server).await? {server.node.name.clone()}else{journal.node.name.clone()}
+        }else{journal.node.name.clone()}
     } else {
         choose(&preference).ok_or_else(|| invalid("NODE_UNREACHABLE: Runner is not paired"))?
     };
@@ -838,7 +730,7 @@ pub(super) async fn runner_action(
     .await?;
     if !has_remote {
         let config = discovery::config(root)?;
-        let offline = match config.peers.iter().find(|peer| peer.node.name == node) {
+        let offline = match config.target.iter().find(|peer| peer.node.name == node) {
             Some(peer) => !discovery::runner_online(root, peer).await?,
             None => true,
         };
@@ -862,7 +754,7 @@ pub(super) async fn runner_action(
         // replicated status/descriptor, without turning a failed readback
         // into a failed (and potentially repeated) committed launch.
         if let Ok(config) = discovery::config(root)
-            && let Some(peer) = config.peers.iter().find(|peer| peer.node.name == node)
+            && let Some(peer) = config.target.iter().find(|peer| peer.node.name == node)
         {
             let _ = tokio::time::timeout(Duration::from_secs(5), super::sync::catch_up(root, peer))
                 .await;
@@ -881,7 +773,7 @@ pub(super) async fn runner_action(
         eprintln!(
             "warning: runner {node} is unreachable ({code}); the task is queued until it reconnects. Pass --runner <local> to run here."
         );
-        // Publish code before the replicated intent: a relay-only runner must
+        // Publish code before the replicated intent: a client runner must
         // never consume a request for a snapshot which has not been published.
         let (code_root, code_id, code_task) = (root.to_path_buf(), id.to_owned(), task.to_owned());
         blocking(move || {
@@ -936,7 +828,7 @@ pub(super) fn local_runner(
     else {
         return Ok(true);
     };
-    if discovery::config(root)?.peers.is_empty() {
+    if discovery::known_nodes(root)?.is_empty() {
         return Ok(true);
     }
     let local = Journal::open(root)?.node;
@@ -947,10 +839,7 @@ pub(super) fn local_runner(
     if name == local.name {
         return Ok(true);
     }
-    if discovery::config(root)?
-        .peers
-        .iter()
-        .any(|peer| peer.node.name == name)
+    if discovery::known_nodes(root)?.iter().any(|node|node.name==name)
     {
         return Ok(false);
     }
@@ -973,12 +862,20 @@ async fn proxy(
         Err(e) => return failure(e),
     };
 
-    let Some(peer) = config.peers.iter().find(|p| p.node.name == node) else {
-        return error(
-            StatusCode::CONFLICT,
-            "NODE_UNREACHABLE",
-            "Runner не сопряжён",
-        );
+    let Some(peer) = config.target.iter().find(|p| p.node.name == node) else {
+        let root=root.to_path_buf();let (id,task,node,action)=(id.to_owned(),task.to_owned(),node.to_owned(),action.to_owned());
+        return respond(blocking(move||{
+            let p=project(&root,&id)?;let ops=Operations::for_project(&p);
+            if action=="launch" {
+                let remote=crate::core::code::status(&root,&id)?.remote.ok_or_else(||invalid("SYNC_NO_REMOTE: client runner requires a code remote"))?;
+                publish_launch_code(&root,&id,&task,&remote)?;
+                found(ops.update_task(&task,TaskPatch{runner:Some(Some(Runner::Node(node))),..Default::default()})?)?;
+                found(ops.queue_local_run(&task)?)?;
+            }else if !crate::core::sync::control::request(&p.data_root,&task,&action)? {
+                return Err(invalid("Runner command unavailable"));
+            }
+            Ok(json!({"queued":true}))
+        }).await);
     };
     if !available {
         return unavailable(
@@ -995,8 +892,8 @@ async fn proxy(
         .await;
     }
     let role = peer.node.role;
-    let credentials: Vec<discovery::Credential> =
-        match discovery::load(&root.join("sync/peers.yaml")) {
+    let credentials: Option<discovery::Credential> =
+        match discovery::server_credential(root) {
             Ok(c) => c,
             Err(e) => return failure(e),
         };
@@ -1051,14 +948,14 @@ async fn proxy(
         )
         .await;
     }
-    let addresses = match discovery::peer_addresses(root, peer, Some(secret), &presence, &config) {
+    let addresses = match discovery::server_addresses(root, peer, Some(secret), &presence, &config) {
         Ok(addresses) => addresses,
         Err(e) => return failure(e),
     };
     let mut last: Option<String> = None;
     for address in addresses {
         let timeout = Duration::from_secs(config.probe_timeout);
-        let http = match discovery::peer_client(root, &address, timeout, Some(timeout)) {
+        let http = match discovery::server_client(root, &address, timeout, Some(timeout)) {
             Ok(http) => http,
             Err(e) => {
                 last = Some(e.to_string());
@@ -1066,7 +963,7 @@ async fn proxy(
             }
         };
         let probe = match http
-            .get(format!("http://{address}/node"))
+            .get(format!("{address}/node"))
             .bearer_auth(&secret.token)
             .send()
             .await
@@ -1134,11 +1031,6 @@ async fn proxy(
                 "Runner protocol is incompatible",
             );
         }
-        if peer.node.store_id != store_id {
-            if let Err(e) = refresh_peer_store(root, &peer.node.node_id, &store_id) {
-                return failure(e);
-            }
-        }
         if action == "launch" {
             if project(root, id)
                 .ok()
@@ -1152,7 +1044,7 @@ async fn proxy(
             // The runner still enforces it at mutation time (this is not a lock).
             let preflight = match http
                 .get(format!(
-                    "http://{address}/api/v1/projects/{id}/tasks/{task}"
+                    "{address}/api/v1/projects/{id}/tasks/{task}"
                 ))
                 .bearer_auth(&secret.token)
                 .send()
@@ -1253,7 +1145,7 @@ async fn proxy(
                 }
             };
             let mut upload = http
-                .post(format!("http://{address}/git/{id}/bundle"))
+                .post(format!("{address}/git/{id}/bundle"))
                 .bearer_auth(&secret.token);
             if let Some(remote) = transfer.1 {
                 upload = upload.query(&[("remote", remote)]);
@@ -1282,7 +1174,7 @@ async fn proxy(
                 return failure(e);
             }
         }
-        let url = format!("http://{address}/api/v1/projects/{id}/tasks/{task}/{action}");
+        let url = format!("{address}/api/v1/projects/{id}/tasks/{task}/{action}");
         match http
             .post(url)
             .bearer_auth(&secret.token)
@@ -1438,10 +1330,10 @@ async fn unavailable(
                         let preference = requested
                             .unwrap_or(ops.config.load()?.runner_for(current.runner.clone()));
                         let node = config
-                            .peers
+                            .target
                             .iter()
                             .find(|peer| peer.node.name == preference.as_str())
-                            .or_else(|| config.peers.iter().find(|peer| peer.node.role == role))
+                            .or_else(|| config.target.iter().find(|peer| peer.node.role == role))
                             .ok_or_else(|| invalid("NODE_UNREACHABLE: Runner is not paired"))?;
                         let runner = Runner::Node(node.node.name.clone());
                         if current.runner.as_ref().map(Runner::as_str) != Some(runner.as_str()) {
@@ -1483,7 +1375,7 @@ pub(crate) fn launch_on_board(
     let Some(root) = crate::core::sync::store_for_board(board) else {
         return Ok(None);
     };
-    if discovery::config(root)?.peers.is_empty() {
+    if discovery::known_nodes(root)?.is_empty() {
         return Ok(None);
     }
     let id = board
@@ -1529,10 +1421,10 @@ async fn continue_task(root: PathBuf, id: String, task_id: String, request: Acti
             .runner
             .as_ref()
             .ok_or_else(|| invalid("runner is required"))?;
-        let config = discovery::config(&root)?;
+        let known = discovery::known_nodes(&root)?;
         let local = Journal::open(&root)?.node;
         let name = runner.as_str();
-        if name != local.name && !config.peers.iter().any(|p| p.node.name == name) {
+        if name != local.name && !known.iter().any(|p| p.name == name) {
             return Err(invalid("NODE_UNREACHABLE: target must name a paired node"));
         }
         let runs = Journal::open(&root)?.runs(&id, &task_id)?;
@@ -1563,13 +1455,13 @@ async fn continue_task(root: PathBuf, id: String, task_id: String, request: Acti
             Ok(c) => c,
             Err(e) => return failure(e),
         };
-        let Some(peer) = config.peers.iter().find(|p| p.node.name == source) else {
-            return failure(invalid("NODE_UNREACHABLE: source is not paired"));
-        };
-        match discovery::runner_online(&root, peer).await {
-            Ok(true) => return proxy(&root, &source, &id, &task_id, "continue", &request).await,
-            Err(e) => return failure(e),
-            Ok(false) => {}
+        let known=match discovery::known_nodes(&root){Ok(n)=>n,Err(e)=>return failure(e)};
+        let Some(source_node)=known.iter().find(|n|n.name==source)else{return failure(invalid("NODE_UNREACHABLE: source is unknown"));};
+        if let Some(server)=config.target.iter().find(|p|p.node.name==source) {
+            match discovery::runner_online(&root,server).await {
+                Ok(true)=>return proxy(&root,&source,&id,&task_id,"continue",&request).await,
+                Err(e)=>return failure(e),Ok(false)=>(),
+            }
         }
         if !request.last_published {
             return failure(invalid(
@@ -1577,7 +1469,7 @@ async fn continue_task(root: PathBuf, id: String, task_id: String, request: Acti
             ));
         }
         let (r, i, t) = (root.clone(), id.clone(), task_id.clone());
-        let source_id = peer.node.node_id.clone();
+        let source_id = source_node.node_id.clone();
         let runner = request.runner.expect("validated target");
         let adopted = blocking(move || {
             let project = crate::core::code::prepare(&r, &i)?;
@@ -1706,12 +1598,9 @@ pub(crate) fn continuation_nodes(board: &Path) -> Result<Vec<String>> {
     let root = crate::core::sync::store_for_board(board)
         .ok_or_else(|| invalid("not a synchronized board"))?;
     let local = Journal::open(root)?.node.name;
-    let mut nodes = vec![local];
+    let mut nodes = vec![local.clone()];
     nodes.extend(
-        discovery::config(root)?
-            .peers
-            .into_iter()
-            .map(|p| p.node.name),
+        discovery::known_nodes(root)?.into_iter().filter(|n|n.name!=local).map(|n|n.name),
     );
     Ok(nodes)
 }
@@ -1720,7 +1609,7 @@ pub(crate) fn remote_runner_on_board(board: &Path, task: &str) -> Result<Option<
     let Some(root) = crate::core::sync::store_for_board(board) else {
         return Ok(None);
     };
-    if discovery::config(root)?.peers.is_empty() {
+    if discovery::known_nodes(root)?.is_empty() {
         return Ok(None);
     }
     let ops = Operations::new(board);
@@ -1808,7 +1697,7 @@ mod tests {
     async fn explicit_offline_runner_offers_alternative_without_mutation_and_waits() {
         for (local_role, target_role, alternative) in [
             ("laptop", "server", "laptop"),
-            ("mobile", "laptop", "server"),
+            ("mobile", "server", "laptop"),
         ] {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("store");
@@ -1824,26 +1713,25 @@ mod tests {
             Storage::new(&p.data_root).init_board().unwrap();
             let ops = Operations::for_project(&p);
             let task = ops.create_task(NewTask::titled("Offline runner")).unwrap();
-            let node = Journal::open(&root).unwrap().node;
+            Journal::open(&root).unwrap();
             let at = chrono::Utc::now() - chrono::Duration::minutes(10);
             atomic_write_text_raw(
                 &root.join("config.yaml"),
                 &serde_yaml_ng::to_string(&json!({
                     "node": {"name": local_role, "role": local_role},
                     "runner": {"default": target_role},
-                    "sync": {"home_networks": ["0.0.0.0/0"], "peers": [{
-                        "node_id": "offline-runner", "name": target_role, "role": target_role,
-                        "store_id": node.store_id, "address": "127.0.0.1:9"
-                    }]}
+                    "sync": {"home_networks": ["0.0.0.0/0"], "server": {
+                        "node_id": "offline-runner", "name": target_role, "urls":["http://127.0.0.1:9"]
+                    }}
                 }))
                 .unwrap(),
             )
             .unwrap();
             atomic_write_text_raw(
-                &root.join("sync/peers.yaml"),
-                &serde_yaml_ng::to_string(&json!([{
-                    "node_id": "offline-runner", "token": "test", "inbound_sha256": "unused"
-                }]))
+                &root.join("sync/server.yaml"),
+                &serde_yaml_ng::to_string(&json!({
+                    "node_id": "offline-runner", "token": "test", "urls":["http://127.0.0.1:9"]
+                }))
                 .unwrap(),
             )
             .unwrap();
@@ -2173,19 +2061,19 @@ mod tests {
         let task = Operations::for_project(&p)
             .create_task(NewTask::titled("Placement"))
             .unwrap();
-        let local = Journal::open(&root).unwrap().node;
+        Journal::open(&root).unwrap();
         atomic_write_text_raw(
             &root.join("config.yaml"),
             &serde_yaml_ng::to_string(&json!({
                 "node": {"name":"desk", "role":"laptop"},
-                "sync": {"peers": [{
-                    "node_id":"other-node", "name":"laptop", "role":"laptop",
-                    "store_id":local.store_id, "address":"127.0.0.1:1"
-                }]}
+                "sync": {"server": {"node_id":"server-node","name":"home","urls":["http://127.0.0.1:1"]}}
             }))
             .unwrap(),
         )
         .unwrap();
+        atomic_write_text_raw(&root.join("sync/nodes.json"),&json!([{
+            "node":"other-node","name":"laptop","role":"laptop","status":"offline","code":"OFFLINE","path":"server","message":"","since":null,"last_seen":null
+        }]).to_string()).unwrap();
         assert_eq!(
             target(&root, &p.id, &task.id, Some(Runner::Here), true)
                 .await

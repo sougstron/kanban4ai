@@ -1,3 +1,5 @@
+mod common;
+
 use kanban4ai::core::storage::{Storage, atomic_write_text};
 use kanban4ai::core::sync::{Hlc, Journal, Operation};
 use std::collections::BTreeMap;
@@ -12,7 +14,7 @@ fn operations(store: &std::path::Path, node: &str) -> Vec<Operation> {
 
 #[test]
 fn bootstrap_only_transfers_board_data_instructions_and_images() {
-    use kanban4ai::core::sync::install_snapshot;
+    use kanban4ai::core::sync::transport::{snapshot_spool, stage_snapshot};
 
     let source = tempfile::tempdir().unwrap();
     let board = source.path().join("projects/demo");
@@ -44,18 +46,22 @@ fn bootstrap_only_transfers_board_data_instructions_and_images() {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, "local-only").unwrap();
     }
-    let snapshot = Journal::open(source.path()).unwrap().snapshot().unwrap();
+    let snapshot = snapshot_spool(source.path()).unwrap();
+    let lines: Vec<serde_json::Value> = fs::read_to_string(snapshot.path())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
     for relative in excluded {
+        let path = format!("projects/demo/.kanban/{relative}");
         assert!(
-            !snapshot
-                .files
-                .contains_key(&format!("projects/demo/.kanban/{relative}")),
+            !lines.iter().any(|line| line["path"] == path),
             "snapshot leaked {relative}"
         );
     }
     let receiver = tempfile::tempdir().unwrap();
     Journal::open(receiver.path()).unwrap();
-    install_snapshot(receiver.path(), &snapshot).unwrap();
+    common::bootstrap(source.path(), receiver.path());
     for (relative, contents) in included {
         let path = receiver.path().join("projects/demo/.kanban").join(relative);
         let actual = fs::read_to_string(path).unwrap();
@@ -74,11 +80,25 @@ fn bootstrap_only_transfers_board_data_instructions_and_images() {
                 .join(relative)
                 .exists()
         );
-        let mut forbidden = snapshot.clone();
-        forbidden
-            .files
-            .insert(format!("projects/demo/.kanban/{relative}"), "eA==".into());
-        assert!(install_snapshot(receiver.path(), &forbidden).is_err());
+        let mut forbidden = lines.clone();
+        let end = forbidden.last_mut().unwrap();
+        end["files"] = (end["files"].as_u64().unwrap() + 1).into();
+        forbidden.insert(
+            forbidden.len() - 1,
+            serde_json::json!({
+                "kind": "file",
+                "path": format!("projects/demo/.kanban/{relative}"),
+                "text": "not allowed"
+            }),
+        );
+        let input = tempfile::NamedTempFile::new().unwrap();
+        let mut content = forbidden.iter()
+            .map(|line| serde_json::to_string(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        content.push('\n');
+        fs::write(input.path(), content).unwrap();
+        assert!(stage_snapshot(receiver.path(), input.path()).is_err());
     }
 }
 

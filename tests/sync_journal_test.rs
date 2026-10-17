@@ -260,7 +260,7 @@ fn deleting_projection_or_index_rebuilds_the_same_state() {
     let storage = board(dir.path());
     atomic_write_text(&storage.tasks_dir.join("todo/TASK-001.md"), &task("kept")).unwrap();
     let journal = Journal::open(dir.path()).unwrap();
-    journal.snapshot().unwrap();
+    kanban4ai::core::sync::transport::snapshot_spool(dir.path()).unwrap();
     let before = serde_json::to_value(journal.state().unwrap()).unwrap();
     let shards = dir.path().join("sync/meta/projection");
     let saved = tempfile::tempdir().unwrap();

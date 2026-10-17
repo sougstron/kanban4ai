@@ -157,7 +157,7 @@ pub(super) fn migrate(store: &Path) -> Result<()> {
     if !conflicts.is_empty() {
         atomic_write_text_raw(&root.join("meta/conflicts.jsonl"), &conflicts)?;
     }
-    format::write_format(store, STORE_FORMAT)?;
+    format::write_format(store, 3)?;
     finish_v1_move_locked(store)?;
     let _ = segments::rebuild_index(&root);
     Ok(())

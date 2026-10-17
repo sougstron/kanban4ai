@@ -44,16 +44,16 @@ const SYNC_FILES: &[&str] = &[
     "FORMAT",
     "hlc",
     "node.yaml",
-    "peers.yaml",
+    "server.yaml",
     "tokens.yaml",
-    "exchanges.yaml",
+    "cursor.json",
     "landing-intent.json",
     // Reconcile treats a missing index as "every file appeared". Keep it so a
     // full restore does not replay the whole board into the journal.
     "drift.jsonl",
 ];
-const SYNC_DIRS: &[&str] = &["journal", "meta", "relay", "legacy-v1", "blobs"];
-const IDENTITY_FILES: &[&str] = &["node.yaml", "peers.yaml", "tokens.yaml"];
+const SYNC_DIRS: &[&str] = &["journal", "meta", "hub", "legacy-v1", "blobs"];
+const IDENTITY_FILES: &[&str] = &["node.yaml", "server.yaml", "tokens.yaml", "cursor.json"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Kind {
@@ -1746,7 +1746,7 @@ fn core_items(store: &Path, boards: &[Board]) -> Result<Vec<Item>> {
                 &store.join("sync").join(dir),
                 &format!("store/sync/{dir}"),
                 &mut items,
-                None,
+                (*dir == "hub").then_some("spool"),
             )?;
         }
     }
@@ -1984,7 +1984,7 @@ fn pack(manifest: &Manifest, files: &[Staged], dest: &Path) -> Result<()> {
             header.set_size(staged.size);
             header.set_mode(staged.mode);
             // `append_data` writes a GNU long-name entry for paths past the
-            // 100-byte header field (e.g. relay git mirrors under sync/).
+            // 100-byte header field (e.g. nested board image paths).
             builder.append_data(&mut header, &staged.archive_path, File::open(&staged.path)?)?;
         }
         let encoder = builder.into_inner()?;
@@ -2499,6 +2499,9 @@ mod tests {
         arm(&fix.store);
         let storage = storage::Storage::new(&fix.data_root);
         let task = storage.create_task(NewTask::titled("kept")).unwrap();
+        let spool = fix.store.join("sync/hub/spool/in-flight.ndjson");
+        fs::create_dir_all(spool.parent().unwrap()).unwrap();
+        fs::write(&spool, b"unfinished snapshot\n").unwrap();
         let created = create(&fix.store, &request(&fix.dir, true)).unwrap();
         let manifest = verify(&created.core.path).unwrap();
         let paths: BTreeSet<_> = manifest
@@ -2516,6 +2519,7 @@ mod tests {
                 .iter()
                 .all(|path| !path.ends_with("foo.csv") && !path.contains("/logs/"))
         );
+        assert!(!paths.iter().any(|path| path.contains("/hub/spool/")));
         let art = verify(&created.artifacts.as_ref().unwrap().path).unwrap();
         assert!(art.files.iter().any(|file| file.path.ends_with("foo.csv")));
         assert!(art.files.iter().all(|file| !file.path.contains("/images/")));
@@ -2555,6 +2559,10 @@ mod tests {
         storage::Storage::new(&fix.data_root)
             .create_task(NewTask::titled("id"))
             .unwrap();
+        let credentials = "node_id: server\ntoken: backup-secret\nurls: [http://127.0.0.1:7420]\n";
+        let cursor = r#"{"server_node_id":"server","store_id":"store","hub_epoch":"epoch","last_seq":42,"pushed":7}"#;
+        fs::write(fix.store.join("sync/server.yaml"), credentials).unwrap();
+        fs::write(fix.store.join("sync/cursor.json"), cursor).unwrap();
         let created = create(&fix.store, &request(&fix.dir, false)).unwrap();
         let old = node_id(&fix.store).unwrap();
         let kept = fix._root.path().join("kept");
@@ -2573,6 +2581,10 @@ mod tests {
         .unwrap();
         assert_eq!(node_id(&kept).unwrap(), old);
         assert_ne!(node_id(&fresh).unwrap(), old);
+        assert_eq!(fs::read_to_string(kept.join("sync/server.yaml")).unwrap(), credentials);
+        assert_eq!(fs::read_to_string(kept.join("sync/cursor.json")).unwrap(), cursor);
+        assert!(!fresh.join("sync/server.yaml").exists());
+        assert!(!fresh.join("sync/cursor.json").exists());
     }
 
     #[test]

@@ -13,6 +13,69 @@ use super::sync::{Journal, RunDescriptor, store_for_board};
 
 pub const MAX_TAIL_BYTES: usize = 1024 * 1024;
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct LogSettings {
+    pub log_interval: u64,
+    pub log_tail_bytes: usize,
+    max_skew: u64,
+    server: Option<LogServer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LogServer {
+    node_id: String,
+}
+
+impl Default for LogSettings {
+    fn default() -> Self {
+        Self {
+            log_interval: 60,
+            log_tail_bytes: 64 * 1024,
+            max_skew: 300,
+            server: None,
+        }
+    }
+}
+
+pub fn settings(store: &Path) -> Result<LogSettings> {
+    #[derive(Default, Deserialize)]
+    struct Config {
+        #[serde(default)]
+        sync: LogSettings,
+    }
+    let config: Config = match fs::read_to_string(store.join("config.yaml")) {
+        Ok(text) => serde_yaml_ng::from_str(&text)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
+        Err(error) => return Err(error.into()),
+    };
+    if config.sync.log_interval == 0
+        || !(1..=MAX_TAIL_BYTES).contains(&config.sync.log_tail_bytes)
+    {
+        return Err(invalid(
+            "sync.log_interval must be positive and sync.log_tail_bytes must be 1..1048576",
+        ));
+    }
+    Ok(config.sync)
+}
+
+fn known_remote_owner(store: &Path, settings: &LogSettings, node: &str, role: super::sync::NodeRole) -> Result<bool> {
+    if role == super::sync::NodeRole::Server {
+        let clients: std::collections::BTreeMap<String, serde_json::Value> =
+            match fs::read_to_string(store.join("sync/hub/clients.json")) {
+                Ok(text) => serde_json::from_str(&text)
+                    .map_err(|_| invalid("Invalid sync hub client registry"))?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+        Ok(clients.contains_key(node))
+    } else {
+        // The server forwards other clients' logs. The portable run descriptor
+        // below still binds the claimed owner, project, task and generation.
+        Ok(settings.server.as_ref().is_some_and(|server| !server.node_id.is_empty()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
@@ -108,7 +171,7 @@ pub fn validate_snapshot(store: &Path, snapshot: &Snapshot) -> Result<()> {
         return Err(invalid("Runner log owner is not paired with this store"));
     }
     cache_path(store, &snapshot.node_id, &snapshot.project, &snapshot.task)?;
-    let settings = super::sync::relay::settings(store)?;
+    let settings = settings(store)?;
     if snapshot.text.len() > settings.log_tail_bytes || snapshot.text.len() > MAX_TAIL_BYTES {
         return Err(invalid("Runner log snapshot exceeds configured tail limit"));
     }
@@ -120,9 +183,7 @@ pub fn validate_snapshot(store: &Path, snapshot: &Snapshot) -> Result<()> {
     }
     let journal = Journal::open(store)?;
     if snapshot.node_id != journal.node.node_id
-        && !settings.peers.iter().any(|peer| {
-            peer.node.node_id == snapshot.node_id && peer.node.store_id == journal.node.store_id
-        })
+        && !known_remote_owner(store, &settings, &snapshot.node_id, journal.node.role)?
     {
         return Err(invalid("Runner log owner is not paired with this store"));
     }
@@ -174,7 +235,7 @@ pub fn cached_tail(board: &Path, task: &str, node_id: &str) -> Result<Snapshot> 
         .cloned()
         .ok_or_else(|| invalid("Runner log project is not registered"))?;
     let path = cache_path(store, node_id, &uid, task)?;
-    let limit = super::sync::relay::settings(store)?
+    let limit = settings(store)?
         .log_tail_bytes
         .saturating_mul(6)
         .saturating_add(4096);
@@ -270,7 +331,7 @@ fn local_session(board: &Path, task: &str) -> Result<Session> {
 pub fn local_tail(board: &Path, task: &str) -> Result<Snapshot> {
     let _guard = Storage::new(board).lock()?;
     let (store, alias) = identity(board)?;
-    let settings = super::sync::relay::settings(store)?;
+    let settings = settings(store)?;
     let journal = Journal::open(store)?;
     let session = local_session(board, task)?;
     let run = owned_latest_run(store, alias, task, &journal.node.node_id)?;

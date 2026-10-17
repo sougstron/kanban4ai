@@ -216,7 +216,7 @@ fn remote_queue_intent_is_runner_owned_and_obeys_runner_caps() {
         config::Runner,
         models::{RunPhase, TaskStatus},
         session::SessionManager,
-        sync::{Journal, install_snapshot},
+        sync::Journal,
     };
     let temp = tempfile::tempdir().unwrap();
     let (_work, p) = fixture(temp.path());
@@ -246,16 +246,15 @@ fn remote_queue_intent_is_runner_owned_and_obeys_runner_caps() {
     .unwrap();
     let a = Journal::open(&sender).unwrap();
     Journal::open(&receiver).unwrap();
-    install_snapshot(&receiver, &a.snapshot().unwrap()).unwrap();
+    common::bootstrap(&sender, &receiver);
     let b = Journal::open(&receiver).unwrap();
-    let peers = |node: &kanban4ai::core::sync::NodeIdentity| {
-        serde_yaml_ng::to_string(&serde_json::json!({"sync": {"peers": [{
-            "node_id": node.node_id, "name": node.name, "role": node.role,
-            "store_id": node.store_id, "address":"127.0.0.1:1"
-        }]}}))
+    let server_config = |node: &kanban4ai::core::sync::NodeIdentity| {
+        serde_yaml_ng::to_string(&serde_json::json!({"sync": {"enabled":true,"server": {
+            "node_id": node.node_id, "name": node.name, "urls":["http://127.0.0.1:1"]
+        }}}))
         .unwrap()
     };
-    fs::write(sender.join("config.yaml"), peers(&b.node)).unwrap();
+    fs::write(sender.join("config.yaml"), server_config(&b.node)).unwrap();
     // The sender must not consume the replicated request or its local queued marker.
     assert!(
         Operations::for_project(&p)
@@ -295,7 +294,7 @@ fn remote_queue_intent_is_runner_owned_and_obeys_runner_caps() {
     }
     fs::write(
         receiver.join("config.yaml"),
-        format!("node:\n  name: home\n  role: server\n{}", peers(&a.node)),
+        "node:\n  name: home\n  role: server\nsync:\n  enabled: true\n",
     )
     .unwrap();
     assert!(ops.dispatch_queue().unwrap().is_empty());
