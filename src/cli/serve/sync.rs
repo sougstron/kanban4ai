@@ -248,7 +248,11 @@ impl ServerLink {
         self.push(&mut cursor).await?;
         if full {self.pull(&mut cursor,0).await?;}
 
+        // Stable = pushed for our own origin and received by every active
+        // client (hello.stable); later concurrent edits still meet our ops here.
         let mut ack=Journal::open(&self.root)?.vector()?;ack.insert(journal.node.node_id,cursor.pushed);
+        for (origin,seq) in ack.iter_mut() {*seq=(*seq).min(hello.stable.get(origin).copied().unwrap_or(0));}
+        ack.retain(|_,seq|*seq>0);
         Journal::open(&self.root)?.prune(&BTreeMap::from([(self.peer.clone(),ack)]))?;
         Ok(cursor)
     }
@@ -453,7 +457,43 @@ mod tests {
         }
         let cursor=Cursor::load(a.path()).unwrap();assert!(cursor.last_seq>0&&cursor.pushed>0);
         assert_eq!(Journal::open(a.path()).unwrap().vector().unwrap(),Journal::open(b.path()).unwrap().vector().unwrap());
+        // The same LWW winner and the same title conflict record on all three replicas.
+        let conflicts:Vec<_>=[a.path(),b.path(),server.path()].iter().map(|root|{
+            let mut found:Vec<_>=Journal::open(root).unwrap().conflicts().unwrap().into_iter()
+                .filter(|c|c.entity=="task"&&c.field=="title").map(|c|(c.winner,c.loser,c.winner_value)).collect();
+            found.sort_by(|x,y|(&x.0,&x.1).cmp(&(&y.0,&y.1)));found
+        }).collect();
+        assert_eq!(conflicts[0].len(),1,"{:?}",conflicts);
+        assert_eq!(conflicts[0],conflicts[1]);assert_eq!(conflicts[0],conflicts[2]);
+        assert_eq!(conflicts[0][0].2,json!(expected));
         http.abort();
+    }
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn server_unavailable_keeps_everything_local_then_delivers() {
+        let _serial=NETWORK.lock().await;
+        let server=node("server","server");let client=node("laptop","laptop");
+        let work=tempfile::tempdir().unwrap();let p=project(server.path(),&work.path().join("demo"));
+        let shared=Storage::new(&p.data_root).create_task(NewTask::titled("shared")).unwrap();
+        let (running,base)=http(server.path()).await;
+        let mut link=connect(client.path(),server.path(),&base).await;link.cycle(true).await.unwrap();
+        running.abort();let _=running.await;
+        let local=ProjectStore::at(client.path()).get(&p.id).unwrap().unwrap();
+        let started=std::time::Instant::now();
+        let ops=Operations::for_project(&local);
+        let created=ops.create_task(NewTask::titled("written while the server is down")).unwrap();
+        ops.update_task(&shared.id,TaskPatch{title:Some("edited offline".into()),..Default::default()}).unwrap();
+        ops.move_task(&created.id,"in_progress",false).unwrap();
+        assert!(started.elapsed()<Duration::from_secs(2),"local writes waited for the network");
+        let results=once(client.path(),true).await.unwrap();
+        assert!(results[0].1.as_ref().is_err_and(|e|e.to_string().contains("NODE_UNREACHABLE")),"{:?}",results[0].1.as_ref().err());
+        assert!(own_outbox(client.path()).len()>=3,"outbox holds the offline writes");
+        let (restored,new_base)=http(server.path()).await;link.base=new_base;
+        link.cycle(true).await.unwrap();
+        assert!(own_outbox(client.path()).is_empty());
+        let board=Storage::new(&p.data_root);
+        assert_eq!(board.load_task(&shared.id).unwrap().unwrap().title,"edited offline");
+        assert!(board.task_exists(&created.id));
+        restored.abort();
     }
     #[tokio::test(flavor="multi_thread",worker_threads=4)]
     async fn protocol_auth_duplicate_push_and_server_only_routes() {

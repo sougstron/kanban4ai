@@ -404,9 +404,13 @@ restore; `claim` — самый ранний op задачи с `set.id = TASK-N
 
 - **Клиент:** после успешного цикла — `Journal::prune({server_node_id: ack})`,
   где `ack` — локальный вектор, в котором собственная компонента равна
-  `pushed` (своему origin-seq, подтверждённому сервером). Всё полученное и
-  всё отправленное становится стабильным; неотправленное не трогается. Вызов
-  идёт вместе со снимком проекции.
+  `pushed` (своему origin-seq, подтверждённому сервером), покомпонентно
+  ограниченный `stable` из hello: вектором, который получили все активные
+  клиенты (`hub.vector_at(min cursor)`, та же граница, по которой прунит
+  сервер). Неотправленное не трогается; своя операция остаётся у origin, пока
+  её не получили остальные, поэтому одновременная правка другого клиента
+  встречает её и здесь, и запись конфликта есть на всех узлах. Вызов идёт
+  вместе со снимком проекции.
 - **Сервер:** `acks = {client: hub.vector_at(cursor_client)}` по активным
   клиентам (те, чьё `last_seen` моложе `sync.hub.client_ttl_days`, по
   умолчанию 30 дней), затем `hub.compact()`: удаляются запечатанные сегменты
@@ -1124,7 +1128,7 @@ Node-токен привязан к клиенту в hub registry. Старые
 
 | Метод | Путь | Запрос / ответ |
 |---|---|---|
-| POST | `/sync/v3/hello` | `{node_card,cursor?,protocol,min_protocol}` → `{server,store_id,hub_epoch,head,floor,your_head,empty}` |
+| POST | `/sync/v3/hello` | `{node_card,cursor?,protocol,min_protocol}` → `{server,store_id,hub_epoch,head,floor,your_head,empty,stable}` |
 | POST | `/sync/v3/ops` | `{ops:[Operation]}` → `{heads:{origin:oseq},head}`; ≤1000 op, тело ≤256 MiB |
 | GET | `/sync/v3/ops?after=N&limit=L&wait=S` | `{ops:[{seq,op}],next,head,more}`; limit default 500, max 1000, бюджет 8 MiB; wait ≤30 с |
 | GET | `/sync/v3/stream?after=N` | SSE `event: ops`, `id: next`, `data: {ops,next,head,more}`; keepalive 15 с |

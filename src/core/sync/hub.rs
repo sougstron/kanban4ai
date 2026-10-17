@@ -178,10 +178,13 @@ impl Hub {
         record["last_seen"] = Value::from(chrono::Utc::now().to_rfc3339());
         atomic_write_text_raw(&self.root.join("clients.json"), &json(&clients)?)
     }
+    /// Clients seen within the TTL whose cursor is still above the floor; a
+    /// returning client below the floor holds nothing until it re-bootstraps.
     fn active_cursors(&self, ttl_days: u64) -> Result<BTreeMap<String,u64>> {
         let clients: BTreeMap<String, Value> = load(&self.root.join("clients.json"))?;
         let now = chrono::Utc::now();
-        Ok(clients.into_iter().filter_map(|(id,c)| {
+        let floor = self.floor()?;
+        Ok(clients.into_iter().filter(|(_,c)| c["cursor"].as_u64().unwrap_or(0) >= floor).filter_map(|(id,c)| {
             let seen = c["last_seen"].as_str()?.parse::<chrono::DateTime<chrono::Utc>>().ok()?;
             ((now-seen).num_seconds() <= ttl_days.saturating_mul(86400).min(i64::MAX as u64) as i64).then(|| (id,c["cursor"].as_u64().unwrap_or(0)))
         }).collect())
@@ -202,12 +205,25 @@ impl Hub {
         for segment in removed { fs::remove_file(self.segment_path(segment.first))?; }
         Ok(())
     }
+    fn client_ttl(&self) -> Result<u64> {
+        let config: Value = match fs::read_to_string(self.store.join("config.yaml")) { Ok(text) => serde_yaml_ng::from_str(&text)?, Err(e) if e.kind()==std::io::ErrorKind::NotFound => Value::Null, Err(e) => return Err(e.into()) };
+        Ok(config.pointer("/sync/hub/client_ttl_days").and_then(Value::as_u64).unwrap_or(30))
+    }
+    /// What every active client has received: the frontier the server prunes
+    /// by. Clients prune no further, so an operation stays retained on its
+    /// origin until any concurrent edit from another client can meet it there.
+    pub fn stable_vector(&self) -> Result<VersionVector> {
+        let _guard = lock_file_reentrant(&self.store.join("sync/.lock"))?;
+        match self.active_cursors(self.client_ttl()?)?.values().copied().min() {
+            Some(cursor) => self.vector_at(cursor),
+            None => Ok(self.recover()?.heads),
+        }
+    }
     pub fn maintenance(&self) -> Result<()> {
         let journal = Journal::open(&self.store)?;
         let _guard = lock_file_reentrant(&self.store.join("sync/.lock"))?;
         self.ingest_journal(&journal)?;
-        let config: Value = match fs::read_to_string(self.store.join("config.yaml")) { Ok(text) => serde_yaml_ng::from_str(&text)?, Err(e) if e.kind()==std::io::ErrorKind::NotFound => Value::Null, Err(e) => return Err(e.into()) };
-        let ttl = config.pointer("/sync/hub/client_ttl_days").and_then(Value::as_u64).unwrap_or(30);
+        let ttl = self.client_ttl()?;
         let mut acks = BTreeMap::new();
         for (id,cursor) in self.active_cursors(ttl)? { acks.insert(id, self.vector_at(cursor)?); }
         journal.prune(&acks)?; self.compact(ttl)

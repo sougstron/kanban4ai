@@ -87,6 +87,8 @@ pub(super) struct Hello {
 pub(super) struct HelloReply {
     pub server:NodeIdentity,pub store_id:String,pub hub_epoch:String,
     pub head:u64,pub floor:u64,pub your_head:u64,pub empty:bool,
+    /// Received by every active client; bounds client pruning (optional field).
+    #[serde(default)] pub stable:crate::core::sync::VersionVector,
 }
 #[derive(Serialize,Deserialize)]
 pub(super) struct Push { pub ops:Vec<Operation> }
@@ -112,7 +114,7 @@ async fn hello(State(root):State<PathBuf>,Extension(hash):Extension<String>,Json
         let journal=Journal::open(&root)?;journal.reconcile()?;
         touch(&root,&id)?;
         let hub=Hub::open(&root)?;let head=hub.ingest()?;
-        Ok(HelloReply{server:journal.node.clone(),store_id:journal.node.store_id.clone(),hub_epoch:hub.epoch()?,head,floor:hub.floor()?,your_head:journal.vector()?.get(&id).copied().unwrap_or(0),empty:ProjectStore::at(&root).list()?.is_empty()})
+        Ok(HelloReply{server:journal.node.clone(),store_id:journal.node.store_id.clone(),hub_epoch:hub.epoch()?,head,floor:hub.floor()?,your_head:journal.vector()?.get(&id).copied().unwrap_or(0),empty:ProjectStore::at(&root).list()?.is_empty(),stable:hub.stable_vector()?})
     }).await {Ok(reply)=>Json(reply).into_response(),Err(e)=>sync::failure(e)}
 }
 async fn push(State(root):State<PathBuf>,Extension(hash):Extension<String>,Json(push):Json<Push>)->Response {
