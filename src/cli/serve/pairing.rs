@@ -514,6 +514,16 @@ mod tests {
         dir
     }
     #[test]
+    fn default_route_interfaces_ignore_down_and_non_default_routes() {
+        let table = "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\n\
+            wlan0\t00000000\t0100A8C0\t0003\t0\t0\t600\t00000000\n\
+            vpn0\t006E0B0A\t00000000\t0001\t0\t0\t4\t00FFFFFF\n\
+            eth0\t00000000\t0100A8C0\t0003\t0\t0\t100\t00000000\n\
+            old0\t00000000\t0100A8C0\t0002\t0\t0\t1\t00000000\n";
+        assert_eq!(default_route_interfaces(table), ["eth0", "wlan0"]);
+        assert!(default_route_interfaces("").is_empty());
+    }
+    #[test]
     fn server_code_is_one_use_and_registers_only_an_inbound_node_token() {
         let server = node("server", "server");
         let client = node("laptop", "laptop");
@@ -566,6 +576,26 @@ mod tests {
         .err()
         .unwrap();
         assert!(error.to_string().contains("SYNC_NOT_A_SERVER"));
+    }
+    #[test]
+    fn invites_parse_bare_or_as_a_pasted_command() {
+        assert_eq!(
+            parse_invite("kanban4ai join 012345@192.168.0.10:7420"),
+            Some(("012345", "192.168.0.10:7420"))
+        );
+        assert_eq!(
+            parse_invite(" 012345@[fd00::1]:7420\n"),
+            Some(("012345", "[fd00::1]:7420"))
+        );
+        for bad in [
+            "",
+            "192.168.0.10:7420",
+            "12345@host:1",
+            "abcdef@host:1",
+            "012345@",
+        ] {
+            assert!(parse_invite(bad).is_none(), "{bad}");
+        }
     }
     #[test]
     fn incorrect_codes_exhaust_the_attempt_limit() {

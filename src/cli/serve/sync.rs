@@ -1527,6 +1527,18 @@ mod tests {
             .unwrap();
         running.abort();
         let _ = running.await;
+        // A seek cache from a mismatched binary: its offsets must not
+        // survive into format 4.
+        for root in [server.path(), laptop.path()] {
+            fs::create_dir_all(root.join("sync/meta")).unwrap();
+            fs::write(
+                root.join("sync/meta/index.json"),
+                json!({"nodes":{"stale-node":[{"file":"00000000000000000001.jsonl",
+                    "marks":[{"seq":9,"offset":31}]}]}})
+                .to_string(),
+            )
+            .unwrap();
+        }
         let (s, l) = (
             Journal::open(server.path()).unwrap().node,
             Journal::open(laptop.path()).unwrap().node,
@@ -1563,6 +1575,11 @@ mod tests {
                 "sync/relay",
             ] {
                 assert!(!root.join(gone).exists(), "{gone}");
+            }
+            // The stale seek cache must not survive: the server rebuilds a
+            // fresh one while ingesting, the client is left without one.
+            if let Ok(text) = fs::read_to_string(root.join("sync/meta/index.json")) {
+                assert!(!text.contains("stale-node"), "{text}");
             }
             assert!(
                 root.join("sync/legacy-v3/peers.yaml").is_file()

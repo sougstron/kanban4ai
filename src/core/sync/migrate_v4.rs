@@ -78,6 +78,15 @@ pub(super) fn migrate(store: &Path) -> Result<()> {
     if format::read_format(store)?.is_some_and(|v| v >= STORE_FORMAT) {
         return Ok(());
     }
+    // The segment offset cache may describe journal bytes written by a
+    // different binary than the ones on disk now (a store touched by mixed
+    // versions keeps appending without updating it). A stale mark sends the
+    // redo cursor into the middle of a line; it is a pure cache, so drop it
+    // before anything reads or extends it.
+    let index = root.join("meta/index.json");
+    if index.exists() {
+        fs::remove_file(&index)?;
+    }
     let path = store.join("config.yaml");
     let mut config = read_yaml(&path)?;
     if config.is_null() {
