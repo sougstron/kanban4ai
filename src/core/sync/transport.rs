@@ -2,8 +2,8 @@
 use super::*;
 use crate::core::project::ProjectStore;
 use crate::core::storage::{BoardGuard, Storage};
-use std::io::BufWriter;
 use sha2::{Digest, Sha256};
+use std::io::BufWriter;
 
 /// One page of operations a peer lacks. `next` is the paging cursor: per
 /// node, the highest sequence included so far.
@@ -90,7 +90,6 @@ impl Journal {
             more,
         })
     }
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,10 +104,22 @@ pub struct SnapshotHeader {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum Record {
-    Header { #[serde(flatten)] header: SnapshotHeader },
-    File { path: String, text: String },
-    Blob { path: String, sha256: String, size: u64 },
-    End { files: u64 },
+    Header {
+        #[serde(flatten)]
+        header: SnapshotHeader,
+    },
+    File {
+        path: String,
+        text: String,
+    },
+    Blob {
+        path: String,
+        sha256: String,
+        size: u64,
+    },
+    End {
+        files: u64,
+    },
 }
 
 fn record(writer: &mut impl Write, value: &Record) -> Result<()> {
@@ -117,15 +128,25 @@ fn record(writer: &mut impl Write, value: &Record) -> Result<()> {
     Ok(())
 }
 fn relative(store: &Path, path: &Path) -> Result<String> {
-    let name = path.strip_prefix(store).ok().and_then(Path::to_str)
+    let name = path
+        .strip_prefix(store)
+        .ok()
+        .and_then(Path::to_str)
         .ok_or_else(|| invalid("invalid snapshot path"))?;
     allowed_path(name)?;
     Ok(name.to_owned())
 }
 fn blob_path(path: &str) -> bool {
-    path.starts_with("sync/blobs/") || path.split('/').skip(2).collect::<Vec<_>>()
-        .starts_with(&[".kanban", "instructions"])
-        || path.split('/').skip(2).collect::<Vec<_>>()
+    path.starts_with("sync/blobs/")
+        || path
+            .split('/')
+            .skip(2)
+            .collect::<Vec<_>>()
+            .starts_with(&[".kanban", "instructions"])
+        || path
+            .split('/')
+            .skip(2)
+            .collect::<Vec<_>>()
             .starts_with(&[".kanban", "assets", "images"])
 }
 fn file_hash(path: &Path) -> Result<(String, u64)> {
@@ -136,37 +157,58 @@ fn file_hash(path: &Path) -> Result<(String, u64)> {
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let count = input.read(&mut buffer)?;
-        if count == 0 { break; }
+        if count == 0 {
+            break;
+        }
         hasher.update(&buffer[..count]);
         size += count as u64;
     }
     Ok((format!("{:x}", hasher.finalize()), size))
 }
 fn hash_valid(hash: &str) -> bool {
-    hash.len() == 64 && hash.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    hash.len() == 64
+        && hash
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
 /// Validate an existing cached blob without allocating its contents.
-pub fn has_blob(store:&Path,hash:&str)->Result<bool> {
-    if !hash_valid(hash) {return Err(invalid("invalid blob hash"));}
-    let path=store.join("sync/blobs").join(hash);
-    match file_hash(&path) {Ok((actual,_))=>Ok(actual==hash),Err(KanbanError::Io(e)) if e.kind()==std::io::ErrorKind::NotFound=>Ok(false),Err(e)=>Err(e)}
+pub fn has_blob(store: &Path, hash: &str) -> Result<bool> {
+    if !hash_valid(hash) {
+        return Err(invalid("invalid blob hash"));
+    }
+    let path = store.join("sync/blobs").join(hash);
+    match file_hash(&path) {
+        Ok((actual, _)) => Ok(actual == hash),
+        Err(KanbanError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 /// Verify and persist a separately transferred blob without loading it into memory.
 pub fn put_blob_file(store: &Path, hash: &str, source: &Path) -> Result<()> {
-    if !hash_valid(hash) || file_hash(source)?.0 != hash { return Err(invalid("blob hash mismatch")); }
+    if !hash_valid(hash) || file_hash(source)?.0 != hash {
+        return Err(invalid("blob hash mismatch"));
+    }
     let target = store.join("sync/blobs").join(hash);
-    if target.is_file() && file_hash(&target)?.0 == hash { return Ok(()); }
+    if target.is_file() && file_hash(&target)?.0 == hash {
+        return Ok(());
+    }
     copy_atomic(source, &target)
 }
 fn copy_atomic(source: &Path, target: &Path) -> Result<()> {
     no_symlinks(source)?;
     no_symlinks(target)?;
-    let parent = target.parent().ok_or_else(|| invalid("missing file parent"))?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| invalid("missing file parent"))?;
     fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::Builder::new().prefix(".tmp_").tempfile_in(parent)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".tmp_")
+        .tempfile_in(parent)?;
     std::io::copy(&mut fs::File::open(source)?, &mut temporary)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(target).map_err(|e| KanbanError::Io(e.error))?;
+    temporary
+        .persist(target)
+        .map_err(|e| KanbanError::Io(e.error))?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
@@ -178,25 +220,42 @@ pub fn snapshot_spool(store: &Path) -> Result<tempfile::NamedTempFile> {
     apply::recover_remote(&journal.root)?;
     let _store = lock_file_reentrant(&store.join(".lock"))?;
     let boards = boards(store)?;
-    let _boards: Vec<BoardGuard> = boards.iter().map(|p| Storage::new(p).lock()).collect::<Result<_>>()?;
+    let _boards: Vec<BoardGuard> = boards
+        .iter()
+        .map(|p| Storage::new(p).lock())
+        .collect::<Result<_>>()?;
     let _sync = lock_file_reentrant(&journal.root.join(".lock"))?;
     journal.recover()?;
     let (mut state, prune_meta) = projection::load_state(&journal.root)?;
     for board in &boards {
         if board.join("project.yaml").is_file() {
-            let alias = board.file_name().and_then(|s| s.to_str()).ok_or_else(|| invalid("invalid project"))?;
-            if !state.project_uids.contains_key(alias) { state.project_uids.insert(alias.into(), uuid()?); }
+            let alias = board
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| invalid("invalid project"))?;
+            if !state.project_uids.contains_key(alias) {
+                state.project_uids.insert(alias.into(), uuid()?);
+            }
         }
     }
     projection::save_uids(&journal.root, &state)?;
     projection::checkpoint(&journal.root, &state, &prune_meta, true)?;
     let hub = super::hub::Hub::open(store)?;
     let seq = hub.ingest()?;
-    let header = SnapshotHeader { format: STORE_FORMAT, store_id: journal.node.store_id.clone(),
-        node_id: journal.node.node_id.clone(), hub_epoch: hub.epoch()?, seq, hlc: journal.clock()? };
+    let header = SnapshotHeader {
+        format: STORE_FORMAT,
+        store_id: journal.node.store_id.clone(),
+        node_id: journal.node.node_id.clone(),
+        hub_epoch: hub.epoch()?,
+        seq,
+        hlc: journal.clock()?,
+    };
     let dir = journal.root.join("hub/spool");
     fs::create_dir_all(&dir)?;
-    let mut spool = tempfile::Builder::new().prefix("snapshot-").suffix(".ndjson").tempfile_in(&dir)?;
+    let mut spool = tempfile::Builder::new()
+        .prefix("snapshot-")
+        .suffix(".ndjson")
+        .tempfile_in(&dir)?;
     let mut writer = BufWriter::new(spool.as_file_mut());
     record(&mut writer, &Record::Header { header })?;
     let mut files = 0u64;
@@ -208,49 +267,105 @@ pub fn snapshot_spool(store: &Path) -> Result<tempfile::NamedTempFile> {
                 let (hash, size) = file_hash(&path)?;
                 put_blob_file(store, &hash, &path)?;
                 hashes.insert(hash.clone());
-                record(&mut writer, &Record::Blob { path: name, sha256: hash, size })?;
+                record(
+                    &mut writer,
+                    &Record::Blob {
+                        path: name,
+                        sha256: hash,
+                        size,
+                    },
+                )?;
             } else {
                 let text = fs::read_to_string(&path)?;
-                let text = if let Some(t) = target(&path).filter(|t| matches!(t.entity, "task" | "project")) {
+                let text = if let Some(t) =
+                    target(&path).filter(|t| matches!(t.entity, "task" | "project"))
+                {
                     replicated(&text, t.entity, false)?
-                } else { text };
+                } else {
+                    text
+                };
                 record(&mut writer, &Record::File { path: name, text })?;
             }
             files += 1;
         }
     }
     let config = store.join("config.yaml");
-    let text = if config.is_file() { replicated(&fs::read_to_string(config)?, "config", true)? } else { "{}\n".into() };
-    record(&mut writer, &Record::File { path: "config.yaml".into(), text })?;
+    let text = if config.is_file() {
+        replicated(&fs::read_to_string(config)?, "config", true)?
+    } else {
+        "{}\n".into()
+    };
+    record(
+        &mut writer,
+        &Record::File {
+            path: "config.yaml".into(),
+            text,
+        },
+    )?;
     files += 1;
     for path in walk(&journal.root.join("meta"))? {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if matches!(name, "index.json" | "state.json" | "since.json" | "relay-ack.json") { continue; }
-        record(&mut writer, &Record::File { path: relative(store, &path)?, text: fs::read_to_string(path)? })?;
+        if matches!(
+            name,
+            "index.json" | "state.json" | "since.json" | "relay-ack.json"
+        ) {
+            continue;
+        }
+        record(
+            &mut writer,
+            &Record::File {
+                path: relative(store, &path)?,
+                text: fs::read_to_string(path)?,
+            },
+        )?;
         files += 1;
     }
     for node in segments::node_names(&journal.root)? {
         for path in read_files(&journal.root.join("journal").join(&node))? {
-            if path.extension().is_none_or(|e| e != "jsonl") { continue; }
-            let text=fs::read_to_string(&path)?;
-            for line in text.lines().filter(|line|!line.is_empty()) {
-                let op:Operation=serde_json::from_str(line).map_err(|e|invalid(&e.to_string()))?;
-                if let Some(hash)=op.blob_hash(){hashes.insert(hash.to_owned());}
+            if path.extension().is_none_or(|e| e != "jsonl") {
+                continue;
             }
-            record(&mut writer, &Record::File { path: relative(store, &path)?, text })?;
+            let text = fs::read_to_string(&path)?;
+            for line in text.lines().filter(|line| !line.is_empty()) {
+                let op: Operation =
+                    serde_json::from_str(line).map_err(|e| invalid(&e.to_string()))?;
+                if let Some(hash) = op.blob_hash() {
+                    hashes.insert(hash.to_owned());
+                }
+            }
+            record(
+                &mut writer,
+                &Record::File {
+                    path: relative(store, &path)?,
+                    text,
+                },
+            )?;
             files += 1;
         }
     }
     for (key, fields) in &state.fields {
-        if serde_json::from_str::<(String,String,String)>(key).is_ok_and(|(_,entity,_)|entity=="file") {
-            if let Some(hash) = fields.values.get("blob").and_then(Value::as_str) { hashes.insert(hash.to_owned()); }
+        if serde_json::from_str::<(String, String, String)>(key)
+            .is_ok_and(|(_, entity, _)| entity == "file")
+        {
+            if let Some(hash) = fields.values.get("blob").and_then(Value::as_str) {
+                hashes.insert(hash.to_owned());
+            }
         }
     }
     for hash in hashes {
         let path = journal.root.join("blobs").join(&hash);
         let (actual, size) = file_hash(&path)?;
-        if actual != hash { return Err(invalid("blob hash mismatch")); }
-        record(&mut writer, &Record::Blob { path: format!("sync/blobs/{hash}"), sha256: hash, size })?;
+        if actual != hash {
+            return Err(invalid("blob hash mismatch"));
+        }
+        record(
+            &mut writer,
+            &Record::Blob {
+                path: format!("sync/blobs/{hash}"),
+                sha256: hash,
+                size,
+            },
+        )?;
         files += 1;
     }
     record(&mut writer, &Record::End { files })?;
@@ -267,57 +382,97 @@ pub struct StagedSnapshot {
     stage: tempfile::TempDir,
 }
 fn validate_header(header: &SnapshotHeader) -> Result<()> {
-    if header.format > STORE_FORMAT { return Err(invalid("SYNC_STORE_TOO_NEW: upgrade kanban4ai")); }
-    if header.format != STORE_FORMAT { return Err(invalid("SYNC_PROTOCOL_MISMATCH: snapshot format is obsolete")); }
-    for value in [&header.store_id, &header.node_id, &header.hub_epoch] { component(value)?; }
+    if header.format > STORE_FORMAT {
+        return Err(invalid("SYNC_STORE_TOO_NEW: upgrade kanban4ai"));
+    }
+    if header.format != STORE_FORMAT {
+        return Err(invalid(
+            "SYNC_PROTOCOL_MISMATCH: snapshot format is obsolete",
+        ));
+    }
+    for value in [&header.store_id, &header.node_id, &header.hub_epoch] {
+        component(value)?;
+    }
     Ok(())
 }
 pub fn stage_snapshot(store: &Path, input: &Path) -> Result<StagedSnapshot> {
     let base = store.join("sync/.bootstrap");
     no_symlinks(&base)?;
     fs::create_dir_all(&base)?;
-    let base=fs::canonicalize(&base)?;
-    let stage = tempfile::Builder::new().prefix("stage-").tempdir_in(&base)?;
+    let base = fs::canonicalize(&base)?;
+    let stage = tempfile::Builder::new()
+        .prefix("stage-")
+        .tempdir_in(&base)?;
     let mut lines = BufReader::new(fs::File::open(input)?).lines();
-    let first = lines.next().ok_or_else(|| invalid("snapshot header is missing"))??;
-    let header = match serde_json::from_str::<Record>(&first).map_err(|e| invalid(&e.to_string()))? {
-        Record::Header { header } => header, _ => return Err(invalid("snapshot must begin with a header")),
-    };
+    let first = lines
+        .next()
+        .ok_or_else(|| invalid("snapshot header is missing"))??;
+    let header =
+        match serde_json::from_str::<Record>(&first).map_err(|e| invalid(&e.to_string()))? {
+            Record::Header { header } => header,
+            _ => return Err(invalid("snapshot must begin with a header")),
+        };
     validate_header(&header)?;
     let mut manifest = BufWriter::new(fs::File::create(stage.path().join("manifest.ndjson"))?);
-    record(&mut manifest, &Record::Header { header: header.clone() })?;
+    record(
+        &mut manifest,
+        &Record::Header {
+            header: header.clone(),
+        },
+    )?;
     let mut count = 0u64;
     let mut blobs = BTreeSet::new();
     let mut ended = false;
     for line in lines {
         let line = line?;
-        if ended { return Err(invalid("snapshot contains data after end")); }
+        if ended {
+            return Err(invalid("snapshot contains data after end"));
+        }
         let item: Record = serde_json::from_str(&line).map_err(|e| invalid(&e.to_string()))?;
         match &item {
             Record::Header { .. } => return Err(invalid("duplicate snapshot header")),
             Record::End { files } => {
-                if *files != count { return Err(invalid("snapshot file count mismatch")); }
+                if *files != count {
+                    return Err(invalid("snapshot file count mismatch"));
+                }
                 ended = true;
             }
             Record::File { path, text } => {
                 allowed_path(path)?;
-                if blob_path(path) { return Err(invalid("binary snapshot paths require blob references")); }
+                if blob_path(path) {
+                    return Err(invalid("binary snapshot paths require blob references"));
+                }
                 if path.starts_with("sync/journal/") {
-                    for line in text.lines().filter(|line|!line.is_empty()) {
-                        let op:Operation=serde_json::from_str(line).map_err(|e|invalid(&e.to_string()))?;
-                        if op.store!=header.store_id {return Err(invalid("SYNC_STORE_MISMATCH: snapshot journal identity differs"));}
-                        if op.v>OP_FORMAT {return Err(invalid("SYNC_OP_FORMAT_TOO_NEW"));}
+                    for line in text.lines().filter(|line| !line.is_empty()) {
+                        let op: Operation =
+                            serde_json::from_str(line).map_err(|e| invalid(&e.to_string()))?;
+                        if op.store != header.store_id {
+                            return Err(invalid(
+                                "SYNC_STORE_MISMATCH: snapshot journal identity differs",
+                            ));
+                        }
+                        if op.v > OP_FORMAT {
+                            return Err(invalid("SYNC_OP_FORMAT_TOO_NEW"));
+                        }
                     }
                 }
                 stage_unique(stage.path(), path)?;
                 write_bytes(&stage.path().join("data").join(path), text.as_bytes())?;
                 count += 1;
             }
-            Record::Blob { path, sha256, size: _ } => {
+            Record::Blob {
+                path,
+                sha256,
+                size: _,
+            } => {
                 allowed_path(path)?;
-                if !blob_path(path) || !hash_valid(sha256) { return Err(invalid("invalid snapshot blob reference")); }
+                if !blob_path(path) || !hash_valid(sha256) {
+                    return Err(invalid("invalid snapshot blob reference"));
+                }
                 if let Some(hash) = path.strip_prefix("sync/blobs/") {
-                    if hash != sha256 { return Err(invalid("snapshot blob path/hash mismatch")); }
+                    if hash != sha256 {
+                        return Err(invalid("snapshot blob path/hash mismatch"));
+                    }
                 }
                 stage_unique(stage.path(), path)?;
                 write_bytes(&stage.path().join("refs").join(path), b"")?;
@@ -327,11 +482,17 @@ pub fn stage_snapshot(store: &Path, input: &Path) -> Result<StagedSnapshot> {
         }
         record(&mut manifest, &item)?;
     }
-    if !ended { return Err(invalid("snapshot end record is missing")); }
+    if !ended {
+        return Err(invalid("snapshot end record is missing"));
+    }
     manifest.flush()?;
     manifest.get_ref().sync_all()?;
     drop(manifest);
-    Ok(StagedSnapshot { header, blobs: blobs.into_iter().collect(), stage })
+    Ok(StagedSnapshot {
+        header,
+        blobs: blobs.into_iter().collect(),
+        stage,
+    })
 }
 fn stage_unique(stage: &Path, relative: &str) -> Result<()> {
     if stage.join("data").join(relative).exists() || stage.join("refs").join(relative).exists() {
@@ -347,14 +508,17 @@ struct Bootstrap {
 }
 fn manifest(stage: &Path) -> Result<impl Iterator<Item = Result<Record>>> {
     let input = fs::File::open(stage.join("manifest.ndjson"))?;
-    Ok(BufReader::new(input).lines().map(|line| {
-        serde_json::from_str(&line?).map_err(|e| invalid(&e.to_string()))
-    }))
+    Ok(BufReader::new(input)
+        .lines()
+        .map(|line| serde_json::from_str(&line?).map_err(|e| invalid(&e.to_string()))))
 }
 /// Read only the compacted vector and segment heads, without loading task shards.
 fn retained_vector(sync: &Path) -> Result<VersionVector> {
     #[derive(Default, Deserialize)]
-    struct Floor { #[serde(default)] compacted: VersionVector }
+    struct Floor {
+        #[serde(default)]
+        compacted: VersionVector,
+    }
     let head = projection::head_path(sync);
     let floor: Floor = match fs::read_to_string(head) {
         Ok(text) => serde_json::from_str(&text).map_err(|e| invalid(&e.to_string()))?,
@@ -373,35 +537,72 @@ fn retained_vector(sync: &Path) -> Result<VersionVector> {
 fn affected_boards(store: &Path, stage: &Path) -> Result<BTreeSet<PathBuf>> {
     let mut all: BTreeSet<_> = boards(store)?.into_iter().collect();
     for item in manifest(stage)? {
-        let relative = match item? { Record::File { path, .. } | Record::Blob { path, .. } => path, _ => continue };
+        let relative = match item? {
+            Record::File { path, .. } | Record::Blob { path, .. } => path,
+            _ => continue,
+        };
         if let Some(rest) = relative.strip_prefix("projects/") {
-            let alias = rest.split('/').next().ok_or_else(|| invalid("invalid project path"))?;
+            let alias = rest
+                .split('/')
+                .next()
+                .ok_or_else(|| invalid("invalid project path"))?;
             component(alias)?;
             all.insert(store.join("projects").join(alias));
         }
     }
-    for board in &all { no_symlinks(board)?; }
+    for board in &all {
+        no_symlinks(board)?;
+    }
     Ok(all)
 }
-fn local_file(store: &Path, relative: &str, remote: &projection::Uids, local: &projection::Uids) -> PathBuf {
+fn local_file(
+    store: &Path,
+    relative: &str,
+    remote: &projection::Uids,
+    local: &projection::Uids,
+) -> PathBuf {
     let parts: Vec<_> = relative.split('/').collect();
-    if parts.first() != Some(&"projects") || parts.len() < 3 { return store.join(relative); }
+    if parts.first() != Some(&"projects") || parts.len() < 3 {
+        return store.join(relative);
+    }
     let alias = parts[1];
-    let project = remote.project_uids.get(alias).map(String::as_str).unwrap_or(alias);
-    let local_alias = local.project_uids.iter().find(|(_, uid)| uid.as_str() == project)
-        .map(|(alias, _)| alias.as_str()).unwrap_or(alias);
+    let project = remote
+        .project_uids
+        .get(alias)
+        .map(String::as_str)
+        .unwrap_or(alias);
+    let local_alias = local
+        .project_uids
+        .iter()
+        .find(|(_, uid)| uid.as_str() == project)
+        .map(|(alias, _)| alias.as_str())
+        .unwrap_or(alias);
     let board = store.join("projects").join(local_alias);
     if let [_, _, ".kanban", "tasks", _, file] = parts.as_slice() {
         let display = file.trim_end_matches(".md");
         let key = serde_json::to_string(&(project, "task", display)).unwrap_or_default();
-        let uid = remote.task_uids.get(&key).map(String::as_str).unwrap_or(display);
-        let local_display = local.task_uids.iter().find_map(|(key, value)| {
-            let (p, entity, display): (String,String,String) = serde_json::from_str(key).ok()?;
-            (p == project && entity == "task" && value == uid).then_some(display)
-        }).unwrap_or_else(|| display.to_owned());
+        let uid = remote
+            .task_uids
+            .get(&key)
+            .map(String::as_str)
+            .unwrap_or(display);
+        let local_display = local
+            .task_uids
+            .iter()
+            .find_map(|(key, value)| {
+                let (p, entity, display): (String, String, String) =
+                    serde_json::from_str(key).ok()?;
+                (p == project && entity == "task" && value == uid).then_some(display)
+            })
+            .unwrap_or_else(|| display.to_owned());
         for status in STATUSES {
-            let path = board.join(".kanban/tasks").join(status).join(format!("{local_display}.md"));
-            if path.is_file() { return path; }
+            let path = board
+                .join(".kanban/tasks")
+                .join(status)
+                .join(format!("{local_display}.md"));
+            if path.is_file() {
+                return path;
+            }
         }
     }
     board.join(parts[2..].join("/"))
@@ -413,31 +614,50 @@ fn merge_file(local: &Path, remote: &str, entity: &str) -> Result<String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    let map = value.as_object_mut().ok_or_else(|| invalid("snapshot file is not a mapping"))?;
+    let map = value
+        .as_object_mut()
+        .ok_or_else(|| invalid("snapshot file is not a mapping"))?;
     for field in local_fields(entity, false) {
         map.remove(*field);
-        if let Some(old) = local_value.as_ref().and_then(|v| v.get(*field)) { map.insert((*field).into(), old.clone()); }
+        if let Some(old) = local_value.as_ref().and_then(|v| v.get(*field)) {
+            map.insert((*field).into(), old.clone());
+        }
     }
-    if entity == "project" { map.entry("work_path".to_owned()).or_insert(Value::String(String::new())); }
+    if entity == "project" {
+        map.entry("work_path".to_owned())
+            .or_insert(Value::String(String::new()));
+    }
     if entity == "task" {
-        let description = map.remove("description").and_then(|v|v.as_str().map(str::to_owned)).unwrap_or_default();
-        Ok(format!("---\n{}---\n{description}\n", serde_yaml_ng::to_string(&value)?))
-    } else { Ok(serde_yaml_ng::to_string(&value)?) }
+        let description = map
+            .remove("description")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        Ok(format!(
+            "---\n{}---\n{description}\n",
+            serde_yaml_ng::to_string(&value)?
+        ))
+    } else {
+        Ok(serde_yaml_ng::to_string(&value)?)
+    }
 }
 fn sync_directories(dir: &Path) -> Result<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
-        if fs::symlink_metadata(&path)?.is_dir() { sync_directories(&path)?; }
+        if fs::symlink_metadata(&path)?.is_dir() {
+            sync_directories(&path)?;
+        }
     }
     fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 // Flush every newly-created live ancestor represented in the staged tree,
 // without descending into excluded local artifacts or session directories.
-fn sync_installed_directories(staged:&Path,live:&Path)->Result<()> {
+fn sync_installed_directories(staged: &Path, live: &Path) -> Result<()> {
     for entry in fs::read_dir(staged)? {
-        let entry=entry?;
-        if entry.file_type()?.is_dir(){sync_installed_directories(&entry.path(),&live.join(entry.file_name()))?;}
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            sync_installed_directories(&entry.path(), &live.join(entry.file_name()))?;
+        }
     }
     fs::File::open(live)?.sync_all()?;
     Ok(())
@@ -446,14 +666,19 @@ impl StagedSnapshot {
     /// Commit a validated, blob-complete replica. All local edits made while the
     /// response was downloading are checked while writers are excluded.
     pub fn install(self, store: &Path) -> Result<()> {
-        let base=fs::canonicalize(store.join("sync/.bootstrap"))?;
-        if self.stage.path().parent()!=Some(base.as_path()) {return Err(invalid("snapshot was staged for another store"));}
+        let base = fs::canonicalize(store.join("sync/.bootstrap"))?;
+        if self.stage.path().parent() != Some(base.as_path()) {
+            return Err(invalid("snapshot was staged for another store"));
+        }
         let journal = Journal::open(store)?;
         journal.reconcile()?;
         apply::recover_remote(&journal.root)?;
         let _store = lock_file_reentrant(&store.join(".lock"))?;
         let boards = affected_boards(store, self.stage.path())?;
-        let _boards: Vec<BoardGuard> = boards.iter().map(|p|Storage::new(p).lock()).collect::<Result<_>>()?;
+        let _boards: Vec<BoardGuard> = boards
+            .iter()
+            .map(|p| Storage::new(p).lock())
+            .collect::<Result<_>>()?;
         let _sync = lock_file_reentrant(&journal.root.join(".lock"))?;
         journal.recover()?;
         let nonempty = !ProjectStore::at(store).list()?.is_empty();
@@ -461,15 +686,22 @@ impl StagedSnapshot {
             return Err(invalid("SYNC_STORE_MISMATCH: use join --fresh"));
         }
         let staged_sync = self.stage.path().join("data/sync");
-        if !projection::head_path(&staged_sync).is_file() || !staged_sync.join("meta/uids.json").is_file()
-            || !self.stage.path().join("data/config.yaml").is_file() {
+        if !projection::head_path(&staged_sync).is_file()
+            || !staged_sync.join("meta/uids.json").is_file()
+            || !self.stage.path().join("data/config.yaml").is_file()
+        {
             return Err(invalid("snapshot is missing replica metadata"));
         }
         let local_heads = retained_vector(&journal.root)?;
         let remote_heads = retained_vector(&staged_sync)?;
         let id = &journal.node.node_id;
-        if nonempty && local_heads.get(id).copied().unwrap_or(0) > remote_heads.get(id).copied().unwrap_or(0) {
-            return Err(invalid("SYNC_SERVER_BEHIND: local outbox changed during snapshot download"));
+        if nonempty
+            && local_heads.get(id).copied().unwrap_or(0)
+                > remote_heads.get(id).copied().unwrap_or(0)
+        {
+            return Err(invalid(
+                "SYNC_SERVER_BEHIND: local outbox changed during snapshot download",
+            ));
         }
         let local_uids = projection::load_uids(&journal.root)?;
         let remote_uids = projection::load_uids(&staged_sync)?;
@@ -482,22 +714,38 @@ impl StagedSnapshot {
                     no_symlinks(&local)?;
                     if path == "config.yaml" {
                         write_bytes(&staged, merge_global(&local, &text)?.as_bytes())?;
-                    } else if let Some(target) = target(&store.join(&path)).filter(|t|matches!(t.entity,"task"|"project")) {
-                        write_bytes(&staged, merge_file(&local, &text, target.entity)?.as_bytes())?;
+                    } else if let Some(target) = target(&store.join(&path))
+                        .filter(|t| matches!(t.entity, "task" | "project"))
+                    {
+                        write_bytes(
+                            &staged,
+                            merge_file(&local, &text, target.entity)?.as_bytes(),
+                        )?;
                     }
                 }
                 Record::Blob { path, sha256, size } => {
                     let source = journal.root.join("blobs").join(&sha256);
                     let actual = file_hash(&source)?;
-                    if actual != (sha256, size) { return Err(invalid("snapshot blob hash or size mismatch")); }
+                    if actual != (sha256, size) {
+                        return Err(invalid("snapshot blob hash or size mismatch"));
+                    }
                     copy_atomic(&source, &self.stage.path().join("data").join(path))?;
                 }
                 _ => (),
             }
         }
         sync_directories(self.stage.path())?;
-        let name = self.stage.path().file_name().and_then(|s|s.to_str()).ok_or_else(||invalid("invalid stage directory"))?.to_owned();
-        let redo = Bootstrap { stage: name, header: self.header };
+        let name = self
+            .stage
+            .path()
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| invalid("invalid stage directory"))?
+            .to_owned();
+        let redo = Bootstrap {
+            stage: name,
+            header: self.header,
+        };
         // Keep staging before the redo commit; an orphan is harmless, whereas
         // a committed redo must never point at a TempDir removed on error.
         let retained = self.stage.keep();
@@ -510,16 +758,24 @@ impl StagedSnapshot {
 /// Finish an interrupted committed install before Journal::open exposes the store.
 pub(super) fn recover_bootstrap(store: &Path) -> Result<()> {
     let path = store.join("sync/bootstrap.json");
-    if !path.exists() { return Ok(()); }
+    if !path.exists() {
+        return Ok(());
+    }
     let _store = lock_file_reentrant(&store.join(".lock"))?;
-    if !path.exists() { return Ok(()); }
-    let redo: Bootstrap = serde_json::from_str(&fs::read_to_string(&path)?).map_err(|e| invalid(&e.to_string()))?;
+    if !path.exists() {
+        return Ok(());
+    }
+    let redo: Bootstrap =
+        serde_json::from_str(&fs::read_to_string(&path)?).map_err(|e| invalid(&e.to_string()))?;
     component(&redo.stage)?;
     validate_header(&redo.header)?;
     let stage = store.join("sync/.bootstrap").join(&redo.stage);
     no_symlinks(&stage)?;
     let boards = affected_boards(store, &stage)?;
-    let _boards: Vec<BoardGuard> = boards.iter().map(|p|Storage::new(p).lock()).collect::<Result<_>>()?;
+    let _boards: Vec<BoardGuard> = boards
+        .iter()
+        .map(|p| Storage::new(p).lock())
+        .collect::<Result<_>>()?;
     let _sync = lock_file_reentrant(&store.join("sync/.lock"))?;
     finish_bootstrap(store, &redo, &boards)
 }
@@ -539,11 +795,20 @@ fn finish_bootstrap(store: &Path, redo: &Bootstrap, boards: &BTreeSet<PathBuf>) 
         }
     }
     for stale in ["journal", "meta", "snapshot"] {
-        let path = root.join(stale);no_symlinks(&path)?;
-        match fs::remove_dir_all(path) {Ok(())=>(),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>(),Err(e)=>return Err(e.into())}
+        let path = root.join(stale);
+        no_symlinks(&path)?;
+        match fs::remove_dir_all(path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
     }
     for name in ["pending.json", "remote-pending.json", "drift.jsonl"] {
-        match fs::remove_file(root.join(name)) {Ok(())=>(),Err(e) if e.kind()==std::io::ErrorKind::NotFound=>(),Err(e)=>return Err(e.into())}
+        match fs::remove_file(root.join(name)) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
     }
     projection::forget(&root);
     prune::forget_groups(&root);
@@ -556,29 +821,44 @@ fn finish_bootstrap(store: &Path, redo: &Bootstrap, boards: &BTreeSet<PathBuf>) 
             _ => (),
         }
     }
-    for board in boards.iter().filter(|p|p.join("project.yaml").is_file()) {
+    for board in boards.iter().filter(|p| p.join("project.yaml").is_file()) {
         for status in STATUSES {
-            let path=board.join(".kanban/tasks").join(status);
-            fs::create_dir_all(&path)?;fs::File::open(path)?.sync_all()?;
+            let path = board.join(".kanban/tasks").join(status);
+            fs::create_dir_all(&path)?;
+            fs::File::open(path)?.sync_all()?;
         }
-        let threads=board.join(".kanban/threads");
-        fs::create_dir_all(&threads)?;fs::File::open(threads)?.sync_all()?;
+        let threads = board.join(".kanban/threads");
+        fs::create_dir_all(&threads)?;
+        fs::File::open(threads)?.sync_all()?;
         fs::File::open(board.join(".kanban/tasks"))?.sync_all()?;
         fs::File::open(board.join(".kanban"))?.sync_all()?;
     }
-    sync_installed_directories(&data,store)?;
+    sync_installed_directories(&data, store)?;
     let mut clock: Hlc = load(&root.join("hlc"))?;
-    if redo.header.hlc > clock { clock = redo.header.hlc.clone(); }
+    if redo.header.hlc > clock {
+        clock = redo.header.hlc.clone();
+    }
     atomic_write_text_raw(&root.join("hlc"), &json(&clock)?)?;
     let node_path = root.join("node.yaml");
     let mut node: NodeIdentity = serde_yaml_ng::from_str(&fs::read_to_string(&node_path)?)?;
     node.store_id = redo.header.store_id.clone();
-    let journal = Journal { root: root.clone(), node: node.clone() };
+    let journal = Journal {
+        root: root.clone(),
+        node: node.clone(),
+    };
     for item in manifest(&stage)? {
-        let path = match item? {Record::File {path,..}|Record::Blob {path,..}=>path,_=>continue};
-        if !path.starts_with("sync/") { drift::record(&journal, &store.join(path))?; }
+        let path = match item? {
+            Record::File { path, .. } | Record::Blob { path, .. } => path,
+            _ => continue,
+        };
+        if !path.starts_with("sync/") {
+            drift::record(&journal, &store.join(path))?;
+        }
     }
-    let own = retained_vector(&root)?.get(&node.node_id).copied().unwrap_or(0);
+    let own = retained_vector(&root)?
+        .get(&node.node_id)
+        .copied()
+        .unwrap_or(0);
     atomic_write_text_raw(&root.join("cursor.json"), &serde_json::json!({
         "server_node_id":redo.header.node_id,"store_id":redo.header.store_id,
         "hub_epoch":redo.header.hub_epoch,"last_seq":redo.header.seq,"pushed":own,"migrating":false
@@ -587,7 +867,8 @@ fn finish_bootstrap(store: &Path, redo: &Bootstrap, boards: &BTreeSet<PathBuf>) 
     format::write_stub(&root)?;
     // Identity is the final live-data commit point; the redo remains until durable.
     atomic_write_text_raw(&node_path, &serde_yaml_ng::to_string(&node)?)?;
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&node_path, fs::Permissions::from_mode(0o600))?;
     }
@@ -833,7 +1114,11 @@ mod tests {
 
     fn node(name: &str, role: &str) -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("config.yaml"), format!("node:\n  name: {name}\n  role: {role}\nsync:\n  enabled: true\n")).unwrap();
+        fs::write(
+            root.path().join("config.yaml"),
+            format!("node:\n  name: {name}\n  role: {role}\nsync:\n  enabled: true\n"),
+        )
+        .unwrap();
         Journal::open(root.path()).unwrap();
         root
     }
@@ -859,7 +1144,9 @@ mod tests {
         let receiver = node("laptop", "laptop");
         let work = tempfile::tempdir().unwrap();
         let (project, id) = seed(source.path(), &work.path().join("demo"));
-        stage(source.path(), receiver.path()).install(receiver.path()).unwrap();
+        stage(source.path(), receiver.path())
+            .install(receiver.path())
+            .unwrap();
         let staged = stage(source.path(), receiver.path());
         let copy = Storage::new(receiver.path().join("projects").join(&project.id));
         {
@@ -870,7 +1157,10 @@ mod tests {
         }
         let error = staged.install(receiver.path()).unwrap_err().to_string();
         assert!(error.contains("SYNC_SERVER_BEHIND"), "{error}");
-        assert_eq!(copy.load_task(&id).unwrap().unwrap().title, "new offline edit");
+        assert_eq!(
+            copy.load_task(&id).unwrap().unwrap().title,
+            "new offline edit"
+        );
         assert!(!receiver.path().join("sync/bootstrap.json").exists());
     }
     #[test]
@@ -882,19 +1172,40 @@ mod tests {
         let image = project.data_root.join(".kanban/assets/images/old.png");
         fs::create_dir_all(image.parent().unwrap()).unwrap();
         fs::write(&image, [0, 255, 128]).unwrap();
-        stage(source.path(), receiver.path()).install(receiver.path()).unwrap();
+        stage(source.path(), receiver.path())
+            .install(receiver.path())
+            .unwrap();
         let copied = receiver.path().join("projects").join(&project.id);
         let task = copied.join(".kanban/tasks/todo").join(format!("{id}.md"));
         let text = fs::read_to_string(&task).unwrap();
-        write_bytes(&task, text.replacen("---\n", "---\nsession: ses-local\nworktree: /local/worktree\n", 1).as_bytes()).unwrap();
+        write_bytes(
+            &task,
+            text.replacen(
+                "---\n",
+                "---\nsession: ses-local\nworktree: /local/worktree\n",
+                1,
+            )
+            .as_bytes(),
+        )
+        .unwrap();
         let local_project = copied.join("project.yaml");
-        let mut value: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&local_project).unwrap()).unwrap();
+        let mut value: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&fs::read_to_string(&local_project).unwrap()).unwrap();
         value["work_path"] = "/local/work".into();
-        write_bytes(&local_project, serde_yaml_ng::to_string(&value).unwrap().as_bytes()).unwrap();
+        write_bytes(
+            &local_project,
+            serde_yaml_ng::to_string(&value).unwrap().as_bytes(),
+        )
+        .unwrap();
         let config_path = receiver.path().join("config.yaml");
-        let mut config: serde_yaml_ng::Value = serde_yaml_ng::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        let mut config: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         config["tui"] = serde_yaml_ng::from_str("theme: local").unwrap();
-        write_bytes(&config_path, serde_yaml_ng::to_string(&config).unwrap().as_bytes()).unwrap();
+        write_bytes(
+            &config_path,
+            serde_yaml_ng::to_string(&config).unwrap().as_bytes(),
+        )
+        .unwrap();
         let artifact = copied.join(".kanban/context/local.md");
         fs::create_dir_all(artifact.parent().unwrap()).unwrap();
         fs::write(&artifact, "local context").unwrap();
@@ -906,11 +1217,26 @@ mod tests {
             task.title = "new server title".into();
             original.save_task(&task).unwrap();
         }
-        stage(source.path(), receiver.path()).install(receiver.path()).unwrap();
+        stage(source.path(), receiver.path())
+            .install(receiver.path())
+            .unwrap();
         let text = fs::read_to_string(task).unwrap();
-        assert!(text.contains("new server title") && text.contains("ses-local") && text.contains("/local/worktree"), "{text}");
-        assert!(fs::read_to_string(local_project).unwrap().contains("/local/work"));
-        assert!(fs::read_to_string(config_path).unwrap().contains("theme: local"));
+        assert!(
+            text.contains("new server title")
+                && text.contains("ses-local")
+                && text.contains("/local/worktree"),
+            "{text}"
+        );
+        assert!(
+            fs::read_to_string(local_project)
+                .unwrap()
+                .contains("/local/work")
+        );
+        assert!(
+            fs::read_to_string(config_path)
+                .unwrap()
+                .contains("theme: local")
+        );
         assert_eq!(fs::read_to_string(artifact).unwrap(), "local context");
         assert!(!copied.join(".kanban/assets/images/old.png").exists());
     }
@@ -924,17 +1250,35 @@ mod tests {
         let staged = stage(source.path(), receiver.path());
         for item in manifest(staged.stage.path()).unwrap() {
             match item.unwrap() {
-                Record::Blob { path, sha256, .. } => copy_atomic(&receiver.path().join("sync/blobs").join(sha256), &staged.stage.path().join("data").join(path)).unwrap(),
+                Record::Blob { path, sha256, .. } => copy_atomic(
+                    &receiver.path().join("sync/blobs").join(sha256),
+                    &staged.stage.path().join("data").join(path),
+                )
+                .unwrap(),
                 Record::File { path, text } if path == "config.yaml" => {
                     let text = merge_global(&receiver.path().join(&path), &text).unwrap();
-                    write_bytes(&staged.stage.path().join("data").join(path), text.as_bytes()).unwrap();
+                    write_bytes(
+                        &staged.stage.path().join("data").join(path),
+                        text.as_bytes(),
+                    )
+                    .unwrap();
                 }
                 _ => (),
             }
         }
         sync_directories(staged.stage.path()).unwrap();
-        let name = staged.stage.path().file_name().unwrap().to_str().unwrap().to_owned();
-        let redo = Bootstrap { stage: name, header: staged.header };
+        let name = staged
+            .stage
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let redo = Bootstrap {
+            stage: name,
+            header: staged.header,
+        };
         let _retained = staged.stage.keep();
         let root = receiver.path().join("sync");
         atomic_write_text_raw(&root.join("bootstrap.json"), &json(&redo).unwrap()).unwrap();
@@ -945,7 +1289,8 @@ mod tests {
         assert_eq!(recovered.node.name, "phone");
         assert_eq!(recovered.node.store_id, redo.header.store_id);
         assert!(Storage::new(receiver.path().join("projects").join(project.id)).task_exists(&task));
-        let cursor: Value = serde_json::from_str(&fs::read_to_string(root.join("cursor.json")).unwrap()).unwrap();
+        let cursor: Value =
+            serde_json::from_str(&fs::read_to_string(root.join("cursor.json")).unwrap()).unwrap();
         assert_eq!(cursor["last_seq"], redo.header.seq);
         assert!(!root.join("bootstrap.json").exists());
         assert!(!root.join(".bootstrap").join(redo.stage).exists());
@@ -959,7 +1304,10 @@ mod tests {
         seed(source.path(), &work.path().join("demo"));
         let staged = stage(source.path(), receiver.path());
         let error = staged.install(other.path()).unwrap_err().to_string();
-        assert!(error.contains("staged for another store") || error.contains("No such file"), "{error}");
+        assert!(
+            error.contains("staged for another store") || error.contains("No such file"),
+            "{error}"
+        );
         assert!(ProjectStore::at(other.path()).list().unwrap().is_empty());
         assert!(!other.path().join("sync/bootstrap.json").exists());
     }

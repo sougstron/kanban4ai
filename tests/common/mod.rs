@@ -22,7 +22,9 @@ pub fn bootstrap(source: &Path, receiver: &Path) {
     let source = Journal::open(source).unwrap();
     let destination = Journal::open(receiver).unwrap();
     for hash in &staged.blobs {
-        destination.put_blob(hash, &source.blob(hash).unwrap()).unwrap();
+        destination
+            .put_blob(hash, &source.blob(hash).unwrap())
+            .unwrap();
     }
     staged.install(receiver).unwrap();
 }

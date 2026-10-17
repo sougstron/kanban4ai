@@ -1,6 +1,6 @@
 //! Store-scoped settings and read-only server/client status.
-use super::*;
 use super::discovery;
+use super::*;
 use crate::core::sync::{Journal, NodeDial, NodeRole};
 use serde_json::Value;
 use std::process::Command;
@@ -8,85 +8,226 @@ const UNIT: &str = "kanban4ai-serve.service";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Peer {
-    pub id: String, pub name: String, pub role: NodeRole, pub route: String,
-    pub code: String, pub message: String, pub exchange: Option<String>, pub pending: u64,
-    pub clones: Vec<String>, pub cursor: u64, pub lag: u64,
+    pub id: String,
+    pub name: String,
+    pub role: NodeRole,
+    pub route: String,
+    pub code: String,
+    pub message: String,
+    pub exchange: Option<String>,
+    pub pending: u64,
+    pub clones: Vec<String>,
+    pub cursor: u64,
+    pub lag: u64,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Server {
-    pub id: String, pub name: String, pub urls: Vec<String>, pub route: String,
-    pub code: String, pub message: String, pub exchange: Option<String>, pub pending: u64,
-    pub last_seq: u64, pub head: u64,
+    pub id: String,
+    pub name: String,
+    pub urls: Vec<String>,
+    pub route: String,
+    pub code: String,
+    pub message: String,
+    pub exchange: Option<String>,
+    pub pending: u64,
+    pub last_seq: u64,
+    pub head: u64,
 }
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct View {
-    pub name: String, pub role: NodeRole, pub api_enabled: bool, pub api_active: Option<bool>,
-    pub server: Option<Server>, pub nodes: Vec<Peer>, pub conflicts: Vec<String>,
-    pub local_clones: Vec<String>, pub probed: bool,
+    pub name: String,
+    pub role: NodeRole,
+    pub api_enabled: bool,
+    pub api_active: Option<bool>,
+    pub server: Option<Server>,
+    pub nodes: Vec<Peer>,
+    pub conflicts: Vec<String>,
+    pub local_clones: Vec<String>,
+    pub probed: bool,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct BoardPeer {
-    pub name: String, pub role: NodeRole, pub code: String,
+    pub name: String,
+    pub role: NodeRole,
+    pub code: String,
     pub exchange: Option<chrono::DateTime<chrono::Utc>>,
-    pub since: Option<chrono::DateTime<chrono::Utc>>, pub pending: u64,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    pub pending: u64,
 }
-fn systemctl(args: &[&str]) -> std::io::Result<std::process::Output> { Command::new("systemctl").arg("--user").args(args).output() }
+fn systemctl(args: &[&str]) -> std::io::Result<std::process::Output> {
+    Command::new("systemctl").arg("--user").args(args).output()
+}
 fn unit_active() -> Option<bool> {
-    if cfg!(test) { None } else { systemctl(&["is-active","--quiet",UNIT]).ok().map(|o| o.status.success()) }
+    if cfg!(test) {
+        None
+    } else {
+        systemctl(&["is-active", "--quiet", UNIT])
+            .ok()
+            .map(|o| o.status.success())
+    }
 }
 fn api_enabled(root: &Path) -> Result<bool> {
-    Ok(ProjectStore::at(root).load_global_config()?.extras.get("serve").and_then(|s|s.get("enabled")).and_then(serde_yaml_ng::Value::as_bool).unwrap_or(false))
+    Ok(ProjectStore::at(root)
+        .load_global_config()?
+        .extras
+        .get("serve")
+        .and_then(|s| s.get("enabled"))
+        .and_then(serde_yaml_ng::Value::as_bool)
+        .unwrap_or(false))
 }
-fn time_text(at: chrono::DateTime<chrono::Utc>) -> String { at.with_timezone(&chrono::Local).format("%d.%m %H:%M").to_string() }
+fn time_text(at: chrono::DateTime<chrono::Utc>) -> String {
+    at.with_timezone(&chrono::Local)
+        .format("%d.%m %H:%M")
+        .to_string()
+}
 pub(super) fn clone_line(value: &Value) -> String {
-    format!("{}: {} · {}",value["project"].as_str().unwrap_or("—"),value["state"].as_str().unwrap_or("—"),value["path"].as_str().unwrap_or("—"))
+    format!(
+        "{}: {} · {}",
+        value["project"].as_str().unwrap_or("—"),
+        value["state"].as_str().unwrap_or("—"),
+        value["path"].as_str().unwrap_or("—")
+    )
 }
 pub(crate) fn local_view(root: &Path) -> Result<View> {
     let journal = Journal::open(root)?;
     let config = discovery::config(root)?;
-    let cursor: Value = fs::read_to_string(root.join("sync/cursor.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
-    let runtime: Value = fs::read_to_string(root.join("sync/server-status.json")).ok().and_then(|t|serde_json::from_str(&t).ok()).unwrap_or_default();
-    let own = journal.vector()?.get(&journal.node.node_id).copied().unwrap_or(0);
+    let cursor: Value = fs::read_to_string(root.join("sync/cursor.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let runtime: Value = fs::read_to_string(root.join("sync/server-status.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let own = journal
+        .vector()?
+        .get(&journal.node.node_id)
+        .copied()
+        .unwrap_or(0);
     let server = config.server.map(|s| Server {
-        id:s.node_id, name:s.name, urls:s.urls, route:runtime["route"].as_str().unwrap_or("not connected").into(),
-        code:runtime["code"].as_str().unwrap_or("").into(), message:runtime["message"].as_str().unwrap_or("").into(),
-        exchange:runtime["at"].as_str().map(str::to_owned), pending:own.saturating_sub(cursor["pushed"].as_u64().unwrap_or(0)),
-        last_seq:cursor["last_seq"].as_u64().unwrap_or(0), head:runtime["head"].as_u64().unwrap_or(0),
+        id: s.node_id,
+        name: s.name,
+        urls: s.urls,
+        route: runtime["route"].as_str().unwrap_or("not connected").into(),
+        code: runtime["code"].as_str().unwrap_or("").into(),
+        message: runtime["message"].as_str().unwrap_or("").into(),
+        exchange: runtime["at"].as_str().map(str::to_owned),
+        pending: own.saturating_sub(cursor["pushed"].as_u64().unwrap_or(0)),
+        last_seq: cursor["last_seq"].as_u64().unwrap_or(0),
+        head: runtime["head"].as_u64().unwrap_or(0),
     });
-    let nodes = if journal.node.role == NodeRole::Server { super::hub::node_statuses(root)? } else {
-        fs::read_to_string(root.join("sync/nodes.json")).ok().and_then(|t|serde_json::from_str(&t).ok()).unwrap_or_default()
-    }.into_iter().map(|n:discovery::Status| Peer {
-        id:n.node, name:n.name,role:n.role,route:n.path,code:n.code,message:n.message,exchange:n.last_seen.map(time_text),
-        pending:n.lag,clones:Vec::new(),cursor:n.cursor,lag:n.lag,
-    }).collect();
-    let local_clones = ProjectStore::at(root).list()?.into_iter().map(|p| match crate::core::code::status(root,&p.id) {
-        Ok(s)=>clone_line(&serde_json::to_value(s).unwrap_or_default()),Err(e)=>format!("{}: {e}",p.id),
-    }).collect();
-    Ok(View { name:journal.node.name.clone(),role:journal.node.role,api_enabled:api_enabled(root)?,api_active:unit_active(),server,nodes,
-        conflicts:journal.conflicts()?.into_iter().map(|c|format!("{}/{} {}: {}",c.project,c.entity,c.id,c.field)).collect(),local_clones,probed:false })
+    let nodes = if journal.node.role == NodeRole::Server {
+        super::hub::node_statuses(root)?
+    } else {
+        fs::read_to_string(root.join("sync/nodes.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+    .into_iter()
+    .map(|n: discovery::Status| Peer {
+        id: n.node,
+        name: n.name,
+        role: n.role,
+        route: n.path,
+        code: n.code,
+        message: n.message,
+        exchange: n.last_seen.map(time_text),
+        pending: n.lag,
+        clones: Vec::new(),
+        cursor: n.cursor,
+        lag: n.lag,
+    })
+    .collect();
+    let local_clones = ProjectStore::at(root)
+        .list()?
+        .into_iter()
+        .map(|p| match crate::core::code::status(root, &p.id) {
+            Ok(s) => clone_line(&serde_json::to_value(s).unwrap_or_default()),
+            Err(e) => format!("{}: {e}", p.id),
+        })
+        .collect();
+    Ok(View {
+        name: journal.node.name.clone(),
+        role: journal.node.role,
+        api_enabled: api_enabled(root)?,
+        api_active: unit_active(),
+        server,
+        nodes,
+        conflicts: journal
+            .conflicts()?
+            .into_iter()
+            .map(|c| format!("{}/{} {}: {}", c.project, c.entity, c.id, c.field))
+            .collect(),
+        local_clones,
+        probed: false,
+    })
 }
 pub(crate) fn refresh(root: &Path) -> Result<View> {
-    let runtime=tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let statuses=runtime.block_on(discovery::probes(root))?;
-    atomic_write_text_raw(&root.join("sync/nodes.json"),&serde_json::to_string(&statuses).map_err(|e|invalid(e.to_string()))?)?;
-    let mut view=local_view(root)?;view.probed=true;Ok(view)
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let statuses = runtime.block_on(discovery::probes(root))?;
+    atomic_write_text_raw(
+        &root.join("sync/nodes.json"),
+        &serde_json::to_string(&statuses).map_err(|e| invalid(e.to_string()))?,
+    )?;
+    let mut view = local_view(root)?;
+    view.probed = true;
+    Ok(view)
 }
 pub(crate) fn board_peers(root: &Path) -> Result<Vec<BoardPeer>> {
-    let journal=Journal::open(root)?;
-    let statuses:Vec<discovery::Status>=if journal.node.role==NodeRole::Server {super::hub::node_statuses(root)?}else{
-        fs::read_to_string(root.join("sync/nodes.json")).ok().and_then(|t|serde_json::from_str(&t).ok()).unwrap_or_default()
+    let journal = Journal::open(root)?;
+    let statuses: Vec<discovery::Status> = if journal.node.role == NodeRole::Server {
+        super::hub::node_statuses(root)?
+    } else {
+        fs::read_to_string(root.join("sync/nodes.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
     };
-    let mut nodes:Vec<_>=statuses.into_iter().filter(|n|n.node!=journal.node.node_id).map(|n|BoardPeer {
-        name:n.name,role:n.role,code:n.code,exchange:n.last_seen,since:n.since,pending:n.lag,
-    }).collect();
-    if let Some(server)=discovery::config(root)?.server {
+    let mut nodes: Vec<_> = statuses
+        .into_iter()
+        .filter(|n| n.node != journal.node.node_id)
+        .map(|n| BoardPeer {
+            name: n.name,
+            role: n.role,
+            code: n.code,
+            exchange: n.last_seen,
+            since: n.since,
+            pending: n.lag,
+        })
+        .collect();
+    if let Some(server) = discovery::config(root)?.server {
         {
-            let status:Value=fs::read_to_string(root.join("sync/server-status.json")).ok().and_then(|t|serde_json::from_str(&t).ok()).unwrap_or_default();
-            let cursor:Value=fs::read_to_string(root.join("sync/cursor.json")).ok().and_then(|t|serde_json::from_str(&t).ok()).unwrap_or_default();
-            let own=journal.vector()?.get(&journal.node.node_id).copied().unwrap_or(0);
-            let pending=own.saturating_sub(cursor["pushed"].as_u64().unwrap_or(0));
-            if let Some(node)=nodes.iter_mut().find(|n|n.role==NodeRole::Server){node.pending=pending;}else{
-                nodes.insert(0,BoardPeer{name:server.name,role:NodeRole::Server,code:status["code"].as_str().unwrap_or("OFFLINE").into(),exchange:None,since:None,pending});
+            let status: Value = fs::read_to_string(root.join("sync/server-status.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+            let cursor: Value = fs::read_to_string(root.join("sync/cursor.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+            let own = journal
+                .vector()?
+                .get(&journal.node.node_id)
+                .copied()
+                .unwrap_or(0);
+            let pending = own.saturating_sub(cursor["pushed"].as_u64().unwrap_or(0));
+            if let Some(node) = nodes.iter_mut().find(|n| n.role == NodeRole::Server) {
+                node.pending = pending;
+            } else {
+                nodes.insert(
+                    0,
+                    BoardPeer {
+                        name: server.name,
+                        role: NodeRole::Server,
+                        code: status["code"].as_str().unwrap_or("OFFLINE").into(),
+                        exchange: None,
+                        since: None,
+                        pending,
+                    },
+                );
             }
         }
     }
@@ -256,7 +397,11 @@ pub(crate) fn pairing_code(
 }
 
 pub(crate) fn pair(root: &Path, address: &str, code: &str) -> Result<String> {
-    if code.trim().is_empty() && pairing::parse_invite(address).is_some() { return pairing::join(root,address,None); }
-    if code.trim().is_empty() { return Err(invalid("Enter the pairing code")); }
-    pairing::pair(&ProjectStore::at(root),address.trim(),code.trim().into())
+    if code.trim().is_empty() && pairing::parse_invite(address).is_some() {
+        return pairing::join(root, address, None);
+    }
+    if code.trim().is_empty() {
+        return Err(invalid("Enter the pairing code"));
+    }
+    pairing::pair(&ProjectStore::at(root), address.trim(), code.trim().into())
 }

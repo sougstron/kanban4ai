@@ -82,26 +82,63 @@ fn save<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     }
     Ok(())
 }
-fn endpoint(_root: &Path, address: &str) -> Result<reqwest::Url> { discovery::base_url(address) }
+fn endpoint(_root: &Path, address: &str) -> Result<reqwest::Url> {
+    discovery::base_url(address)
+}
 fn tailnet_address(root: &Path, port: u16) -> Result<Option<String>> {
-    if port == 0 || crate::core::net::settings(root)?.mode == crate::core::net::Mode::Off { return Ok(None); }
-    let Ok(status) = crate::core::net::status(root) else { return Ok(None); };
-    Ok(status["Self"]["DNSName"].as_str().map(|s| format!("{}:{port}",s.trim_end_matches('.'))))
+    if port == 0 || crate::core::net::settings(root)?.mode == crate::core::net::Mode::Off {
+        return Ok(None);
+    }
+    let Ok(status) = crate::core::net::status(root) else {
+        return Ok(None);
+    };
+    Ok(status["Self"]["DNSName"]
+        .as_str()
+        .map(|s| format!("{}:{port}", s.trim_end_matches('.'))))
 }
 fn card(store: &ProjectStore) -> Result<Card> {
-    Ok(Card { node: Journal::open(store.root())?.node, empty: store.list()?.is_empty(), proto: PROTO, min_proto: MIN_PROTO })
+    Ok(Card {
+        node: Journal::open(store.root())?.node,
+        empty: store.list()?.is_empty(),
+        proto: PROTO,
+        min_proto: MIN_PROTO,
+    })
 }
 fn validate(local: &Card, remote: &Card) -> Result<()> {
-    if remote.proto < MIN_PROTO || remote.min_proto > PROTO { return Err(invalid("SYNC_PROTOCOL_MISMATCH: обновите kanban4ai на всех узлах")); }
-    if local.node.node_id == remote.node.node_id || local.node.name == remote.node.name
-        || (local.node.role == NodeRole::Server && remote.node.role == NodeRole::Server) {
-        return Err(invalid("Node ID and name must differ; server role must be unique"));
+    if remote.proto < MIN_PROTO || remote.min_proto > PROTO {
+        return Err(invalid(
+            "SYNC_PROTOCOL_MISMATCH: обновите kanban4ai на всех узлах",
+        ));
     }
-    if !local.empty && !remote.empty && local.node.store_id != remote.node.store_id { return Err(invalid("SYNC_STORE_MISMATCH: use join --fresh")); }
+    if local.node.node_id == remote.node.node_id
+        || local.node.name == remote.node.name
+        || (local.node.role == NodeRole::Server && remote.node.role == NodeRole::Server)
+    {
+        return Err(invalid(
+            "Node ID and name must differ; server role must be unique",
+        ));
+    }
+    if !local.empty && !remote.empty && local.node.store_id != remote.node.store_id {
+        return Err(invalid("SYNC_STORE_MISMATCH: use join --fresh"));
+    }
     Ok(())
 }
-pub(super) async fn accept(State(root): State<PathBuf>, headers: axum::http::HeaderMap, Json(request): Json<PairRequest>) -> Response {
-    if headers.get("x-kanban-sync-protocol").and_then(|v|v.to_str().ok())!=Some("3"){return error(StatusCode::UPGRADE_REQUIRED,"SYNC_PROTOCOL_MISMATCH","обновите kanban4ai на всех узлах");}
+pub(super) async fn accept(
+    State(root): State<PathBuf>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<PairRequest>,
+) -> Response {
+    if headers
+        .get("x-kanban-sync-protocol")
+        .and_then(|v| v.to_str().ok())
+        != Some("3")
+    {
+        return error(
+            StatusCode::UPGRADE_REQUIRED,
+            "SYNC_PROTOCOL_MISMATCH",
+            "обновите kanban4ai на всех узлах",
+        );
+    }
     match tokio::task::spawn_blocking(move || accept_sync(&root, request)).await {
         Ok(Ok(reply)) => Json(reply).into_response(),
         Ok(Err(e)) => super::sync::failure(e),
@@ -110,16 +147,31 @@ pub(super) async fn accept(State(root): State<PathBuf>, headers: axum::http::Hea
 }
 fn accept_sync(root: &Path, request: PairRequest) -> Result<PairReply> {
     let store = ProjectStore::at(root);
-    if Journal::open(root)?.node.role != NodeRole::Server { return Err(invalid("SYNC_NOT_A_SERVER")); }
+    if Journal::open(root)?.node.role != NodeRole::Server {
+        return Err(invalid("SYNC_NOT_A_SERVER"));
+    }
     let local = card(&store)?;
     let _store_lock = store.lock()?;
     let _sync_lock = lock_file_reentrant(&root.join("sync/.lock"))?;
     let path = root.join("sync/pair-code.yaml");
-    let mut code: Code = serde_yaml_ng::from_str(&fs::read_to_string(&path).map_err(|_| invalid("NODE_AUTH_FAILED: No active pairing code"))?)?;
-    if code.expires <= chrono::Utc::now().timestamp() || code.attempts >= code.limit { return Err(invalid("NODE_AUTH_FAILED: Pairing code expired or exhausted")); }
+    let mut code: Code = serde_yaml_ng::from_str(
+        &fs::read_to_string(&path)
+            .map_err(|_| invalid("NODE_AUTH_FAILED: No active pairing code"))?,
+    )?;
+    if code.expires <= chrono::Utc::now().timestamp() || code.attempts >= code.limit {
+        return Err(invalid(
+            "NODE_AUTH_FAILED: Pairing code expired or exhausted",
+        ));
+    }
     code.attempts += 1;
     save(&path, &code)?;
-    if request.code.len() != 6 || !bool::from(code.hash.as_bytes().ct_eq(token_hash(&request.code).as_bytes())) {
+    if request.code.len() != 6
+        || !bool::from(
+            code.hash
+                .as_bytes()
+                .ct_eq(token_hash(&request.code).as_bytes()),
+        )
+    {
         return Err(invalid("NODE_AUTH_FAILED: Incorrect pairing code"));
     }
     validate(&local, &request.node_card)?;
@@ -127,12 +179,17 @@ fn accept_sync(root: &Path, request: PairRequest) -> Result<PairReply> {
     save(&path, &code)?;
     let token = issue_token(root, TokenKind::Node)?;
     super::hub::register(root, &request.node_card.node, &token_hash(&token))?;
-    Ok(PairReply { node_card: local, token })
+    Ok(PairReply {
+        node_card: local,
+        token,
+    })
 }
 
 pub(super) fn create_code(store: &ProjectStore) -> Result<String> {
     let root = store.root();
-    if Journal::open(root)?.node.role != NodeRole::Server { return Err(invalid("SYNC_NOT_A_SERVER")); }
+    if Journal::open(root)?.node.role != NodeRole::Server {
+        return Err(invalid("SYNC_NOT_A_SERVER"));
+    }
     let global = store.load_global_config()?;
     let settings: PairingSettings = global
         .extras
@@ -175,32 +232,88 @@ pub(super) fn pair(store: &ProjectStore, address: &str, code: String) -> Result<
     let root = store.root();
     let url = endpoint(root, address)?;
     let local = card(store)?;
-    if local.node.role == NodeRole::Server { return Err(invalid("A sync server cannot pair as a client")); }
-    let request = PairRequest { code, node_card: local.clone() };
+    if local.node.role == NodeRole::Server {
+        return Err(invalid("A sync server cannot pair as a client"));
+    }
+    let request = PairRequest {
+        code,
+        node_card: local.clone(),
+    };
     let mut command = Command::new("curl");
-    let authority = format!("{}:{}",url.host_str().unwrap_or_default(),url.port_or_known_default().unwrap_or(7420));
+    let authority = format!(
+        "{}:{}",
+        url.host_str().unwrap_or_default(),
+        url.port_or_known_default().unwrap_or(7420)
+    );
     if let Some(proxy) = crate::core::net::proxy_for(root, &authority)? {
         command.args(["--proxy", &proxy, "--noproxy", ""]);
-    } else { command.args(["--noproxy", "*"]); }
-    let mut child = command.args(["--silent","--show-error","--fail-with-body","--connect-timeout","5","--max-time","15",
-        "-H","Content-Type: application/json","-H","x-kanban-sync-protocol: 3","--data-binary","@-"])
-        .arg(format!("{}/pair",discovery::base(url.as_str())))
-        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    child.stdin.take().ok_or_else(|| invalid("curl stdin missing"))?.write_all(&serde_json::to_vec(&request).map_err(|e| invalid(e.to_string()))?)?;
+    } else {
+        command.args(["--noproxy", "*"]);
+    }
+    let mut child = command
+        .args([
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "15",
+            "-H",
+            "Content-Type: application/json",
+            "-H",
+            "x-kanban-sync-protocol: 3",
+            "--data-binary",
+            "@-",
+        ])
+        .arg(format!("{}/pair", discovery::base(url.as_str())))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| invalid("curl stdin missing"))?
+        .write_all(&serde_json::to_vec(&request).map_err(|e| invalid(e.to_string()))?)?;
     let output = child.wait_with_output()?;
-    if !output.status.success() { return Err(invalid(format!("Pair failed: {} {}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr)))); }
-    let reply: PairReply = serde_json::from_slice(&output.stdout).map_err(|e| invalid(e.to_string()))?;
-    if reply.node_card.node.role != NodeRole::Server { return Err(invalid("SYNC_NOT_A_SERVER")); }
+    if !output.status.success() {
+        return Err(invalid(format!(
+            "Pair failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let reply: PairReply =
+        serde_json::from_slice(&output.stdout).map_err(|e| invalid(e.to_string()))?;
+    if reply.node_card.node.role != NodeRole::Server {
+        return Err(invalid("SYNC_NOT_A_SERVER"));
+    }
     validate(&local, &reply.node_card)?;
-    if reply.token.len() != 64 || !reply.token.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(invalid("Invalid server credential")); }
+    if reply.token.len() != 64 || !reply.token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(invalid("Invalid server credential"));
+    }
     {
         let _store = store.lock()?;
         let _sync = lock_file_reentrant(&root.join("sync/.lock"))?;
-        let server = discovery::ServerConfig { node_id: reply.node_card.node.node_id.clone(), name: reply.node_card.node.name.clone(), urls: vec![discovery::base(url.as_str())] };
-        let credential = discovery::Credential { node_id: server.node_id.clone(), token: reply.token, urls: server.urls.clone() };
+        let server = discovery::ServerConfig {
+            node_id: reply.node_card.node.node_id.clone(),
+            name: reply.node_card.node.name.clone(),
+            urls: vec![discovery::base(url.as_str())],
+        };
+        let credential = discovery::Credential {
+            node_id: server.node_id.clone(),
+            token: reply.token,
+            urls: server.urls.clone(),
+        };
         let mut config = store.load_global_config()?;
-        let sync = config.extras.entry("sync".into()).or_insert_with(|| serde_yaml_ng::Value::Mapping(Default::default()));
-        if !sync.is_mapping() { return Err(invalid("sync must be a mapping")); }
+        let sync = config
+            .extras
+            .entry("sync".into())
+            .or_insert_with(|| serde_yaml_ng::Value::Mapping(Default::default()));
+        if !sync.is_mapping() {
+            return Err(invalid("sync must be a mapping"));
+        }
         sync["server"] = serde_yaml_ng::to_value(&server)?;
         save(&root.join("sync/server.yaml"), &credential)?;
         store.save_global_config(&config)?;
@@ -387,53 +500,115 @@ pub(super) fn run(store: &ProjectStore, options: &PairingOptions) -> Result<bool
     Ok(true)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn node(name:&str,role:&str)->tempfile::TempDir {
-        let dir=tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("config.yaml"),format!("node:\n  name: {name}\n  role: {role}\n")).unwrap();
-        Journal::open(dir.path()).unwrap();dir
+    fn node(name: &str, role: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("config.yaml"),
+            format!("node:\n  name: {name}\n  role: {role}\n"),
+        )
+        .unwrap();
+        Journal::open(dir.path()).unwrap();
+        dir
     }
     #[test]
     fn server_code_is_one_use_and_registers_only_an_inbound_node_token() {
-        let server=node("server","server");let client=node("laptop","laptop");
-        let store=ProjectStore::at(server.path());
-        let code=create_code(&store).unwrap();
-        let card=card(&ProjectStore::at(client.path())).unwrap();
-        let reply=accept_sync(server.path(),PairRequest{code:code.clone(),node_card:card.clone()}).unwrap();
-        let value=serde_json::to_value(&reply).unwrap();
+        let server = node("server", "server");
+        let client = node("laptop", "laptop");
+        let store = ProjectStore::at(server.path());
+        let code = create_code(&store).unwrap();
+        let card = card(&ProjectStore::at(client.path())).unwrap();
+        let reply = accept_sync(
+            server.path(),
+            PairRequest {
+                code: code.clone(),
+                node_card: card.clone(),
+            },
+        )
+        .unwrap();
+        let value = serde_json::to_value(&reply).unwrap();
         assert!(value.get("reverse_token").is_none());
-        assert_eq!(reply.token.len(),64);
-        let id=super::super::hub::caller(server.path(),&token_hash(&reply.token)).unwrap();
-        assert_eq!(id,card.node.node_id);
+        assert_eq!(reply.token.len(), 64);
+        let id = super::super::hub::caller(server.path(), &token_hash(&reply.token)).unwrap();
+        assert_eq!(id, card.node.node_id);
         assert!(!server.path().join("sync/server.yaml").exists());
         assert!(!client.path().join("sync/tokens.yaml").exists());
-        assert!(accept_sync(server.path(),PairRequest{code,node_card:card}).is_err());
+        assert!(
+            accept_sync(
+                server.path(),
+                PairRequest {
+                    code,
+                    node_card: card
+                }
+            )
+            .is_err()
+        );
     }
     #[test]
     fn clients_cannot_issue_pair_codes_or_accept_pairing() {
-        let client=node("laptop","laptop");
-        assert!(create_code(&ProjectStore::at(client.path())).unwrap_err().to_string().contains("SYNC_NOT_A_SERVER"));
-        let card=card(&ProjectStore::at(client.path())).unwrap();
-        let error=accept_sync(client.path(),PairRequest{code:"123456".into(),node_card:card}).err().unwrap();
+        let client = node("laptop", "laptop");
+        assert!(
+            create_code(&ProjectStore::at(client.path()))
+                .unwrap_err()
+                .to_string()
+                .contains("SYNC_NOT_A_SERVER")
+        );
+        let card = card(&ProjectStore::at(client.path())).unwrap();
+        let error = accept_sync(
+            client.path(),
+            PairRequest {
+                code: "123456".into(),
+                node_card: card,
+            },
+        )
+        .err()
+        .unwrap();
         assert!(error.to_string().contains("SYNC_NOT_A_SERVER"));
     }
     #[test]
     fn incorrect_codes_exhaust_the_attempt_limit() {
-        let server=node("server","server");let client=node("laptop","laptop");
-        let code=create_code(&ProjectStore::at(server.path())).unwrap();
-        let bad=if code=="000000"{"111111"}else{"000000"};
-        let card=card(&ProjectStore::at(client.path())).unwrap();
-        for _ in 0..5 {assert!(accept_sync(server.path(),PairRequest{code:bad.into(),node_card:card.clone()}).is_err());}
-        assert!(accept_sync(server.path(),PairRequest{code,node_card:card}).is_err());
+        let server = node("server", "server");
+        let client = node("laptop", "laptop");
+        let code = create_code(&ProjectStore::at(server.path())).unwrap();
+        let bad = if code == "000000" { "111111" } else { "000000" };
+        let card = card(&ProjectStore::at(client.path())).unwrap();
+        for _ in 0..5 {
+            assert!(
+                accept_sync(
+                    server.path(),
+                    PairRequest {
+                        code: bad.into(),
+                        node_card: card.clone()
+                    }
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            accept_sync(
+                server.path(),
+                PairRequest {
+                    code,
+                    node_card: card
+                }
+            )
+            .is_err()
+        );
     }
     #[test]
     fn invite_accepts_https_and_preserves_the_server_origin() {
-        let server=node("server","server");
-        let invite=phone_invite(&ProjectStore::at(server.path()),"https://sync.example.test").unwrap();
-        assert_eq!(parse_invite(&invite.command).unwrap().1,"https://sync.example.test");
+        let server = node("server", "server");
+        let invite = phone_invite(
+            &ProjectStore::at(server.path()),
+            "https://sync.example.test",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_invite(&invite.command).unwrap().1,
+            "https://sync.example.test"
+        );
         assert!(!invite.payload.contains("token"));
     }
 }

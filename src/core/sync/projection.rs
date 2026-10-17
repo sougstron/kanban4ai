@@ -310,7 +310,9 @@ pub(crate) fn apply_meta(state: &mut JournalState, op: &Operation) {
         .entry(key(&op.project, &op.entity, &op.id))
         .or_default();
     for (field, value) in &op.set {
-        if op.entity == "config" && op.project.is_empty() && field == "sync.relay_encrypt" { continue; }
+        if op.entity == "config" && op.project.is_empty() && field == "sync.relay_encrypt" {
+            continue;
+        }
         if fields.clocks.get(field).is_none_or(|clock| clock < &op.hlc) {
             fields.values.insert(field.clone(), value.clone());
             fields.clocks.insert(field.clone(), op.hlc.clone());

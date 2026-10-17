@@ -59,18 +59,10 @@ pub(crate) struct Form {
 pub(crate) enum Request {
     Load,
     Refresh,
-    SaveNode {
-        name: String,
-        role: NodeRole,
-    },
+    SaveNode { name: String, role: NodeRole },
     SetApi(bool),
-    PairingCode {
-        address: String,
-    },
-    Pair {
-        address: String,
-        code: String,
-    },
+    PairingCode { address: String },
+    Pair { address: String, code: String },
     Network(NetworkAction),
 }
 
@@ -344,8 +336,7 @@ impl SyncTab {
                 let job_root = root.clone();
                 self.spawn(move || {
                     Outcome::Paired(
-                        settings::pair(&job_root, &address, &code)
-                            .map_err(|e| e.to_string()),
+                        settings::pair(&job_root, &address, &code).map_err(|e| e.to_string()),
                     )
                 });
                 self.notice = Some(("Pairing…".into(), false));
@@ -769,10 +760,7 @@ fn lines(
     };
     out.push(heading(app, nodes_heading));
     if view.nodes.is_empty() {
-        out.push(Line::from(Span::styled(
-            "  No other nodes yet",
-            muted,
-        )));
+        out.push(Line::from(Span::styled("  No other nodes yet", muted)));
     }
     for (index, node) in view.nodes.iter().enumerate() {
         let mut spans = vec![Span::raw(format!(

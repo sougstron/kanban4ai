@@ -11,7 +11,11 @@ fn command(root: &std::path::Path) -> Command {
 fn phone_qr_uses_expiring_pair_code_not_bearer_credentials() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.yaml"),"node:\n  name: srv\n  role: server\n").unwrap();
+    std::fs::write(
+        dir.path().join("config.yaml"),
+        "node:\n  name: srv\n  role: server\n",
+    )
+    .unwrap();
     let output = command(dir.path())
         .args(["serve", "--phone-qr", "192.168.1.2:7420"])
         .output()

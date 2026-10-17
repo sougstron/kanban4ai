@@ -92,7 +92,8 @@ fn bootstrap_only_transfers_board_data_instructions_and_images() {
             }),
         );
         let input = tempfile::NamedTempFile::new().unwrap();
-        let mut content = forbidden.iter()
+        let mut content = forbidden
+            .iter()
             .map(|line| serde_json::to_string(line).unwrap())
             .collect::<Vec<_>>()
             .join("\n");

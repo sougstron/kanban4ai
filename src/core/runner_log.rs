@@ -49,8 +49,7 @@ pub fn settings(store: &Path) -> Result<LogSettings> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
         Err(error) => return Err(error.into()),
     };
-    if config.sync.log_interval == 0
-        || !(1..=MAX_TAIL_BYTES).contains(&config.sync.log_tail_bytes)
+    if config.sync.log_interval == 0 || !(1..=MAX_TAIL_BYTES).contains(&config.sync.log_tail_bytes)
     {
         return Err(invalid(
             "sync.log_interval must be positive and sync.log_tail_bytes must be 1..1048576",
@@ -59,7 +58,12 @@ pub fn settings(store: &Path) -> Result<LogSettings> {
     Ok(config.sync)
 }
 
-fn known_remote_owner(store: &Path, settings: &LogSettings, node: &str, role: super::sync::NodeRole) -> Result<bool> {
+fn known_remote_owner(
+    store: &Path,
+    settings: &LogSettings,
+    node: &str,
+    role: super::sync::NodeRole,
+) -> Result<bool> {
     if role == super::sync::NodeRole::Server {
         let clients: std::collections::BTreeMap<String, serde_json::Value> =
             match fs::read_to_string(store.join("sync/hub/clients.json")) {
@@ -72,7 +76,10 @@ fn known_remote_owner(store: &Path, settings: &LogSettings, node: &str, role: su
     } else {
         // The server forwards other clients' logs. The portable run descriptor
         // below still binds the claimed owner, project, task and generation.
-        Ok(settings.server.as_ref().is_some_and(|server| !server.node_id.is_empty()))
+        Ok(settings
+            .server
+            .as_ref()
+            .is_some_and(|server| !server.node_id.is_empty()))
     }
 }
 

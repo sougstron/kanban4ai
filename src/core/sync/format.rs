@@ -157,12 +157,18 @@ pub(super) fn is_stub(text: &str) -> bool {
 /// A format newer than this binary is refused with no writes.
 pub(super) fn ensure(store: &Path) -> Result<()> {
     let root = store.join("sync");
-    if !root.exists() { return Ok(()); }
+    if !root.exists() {
+        return Ok(());
+    }
     let version = read_format(store)?;
     if version.is_some_and(|v| v > STORE_FORMAT || v == 0) {
-        return Err(invalid(&format!("SYNC_STORE_TOO_NEW: binary supports {STORE_FORMAT}")));
+        return Err(invalid(&format!(
+            "SYNC_STORE_TOO_NEW: binary supports {STORE_FORMAT}"
+        )));
     }
-    if version == Some(STORE_FORMAT) { return Ok(()); }
+    if version == Some(STORE_FORMAT) {
+        return Ok(());
+    }
     if version.is_some_and(|v| v < SEGMENTS_FORMAT) || (version.is_none() && v1_present(&root)?) {
         migrate_v1::migrate(store)?;
     } else if leftovers(&root)? {
@@ -289,7 +295,9 @@ pub(super) fn disarm(store: &Path) -> Result<()> {
 }
 
 /// Explicit false disables sync; otherwise a server link or server clients arms it.
-pub fn enabled(store: &Path) -> bool { read_enabled(&store.join("config.yaml")) }
+pub fn enabled(store: &Path) -> bool {
+    read_enabled(&store.join("config.yaml"))
+}
 
 fn read_enabled(path: &Path) -> bool {
     let Ok(text) = fs::read_to_string(path) else {
@@ -303,17 +311,28 @@ fn read_enabled(path: &Path) -> bool {
     };
     match sync.get("enabled") {
         Some(serde_yaml_ng::Value::Bool(value)) => *value,
-        _ => auto_enabled(sync) || (config.get("node").and_then(|n|n.get("role")).and_then(|r|r.as_str()) == Some("server") && path.parent().is_some_and(has_clients)),
+        _ => {
+            auto_enabled(sync)
+                || (config
+                    .get("node")
+                    .and_then(|n| n.get("role"))
+                    .and_then(|r| r.as_str())
+                    == Some("server")
+                    && path.parent().is_some_and(has_clients))
+        }
     }
 }
 
 fn auto_enabled(sync: &serde_yaml_ng::Value) -> bool {
-    sync.get("server").and_then(|v|v.as_mapping()).is_some_and(|s|!s.is_empty())
+    sync.get("server")
+        .and_then(|v| v.as_mapping())
+        .is_some_and(|s| !s.is_empty())
 }
 fn has_clients(store: &Path) -> bool {
-    fs::read_to_string(store.join("sync/hub/clients.json")).ok()
-        .and_then(|s|serde_json::from_str::<BTreeMap<String,Value>>(&s).ok())
-        .is_some_and(|c|!c.is_empty())
+    fs::read_to_string(store.join("sync/hub/clients.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<BTreeMap<String, Value>>(&s).ok())
+        .is_some_and(|c| !c.is_empty())
 }
 
 /// Test and setup helper: turn journaling on without discarding the rest of

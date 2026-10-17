@@ -2581,8 +2581,14 @@ mod tests {
         .unwrap();
         assert_eq!(node_id(&kept).unwrap(), old);
         assert_ne!(node_id(&fresh).unwrap(), old);
-        assert_eq!(fs::read_to_string(kept.join("sync/server.yaml")).unwrap(), credentials);
-        assert_eq!(fs::read_to_string(kept.join("sync/cursor.json")).unwrap(), cursor);
+        assert_eq!(
+            fs::read_to_string(kept.join("sync/server.yaml")).unwrap(),
+            credentials
+        );
+        assert_eq!(
+            fs::read_to_string(kept.join("sync/cursor.json")).unwrap(),
+            cursor
+        );
         assert!(!fresh.join("sync/server.yaml").exists());
         assert!(!fresh.join("sync/cursor.json").exists());
     }

@@ -93,9 +93,13 @@ impl Embedded {
                             ownership.take();
                         }
                     }
-                    if !service_active && running.is_none()
-                        && (config.as_ref().is_ok_and(|c|c.server.is_some())
-                            || (serving && crate::core::sync::Journal::open(&root).is_ok_and(|j|j.node.role==crate::core::sync::NodeRole::Server)))
+                    if !service_active
+                        && running.is_none()
+                        && (config.as_ref().is_ok_and(|c| c.server.is_some())
+                            || (serving
+                                && crate::core::sync::Journal::open(&root).is_ok_and(|j| {
+                                    j.node.role == crate::core::sync::NodeRole::Server
+                                })))
                     {
                         let acquired = try_owner(&root.join("sync/worker.lock"));
                         match acquired {

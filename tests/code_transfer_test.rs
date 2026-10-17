@@ -244,7 +244,7 @@ fn remote_queue_intent_is_runner_owned_and_obeys_runner_caps() {
         "node:\n  name: home\n  role: server\n",
     )
     .unwrap();
-    let a = Journal::open(&sender).unwrap();
+    Journal::open(&sender).unwrap();
     Journal::open(&receiver).unwrap();
     common::bootstrap(&sender, &receiver);
     let b = Journal::open(&receiver).unwrap();

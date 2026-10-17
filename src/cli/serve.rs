@@ -35,10 +35,10 @@ mod embedded;
 pub(crate) use embedded::Embedded;
 mod discovery;
 mod git;
+mod hub;
 mod pairing;
 pub(crate) mod settings;
 mod sync;
-mod hub;
 pub use discovery::DiscoveryOptions;
 pub use pairing::PairingOptions;
 
@@ -259,12 +259,35 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
 }
 
 async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: Next) -> Response {
-    let route=request.uri().path();
-    if matches!(route,"/sync/vector"|"/sync/ops"|"/sync/ack"|"/sync/stream"|"/sync/snapshot"|"/sync/hello"|"/sync/bye") {
-        return error(StatusCode::UPGRADE_REQUIRED,"SYNC_PROTOCOL_MISMATCH","обновите kanban4ai на всех узлах");
+    let route = request.uri().path();
+    if matches!(
+        route,
+        "/sync/vector"
+            | "/sync/ops"
+            | "/sync/ack"
+            | "/sync/stream"
+            | "/sync/snapshot"
+            | "/sync/hello"
+            | "/sync/bye"
+    ) {
+        return error(
+            StatusCode::UPGRADE_REQUIRED,
+            "SYNC_PROTOCOL_MISMATCH",
+            "обновите kanban4ai на всех узлах",
+        );
     }
-    if route.starts_with("/sync/") && request.headers().get("x-kanban-sync-protocol").and_then(|v|v.to_str().ok())!=Some("3") {
-        return error(StatusCode::UPGRADE_REQUIRED,"SYNC_PROTOCOL_MISMATCH","обновите kanban4ai на всех узлах");
+    if route.starts_with("/sync/")
+        && request
+            .headers()
+            .get("x-kanban-sync-protocol")
+            .and_then(|v| v.to_str().ok())
+            != Some("3")
+    {
+        return error(
+            StatusCode::UPGRADE_REQUIRED,
+            "SYNC_PROTOCOL_MISMATCH",
+            "обновите kanban4ai на всех узлах",
+        );
     }
     let secret = request
         .headers()
@@ -323,9 +346,20 @@ async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: N
     };
     let route = request.uri().path();
     if route.starts_with("/sync/") || route.starts_with("/git/") {
-        let root=path.parent().and_then(Path::parent).unwrap_or(Path::new("."));
-        if let Err(e)=hub::require_server(root) { return sync::failure(e); }
-        if route.starts_with("/sync/") && hub::caller(root,&hash).is_err(){return error(StatusCode::UNAUTHORIZED,"NODE_AUTH_FAILED","Token is not bound to a paired node");}
+        let root = path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new("."));
+        if let Err(e) = hub::require_server(root) {
+            return sync::failure(e);
+        }
+        if route.starts_with("/sync/") && hub::caller(root, &hash).is_err() {
+            return error(
+                StatusCode::UNAUTHORIZED,
+                "NODE_AUTH_FAILED",
+                "Token is not bound to a paired node",
+            );
+        }
     }
     request.extensions_mut().insert(kind);
     request.extensions_mut().insert(hash);
@@ -618,7 +652,11 @@ mod tests {
     fn authentication_is_fail_closed_and_revocation_is_immediate() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("sync")).unwrap();
-        fs::write(dir.path().join("config.yaml"),"node:\n  name: server\n  role: server\n").unwrap();
+        fs::write(
+            dir.path().join("config.yaml"),
+            "node:\n  name: server\n  role: server\n",
+        )
+        .unwrap();
         let path = dir.path().join("sync/tokens.yaml");
         let node = "a".repeat(64);
         let app = router(path.clone());
@@ -628,7 +666,9 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let request = |path: &str, token: Option<&str>| {
-                let mut builder = axum::http::Request::builder().uri(path).header("x-kanban-sync-protocol","3");
+                let mut builder = axum::http::Request::builder()
+                    .uri(path)
+                    .header("x-kanban-sync-protocol", "3");
                 if let Some(token) = token {
                     builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
                 }
@@ -668,8 +708,16 @@ mod tests {
                 ),
                 ("/node", Some(node.as_str()), StatusCode::OK),
                 // A valid node token not bound to a hub client is refused for sync.
-                ("/sync/unknown", Some(node.as_str()), StatusCode::UNAUTHORIZED),
-                ("/sync/vector", Some(node.as_str()), StatusCode::UPGRADE_REQUIRED),
+                (
+                    "/sync/unknown",
+                    Some(node.as_str()),
+                    StatusCode::UNAUTHORIZED,
+                ),
+                (
+                    "/sync/vector",
+                    Some(node.as_str()),
+                    StatusCode::UPGRADE_REQUIRED,
+                ),
             ] {
                 let response = app.clone().oneshot(request(path, token)).await.unwrap();
                 assert_eq!(response.status(), expected, "{path}");
