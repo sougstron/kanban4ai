@@ -57,13 +57,13 @@ fn frontier(
     meta: &mut PruneMeta,
     acks: &BTreeMap<String, VersionVector>,
 ) -> Result<VersionVector> {
-    let me = &journal.node.node_id;
-    let mut participants = BTreeSet::new();
-    participants.extend(acks.keys().cloned());
-    for node in state.vector.keys() {
-        if node != me {
-            participants.insert(node.clone());
-        }
+    // Participants are active hub clients or the client's single server receipt.
+    // Without any receipt, foreign origins hold their history: a store that
+    // has not reached a server yet must not simplify what it never forwarded.
+    let mut participants: BTreeSet<String> = acks.keys().cloned().collect();
+    if participants.is_empty() {
+        let me = &journal.node.node_id;
+        participants.extend(state.vector.keys().filter(|node| *node != me).cloned());
     }
     let stable = if participants.is_empty() {
         state.vector.clone()

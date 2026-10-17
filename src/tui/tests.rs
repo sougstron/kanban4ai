@@ -13074,12 +13074,17 @@ fn sync_tab_app(work: &std::path::Path) -> (tempfile::TempDir, App) {
     let (store_dir, mut app) = projects_app(work, None);
     let store = ProjectStore::at(store_dir.path());
     let mut config = store.load_global_config().unwrap();
+    // Star topology: an explicit sync server, sync enabled, and the probe
+    // thresholds discovery::config validates are all positive.
     config.extras.insert(
         "sync".into(),
         serde_yaml_ng::from_str(
-            "peers:\n\
-             - {node_id: n-server, name: server, role: server, store_id: s, address: '192.168.0.20:7420'}\n\
-             - {node_id: n-phone, name: phone, role: mobile, store_id: s, dial: outbound, address: '0.0.0.0:0'}\n",
+            "enabled: true\n\
+             probe_timeout: 3\n\
+             interval: 30\n\
+             run_heartbeat: 60\n\
+             log_interval: 60\n\
+             server: {node_id: n-server, name: server, urls: ['http://192.168.0.20:7420']}\n",
         )
         .unwrap(),
     );
@@ -13101,18 +13106,9 @@ fn sync_tab_app(work: &std::path::Path) -> (tempfile::TempDir, App) {
     (store_dir, app)
 }
 
-fn peer_order(store: &ProjectStore) -> Vec<String> {
-    store.load_global_config().unwrap().extras["sync"]["peers"]
-        .as_sequence()
-        .unwrap()
-        .iter()
-        .map(|p| p["node_id"].as_str().unwrap().to_owned())
-        .collect()
-}
-
 #[test]
 fn global_settings_sync_tab_snapshot() {
-    use crate::cli::serve::settings::{Peer, View};
+    use crate::cli::serve::settings::{Peer, Server, View};
     use crate::core::sync::NodeRole;
     let (_store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-tab"));
     let modal = app.modal.as_mut().expect("global settings modal");
@@ -13120,7 +13116,7 @@ fn global_settings_sync_tab_snapshot() {
     assert_eq!(modal.active_field(), DialogField::SyncPanel);
     let loaded = modal.sync.view.as_ref().expect("loaded on first show");
     assert_eq!(loaded.name, "laptop");
-    assert_eq!(loaded.peers.len(), 2);
+    assert!(loaded.server.is_some());
     assert!(!loaded.probed);
     // Live probe results are network-bound, so the snapshot pins them.
     modal.sync.view = Some(View {
@@ -13128,30 +13124,31 @@ fn global_settings_sync_tab_snapshot() {
         role: NodeRole::Laptop,
         api_enabled: true,
         api_active: Some(true),
-        peers: vec![
-            Peer {
-                id: "n-server".into(),
-                name: "server".into(),
-                role: NodeRole::Server,
-                route: "LAN".into(),
-                code: "ONLINE".into(),
-                message: "Сервер в сети".into(),
-                exchange: Some("12:30".into()),
-                pending: 3,
-                clones: vec!["demo: ready · /srv/clones/demo · integration 1a2b3c4d".into()],
-            },
-            Peer {
-                id: "n-phone".into(),
-                name: "phone".into(),
-                role: NodeRole::Mobile,
-                route: "phone dials in".into(),
-                code: String::new(),
-                message: "Телефон: был в сети 09:15".into(),
-                exchange: None,
-                pending: 7,
-                clones: Vec::new(),
-            },
-        ],
+        server: Some(Server {
+            id: "n-server".into(),
+            name: "server".into(),
+            urls: vec!["192.168.0.20:7420".into()],
+            route: "LAN".into(),
+            code: "ONLINE".into(),
+            message: "Сервер в сети".into(),
+            exchange: Some("12:30".into()),
+            pending: 3,
+            last_seq: 41,
+            head: 41,
+        }),
+        nodes: vec![Peer {
+            id: "n-phone".into(),
+            name: "phone".into(),
+            role: NodeRole::Mobile,
+            route: "phone dials in".into(),
+            code: String::new(),
+            message: "Телефон: был в сети 09:15".into(),
+            exchange: None,
+            pending: 7,
+            clones: Vec::new(),
+            cursor: 34,
+            lag: 7,
+        }],
         conflicts: vec!["demo/task TASK-001 · title: kept «Fix login», lost «Fix auth»".into()],
         local_clones: vec!["demo: missing · /tmp/k4ai-sync-tab · integration —".into()],
         probed: true,
@@ -13178,26 +13175,28 @@ fn global_settings_sync_tab_disabled_snapshot() {
     app.handle_key(key(KeyCode::Left)).expect("sync tab");
     let rendered = render_at(&mut app, 100, 40);
     assert!(
-        rendered.contains("Sync выключен — добавьте peer (kanban serve pair / join) или relay"),
+        rendered.contains("Sync выключен — подключите sync server (kanban serve --pair)"),
         "{rendered}"
     );
     assert!(!_store_dir.path().join("sync").exists());
     insta::assert_snapshot!("global_settings_sync_disabled", rendered);
 }
 
+/// Only a server issues pairing codes in the star topology.
+fn as_server(root: &std::path::Path, app: &mut App) {
+    crate::cli::serve::settings::save_node(root, "laptop", crate::core::sync::NodeRole::Server)
+        .unwrap();
+    let sync = &mut app.modal.as_mut().unwrap().sync;
+    sync.execute(root, super::sync_tab::Request::Load);
+}
+
 #[test]
-fn global_settings_sync_tab_changes_node_and_peer_order() {
+fn global_settings_sync_tab_changes_node_name_and_pairing_code() {
     let (store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-actions"));
+    as_server(store_dir.path(), &mut app);
     app.handle_key(key(KeyCode::Enter))
         .expect("step into the sync panel");
-    let store = ProjectStore::at(store_dir.path());
     let root = store_dir.path();
-
-    // Role is a switch: Space walks laptop → server and saves at once.
-    app.handle_key(key(KeyCode::Down)).expect("role row");
-    app.handle_key(key(KeyCode::Char(' '))).expect("next role");
-    let node = crate::core::sync::Journal::open(root).unwrap().node;
-    assert_eq!(node.role, crate::core::sync::NodeRole::Server);
 
     // Enter on the name opens a one-line form; Enter saves it.
     app.handle_key(key(KeyCode::Up)).expect("name row");
@@ -13226,21 +13225,6 @@ fn global_settings_sync_tab_changes_node_and_peer_order() {
     let notice = app.modal.as_ref().unwrap().sync.notice.clone();
     assert!(matches!(notice, Some((_, true))), "{notice:?}");
 
-    // The phone's priority order: K on the second node moves it up.
-    assert_eq!(peer_order(&store), ["n-server", "n-phone"]);
-    for _ in 0..9 {
-        app.handle_key(key(KeyCode::Down)).expect("walk to phone");
-    }
-    app.handle_key(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
-        .expect("move up");
-    assert_eq!(peer_order(&store), ["n-phone", "n-server"]);
-    let view = app.modal.as_ref().unwrap().sync.view.clone().unwrap();
-    assert_eq!(view.peers[0].name, "phone");
-    // The cursor followed the node; Shift+↓ moves it back.
-    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT))
-        .expect("move down");
-    assert_eq!(peer_order(&store), ["n-server", "n-phone"]);
-
     // Pairing code: an empty address gives a bare code, Esc closes it.
     app.handle_key(key(KeyCode::End)).expect("refresh row");
     app.handle_key(key(KeyCode::Up)).expect("code row");
@@ -13268,7 +13252,6 @@ fn global_settings_sync_tab_changes_node_and_peer_order() {
         .focus_field(DialogField::Confirm);
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
     assert!(app.modal.is_none());
-    assert_eq!(peer_order(&store), ["n-server", "n-phone"]);
     assert_eq!(
         crate::core::sync::Journal::open(root).unwrap().node.name,
         "home-srv"
@@ -13276,20 +13259,21 @@ fn global_settings_sync_tab_changes_node_and_peer_order() {
 }
 
 #[test]
-fn global_settings_sync_tab_qr_needs_a_lan_address() {
+fn global_settings_sync_tab_qr_needs_a_server_address() {
     let (_store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-qr"));
+    as_server(_store_dir.path(), &mut app);
     app.handle_key(key(KeyCode::Enter))
         .expect("step into the sync panel");
     app.handle_key(key(KeyCode::End)).expect("refresh row");
     app.handle_key(key(KeyCode::Up)).expect("code row");
     app.handle_key(key(KeyCode::Enter)).expect("code form");
-    for c in "8.8.8.8:7420".chars() {
+    for c in "https://example.test/store".chars() {
         app.handle_key(key(KeyCode::Char(c))).expect("type");
     }
     app.handle_key(key(KeyCode::Enter)).expect("refused");
     let sync = &app.modal.as_ref().unwrap().sync;
     assert!(sync.pairing.is_none());
-    assert!(matches!(&sync.notice, Some((text, true)) if text.contains("LAN")));
+    assert!(matches!(&sync.notice, Some((text, true)) if text.contains("server's address")));
 
     app.handle_key(key(KeyCode::Enter)).expect("code form");
     for c in "192.168.0.10:7420".chars() {

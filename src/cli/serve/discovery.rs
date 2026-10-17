@@ -1,43 +1,58 @@
-//! LAN discovery is advisory. Only paired bearer credentials establish identity.
+//! Server discovery is advisory; bearer credentials establish identity.
 use super::*;
 use crate::core::sync::{Journal, NodeIdentity, NodeRole};
-use axum::Extension;
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Utc};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::BTreeMap;
 
 const SERVICE: &str = "_kanban4ai._tcp.local.";
 
 #[derive(clap::Args, Default)]
-#[group(id = "discovery_action", multiple = false)]
+#[group(id = "discovery_action", multiple = true)]
 pub struct DiscoveryOptions {
-    /// Discover LAN services for sync.probe_timeout seconds and print JSON.
-    #[arg(long, conflicts_with_all = ["issue_token", "pair_code", "pair", "revoke_token", "phone_qr"])]
+    /// Discover sync servers on the LAN.
+    #[arg(long)]
     discover: bool,
-    /// Probe all paired peers and print explicit availability codes as JSON.
-    #[arg(long, conflicts_with_all = ["issue_token", "pair_code", "pair", "revoke_token", "phone_qr"])]
+    /// Probe the configured sync server.
+    #[arg(long)]
     probe: bool,
-    /// Notify peers before shutdown or sleep (for systemd hooks).
-    #[arg(long, value_parser = ["shutdown", "sleep"], conflicts_with_all = ["issue_token", "pair_code", "pair", "revoke_token", "phone_qr"])]
+    /// Push the outbox and announce departure to the server.
+    #[arg(long, value_parser = ["shutdown", "sleep"])]
     bye: Option<String>,
-    /// Notify peers after resume; also sent automatically on serve startup.
-    #[arg(long, conflicts_with_all = ["issue_token", "pair_code", "pair", "revoke_token", "phone_qr"])]
+    /// Announce arrival to the server.
+    #[arg(long)]
     hello: bool,
-    /// Run one sync cycle with every paired peer and exit (serve does this
-    /// continuously on its own).
-    #[arg(long, conflicts_with_all = ["issue_token", "pair_code", "pair", "revoke_token", "phone_qr"])]
+    /// Run one push/pull cycle with the server.
+    #[arg(long)]
     sync: bool,
+    /// Explicitly delete this node's old sync/log refs from project origins.
+    #[arg(long, conflicts_with_all=["discover","probe","bye","hello","sync","pair","pair_code","revoke_token","phone_qr","issue_token"])]
+    purge_relay_refs: bool,
+    /// List refs without deleting them (with --purge-relay-refs).
+    #[arg(long, requires = "purge_relay_refs")]
+    dry_run: bool,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub(super) struct ServerConfig {
+    pub node_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub urls: Vec<String>,
+}
 #[derive(Clone, Deserialize)]
 #[serde(default)]
 pub(super) struct Config {
-    pub(super) home_networks: Vec<IpNet>,
-    pub(super) probe_timeout: u64,
-    pub(super) interval: u64,
-    pub(super) run_heartbeat: u64,
-    pub(super) max_skew: u64,
-    pub(super) peers: Vec<PeerCard>,
+    pub home_networks: Vec<IpNet>,
+    pub probe_timeout: u64,
+    pub interval: u64,
+    pub run_heartbeat: u64,
+    pub max_skew: u64,
+    pub server: Option<ServerConfig>,
+    // One resolved server identity; addresses remain ordered in server.urls.
+    #[serde(skip)]
+    pub target: Option<ServerCard>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -47,69 +62,49 @@ impl Default for Config {
             interval: 30,
             run_heartbeat: 60,
             max_skew: 300,
-            peers: Vec::new(),
+            server: None,
+            target: None,
         }
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
-pub(super) struct PeerCard {
-    #[serde(flatten)]
-    pub(super) node: NodeIdentity,
-    pub(super) address: SocketAddr,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) tailscale_address: Option<String>,
+#[derive(Clone)]
+pub(super) struct ServerCard {
+    pub node: NodeIdentity,
 }
-#[derive(Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub(super) struct Credential {
-    pub(super) node_id: String,
-    pub(super) token: String,
-    inbound_sha256: String,
+    pub node_id: String,
+    pub token: String,
     #[serde(default)]
-    address: Option<SocketAddr>,
-    #[serde(default)]
-    addresses: Vec<SocketAddr>,
-    #[serde(default)]
-    tailscale_address: Option<String>,
+    pub urls: Vec<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Bye {
-    pub(super) reason: String,
-    pub(super) at: DateTime<Utc>,
+    pub reason: String,
+    pub at: DateTime<Utc>,
 }
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub(super) struct Presence {
-    #[serde(default)]
-    pub(super) last_seen: Option<DateTime<Utc>>,
-    #[serde(default)]
-    pub(super) bye: Option<Bye>,
+    pub last_seen: Option<DateTime<Utc>>,
+    pub bye: Option<Bye>,
     #[serde(default)]
     discovered: Vec<SocketAddr>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Status {
-    pub(super) node: String,
-    status: &'static str,
-    pub(super) code: &'static str,
-    pub(super) path: &'static str,
-    pub(super) message: String,
-    pub(super) since: Option<DateTime<Utc>>,
-    pub(super) last_seen: Option<DateTime<Utc>>,
-}
-#[derive(Serialize, Deserialize)]
-struct Version {
-    proto: u32,
-    min_proto: u32,
-}
-#[derive(Serialize, Deserialize)]
-struct NodeCard {
-    #[serde(flatten)]
-    node: NodeIdentity,
-    app_version: String,
-    proto: u32,
-    min_proto: u32,
-    hlc: crate::core::sync::Hlc,
-    started_at: DateTime<Utc>,
-    wol: Option<serde_json::Value>,
+    pub node: String,
+    pub name: String,
+    pub role: NodeRole,
+    pub status: String,
+    pub code: String,
+    pub path: String,
+    pub message: String,
+    pub since: Option<DateTime<Utc>>,
+    pub last_seen: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub cursor: u64,
+    #[serde(default)]
+    pub lag: u64,
 }
 
 pub(super) fn load<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Result<T> {
@@ -119,9 +114,13 @@ pub(super) fn load<T: serde::de::DeserializeOwned + Default>(path: &Path) -> Res
         Err(e) => Err(e.into()),
     }
 }
+pub(super) fn server_credential(root: &Path) -> Result<Option<Credential>> {
+    let secret: Credential = load(&root.join("sync/server.yaml"))?;
+    Ok((!secret.node_id.is_empty()).then_some(secret))
+}
 pub(super) fn config(root: &Path) -> Result<Config> {
     let global = ProjectStore::at(root).load_global_config()?;
-    let config: Config = global
+    let mut config: Config = global
         .extras
         .get("sync")
         .cloned()
@@ -133,7 +132,43 @@ pub(super) fn config(root: &Path) -> Result<Config> {
             "sync.probe_timeout, sync.interval and sync.run_heartbeat must be positive",
         ));
     }
+    if let Some(server) = &config.server {
+        if !server.node_id.is_empty() {
+            let mut node = Journal::open(root)?.node;
+            node.node_id = server.node_id.clone();
+            node.name = server.name.clone();
+            node.role = NodeRole::Server;
+            node.dial = crate::core::sync::NodeDial::Inbound;
+            config.target = Some(ServerCard { node });
+        }
+    }
     Ok(config)
+}
+pub(super) fn base_url(address: &str) -> Result<reqwest::Url> {
+    let text = if address.contains("://") {
+        address.to_owned()
+    } else {
+        format!("http://{address}")
+    };
+    let mut url =
+        reqwest::Url::parse(&text).map_err(|_| invalid("Expected http(s) URL or host:port"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
+    {
+        return Err(invalid(
+            "Expected http(s) server origin without credentials, query or path",
+        ));
+    }
+    url.set_path("");
+    Ok(url)
+}
+pub(super) fn base(address: &str) -> String {
+    address.trim_end_matches('/').to_string()
 }
 pub(super) fn update_presence(
     root: &Path,
@@ -147,186 +182,52 @@ pub(super) fn update_presence(
     atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&state)?)
 }
 pub(super) fn in_lan(config: &Config) -> Result<bool> {
-    Ok(if_addrs::get_if_addrs()?.iter().any(|i| {
-        let ip = i.ip();
-        !ip.is_loopback() && allowed(ip, &config.home_networks)
-    }))
+    Ok(if_addrs::get_if_addrs()?
+        .iter()
+        .any(|i| !i.ip().is_loopback() && allowed(i.ip(), &config.home_networks)))
 }
-pub(super) fn network_available(root: &Path, config: &Config) -> Result<bool> {
-    Ok(in_lan(config)?
-        || !matches!(
-            crate::core::net::settings(root)?.mode,
-            crate::core::net::Mode::Off
-        ))
+pub(super) fn network_available(_root: &Path, _config: &Config) -> Result<bool> {
+    Ok(true)
 }
-
-fn tailnet_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => u32::from(ip) & 0xffc0_0000 == 0x6440_0000,
-        IpAddr::V6(ip) => ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
-    }
-}
-
-pub(super) fn peer_addresses(
+pub(super) fn server_addresses(
     root: &Path,
-    peer: &PeerCard,
+    peer: &ServerCard,
     secret: Option<&Credential>,
     presence: &Presence,
     config: &Config,
 ) -> Result<Vec<String>> {
-    if peer.node.outbound_only() {
+    let Some(server) = &config.server else {
         return Ok(Vec::new());
+    };
+    if server.node_id != peer.node.node_id {
+        return Err(invalid("SYNC_NOT_A_SERVER"));
     }
-    let mut result = presence.discovered.clone();
-    if let Some(secret) = secret {
-        result.extend(secret.address);
-        result.extend(&secret.addresses);
-    }
-    result.push(peer.address);
-    let enabled = !matches!(
-        crate::core::net::settings(root)?.mode,
-        crate::core::net::Mode::Off
-    );
-    result.retain(|a| {
-        a.port() != 0
-            && if tailnet_ip(a.ip()) {
-                enabled
-            } else {
-                allowed(a.ip(), &config.home_networks)
-            }
-    });
-    // Stable partition: every direct LAN route is tried before the tailnet.
-    result.sort_by_key(|a| tailnet_ip(a.ip()));
-    let mut seen = BTreeSet::new();
-    let mut result: Vec<String> = result
-        .into_iter()
-        .filter(|a| seen.insert(*a))
-        .map(|a| a.to_string())
+    let mut urls: Vec<String> = presence
+        .discovered
+        .iter()
+        .filter(|a| allowed(a.ip(), &config.home_networks))
+        .map(|a| format!("http://{a}"))
         .collect();
-    if enabled {
-        for address in secret
-            .and_then(|s| s.tailscale_address.as_ref())
-            .into_iter()
-            .chain(peer.tailscale_address.as_ref())
-        {
-            let url = reqwest::Url::parse(&format!("http://{address}"))
-                .map_err(|_| invalid("Invalid tailscale_address: expected host:port"))?;
-            if !address
-                .rsplit_once(':')
-                .is_some_and(|(_, port)| port.parse::<u16>().is_ok_and(|port| port != 0))
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.path() != "/"
-                || url.query().is_some()
-                || url.fragment().is_some()
-                || !crate::core::net::is_tailnet_address(address)
-            {
-                return Err(invalid(
-                    "Invalid tailscale_address: expected tailnet host:port",
-                ));
-            }
-            if !result.contains(address) {
-                result.push(address.clone());
-            }
+    urls.extend(server.urls.clone());
+    if let Some(secret) = secret {
+        urls.extend(secret.urls.clone());
+    }
+    let enabled = crate::core::net::settings(root)?.mode != crate::core::net::Mode::Off;
+    let mut seen = BTreeSet::new();
+    let mut result = Vec::new();
+    for text in urls {
+        let url = base_url(&text)?;
+        if crate::core::net::is_tailnet_address(url.host_str().unwrap_or_default()) && !enabled {
+            continue;
+        }
+        let text = base(url.as_str());
+        if seen.insert(text.clone()) {
+            result.push(text);
         }
     }
     Ok(result)
 }
-fn display_node(node: &NodeIdentity) -> &'static str {
-    match node.role {
-        NodeRole::Server => "Сервер",
-        NodeRole::Laptop => "Ноут",
-        NodeRole::Mobile => "Телефон",
-    }
-}
-fn time_text(at: DateTime<Utc>) -> String {
-    let at = at.with_timezone(&Local);
-    if at.date_naive() == Local::now().date_naive() {
-        at.format("%H:%M").to_string()
-    } else {
-        at.format("%d.%m %H:%M").to_string()
-    }
-}
-fn status(
-    peer: &PeerCard,
-    presence: &Presence,
-    code: &'static str,
-    version: Option<&Version>,
-) -> Status {
-    let node = display_node(&peer.node);
-    let since = presence.bye.as_ref().map(|bye| bye.at);
-    let message = match code {
-        "ONLINE" => format!("{node} в сети"),
-        "OFFLINE" => presence.last_seen.map_or_else(
-            || format!("{node}: ещё не был в сети"),
-            |at| format!("{node}: не в сети с {}", time_text(at)),
-        ),
-        "NODE_OUT_OF_LAN" => format!(
-            "Вы вне домашней сети — {node} недоступен. Изменения сохранятся и уйдут при возвращении"
-        ),
-        "NODE_POWERED_OFF" => {
-            let bye = presence.bye.as_ref().expect("powered off requires bye");
-            let verb = if bye.reason == "sleep" {
-                "спит"
-            } else {
-                "выключен"
-            };
-            format!("{node} {verb} с {}", time_text(bye.at))
-        }
-        "NODE_UNREACHABLE" => {
-            let contact = presence
-                .last_seen
-                .map(|at| {
-                    format!(
-                        "{} ({} мин назад)",
-                        time_text(at),
-                        (Utc::now() - at).num_minutes().max(0)
-                    )
-                })
-                .unwrap_or_else(|| "ещё не было".into());
-            format!("{node} не отвечает. Последний контакт: {contact}")
-        }
-        "NODE_SERVICE_DOWN" => format!("{node} включён, но kanban4ai на нём не запущен"),
-        "NODE_AUTH_FAILED" => {
-            format!("{node} не принимает этот узел: сопряжение отозвано или не выполнено")
-        }
-        "NODE_VERSION_MISMATCH" => {
-            let remote = version.map(|v| v.proto).unwrap_or(0);
-            let older = if remote < PROTO {
-                node
-            } else {
-                "этот узел"
-            };
-            format!(
-                "На {node} несовместимая версия kanban4ai ({remote}, здесь {PROTO}). Обновите {older}"
-            )
-        }
-        "SYNC_STORE_MISMATCH" => {
-            format!("На {node} другая база kanban4ai. Выберите, какую оставить")
-        }
-        "SYNC_CLOCK_SKEW" => format!(
-            "Часы на {node} расходятся с этим узлом. Синхронизация приостановлена — включите NTP"
-        ),
-        _ => unreachable!(),
-    };
-    Status {
-        node: peer.node.node_id.clone(),
-        status: if code == "ONLINE" {
-            "online"
-        } else {
-            "offline"
-        },
-        code,
-        path: if code == "ONLINE" { "direct" } else { "none" },
-        message,
-        since,
-        last_seen: presence.last_seen,
-    }
-}
-fn compatible(version: &Version) -> bool {
-    version.proto >= MIN_PROTO && version.min_proto <= PROTO && version.min_proto <= version.proto
-}
-pub(super) fn peer_client(
+pub(super) fn server_client(
     root: &Path,
     address: &str,
     connect: Duration,
@@ -336,7 +237,10 @@ pub(super) fn peer_client(
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(connect);
-    if let Some(proxy) = crate::core::net::proxy_for(root, address)? {
+    let url = base_url(address)?;
+    let host = url.host_str().unwrap_or_default();
+    let authority = format!("{host}:{}", url.port_or_known_default().unwrap_or(7420));
+    if let Some(proxy) = crate::core::net::proxy_for(root, &authority)? {
         builder = builder.proxy(reqwest::Proxy::all(proxy).map_err(|e| invalid(e.to_string()))?);
     }
     if let Some(timeout) = timeout {
@@ -344,474 +248,124 @@ pub(super) fn peer_client(
     }
     builder.build().map_err(|e| invalid(e.to_string()))
 }
-async fn probe_peer(
-    root: &Path,
-    config: &Config,
-    peer: &PeerCard,
-    secret: Option<&Credential>,
-    presence: &Presence,
-    lan: bool,
-) -> Result<Status> {
-    if peer.node.outbound_only() {
-        let online = presence.bye.is_none()
-            && presence.last_seen.is_some_and(|seen| {
+pub(super) async fn runner_online(root: &Path, peer: &ServerCard) -> Result<bool> {
+    let config = config(root)?;
+    if !config
+        .target
+        .iter()
+        .any(|p| p.node.node_id == peer.node.node_id)
+    {
+        return Ok(false);
+    }
+    let states: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
+    Ok(states.get(&peer.node.node_id).is_some_and(|p| {
+        p.bye.is_none()
+            && p.last_seen.is_some_and(|seen| {
                 (Utc::now() - seen).num_seconds() < config.interval.saturating_mul(3) as i64
-            });
-        return Ok(status(
-            peer,
-            presence,
-            if online { "ONLINE" } else { "OFFLINE" },
-            None,
-        ));
-    }
-    if !lan
-        && matches!(
-            crate::core::net::settings(root)?.mode,
-            crate::core::net::Mode::Off
-        )
-    {
-        return Ok(status(peer, presence, "NODE_OUT_OF_LAN", None));
-    }
-    if presence
-        .bye
-        .as_ref()
-        .is_some_and(|bye| presence.last_seen.is_none_or(|seen| seen <= bye.at))
-    {
-        return Ok(status(peer, presence, "NODE_POWERED_OFF", None));
-    }
-    let local = Journal::open(root)?.node;
-    let mut code = "NODE_UNREACHABLE";
-    let mut remote_version = None;
-    for address in peer_addresses(root, peer, secret, presence, config)? {
-        let http = match peer_client(
-            root,
-            &address,
-            Duration::from_secs(config.probe_timeout),
-            Some(Duration::from_secs(config.probe_timeout)),
-        ) {
-            Ok(http) => http,
-            Err(e) => return Err(e),
-        };
-        // Never bypass managed SOCKS with a direct TCP preflight.
-        if let Ok(socket) = address.parse::<SocketAddr>()
-            && crate::core::net::proxy_for(root, &address)?.is_none()
-        {
-            match tokio::time::timeout(
-                Duration::from_secs(config.probe_timeout),
-                tokio::net::TcpStream::connect(socket),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => drop(stream),
-                Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                    if code == "NODE_UNREACHABLE" {
-                        code = "NODE_SERVICE_DOWN";
-                    }
-                    continue;
-                }
-                _ => continue,
-            }
-        }
-        let base = format!("http://{address}");
-        let Ok(reply) = http.get(format!("{base}/version")).send().await else {
-            continue;
-        };
-        let Ok(version) = reply.json::<Version>().await else {
-            continue;
-        };
-        if !compatible(&version) {
-            code = "NODE_VERSION_MISMATCH";
-            remote_version = Some(version);
-            continue;
-        }
-        let Some(secret) = secret else {
-            code = "NODE_AUTH_FAILED";
-            continue;
-        };
-        let Ok(reply) = http
-            .get(format!("{base}/node"))
-            .bearer_auth(&secret.token)
-            .send()
-            .await
-        else {
-            continue;
-        };
-        if reply.status() == StatusCode::UNAUTHORIZED || reply.status() == StatusCode::FORBIDDEN {
-            code = "NODE_AUTH_FAILED";
-            continue;
-        }
-        if !reply.status().is_success() {
-            continue;
-        }
-        let Ok(card) = reply.json::<NodeCard>().await else {
-            continue;
-        };
-        if card.node.node_id != peer.node.node_id {
-            code = "NODE_AUTH_FAILED";
-            continue;
-        }
-        let now = Utc::now();
-        update_presence(root, &peer.node.node_id, |p| {
-            p.last_seen = Some(now);
-            p.bye = None;
-        })?;
-        let mut contacted = presence.clone();
-        contacted.last_seen = Some(now);
-        contacted.bye = None;
-        if card.node.store_id != local.store_id {
-            return Ok(status(peer, &contacted, "SYNC_STORE_MISMATCH", None));
-        }
-        if now.timestamp_millis().abs_diff(card.hlc.0 as i64) > config.max_skew.saturating_mul(1000)
-        {
-            return Ok(status(peer, &contacted, "SYNC_CLOCK_SKEW", None));
-        }
-        return Ok(status(peer, &contacted, "ONLINE", None));
-    }
-    Ok(status(peer, presence, code, remote_version.as_ref()))
-}
-
-pub(super) async fn runner_online(root: &Path, peer: &PeerCard) -> Result<bool> {
-    let config = config(root)?;
-    let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
-    let presence: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
-    Ok(probe_peer(
-        root,
-        &config,
-        peer,
-        credentials.iter().find(|c| c.node_id == peer.node.node_id),
-        presence
-            .get(&peer.node.node_id)
-            .unwrap_or(&Presence::default()),
-        in_lan(&config)?,
-    )
-    .await?
-    .code
-        == "ONLINE"
-        || crate::core::sync::relay::available(
-            root,
-            &peer.node.node_id,
-            Utc::now().timestamp_millis().max(0) as u64,
-        )?)
-}
-
-pub(super) async fn probes(root: &Path) -> Result<Vec<Status>> {
-    let config = config(root)?;
-    let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
-    let presence: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
-    let lan = in_lan(&config)?;
-    let mut statuses = Vec::with_capacity(config.peers.len());
-    for peer in &config.peers {
-        let mut result = probe_peer(
-            root,
-            &config,
-            peer,
-            credentials.iter().find(|c| c.node_id == peer.node.node_id),
-            presence
-                .get(&peer.node.node_id)
-                .unwrap_or(&Presence::default()),
-            lan,
-        )
-        .await?;
-        if result.code != "ONLINE"
-            && matches!(
-                result.code,
-                "OFFLINE"
-                    | "NODE_OUT_OF_LAN"
-                    | "NODE_POWERED_OFF"
-                    | "NODE_UNREACHABLE"
-                    | "NODE_SERVICE_DOWN"
-            )
-            && crate::core::sync::relay::available(
-                root,
-                &peer.node.node_id,
-                Utc::now().timestamp_millis().max(0) as u64,
-            )?
-        {
-            result.status = "online";
-            result.code = "ONLINE";
-            result.path = "relay";
-            result.message = format!("{} в сети через git-relay", display_node(&peer.node));
-        }
-        if matches!(
-            result.code,
-            "ONLINE" | "OFFLINE" | "NODE_POWERED_OFF" | "NODE_UNREACHABLE" | "NODE_SERVICE_DOWN"
-        ) {
-            let root = root.to_path_buf();
-            let node = peer.node.node_id.clone();
-            let online = result.code == "ONLINE";
-            let bye = presence.get(&node).and_then(|p| p.bye.clone());
-            let timeout = config
-                .interval
-                .max(config.run_heartbeat)
-                .saturating_mul(3)
-                .min(i64::MAX as u64) as i64;
-            tokio::task::spawn_blocking(move || {
-                crate::core::runner_failure::observe(
-                    &root,
-                    &node,
-                    online,
-                    bye.as_ref().map(|b| (b.at, b.reason.as_str())),
-                    timeout,
-                )
             })
-            .await
-            .map_err(|e| invalid(e.to_string()))??;
-        }
-        statuses.push(result);
+    }))
+}
+pub(super) async fn probes(root: &Path) -> Result<Vec<Status>> {
+    if Journal::open(root)?.node.role == NodeRole::Server {
+        return super::hub::node_statuses(root);
+    }
+    let config = config(root)?;
+    let Some(peer) = config.target.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let result = super::sync::server_nodes(root).await;
+    let (online, mut statuses, message) = match result {
+        Ok(nodes) => (true, nodes, String::new()),
+        Err(e) => (false, Vec::new(), e.to_string()),
+    };
+    if !online {
+        let states: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
+        let state = states.get(&peer.node.node_id).cloned().unwrap_or_default();
+        statuses.push(Status {
+            node: peer.node.node_id.clone(),
+            name: peer.node.name.clone(),
+            role: NodeRole::Server,
+            status: "offline".into(),
+            code: "NODE_UNREACHABLE".into(),
+            path: "none".into(),
+            message,
+            since: None,
+            last_seen: state.last_seen,
+            cursor: 0,
+            lag: 0,
+        });
     }
     Ok(statuses)
 }
-
-#[derive(Clone)]
-struct HttpState {
-    root: PathBuf,
-    started_at: DateTime<Utc>,
+pub(super) fn known_nodes(root: &Path) -> Result<Vec<NodeIdentity>> {
+    let local = Journal::open(root)?.node;
+    let statuses = if local.role == NodeRole::Server {
+        super::hub::node_statuses(root)?
+    } else {
+        fs::read_to_string(root.join("sync/nodes.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    };
+    let mut nodes: Vec<_> = statuses
+        .into_iter()
+        .map(|s: Status| {
+            let mut node = local.clone();
+            node.node_id = s.node;
+            node.name = s.name;
+            node.role = s.role;
+            node
+        })
+        .collect();
+    if let Some(server) = config(root)?.target {
+        if !nodes.iter().any(|n| n.node_id == server.node.node_id) {
+            nodes.push(server.node);
+        }
+    }
+    Ok(nodes)
 }
 pub(super) fn routes(root: PathBuf) -> Router {
     Router::new()
         .route("/node", get(node))
         .route("/nodes", get(nodes))
-        .route("/sync/bye", axum::routing::post(bye))
-        .route("/sync/hello", axum::routing::post(hello))
-        .with_state(HttpState {
-            root,
-            started_at: Utc::now(),
-        })
+        .with_state(root)
 }
-pub(super) fn caller(root: &Path, hash: &str) -> Result<String> {
-    let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
-    credentials
-        .into_iter()
-        .find(|c| c.inbound_sha256.as_bytes().ct_eq(hash.as_bytes()).into())
-        .map(|c| c.node_id)
-        .ok_or_else(|| invalid("NODE_AUTH_FAILED"))
-}
-async fn node(State(state): State<HttpState>, Extension(hash): Extension<String>) -> Response {
-    let result = (|| -> Result<NodeCard> {
-        let journal = Journal::open(&state.root)?;
-        // A paired request is a fresh contact.
-        if let Ok(id) = caller(&state.root, &hash) {
-            update_presence(&state.root, &id, |p| {
-                p.last_seen = Some(Utc::now());
-                p.bye = None;
-            })?;
-        }
-        let global = ProjectStore::at(&state.root).load_global_config()?;
-        let wol = if journal.node.role == NodeRole::Server {
-            global
-                .extras
-                .get("node")
-                .and_then(|n| n.get("wol"))
-                .map(serde_json::to_value)
-                .transpose()
-                .map_err(|e| invalid(e.to_string()))?
-        } else {
-            None
-        };
-        let mut hlc: crate::core::sync::Hlc = load(&state.root.join("sync/hlc"))?;
-        hlc.0 = hlc.0.max(Utc::now().timestamp_millis() as u64);
-        hlc.2 = journal.node.node_id.clone();
-        Ok(NodeCard {
-            node: journal.node,
-            app_version: env!("CARGO_PKG_VERSION").into(),
-            proto: PROTO,
-            min_proto: MIN_PROTO,
-            hlc,
-            started_at: state.started_at,
-            wol,
-        })
-    })();
-    match result {
-        Ok(card) => Json(card).into_response(),
-        Err(e) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        ),
+async fn node(State(root): State<PathBuf>) -> Response {
+    match Journal::open(&root) {
+        Ok(journal) if journal.node.role == NodeRole::Server => Json(json!({
+            "node_id":journal.node.node_id,"name":journal.node.name,"role":journal.node.role,
+            "store_id":journal.node.store_id,"proto":PROTO,"min_proto":MIN_PROTO,
+            "hlc":[Utc::now().timestamp_millis(),0,journal.node.node_id]
+        }))
+        .into_response(),
+        Ok(_) => super::hub::not_server(),
+        Err(e) => super::sync::failure(e),
     }
 }
-async fn nodes(State(state): State<HttpState>) -> Response {
-    match probes(&state.root).await {
-        Ok(statuses) => Json(statuses).into_response(),
-        Err(e) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        ),
-    }
-}
-async fn bye(
-    State(state): State<HttpState>,
-    Extension(hash): Extension<String>,
-    Json(bye): Json<Bye>,
-) -> Response {
-    if !matches!(bye.reason.as_str(), "sleep" | "shutdown") {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "INVALID_REQUEST",
-            "reason must be shutdown or sleep",
-        );
-    }
-    let id = match caller(&state.root, &hash) {
-        Ok(id) => id,
-        Err(_) => {
-            return error(
-                StatusCode::UNAUTHORIZED,
-                "NODE_AUTH_FAILED",
-                "Only paired nodes can announce departure",
-            );
-        }
-    };
-    match update_presence(&state.root, &id, |p| {
-        if p.last_seen.is_none_or(|seen| seen <= bye.at) {
-            p.last_seen = Some(bye.at);
-            p.bye = Some(bye);
-        }
-    }) {
-        Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(e) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        ),
-    }
-}
-async fn hello(State(state): State<HttpState>, Extension(hash): Extension<String>) -> Response {
-    let id = match caller(&state.root, &hash) {
-        Ok(id) => id,
-        Err(_) => {
-            return error(
-                StatusCode::UNAUTHORIZED,
-                "NODE_AUTH_FAILED",
-                "Only paired nodes can announce arrival",
-            );
-        }
-    };
-    match update_presence(&state.root, &id, |p| {
-        p.last_seen = Some(Utc::now());
-        p.bye = None;
-    }) {
-        Ok(()) => {
-            // The peer is back: catch up now instead of at the next interval.
-            super::sync::kick();
-            Json(json!({"ok": true})).into_response()
-        }
-        Err(e) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "INTERNAL_ERROR",
-            &e.to_string(),
-        ),
+async fn nodes(State(root): State<PathBuf>) -> Response {
+    match probes(&root).await {
+        Ok(nodes) => Json(nodes).into_response(),
+        Err(e) => super::sync::failure(e),
     }
 }
 pub(super) async fn notify(root: &Path, reason: Option<&str>) -> Result<()> {
-    let config = config(root)?;
-    if reason.is_some() {
-        let checkpoint_root = root.to_path_buf();
-        let interval = config.run_heartbeat;
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            crate::core::wip::publish(&checkpoint_root, interval, true)
-        })
-        .await
-        .map_err(|e| invalid(e.to_string()))?
-        {
-            eprintln!("WIP before bye: {e}");
-        }
-    }
-    if !network_available(root, &config)? {
+    if Journal::open(root)?.node.role == NodeRole::Server {
         return Ok(());
     }
-    if reason.is_some() {
-        // Push the journal tail first; an unreachable peer must not block sleep.
-        for (peer, result) in super::sync::once(root, false).await? {
-            if let Err(e) = result {
-                eprintln!("sync {peer} before bye: {e}");
-            }
-        }
-    }
-    let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
-    let presence: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
-    let mut failed = Vec::new();
-    for peer in &config.peers {
-        if peer.node.outbound_only() {
-            continue;
-        }
-        let Some(secret) = credentials.iter().find(|s| s.node_id == peer.node.node_id) else {
-            failed.push(peer.node.name.clone());
-            continue;
-        };
-        let mut sent = false;
-        for address in peer_addresses(
-            root,
-            peer,
-            Some(secret),
-            presence
-                .get(&peer.node.node_id)
-                .unwrap_or(&Presence::default()),
-            &config,
-        )? {
-            let http = peer_client(
-                root,
-                &address,
-                Duration::from_secs(config.probe_timeout),
-                Some(Duration::from_secs(config.probe_timeout)),
-            )?;
-            let path = if reason.is_some() { "bye" } else { "hello" };
-            let request = http
-                .post(format!("http://{address}/sync/{path}"))
-                .bearer_auth(&secret.token);
-            let request = if let Some(reason) = reason {
-                request.json(&Bye {
-                    reason: reason.into(),
-                    at: Utc::now(),
-                })
-            } else {
-                request
-            };
-            if request.send().await.is_ok_and(|r| r.status().is_success()) {
-                sent = true;
-                if reason.is_none() {
-                    update_presence(root, &peer.node.node_id, |p| {
-                        p.last_seen = Some(Utc::now());
-                        p.bye = None;
-                    })?;
-                }
-                break;
-            }
-        }
-        if !sent {
-            failed.push(peer.node.name.clone());
-        }
-    }
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(invalid(format!(
-            "Cannot notify peers: {}",
-            failed.join(", ")
-        )))
-    }
+    super::sync::notify_server(root, reason).await
 }
-
 async fn rediscovered(root: &Path, discovered: Discovered) -> Result<()> {
     let config = config(root)?;
-    let Some(peer) = config
-        .peers
-        .iter()
-        .find(|p| p.node.node_id == discovered.node_id)
-    else {
+    if config
+        .server
+        .as_ref()
+        .is_none_or(|s| s.node_id != discovered.node_id)
+    {
         return Ok(());
-    };
+    }
     update_presence(root, &discovered.node_id, |p| {
         p.discovered = discovered.addresses
     })?;
-    let state: BTreeMap<String, Presence> = load(&root.join("sync/presence.yaml"))?;
-    let mut presence = state.get(&discovered.node_id).cloned().unwrap_or_default();
-    // A fresh announcement may follow a missed hello. Do not clear the durable
-    // bye on mDNS alone: only a successful authenticated /node clears it.
-    presence.bye = None;
-    let credentials: Vec<Credential> = load(&root.join("sync/peers.yaml"))?;
-    let secret = credentials.iter().find(|c| c.node_id == discovered.node_id);
-    probe_peer(root, &config, peer, secret, &presence, in_lan(&config)?).await?;
     super::sync::kick();
     Ok(())
 }
@@ -836,7 +390,7 @@ fn resolved(info: &ServiceInfo, networks: &[IpNet]) -> Option<Discovered> {
         .map(|ip| SocketAddr::new(*ip, info.get_port()))
         .collect();
     addresses.sort();
-    if addresses.is_empty() || info.get_port() == 0 {
+    if role != "server" || addresses.is_empty() || info.get_port() == 0 {
         return None;
     }
     Some(Discovered {
@@ -931,9 +485,9 @@ pub(super) async fn start(root: &Path, networks: &[IpNet], port: u16) -> Result<
             ("node_id", node.node_id.as_str()),
             ("name", node.name.as_str()),
             ("role", role),
-            ("proto", "1"),
+            ("proto", "3"),
         ];
-        if !ips.is_empty() {
+        if node.role == NodeRole::Server && !ips.is_empty() {
             let info = ServiceInfo::new(
                 SERVICE,
                 &node.node_id,
@@ -950,7 +504,7 @@ pub(super) async fn start(root: &Path, networks: &[IpNet], port: u16) -> Result<
     let (daemon, receiver) = match mdns {
         Ok((d, r)) => (Some(d), Some(r)),
         Err(e) => {
-            eprintln!("mDNS unavailable; using static peers: {e}");
+            eprintln!("mDNS unavailable; using static server: {e}");
             (None, None)
         }
     };
@@ -978,6 +532,10 @@ pub(super) async fn start(root: &Path, networks: &[IpNet], port: u16) -> Result<
     Ok(Running { daemon, worker })
 }
 pub(super) fn run(store: &ProjectStore, options: DiscoveryOptions) -> Result<bool> {
+    if options.purge_relay_refs {
+        purge_relay_refs(store, options.dry_run)?;
+        return Ok(true);
+    }
     if !options.discover
         && !options.probe
         && options.bye.is_none()
@@ -1024,303 +582,67 @@ pub(super) fn run(store: &ProjectStore, options: DiscoveryOptions) -> Result<boo
     Ok(true)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::{Body, to_bytes};
-    use tower::ServiceExt;
-
-    fn runtime() -> tokio::runtime::Runtime {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-    }
-    fn peer(root: &Path, address: SocketAddr) -> PeerCard {
-        let mut node = Journal::open(root).unwrap().node;
-        node.node_id = "remote".into();
-        node.name = "server".into();
-        node.role = NodeRole::Server;
-        PeerCard {
-            node,
-            address,
-            tailscale_address: None,
+fn purge_relay_refs(store: &ProjectStore, dry_run: bool) -> Result<()> {
+    let node = Journal::open(store.root())?.node.node_id;
+    for project in store.list()? {
+        let work = &project.work_path;
+        if !work.is_dir() {
+            continue;
+        }
+        let origin = std::process::Command::new("git")
+            .arg("-C")
+            .arg(work)
+            .args(["remote", "get-url", "origin"])
+            .output()?;
+        if !origin.status.success() {
+            println!("{} has no origin; skipped", project.id);
+            continue;
+        }
+        let mut list = std::process::Command::new("git");
+        let output = list
+            .arg("-C")
+            .arg(work)
+            .args([
+                "ls-remote",
+                "--refs",
+                "origin",
+                &format!("refs/kanban/sync/{node}"),
+                &format!("refs/kanban/logs/{node}/*"),
+            ])
+            .output()?;
+        if !output.status.success() {
+            return Err(invalid(format!(
+                "{}: {}",
+                project.id,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        let refs: Vec<_> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|l| l.split_whitespace().nth(1))
+            .map(str::to_owned)
+            .collect();
+        if refs.is_empty() {
+            continue;
+        }
+        for name in &refs {
+            println!(
+                "{} origin {} {name}",
+                project.id,
+                if dry_run { "would delete" } else { "deleting" }
+            );
+        }
+        if !dry_run {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(work)
+                .args(["push", "origin", "--delete"])
+                .args(&refs)
+                .output()?;
+            if !output.status.success() {
+                return Err(invalid(String::from_utf8_lossy(&output.stderr).to_string()));
+            }
         }
     }
-    #[test]
-    fn tailnet_candidates_follow_lan_and_off_keeps_legacy_cards() {
-        let root = tempfile::tempdir().unwrap();
-        let mut remote = peer(root.path(), "100.80.1.2:4242".parse().unwrap());
-        remote.tailscale_address = Some("runner.example.ts.net:4242".into());
-        let presence = Presence {
-            discovered: vec![
-                "100.80.1.3:4242".parse().unwrap(),
-                "192.168.1.3:4242".parse().unwrap(),
-            ],
-            ..Presence::default()
-        };
-        assert_eq!(
-            peer_addresses(root.path(), &remote, None, &presence, &Config::default()).unwrap(),
-            vec!["192.168.1.3:4242"]
-        );
-        fs::write(
-            root.path().join("config.yaml"),
-            "net:\n  tailscale:\n    mode: system\n",
-        )
-        .unwrap();
-        assert_eq!(
-            peer_addresses(root.path(), &remote, None, &presence, &Config::default()).unwrap(),
-            vec![
-                "192.168.1.3:4242",
-                "100.80.1.3:4242",
-                "100.80.1.2:4242",
-                "runner.example.ts.net:4242"
-            ]
-        );
-        remote.tailscale_address = Some("public.example.com:4242".into());
-        assert!(peer_addresses(root.path(), &remote, None, &presence, &Config::default()).is_err());
-    }
-
-    #[test]
-    fn mobile_departure_and_stale_contact_are_neutral_even_outside_lan() {
-        runtime().block_on(async {
-            let root = tempfile::tempdir().unwrap();
-            let mut mobile = peer(root.path(), "127.0.0.1:1".parse().unwrap());
-            mobile.node.role = NodeRole::Mobile;
-            let config = Config::default();
-            let now = Utc::now();
-            for presence in [
-                Presence::default(),
-                Presence {
-                    last_seen: Some(now - chrono::Duration::seconds(91)),
-                    ..Default::default()
-                },
-                Presence {
-                    last_seen: Some(now),
-                    bye: Some(Bye {
-                        reason: "shutdown".into(),
-                        at: now,
-                    }),
-                    ..Default::default()
-                },
-            ] {
-                let result = probe_peer(root.path(), &config, &mobile, None, &presence, false)
-                    .await
-                    .unwrap();
-                assert_eq!(result.code, "OFFLINE");
-                assert_eq!(result.status, "offline");
-                assert!(!result.message.contains("не отвечает"));
-            }
-            let presence = Presence {
-                last_seen: Some(now),
-                ..Default::default()
-            };
-            let result = probe_peer(root.path(), &config, &mobile, None, &presence, true)
-                .await
-                .unwrap();
-            assert_eq!(result.code, "ONLINE");
-            assert!(
-                peer_addresses(root.path(), &mobile, None, &presence, &config)
-                    .unwrap()
-                    .is_empty()
-            );
-        });
-    }
-
-    #[test]
-    fn out_of_lan_precedes_departure_and_departure_precedes_network() {
-        runtime().block_on(async {
-            let root = tempfile::tempdir().unwrap();
-            let peer = peer(root.path(), "127.0.0.1:1".parse().unwrap());
-            let now = Utc::now();
-            let presence = Presence {
-                last_seen: Some(now),
-                bye: Some(Bye {
-                    reason: "sleep".into(),
-                    at: now,
-                }),
-                discovered: Vec::new(),
-            };
-            let result = probe_peer(
-                root.path(),
-                &Config::default(),
-                &peer,
-                None,
-                &presence,
-                false,
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.code, "NODE_OUT_OF_LAN");
-            let result = probe_peer(
-                root.path(),
-                &Config::default(),
-                &peer,
-                None,
-                &presence,
-                true,
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.code, "NODE_POWERED_OFF");
-            assert_eq!(result.since, Some(now));
-            assert!(result.message.starts_with("Сервер спит с "));
-        });
-    }
-
-    #[test]
-    fn discovery_failure_falls_back_to_static_address_and_distinguishes_http_errors() {
-        runtime().block_on(async {
-            let root = tempfile::tempdir().unwrap();
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let peer = peer(root.path(), listener.local_addr().unwrap());
-            let secret = Credential {
-                node_id: peer.node.node_id.clone(),
-                token: "a".repeat(64),
-                inbound_sha256: "b".repeat(64),
-                address: None,
-                addresses: Vec::new(),
-                tailscale_address: None,
-            };
-            let rejected = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap();
-            let presence = Presence {
-                discovered: vec![rejected],
-                ..Presence::default()
-            };
-            let app = Router::new()
-                .route(
-                    "/version",
-                    get(|| async { Json(json!({"proto": 1, "min_proto": 1})) }),
-                )
-                .route("/node", get(|| async { StatusCode::UNAUTHORIZED }));
-            let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-            let result = probe_peer(
-                root.path(),
-                &Config::default(),
-                &peer,
-                Some(&secret),
-                &presence,
-                true,
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.code, "NODE_AUTH_FAILED");
-            server.abort();
-            let _ = server.await;
-            // Reserve a non-listening port. A dropped ephemeral listener can
-            // be reused by another parallel test before the refusal probe.
-            let refused = tokio::net::TcpSocket::new_v4().unwrap();
-            refused.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-            let mut stopped_peer = peer.clone();
-            stopped_peer.address = refused.local_addr().unwrap();
-            let result = probe_peer(
-                root.path(),
-                &Config::default(),
-                &stopped_peer,
-                Some(&secret),
-                &Presence::default(),
-                true,
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.code, "NODE_SERVICE_DOWN");
-            let listener = TcpListener::bind(peer.address).await.unwrap();
-            let app = Router::new().route(
-                "/version",
-                get(|| async { Json(json!({"proto": 2, "min_proto": 2})) }),
-            );
-            let server = tokio::spawn(async move {
-                axum::serve(listener, app).await.unwrap();
-            });
-            let result = probe_peer(
-                root.path(),
-                &Config::default(),
-                &peer,
-                Some(&secret),
-                &Presence::default(),
-                true,
-            )
-            .await
-            .unwrap();
-            assert_eq!(result.code, "NODE_VERSION_MISMATCH");
-            assert!(result.message.contains("(2, здесь 1)"));
-            server.abort();
-            let _ = server.await;
-        });
-    }
-
-    #[test]
-    fn paired_bye_is_durable_stale_bye_is_ignored_and_hello_clears_it() {
-        runtime().block_on(async {
-            let root = tempfile::tempdir().unwrap();
-            Journal::open(root.path()).unwrap();
-            let secret = "a".repeat(64);
-            let inbound = token_hash(&secret);
-            atomic_write_text_raw(
-                &root.path().join("sync/peers.yaml"),
-                &format!(
-                    "- node_id: remote\n  token: {}\n  inbound_sha256: {inbound}\n",
-                    "b".repeat(64)
-                ),
-            )
-            .unwrap();
-            let app = routes(root.path().to_path_buf()).layer(Extension(inbound));
-            let now = Utc::now();
-            let request = |path: &str, body: serde_json::Value| {
-                axum::http::Request::builder()
-                    .method("POST")
-                    .uri(path)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap()
-            };
-            let reply = app
-                .clone()
-                .oneshot(request(
-                    "/sync/bye",
-                    json!({"reason": "shutdown", "at": now}),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(reply.status(), StatusCode::OK);
-            let state: BTreeMap<String, Presence> =
-                load(&root.path().join("sync/presence.yaml")).unwrap();
-            assert_eq!(state["remote"].bye.as_ref().unwrap().reason, "shutdown");
-            let reply = app
-                .clone()
-                .oneshot(request("/sync/hello", json!({})))
-                .await
-                .unwrap();
-            assert_eq!(reply.status(), StatusCode::OK);
-            let reply = app
-                .clone()
-                .oneshot(request(
-                    "/sync/bye",
-                    json!({"reason": "sleep", "at": now - chrono::Duration::minutes(1)}),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(reply.status(), StatusCode::OK);
-            let state: BTreeMap<String, Presence> =
-                load(&root.path().join("sync/presence.yaml")).unwrap();
-            assert!(state["remote"].bye.is_none());
-            assert!(state["remote"].last_seen.unwrap() >= now);
-            let unpaired = routes(root.path().to_path_buf()).layer(Extension("c".repeat(64)));
-            let reply = unpaired
-                .oneshot(request("/sync/bye", json!({"reason": "sleep", "at": now})))
-                .await
-                .unwrap();
-            assert_eq!(reply.status(), StatusCode::UNAUTHORIZED);
-            let body = to_bytes(reply.into_body(), 4096).await.unwrap();
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"],
-                "NODE_AUTH_FAILED"
-            );
-        });
-    }
+    Ok(())
 }

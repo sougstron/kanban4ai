@@ -472,9 +472,6 @@ pub(super) fn validate(op: &Operation, store: &str) -> Result<()> {
     let global = op.project.is_empty();
     for field in op.set.keys() {
         if op.entity == "config" && global && field == "sync.relay_encrypt" {
-            if !op.set[field].is_boolean() && !op.set[field].is_null() {
-                return Err(invalid("invalid sync.relay_encrypt"));
-            }
             continue;
         }
         let top = field.split('.').next().unwrap_or(field);

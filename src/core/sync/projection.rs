@@ -310,6 +310,9 @@ pub(crate) fn apply_meta(state: &mut JournalState, op: &Operation) {
         .entry(key(&op.project, &op.entity, &op.id))
         .or_default();
     for (field, value) in &op.set {
+        if op.entity == "config" && op.project.is_empty() && field == "sync.relay_encrypt" {
+            continue;
+        }
         if fields.clocks.get(field).is_none_or(|clock| clock < &op.hlc) {
             fields.values.insert(field.clone(), value.clone());
             fields.clocks.insert(field.clone(), op.hlc.clone());
@@ -927,6 +930,15 @@ mod tests {
         text
     }
 
+    /// Forces a full projection checkpoint, as the snapshot spool does.
+    fn snapshot(journal: &Journal) {
+        journal.reconcile().unwrap();
+        let _sync = lock_file_reentrant(&journal.root.join(".lock")).unwrap();
+        journal.recover().unwrap();
+        let (state, prune_meta) = load_state(&journal.root).unwrap();
+        checkpoint(&journal.root, &state, &prune_meta, true).unwrap();
+    }
+
     fn store() -> (tempfile::TempDir, Storage) {
         let dir = tempfile::tempdir().unwrap();
         crate::core::sync::enable_sync(dir.path()).unwrap();
@@ -974,7 +986,7 @@ mod tests {
         let journal = Journal::open(dir.path()).unwrap();
         write(&board, "TASK-001", "one", &["first"]);
         write(&board, "TASK-002", "two", &["second"]);
-        journal.snapshot().unwrap();
+        snapshot(&journal);
         assert!(head_path(&journal.root).is_file());
         assert!(!legacy_path(&journal.root).exists());
         // Operations after the head are replayed onto the shards.
@@ -1015,7 +1027,7 @@ mod tests {
         let (dir, board) = store();
         let journal = Journal::open(dir.path()).unwrap();
         write(&board, "TASK-001", "one", &["first"]);
-        journal.snapshot().unwrap();
+        snapshot(&journal);
         let full = journal.state().unwrap();
         let head = read_head(&journal.root).unwrap().unwrap();
         let legacy = serde_json::json!({
@@ -1034,7 +1046,7 @@ mod tests {
         assert!(!scoped.partial, "a format 2 file is the whole state");
         assert_eq!(json_of(&scoped.fields), json_of(&full.fields));
 
-        journal.snapshot().unwrap();
+        snapshot(&journal);
         assert!(head_path(&journal.root).is_file());
         assert!(!legacy_path(&journal.root).exists());
         forget(&journal.root);

@@ -260,7 +260,7 @@ fn deleting_projection_or_index_rebuilds_the_same_state() {
     let storage = board(dir.path());
     atomic_write_text(&storage.tasks_dir.join("todo/TASK-001.md"), &task("kept")).unwrap();
     let journal = Journal::open(dir.path()).unwrap();
-    journal.snapshot().unwrap();
+    kanban4ai::core::sync::transport::snapshot_spool(dir.path()).unwrap();
     let before = serde_json::to_value(journal.state().unwrap()).unwrap();
     let shards = dir.path().join("sync/meta/projection");
     let saved = tempfile::tempdir().unwrap();
@@ -543,7 +543,7 @@ fn prune_bounds_acked_history_and_keeps_conflicts_and_fresh_blobs() {
 fn newer_store_format_is_refused_without_writes() {
     let dir = tempfile::tempdir().unwrap();
     let storage = board(dir.path());
-    fs::write(dir.path().join("sync/FORMAT"), "4\n").unwrap();
+    fs::write(dir.path().join("sync/FORMAT"), "5\n").unwrap();
     let stamp = |root: &Path| {
         let mut names = fs::read_dir(root.join("sync"))
             .unwrap()
@@ -638,7 +638,7 @@ fn v1_fixture_migrates_and_a_partial_migration_restarts() {
         fs::read_to_string(again.path().join("sync/FORMAT"))
             .unwrap()
             .trim(),
-        "3"
+        "4"
     );
 }
 
@@ -667,7 +667,9 @@ fn unknown_op_fields_round_trip_and_versions_are_negotiated() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("SYNC_OP_FORMAT_TOO_NEW"), "{err}");
-    assert!(accept_store_protocol(0, 0).is_ok());
+    // Protocol 3 dropped peer exchange: older nodes are refused, not downgraded.
+    assert!(accept_store_protocol(0, 0).is_err());
+    assert!(accept_store_protocol(3, 3).is_ok());
     assert!(negotiate(1, 2, 0, 0).is_some());
     let err = accept_store_protocol(0, 99).unwrap_err().to_string();
     assert!(err.contains("SYNC_PROTOCOL_MISMATCH"), "{err}");

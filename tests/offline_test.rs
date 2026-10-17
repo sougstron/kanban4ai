@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use assert_cmd::Command;
 use kanban4ai::core::project::ProjectStore;
 use kanban4ai::core::storage::Storage;
-use kanban4ai::core::sync::{Journal, Operation, install_snapshot};
+use kanban4ai::core::sync::{Journal, Operation};
 
 struct Env {
     work: tempfile::TempDir,
@@ -137,7 +137,7 @@ fn drop_enabled_key(store: &Path) {
     fs::write(path, serde_yaml_ng::to_string(&config).unwrap()).unwrap();
 }
 
-fn write_peers(store: &Path, peers: &str) {
+fn write_server(store: &Path, peers: &str) {
     let path = store.join("config.yaml");
     let mut config: serde_yaml_ng::Value = fs::read_to_string(&path)
         .ok()
@@ -333,12 +333,12 @@ fn enable_later_snapshots_whitelist() {
 }
 
 #[test]
-fn enable_later_via_peer_card_snapshots_whitelist() {
+fn enable_later_via_server_config_snapshots_whitelist() {
     let env = Env::new();
     seed_local_files(&env);
-    write_peers(
+    write_server(
         env.store(),
-        "peers:\n  - {node_id: n-peer, name: peer, role: laptop, store_id: store, address: '127.0.0.1:9'}\n",
+        "server: {node_id: n-peer, name: peer, urls: ['http://127.0.0.1:9']}\n",
     );
     assert_whitelist_baseline(&env);
 }
@@ -369,10 +369,9 @@ fn disable_edit_reenable_keeps_both_deltas() {
     assert!(text.contains("field-a"), "{text}");
     assert!(text.contains("TASK-002"), "{text}");
     assert!(text.contains("TASK-003"), "{text}");
-    let snapshot = Journal::open(env.store()).unwrap().snapshot().unwrap();
     let replica = tempfile::tempdir().unwrap();
     Journal::open(replica.path()).unwrap();
-    install_snapshot(replica.path(), &snapshot).unwrap();
+    common::bootstrap(env.store(), replica.path());
     let task = walk_task(&replica.path().join("projects"), "TASK-001");
     assert!(task.contains("field-a"), "{task}");
     assert!(task.contains("TASK-002"), "{task}");
@@ -397,16 +396,16 @@ fn walk_task(projects: &Path, id: &str) -> String {
 }
 
 #[test]
-fn unreachable_peer_commands_work_offline() {
+fn unreachable_server_commands_work_offline() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     let env = Env::new();
     init(&env);
-    write_peers(
+    write_server(
         env.store(),
         &format!(
-            "home_networks: [192.0.2.0/24]\npeers:\n  - {{node_id: n-closed, name: closed, role: laptop, store_id: store, address: '127.0.0.1:{port}'}}\n  - {{node_id: n-blackhole, name: blackhole, role: laptop, store_id: store, address: '192.0.2.1:9'}}\n"
+            "server: {{node_id: n-closed, name: closed, urls: ['http://127.0.0.1:{port}', 'http://192.0.2.1:9']}}\n"
         ),
     );
     let before = if env.store().join("sync").exists() {
@@ -424,10 +423,9 @@ fn unreachable_peer_commands_work_offline() {
     timed(kanban(&env).args(["take", "TASK-001", "--session", "ses-off", "--agent"]));
     let after = ops(env.store());
     assert!(after.len() > before, "{} -> {}", before, after.len());
-    let snapshot = Journal::open(env.store()).unwrap().snapshot().unwrap();
     let replica = tempfile::tempdir().unwrap();
     Journal::open(replica.path()).unwrap();
-    install_snapshot(replica.path(), &snapshot).unwrap();
+    common::bootstrap(env.store(), replica.path());
     let task = walk_task(&replica.path().join("projects"), "TASK-001");
     assert!(task.contains("id: TASK-001"), "{task}");
     assert_eq!(task.matches("id: TASK-001").count(), 1);
@@ -452,16 +450,14 @@ fn pair_closed(env: &Env) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
-    write_peers(
+    write_server(
         env.store(),
-        &format!(
-            "peers:\n  - {{node_id: n-peer, name: peer, role: laptop, store_id: store, address: '127.0.0.1:{port}'}}\n"
-        ),
+        &format!("server: {{node_id: n-peer, name: peer, urls: ['http://127.0.0.1:{port}']}}\n"),
     );
     fs::create_dir_all(env.store().join("sync")).unwrap();
     fs::write(
-        env.store().join("sync/peers.yaml"),
-        "- node_id: n-peer\n  token: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  inbound_sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        env.store().join("sync/server.yaml"),
+        "node_id: n-peer\ntoken: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
     )
     .unwrap();
 }

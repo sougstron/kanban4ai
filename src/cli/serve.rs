@@ -35,6 +35,7 @@ mod embedded;
 pub(crate) use embedded::Embedded;
 mod discovery;
 mod git;
+mod hub;
 mod pairing;
 pub(crate) mod settings;
 mod sync;
@@ -57,7 +58,7 @@ pub(crate) fn runner_action(
     let Some(root) = projects.parent() else {
         return Ok(None);
     };
-    if !crate::core::sync::enabled(root) || discovery::config(root)?.peers.is_empty() {
+    if !crate::core::sync::enabled(root) || discovery::known_nodes(root)?.is_empty() {
         return Ok(None);
     }
     let storage = crate::core::storage::Storage::new(board);
@@ -114,8 +115,8 @@ pub(crate) fn local_runner(
     api::local_runner(board, runner)
 }
 
-const PROTO: u32 = 1;
-const MIN_PROTO: u32 = 1;
+const PROTO: u32 = 3;
+const MIN_PROTO: u32 = 3;
 
 #[derive(Deserialize)]
 struct Settings {
@@ -258,6 +259,36 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
 }
 
 async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: Next) -> Response {
+    let route = request.uri().path();
+    if matches!(
+        route,
+        "/sync/vector"
+            | "/sync/ops"
+            | "/sync/ack"
+            | "/sync/stream"
+            | "/sync/snapshot"
+            | "/sync/hello"
+            | "/sync/bye"
+    ) {
+        return error(
+            StatusCode::UPGRADE_REQUIRED,
+            "SYNC_PROTOCOL_MISMATCH",
+            "обновите kanban4ai на всех узлах",
+        );
+    }
+    if route.starts_with("/sync/")
+        && request
+            .headers()
+            .get("x-kanban-sync-protocol")
+            .and_then(|v| v.to_str().ok())
+            != Some("3")
+    {
+        return error(
+            StatusCode::UPGRADE_REQUIRED,
+            "SYNC_PROTOCOL_MISMATCH",
+            "обновите kanban4ai на всех узлах",
+        );
+    }
     let secret = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -313,6 +344,23 @@ async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: N
             "Token is unknown or revoked",
         );
     };
+    let route = request.uri().path();
+    if route.starts_with("/sync/") || route.starts_with("/git/") {
+        let root = path
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new("."));
+        if let Err(e) = hub::require_server(root) {
+            return sync::failure(e);
+        }
+        if route.starts_with("/sync/") && hub::caller(root, &hash).is_err() {
+            return error(
+                StatusCode::UNAUTHORIZED,
+                "NODE_AUTH_FAILED",
+                "Token is not bound to a paired node",
+            );
+        }
+    }
     request.extensions_mut().insert(kind);
     request.extensions_mut().insert(hash);
     next.run(request).await
@@ -327,6 +375,7 @@ fn router(tokens: PathBuf) -> Router {
     let protected = Router::new()
         .merge(discovery::routes(root.clone()))
         .merge(sync::routes(root.clone()))
+        .merge(hub::routes(root.clone()))
         .merge(git::routes(root.clone()))
         .merge(api::routes(root))
         .fallback(|| async { error(StatusCode::NOT_FOUND, "NOT_FOUND", "Unknown endpoint") })
@@ -393,6 +442,9 @@ async fn serve(root: &Path, networks: &[IpNet], port: u16, grace: Duration) -> R
                     .map(|cidr| cidr.parse::<IpNet>().expect("static private CIDR")),
             );
         }
+    }
+    if crate::core::sync::Journal::open(root)?.node.role == crate::core::sync::NodeRole::Server {
+        hub::initialize(root)?;
     }
     let app = router(root.join("sync/tokens.yaml"));
     // Bind everything before starting any request handling: a failed bind
@@ -491,9 +543,35 @@ fn retire_client_tokens(root: &Path) -> Result<()> {
 
 /// `kanban4ai join`: set this node up as a phone from one invite, pair,
 /// then pull the shared board once.
-pub fn join(invite: &str, name: Option<&str>) -> Result<ExitCode> {
-    let store = ProjectStore::open()?;
-    let peer = pairing::join(store.root(), invite, name)?;
+/// `fresh` first moves a store that already holds projects aside, so the
+/// phone can adopt the server's board instead of failing with
+/// `SYNC_STORE_MISMATCH`.
+pub fn join(invite: &str, name: Option<&str>, fresh: bool) -> Result<ExitCode> {
+    let mut store = ProjectStore::open()?;
+    if fresh && !store.list()?.is_empty() {
+        let root = store.root().to_path_buf();
+        let stem = root
+            .file_name()
+            .ok_or_else(|| invalid("Store root has no name"))?
+            .to_string_lossy();
+        let backup = root.with_file_name(format!(
+            "{stem}.pre-join-{}",
+            chrono::Local::now().format("%Y%m%d-%H%M%S")
+        ));
+        fs::rename(&root, &backup)?;
+        println!("Previous store moved to {}", backup.display());
+        store = ProjectStore::open()?;
+    }
+    let peer = match pairing::join(store.root(), invite, name) {
+        Err(e) if e.to_string().contains("SYNC_STORE_MISMATCH") => {
+            return Err(invalid(format!(
+                "{e}\nThis store already holds another board. To replace it with the \
+                 server's board, rerun with a fresh invite: kanban4ai join --fresh CODE@HOST:PORT \
+                 (the current store is moved aside, not deleted)"
+            )));
+        }
+        other => other?,
+    };
     println!("Paired with {peer}");
     let results = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -574,6 +652,11 @@ mod tests {
     fn authentication_is_fail_closed_and_revocation_is_immediate() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("sync")).unwrap();
+        fs::write(
+            dir.path().join("config.yaml"),
+            "node:\n  name: server\n  role: server\n",
+        )
+        .unwrap();
         let path = dir.path().join("sync/tokens.yaml");
         let node = "a".repeat(64);
         let app = router(path.clone());
@@ -583,7 +666,9 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let request = |path: &str, token: Option<&str>| {
-                let mut builder = axum::http::Request::builder().uri(path);
+                let mut builder = axum::http::Request::builder()
+                    .uri(path)
+                    .header("x-kanban-sync-protocol", "3");
                 if let Some(token) = token {
                     builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
                 }
@@ -622,7 +707,17 @@ mod tests {
                     StatusCode::UNAUTHORIZED,
                 ),
                 ("/node", Some(node.as_str()), StatusCode::OK),
-                ("/sync/unknown", Some(node.as_str()), StatusCode::NOT_FOUND),
+                // A valid node token not bound to a hub client is refused for sync.
+                (
+                    "/sync/unknown",
+                    Some(node.as_str()),
+                    StatusCode::UNAUTHORIZED,
+                ),
+                (
+                    "/sync/vector",
+                    Some(node.as_str()),
+                    StatusCode::UPGRADE_REQUIRED,
+                ),
             ] {
                 let response = app.clone().oneshot(request(path, token)).await.unwrap();
                 assert_eq!(response.status(), expected, "{path}");

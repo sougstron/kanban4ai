@@ -49,7 +49,7 @@ pub enum BackupAction {
         /// `board` keeps this machine's sync; `full` is disaster recovery.
         #[arg(long, value_parser = ["board", "full"], default_value = "board")]
         mode: String,
-        /// Restore `node.yaml`, `peers.yaml` and `tokens.yaml` from the archive.
+        /// Restore `node.yaml`, `server.yaml`, `cursor.json` and `tokens.yaml` from the archive.
         #[arg(long)]
         identity: bool,
         /// Do not ask; required when stdin is not a terminal.

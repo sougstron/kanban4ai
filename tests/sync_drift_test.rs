@@ -1,5 +1,7 @@
+mod common;
+
 use kanban4ai::core::storage::{Storage, atomic_write_text};
-use kanban4ai::core::sync::{Journal, install_snapshot};
+use kanban4ai::core::sync::Journal;
 use std::{fs, path::Path, process::Command, time::Instant};
 
 fn task(title: &str) -> String {
@@ -49,7 +51,7 @@ fn external_edits_checkout_create_delete_and_repeat_replicate() {
     let source = Journal::open(a.path()).unwrap();
     source.reconcile().unwrap();
     Journal::open(b.path()).unwrap();
-    install_snapshot(b.path(), &source.snapshot().unwrap()).unwrap();
+    common::bootstrap(a.path(), b.path());
     let peer = Journal::open(b.path()).unwrap();
     let remote = b
         .path()
@@ -136,7 +138,7 @@ fn blobs_and_instructions_are_incremental_but_artifacts_are_not() {
     let board = board(a.path());
     let source = Journal::open(a.path()).unwrap();
     Journal::open(b.path()).unwrap();
-    install_snapshot(b.path(), &source.snapshot().unwrap()).unwrap();
+    common::bootstrap(a.path(), b.path());
     let peer = Journal::open(b.path()).unwrap();
     let image = ".kanban/assets/images/pasted-123-deadbeef.png";
     let instructions = ".kanban/instructions/executor.md";
@@ -198,7 +200,7 @@ fn remote_apply_captures_pending_local_drift_and_moves_do_not_delete_tasks() {
     atomic_write_text(&path, &task("original")).unwrap();
     let source = Journal::open(a.path()).unwrap();
     Journal::open(b.path()).unwrap();
-    install_snapshot(b.path(), &source.snapshot().unwrap()).unwrap();
+    common::bootstrap(a.path(), b.path());
     let peer = Journal::open(b.path()).unwrap();
     let remote = b
         .path()
@@ -262,7 +264,7 @@ fn external_thread_and_config_deletion_replicate() {
     fs::write(&thread, "task_id: TASK-001\nmessages: []\n").unwrap();
     let source = Journal::open(a.path()).unwrap();
     Journal::open(b.path()).unwrap();
-    install_snapshot(b.path(), &source.snapshot().unwrap()).unwrap();
+    common::bootstrap(a.path(), b.path());
     let peer = Journal::open(b.path()).unwrap();
     let remote = b.path().join("projects/demo/.kanban");
     fs::remove_file(&thread).unwrap();
@@ -295,7 +297,7 @@ fn capture_folds_bypass_edits_and_moves_of_the_written_task() {
     let source = Journal::open(a.path()).unwrap();
     source.reconcile().unwrap();
     Journal::open(b.path()).unwrap();
-    install_snapshot(b.path(), &source.snapshot().unwrap()).unwrap();
+    common::bootstrap(a.path(), b.path());
     let peer = Journal::open(b.path()).unwrap();
     let peer_tasks = || {
         Storage::new(b.path().join("projects/demo"))

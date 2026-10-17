@@ -44,9 +44,10 @@ Load only what the task touches:
 | `docs/agent-io.md` | Agent reply capture, live telemetry, image attachments |
 | `docs/stats.md` | Application-collected usage statistics (`core/stats.rs`): event schema, hooks, the Stats report |
 | `docs/releasing.md` | Updater internals (`core/update.rs`, `core/http.rs`, self-update behavior) |
-| `docs/sync.md` | Multi-node sync spec (laptop / server / mobile, Tailscale, git-relay): replication, HLC/LWW, local task IDs and renumbering, `serve` protocol, error codes |
+| `docs/sync.md` | Multi-node sync spec (star via sync server, laptop / server / mobile, Tailscale): replication, HLC/LWW, local task IDs, `serve` protocol 3, error codes |
+| `docs/sync-server.md` | How to run the sync server, connect machines, reverse proxy/TLS, migrate from 0.8 peers/relay |
 | `docs/backup.md` | `kanban backup`: store snapshots, restore modes, retention |
-| [docs/android.md](docs/android.md) | Phone setup (aarch64 Arch/proot), Android process survival, managed Tailscale and offline/relay workflow |
+| [docs/android.md](docs/android.md) | Phone setup (aarch64 Arch/proot), Android process survival, managed Tailscale and offline workflow |
 | `docs/token-profile.md` | Measured token cost of the board, and where to cut |
 
 ### Directory Structure

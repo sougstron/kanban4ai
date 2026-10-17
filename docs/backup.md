@@ -17,9 +17,12 @@ Core archive, always:
 - each board `.kanban/`: `tasks/**`, `threads/**`, `config.yaml`,
   `instructions/**`, `assets/images/**`, `context/**`, `stats/**`
 - `sync/` when it exists (a store with sync off has none, and that is not an
-  error): `FORMAT`, `hlc`, `node.yaml`, `peers.yaml`, `tokens.yaml`,
-  `exchanges.yaml`, `landing-intent.json`, `drift.jsonl`, `journal/**`,
-  `meta/**`, `relay/**`, `legacy-v1/**`, `blobs/**`
+  error): `FORMAT`, `hlc`, `node.yaml`, `server.yaml`, `tokens.yaml`,
+  `cursor.json`, `landing-intent.json`, `drift.jsonl`, `journal/**`,
+  `meta/**`, `hub/**` (without `hub/spool/`), `legacy-v1/**`, `blobs/**`
+
+The sync server's replica is a channel, not a backup: keep running
+`kanban backup` on the server too (`docs/sync-server.md`).
 
 `drift.jsonl` and `blobs/` are included so a full restore can reconcile.
 Without the drift index every file looks new; without the blobs a real
@@ -101,9 +104,10 @@ Modes:
   one board and does not touch the global config or other boards.
 - `full`. Disaster recovery, including `sync/`. Refused when the destination
   already has tasks unless `--force` is set. Identity files
-  (`node.yaml`, `peers.yaml`, `tokens.yaml`) and the `node` config section
-  are not restored unless `--identity` is passed. Without that flag the
-  store gets a new node id and peers must pair again. `--identity` prints a
+  (`node.yaml`, `server.yaml`, `tokens.yaml`, `cursor.json`) and the `node`
+  config section are not restored unless `--identity` is passed. Without that
+  flag the store keeps its live identity files (or gets a new node id) and
+  must pair with the server again if it had none. `--identity` prints a
   warning: two live machines with one node id break HLC/LWW.
 
 An artifacts archive is restored only when the path is that archive. Files

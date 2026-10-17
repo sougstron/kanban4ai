@@ -434,6 +434,10 @@ enum Command {
         /// This node's name (default: keep a phone's name, else `phone`).
         #[arg(long)]
         name: Option<String>,
+        /// Move a store that already holds projects aside first and adopt
+        /// the server's board (fixes `SYNC_STORE_MISMATCH`).
+        #[arg(long)]
+        fresh: bool,
     },
     /// Serve the local store over HTTP on LAN and loopback interfaces.
     Serve {
@@ -933,8 +937,12 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Daemon { interval, once } => {
             return daemon::run(once, interval, cli.project.as_deref());
         }
-        Command::Join { invite, name } => {
-            return serve::join(&invite, name.as_deref());
+        Command::Join {
+            invite,
+            name,
+            fresh,
+        } => {
+            return serve::join(&invite, name.as_deref(), fresh);
         }
         Command::Serve {
             port,

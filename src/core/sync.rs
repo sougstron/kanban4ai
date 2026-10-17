@@ -16,14 +16,15 @@ mod apply;
 pub(crate) mod control;
 mod drift;
 mod format;
+pub mod hub;
 mod ids;
 mod migrate_v1;
+mod migrate_v4;
 mod projection;
 mod prune;
-pub mod relay;
 mod run;
 mod segments;
-mod transport;
+pub mod transport;
 pub use apply::Conflict;
 pub use format::{
     MIN_SYNC_PROTOCOL, OP_FORMAT, STORE_FORMAT, SYNC_PROTOCOL, accept_store_protocol, enable_sync,
@@ -36,7 +37,7 @@ pub use projection::{Claim, Lifecycle};
 pub use run::{LandingDescriptor, RunDescriptor, RunState, remote_runs};
 pub(crate) use run::{remote_runs_for_tasks, store_for_board, task_landings, task_runs};
 pub use segments::change_token;
-pub use transport::{Page, Snapshot, install_snapshot};
+pub use transport::Page;
 
 type Fields = BTreeMap<String, Value>;
 pub type VersionVector = BTreeMap<String, u64>;
@@ -761,11 +762,6 @@ fn fields(value: &Value, entity: &str, global: bool) -> Fields {
     let mut result = Fields::new();
     if let Some(map) = value.as_object() {
         for (field, value) in map {
-            if entity == "config" && global && field == "sync" {
-                if let Some(encrypt) = value.get("relay_encrypt") {
-                    result.insert("sync.relay_encrypt".into(), encrypt.clone());
-                }
-            }
             if local.contains(&field.as_str()) {
                 continue;
             }

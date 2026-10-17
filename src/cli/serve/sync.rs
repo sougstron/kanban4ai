@@ -1,171 +1,88 @@
-//! Operation exchange between paired nodes (section 10). Every paired peer
-//! gets a background worker: catch-up over `/sync/vector` + `/sync/ops`,
-//! then a live SSE stream plus a push after each local write. Store access
-//! stays in `core::sync`; this module only moves pages over HTTP.
-use super::discovery::{self, Config, Credential, PeerCard, Presence};
+//! One outbound server link: push durable outbox, then consume hub sequence pages.
+use super::discovery::{Config, ServerCard};
+use super::hub::{Hello, HelloReply, Push, PushReply};
 use super::*;
 use crate::core::sync::{
-    Journal, MIN_SYNC_PROTOCOL, Operation, Page, SYNC_PROTOCOL, Snapshot, VersionVector,
-    accept_store_protocol, change_token, install_snapshot, max_op_version,
+    Journal, MIN_SYNC_PROTOCOL, Operation, SYNC_PROTOCOL, VersionVector, change_token,
 };
-use axum::Extension;
-use axum::extract::DefaultBodyLimit;
-use axum::http::{HeaderMap, Uri};
+use axum::extract::{DefaultBodyLimit, Path as Params};
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::sync::LazyLock;
+use tokio::io::AsyncWriteExt;
 
 const PAGE: usize = 200;
 const KEEPALIVE: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-/// Local journal/state writes from any process on this machine.
 const POLL: Duration = Duration::from_millis(500);
-
 static CHANGED: LazyLock<watch::Sender<u64>> = LazyLock::new(|| watch::channel(0).0);
 static KICK: LazyLock<watch::Sender<u64>> = LazyLock::new(|| watch::channel(0).0);
 static STOPPING: LazyLock<watch::Sender<bool>> = LazyLock::new(|| watch::channel(false).0);
-
-/// Wake idle workers: a peer said hello or reappeared in mDNS.
 pub(super) fn kick() {
     KICK.send_modify(|n| *n = n.wrapping_add(1));
 }
-fn changed() {
+pub(super) fn changed() {
     CHANGED.send_modify(|n| *n = n.wrapping_add(1));
 }
-
-#[derive(Serialize, Deserialize)]
-struct VectorReply {
-    node_id: String,
-    store_id: String,
-    /// No registered projects: a bootstrap target rather than a store mismatch.
-    empty: bool,
-    vector: VersionVector,
-    /// Highest protocol this node speaks. Absent on a 0.8 peer; treat that as 1.
-    #[serde(default)]
-    protocol: u32,
-    /// Lowest protocol this node still accepts.
-    #[serde(default)]
-    min_protocol: u32,
+pub(super) fn subscribe() -> watch::Receiver<u64> {
+    CHANGED.subscribe()
 }
-#[derive(Serialize, Deserialize)]
-struct Push {
-    operations: Vec<Operation>,
+pub(super) fn stopping() -> watch::Receiver<bool> {
+    STOPPING.subscribe()
 }
-#[derive(Serialize, Deserialize)]
-struct Ack {
-    vector: VersionVector,
-}
-
-#[derive(Serialize, Deserialize)]
-struct AckRequest {
-    store_id: String,
-    vector: VersionVector,
-}
-
-async fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|e| invalid(e.to_string()))?
 }
-
-/// `id:seq,id:seq`: node IDs are UUIDs, so the cursor needs no URL encoding.
-fn encode_vector(vector: &VersionVector) -> String {
-    vector
-        .iter()
-        .filter(|(_, seq)| **seq > 0)
-        .map(|(node, seq)| format!("{node}:{seq}"))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-fn decode_vector(text: &str) -> Result<VersionVector> {
-    let mut vector = VersionVector::new();
-    for item in text.split(',').filter(|item| !item.is_empty()) {
-        let (node, seq) = item
-            .rsplit_once(':')
-            .ok_or_else(|| invalid("invalid version vector"))?;
-        if node.is_empty() || !node.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
-            return Err(invalid("invalid version vector node"));
-        }
-        let seq = seq
-            .parse()
-            .map_err(|_| invalid("invalid version vector sequence"))?;
-        vector.insert(node.to_owned(), seq);
-    }
-    Ok(vector)
-}
-fn query<'a>(uri: &'a Uri, name: &str) -> Option<&'a str> {
-    uri.query()?
-        .split('&')
-        .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='))
-}
-fn max_skew_ms(root: &Path) -> Result<u64> {
-    Ok(discovery::config(root)?.max_skew.saturating_mul(1000))
-}
-
-/// Apply remote operations, skipping what the contiguous vector already holds.
-async fn apply(root: &Path, operations: Vec<Operation>) -> Result<VersionVector> {
-    let root = root.to_path_buf();
-    let (vector, applied) = blocking(move || {
-        let journal = Journal::open(&root)?;
-        let known = journal.vector()?;
-        let fresh: Vec<_> = operations
-            .into_iter()
-            .filter(|op| {
-                op.op
-                    .rsplit_once(':')
-                    .and_then(|(_, seq)| seq.parse::<u64>().ok())
-                    .is_none_or(|seq| seq > known.get(&op.hlc.2).copied().unwrap_or(0))
-            })
-            .collect();
-        if fresh.is_empty() {
-            return Ok((known, false));
-        }
-        journal.apply_remote(&fresh, max_skew_ms(&root)?)?;
-        Ok((journal.vector()?, true))
-    })
-    .await?;
-    if applied {
-        changed();
-    }
-    Ok(vector)
-}
-
-fn failure(e: KanbanError) -> Response {
+pub(super) fn failure(e: KanbanError) -> Response {
     let text = e.to_string();
-    for code in [
+    let code = [
         "SYNC_STORE_MISMATCH",
         "SYNC_CLOCK_SKEW",
         "SYNC_STORE_TOO_NEW",
         "SYNC_OP_FORMAT_TOO_NEW",
         "SYNC_PROTOCOL_MISMATCH",
         "SYNC_SNAPSHOT_REQUIRED",
-    ] {
-        if text.contains(code) {
-            return error(StatusCode::CONFLICT, code, &text);
-        }
+        "SYNC_NOT_A_SERVER",
+        "SYNC_SERVER_BEHIND",
+        "SYNC_MIGRATION_GAP",
+        "NODE_AUTH_FAILED",
+    ]
+    .into_iter()
+    .find(|c| text.contains(c));
+    if let Some(code) = code {
+        let status = match code {
+            "SYNC_PROTOCOL_MISMATCH" => StatusCode::UPGRADE_REQUIRED,
+            "NODE_AUTH_FAILED" => StatusCode::UNAUTHORIZED,
+            _ => StatusCode::CONFLICT,
+        };
+        return error(status, code, &text);
     }
-    match e {
-        KanbanError::Invalid(_) | KanbanError::Yaml(_) => {
-            error(StatusCode::BAD_REQUEST, "INVALID_REQUEST", &text)
-        }
-        _ => error(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR", &text),
-    }
+    let status = if matches!(e, KanbanError::Invalid(_) | KanbanError::Yaml(_)) {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    error(status, "INVALID_REQUEST", &text)
 }
-
 pub(super) fn routes(root: PathBuf) -> Router {
-    Router::new()
-        .route("/sync/vector", get(vector))
-        .route(
-            "/sync/ops",
-            get(pull)
-                .post(receive)
-                .layer(DefaultBodyLimit::max(256 << 20)),
+    let legacy = || async {
+        error(
+            StatusCode::UPGRADE_REQUIRED,
+            "SYNC_PROTOCOL_MISMATCH",
+            "обновите kanban4ai на всех узлах",
         )
-        .route("/sync/stream", get(stream))
-        .route("/sync/snapshot", get(snapshot))
-        .route("/sync/ack", axum::routing::post(ack_request))
+    };
+    Router::new()
+        .route("/sync/vector", get(legacy))
+        .route("/sync/ops", get(legacy).post(legacy))
+        .route("/sync/ack", axum::routing::post(legacy))
+        .route("/sync/stream", get(legacy))
+        .route("/sync/snapshot", get(legacy))
+        .route("/sync/hello", axum::routing::post(legacy))
+        .route("/sync/bye", axum::routing::post(legacy))
         .route(
             "/sync/blobs/{hash}",
             get(get_blob)
@@ -174,202 +91,96 @@ pub(super) fn routes(root: PathBuf) -> Router {
         )
         .with_state(root)
 }
-
-async fn get_blob(
-    State(root): State<PathBuf>,
-    axum::extract::Path(hash): axum::extract::Path<String>,
-) -> Response {
+async fn get_blob(State(root): State<PathBuf>, Params(hash): Params<String>) -> Response {
     match blocking(move || Journal::open(&root)?.blob(&hash)).await {
-        Ok(bytes) => (
-            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
-            bytes,
-        )
-            .into_response(),
+        Ok(bytes) => ([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response(),
         Err(e) => failure(e),
     }
 }
-
 async fn put_blob(
     State(root): State<PathBuf>,
-    axum::extract::Path(hash): axum::extract::Path<String>,
+    Params(hash): Params<String>,
     bytes: axum::body::Bytes,
 ) -> Response {
     match blocking(move || Journal::open(&root)?.put_blob(&hash, &bytes)).await {
-        Ok(()) => Json(serde_json::json!({})).into_response(),
+        Ok(()) => Json(json!({})).into_response(),
         Err(e) => failure(e),
     }
 }
-
-async fn vector(State(root): State<PathBuf>, Extension(hash): Extension<String>) -> Response {
-    let result = blocking(move || {
-        // Every authenticated sync request is a fresh contact (hello).
-        if let Ok(id) = discovery::caller(&root, &hash) {
-            discovery::update_presence(&root, &id, |p| {
-                p.last_seen = Some(chrono::Utc::now());
-                p.bye = None;
-            })?;
+#[derive(Default, Clone, Serialize, Deserialize)]
+struct Cursor {
+    #[serde(default)]
+    server_node_id: String,
+    #[serde(default)]
+    store_id: String,
+    #[serde(default)]
+    hub_epoch: String,
+    #[serde(default)]
+    last_seq: u64,
+    #[serde(default)]
+    pushed: u64,
+    #[serde(default)]
+    migrating: bool,
+}
+impl Cursor {
+    fn load(root: &Path) -> Result<Self> {
+        match fs::read_to_string(root.join("sync/cursor.json")) {
+            Ok(t) => serde_json::from_str(&t).map_err(|e| invalid(e.to_string())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
         }
+    }
+    fn save(&self, root: &Path) -> Result<()> {
+        let _lock = lock_file_reentrant(&root.join("sync/.lock"))?;
+        atomic_write_text_raw(
+            &root.join("sync/cursor.json"),
+            &serde_json::to_string(self).map_err(|e| invalid(e.to_string()))?,
+        )
+    }
+}
+#[derive(Deserialize)]
+struct HubOp {
+    seq: u64,
+    op: Operation,
+}
+#[derive(Deserialize)]
+struct HubPage {
+    ops: Vec<HubOp>,
+    next: u64,
+    head: u64,
+    #[serde(default)]
+    more: bool,
+}
+async fn apply(root: &Path, operations: Vec<Operation>) -> Result<()> {
+    let root = root.to_path_buf();
+    let applied = blocking(move || {
         let journal = Journal::open(&root)?;
-        journal.reconcile()?;
-        Ok(VectorReply {
-            node_id: journal.node.node_id.clone(),
-            store_id: journal.node.store_id.clone(),
-            empty: ProjectStore::at(&root).list()?.is_empty(),
-            vector: journal.vector()?,
-            protocol: SYNC_PROTOCOL,
-            min_protocol: MIN_SYNC_PROTOCOL,
-        })
-    })
-    .await;
-    match result {
-        Ok(reply) => Json(reply).into_response(),
-        Err(e) => failure(e),
-    }
-}
-
-fn advertised_protocol(headers: &HeaderMap) -> u32 {
-    headers
-        .get("x-kanban-sync-protocol")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0)
-}
-
-fn cap_page(mut page: Page, protocol: u32) -> Page {
-    let max_v = max_op_version(if protocol == 0 { 1 } else { protocol });
-    page.operations.retain(|op| op.v <= max_v);
-    page
-}
-
-async fn pull(State(root): State<PathBuf>, headers: HeaderMap, uri: Uri) -> Response {
-    let result = async {
-        let after = decode_vector(query(&uri, "after").unwrap_or(""))?;
-        let limit = match query(&uri, "limit") {
-            Some(limit) => limit
-                .parse::<usize>()
-                .ok()
-                .filter(|limit| (1..=1000).contains(limit))
-                .ok_or_else(|| invalid("limit must be 1..=1000"))?,
-            None => PAGE,
-        };
-        let protocol = advertised_protocol(&headers);
-        blocking(move || Journal::open(&root)?.operations_after(&after, limit))
-            .await
-            .map(|page| cap_page(page, protocol))
-    }
-    .await;
-    match result {
-        Ok(page) => Json(page).into_response(),
-        Err(e) => failure(e),
-    }
-}
-
-async fn receive(State(root): State<PathBuf>, Json(push): Json<Push>) -> Response {
-    match apply(&root, push.operations).await {
-        Ok(vector) => Json(Ack { vector }).into_response(),
-        Err(e) => failure(e),
-    }
-}
-
-/// An outbound peer reports what it holds; the server cannot dial it back.
-async fn ack_request(
-    State(root): State<PathBuf>,
-    Extension(hash): Extension<String>,
-    Json(request): Json<AckRequest>,
-) -> Response {
-    let result = blocking(move || {
-        let peer = discovery::caller(&root, &hash)?;
-        let journal = Journal::open(&root)?;
-        if request.store_id != journal.node.store_id {
-            return Err(invalid("SYNC_STORE_MISMATCH"));
+        let known = journal.vector()?;
+        let fresh: Vec<_> = operations
+            .into_iter()
+            .filter(|op| {
+                op.op
+                    .rsplit_once(':')
+                    .and_then(|(_, s)| s.parse::<u64>().ok())
+                    .is_none_or(|seq| seq > known.get(&op.hlc.2).copied().unwrap_or(0))
+            })
+            .collect();
+        if fresh.is_empty() {
+            return Ok(false);
         }
-        // The outbound peer has now confirmed its post-bootstrap store identity.
-        // Its original pairing card may still contain the empty store's UUID.
-        super::api::refresh_peer_store(&root, &peer, &journal.node.store_id)?;
-        settings::acknowledge(&root, &peer, &request.vector)
+        journal.apply_remote(
+            &fresh,
+            discovery::config(&root)?.max_skew.saturating_mul(1000),
+        )?;
+        Ok(true)
     })
-    .await;
-    match result {
-        Ok(()) => Json(Push {
-            operations: Vec::new(),
-        })
-        .into_response(),
-        Err(e) => failure(e),
+    .await?;
+    if applied {
+        changed();
     }
+    Ok(())
 }
-
-async fn snapshot(State(root): State<PathBuf>) -> Response {
-    match blocking(move || Journal::open(&root)?.snapshot()).await {
-        Ok(snapshot) => Json(snapshot).into_response(),
-        Err(e) => failure(e),
-    }
-}
-
-/// SSE: every operation after `after`, then live pages as the store changes.
-async fn stream(State(root): State<PathBuf>, headers: HeaderMap, uri: Uri) -> Response {
-    let protocol = advertised_protocol(&headers);
-    let after = match decode_vector(query(&uri, "after").unwrap_or("")) {
-        Ok(after) => after,
-        Err(e) => return failure(e),
-    };
-    // Subscribe before the first read so no change can slip between them.
-    let changes = CHANGED.subscribe();
-    let stopping = STOPPING.subscribe();
-    let body = futures_util::stream::unfold(
-        (root, after, changes, stopping, protocol),
-        |(root, mut cursor, mut changes, mut stopping, protocol)| async move {
-            loop {
-                if *stopping.borrow() {
-                    return None;
-                }
-                let read = root.clone();
-                let after = cursor.clone();
-                let page: Page =
-                    match blocking(move || Journal::open(&read)?.operations_after(&after, PAGE))
-                        .await
-                        .map(|page| cap_page(page, protocol))
-                    {
-                        Ok(page) => page,
-                        Err(e) => {
-                            eprintln!("sync stream: {e}");
-                            return None;
-                        }
-                    };
-                if !page.operations.is_empty() {
-                    cursor = page.next;
-                    let data = serde_json::to_string(&page.operations).ok()?;
-                    let event = format!("event: ops\ndata: {data}\n\n");
-                    return Some((
-                        Ok::<_, Infallible>(event),
-                        (root, cursor, changes, stopping, protocol),
-                    ));
-                }
-                tokio::select! {
-                    result = tokio::time::timeout(KEEPALIVE, changes.changed()) => match result {
-                        Ok(Ok(())) => continue,
-                        Ok(Err(_)) => return None,
-                        Err(_) => return Some((
-                            Ok(": keepalive\n\n".to_owned()),
-                            (root, cursor, changes, stopping, protocol),
-                        )),
-                    },
-                    _ = stopping.changed() => return None,
-                }
-            }
-        },
-    );
-    (
-        [
-            (header::CONTENT_TYPE, "text/event-stream"),
-            (header::CACHE_CONTROL, "no-cache"),
-        ],
-        axum::body::Body::from_stream(body),
-    )
-        .into_response()
-}
-
-/// An authenticated route to one peer at the first address that answered.
-struct Link {
+struct ServerLink {
     root: PathBuf,
     peer: String,
     name: String,
@@ -378,96 +189,121 @@ struct Link {
     http: reqwest::Client,
     streaming: reqwest::Client,
 }
-
-impl Link {
-    async fn connect(root: &Path, config: &Config, peer: &PeerCard) -> Result<(Self, VectorReply)> {
-        let credentials: Vec<Credential> = discovery::load(&root.join("sync/peers.yaml"))?;
-        let secret = credentials
+impl ServerLink {
+    async fn connect(root: &Path, config: &Config) -> Result<(Self, HelloReply)> {
+        let peer = config
+            .target
+            .as_ref()
+            .ok_or_else(|| invalid("No sync.server configured"))?;
+        let secrets = discovery::server_credential(root)?;
+        let secret = secrets
             .iter()
-            .find(|c| c.node_id == peer.node.node_id)
-            .ok_or_else(|| invalid("NODE_AUTH_FAILED: peer is not paired"))?;
-        let presence: BTreeMap<String, Presence> =
+            .find(|s| s.node_id == peer.node.node_id)
+            .ok_or_else(|| invalid("NODE_AUTH_FAILED: server is not paired"))?;
+        let states: BTreeMap<String, discovery::Presence> =
             discovery::load(&root.join("sync/presence.yaml"))?;
-        let presence = presence
-            .get(&peer.node.node_id)
-            .cloned()
-            .unwrap_or_default();
-        let connect = Duration::from_secs(config.probe_timeout);
-        let mut last = invalid("NODE_UNREACHABLE: no address answered");
-        for address in discovery::peer_addresses(root, peer, Some(secret), &presence, config)? {
-            let http = match discovery::peer_client(root, &address, connect, Some(REQUEST_TIMEOUT))
-            {
-                Ok(http) => http,
-                Err(e) => {
-                    last = e;
-                    continue;
-                }
-            };
-            let link = Link {
+        let state = states.get(&secret.node_id).cloned().unwrap_or_default();
+        let mut last = invalid("NODE_UNREACHABLE: no server address answered");
+        for address in discovery::server_addresses(root, peer, Some(secret), &state, config)? {
+            let connect = Duration::from_secs(config.probe_timeout);
+            let http = discovery::server_client(root, &address, connect, Some(REQUEST_TIMEOUT))?;
+            let link = Self {
                 root: root.to_path_buf(),
-                peer: peer.node.node_id.clone(),
+                peer: secret.node_id.clone(),
                 name: peer.node.name.clone(),
-                base: format!("http://{address}"),
+                base: address.clone(),
                 token: secret.token.clone(),
                 http,
-                streaming: discovery::peer_client(root, &address, connect, None)?,
+                streaming: discovery::server_client(root, &address, connect, None)?,
             };
-            match link.vector().await {
-                Ok(reply) if reply.node_id == link.peer => {
-                    accept_store_protocol(reply.protocol, reply.min_protocol)?;
+            match link.hello().await {
+                Ok(reply)
+                    if reply.server.node_id == link.peer
+                        && reply.server.role == crate::core::sync::NodeRole::Server =>
+                {
+                    if reply.store_id != Journal::open(root)?.node.store_id
+                        && !ProjectStore::at(root).list()?.is_empty()
+                    {
+                        last = invalid("SYNC_STORE_MISMATCH: use join --fresh");
+                        continue;
+                    }
                     discovery::update_presence(root, &link.peer, |p| {
                         p.last_seen = Some(chrono::Utc::now());
                         p.bye = None;
                     })?;
+                    link.status("ONLINE", "", reply.head)?;
                     return Ok((link, reply));
                 }
-                Ok(_) => last = invalid("NODE_AUTH_FAILED: another node answered"),
+                Ok(_) => last = invalid("SYNC_NOT_A_SERVER: another node answered"),
                 Err(e) => last = e,
             }
         }
         Err(last)
     }
-
+    fn status(&self, code: &str, message: &str, head: u64) -> Result<()> {
+        let route = if self.base.starts_with("https:") {
+            "HTTPS"
+        } else if crate::core::net::is_tailnet_address(&self.base) {
+            "tailnet"
+        } else {
+            "LAN"
+        };
+        atomic_write_text_raw(&self.root.join("sync/server-status.json"),&json!({"code":code,"message":message,"head":head,"route":route,"at":chrono::Local::now().format("%d.%m %H:%M").to_string()}).to_string())
+    }
+    fn auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request
+            .bearer_auth(&self.token)
+            .header("x-kanban-sync-protocol", "3")
+    }
+    async fn response(&self, request: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let reply = self
+            .auth(request)
+            .send()
+            .await
+            .map_err(|e| invalid(format!("NODE_UNREACHABLE: {}: {e}", self.name)))?;
+        if !reply.status().is_success() {
+            let status = reply.status();
+            let body: serde_json::Value = reply.json().await.unwrap_or_default();
+            return Err(invalid(format!(
+                "{} ({status}): {}",
+                body["error"]["code"].as_str().unwrap_or("HTTP_ERROR"),
+                body["error"]["message"].as_str().unwrap_or("")
+            )));
+        }
+        Ok(reply)
+    }
     async fn send<T: serde::de::DeserializeOwned>(
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<T> {
-        let reply = request
-            .bearer_auth(&self.token)
-            .header("x-kanban-sync-protocol", SYNC_PROTOCOL.to_string())
-            .send()
-            .await
-            .map_err(|e| invalid(format!("{}: NODE_UNREACHABLE: {e}", self.name)))?;
-        if !reply.status().is_success() {
-            let status = reply.status();
-            let body: serde_json::Value = reply.json().await.unwrap_or_default();
-            let code = body["error"]["code"].as_str().unwrap_or("HTTP_ERROR");
-            let message = body["error"]["message"].as_str().unwrap_or("");
-            return Err(invalid(format!(
-                "{}: {code} ({status}) {message}",
-                self.name
-            )));
-        }
-        reply
+        self.response(request)
+            .await?
             .json()
             .await
-            .map_err(|e| invalid(format!("{}: {e}", self.name)))
+            .map_err(|e| invalid(e.to_string()))
     }
-
-    async fn vector(&self) -> Result<VectorReply> {
-        self.send(self.http.get(format!("{}/sync/vector", self.base)))
-            .await
+    async fn hello(&self) -> Result<HelloReply> {
+        let journal = Journal::open(&self.root)?;
+        let cursor = Cursor::load(&self.root)?;
+        self.send(
+            self.http
+                .post(format!("{}/sync/v3/hello", self.base))
+                .json(&Hello {
+                    node_card: journal.node,
+                    cursor: Some(serde_json::to_value(cursor).map_err(|e| invalid(e.to_string()))?),
+                    protocol: SYNC_PROTOCOL,
+                    min_protocol: MIN_SYNC_PROTOCOL,
+                }),
+        )
+        .await
     }
-
-    async fn post(&self, operations: Vec<Operation>) -> Result<VersionVector> {
-        for hash in operations
+    async fn post(&self, ops: Vec<Operation>) -> Result<PushReply> {
+        for hash in ops
             .iter()
             .filter_map(Operation::blob_hash)
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
         {
-            let root = self.root.clone();
-            let digest = hash.to_owned();
-            let bytes = blocking(move || Journal::open(&root)?.blob(&digest)).await?;
+            let bytes = Journal::open(&self.root)?.blob(hash)?;
             let _: serde_json::Value = self
                 .send(
                     self.http
@@ -476,293 +312,326 @@ impl Link {
                 )
                 .await?;
         }
-        let ack: Ack = self
-            .send(
-                self.http
-                    .post(format!("{}/sync/ops", self.base))
-                    .json(&Push { operations }),
-            )
-            .await?;
-        Ok(ack.vector)
+        self.send(
+            self.http
+                .post(format!("{}/sync/v3/ops", self.base))
+                .json(&Push { ops }),
+        )
+        .await
     }
-
-    async fn fetch_blobs(&self, operations: &[Operation]) -> Result<()> {
-        for hash in operations
+    async fn fetch_blob(&self, hash: &str) -> Result<()> {
+        if crate::core::sync::transport::has_blob(&self.root, hash)? {
+            return Ok(());
+        }
+        let mut response = self
+            .response(self.http.get(format!("{}/sync/blobs/{hash}", self.base)))
+            .await?;
+        let spool = tempfile::NamedTempFile::new()?;
+        let mut file = tokio::fs::File::create(spool.path()).await?;
+        while let Some(chunk) = response.chunk().await.map_err(|e| invalid(e.to_string()))? {
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        let root = self.root.clone();
+        let hash = hash.to_owned();
+        blocking(move || crate::core::sync::transport::put_blob_file(&root, &hash, spool.path()))
+            .await
+    }
+    async fn fetch_blobs(&self, ops: &[Operation]) -> Result<()> {
+        for hash in ops
             .iter()
             .filter_map(Operation::blob_hash)
-            .collect::<std::collections::BTreeSet<_>>()
+            .collect::<BTreeSet<_>>()
         {
-            let root = self.root.clone();
-            let digest = hash.to_owned();
-            if blocking(move || Ok(Journal::open(&root)?.blob(&digest).is_ok())).await? {
-                continue;
-            }
-            let bytes = self
-                .http
-                .get(format!("{}/sync/blobs/{hash}", self.base))
-                .bearer_auth(&self.token)
-                .send()
-                .await
-                .and_then(reqwest::Response::error_for_status)
-                .map_err(|e| invalid(e.to_string()))?
-                .bytes()
-                .await
-                .map_err(|e| invalid(e.to_string()))?;
-            let root = self.root.clone();
-            let digest = hash.to_owned();
-            blocking(move || Journal::open(&root)?.put_blob(&digest, &bytes)).await?;
+            self.fetch_blob(hash).await?;
         }
         Ok(())
     }
-
-    /// Steps 2 of 10.2: page through everything the peer has and we lack.
-    async fn pull(&self) -> Result<()> {
-        let root = self.root.clone();
-        let mut cursor = blocking(move || Journal::open(&root)?.vector()).await?;
-        loop {
-            let page: Page = self
-                .send(self.http.get(format!(
-                    "{}/sync/ops?after={}&limit={PAGE}",
-                    self.base,
-                    encode_vector(&cursor)
-                )))
-                .await?;
-            if !page.operations.is_empty() {
-                self.fetch_blobs(&page.operations).await?;
-                apply(&self.root, page.operations).await?;
-            }
-            if !page.more || page.next == cursor {
-                return Ok(());
-            }
-            cursor = page.next;
-        }
-    }
-
-    /// Step 3: send what the peer lacks; returns the peer's acknowledged vector.
-    async fn push(&self, acknowledged: VersionVector) -> Result<VersionVector> {
-        let mut acknowledged = acknowledged;
-        let mut cursor = acknowledged.clone();
+    async fn push(&self, cursor: &mut Cursor) -> Result<()> {
+        let journal = Journal::open(&self.root)?;
+        let own = journal.node.node_id.clone();
+        let mut after = journal.vector()?;
+        after.insert(own.clone(), cursor.pushed);
         loop {
             let root = self.root.clone();
-            let after = cursor.clone();
-            let page =
-                blocking(move || Journal::open(&root)?.operations_after(&after, PAGE)).await?;
+            let offset = after.clone();
+            let page = blocking(move || Journal::open(&root)?.operations_after(&offset, PAGE))
+                .await
+                .map_err(|e| {
+                    if e.to_string().contains("SYNC_SNAPSHOT_REQUIRED") {
+                        invalid("SYNC_SERVER_BEHIND: retained outbox cannot repair server rollback")
+                    } else {
+                        e
+                    }
+                })?;
+            if page.operations.is_empty() {
+                return Ok(());
+            }
+            let max = page
+                .operations
+                .iter()
+                .filter(|op| op.hlc.2 == own)
+                .filter_map(|op| op.op.rsplit_once(':')?.1.parse::<u64>().ok())
+                .max()
+                .unwrap_or(cursor.pushed);
+            let reply = self.post(page.operations).await?;
+            let accepted = reply
+                .heads
+                .get(&own)
+                .copied()
+                .unwrap_or(cursor.pushed)
+                .min(max);
+            if accepted <= cursor.pushed {
+                return Err(invalid(
+                    "SYNC_SERVER_BEHIND: server has a gap before the retained outbox",
+                ));
+            }
+            cursor.pushed = accepted;
+            cursor.save(&self.root)?;
+            after.insert(own.clone(), accepted);
+            if !page.more {
+                return Ok(());
+            }
+        }
+    }
+    async fn migrate(&self, cursor: &mut Cursor) -> Result<()> {
+        let journal = Journal::open(&self.root)?;
+        let mut after = journal.state()?.compacted;
+        after.insert(
+            self.peer.clone(),
+            journal.vector()?.get(&self.peer).copied().unwrap_or(0),
+        );
+        loop {
+            let page = journal.operations_after(&after, PAGE)?;
             if page.operations.is_empty() {
                 break;
             }
-            acknowledged = self.post(page.operations).await?;
-            cursor = page.next;
+            let sent: VersionVector = page
+                .operations
+                .iter()
+                .filter_map(|op| {
+                    Some((
+                        op.hlc.2.clone(),
+                        op.op.rsplit_once(':')?.1.parse::<u64>().ok()?,
+                    ))
+                })
+                .fold(BTreeMap::new(), |mut v, (n, s)| {
+                    let e = v.entry(n).or_default();
+                    *e = (*e).max(s);
+                    v
+                });
+            let reply = self.post(page.operations).await?;
+            for (origin, seq) in sent {
+                if reply.heads.get(&origin).copied().unwrap_or(0) < seq {
+                    eprintln!(
+                        "SYNC_MIGRATION_GAP: origin {origin}, retained prefix begins after server head"
+                    );
+                }
+            }
+            cursor.pushed = reply
+                .heads
+                .get(&journal.node.node_id)
+                .copied()
+                .unwrap_or(cursor.pushed);
+            cursor.save(&self.root)?;
+            after = page.next;
             if !page.more {
                 break;
             }
         }
-        let (root, peer, ack) = (self.root.clone(), self.peer.clone(), acknowledged.clone());
-        blocking(move || settings::acknowledge(&root, &peer, &ack)).await?;
-        Ok(acknowledged)
+        cursor.migrating = false;
+        cursor.save(&self.root)
     }
-
-    /// One catch-up cycle. `None` means the peer is waiting to bootstrap.
-    async fn cycle(&self) -> Result<Option<VersionVector>> {
-        let root = self.root.clone();
-        blocking(move || Journal::open(&root)?.reconcile()).await?;
+    async fn consume(&self, page: HubPage, cursor: &mut Cursor) -> Result<bool> {
+        if page.next < cursor.last_seq || page.next > page.head {
+            return Err(invalid("Invalid server sequence page"));
+        }
+        let mut previous = cursor.last_seq;
+        for entry in &page.ops {
+            if entry.seq != previous + 1 {
+                return Err(invalid("SYNC_SNAPSHOT_REQUIRED: noncontiguous hub page"));
+            }
+            previous = entry.seq;
+        }
+        if previous != page.next {
+            return Err(invalid("Invalid server page cursor"));
+        }
+        let ops: Vec<_> = page.ops.into_iter().map(|e| e.op).collect();
+        self.fetch_blobs(&ops).await?;
+        apply(&self.root, ops).await?;
+        cursor.last_seq = page.next;
+        cursor.save(&self.root)?;
+        self.status("ONLINE", "", page.head)?;
+        Ok(page.more)
+    }
+    async fn pull(&self, cursor: &mut Cursor, wait: u64) -> Result<()> {
         loop {
-            let reply = self.vector().await?;
-            let root = self.root.clone();
-            let (node, empty) = blocking(move || {
-                Ok((
-                    Journal::open(&root)?.node,
-                    ProjectStore::at(&root).list()?.is_empty(),
-                ))
-            })
-            .await?;
-            if reply.store_id != node.store_id {
-                // Two empty stores: the larger node_id adopts the other's UUID.
-                if empty && (!reply.empty || node.node_id > reply.node_id) {
-                    self.bootstrap(&reply.store_id).await?;
+            let result = self
+                .send::<HubPage>(self.http.get(format!(
+                    "{}/sync/v3/ops?after={}&limit=500&wait={wait}",
+                    self.base, cursor.last_seq
+                )))
+                .await;
+            let page = match result {
+                Err(e) if e.to_string().contains("SYNC_SNAPSHOT_REQUIRED") => {
+                    let hello = self.hello().await?;
+                    let journal = Journal::open(&self.root)?;
+                    let own = journal
+                        .vector()?
+                        .get(&journal.node.node_id)
+                        .copied()
+                        .unwrap_or(0);
+                    if own > hello.your_head {
+                        return Err(invalid(
+                            "SYNC_SERVER_BEHIND: refusing snapshot with unsent local operations",
+                        ));
+                    }
+                    self.bootstrap(&hello, cursor).await?;
                     continue;
                 }
-                if reply.empty {
-                    return Ok(None);
-                }
-                return Err(invalid(format!(
-                    "{}: SYNC_STORE_MISMATCH: the peer holds another kanban4ai store",
-                    self.name
-                )));
+                other => other?,
+            };
+            if !self.consume(page, cursor).await? {
+                return Ok(());
             }
-            self.pull().await?;
-            let acknowledged = self.push(reply.vector).await?;
-            if node.outbound_only() {
-                self.report_vector().await?;
-            }
-            return Ok(Some(acknowledged));
         }
     }
-
-    async fn report_vector(&self) -> Result<()> {
-        // The server cannot dial an outbound node. Report the post-pull
-        // vector and store identity over the same outbound HTTP path instead.
-        let root = self.root.clone();
-        let request = blocking(move || {
-            let journal = Journal::open(&root)?;
-            Ok(AckRequest {
-                store_id: journal.node.store_id.clone(),
-                vector: journal.vector()?,
-            })
-        })
-        .await?;
-        let _: Push = self
-            .send(
-                self.http
-                    .post(format!("{}/sync/ack", self.base))
-                    .json(&request),
+    async fn bootstrap(&self, hello: &HelloReply, cursor: &mut Cursor) -> Result<()> {
+        let mut response = self
+            .response(
+                self.streaming
+                    .get(format!("{}/sync/v3/snapshot", self.base)),
             )
             .await?;
-        Ok(())
-    }
-
-    async fn bootstrap(&self, store_id: &str) -> Result<()> {
-        let snapshot: Snapshot = self
-            .send(self.http.get(format!("{}/sync/snapshot", self.base)))
-            .await?;
-        if snapshot.store_id != store_id || snapshot.node_id != self.peer {
-            return Err(invalid("snapshot does not match the peer"));
+        let spool = tempfile::NamedTempFile::new()?;
+        let mut file = tokio::fs::File::create(spool.path()).await?;
+        while let Some(chunk) = response.chunk().await.map_err(|e| invalid(e.to_string()))? {
+            file.write_all(&chunk).await?;
+        }
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        let root = self.root.clone();
+        let staged =
+            blocking(move || crate::core::sync::transport::stage_snapshot(&root, spool.path()))
+                .await?;
+        if staged.header.store_id != hello.store_id || staged.header.node_id != self.peer {
+            return Err(invalid("SYNC_STORE_MISMATCH: snapshot identity differs"));
+        }
+        for hash in &staged.blobs {
+            self.fetch_blob(hash).await?;
         }
         let root = self.root.clone();
-        blocking(move || install_snapshot(&root, &snapshot)).await?;
+        blocking(move || staged.install(&root)).await?;
+        *cursor = Cursor::load(&self.root)?;
         changed();
-        println!("sync: replica bootstrapped from {}", self.name);
         Ok(())
     }
-
-    /// Step 4: live operations both ways until the stream breaks.
-    async fn live(&self, acknowledged: VersionVector, interval: Duration) -> Result<()> {
+    async fn cycle(&self, full: bool) -> Result<Cursor> {
         let root = self.root.clone();
-        let local = blocking(move || Journal::open(&root)?.vector()).await?;
-        let mut response = self
-            .streaming
-            .get(format!(
-                "{}/sync/stream?after={}",
-                self.base,
-                encode_vector(&local)
-            ))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .map_err(|e| invalid(format!("{}: {e}", self.name)))?;
-        if !response.status().is_success() {
-            return Err(invalid(format!(
-                "{}: stream {}",
-                self.name,
-                response.status()
-            )));
+        blocking(move || Journal::open(&root)?.reconcile()).await?;
+        let mut hello = self.hello().await?;
+        let journal = Journal::open(&self.root)?;
+        let mut cursor = Cursor::load(&self.root)?;
+        if !cursor.server_node_id.is_empty() && cursor.server_node_id != self.peer {
+            cursor = Cursor::default();
         }
+        if hello.store_id != journal.node.store_id {
+            if !ProjectStore::at(&self.root).list()?.is_empty() {
+                return Err(invalid("SYNC_STORE_MISMATCH: use join --fresh"));
+            }
+            self.bootstrap(&hello, &mut cursor).await?;
+            hello = self.hello().await?;
+        }
+        if cursor.hub_epoch != hello.hub_epoch || cursor.last_seq > hello.head {
+            cursor.last_seq = 0;
+        }
+        cursor.server_node_id = self.peer.clone();
+        cursor.store_id = hello.store_id.clone();
+        cursor.hub_epoch = hello.hub_epoch.clone();
+        cursor.pushed = hello.your_head;
+        cursor.save(&self.root)?;
+        if cursor.migrating {
+            self.migrate(&mut cursor).await?;
+        }
+        self.push(&mut cursor).await?;
+        if full {
+            self.pull(&mut cursor, 0).await?;
+        }
+
+        // Stable = pushed for our own origin and received by every active
+        // client (hello.stable); later concurrent edits still meet our ops here.
+        let mut ack = Journal::open(&self.root)?.vector()?;
+        ack.insert(journal.node.node_id, cursor.pushed);
+        for (origin, seq) in ack.iter_mut() {
+            *seq = (*seq).min(hello.stable.get(origin).copied().unwrap_or(0));
+        }
+        ack.retain(|_, seq| *seq > 0);
+        Journal::open(&self.root)?.prune(&BTreeMap::from([(self.peer.clone(), ack)]))?;
+        Ok(cursor)
+    }
+    async fn upload_logs(&self) -> Result<()> {
+        let journal = Journal::open(&self.root)?;
+        for project in ProjectStore::at(&self.root).list()? {
+            let board = self.root.join("projects").join(&project.id);
+            for task in crate::core::storage::Storage::new(&board).list_tasks(None)? {
+                let Ok(snapshot) = crate::core::runner_log::local_tail(&board, &task.id) else {
+                    continue;
+                };
+                if snapshot.node_id != journal.node.node_id {
+                    continue;
+                }
+                let _: serde_json::Value = self
+                    .send(
+                        self.http
+                            .put(format!(
+                                "{}/sync/v3/logs/{}/{}",
+                                self.base, snapshot.project, snapshot.task
+                            ))
+                            .json(&snapshot),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+    async fn live(&self, mut cursor: Cursor, interval: Duration) -> Result<()> {
+        let mut response = self
+            .response(self.streaming.get(format!(
+                "{}/sync/v3/stream?after={}",
+                self.base, cursor.last_seq
+            )))
+            .await?;
         let mut changes = CHANGED.subscribe();
-        changes.borrow_and_update();
         let mut stopping = STOPPING.subscribe();
         let mut tick = tokio::time::interval(interval);
         tick.tick().await;
-        let mut acknowledged = acknowledged;
-        let mut buffer = String::new();
+        let mut buffer = Vec::new();
         loop {
             tokio::select! {
-                chunk = tokio::time::timeout(KEEPALIVE * 3, response.chunk()) => {
-                    let chunk = match chunk {
-                        Err(_) => return Err(invalid(format!("{}: stream idle", self.name))),
-                        Ok(chunk) => chunk.map_err(|e| invalid(format!("{}: {e}", self.name)))?,
-                    };
-                    let Some(chunk) = chunk else { return Ok(()) };
-                    buffer.push_str(&String::from_utf8_lossy(&chunk));
-                    while let Some(end) = buffer.find("\n\n") {
-                        let event: String = buffer.drain(..end + 2).collect();
-                        for data in event.lines().filter_map(|l| l.strip_prefix("data: ")) {
-                            let operations: Vec<Operation> = serde_json::from_str(data)
-                                .map_err(|e| invalid(e.to_string()))?;
-                            // The sender holds what it streams: skip echoing it back.
-                            for op in &operations {
-                                if let Some((node, seq)) = op.op.rsplit_once(':')
-                                    && let Ok(seq) = seq.parse::<u64>()
-                                {
-                                    let entry = acknowledged.entry(node.to_owned()).or_default();
-                                    *entry = (*entry).max(seq);
-                                }
-                            }
-                            self.fetch_blobs(&operations).await?;
-                            apply(&self.root, operations).await?;
+                result=tokio::time::timeout(KEEPALIVE*3,response.chunk())=>{
+                    let chunk=result.map_err(|_|invalid("SSE idle"))?.map_err(|e|invalid(e.to_string()))?.ok_or_else(||invalid("SSE disconnected"))?;
+                    buffer.extend_from_slice(&chunk);
+                    if buffer.len()>16<<20{return Err(invalid("Oversized SSE event"));}
+                    while let Some(end)=buffer.windows(2).position(|w|w==b"\n\n"){
+                        let event:Vec<_>=buffer.drain(..end+2).collect();
+                        let text=std::str::from_utf8(&event).map_err(|e|invalid(e.to_string()))?;
+                        for data in text.lines().filter_map(|line|line.strip_prefix("data: ")) {
+                            let page:HubPage=serde_json::from_str(data).map_err(|e|invalid(e.to_string()))?;
+                            self.consume(page,&mut cursor).await?;
                         }
+                        // Pull acknowledges only after the event was durably applied.
                     }
                 }
-                result = changes.changed() => {
-                    if result.is_err() { return Ok(()); }
-                    acknowledged = self.push(acknowledged).await?;
-                }
-                _ = tick.tick() => {
-                    match self.cycle().await? {
-                        Some(vector) => acknowledged = vector,
-                        None => return Ok(()),
-                    }
-                }
-                _ = stopping.changed() => return Ok(()),
+                _=changes.changed()=>{self.push(&mut cursor).await?;}
+                _=tick.tick()=>{return Ok(());}
+                _=stopping.changed()=>return Ok(()),
             }
         }
     }
 }
-
-/// Connect, catch up and stay live. `Ok(false)` once the peer is unpaired.
-async fn session(root: &Path, peer_id: &str) -> Result<bool> {
-    let config = discovery::config(root)?;
-    let Some(peer) = config.peers.iter().find(|p| p.node.node_id == peer_id) else {
-        return Ok(false);
-    };
-    if peer.node.outbound_only() {
-        return Ok(false);
-    }
-    // Writes wait in the journal until either LAN or tailnet is available.
-    if !discovery::network_available(root, &config)? {
-        return Ok(true);
-    }
-    let presence: BTreeMap<String, Presence> = discovery::load(&root.join("sync/presence.yaml"))?;
-    if presence.get(peer_id).is_some_and(|p| {
-        p.bye
-            .as_ref()
-            .is_some_and(|bye| p.last_seen.is_none_or(|seen| seen <= bye.at))
-    }) {
-        // NODE_POWERED_OFF until its hello or an mDNS re-announcement.
-        return Ok(true);
-    }
-    let (link, _) = Link::connect(root, &config, peer).await?;
-    let Some(acknowledged) = link.cycle().await? else {
-        return Ok(true);
-    };
-    link.live(acknowledged, Duration::from_secs(config.interval))
-        .await?;
-    Ok(true)
-}
-
-async fn worker(root: PathBuf, peer: String) {
-    let mut kicks = KICK.subscribe();
-    let mut reported = None;
-    loop {
-        match session(&root, &peer).await {
-            Ok(false) => return,
-            Ok(true) => reported = None,
-            Err(e) => {
-                // Log transitions only; a powered-off peer would flood journald.
-                let text = e.to_string();
-                if reported.as_ref() != Some(&text) {
-                    eprintln!("sync {peer}: {text}");
-                    reported = Some(text);
-                }
-            }
-        }
-        let interval = discovery::config(&root).map_or(30, |c| c.interval);
-        kicks.borrow_and_update();
-        tokio::select! {
-            _ = kicks.changed() => (),
-            _ = tokio::time::sleep(Duration::from_secs(interval)) => (),
-        }
-    }
-}
-
 pub(super) struct Running {
     tasks: JoinSet<()>,
 }
@@ -773,673 +642,1075 @@ impl Running {
         while self.tasks.join_next().await.is_some() {}
     }
 }
-
-/// Start the poller for local writes and one worker per paired peer.
-/// Peers paired while serve runs are picked up on the next interval or kick.
 pub(super) fn start(root: &Path) -> Running {
     STOPPING.send_replace(false);
     let mut tasks = JoinSet::new();
     let watched = root.to_path_buf();
     tasks.spawn(async move {
-        // Writers are other processes (TUI, agents' $KANBAN_CMD), so watch
-        // the journal files rather than an in-process event.
         let mut last = change_token(&watched);
         loop {
             tokio::time::sleep(POLL).await;
             let now = change_token(&watched);
             if now != last {
                 last = now;
+                if Journal::open(&watched)
+                    .is_ok_and(|j| j.node.role == crate::core::sync::NodeRole::Server)
+                {
+                    let r = watched.clone();
+                    let _ = blocking(move || crate::core::sync::hub::Hub::open(&r)?.ingest()).await;
+                }
                 changed();
             }
         }
     });
-    let monitor_root = root.to_path_buf();
+    let monitor = root.to_path_buf();
     tasks.spawn(async move {
         loop {
-            if let Err(e) = discovery::probes(&monitor_root).await {
-                eprintln!("runner availability: {e}");
+            let r = monitor.clone();
+            let interval = discovery::config(&monitor).map_or(60, |c| c.run_heartbeat);
+            if let Err(e) = blocking(move || {
+                let journal = Journal::open(&r)?;
+                journal.reconcile()?;
+                if journal.node.role == crate::core::sync::NodeRole::Server {
+                    crate::core::sync::hub::Hub::open(&r)?.maintenance()?;
+                }
+                crate::core::code::reconcile(&r)?;
+                crate::core::wip::publish(&r, interval, false)?;
+                Ok(())
+            })
+            .await
+            {
+                eprintln!("sync reconcile: {e}");
             }
-            let root = monitor_root.clone();
-            let drift_root = root.clone();
-            if crate::core::sync::enabled(&monitor_root) {
-                if let Err(e) = blocking(move || Journal::open(&drift_root)?.reconcile()).await {
-                    eprintln!("drift reconciliation: {e}");
-                }
-                if let Err(e) = blocking(move || crate::core::code::reconcile(&root)).await {
-                    eprintln!("code replication: {e}");
-                }
-                let root = monitor_root.clone();
-                let checkpoint_interval = discovery::config(&root).map_or(60, |c| c.run_heartbeat);
-                if let Err(e) =
-                    blocking(move || crate::core::wip::publish(&root, checkpoint_interval, false))
-                        .await
-                {
-                    eprintln!("WIP publication: {e}");
-                }
-            }
-            let interval = discovery::config(&monitor_root).map_or(30, |c| c.interval);
+            let interval = discovery::config(&monitor).map_or(30, |c| c.interval);
             tokio::time::sleep(Duration::from_secs(interval)).await;
         }
     });
-    let relay_root = root.to_path_buf();
-    tasks.spawn(async move {
-        let mut changes = CHANGED.subscribe();
-        let mut force = false;
-        let mut reported = None;
-        loop {
-            if !crate::core::sync::enabled(&relay_root) {
-                let interval = crate::core::sync::relay::settings(&relay_root)
-                    .map_or(60, |config| config.relay_interval.min(config.log_interval));
+    if Journal::open(root).is_ok_and(|j| j.node.role != crate::core::sync::NodeRole::Server) {
+        let logs = root.to_path_buf();
+        tasks.spawn(async move {
+            let mut reported = None;
+            loop {
+                let config = match discovery::config(&logs) {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                if let Ok((link, _)) = ServerLink::connect(&logs, &config).await {
+                    match link.upload_logs().await {
+                        Ok(()) => reported = None,
+                        Err(e) => {
+                            let text = e.to_string();
+                            if reported.as_ref() != Some(&text) {
+                                eprintln!("runner log upload: {text}");
+                                reported = Some(text);
+                            }
+                        }
+                    }
+                }
+                let interval = match crate::core::runner_log::settings(&logs) {
+                    Ok(s) => s.log_interval,
+                    Err(e) => {
+                        eprintln!("runner log settings: {e}");
+                        return;
+                    }
+                };
                 tokio::time::sleep(Duration::from_secs(interval)).await;
-                continue;
             }
-            let root = relay_root.clone();
-            match blocking(move || crate::core::sync::relay::cycle(&root, force)).await {
-                Ok(count) => {
-                    if count > 0 {
-                        changed();
+        });
+        let root = root.to_path_buf();
+        tasks.spawn(async move{
+            let mut failures=0usize;let mut reported=None;let mut kicks=KICK.subscribe();let mut writes=CHANGED.subscribe();
+            loop {
+                let config=match discovery::config(&root){Ok(c)=>c,Err(e)=>{eprintln!("sync config: {e}");return}};
+                let result=async{
+                    let (link,_)=ServerLink::connect(&root,&config).await?;
+                    let mut cursor=link.cycle(true).await?;
+                    if failures>=2 {
+                        // Long-poll fallback after two broken SSE sessions; retry SSE now and then.
+                        failures=if failures>=12 {0} else {failures+1};
+                        let mut local=CHANGED.subscribe();
+                        tokio::select!{result=link.pull(&mut cursor,25)=>result,_=local.changed()=>Ok(())}
+                    }else{
+                        let result=link.live(cursor,Duration::from_secs(config.interval)).await;
+                        if result.is_err(){failures=failures.saturating_add(1);}else{failures=0;}
+                        result
                     }
-                    reported = None;
+                }.await;
+                if *STOPPING.borrow(){return;}
+                match result {
+                    // A finished live session (safety tick, local write in
+                    // long-poll mode) reconnects at once: no gap without updates.
+                    Ok(())=>{reported=None;continue;}
+                    Err(e)=>{let text=e.to_string();if reported.as_ref()!=Some(&text){eprintln!("sync server: {text}");reported=Some(text.clone());}
+                        let _=atomic_write_text_raw(&root.join("sync/server-status.json"),&json!({"code":"NODE_UNREACHABLE","message":text}).to_string());}
                 }
-                Err(e) => {
-                    let text = e.to_string();
-                    if reported.as_ref() != Some(&text) {
-                        eprintln!("sync relay: {text}");
-                        reported = Some(text);
-                    }
-                }
+                tokio::select!{_=kicks.changed()=>(),_=writes.changed()=>(),_=tokio::time::sleep(Duration::from_secs(config.interval))=>()}
             }
-            // Ignore our own notification; other workers observe the projection.
-            changes.borrow_and_update();
-            let interval = crate::core::sync::relay::settings(&relay_root)
-                .map_or(60, |config| config.relay_interval.min(config.log_interval));
-            force = tokio::select! {
-                _ = changes.changed() => true,
-                _ = tokio::time::sleep(Duration::from_secs(interval)) => false,
-            };
-        }
-    });
-    let root = root.to_path_buf();
-    tasks.spawn(async move {
-        let mut workers = JoinSet::new();
-        let mut active = std::collections::BTreeSet::new();
-        let mut kicks = KICK.subscribe();
-        loop {
-            let config = discovery::config(&root);
-            if let Ok(config) = &config {
-                while let Some(result) = workers.try_join_next() {
-                    if let Ok(id) = result {
-                        active.remove(&id);
-                    }
-                }
-                for peer in &config.peers {
-                    if peer.node.outbound_only() {
-                        continue;
-                    }
-                    let id = peer.node.node_id.clone();
-                    if active.insert(id.clone()) {
-                        let root = root.clone();
-                        workers.spawn(async move {
-                            worker(root, id.clone()).await;
-                            id
-                        });
-                    }
-                }
-            }
-            let interval = config.map_or(30, |c| c.interval);
-            tokio::select! {
-                _ = kicks.changed() => (),
-                _ = tokio::time::sleep(Duration::from_secs(interval)) => (),
-            }
-        }
-        // Unreachable: the JoinSet aborts this task; workers end with it via drop.
-    });
-    Running { tasks }
-}
-
-pub(super) async fn catch_up(root: &Path, peer: &PeerCard) -> Result<()> {
-    let config = discovery::config(root)?;
-    let (link, _) = Link::connect(root, &config, peer).await?;
-    link.cycle()
-        .await?
-        .ok_or_else(|| invalid("Runner replica is not bootstrapped"))?;
-    Ok(())
-}
-
-/// The Sync tab's view of a reachable peer: the route that answered and
-/// the peer's own clone status for each project (`GET /git/<id>/status`).
-pub(super) async fn settings_peer(
-    root: &Path,
-    config: &Config,
-    peer: &PeerCard,
-    projects: &[String],
-) -> Result<(String, Vec<String>)> {
-    let (link, _) = Link::connect(root, config, peer).await?;
-    let route = if crate::core::net::is_tailnet_address(&link.base) {
-        "tailnet"
-    } else {
-        "LAN"
-    };
-    let mut clones = Vec::with_capacity(projects.len());
-    for id in projects {
-        let request = link.http.get(format!("{}/git/{id}/status", link.base));
-        clones.push(match link.send::<serde_json::Value>(request).await {
-            Ok(status) => settings::clone_line(&status),
-            Err(e) => format!("{id}: {e}"),
         });
     }
-    Ok((route.into(), clones))
+    Running { tasks }
 }
-
-/// One catch-up cycle with every paired peer (`serve --sync`, and the tail
-/// push before bye). With `full == false` only pushes local operations.
 pub(super) async fn once(root: &Path, full: bool) -> Result<Vec<(String, Result<()>)>> {
     if !crate::core::sync::enabled(root) {
         return Ok(Vec::new());
     }
-    let drift_root = root.to_path_buf();
-    blocking(move || Journal::open(&drift_root)?.reconcile()).await?;
+    if Journal::open(root)?.node.role == crate::core::sync::NodeRole::Server {
+        let root = root.to_path_buf();
+        blocking(move || crate::core::sync::hub::Hub::open(&root)?.maintenance()).await?;
+        return Ok(Vec::new());
+    }
     let config = discovery::config(root)?;
-    let mut results: Vec<(String, Result<()>)> = Vec::new();
-    let network = discovery::network_available(root, &config)?;
-    for peer in &config.peers {
-        if peer.node.outbound_only() {
-            continue;
-        }
-        if !network {
-            continue;
-        }
-        let result = async {
-            let (link, reply) = Link::connect(root, &config, peer).await?;
-            if full {
-                link.cycle().await?;
-            } else if reply.store_id == Journal::open(root)?.node.store_id {
-                link.push(reply.vector).await?;
-            }
-            Ok(())
-        }
-        .await;
-        results.push((peer.node.name.clone(), result));
+    let Some(server) = config.server.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let result = async {
+        let (link, _) = ServerLink::connect(root, &config).await?;
+        link.cycle(full).await?;
+        link.upload_logs().await?;
+        Ok(())
     }
-    let relay_root = root.to_path_buf();
-    match blocking(move || crate::core::sync::relay::cycle(&relay_root, true)).await {
-        Ok(count) if count > 0 => {
-            // A relay push delivers to the durable remote, not necessarily to a
-            // live peer. Report that distinction instead of claiming HTTP contact.
-            results.retain(|(_, result)| {
-                !result
-                    .as_ref()
-                    .is_err_and(|e| e.to_string().contains("NODE_UNREACHABLE"))
-            });
-            results.push(("git-relay".into(), Ok(())));
-            changed();
-        }
-        Ok(_) => (),
-        Err(e) => results.push(("git-relay".into(), Err(e))),
+    .await;
+    Ok(vec![(server.name.clone(), result)])
+}
+pub(super) async fn catch_up(root: &Path, peer: &ServerCard) -> Result<()> {
+    let config = discovery::config(root)?;
+    if config
+        .server
+        .as_ref()
+        .is_none_or(|s| s.node_id != peer.node.node_id)
+    {
+        return Err(invalid("SYNC_NOT_A_SERVER"));
     }
-    let code_root = root.to_path_buf();
-    if let Err(e) = blocking(move || crate::core::code::reconcile(&code_root)).await {
-        results.push(("code-remote".into(), Err(e)));
+    let (link, _) = ServerLink::connect(root, &config).await?;
+    link.cycle(true).await?;
+    Ok(())
+}
+pub(super) async fn server_nodes(root: &Path) -> Result<Vec<discovery::Status>> {
+    let config = discovery::config(root)?;
+    let (link, _) = ServerLink::connect(root, &config).await?;
+    let nodes: Vec<discovery::Status> = link
+        .send(link.http.get(format!("{}/nodes", link.base)))
+        .await?;
+    atomic_write_text_raw(
+        &root.join("sync/nodes.json"),
+        &serde_json::to_string(&nodes).map_err(|e| invalid(e.to_string()))?,
+    )?;
+    Ok(nodes)
+}
+pub(super) async fn notify_server(root: &Path, reason: Option<&str>) -> Result<()> {
+    let config = discovery::config(root)?;
+    if config.server.is_none() {
+        return Ok(());
     }
-    Ok(results)
+    let (link, _) = ServerLink::connect(root, &config).await?;
+    if let Some(reason) = reason {
+        link.cycle(false).await?;
+        link.upload_logs().await?;
+        let _: serde_json::Value = link
+            .send(
+                link.http
+                    .post(format!("{}/sync/v3/bye", link.base))
+                    .json(&discovery::Bye {
+                        reason: reason.into(),
+                        at: chrono::Utc::now(),
+                    }),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::storage::{NewTask, Storage, atomic_write_text};
-    static NETWORK_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    use crate::core::operations::{Operations, TaskPatch};
+    use crate::core::storage::{NewTask, Storage};
+    use std::future::IntoFuture;
 
-    fn node(role: &str) -> (tempfile::TempDir, String) {
+    static NETWORK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    fn node(name: &str, role: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let id = Journal::open(dir.path()).unwrap().node.node_id;
         fs::write(
             dir.path().join("config.yaml"),
-            format!("node:\n  node_id: {id}\n  name: {role}\n  role: {role}\n"),
+            format!("node:\n  name: {name}\n  role: {role}\nsync:\n  enabled: true\n"),
         )
         .unwrap();
         Journal::open(dir.path()).unwrap();
-        crate::core::sync::enable_sync(dir.path()).unwrap();
-        (dir, id)
+        dir
     }
-
-    /// Pair `local` with `remote`: `token` is what local presents to remote,
-    /// `inbound` what remote presents to local.
-    fn pair(local: &Path, remote: &Path, address: SocketAddr, token: &str, inbound: &str) {
-        let peer = Journal::open(remote).unwrap().node;
-        let own = Journal::open(local).unwrap().node;
-        let role = |r| match r {
-            crate::core::sync::NodeRole::Laptop => "laptop",
-            crate::core::sync::NodeRole::Server => "server",
-            crate::core::sync::NodeRole::Mobile => "mobile",
+    async fn connect(client: &Path, server: &Path, base: &str) -> ServerLink {
+        let node = Journal::open(client).unwrap().node;
+        let server_node = Journal::open(server).unwrap().node;
+        let token = issue_token(server, TokenKind::Node).unwrap();
+        hub::register(server, &node, &token_hash(&token)).unwrap();
+        let credential = discovery::Credential {
+            node_id: server_node.node_id.clone(),
+            token,
+            urls: vec![base.to_owned()],
         };
-        fs::write(
-            local.join("config.yaml"),
-            format!(
-                "node:\n  node_id: {}\n  name: {}\n  role: {}\nsync:\n  interval: 1\n  peers:\n  - node_id: {}\n    name: {}\n    role: {}\n    store_id: {}\n    address: {address}\n",
-                own.node_id, own.name, role(own.role), peer.node_id, peer.name, role(peer.role), peer.store_id
-            ),
+        atomic_write_text_raw(
+            &client.join("sync/server.yaml"),
+            &serde_yaml_ng::to_string(&credential).unwrap(),
         )
         .unwrap();
-        fs::write(
-            local.join("sync/peers.yaml"),
-            format!(
-                "- node_id: {}\n  token: {token}\n  inbound_sha256: {}\n",
-                peer.node_id,
-                token_hash(inbound)
-            ),
-        )
-        .unwrap();
-        fs::write(
-            local.join("sync/tokens.yaml"),
-            format!("tokens:\n- kind: node\n  sha256: {}\n", token_hash(inbound)),
-        )
-        .unwrap();
-        crate::core::sync::enable_sync(local).unwrap();
-    }
-    #[cfg(unix)]
-    #[test]
-    fn managed_magicdns_uses_local_socks_for_authenticated_http_and_streaming() {
-        let _serial = NETWORK_TEST.blocking_lock();
-        STOPPING.send_replace(false);
-        use std::os::unix::fs::PermissionsExt;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        let store = ProjectStore::at(client);
+        let mut config = store.load_global_config().unwrap();
+        config.extras.get_mut("sync").unwrap()["server"] =
+            serde_yaml_ng::to_value(discovery::ServerConfig {
+                node_id: server_node.node_id,
+                name: server_node.name,
+                urls: vec![base.to_owned()],
+            })
             .unwrap();
-        runtime.block_on(async {
-            let (local, _) = node("laptop");
-            let (remote, remote_id) = node("server");
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let destination = listener.local_addr().unwrap();
-            let http_server = tokio::spawn(
-                axum::serve(listener, router(remote.path().join("sync/tokens.yaml"))).into_future(),
-            );
-            let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let unreachable = closed.local_addr().unwrap();
-            drop(closed);
-            let token = "a".repeat(64);
-            pair(
-                local.path(),
-                remote.path(),
-                unreachable,
-                &token,
-                &"b".repeat(64),
-            );
-            fs::write(
-                remote.path().join("sync/tokens.yaml"),
-                format!("tokens:\n- kind: node\n  sha256: {}\n", token_hash(&token)),
-            )
-            .unwrap();
-            let socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let port = socks.local_addr().unwrap().port();
-            let requested = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-            let recorded = requested.clone();
-            let proxy = tokio::spawn(async move {
-                loop {
-                    let (mut incoming, _) = socks.accept().await.unwrap();
-                    let recorded = recorded.clone();
-                    tokio::spawn(async move {
-                        let mut greeting = [0; 2];
-                        incoming.read_exact(&mut greeting).await.unwrap();
-                        assert_eq!(greeting[0], 5);
-                        let mut methods = vec![0; greeting[1] as usize];
-                        incoming.read_exact(&mut methods).await.unwrap();
-                        assert!(methods.contains(&0));
-                        incoming.write_all(&[5, 0]).await.unwrap();
-                        let mut connect = [0; 5];
-                        incoming.read_exact(&mut connect).await.unwrap();
-                        assert_eq!(
-                            &connect[..4],
-                            &[5, 1, 0, 3],
-                            "SOCKS5h must resolve MagicDNS at the proxy"
-                        );
-                        let mut host = vec![0; connect[4] as usize];
-                        incoming.read_exact(&mut host).await.unwrap();
-                        let mut port = [0; 2];
-                        incoming.read_exact(&mut port).await.unwrap();
-                        recorded
-                            .lock()
-                            .await
-                            .push((String::from_utf8(host).unwrap(), u16::from_be_bytes(port)));
-                        let mut outgoing =
-                            tokio::net::TcpStream::connect(destination).await.unwrap();
-                        incoming
-                            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
-                            .await
-                            .unwrap();
-                        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
-                    });
-                }
-            });
-            let mut config: serde_yaml_ng::Value = serde_yaml_ng::from_str(
-                &fs::read_to_string(local.path().join("config.yaml")).unwrap(),
-            )
-            .unwrap();
-            config["sync"]["peers"][0]["tailscale_address"] =
-                serde_yaml_ng::Value::String("runner.example.ts.net:4242".into());
-            config["net"]["tailscale"]["mode"] = serde_yaml_ng::Value::String("managed".into());
-            config["net"]["tailscale"]["socks_port"] = serde_yaml_ng::Value::from(port);
-            fs::write(
-                local.path().join("config.yaml"),
-                serde_yaml_ng::to_string(&config).unwrap(),
-            )
-            .unwrap();
-            let bin = local.path().join("net/bin");
-            fs::create_dir_all(&bin).unwrap();
-            fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
-            for (name, script) in [
-                ("tailscaled", "#!/bin/sh\nwhile :; do sleep 1; done\n"),
-                (
-                    "tailscale",
-                    "#!/bin/sh\necho '{\"BackendState\":\"Running\"}'\n",
-                ),
-            ] {
-                let path = bin.join(name);
-                fs::write(&path, script).unwrap();
-                fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-            }
-            let mut manager = crate::core::net::Manager::new(local.path()).unwrap();
-            manager.tick().unwrap();
-            let config = discovery::config(local.path()).unwrap();
-            let (link, vector) = Link::connect(local.path(), &config, &config.peers[0])
-                .await
-                .unwrap();
-            assert_eq!(vector.node_id, remote_id);
-            assert_eq!(link.base, "http://runner.example.ts.net:4242");
-            let mut response = tokio::time::timeout(
-                KEEPALIVE + Duration::from_secs(3),
-                link.streaming
-                    .get(format!("{}/sync/stream", link.base))
-                    .bearer_auth(&token)
-                    .send(),
-            )
+        store.save_global_config(&config).unwrap();
+        ServerLink::connect(client, &discovery::config(client).unwrap())
             .await
             .unwrap()
+            .0
+    }
+    async fn http(root: &Path) -> (tokio::task::JoinHandle<std::io::Result<()>>, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(
+            axum::serve(listener, router(root.join("sync/tokens.yaml"))).into_future(),
+        );
+        (server, base)
+    }
+    fn project(root: &Path, work: &Path) -> crate::core::project::Project {
+        fs::create_dir_all(work).unwrap();
+        let p = ProjectStore::at(root).add(work, None).unwrap().project;
+        Storage::new(&p.data_root).init_board().unwrap();
+        p
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_clients_offline_edits_push_before_pull_and_converge() {
+        let _serial = NETWORK.lock().await;
+        let server = node("server", "server");
+        let a = node("laptop", "laptop");
+        let b = node("phone", "mobile");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        let initial = Storage::new(&p.data_root)
+            .create_task(NewTask::titled("shared"))
             .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.headers()["content-type"], "text/event-stream");
-            assert!(
-                tokio::time::timeout(KEEPALIVE + Duration::from_secs(3), response.chunk())
-                    .await
+        let (http, base) = http(server.path()).await;
+        let la = connect(a.path(), server.path(), &base).await;
+        let lb = connect(b.path(), server.path(), &base).await;
+        la.cycle(true).await.unwrap();
+        lb.cycle(true).await.unwrap();
+        let pa = ProjectStore::at(a.path()).get(&p.id).unwrap().unwrap();
+        let pb = ProjectStore::at(b.path()).get(&p.id).unwrap().unwrap();
+        Operations::for_project(&pa)
+            .update_task(
+                &initial.id,
+                TaskPatch {
+                    title: Some("from laptop".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        Operations::for_project(&pb)
+            .update_task(
+                &initial.id,
+                TaskPatch {
+                    title: Some("from phone".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        Storage::new(&pa.data_root)
+            .create_task(NewTask::titled("offline a"))
+            .unwrap();
+        Storage::new(&pb.data_root)
+            .create_task(NewTask::titled("offline b"))
+            .unwrap();
+        la.cycle(true).await.unwrap();
+        lb.cycle(true).await.unwrap();
+        la.cycle(true).await.unwrap();
+        let expected = Storage::new(&p.data_root)
+            .load_task(&initial.id)
+            .unwrap()
+            .unwrap()
+            .title;
+        assert_eq!(
+            Storage::new(&pa.data_root)
+                .load_task(&initial.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            expected
+        );
+        assert_eq!(
+            Storage::new(&pb.data_root)
+                .load_task(&initial.id)
+                .unwrap()
+                .unwrap()
+                .title,
+            expected
+        );
+        for root in [a.path(), b.path(), server.path()] {
+            assert_eq!(
+                Storage::new(root.join("projects").join(&p.id))
+                    .list_tasks(None)
                     .unwrap()
+                    .len(),
+                3
+            );
+        }
+        let cursor = Cursor::load(a.path()).unwrap();
+        assert!(cursor.last_seq > 0 && cursor.pushed > 0);
+        assert_eq!(
+            Journal::open(a.path()).unwrap().vector().unwrap(),
+            Journal::open(b.path()).unwrap().vector().unwrap()
+        );
+        // The same LWW winner and the same title conflict record on all three replicas.
+        let conflicts: Vec<_> = [a.path(), b.path(), server.path()]
+            .iter()
+            .map(|root| {
+                let mut found: Vec<_> = Journal::open(root)
                     .unwrap()
-                    .is_some()
-            );
-            drop(response);
-            let rejected = link
-                .http
-                .get(format!("{}/sync/vector", link.base))
-                .bearer_auth("revoked")
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
-            let routes = requested.lock().await;
-            assert!(
-                routes
-                    .iter()
-                    .all(|(host, port)| host == "runner.example.ts.net" && *port == 4242)
-            );
-            drop(routes);
-            drop(link);
-            drop(manager);
-            proxy.abort();
-            http_server.abort();
-        });
+                    .conflicts()
+                    .unwrap()
+                    .into_iter()
+                    .filter(|c| c.entity == "task" && c.field == "title")
+                    .map(|c| (c.winner, c.loser, c.winner_value))
+                    .collect();
+                found.sort_by(|x, y| (&x.0, &x.1).cmp(&(&y.0, &y.1)));
+                found
+            })
+            .collect();
+        assert_eq!(conflicts[0].len(), 1, "{conflicts:?}");
+        assert_eq!(conflicts[0], conflicts[1]);
+        assert_eq!(conflicts[0], conflicts[2]);
+        assert_eq!(conflicts[0][0].2, json!(expected));
+        http.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_unavailable_keeps_everything_local_then_delivers() {
+        let _serial = NETWORK.lock().await;
+        let server = node("server", "server");
+        let client = node("laptop", "laptop");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        let shared = Storage::new(&p.data_root)
+            .create_task(NewTask::titled("shared"))
+            .unwrap();
+        let (running, base) = http(server.path()).await;
+        let mut link = connect(client.path(), server.path(), &base).await;
+        link.cycle(true).await.unwrap();
+        running.abort();
+        let _ = running.await;
+        let local = ProjectStore::at(client.path()).get(&p.id).unwrap().unwrap();
+        let started = std::time::Instant::now();
+        let ops = Operations::for_project(&local);
+        let created = ops
+            .create_task(NewTask::titled("written while the server is down"))
+            .unwrap();
+        ops.update_task(
+            &shared.id,
+            TaskPatch {
+                title: Some("edited offline".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        ops.move_task(&created.id, "in_progress", false).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "local writes waited for the network"
+        );
+        let results = once(client.path(), true).await.unwrap();
+        assert!(
+            results[0]
+                .1
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("NODE_UNREACHABLE")),
+            "{:?}",
+            results[0].1.as_ref().err()
+        );
+        assert!(
+            own_outbox(client.path()).len() >= 3,
+            "outbox holds the offline writes"
+        );
+        let (restored, new_base) = http(server.path()).await;
+        link.base = new_base;
+        link.cycle(true).await.unwrap();
+        assert!(own_outbox(client.path()).is_empty());
+        let board = Storage::new(&p.data_root);
+        assert_eq!(
+            board.load_task(&shared.id).unwrap().unwrap().title,
+            "edited offline"
+        );
+        assert!(board.task_exists(&created.id));
+        restored.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn protocol_auth_duplicate_push_and_server_only_routes() {
+        let _serial = NETWORK.lock().await;
+        let server = node("server", "server");
+        let client = node("laptop", "laptop");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        Storage::new(&p.data_root)
+            .create_task(NewTask::titled("initial"))
+            .unwrap();
+        let (http, base) = http(server.path()).await;
+        let link = connect(client.path(), server.path(), &base).await;
+        link.cycle(true).await.unwrap();
+        let no_auth = reqwest::Client::new()
+            .get(format!("{base}/sync/v3/ops"))
+            .header("x-kanban-sync-protocol", "3")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(no_auth.status(), StatusCode::UNAUTHORIZED);
+        let old = link
+            .http
+            .get(format!("{base}/sync/v3/ops"))
+            .bearer_auth(&link.token)
+            .header("x-kanban-sync-protocol", "2")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(old.status(), StatusCode::UPGRADE_REQUIRED);
+        let old = link
+            .http
+            .get(format!("{base}/sync/vector"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(old.status(), StatusCode::UPGRADE_REQUIRED);
+        let journal = Journal::open(server.path()).unwrap();
+        let ops = journal
+            .operations_after(&VersionVector::new(), 200)
+            .unwrap()
+            .operations;
+        let head = link.post(ops.clone()).await.unwrap().head;
+        let again = link.post(ops.clone()).await.unwrap().head;
+        assert_eq!(head, again);
+        let mut future = ops.clone();
+        future[0].v = 2;
+        let error = link.post(future).await.err().unwrap().to_string();
+        assert!(error.contains("SYNC_OP_FORMAT_TOO_NEW"), "{error}");
+        let raw = link
+            .http
+            .get(format!("{base}/sync/v3/ops?after=0&limit=1"))
+            .bearer_auth(&link.token)
+            .header("x-kanban-sync-protocol", "3")
+            .send()
+            .await
+            .unwrap();
+        let page: serde_json::Value = raw.json().await.unwrap();
+        assert_eq!(page["ops"].as_array().unwrap().len(), 1);
+        assert_eq!(page["next"], 1);
+        let token = issue_token(client.path(), TokenKind::Node).unwrap();
+        let (other, client_base) = http_client(client.path()).await;
+        let response = link
+            .http
+            .get(format!("{client_base}/sync/v3/ops"))
+            .header("x-kanban-sync-protocol", "3")
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "SYNC_NOT_A_SERVER"
+        );
+        other.abort();
+        http.abort();
+    }
+    async fn http_client(root: &Path) -> (tokio::task::JoinHandle<std::io::Result<()>>, String) {
+        http(root).await
+    }
+    #[test]
+    fn cursor_roundtrip_keeps_migration_and_outbox_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("sync")).unwrap();
+        let cursor = Cursor {
+            server_node_id: "server".into(),
+            store_id: "store".into(),
+            hub_epoch: "epoch".into(),
+            last_seq: 9,
+            pushed: 4,
+            migrating: true,
+        };
+        cursor.save(dir.path()).unwrap();
+        let loaded = Cursor::load(dir.path()).unwrap();
+        assert_eq!(
+            (loaded.last_seq, loaded.pushed, loaded.migrating),
+            (9, 4, true)
+        );
+    }
+    #[test]
+    fn server_url_accepts_tls_and_rejects_credentials_and_redirect_paths() {
+        assert_eq!(
+            discovery::base_url("https://sync.example.test")
+                .unwrap()
+                .scheme(),
+            "https"
+        );
+        assert!(discovery::base_url("http://user:password@example.test").is_err());
+        assert!(discovery::base_url("https://example.test/store").is_err());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn longpoll_sse_and_streaming_snapshot_are_server_mediated() {
+        let _serial = NETWORK.lock().await;
+        STOPPING.send_replace(false);
+        let server = node("server", "server");
+        let client = node("laptop", "laptop");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        let storage = Storage::new(&p.data_root);
+        storage.create_task(NewTask::titled("initial")).unwrap();
+        fs::create_dir_all(p.data_root.join(".kanban/assets/images")).unwrap();
+        fs::write(
+            p.data_root.join(".kanban/assets/images/test.png"),
+            [0, 255, 1, 128],
+        )
+        .unwrap();
+        fs::create_dir_all(p.data_root.join(".kanban/context")).unwrap();
+        fs::write(p.data_root.join(".kanban/context/local.txt"), "private").unwrap();
+        let (http, base) = http(server.path()).await;
+        let link = connect(client.path(), server.path(), &base).await;
+        let cursor = link.cycle(true).await.unwrap();
+        let image = client
+            .path()
+            .join("projects")
+            .join(&p.id)
+            .join(".kanban/assets/images/test.png");
+        assert_eq!(fs::read(image).unwrap(), [0, 255, 1, 128]);
+        let response = link
+            .response(link.http.get(format!("{base}/sync/v3/snapshot")))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/x-ndjson"
+        );
+        let data = response.bytes().await.unwrap();
+        let text = std::str::from_utf8(&data).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records.first().unwrap()["kind"], "header");
+        assert_eq!(records.last().unwrap()["kind"], "end");
+        assert!(!text.contains("context/local.txt"));
+        assert!(
+            records.iter().any(|r| r["kind"] == "blob"
+                && r["path"].as_str().is_some_and(|p| p.ends_with("test.png")))
+        );
+        let incomplete = tempfile::NamedTempFile::new().unwrap();
+        fs::write(
+            incomplete.path(),
+            text.lines()
+                .take(records.len() - 1)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        assert!(
+            crate::core::sync::transport::stage_snapshot(client.path(), incomplete.path()).is_err()
+        );
+        let request = link.auth(link.http.get(format!(
+            "{base}/sync/v3/ops?after={}&wait=5",
+            cursor.last_seq
+        )));
+        let pending = tokio::spawn(async move { request.send().await.unwrap() });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        storage
+            .create_task(NewTask::titled("longpoll write"))
+            .unwrap();
+        changed();
+        let page: serde_json::Value = tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(!page["ops"].as_array().unwrap().is_empty());
+        let after = page["next"].as_u64().unwrap();
+        let mut stream = link
+            .response(
+                link.streaming
+                    .get(format!("{base}/sync/v3/stream?after={after}")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stream.headers()["x-accel-buffering"], "no");
+        storage.create_task(NewTask::titled("SSE write")).unwrap();
+        changed();
+        let chunk = tokio::time::timeout(Duration::from_secs(3), stream.chunk())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(std::str::from_utf8(&chunk).unwrap().contains("event: ops"));
+        // Delivery alone is not a durable acknowledgement.
+        let clients: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(server.path().join("sync/hub/clients.json")).unwrap(),
+        )
+        .unwrap();
+        let id = Journal::open(client.path()).unwrap().node.node_id;
+        assert_eq!(clients[&id]["cursor"].as_u64().unwrap(), after);
+        drop(stream);
+        http.abort();
     }
 
-    async fn wait_for(what: &str, check: impl Fn() -> bool) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while !check() {
-            assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    fn own_outbox(root: &Path) -> Vec<Operation> {
+        let journal = Journal::open(root).unwrap();
+        let pushed = Cursor::load(root).unwrap().pushed;
+        journal
+            .operations(Some(&journal.node.node_id))
+            .unwrap()
+            .into_iter()
+            .filter(|op| {
+                op.op
+                    .rsplit_once(':')
+                    .and_then(|(_, seq)| seq.parse::<u64>().ok())
+                    .is_some_and(|seq| seq > pushed)
+            })
+            .collect()
+    }
+    fn copy_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let path = entry.unwrap().path();
+            let dest = target.join(path.file_name().unwrap());
+            if path.is_dir() {
+                copy_tree(&path, &dest);
+            } else {
+                fs::copy(path, dest).unwrap();
+            }
         }
     }
-
-    #[test]
-    fn empty_server_bootstraps_then_live_stream_converges() {
-        let _serial = NETWORK_TEST.blocking_lock();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn restart_repairs_torn_hub_tail_and_apply_before_ingest() {
+        use std::io::Write;
+        let _serial = NETWORK.lock().await;
+        let server = node("server", "server");
+        let client = node("laptop", "laptop");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        Storage::new(&p.data_root)
+            .create_task(NewTask::titled("initial"))
             .unwrap();
-        runtime.block_on(async {
-            let (laptop, _) = node("laptop");
-            let (server, server_id) = node("server");
-            let a = laptop.path().to_path_buf();
-            let b = server.path().to_path_buf();
-            // Laptop data, including machine-local fields and a binary asset.
-            let board = Storage::new(a.join("projects/demo"));
-            board.init_board().unwrap();
-            atomic_write_text(
-                &board.project_path.join("project.yaml"),
-                "id: demo\nname: Demo\nwork_path: /home/me/demo\ncreated_at: '2026-01-01T00:00:00'\n",
-            )
+        let (running, base) = http(server.path()).await;
+        let mut link = connect(client.path(), server.path(), &base).await;
+        let cursor = link.cycle(true).await.unwrap();
+        let epoch = crate::core::sync::hub::Hub::open(server.path())
+            .unwrap()
+            .epoch()
             .unwrap();
-            let first = board.create_task(NewTask::titled("first")).unwrap();
-            let path = board.tasks_dir.join(format!("todo/{}.md", first.id));
-            let text = fs::read_to_string(&path).unwrap();
-            fs::write(&path, text.replacen("---\n", "---\nsession: ses-local\n", 1)).unwrap();
-            fs::create_dir_all(board.project_path.join(".kanban/assets/images")).unwrap();
-            fs::write(board.project_path.join(".kanban/assets/images/a.png"), [0u8, 159, 146, 150]).unwrap();
-
-            let la = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let lb = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let (aa, ab) = (la.local_addr().unwrap(), lb.local_addr().unwrap());
-            let (t_ab, t_ba) = ("a".repeat(64), "b".repeat(64));
-            pair(&a, &b, ab, &t_ab, &t_ba);
-            pair(&b, &a, aa, &t_ba, &t_ab);
-            let sa = tokio::spawn(axum::serve(la, router(a.join("sync/tokens.yaml"))).into_future());
-            let sb = tokio::spawn(axum::serve(lb, router(b.join("sync/tokens.yaml"))).into_future());
-
-            // The empty server adopts the laptop store.
-            let config = discovery::config(&b).unwrap();
-            let (to_laptop, _) = Link::connect(&b, &config, &config.peers[0]).await.unwrap();
-            to_laptop.cycle().await.unwrap().unwrap();
-            let (ja, jb) = (Journal::open(&a).unwrap(), Journal::open(&b).unwrap());
-            assert_eq!(jb.node.store_id, ja.node.store_id);
-            assert_eq!(jb.node.name, "server");
-            let copy = Storage::new(b.join("projects/demo"));
-            let task = fs::read_to_string(copy.tasks_dir.join(format!("todo/{}.md", first.id))).unwrap();
-            assert!(task.contains("first") && !task.contains("ses-local"), "{task}");
-            let project = fs::read_to_string(b.join("projects/demo/project.yaml")).unwrap();
-            assert!(!project.contains("/home/me/demo"), "{project}");
-            assert_eq!(
-                fs::read(b.join("projects/demo/.kanban/assets/images/a.png")).unwrap(),
-                [0u8, 159, 146, 150]
-            );
-            // Post-bootstrap attachments travel by hash over the authenticated blob route.
-            let image = ".kanban/assets/images/incremental.png";
-            fs::write(board.project_path.join(image), [255, 0, 128, 7]).unwrap();
-            to_laptop.cycle().await.unwrap();
-            assert_eq!(fs::read(copy.project_path.join(image)).unwrap(), [255, 0, 128, 7]);
-            let rules = ".kanban/instructions/executor.md";
-            fs::create_dir_all(copy.project_path.join(".kanban/instructions")).unwrap();
-            fs::write(copy.project_path.join(rules), "Remote instructions").unwrap();
-            to_laptop.cycle().await.unwrap();
-            assert_eq!(fs::read_to_string(board.project_path.join(rules)).unwrap(), "Remote instructions");
-            fs::remove_file(board.project_path.join(image)).unwrap();
-            to_laptop.cycle().await.unwrap();
-            assert!(!copy.project_path.join(image).exists());
-            let rejected = to_laptop.http.put(format!("{}/sync/blobs/{}", to_laptop.base, "0".repeat(64)))
-                .bearer_auth(&to_laptop.token).body("wrong bytes").send().await.unwrap();
-            assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
-            assert!(discovery::config(&b).unwrap().peers.len() == 1);
-            assert!(install_snapshot(&a, &ja.snapshot().unwrap()).unwrap_err().to_string().contains("SYNC_STORE_MISMATCH"));
-
-            let config = discovery::config(&a).unwrap();
-            let (to_server, _) = Link::connect(&a, &config, &config.peers[0]).await.unwrap();
-            let acknowledged = to_server.cycle().await.unwrap().unwrap();
-            assert_eq!(ja.vector().unwrap(), jb.vector().unwrap());
-
-            // Live: a server write reaches the laptop through the SSE stream.
-            let live = tokio::spawn(async move { to_server.live(acknowledged, Duration::from_secs(3600)).await });
-            let remote = copy.create_task(NewTask::titled("from server")).unwrap();
-            changed();
-            let (root, id) = (a.join("projects/demo"), remote.id.clone());
-            wait_for("server task on laptop", move || Storage::new(&root).task_exists(&id)).await;
-            assert_ne!(remote.id, board.create_task(NewTask::titled("from laptop")).unwrap().id);
-            // ...and a laptop write is pushed to the server on the change signal.
-            changed();
-            let root = b.join("projects/demo");
-            wait_for("laptop task on server", move || Storage::new(&root).list_tasks(None).unwrap().len() == 3).await;
-            // The task file lands before the server's journal records the batch.
-            wait_for("vectors converge", || ja.vector().unwrap() == jb.vector().unwrap()).await;
-            assert!(!server_id.is_empty());
-            live.abort();
-            sa.abort();
-            sb.abort();
-        });
-    }
-
-    #[test]
-    fn mobile_outbound_worker_bootstraps_pushes_pulls_and_announces_lifecycle() {
-        let _serial = NETWORK_TEST.blocking_lock();
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
-            .enable_all()
-            .build()
+        let board = Storage::new(client.path().join("projects").join(&p.id));
+        let task = board
+            .create_task(NewTask::titled("apply committed before hub append"))
             .unwrap();
-        runtime.block_on(async {
-            let (mobile, mobile_id) = node("mobile");
-            let (server, _) = node("server");
-            let (a, b) = (mobile.path(), server.path());
-            let board = Storage::new(b.join("projects/demo"));
-            board.init_board().unwrap();
-            atomic_write_text(
-                &board.project_path.join("project.yaml"),
-                "id: demo\nname: Demo\nwork_path: /tmp/demo\ncreated_at: '2026-01-01T00:00:00'\n",
-            )
+        let operations = own_outbox(client.path());
+        assert!(!operations.is_empty());
+        Journal::open(server.path())
+            .unwrap()
+            .apply_remote(&operations, 300_000)
             .unwrap();
-            let first = board
-                .create_task(NewTask::titled("server initial"))
-                .unwrap();
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            let (outbound, inbound) = ("c".repeat(64), "d".repeat(64));
-            pair(a, b, address, &outbound, &inbound);
-            // There is deliberately no mobile listener.
-            pair(b, a, "127.0.0.1:1".parse().unwrap(), &inbound, &outbound);
-            assert!(!session(b, &mobile_id).await.unwrap());
-            assert!(once(b, true).await.unwrap().is_empty());
-            use std::sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering},
-            };
-            let hello = Arc::new(AtomicUsize::new(0));
-            let bye = Arc::new(AtomicUsize::new(0));
-            let (hellos, byes) = (hello.clone(), bye.clone());
-            let app = router(b.join("sync/tokens.yaml")).layer(axum::middleware::from_fn(
-                move |request: Request, next: Next| {
-                    let (hellos, byes) = (hellos.clone(), byes.clone());
-                    async move {
-                        match request.uri().path() {
-                            "/sync/hello" => {
-                                hellos.fetch_add(1, Ordering::SeqCst);
-                            }
-                            "/sync/bye" => {
-                                byes.fetch_add(1, Ordering::SeqCst);
-                            }
-                            _ => (),
-                        }
-                        next.run(request).await
-                    }
-                },
-            ));
-            let server_http = tokio::spawn(axum::serve(listener, app).into_future());
-            discovery::update_presence(b, &mobile_id, |p| {
-                p.bye = Some(discovery::Bye {
-                    reason: "shutdown".into(),
-                    at: chrono::Utc::now(),
-                });
-            })
+        running.abort();
+        let _ = running.await;
+        let mut segments: Vec<_> = fs::read_dir(server.path().join("sync/hub/log"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        segments.sort();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(segments.last().unwrap())
+            .unwrap()
+            .write_all(b"{\"seq\":")
             .unwrap();
-            let owner = Embedded::start(a).unwrap();
-            let copy = Storage::new(a.join("projects/demo"));
-            wait_for("mobile bootstrap", || copy.task_exists(&first.id)).await;
-            let presence = || {
-                discovery::load::<BTreeMap<String, Presence>>(&b.join("sync/presence.yaml"))
-                    .unwrap()
-            };
-            assert!(presence()[&mobile_id].bye.is_none());
-            assert_eq!(hello.load(Ordering::SeqCst), 1);
-            let follower = Embedded::start(a).unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            drop(follower);
-            assert_eq!(hello.load(Ordering::SeqCst), 1);
-            assert_eq!(bye.load(Ordering::SeqCst), 0);
-            wait_for("mobile acknowledgement", || {
-                fs::read_to_string(b.join("sync/exchanges.yaml"))
-                    .is_ok_and(|text| text.contains(&mobile_id))
-            })
-            .await;
-            let mobile_task = copy
-                .create_task(NewTask::titled("mobile offline write"))
-                .unwrap();
-            wait_for("mobile push", || board.task_exists(&mobile_task.id)).await;
-            let server_task = board
-                .create_task(NewTask::titled("server live write"))
-                .unwrap();
-            changed();
-            wait_for("mobile SSE pull", || copy.task_exists(&server_task.id)).await;
-            let serving = Embedded::serving(a).unwrap();
-            wait_for("serve takeover", || hello.load(Ordering::SeqCst) == 2).await;
-            drop(owner);
-            assert_eq!(bye.load(Ordering::SeqCst), 0);
-            assert!(presence()[&mobile_id].bye.is_none());
-            drop(serving);
-            assert!(presence()[&mobile_id].bye.is_some());
-            assert_eq!(bye.load(Ordering::SeqCst), 1);
-            tokio::time::sleep(POLL * 2).await;
-            assert!(presence()[&mobile_id].bye.is_some());
-            server_http.abort();
-            // Bootstrap replaces the mobile store UUID. Its authenticated
-            // acknowledgement must also update the server's trusted relay peer.
-            let remote = tempfile::tempdir().unwrap();
-            assert!(
-                std::process::Command::new("git")
-                    .args(["init", "--bare", "--quiet"])
-                    .arg(remote.path())
-                    .status()
-                    .unwrap()
-                    .success()
-            );
-            for root in [a, b] {
-                let path = root.join("config.yaml");
-                let mut config: serde_yaml_ng::Value = discovery::load(&path).unwrap();
-                config["sync"]["relay_remote"] =
-                    serde_yaml_ng::Value::String(remote.path().display().to_string());
-                atomic_write_text_raw(&path, &serde_yaml_ng::to_string(&config).unwrap()).unwrap();
-            }
-            let offline = copy
-                .create_task(NewTask::titled("mobile relay after bootstrap"))
-                .unwrap();
-            crate::core::sync::relay::cycle(a, true).unwrap();
-            crate::core::sync::relay::cycle(b, true).unwrap();
-            assert!(
-                board.task_exists(&offline.id),
-                "server must accept post-bootstrap mobile relay writes"
-            );
-        });
-    }
-
-    #[test]
-    fn vector_cursor_round_trips_and_rejects_injection() {
-        let vector = VersionVector::from([
-            ("6f1c0000-0000-4000-8000-000000000001".into(), 7),
-            ("a1b2".into(), 0),
-        ]);
-        let text = encode_vector(&vector);
-        assert_eq!(text, "6f1c0000-0000-4000-8000-000000000001:7");
+        hub::initialize(server.path()).unwrap();
+        let state: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(server.path().join("sync/hub/clients.json")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            decode_vector(&text).unwrap(),
-            VersionVector::from([("6f1c0000-0000-4000-8000-000000000001".into(), 7)])
+            state[&Journal::open(client.path()).unwrap().node.node_id]["cursor"],
+            cursor.last_seq
         );
-        assert!(decode_vector("../x:1").is_err());
-        assert!(decode_vector("node:x").is_err());
-        assert!(decode_vector("").unwrap().is_empty());
+        let (restarted, new_base) = http(server.path()).await;
+        link.base = new_base;
+        let resumed = link.cycle(true).await.unwrap();
+        assert_eq!(resumed.hub_epoch, epoch);
+        assert!(resumed.last_seq > cursor.last_seq);
+        assert!(Storage::new(&p.data_root).task_exists(&task.id));
+        assert_eq!(
+            Journal::open(client.path()).unwrap().vector().unwrap(),
+            Journal::open(server.path()).unwrap().vector().unwrap()
+        );
+        restarted.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn server_rollback_rewinds_receipt_and_repushes_retained_outbox() {
+        let _serial = NETWORK.lock().await;
+        let server = node("server", "server");
+        let client = node("laptop", "laptop");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        Storage::new(&p.data_root)
+            .create_task(NewTask::titled("initial"))
+            .unwrap();
+        let (running, base) = http(server.path()).await;
+        let mut link = connect(client.path(), server.path(), &base).await;
+        let mut cursor = link.cycle(true).await.unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        copy_tree(server.path(), backup.path());
+        let copy = Storage::new(client.path().join("projects").join(&p.id));
+        let task = copy
+            .create_task(NewTask::titled("must survive server rollback"))
+            .unwrap();
+        // Preserve the retained prefix to exercise successful resend, without pruning.
+        link.push(&mut cursor).await.unwrap();
+        link.pull(&mut cursor, 0).await.unwrap();
+        let pushed = cursor.pushed;
+        assert!(pushed > 0);
+        running.abort();
+        let _ = running.await;
+        fs::remove_dir_all(server.path()).unwrap();
+        copy_tree(backup.path(), server.path());
+        fs::remove_file(server.path().join("sync/hub/epoch")).unwrap();
+        hub::initialize(server.path()).unwrap();
+        let (restored, new_base) = http(server.path()).await;
+        link.base = new_base;
+        let hello = link.hello().await.unwrap();
+        assert!(hello.your_head < pushed);
+        let resumed = link.cycle(true).await.unwrap();
+        assert!(resumed.pushed >= pushed);
+        assert_eq!(resumed.hub_epoch, hello.hub_epoch);
+        assert!(Storage::new(&p.data_root).task_exists(&task.id));
+        assert!(copy.task_exists(&task.id));
+        restored.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lagging_client_pages_then_pushes_outbox_before_compacted_snapshot() {
+        let _serial = NETWORK.lock().await;
+        let server = node("server", "server");
+        let lagging = node("phone", "mobile");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        let store = ProjectStore::at(server.path());
+        let mut config = store.load_global_config().unwrap();
+        config.extras.get_mut("sync").unwrap()["journal"] =
+            serde_yaml_ng::from_str("segment_bytes: 256").unwrap();
+        config.extras.get_mut("sync").unwrap()["hub"] =
+            serde_yaml_ng::from_str("client_ttl_days: 0").unwrap();
+        store.save_global_config(&config).unwrap();
+        let source = Storage::new(&p.data_root);
+        source.create_task(NewTask::titled("initial")).unwrap();
+        let (running, base) = http(server.path()).await;
+        let link = connect(lagging.path(), server.path(), &base).await;
+        let initial = link.cycle(true).await.unwrap();
+        let copy = Storage::new(lagging.path().join("projects").join(&p.id));
+        let offline = copy
+            .create_task(NewTask::titled("offline outbox retained across snapshot"))
+            .unwrap();
+        for n in 0..300 {
+            source
+                .create_task(NewTask::titled(format!("server task {n}")))
+                .unwrap();
+        }
+        let mut after = initial.last_seq;
+        let mut pages = 0;
+        loop {
+            let page: HubPage = link
+                .send(
+                    link.http
+                        .get(format!("{base}/sync/v3/ops?after={after}&limit=5")),
+                )
+                .await
+                .unwrap();
+            assert!(page.ops.len() <= 5);
+            after = page.next;
+            pages += 1;
+            if !page.more {
+                break;
+            }
+        }
+        assert!(pages > 50, "only {pages} pages");
+        let hub = crate::core::sync::hub::Hub::open(server.path()).unwrap();
+        hub.maintenance().unwrap();
+        assert!(hub.floor().unwrap() > initial.last_seq);
+        let error = link
+            .send::<HubPage>(
+                link.http
+                    .get(format!("{base}/sync/v3/ops?after={}", initial.last_seq)),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("SYNC_SNAPSHOT_REQUIRED"), "{error}");
+        let resumed = link.cycle(true).await.unwrap();
+        assert!(resumed.last_seq > initial.last_seq && resumed.pushed > 0);
+        assert!(
+            source
+                .list_tasks(None)
+                .unwrap()
+                .iter()
+                .any(|task| task.title == offline.title)
+        );
+        assert!(
+            copy.list_tasks(None)
+                .unwrap()
+                .iter()
+                .any(|task| task.title == offline.title)
+        );
+        assert_eq!(
+            source.list_tasks(None).unwrap().len(),
+            copy.list_tasks(None).unwrap().len()
+        );
+        assert_eq!(
+            Journal::open(server.path()).unwrap().vector().unwrap(),
+            Journal::open(lagging.path()).unwrap().vector().unwrap()
+        );
+        running.abort();
+    }
+    /// Rewrites a star store into the 0.8 (format 3) peer layout.
+    fn legacy_v3(root: &Path, peer: serde_json::Value, secret: serde_json::Value) {
+        for path in ["sync/hub", "sync/server.yaml", "sync/cursor.json"] {
+            let path = root.join(path);
+            if path.is_dir() {
+                fs::remove_dir_all(&path).unwrap();
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        let mut config: serde_json::Value =
+            serde_yaml_ng::from_str(&fs::read_to_string(root.join("config.yaml")).unwrap())
+                .unwrap();
+        let sync = config["sync"].as_object_mut().unwrap();
+        sync.remove("server");
+        sync.insert("peers".into(), json!([peer]));
+        sync.insert("relay_remote".into(), json!("origin"));
+        sync.insert("relay_interval".into(), json!(60));
+        sync.insert("relay_encrypt".into(), json!(false));
+        fs::write(
+            root.join("config.yaml"),
+            serde_yaml_ng::to_string(&config).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.join("sync/peers.yaml"),
+            serde_yaml_ng::to_string(&json!([secret])).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("sync/exchanges.yaml"), "{}\n").unwrap();
+        fs::write(root.join("sync/relay-ack.json"), "{}\n").unwrap();
+        fs::write(root.join("sync/relay-age.key"), "AGE-SECRET-KEY-1TEST\n").unwrap();
+        fs::create_dir_all(root.join("sync/relay/refs")).unwrap();
+        fs::write(root.join("sync/FORMAT"), "3\n").unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn format3_peers_and_relay_migrate_to_the_star_without_repairing() {
+        let _serial = NETWORK.lock().await;
+        let server = node("server", "server");
+        let laptop = node("laptop", "laptop");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        Storage::new(&p.data_root)
+            .create_task(NewTask::titled("before migration"))
+            .unwrap();
+        let (running, base) = http(server.path()).await;
+        connect(laptop.path(), server.path(), &base)
+            .await
+            .cycle(true)
+            .await
+            .unwrap();
+        running.abort();
+        let _ = running.await;
+        let (s, l) = (
+            Journal::open(server.path()).unwrap().node,
+            Journal::open(laptop.path()).unwrap().node,
+        );
+        let credential: discovery::Credential =
+            discovery::load(&laptop.path().join("sync/server.yaml")).unwrap();
+        let address = base.trim_start_matches("http://").to_owned();
+        legacy_v3(
+            server.path(),
+            json!({"node_id":l.node_id,"name":l.name,"role":"laptop","store_id":l.store_id,"address":"127.0.0.1:9"}),
+            json!({"node_id":l.node_id,"token":"server-to-laptop","inbound_sha256":token_hash(&credential.token)}),
+        );
+        legacy_v3(
+            laptop.path(),
+            json!({"node_id":s.node_id,"name":s.name,"role":"server","store_id":s.store_id,"address":address}),
+            json!({"node_id":s.node_id,"token":credential.token,"inbound_sha256":token_hash("server-to-laptop")}),
+        );
+        // Accumulated while still on 0.8: must reach the server through migration.
+        let offline = Storage::new(laptop.path().join("projects").join(&p.id))
+            .create_task(NewTask::titled("written on 0.8"))
+            .unwrap();
+
+        for root in [server.path(), laptop.path()] {
+            Journal::open(root).unwrap();
+            assert_eq!(
+                fs::read_to_string(root.join("sync/FORMAT")).unwrap().trim(),
+                "4"
+            );
+            for gone in [
+                "sync/peers.yaml",
+                "sync/exchanges.yaml",
+                "sync/relay-ack.json",
+                "sync/relay-age.key",
+                "sync/relay",
+            ] {
+                assert!(!root.join(gone).exists(), "{gone}");
+            }
+            assert!(
+                root.join("sync/legacy-v3/peers.yaml").is_file()
+                    && root.join("sync/legacy-v3/credentials.yaml").is_file()
+            );
+            let config = fs::read_to_string(root.join("config.yaml")).unwrap();
+            assert!(
+                !config.contains("peers") && !config.contains("relay_"),
+                "{config}"
+            );
+        }
+        let clients: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(server.path().join("sync/hub/clients.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            clients[&l.node_id]["token_sha256"],
+            json!(token_hash(&credential.token))
+        );
+        let config = discovery::config(laptop.path()).unwrap();
+        let target = config.server.clone().unwrap();
+        assert_eq!(
+            (target.node_id.as_str(), target.urls.clone()),
+            (s.node_id.as_str(), vec![base.clone()])
+        );
+        assert!(Cursor::load(laptop.path()).unwrap().migrating);
+        let before = fs::read_to_string(laptop.path().join("config.yaml")).unwrap();
+        Journal::open(laptop.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(laptop.path().join("config.yaml")).unwrap(),
+            before,
+            "a second open is a no-op"
+        );
+
+        // Crash after the config cutover but before cleanup and FORMAT: the rerun finishes from legacy-v3.
+        fs::write(laptop.path().join("sync/FORMAT"), "3\n").unwrap();
+        fs::copy(
+            laptop.path().join("sync/legacy-v3/credentials.yaml"),
+            laptop.path().join("sync/peers.yaml"),
+        )
+        .unwrap();
+        fs::create_dir_all(laptop.path().join("sync/relay")).unwrap();
+        Journal::open(laptop.path()).unwrap();
+        assert_eq!(
+            fs::read_to_string(laptop.path().join("sync/FORMAT"))
+                .unwrap()
+                .trim(),
+            "4"
+        );
+        assert!(
+            !laptop.path().join("sync/peers.yaml").exists()
+                && !laptop.path().join("sync/relay").exists()
+        );
+        assert_eq!(
+            discovery::server_credential(laptop.path())
+                .unwrap()
+                .unwrap()
+                .token,
+            credential.token
+        );
+
+        // The old token still authenticates; the retained 0.8 outbox lands on the server.
+        let listener = TcpListener::bind(&address).await.unwrap();
+        let restored = tokio::spawn(
+            axum::serve(listener, router(server.path().join("sync/tokens.yaml"))).into_future(),
+        );
+        let results = once(laptop.path(), true).await.unwrap();
+        assert!(results[0].1.is_ok(), "{:?}", results[0].1.as_ref().err());
+        assert!(!Cursor::load(laptop.path()).unwrap().migrating);
+        assert!(Storage::new(&p.data_root).task_exists(&offline.id));
+        restored.abort();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn migrating_client_forwards_retained_foreign_ops_with_unknown_fields() {
+        let _serial = NETWORK.lock().await;
+        let server = node("server", "server");
+        let laptop = node("laptop", "laptop");
+        let phone = node("phone", "mobile");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        Storage::new(&p.data_root)
+            .create_task(NewTask::titled("initial"))
+            .unwrap();
+        let (running, base) = http(server.path()).await;
+        let laptop_link = connect(laptop.path(), server.path(), &base).await;
+        laptop_link.cycle(true).await.unwrap();
+        let phone_link = connect(phone.path(), server.path(), &base).await;
+        phone_link.cycle(true).await.unwrap();
+        let phone_board = Storage::new(phone.path().join("projects").join(&p.id));
+        let task = phone_board
+            .create_task(NewTask::titled(
+                "previously received from legacy phone peer",
+            ))
+            .unwrap();
+        let mut foreign = own_outbox(phone.path());
+        assert!(!foreign.is_empty());
+        foreign[0]
+            .extra
+            .insert("future_field".into(), json!({"preserve":[1,2,3]}));
+        // Simulate format-3 retained journal history; there is no client HTTP route.
+        Journal::open(laptop.path())
+            .unwrap()
+            .apply_remote(&foreign, 300_000)
+            .unwrap();
+        let mut cursor = Cursor::load(laptop.path()).unwrap();
+        cursor.migrating = true;
+        cursor.save(laptop.path()).unwrap();
+        laptop_link.cycle(true).await.unwrap();
+        assert!(!Cursor::load(laptop.path()).unwrap().migrating);
+        assert!(Storage::new(&p.data_root).task_exists(&task.id));
+        let phone_id = Journal::open(phone.path()).unwrap().node.node_id;
+        let retained = Journal::open(server.path())
+            .unwrap()
+            .operations(Some(&phone_id))
+            .unwrap();
+        assert!(
+            retained
+                .iter()
+                .any(|op| op.extra.get("future_field") == Some(&json!({"preserve":[1,2,3]})))
+        );
+        let hub = crate::core::sync::hub::Hub::open(server.path()).unwrap();
+        let mut after = 0;
+        let mut found = false;
+        loop {
+            let page = hub.page(after, 5, 8 << 20).unwrap();
+            found |= page
+                .ops
+                .iter()
+                .any(|entry| entry.op.extra.contains_key("future_field"));
+            after = page.next;
+            if !page.more {
+                break;
+            }
+        }
+        assert!(found);
+        let mut future = foreign;
+        future[0].v = 2;
+        let before = hub.ingest().unwrap();
+        assert!(
+            laptop_link
+                .post(future)
+                .await
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("SYNC_OP_FORMAT_TOO_NEW")
+        );
+        assert_eq!(hub.ingest().unwrap(), before);
+        running.abort();
     }
 }
