@@ -10,9 +10,10 @@
 - **Store format 4.** The first start of the new binary migrates the store
   one-way from format 2/3: the legacy peers/relay state is preserved under
   `sync/legacy-v3/`, the sync projection is sharded by task, and the journal
-  schema changes. Old 0.8.x peers cannot sync with a format-4 server until
-  they are upgraded, and the migration cannot be undone — back up the store
-  first.
+  schema changes. A stale `sync/meta/index.json` seek cache left by an
+  earlier mismatched binary is dropped on migration. Old 0.8.x peers cannot
+  sync with a format-4 server until they are upgraded, and the migration
+  cannot be undone — back up the store first.
 - **Git relay removed.** The relay transport and its encryption are gone; the
   server (direct LAN/tailnet or via HTTPS reverse proxy) is the only sync
   path. `kanban serve --purge-relay-refs [--dry-run]` deletes this node's old
