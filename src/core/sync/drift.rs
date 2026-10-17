@@ -104,6 +104,7 @@ impl Journal {
             .collect();
         paths.extend(index.keys().cloned());
         let mut changed = 0;
+        let mut batch = Vec::new();
         // Project metadata is captured before dependent task/thread files.
         let mut paths: Vec<_> = paths.into_iter().collect();
         paths.sort_by_key(|p| {
@@ -192,12 +193,12 @@ impl Journal {
                     .transpose()
                     .map_err(|_| invalid("replicated text is not UTF-8"))?
             };
-            capture_inner(
-                &path,
-                after.as_deref(),
-                Some(before.as_deref()),
-                current.as_ref().map(|(entry, _)| entry.clone()),
-            )?;
+            batch.push(Observed {
+                path: path.clone(),
+                before,
+                after,
+                entry: current.as_ref().map(|(entry, _)| entry.clone()),
+            });
             changed += 1;
             if let Some((entry, _)) = current {
                 index.insert(relative, entry);
@@ -205,6 +206,9 @@ impl Journal {
                 index.remove(&relative);
             }
         }
+        // One transaction for the whole scan; a commit per file made a large
+        // first import take minutes under every board lock.
+        capture_batch(self, batch)?;
         let text = index
             .iter()
             .map(|(path, entry)| json(&(path, Some(entry))))
@@ -362,6 +366,33 @@ pub(super) fn record_observed(journal: &Journal, path: &Path, entry: Option<&Ent
     repair_tail(&index)?;
     let mut file = OpenOptions::new().create(true).append(true).open(index)?;
     writeln!(file, "{}", json(&(relative, entry))?)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// `record_observed` for a whole batch: one append and one fsync.
+pub(super) fn record_observed_many(
+    journal: &Journal,
+    entries: &[(PathBuf, Option<Entry>)],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let store = journal.root.parent().expect("sync parent");
+    let mut text = String::new();
+    for (path, entry) in entries {
+        let relative = path
+            .strip_prefix(store)
+            .map_err(|_| invalid("invalid drift path"))?
+            .to_str()
+            .ok_or_else(|| invalid("non-UTF8 drift path"))?;
+        text.push_str(&json(&(relative, entry.as_ref()))?);
+        text.push('\n');
+    }
+    let index = journal.root.join("drift.jsonl");
+    repair_tail(&index)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(index)?;
+    file.write_all(text.as_bytes())?;
     file.sync_all()?;
     Ok(())
 }

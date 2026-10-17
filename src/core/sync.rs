@@ -194,6 +194,9 @@ struct Intent {
     /// A board file was written as part of this transaction.
     #[serde(default)]
     file: bool,
+    /// Files a drift scan folded in this one transaction, with what it saw.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    batch: Vec<(PathBuf, Option<drift::Entry>)>,
 }
 
 thread_local! {
@@ -425,6 +428,7 @@ impl Journal {
                     drift::record(self, &intent.path)?;
                 }
             }
+            drift::record_observed_many(self, &intent.batch)?;
             fs::remove_file(&path)?;
             return Ok(());
         }
@@ -511,6 +515,7 @@ fn commit_local(
     before: &projection::Uids,
     ops: &[Operation],
     file: Option<FileWrite>,
+    batch: &[(PathBuf, Option<drift::Entry>)],
 ) -> Result<()> {
     if ops.is_empty() {
         return Ok(());
@@ -531,6 +536,7 @@ fn commit_local(
             .iter()
             .any(|op| op.entity == "run" && !op.set.contains_key("command")),
         file: file.is_some(),
+        batch: batch.to_vec(),
     };
     atomic_write_text_raw(&journal.root.join("intent.json"), &json(&intent)?)?;
     if let Some(file) = &file {
@@ -576,6 +582,7 @@ fn commit_local(
             drift::record(journal, &file.path)?;
         }
     }
+    drift::record_observed_many(journal, batch)?;
     match fs::remove_file(journal.root.join("intent.json")) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -849,30 +856,20 @@ fn scope_display(target: &Target, path: &Path, content: Option<&str>) -> Result<
     })
 }
 
-fn capture_inner(
+/// Operations for one captured file, planned on `state`. Callers own the
+/// state, clock and operation list, so a drift scan can plan every file on
+/// one state and commit them in a single transaction.
+#[allow(clippy::too_many_arguments)]
+fn plan_capture(
+    journal: &Journal,
+    target: &Target,
     path: &Path,
     content: Option<&str>,
     before_override: Option<Option<&str>>,
-    observed: Option<drift::Entry>,
-) -> Result<bool> {
-    let Some(target) = target(path) else {
-        return Ok(false);
-    };
-    let journal = Journal::open(&target.store)?;
-    let _guard = lock_file_reentrant(&journal.root.join(".lock"))?;
-    journal.recover()?;
-    if before_override.is_none() {
-        drift::reconcile_for_write(&journal, path)?;
-    }
-    let scoped = scope_display(&target, path, content)?;
-    let mut state = projection::take_tasks(&journal.root, |uids| {
-        projection::task_scope(
-            uids,
-            &target.project,
-            &scoped.iter().map(String::as_str).collect::<Vec<_>>(),
-        )
-    })?;
-    let before_uids = projection::uids_of(&state);
+    state: &mut JournalState,
+    clock: &mut Hlc,
+    operations: &mut Vec<Operation>,
+) -> Result<()> {
     let project = if target.project.is_empty() {
         String::new()
     } else {
@@ -917,7 +914,7 @@ fn capture_inner(
         .unwrap_or(Value::Null);
     let task_uid = if target.entity == "task" {
         Some(ids::capture_uid(
-            &mut state,
+            state,
             &project,
             &target.id,
             before.is_null(),
@@ -925,16 +922,14 @@ fn capture_inner(
     } else {
         None
     };
-    let mut clock: Hlc = journal.clock()?;
-    let mut operations = Vec::new();
     run::capture(
-        &journal,
-        &target,
+        journal,
+        target,
         &project,
         (&before, &after),
-        &mut state,
-        &mut clock,
-        &mut operations,
+        state,
+        clock,
+        operations,
     )?;
     let mut changes = Vec::new();
     if target.entity == "message" {
@@ -1011,7 +1006,7 @@ fn capture_inner(
         let op_id = format!("{}:{seq}", journal.node.node_id);
         let mut id = task_uid.clone().unwrap_or_else(|| display_id.clone());
         if target.entity == "task" {
-            ids::references_to_uids(&state, &project, &mut set);
+            ids::references_to_uids(state, &project, &mut set);
         }
         if target.entity == "message" {
             let alias = key(&project, &target.id, &display_id);
@@ -1029,7 +1024,7 @@ fn capture_inner(
             }
             set.insert(
                 "task_id".into(),
-                Value::String(ids::task_uid(&state, &project, &target.id)),
+                Value::String(ids::task_uid(state, &project, &target.id)),
             );
         }
         let entity = if after.is_null() {
@@ -1040,7 +1035,7 @@ fn capture_inner(
         } else {
             target.entity
         };
-        clock = clock.tick(now_ms(), &journal.node.node_id)?;
+        *clock = clock.tick(now_ms(), &journal.node.node_id)?;
         let previous = state.fields.get(&key(&project, entity, &id));
         let prev = set
             .keys()
@@ -1068,7 +1063,7 @@ fn capture_inner(
                 })
                 .into(),
         };
-        apply_meta(&mut state, &op);
+        apply_meta(state, &op);
         if target.entity == "message" && after.is_null() {
             state
                 .message_uids
@@ -1077,13 +1072,13 @@ fn capture_inner(
         operations.push(op);
         if !after.is_null()
             && apply::deleted(
-                &state,
+                state,
                 &project,
                 target.entity,
                 &operations.last().expect("operation").id,
             )
         {
-            clock = clock.tick(now_ms(), &journal.node.node_id)?;
+            *clock = clock.tick(now_ms(), &journal.node.node_id)?;
             let restore = Operation {
                 v: OP_FORMAT,
                 op: format!(
@@ -1101,12 +1096,12 @@ fn capture_inner(
                 extra: BTreeMap::new(),
                 actor: "human".into(),
             };
-            apply_meta(&mut state, &restore);
+            apply_meta(state, &restore);
             operations.push(restore);
         }
     }
     if target.entity == "message" {
-        let id = ids::task_uid(&state, &project, &target.id);
+        let id = ids::task_uid(state, &project, &target.id);
         let deleted = Value::Bool(content.is_none());
         let previous = state.fields.get(&key(&project, "thread", &id));
         if previous.and_then(|f| f.values.get("deleted")) != Some(&deleted) {
@@ -1114,7 +1109,7 @@ fn capture_inner(
                 .and_then(|f| f.clocks.get("deleted"))
                 .map(|clock| BTreeMap::from([("deleted".into(), clock.clone())]))
                 .unwrap_or_default();
-            clock = clock.tick(now_ms(), &journal.node.node_id)?;
+            *clock = clock.tick(now_ms(), &journal.node.node_id)?;
             let op = Operation {
                 v: OP_FORMAT,
                 op: format!(
@@ -1137,10 +1132,49 @@ fn capture_inner(
                 extra: BTreeMap::new(),
                 actor: "human".into(),
             };
-            apply_meta(&mut state, &op);
+            apply_meta(state, &op);
             operations.push(op);
         }
     }
+    Ok(())
+}
+
+fn capture_inner(
+    path: &Path,
+    content: Option<&str>,
+    before_override: Option<Option<&str>>,
+    observed: Option<drift::Entry>,
+) -> Result<bool> {
+    let Some(target) = target(path) else {
+        return Ok(false);
+    };
+    let journal = Journal::open(&target.store)?;
+    let _guard = lock_file_reentrant(&journal.root.join(".lock"))?;
+    journal.recover()?;
+    if before_override.is_none() {
+        drift::reconcile_for_write(&journal, path)?;
+    }
+    let scoped = scope_display(&target, path, content)?;
+    let mut state = projection::take_tasks(&journal.root, |uids| {
+        projection::task_scope(
+            uids,
+            &target.project,
+            &scoped.iter().map(String::as_str).collect::<Vec<_>>(),
+        )
+    })?;
+    let before_uids = projection::uids_of(&state);
+    let mut clock: Hlc = journal.clock()?;
+    let mut operations = Vec::new();
+    plan_capture(
+        &journal,
+        &target,
+        path,
+        content,
+        before_override,
+        &mut state,
+        &mut clock,
+        &mut operations,
+    )?;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1176,8 +1210,60 @@ fn capture_inner(
             external: before_override.is_some(),
             observed,
         }),
+        &[],
     )?;
     Ok(true)
+}
+
+/// A file a drift scan read: its text before (from the index blob) and now,
+/// and the stat/hash entry the scan observed.
+struct Observed {
+    path: PathBuf,
+    before: Option<String>,
+    after: Option<String>,
+    entry: Option<drift::Entry>,
+}
+
+/// Fold every file of a drift scan into the journal as one transaction: one
+/// whole-store state, one intent, one append, one uid save and one index
+/// append, instead of a commit per file. The caller holds the store, board
+/// and sync locks, so files are planned in the caller's order (project
+/// metadata first).
+fn capture_batch(journal: &Journal, files: Vec<Observed>) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    let _guard = lock_file_reentrant(&journal.root.join(".lock"))?;
+    journal.recover()?;
+    let (mut state, _) = projection::load_state(&journal.root)?;
+    let before_uids = projection::uids_of(&state);
+    let mut clock: Hlc = journal.clock()?;
+    let mut operations = Vec::new();
+    let mut observed = Vec::with_capacity(files.len());
+    for file in files {
+        if let Some(target) = target(&file.path) {
+            plan_capture(
+                journal,
+                &target,
+                &file.path,
+                file.after.as_deref(),
+                Some(file.before.as_deref()),
+                &mut state,
+                &mut clock,
+                &mut operations,
+            )?;
+        }
+        observed.push((file.path, file.entry));
+    }
+    if operations.is_empty() {
+        drift::record_observed_many(journal, &observed)?;
+        if projection::same_uids(&before_uids, &state) {
+            let meta = projection::load_prune(&journal.root)?;
+            projection::remember(&journal.root, state, &meta);
+        }
+        return Ok(());
+    }
+    commit_local(journal, state, &before_uids, &operations, None, &observed)
 }
 
 #[cfg(test)]

@@ -225,6 +225,45 @@ fn remote_apply_captures_pending_local_drift_and_moves_do_not_delete_tasks() {
     assert_eq!(peer.reconcile().unwrap(), 0);
 }
 
+/// A scan folds every drifted file in one transaction, planned on one state:
+/// later files (a reply's parent, tasks of the board) see the uids earlier
+/// files of the same scan assigned.
+#[test]
+fn one_scan_folds_many_dependent_bypass_files_and_replicates() {
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    let root = board(a.path());
+    let source = Journal::open(a.path()).unwrap();
+    source.reconcile().unwrap();
+    Journal::open(b.path()).unwrap();
+    common::bootstrap(a.path(), b.path());
+    let peer = Journal::open(b.path()).unwrap();
+    for n in 1..=40 {
+        fs::write(
+            root.join(format!(".kanban/tasks/todo/TASK-{n:03}.md")),
+            format!("---\nid: TASK-{n:03}\ntitle: bulk {n}\nstatus: todo\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join(".kanban/threads/TASK-001.yaml"),
+        "task_id: TASK-001\nrev: 1\nmessages:\n- id: MSG-001\n  body: question\n- id: MSG-002\n  body: reply\n  parent_id: MSG-001\n",
+    )
+    .unwrap();
+    assert_eq!(source.reconcile().unwrap(), 41);
+    let vector = source.vector().unwrap();
+    assert_eq!(source.reconcile().unwrap(), 0);
+    assert_eq!(source.vector().unwrap(), vector);
+    replicate(&source, &peer);
+    let remote = b.path().join("projects/demo/.kanban");
+    for n in [1, 17, 40] {
+        let text = fs::read_to_string(remote.join(format!("tasks/todo/TASK-{n:03}.md"))).unwrap();
+        assert!(text.contains(&format!("title: bulk {n}\n")), "{text}");
+    }
+    let thread = fs::read_to_string(remote.join("threads/TASK-001.yaml")).unwrap();
+    assert!(thread.contains("parent_id: MSG-001"), "{thread}");
+}
+
 #[test]
 #[ignore = "2000-file drift benchmark; run explicitly with --ignored --nocapture"]
 fn benchmark_reconcile_2000_files() {
