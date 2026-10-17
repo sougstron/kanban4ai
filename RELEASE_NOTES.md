@@ -1,3 +1,41 @@
+# kanban4ai 0.8.5
+
+- **Star sync topology.** Pairing and replication go through a hub: only a
+  `node.role: server` node accepts pairing and serves `/sync/v3/*`; clients
+  never pair with each other. Client tokens are registered server-side in
+  `sync/hub/clients.json`; a client stores the server and its token in
+  `sync/server.yaml` (0600). Running a sync server, reverse proxy/TLS, and the
+  migration from the old peers/relay setup are documented in the new
+  `docs/sync-server.md`.
+- **Store format 4.** The first start of the new binary migrates the store
+  one-way from format 2/3: the legacy peers/relay state is preserved under
+  `sync/legacy-v3/`, the sync projection is sharded by task, and the journal
+  schema changes. Old 0.8.x peers cannot sync with a format-4 server until
+  they are upgraded, and the migration cannot be undone — back up the store
+  first.
+- **Git relay removed.** The relay transport and its encryption are gone; the
+  server (direct LAN/tailnet or via HTTPS reverse proxy) is the only sync
+  path. `kanban serve --purge-relay-refs [--dry-run]` deletes this node's old
+  `refs/kanban/sync/<node_id>` and `refs/kanban/logs/<node_id>/*` from each
+  project's origin; the migration only prints a hint and never pushes
+  deletions itself.
+- **Conflicts are recorded on every replica.** A client pruning server state
+  is bounded by a hub-wide stable vector, so a losing write is recorded as a
+  conflict on every replica instead of being silently dropped on some of them.
+- **Cheaper drift handling.** The CLI folds drift per written path instead of
+  rescanning the whole board at every start, and an unchanged drift scan
+  answers without taking the board locks.
+- **`kanban backup`.** New command to snapshot, list, verify, restore, and
+  prune store backups with retention buckets; snapshots lock boards in the
+  same order the daemon does and verify streamed hashes (see
+  `docs/backup.md`).
+- **`join --fresh`.** `kanban4ai join --fresh CODE@HOST:PORT` moves a store
+  that already holds another board to `<store>.pre-join-<timestamp>` (nothing
+  is deleted) and adopts the server's board; without `--fresh` such a store
+  fails with `SYNC_STORE_MISMATCH` and a hint.
+- **Local-first stores.** A new store stays local until sync is turned on; a
+  `sync/` directory is no longer created for a plain local board.
+
 # kanban4ai 0.8.4
 
 - **One-step phone pairing.** `kanban4ai join CODE@HOST:PORT [--name NAME]`
