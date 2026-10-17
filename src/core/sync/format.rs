@@ -317,8 +317,9 @@ fn has_clients(store: &Path) -> bool {
 }
 
 /// Test and setup helper: turn journaling on without discarding the rest of
-/// `config.yaml`, and arm capture. Production turns sync on by writing peers,
-/// `relay_remote`, or `sync.enabled` and then [`super::activate`].
+/// `config.yaml`, and arm capture. Production turns sync on by pairing with a
+/// server (`sync.server`), registering a hub client, or `sync.enabled` and
+/// then [`super::activate`].
 pub fn enable_sync(store: &Path) -> Result<()> {
     let path = store.join("config.yaml");
     let mut config: serde_yaml_ng::Value = match fs::read_to_string(&path) {
@@ -352,7 +353,7 @@ pub fn node_role(store: &Path) -> Result<Option<super::NodeRole>> {
     }
 }
 
-/// True when this store has no paired peers and git relay is off.
+/// True when this store has no sync server and, as a server, no hub clients.
 /// A config that does not parse still counts as "do not prune".
 pub(super) fn solo_store(store: &Path) -> bool {
     let Ok(text) = fs::read_to_string(store.join("config.yaml")) else {
@@ -365,7 +366,6 @@ pub(super) fn solo_store(store: &Path) -> bool {
         return true;
     };
     !auto_enabled(sync) && !has_clients(store)
-
 }
 
 #[cfg(test)]

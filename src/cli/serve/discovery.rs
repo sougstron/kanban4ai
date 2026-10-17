@@ -451,12 +451,13 @@ pub(super) fn run(store: &ProjectStore, options: DiscoveryOptions) -> Result<boo
     Ok(true)
 }
 
-
 fn purge_relay_refs(store:&ProjectStore,dry_run:bool)->Result<()> {
     let node=Journal::open(store.root())?.node.node_id;
     for project in store.list()? {
         let work=&project.work_path;
         if !work.is_dir(){continue;}
+        let origin=std::process::Command::new("git").arg("-C").arg(work).args(["remote","get-url","origin"]).output()?;
+        if !origin.status.success(){println!("{} has no origin; skipped",project.id);continue;}
         let mut list=std::process::Command::new("git");
         let output=list.arg("-C").arg(work).args(["ls-remote","--refs","origin",&format!("refs/kanban/sync/{node}"),&format!("refs/kanban/logs/{node}/*")]).output()?;
         if !output.status.success(){return Err(invalid(format!("{}: {}",project.id,String::from_utf8_lossy(&output.stderr))));}

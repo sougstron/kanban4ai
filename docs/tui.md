@@ -173,8 +173,8 @@ the plain-letter hotkeys.
 - `m`: Move task
 - `w`: Open the answer-question dialog
 - `L`: Task log from Board/Detail. A foreign runner's bounded tail is fetched
-  asynchronously once per second over LAN/tailnet; offline uses the latest
-  relay snapshot. The pager header shows the runner and snapshot age; `q`
+  asynchronously once per second (live from the runner when it is the server,
+  otherwise the tail the runner last uploaded to the sync server). The pager header shows the runner and snapshot age; `q`
   returns to the originating screen. Finished runs remain readable.
   Remote stop confirmation and rerun enqueue journal requests; completion
   depends on sync delivery and the runner's daemon, not a local session.
@@ -333,8 +333,10 @@ From the Projects screen, `s` opens Global Settings. Select **Sync** in the
 tab strip (`←/→` while picking blocks, or a click). The page is one block:
 Enter steps inside it to walk and press its rows. The page shows this node's name and
 role (`laptop`, `server`, `mobile`), the API user-unit switch, Tailscale mode,
-paired nodes in phone connection priority order, last confirmed exchanges,
-unconfirmed operation counts, field conflicts and project clone statuses.
+the **Sync server** block (addresses, path, outbox = own operations not yet
+confirmed by the server, `last_seq` / hub head, last error), the read-only
+node list as the server reports it (on the server: clients with their cursor
+and lag), field conflicts and project clone statuses.
 
 - `↑/↓` selects a control; `Enter` or Space activates it. Name, role, API,
   pairing and Refresh controls also accept a mouse click.
@@ -342,15 +344,15 @@ unconfirmed operation counts, field conflicts and project clone statuses.
   starts `kanban4ai-serve.service` with `systemctl --user`, or stops and
   disables it. When no unit is installed, the page installs one for the
   current executable and store. A mobile node cannot enable an inbound API.
-- Select a peer and use `Shift+↑/↓` or `K/J` to change phone priority.
-- **Pair with a node** asks for the peer's LAN IP:port and one-time code,
-  plus this node's LAN IP:port for the return connection (optional on mobile).
-- **Show a pairing code / phone QR** creates a one-time code. Leave the
-  address empty for a code only; enter this node's LAN IP:port for a phone QR.
-  The QR uses the full terminal area; `Enter` or `Esc` closes it.
-- **Refresh status** (`r`) probes peers and fetches reachable peers' real
-  `GET /git/<project>/status` responses without blocking the page. Codes have
-  human-readable explanations; an absent phone is neutral, not an error.
+- **Connect to the sync server** asks for the server's LAN/tailnet `host:port`
+  or `https://` URL and its one-time code (or a whole phone invite with an
+  empty code). Clients never pair with each other.
+- **Show a pairing code / phone QR** (server only) creates a one-time code.
+  Leave the address empty for a code only; enter the server's address for a
+  phone QR. The QR uses the full terminal area; `Enter` or `Esc` closes it.
+- **Refresh status** (`r`) probes the server and fetches its node list without
+  blocking the page. Codes have human-readable explanations; an absent phone
+  is neutral, not an error.
 - `PgUp/PgDn` scrolls the read-only details, conflicts and clones when they
   exceed the dialog height. Arrow navigation returns to the selected control.
 

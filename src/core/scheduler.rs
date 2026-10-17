@@ -338,7 +338,7 @@ impl Operations {
             }
             if !crate::cli::serve::local_runner(self.data_root(), candidate.runner.as_ref())? {
                 // A human waiting queue belongs to the frontend, unlike a
-                // runner_request already durably delivered through the relay.
+                // runner_request already durably delivered through the journal.
                 crate::cli::serve::launch_on_board(self.data_root(), &candidate.id, None, true)?;
                 continue;
             }

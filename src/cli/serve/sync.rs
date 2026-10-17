@@ -338,6 +338,8 @@ pub(super) fn start(root:&Path)->Running {
                     let (link,_)=ServerLink::connect(&root,&config).await?;
                     let mut cursor=link.cycle(true).await?;
                     if failures>=2 {
+                        // Long-poll fallback after two broken SSE sessions; retry SSE now and then.
+                        failures=if failures>=12 {0} else {failures+1};
                         let mut local=CHANGED.subscribe();
                         tokio::select!{result=link.pull(&mut cursor,25)=>result,_=local.changed()=>Ok(())}
                     }else{
@@ -346,8 +348,11 @@ pub(super) fn start(root:&Path)->Running {
                         result
                     }
                 }.await;
+                if *STOPPING.borrow(){return;}
                 match result {
-                    Ok(())=>reported=None,
+                    // A finished live session (safety tick, local write in
+                    // long-poll mode) reconnects at once: no gap without updates.
+                    Ok(())=>{reported=None;continue;}
                     Err(e)=>{let text=e.to_string();if reported.as_ref()!=Some(&text){eprintln!("sync server: {text}");reported=Some(text.clone());}
                         let _=atomic_write_text_raw(&root.join("sync/server-status.json"),&json!({"code":"NODE_UNREACHABLE","message":text}).to_string());}
                 }

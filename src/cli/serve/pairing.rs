@@ -10,7 +10,7 @@ pub struct PairingOptions {
     /// Create a single-use pairing code (serve may already be running).
     #[arg(long, conflicts_with_all = ["issue_token", "pair", "revoke_token", "phone_qr"])]
     pair_code: bool,
-    /// Pair with a LAN or enabled tailnet node at host:port.
+    /// Pair this client with the sync server at host:port or an https URL.
     #[arg(long, requires = "code", conflicts_with_all = ["issue_token", "revoke_token", "phone_qr"])]
     pair: Option<String>,
     /// Revoke a token by its SHA-256 fingerprint.

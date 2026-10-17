@@ -1363,7 +1363,7 @@ impl Operations {
     }
 
     /// Human waiting queues are retried by the frontend, without publishing a
-    /// relay launch intent or claiming a run on behalf of the remote runner.
+    /// journal launch intent or claiming a run on behalf of the remote runner.
     pub(crate) fn queue_local_run(&self, task_id: &str) -> Result<Option<Task>> {
         self.queue_local_run_as(task_id, true)
     }
