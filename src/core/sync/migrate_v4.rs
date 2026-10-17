@@ -10,6 +10,7 @@ fn read_yaml(path: &Path) -> Result<Value> {
     }
 }
 fn preserve(path: &Path, text: &str) -> Result<()> {
+    if let Some(parent) = path.parent() { fs::create_dir_all(parent)?; }
     if !path.exists() { atomic_write_text_raw(path, text)?; }
     #[cfg(unix)] { use std::os::unix::fs::PermissionsExt; fs::set_permissions(path,fs::Permissions::from_mode(0o600))?; }
     Ok(())

@@ -678,6 +678,75 @@ mod tests {
         assert_eq!(Journal::open(server.path()).unwrap().vector().unwrap(),Journal::open(lagging.path()).unwrap().vector().unwrap());
         running.abort();
     }
+    /// Rewrites a star store into the 0.8 (format 3) peer layout.
+    fn legacy_v3(root:&Path,peer:serde_json::Value,secret:serde_json::Value) {
+        for path in ["sync/hub","sync/server.yaml","sync/cursor.json"] {
+            let path=root.join(path);if path.is_dir(){fs::remove_dir_all(&path).unwrap();}else{let _=fs::remove_file(&path);}
+        }
+        let mut config:serde_json::Value=serde_yaml_ng::from_str(&fs::read_to_string(root.join("config.yaml")).unwrap()).unwrap();
+        let sync=config["sync"].as_object_mut().unwrap();sync.remove("server");
+        sync.insert("peers".into(),json!([peer]));sync.insert("relay_remote".into(),json!("origin"));
+        sync.insert("relay_interval".into(),json!(60));sync.insert("relay_encrypt".into(),json!(false));
+        fs::write(root.join("config.yaml"),serde_yaml_ng::to_string(&config).unwrap()).unwrap();
+        fs::write(root.join("sync/peers.yaml"),serde_yaml_ng::to_string(&json!([secret])).unwrap()).unwrap();
+        fs::write(root.join("sync/exchanges.yaml"),"{}\n").unwrap();fs::write(root.join("sync/relay-ack.json"),"{}\n").unwrap();
+        fs::write(root.join("sync/relay-age.key"),"AGE-SECRET-KEY-1TEST\n").unwrap();
+        fs::create_dir_all(root.join("sync/relay/refs")).unwrap();fs::write(root.join("sync/FORMAT"),"3\n").unwrap();
+    }
+    #[tokio::test(flavor="multi_thread",worker_threads=4)]
+    async fn format3_peers_and_relay_migrate_to_the_star_without_repairing() {
+        let _serial=NETWORK.lock().await;
+        let server=node("server","server");let laptop=node("laptop","laptop");
+        let work=tempfile::tempdir().unwrap();let p=project(server.path(),&work.path().join("demo"));
+        Storage::new(&p.data_root).create_task(NewTask::titled("before migration")).unwrap();
+        let (running,base)=http(server.path()).await;
+        connect(laptop.path(),server.path(),&base).await.cycle(true).await.unwrap();
+        running.abort();let _=running.await;
+        let (s,l)=(Journal::open(server.path()).unwrap().node,Journal::open(laptop.path()).unwrap().node);
+        let credential:discovery::Credential=discovery::load(&laptop.path().join("sync/server.yaml")).unwrap();
+        let address=base.trim_start_matches("http://").to_owned();
+        legacy_v3(server.path(),json!({"node_id":l.node_id,"name":l.name,"role":"laptop","store_id":l.store_id,"address":"127.0.0.1:9"}),
+            json!({"node_id":l.node_id,"token":"server-to-laptop","inbound_sha256":token_hash(&credential.token)}));
+        legacy_v3(laptop.path(),json!({"node_id":s.node_id,"name":s.name,"role":"server","store_id":s.store_id,"address":address}),
+            json!({"node_id":s.node_id,"token":credential.token,"inbound_sha256":token_hash("server-to-laptop")}));
+        // Accumulated while still on 0.8: must reach the server through migration.
+        let offline=Storage::new(laptop.path().join("projects").join(&p.id)).create_task(NewTask::titled("written on 0.8")).unwrap();
+
+        for root in [server.path(),laptop.path()] {
+            Journal::open(root).unwrap();
+            assert_eq!(fs::read_to_string(root.join("sync/FORMAT")).unwrap().trim(),"4");
+            for gone in ["sync/peers.yaml","sync/exchanges.yaml","sync/relay-ack.json","sync/relay-age.key","sync/relay"] {assert!(!root.join(gone).exists(),"{gone}");}
+            assert!(root.join("sync/legacy-v3/peers.yaml").is_file()&&root.join("sync/legacy-v3/credentials.yaml").is_file());
+            let config=fs::read_to_string(root.join("config.yaml")).unwrap();
+            assert!(!config.contains("peers")&&!config.contains("relay_"),"{config}");
+        }
+        let clients:serde_json::Value=serde_json::from_str(&fs::read_to_string(server.path().join("sync/hub/clients.json")).unwrap()).unwrap();
+        assert_eq!(clients[&l.node_id]["token_sha256"],json!(token_hash(&credential.token)));
+        let config=discovery::config(laptop.path()).unwrap();let target=config.server.clone().unwrap();
+        assert_eq!((target.node_id.as_str(),target.urls.clone()),(s.node_id.as_str(),vec![base.clone()]));
+        assert!(Cursor::load(laptop.path()).unwrap().migrating);
+        let before=fs::read_to_string(laptop.path().join("config.yaml")).unwrap();
+        Journal::open(laptop.path()).unwrap();
+        assert_eq!(fs::read_to_string(laptop.path().join("config.yaml")).unwrap(),before,"a second open is a no-op");
+
+        // Crash after the config cutover but before cleanup and FORMAT: the rerun finishes from legacy-v3.
+        fs::write(laptop.path().join("sync/FORMAT"),"3\n").unwrap();
+        fs::copy(laptop.path().join("sync/legacy-v3/credentials.yaml"),laptop.path().join("sync/peers.yaml")).unwrap();
+        fs::create_dir_all(laptop.path().join("sync/relay")).unwrap();
+        Journal::open(laptop.path()).unwrap();
+        assert_eq!(fs::read_to_string(laptop.path().join("sync/FORMAT")).unwrap().trim(),"4");
+        assert!(!laptop.path().join("sync/peers.yaml").exists()&&!laptop.path().join("sync/relay").exists());
+        assert_eq!(discovery::server_credential(laptop.path()).unwrap().unwrap().token,credential.token);
+
+        // The old token still authenticates; the retained 0.8 outbox lands on the server.
+        let listener=TcpListener::bind(&address).await.unwrap();
+        let restored=tokio::spawn(axum::serve(listener,router(server.path().join("sync/tokens.yaml"))).into_future());
+        let results=once(laptop.path(),true).await.unwrap();
+        assert!(results[0].1.is_ok(),"{:?}",results[0].1.as_ref().err());
+        assert!(!Cursor::load(laptop.path()).unwrap().migrating);
+        assert!(Storage::new(&p.data_root).task_exists(&offline.id));
+        restored.abort();
+    }
     #[tokio::test(flavor="multi_thread",worker_threads=4)]
     async fn migrating_client_forwards_retained_foreign_ops_with_unknown_fields() {
         let _serial=NETWORK.lock().await;
