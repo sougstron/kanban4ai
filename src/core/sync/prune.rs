@@ -58,8 +58,13 @@ fn frontier(
     acks: &BTreeMap<String, VersionVector>,
 ) -> Result<VersionVector> {
     // Participants are active hub clients or the client's single server receipt.
-    // Origins in retained history are not acknowledgement participants.
-    let participants: BTreeSet<String> = acks.keys().cloned().collect();
+    // Without any receipt, foreign origins hold their history: a store that
+    // has not reached a server yet must not simplify what it never forwarded.
+    let mut participants: BTreeSet<String> = acks.keys().cloned().collect();
+    if participants.is_empty() {
+        let me = &journal.node.node_id;
+        participants.extend(state.vector.keys().filter(|node| *node != me).cloned());
+    }
     let stable = if participants.is_empty() {
         state.vector.clone()
     } else {

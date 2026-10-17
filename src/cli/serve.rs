@@ -266,10 +266,6 @@ async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: N
     if route.starts_with("/sync/") && request.headers().get("x-kanban-sync-protocol").and_then(|v|v.to_str().ok())!=Some("3") {
         return error(StatusCode::UPGRADE_REQUIRED,"SYNC_PROTOCOL_MISMATCH","обновите kanban4ai на всех узлах");
     }
-    if route.starts_with("/sync/") || route.starts_with("/git/") {
-        let root=path.parent().and_then(Path::parent).unwrap_or(Path::new("."));
-        if let Err(e)=hub::require_server(root) { return sync::failure(e); }
-    }
     let secret = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -325,9 +321,11 @@ async fn authenticate(State(path): State<PathBuf>, mut request: Request, next: N
             "Token is unknown or revoked",
         );
     };
-    if request.uri().path().starts_with("/sync/") {
+    let route = request.uri().path();
+    if route.starts_with("/sync/") || route.starts_with("/git/") {
         let root=path.parent().and_then(Path::parent).unwrap_or(Path::new("."));
-        if hub::caller(root,&hash).is_err(){return error(StatusCode::UNAUTHORIZED,"NODE_AUTH_FAILED","Token is not bound to a paired node");}
+        if let Err(e)=hub::require_server(root) { return sync::failure(e); }
+        if route.starts_with("/sync/") && hub::caller(root,&hash).is_err(){return error(StatusCode::UNAUTHORIZED,"NODE_AUTH_FAILED","Token is not bound to a paired node");}
     }
     request.extensions_mut().insert(kind);
     request.extensions_mut().insert(hash);
@@ -669,7 +667,9 @@ mod tests {
                     StatusCode::UNAUTHORIZED,
                 ),
                 ("/node", Some(node.as_str()), StatusCode::OK),
-                ("/sync/unknown", Some(node.as_str()), StatusCode::NOT_FOUND),
+                // A valid node token not bound to a hub client is refused for sync.
+                ("/sync/unknown", Some(node.as_str()), StatusCode::UNAUTHORIZED),
+                ("/sync/vector", Some(node.as_str()), StatusCode::UPGRADE_REQUIRED),
             ] {
                 let response = app.clone().oneshot(request(path, token)).await.unwrap();
                 assert_eq!(response.status(), expected, "{path}");

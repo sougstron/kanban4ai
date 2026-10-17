@@ -477,7 +477,7 @@ mod tests {
     async fn http_client(root:&Path)->(tokio::task::JoinHandle<std::io::Result<()>>,String){http(root).await}
     #[test]
     fn cursor_roundtrip_keeps_migration_and_outbox_receipts() {
-        let dir=tempfile::tempdir().unwrap();
+        let dir=tempfile::tempdir().unwrap();fs::create_dir_all(dir.path().join("sync")).unwrap();
         let cursor=Cursor{server_node_id:"server".into(),store_id:"store".into(),hub_epoch:"epoch".into(),last_seq:9,pushed:4,migrating:true};
         cursor.save(dir.path()).unwrap();let loaded=Cursor::load(dir.path()).unwrap();
         assert_eq!((loaded.last_seq,loaded.pushed,loaded.migrating),(9,4,true));

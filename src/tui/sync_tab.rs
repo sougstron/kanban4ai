@@ -722,11 +722,11 @@ fn lines(
                     if server.urls.is_empty() {
                         "no address set".to_string()
                     } else {
-                        server.urls.join(" · ")
+                        sanitize_terminal_text(&server.urls.join(" · "))
                     }
                 )),
                 Span::styled(
-                    format!("  · {}", sanitize_terminal_text(&server.route)),
+                    format!(" · {}", sanitize_terminal_text(&server.route)),
                     status_style(app, &server.code),
                 ),
             ]));

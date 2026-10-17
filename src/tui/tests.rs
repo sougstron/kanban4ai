@@ -13084,10 +13084,7 @@ fn sync_tab_app(work: &std::path::Path) -> (tempfile::TempDir, App) {
              interval: 30\n\
              run_heartbeat: 60\n\
              log_interval: 60\n\
-             server:\n\
-               node_id: n-server\n\
-               name: server\n\
-               urls: ['http://192.168.0.20:7420']\n",
+             server: {node_id: n-server, name: server, urls: ['http://192.168.0.20:7420']}\n",
         )
         .unwrap(),
     );
@@ -13185,9 +13182,18 @@ fn global_settings_sync_tab_disabled_snapshot() {
     insta::assert_snapshot!("global_settings_sync_disabled", rendered);
 }
 
+/// Only a server issues pairing codes in the star topology.
+fn as_server(root: &std::path::Path, app: &mut App) {
+    crate::cli::serve::settings::save_node(root, "laptop", crate::core::sync::NodeRole::Server)
+        .unwrap();
+    let sync = &mut app.modal.as_mut().unwrap().sync;
+    sync.execute(root, super::sync_tab::Request::Load);
+}
+
 #[test]
 fn global_settings_sync_tab_changes_node_name_and_pairing_code() {
     let (store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-actions"));
+    as_server(store_dir.path(), &mut app);
     app.handle_key(key(KeyCode::Enter))
         .expect("step into the sync panel");
     let root = store_dir.path();
@@ -13253,20 +13259,21 @@ fn global_settings_sync_tab_changes_node_name_and_pairing_code() {
 }
 
 #[test]
-fn global_settings_sync_tab_qr_needs_a_lan_address() {
+fn global_settings_sync_tab_qr_needs_a_server_address() {
     let (_store_dir, mut app) = sync_tab_app(std::path::Path::new("/tmp/k4ai-sync-qr"));
+    as_server(_store_dir.path(), &mut app);
     app.handle_key(key(KeyCode::Enter))
         .expect("step into the sync panel");
     app.handle_key(key(KeyCode::End)).expect("refresh row");
     app.handle_key(key(KeyCode::Up)).expect("code row");
     app.handle_key(key(KeyCode::Enter)).expect("code form");
-    for c in "8.8.8.8:7420".chars() {
+    for c in "https://example.test/store".chars() {
         app.handle_key(key(KeyCode::Char(c))).expect("type");
     }
     app.handle_key(key(KeyCode::Enter)).expect("refused");
     let sync = &app.modal.as_ref().unwrap().sync;
     assert!(sync.pairing.is_none());
-    assert!(matches!(&sync.notice, Some((text, true)) if text.contains("LAN")));
+    assert!(matches!(&sync.notice, Some((text, true)) if text.contains("server's address")));
 
     app.handle_key(key(KeyCode::Enter)).expect("code form");
     for c in "192.168.0.10:7420".chars() {

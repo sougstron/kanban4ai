@@ -12,7 +12,7 @@ expression: rendered
 │              │ Com │ Des │ Rev │ Exe │ Aut │ Bck │ Prj │ Syn                      │              │
 │              │────────────────────────────────────────────────────────────────────│              │
 │              │┌ Sync ────────────────────────────────────────────────────────────┐│              │
-│              ││Sync выключен — добавьте peer (kanban serve pair / join) или relay││              │
+│              ││Sync выключен — подключите sync server (kanban serve --pair)      ││              │
 │              ││                                                                  ││              │
 │              ││                                                                  ││              │
 │              ││                                                                  ││              │

@@ -250,7 +250,7 @@ pub(crate) fn pairing_code(
         return Ok((pairing::create_code(&store)?, None));
     }
     let invite = pairing::phone_invite(&store, address).map_err(|_| {
-        invalid("The phone QR needs this node's LAN or tailnet address, e.g. 192.168.0.10:7420")
+        invalid("The phone QR needs this server's address: LAN/tailnet host:port or https URL, e.g. 192.168.0.10:7420")
     })?;
     Ok((invite.code, Some((invite.command, invite.qr))))
 }

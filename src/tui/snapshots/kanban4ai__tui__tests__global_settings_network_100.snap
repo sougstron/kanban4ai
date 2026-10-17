@@ -29,8 +29,8 @@ expression: "render_at(&mut app, width, 36)"
 │              │┃  [ Отключить / Disconnect ]                                      ┃│              │
 │              │┃  [ Выйти из аккаунта / Logout ]                                  ┃│              │
 │              │┃                                                                  ┃│              │
-│              │┃Nodes in phone priority order (Shift+↑/↓ or K/J moves)            ┃│              │
-│              │┃  1. server (server)                                              ┃│              │
+│              │┃Sync server                                                       ┃│              │
+│              │┃server · http://192.168.0.20:7420 · not connected                 ┃│              │
 │              │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛│              │
 │              └────────────────────────────────────────────────────────────────────┘              │
 │                                                                                                  │
@@ -260,15 +260,17 @@ expression: "render_at(&mut app, width, 36)"
 27:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 27:1-15 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 27:15-17 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-27:17-71 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
-27:71-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+27:17-28 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold()
+27:28-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 27:83-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 27:85-99 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 27:99-100 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 28:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 28:1-15 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
-28:15-19 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-28:19-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+28:15-17 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+28:17-50 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+28:50-66 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+28:66-83 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 28:83-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 28:85-99 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 28:99-100 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)

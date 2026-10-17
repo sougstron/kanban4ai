@@ -10,7 +10,7 @@ expression: rendered
 │           │ Com │ Des │ Rev │ Exe │ Aut │ Bck │ Prj │ Syn        │           │
 │           │──────────────────────────────────────────────────────│           │
 │           │┏ Sync ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓│           │
-│           │┃  [ Pair with a node… ]                             ┃│           │
+│           │┃  [ Connect to the sync server… ]                   ┃│           │
 │           │┃  [ Show a pairing code / phone QR… ]               ┃│           │
 │           │┃  [ Refresh status ]  (r)                           ┃│           │
 │           │┃                                                    ┃│           │
