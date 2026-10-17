@@ -1,3 +1,30 @@
+# kanban4ai 0.8.4
+
+- **One-step phone pairing.** `kanban4ai join CODE@HOST:PORT [--name NAME]`
+  sets a device up from a single invite: it switches the node to the `mobile`
+  role, brings up managed Tailscale when the host is a tailnet address, pairs,
+  and runs the first sync. The TUI Sync → Pair form accepts the same invite.
+- **Phone QR without typing an address.** `serve --phone-qr` now detects this
+  node's address (default-route LAN IPv4 first, links that are down last, else
+  MagicDNS) and prints the `kanban4ai join` command plus its QR.
+- Net unit tests no longer pick up a system-wide `tailscale` from PATH instead
+  of their stub binaries.
+
+# kanban4ai 0.8.3
+
+- **Two-level dialog navigation.** New/Edit task, Project Settings, Global
+  Settings and their Agent settings / Options popups open in block-selection
+  mode. Up/Down select blocks; Enter steps inside; Esc returns to block
+  selection. Inside a block, arrows and Enter stay local, including at edges.
+- **Predictable settings tabs and editing.** Left/Right switch settings tabs
+  while selecting blocks. Tab/Shift+Tab preserve the current navigation level;
+  typing, pasting and clicking enter editable blocks without losing input.
+  Space toggles flags or cycles the runner directly; Ctrl+S saves at either level.
+- **Visible editing focus.** Thick borders, text carets and coloured selection
+  highlights identify the block being edited. The Sync page follows the same
+  navigation model and closes an open input form before leaving its block.
+- Small flat dialogs retain their existing field navigation.
+
 # kanban4ai 0.8.2
 
 - **Responsive project switching.** Opening a project or returning to the
