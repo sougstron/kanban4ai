@@ -320,7 +320,9 @@ pub(crate) fn renamed(board: &Path, id: &str) -> Result<Option<String>> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| invalid("invalid board"))?;
-    let state = Journal::open(store)?.state()?;
+    // Every CLI task command resolves its id here: the uid tables suffice, so
+    // a cold process must not read every task shard of the store.
+    let state = Journal::open(store)?.task_state(alias, &[])?;
     let Some(project) = state.project_uids.get(alias) else {
         return Ok(None);
     };

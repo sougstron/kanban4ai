@@ -465,6 +465,14 @@ pub fn reconcile(root: &Path) -> Result<()> {
             {
                 task.landing_pending = None;
             }
+            let tips = finished
+                .clone()
+                .filter_map(|(_, run)| run.tip.clone())
+                .collect::<Vec<_>>()
+                .join(",");
+            if refusal_pending(&project.data_root, &task.id, &tips) {
+                continue;
+            }
             // Pushes and fetches run unlocked: a slow or rejecting remote held
             // the board lock for seconds every cycle, stalling every TUI save
             // and task open behind it. The task is re-read once they finish.
@@ -571,6 +579,7 @@ pub fn reconcile(root: &Path) -> Result<()> {
                 storage.save_task(&task)?;
             }
             drop(guard);
+            note_refusal(&project.data_root, &task.id, &tips, transfer.as_ref().err())?;
             if let Err(error) = transfer {
                 failure = Some(error);
                 continue;
@@ -599,6 +608,94 @@ pub fn reconcile(root: &Path) -> Result<()> {
         Some(error) => Err(error),
         None => Ok(()),
     }
+}
+
+/// Result transfers the remote refused, per board and task. Unlike an
+/// unreachable remote, a refusal repeats until someone fixes the remote side
+/// (a token without the `workflow` scope), so it waits 30 s doubling up to
+/// 30 min instead of retrying every cycle. New result tips retry at once.
+struct Refused {
+    tips: String,
+    attempts: u32,
+    until: std::time::Instant,
+}
+
+static REFUSED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, String), Refused>>,
+> = std::sync::LazyLock::new(Default::default);
+
+fn refusal_pending(board: &Path, task: &str, tips: &str) -> bool {
+    REFUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(board.to_path_buf(), task.to_owned()))
+        .is_some_and(|r| r.tips == tips && std::time::Instant::now() < r.until)
+}
+
+/// The remote's own refusal line, when `error` is a refusal and not a
+/// connection failure.
+fn refusal(error: &KanbanError) -> Option<String> {
+    let text = error.to_string();
+    let line = text.lines().find(|line| {
+        line.contains("[remote rejected]")
+            || line.contains("[rejected]")
+            || line.contains("Permission to")
+            || line.contains("The requested URL returned error: 403")
+    })?;
+    Some(line.trim().trim_start_matches("! ").to_owned())
+}
+
+/// Track a transfer outcome. The first refusal of a message is posted to the
+/// task thread, so the TUI shows why the result is not on the remote; the
+/// note text is kept in `.kanban/code` so a restart does not repost it.
+fn note_refusal(board: &Path, task: &str, tips: &str, error: Option<&KanbanError>) -> Result<()> {
+    let key = (board.to_path_buf(), task.to_owned());
+    let mark = board.join(".kanban/code").join(format!("{task}.refused"));
+    let Some(line) = error.and_then(refusal) else {
+        if error.is_none() {
+            REFUSED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&key);
+            match fs::remove_file(&mark) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        return Ok(());
+    };
+    {
+        let mut refused = REFUSED.lock().unwrap_or_else(|e| e.into_inner());
+        let attempts = refused
+            .get(&key)
+            .filter(|r| r.tips == tips)
+            .map_or(1, |r| r.attempts.saturating_add(1));
+        let wait = (30u64 << (attempts - 1).min(6)).min(1800);
+        refused.insert(
+            key,
+            Refused {
+                tips: tips.to_owned(),
+                attempts,
+                until: std::time::Instant::now() + std::time::Duration::from_secs(wait),
+            },
+        );
+    }
+    let text = error.map(ToString::to_string).unwrap_or_default();
+    let hint = if text.contains("`workflow` scope") {
+        " У токена GitHub нет scope `workflow`, а результат меняет .github/workflows: выдайте токену этот scope (classic PAT — галочка workflow, fine-grained — Workflows: Read and write)."
+    } else {
+        ""
+    };
+    let note = format!(
+        "RUN_TRANSFER_REFUSED: remote отклонил результат: {line}.{hint} Повтор с нарастающей паузой до 30 мин."
+    );
+    if fs::read_to_string(&mark).is_ok_and(|seen| seen == note) {
+        return Ok(());
+    }
+    super::thread::ThreadManager::new(board)?.post_board_note(task, &note)?;
+    fs::create_dir_all(board.join(".kanban/code"))?;
+    atomic_write_text(&mark, &note)
 }
 
 fn selection_path(board: &Path, task: &str) -> PathBuf {

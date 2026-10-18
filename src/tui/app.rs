@@ -514,6 +514,11 @@ pub struct App {
     project_cache: Option<projects::ProjectCache>,
     project_scan: Option<JoinHandle<ProjectScanReport>>,
     project_generation: u64,
+    /// Detail analytics read off the UI thread: the event log plus every
+    /// project's limit samples for the share line.
+    detail_analytics: Option<AnalyticsJob>,
+    /// The last finished analytics, reused while the task's event log is unchanged.
+    analytics_cache: Option<(AnalyticsKey, TaskAnalytics)>,
     pub project_selected: usize,
     /// First project row drawn on the projects screen. Owned by the renderer,
     /// which is the only place that knows how many rows a frame holds.
@@ -538,6 +543,18 @@ struct ProjectScanReport {
     cache: projects::ProjectCache,
     rows: Result<Vec<ProjectRow>>,
     generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct AnalyticsKey {
+    task_id: String,
+    created_at: chrono::NaiveDateTime,
+    stamp: stats::EventsStamp,
+}
+
+struct AnalyticsJob {
+    key: AnalyticsKey,
+    handle: JoinHandle<TaskAnalytics>,
 }
 
 /// A background launch; `task_id` is `None` for a board/store pump.
@@ -1007,6 +1024,8 @@ impl App {
             project_cache: Some(projects::ProjectCache::default()),
             project_scan: None,
             project_generation: 0,
+            detail_analytics: None,
+            analytics_cache: None,
             project_selected: 0,
             project_scroll: 0,
             create_cwd: None,
@@ -1133,6 +1152,8 @@ impl App {
             project_cache: Some(projects::ProjectCache::default()),
             project_scan: None,
             project_generation: 0,
+            detail_analytics: None,
+            analytics_cache: None,
             project_selected: 0,
             project_scroll: 0,
             create_cwd,
@@ -3749,6 +3770,7 @@ impl App {
     /// Reap finished workers, then apply every report they sent. Reaping
     /// first is what makes this complete: a joined worker has already sent.
     pub fn poll_launches(&mut self) {
+        self.poll_detail_analytics();
         let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.launches)
             .into_iter()
             .partition(|job| job.handle.is_finished());
@@ -4351,16 +4373,7 @@ impl App {
         let has_provenance = !provenance.is_empty();
         let analytics = task
             .as_ref()
-            .map(|task| {
-                let root = self.ops.data_root();
-                let mut analytics = stats::task_analytics(root, &task.id, task.created_at);
-                let since = chrono::Local
-                    .from_local_datetime(&task.created_at)
-                    .earliest()
-                    .map_or(0, |at| at.timestamp());
-                analytics.limit_shares = limit_share::task_limit_shares(root, &task.id, since);
-                analytics
-            })
+            .map(|task| self.detail_analytics_for(task))
             .unwrap_or_default();
         let mut detail = DetailState {
             task_id: task_id.to_string(),
@@ -5084,6 +5097,80 @@ impl App {
             self.apply_project_rows(rows?);
         }
         Ok(())
+    }
+
+    /// Analytics for the detail of `task`: cached while its event log is
+    /// unchanged, otherwise computed by a worker while the detail shows the
+    /// previous numbers. Inline without a wake channel (embedded callers, tests).
+    fn detail_analytics_for(&mut self, task: &Task) -> TaskAnalytics {
+        let root = self.ops.data_root().to_path_buf();
+        let key = AnalyticsKey {
+            task_id: task.id.clone(),
+            created_at: task.created_at,
+            stamp: stats::events_stamp(&root),
+        };
+        if let Some((cached, analytics)) = &self.analytics_cache
+            && *cached == key
+        {
+            return analytics.clone();
+        }
+        let (id, created_at) = (task.id.clone(), task.created_at);
+        let compute = move || {
+            let mut analytics = stats::task_analytics(&root, &id, created_at);
+            let since = chrono::Local
+                .from_local_datetime(&created_at)
+                .earliest()
+                .map_or(0, |at| at.timestamp());
+            analytics.limit_shares = limit_share::task_limit_shares(&root, &id, since);
+            analytics
+        };
+        let Some(wake) = self.launch_wake.clone() else {
+            let analytics = compute();
+            self.analytics_cache = Some((key, analytics.clone()));
+            return analytics;
+        };
+        let shown = self
+            .detail
+            .as_ref()
+            .filter(|detail| detail.task_id == task.id)
+            .map(|detail| detail.analytics.clone())
+            .unwrap_or_default();
+        if !self
+            .detail_analytics
+            .as_ref()
+            .is_some_and(|job| job.key == key)
+        {
+            // A superseded worker finishes on its own; its result is dropped.
+            self.detail_analytics = Some(AnalyticsJob {
+                key,
+                handle: thread::spawn(move || {
+                    let analytics = compute();
+                    let _ = wake.send(AppEvent::LaunchDone);
+                    analytics
+                }),
+            });
+        }
+        shown
+    }
+
+    fn poll_detail_analytics(&mut self) {
+        if !self
+            .detail_analytics
+            .as_ref()
+            .is_some_and(|job| job.handle.is_finished())
+        {
+            return;
+        }
+        let job = self.detail_analytics.take().expect("finished analytics");
+        let Ok(analytics) = job.handle.join() else {
+            return;
+        };
+        if let Some(detail) = self.detail.as_mut()
+            && detail.task_id == job.key.task_id
+        {
+            detail.analytics = analytics.clone();
+        }
+        self.analytics_cache = Some((job.key, analytics));
     }
 
     fn poll_project_scan(&mut self) {
