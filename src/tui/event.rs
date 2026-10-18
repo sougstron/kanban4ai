@@ -13,6 +13,7 @@ use crate::core::project::Project;
 
 use super::app::App;
 use super::board;
+use super::diag;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -62,15 +63,18 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
     refresh_limits(app);
     app.poll_update_banner();
     sync_window_title(app, &mut window_title);
+    diag::busy("draw");
     terminal.draw(|frame| board::ui(frame, app))?;
     loop {
         if let Some(outcome) = app.take_loop_outcome() {
             return Ok(outcome);
         }
+        diag::idle();
         let event = match threads.rx.recv() {
             Ok(event) => event,
             Err(_) => return Ok(LoopOutcome::Quit),
         };
+        diag::busy(event_phase(&event));
         match event {
             AppEvent::Input(input) => handle_input(app, input)?,
             AppEvent::PasteShortcut(key, clipboard) => app.handle_paste_shortcut(key, clipboard)?,
@@ -103,12 +107,14 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
                 if let Err(error) = network.tick() {
                     app.status = error.to_string();
                 }
+                diag::busy("tick: limits");
                 refresh_limits(app);
                 app.poll_update_banner();
                 app.tick()?;
             }
         }
         if let Some(text) = app.take_pending_copy() {
+            diag::busy("copy");
             app.finish_copy(super::image::copy_text(&text));
         }
         if app.take_full_redraw() {
@@ -118,7 +124,24 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
             return Ok(outcome);
         }
         sync_window_title(app, &mut window_title);
+        diag::busy("draw");
         terminal.draw(|frame| board::ui(frame, app))?;
+    }
+}
+
+/// Watchdog label for the work one event starts.
+fn event_phase(event: &AppEvent) -> &'static str {
+    match event {
+        AppEvent::Input(CrosstermEvent::Key(_)) => "input: key",
+        AppEvent::Input(CrosstermEvent::Mouse(_)) => "input: mouse",
+        AppEvent::Input(CrosstermEvent::Paste(_)) => "input: paste",
+        AppEvent::Input(_) => "input",
+        AppEvent::PasteShortcut(..) => "input: paste shortcut",
+        AppEvent::InputError(_) => "input error",
+        AppEvent::FsChanged => "fs change",
+        AppEvent::FsDebounced(_) => "board reload",
+        AppEvent::Tick => "tick: network",
+        AppEvent::LaunchDone => "launch done",
     }
 }
 
@@ -177,6 +200,14 @@ fn spawn_input_thread(tx: Sender<AppEvent>) {
             };
             match input {
                 Ok(event) => {
+                    // Raw mode swallows SIGINT, so a stuck main loop would
+                    // otherwise leave no way out short of killing the shell.
+                    if let CrosstermEvent::Key(key) = event
+                        && key.kind == KeyEventKind::Press
+                        && super::app::is_ctrl_c(key)
+                    {
+                        diag::ctrl_c_pressed();
+                    }
                     if tx.send(input_event(event)).is_err() {
                         break;
                     }

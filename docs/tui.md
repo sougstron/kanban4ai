@@ -211,6 +211,22 @@ the plain-letter hotkeys.
   The board selects the copy. Everywhere else, including the board, new/edit
   dialogs and the detail's answer/review-edit inputs, `Ctrl+C` is for exiting,
   not copying.
+- `Ctrl+C` while the board has stopped responding (its main loop stuck in
+  one step for 2 s or more): restores the terminal and exits with status 130
+  immediately, after writing a stall report to `tui.log` (below).
+
+## Diagnostics log
+
+While the TUI runs, stderr is redirected to `<store>/logs/tui.log` (rotated
+to `tui.log.1` past 2 MiB on start), so the embedded sync worker, child
+processes and background-thread panics can no longer print over the board.
+The log records start/exit, panics with their thread name, and every
+main-loop step (`input: key`, `tick: queue pump`, `draw`, …) that runs past
+5 s, re-reported at 20 s, 80 s, …: each report lists every thread's kernel
+wait channel and the `/proc/locks` holders and waiters of the `.lock` files
+the process has open, with their command lines. A panic off the TUI thread
+is logged and leaves the terminal alone; only a TUI-thread panic tears it
+down.
 
 Clipboard pastes use bracketed paste: the whole block is inserted into the
 focused text field in one edit (flattened to a single line for one-line fields
