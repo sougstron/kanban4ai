@@ -286,6 +286,46 @@ fn conflicting_peer_disk_is_untouched_and_keeps_node_specific_landing_pending() 
 }
 
 #[test]
+fn reconcile_pushes_results_without_holding_the_board_lock() {
+    let p = pair(false);
+    let a = ops(&p.pa);
+    let task = a.create_task(NewTask::titled("unlocked push")).unwrap();
+    take(&p.pa, &task.id, "ses-unlocked", "unlocked-result");
+    a.complete_task(&task.id, "ses-unlocked", true).unwrap();
+    // Completion already published; drop the remote copies so reconcile
+    // pushes again while the remote probes the pushing board's lock.
+    for reference in git(
+        &p.remote,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/kanban",
+            "refs/heads/kanban",
+        ],
+    )
+    .lines()
+    {
+        git(&p.remote, &["update-ref", "-d", reference]);
+    }
+    let probe = p.remote.with_extension("probe");
+    let hook = p.remote.join("hooks/pre-receive");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nif flock -n '{}' true; then echo free; else echo held; fi >> '{}'\n",
+            p.pa.kanban_dir().join(".lock").display(),
+            probe.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    code::reconcile(&p.a).unwrap();
+    let probes = fs::read_to_string(&probe).unwrap();
+    assert!(probes.contains("free"), "{probes}");
+    assert!(!probes.contains("held"), "{probes}");
+}
+#[test]
 fn unavailable_remote_retains_completed_code_and_retries_after_reconnection() {
     let p = pair(false);
     let a = ops(&p.pa);
