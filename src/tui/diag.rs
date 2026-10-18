@@ -58,6 +58,83 @@ pub(super) fn log(message: &str) {
     let _ = writeln!(io::stderr(), "{stamp} [{}] {message}", std::process::id());
 }
 
+/// Timings between completed phases, emitted on drop for work taking at least
+/// 50 ms, or every time with `KANBAN_TUI_PROFILE=1` set at process start.
+/// `mark("load")` records the time since construction/the previous mark.
+/// Fast paths allocate nothing; output uses the existing terminal-safe log.
+pub(super) struct PhaseTimer {
+    name: &'static str,
+    start: Instant,
+    last: Instant,
+    phases: [(&'static str, Duration); 32],
+    len: usize,
+    overflow: Duration,
+}
+
+impl PhaseTimer {
+    pub(super) fn new(name: &'static str) -> Self {
+        let start = Instant::now();
+        Self {
+            name,
+            start,
+            last: start,
+            phases: [("", Duration::ZERO); 32],
+            len: 0,
+            overflow: Duration::ZERO,
+        }
+    }
+
+    pub(super) fn mark(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last);
+        if let Some(slot) = self.phases.get_mut(self.len) {
+            *slot = (phase, elapsed);
+            self.len += 1;
+        } else {
+            self.overflow += elapsed;
+        }
+        self.last = now;
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        use std::fmt::Write as _;
+        static PROFILE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var_os("KANBAN_TUI_PROFILE").is_some_and(|value| value == "1")
+        });
+        if !logging() {
+            return;
+        }
+        let now = Instant::now();
+        let total = now.duration_since(self.start);
+        if !*PROFILE && total < Duration::from_millis(50) {
+            return;
+        }
+        let mut message = format!(
+            "profile {} total={:.3}ms",
+            self.name,
+            total.as_secs_f64() * 1000.0
+        );
+        for (phase, elapsed) in &self.phases[..self.len] {
+            let _ = write!(message, " {phase}={:.3}ms", elapsed.as_secs_f64() * 1000.0);
+        }
+        if !self.overflow.is_zero() {
+            let _ = write!(
+                message,
+                " other_marks={:.3}ms",
+                self.overflow.as_secs_f64() * 1000.0
+            );
+        }
+        let _ = write!(
+            message,
+            " unmarked={:.3}ms",
+            now.duration_since(self.last).as_secs_f64() * 1000.0
+        );
+        log(&message);
+    }
+}
+
 /// Holds stderr on the log file for the TUI's lifetime.
 pub(super) struct StderrLog;
 

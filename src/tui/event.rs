@@ -24,6 +24,8 @@ pub enum AppEvent {
     FsChanged,
     FsDebounced(u64),
     Tick,
+    /// Read-only tick work completed without blocking terminal input.
+    TickReady(Box<super::tick_worker::TickResult>),
     /// A background launch finished; its report is waiting on the app.
     LaunchDone,
 }
@@ -75,6 +77,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
             Err(_) => return Ok(LoopOutcome::Quit),
         };
         diag::busy(event_phase(&event));
+        let mut event_timer = diag::PhaseTimer::new(event_phase(&event));
         match event {
             AppEvent::Input(input) => handle_input(app, input)?,
             AppEvent::PasteShortcut(key, clipboard) => app.handle_paste_shortcut(key, clipboard)?,
@@ -103,16 +106,20 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
                 }
             }
             AppEvent::LaunchDone => app.poll_launches(),
+            AppEvent::TickReady(result) => app.apply_tick_result(*result)?,
             AppEvent::Tick => {
                 if let Err(error) = network.tick() {
                     app.status = error.to_string();
                 }
+                event_timer.mark("network");
                 diag::busy("tick: limits");
                 refresh_limits(app);
                 app.poll_update_banner();
+                event_timer.mark("limits_update");
                 app.tick()?;
             }
         }
+        event_timer.mark("event");
         if let Some(text) = app.take_pending_copy() {
             diag::busy("copy");
             app.finish_copy(super::image::copy_text(&text));
@@ -126,6 +133,7 @@ pub fn run_event_loop<B: Backend<Error = std::io::Error>>(
         sync_window_title(app, &mut window_title);
         diag::busy("draw");
         terminal.draw(|frame| board::ui(frame, app))?;
+        event_timer.mark("draw");
     }
 }
 
@@ -141,6 +149,7 @@ fn event_phase(event: &AppEvent) -> &'static str {
         AppEvent::FsChanged => "fs change",
         AppEvent::FsDebounced(_) => "board reload",
         AppEvent::Tick => "tick: network",
+        AppEvent::TickReady(_) => "tick: apply",
         AppEvent::LaunchDone => "launch done",
     }
 }
