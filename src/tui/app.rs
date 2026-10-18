@@ -44,7 +44,7 @@ use crate::core::operations::{
 use crate::core::project::{Project, ProjectStore};
 use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
-use crate::core::stats::{self, EventsStamp, TaskAnalytics};
+use crate::core::stats::{self, TaskAnalytics};
 use crate::core::storage::{BoardStamps, NewTask, Storage, TaskCache};
 use crate::core::telemetry::{self, SessionProgress, TokenBreakdown};
 use crate::core::thread::ThreadManager;
@@ -64,6 +64,11 @@ use super::projects::{self, ProjectListItem, ProjectRow};
 use super::search::SearchState;
 use super::theme::{BUILTIN_THEMES, Theme};
 use super::thread_view::is_kanban_authored;
+use super::tick_worker::{self, ProgressCache, TickRequest, TickResult, TickWorker};
+
+#[cfg(test)]
+#[path = "tick_tests.rs"]
+mod tick_tests;
 
 const CTRL_C_EXIT_PROMPT: &str = "Press ctrl + C again to close";
 const CTRL_C_EXIT_WINDOW: Duration = Duration::from_secs(3);
@@ -430,9 +435,12 @@ pub struct App {
     /// one), the same figure the detail Analytics panel shows. Refreshed with
     /// [`Self::session_progress`].
     pub task_tokens: HashMap<String, TokenBreakdown>,
-    /// Closed-run analytics per running task, reused until the stats events
-    /// file changes so the tick does not reparse it.
-    task_analytics_cache: HashMap<String, (EventsStamp, TaskAnalytics)>,
+    /// Inline fallback cache; the real event loop keeps its cache on the worker.
+    progress_cache: ProgressCache,
+    tick_worker: Option<TickWorker>,
+    tick_in_flight: bool,
+    tick_force_pending: bool,
+    board_generation: u64,
     /// Provider subscription limits drawn above the status bar. Pulled from the
     /// background-refreshed cache by the event loop, so rendering never reaches
     /// for a global and non-TUI callers (tests) start with no row.
@@ -546,6 +554,7 @@ struct LaunchReport {
     focus: Option<String>,
     refresh: bool,
     redraw: bool,
+    background_refresh: bool,
 }
 
 /// One queue pump's outcome: the tasks it started and any failure line.
@@ -622,6 +631,7 @@ impl App {
         // A project-list scan only reads; nothing is left half-done if it is
         // abandoned, so it is detached rather than joined.
         drop(self.project_scan.take());
+        self.tick_worker = None;
     }
 }
 
@@ -945,7 +955,11 @@ impl App {
             session_selected: 0,
             session_progress: HashMap::new(),
             task_tokens: HashMap::new(),
-            task_analytics_cache: HashMap::new(),
+            progress_cache: ProgressCache::default(),
+            tick_worker: None,
+            tick_in_flight: false,
+            tick_force_pending: false,
+            board_generation: 0,
             limits: None,
             archived_tasks,
             archive_selected: 0,
@@ -1065,7 +1079,11 @@ impl App {
             session_selected: 0,
             session_progress: HashMap::new(),
             task_tokens: HashMap::new(),
-            task_analytics_cache: HashMap::new(),
+            progress_cache: ProgressCache::default(),
+            tick_worker: None,
+            tick_in_flight: false,
+            tick_force_pending: false,
+            board_generation: 0,
             limits: None,
             archived_tasks: Vec::new(),
             archive_selected: 0,
@@ -3110,7 +3128,73 @@ impl App {
             return Ok(());
         }
         self.pending_fs_reload = false;
-        self.reload_if_changed()?;
+        if !self.request_tick_refresh(true) {
+            self.reload_if_changed()?;
+        }
+        Ok(())
+    }
+
+    /// Coalesce refreshes while the single worker is busy. No board I/O here.
+    fn request_tick_refresh(&mut self, force: bool) -> bool {
+        let Some(worker) = self.tick_worker.as_ref() else {
+            return false;
+        };
+        if !worker.finished() {
+            self.tick_force_pending |= force;
+            if self.tick_in_flight {
+                return true;
+            }
+            let request = TickRequest {
+                generation: self.board_generation,
+                main_stamps: self.board.stamps,
+                force: self.tick_force_pending,
+                live: tick_worker::live_tasks(&self.board),
+                #[cfg(test)]
+                before_read: None,
+            };
+            if worker.request(request) {
+                self.tick_in_flight = true;
+                self.tick_force_pending = false;
+                return true;
+            }
+        }
+        self.tick_worker = None;
+        self.tick_in_flight = false;
+        self.tick_force_pending = false;
+        self.status = "Tick worker stopped; using synchronous refresh".into();
+        false
+    }
+
+    pub fn apply_tick_result(&mut self, mut result: TickResult) -> Result<()> {
+        // Identity also distinguishes leaving and reopening the same board.
+        if result.path != self.ops.data_root()
+            || !self.tick_worker.as_ref().is_some_and(|worker| worker.id == result.worker_id)
+        {
+            return Ok(());
+        }
+        self.tick_in_flight = false;
+        self.session_progress = result.progress;
+        self.task_tokens = result.tokens;
+        if result.generation == self.board_generation {
+            if let Some(board) = result.board.take() {
+                let sessions_changed = board.stamps.sessions != self.board.stamps.sessions;
+                let session_before = self.detail_session_state();
+                self.board = board;
+                self.archived_tasks = std::mem::take(&mut self.board.archived);
+                self.clamp_archive_selection();
+                self.finish_board_refresh(result.tasks_changed, sessions_changed, session_before)?;
+                self.expire_session_states_at(timefmt::now());
+            }
+        } else {
+            // A user action won the race; request a fresh snapshot, not the old one.
+            self.tick_force_pending = true;
+        }
+        if let Some(error) = result.error {
+            self.status = error;
+        }
+        if self.tick_force_pending {
+            self.request_tick_refresh(true);
+        }
         Ok(())
     }
 
@@ -3120,6 +3204,7 @@ impl App {
     }
 
     pub fn reload_if_changed(&mut self) -> Result<()> {
+        let mut timer = super::diag::PhaseTimer::new("board refresh");
         if !self.has_board {
             return self.refresh_projects_if_changed();
         }
@@ -3135,24 +3220,35 @@ impl App {
             self.settings.hide_kanban_messages = effective.hide_kanban_messages;
             self.settings.backend_order = self.ops.config.load_global().0.backend_order();
         }
+        if self.request_tick_refresh(global_changed) {
+            return Ok(());
+        }
         let stamps = self.ops.storage.board_stamps();
+        timer.mark("stamps_config");
         if stamps == self.board.stamps && !global_changed {
             return Ok(());
         }
         let tasks_changed = global_changed || stamps.tasks != self.board.stamps.tasks;
         let sessions_changed = stamps.sessions != self.board.stamps.sessions;
-        let detail_session = |app: &Self| {
-            let detail = app.detail.as_ref()?;
-            app.board.session_states.get(&detail.task_id).copied()
-        };
-        let session_before = detail_session(self);
+        let session_before = self.detail_session_state();
         if tasks_changed {
             self.reload_board()?;
         } else {
             // A heartbeat or a thread post: tasks are unchanged, so only the
             // session and thread derived parts of the board are refreshed.
             self.board.refresh_sidecars(&self.ops, stamps)?;
+            self.board_generation = self.board_generation.wrapping_add(1);
         }
+        timer.mark("snapshot");
+        self.finish_board_refresh(tasks_changed, sessions_changed, session_before)
+    }
+
+    fn detail_session_state(&self) -> Option<SessionState> {
+        self.detail.as_ref().and_then(|detail| self.board.session_states.get(&detail.task_id).copied())
+    }
+
+    fn finish_board_refresh(&mut self, tasks_changed: bool, sessions_changed: bool, session_before: Option<SessionState>) -> Result<()> {
+        let mut timer = super::diag::PhaseTimer::new("apply board");
         if self.screen == Screen::Sessions && (tasks_changed || sessions_changed) {
             self.refresh_active_sessions()?;
         }
@@ -3160,7 +3256,7 @@ impl App {
         // changed: its task, its thread, or its session's state.
         let detail_stale = self.detail.as_ref().is_some_and(|detail| {
             tasks_changed
-                || detail_session(self) != session_before
+                || self.detail_session_state() != session_before
                 || ThreadManager::new(self.ops.data_root())
                     .map(|tm| tm.stamp(&detail.task_id))
                     .ok()
@@ -3178,15 +3274,19 @@ impl App {
                 }
             }
         }
+        timer.mark("sessions_detail");
         self.clamp_focus();
         self.status = "Board updated from disk".to_string();
         Ok(())
     }
 
     pub fn tick(&mut self) -> Result<()> {
+        let mut timer = super::diag::PhaseTimer::new("tick");
         super::diag::busy("tick: board reload");
         self.poll_launches();
+        timer.mark("poll_launches");
         self.reload_if_changed()?;
+        timer.mark("reload_if_changed");
         super::diag::busy("tick: sync board");
         if let Some(store) = &self.store {
             self.sync_board.poll(
@@ -3195,7 +3295,9 @@ impl App {
                 self.settings.refresh_interval,
             );
         }
+        timer.mark("sync_board");
         self.refresh_modal_after_catalog_warm();
+        timer.mark("catalog");
         let now = Instant::now();
         self.expire_ctrl_c_prompt_at(now);
         self.expire_copy_notice_at(now);
@@ -3214,13 +3316,18 @@ impl App {
             self.resume_expired_waits_throttled();
             self.dispatch_queue_throttled();
         }
+        timer.mark("pump");
         // Log writes bypass the fs watcher (it only covers board dirs), so
         // the pager tail refreshes on the tick.
         if self.screen == Screen::LogView {
             self.refresh_log_view();
         }
+        timer.mark("log_view");
         super::diag::busy("tick: session progress");
-        self.refresh_session_progress();
+        if self.tick_worker.is_none() {
+            self.refresh_session_progress();
+        }
+        timer.mark("session_progress");
         Ok(())
     }
 
@@ -3253,45 +3360,17 @@ impl App {
     /// the tick. Only Live/Waiting tasks are read — a handful at most — and the
     /// map is rebuilt each pass so a finished agent's line disappears with it.
     fn refresh_session_progress(&mut self) {
-        let mut progress = HashMap::new();
-        let mut tokens = HashMap::new();
-        let mut cache = std::mem::take(&mut self.task_analytics_cache);
-        let mut fresh = HashMap::new();
-        let root = self.ops.data_root();
-        let stamp = stats::events_stamp(root);
-        for column in &self.board.columns {
-            for task in &column.tasks {
-                let Some(session_id) = task.session.as_deref() else {
-                    continue;
-                };
-                if !matches!(
-                    self.board.session_states.get(&task.id),
-                    Some(SessionState::Live | SessionState::Waiting)
-                ) {
-                    continue;
-                }
-                let backend = task.agent_backend.as_deref().unwrap_or("claude");
-                let found = telemetry::read_session_progress(root, session_id, backend);
-                let analytics = match cache.remove(&task.id) {
-                    Some((cached, analytics)) if cached == stamp => analytics,
-                    _ => stats::task_analytics(root, &task.id, task.created_at),
-                };
-                let total = analytics.tokens_with_live(Some(session_id), found.breakdown.as_ref());
-                if !total.is_empty() {
-                    tokens.insert(task.id.clone(), total);
-                }
-                fresh.insert(task.id.clone(), (stamp, analytics));
-                if found.has_data() {
-                    progress.insert(task.id.clone(), found);
-                }
-            }
-        }
-        self.session_progress = progress;
-        self.task_tokens = tokens;
-        self.task_analytics_cache = fresh;
+        (self.session_progress, self.task_tokens) = self.progress_cache.refresh(
+            self.ops.data_root(), &tick_worker::live_tasks(&self.board),
+        );
     }
 
     fn refresh_modal_after_catalog_warm(&mut self) {
+        if !self.modal.as_ref().is_some_and(|modal| matches!(modal.modal,
+            Modal::NewTask { .. } | Modal::EditTask { .. } | Modal::Settings | Modal::GlobalSettings
+        )) {
+            return;
+        }
         let Ok(config) = self.ops.config.load() else {
             return;
         };
@@ -3600,6 +3679,11 @@ impl App {
     /// finished job's report is waiting (see [`Self::poll_launches`]).
     pub fn enable_background_launches(&mut self, wake: Sender<AppEvent>) {
         self.launch_wake = Some(wake);
+        if self.has_board && self.tick_worker.is_none()
+            && let Some(seed) = self.ops.detach()
+        {
+            self.tick_worker = Some(TickWorker::spawn(seed, self.launch_wake.as_ref().unwrap().clone()));
+        }
         if !self.has_board
             && let Err(err) = self.refresh_projects_if_changed()
         {
@@ -3624,8 +3708,11 @@ impl App {
             return;
         };
         let tx = self.launch_tx.clone();
+        let background_refresh = task_id.is_none();
         let handle = thread::spawn(move || {
-            let _ = tx.send(job(&seed.build()));
+            let mut report = job(&seed.build());
+            report.background_refresh = background_refresh;
+            let _ = tx.send(report);
             let _ = wake.send(AppEvent::LaunchDone);
         });
         self.launches.push(LaunchJob { task_id, handle });
@@ -3655,6 +3742,7 @@ impl App {
             self.request_full_redraw();
         }
         if report.refresh
+            && !(report.background_refresh && self.request_tick_refresh(true))
             && let Err(err) = self.refresh_after_action()
         {
             self.status = err.to_string();
@@ -6120,6 +6208,7 @@ impl App {
     /// the archive from the same read.
     fn reload_board(&mut self) -> Result<()> {
         self.board = BoardSnapshot::load_reusing(&self.ops, Some(&self.board))?;
+        self.board_generation = self.board_generation.wrapping_add(1);
         self.archived_tasks = std::mem::take(&mut self.board.archived);
         self.clamp_archive_selection();
         Ok(())
