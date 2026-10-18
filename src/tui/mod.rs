@@ -4,6 +4,7 @@ mod app;
 mod board;
 mod card;
 mod detail;
+mod diag;
 mod dialogs;
 mod event;
 mod image;
@@ -269,6 +270,22 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Everything `TerminalGuard::drop` undoes, unconditionally, for exits that
+/// cannot go through it (a panic, or Ctrl+C on a stalled main loop).
+/// Terminals ignore the pops for stacks they never had pushed.
+fn restore_sequence() -> String {
+    use ratatui::crossterm::Command;
+    let mut text = String::new();
+    let _ = Show.write_ansi(&mut text);
+    text.push_str(POP_WINDOW_TITLE);
+    let _ = PopKeyboardEnhancementFlags.write_ansi(&mut text);
+    text.push_str(RESET_MODIFY_OTHER_KEYS);
+    let _ = DisableBracketedPaste.write_ansi(&mut text);
+    let _ = DisableMouseCapture.write_ansi(&mut text);
+    let _ = LeaveAlternateScreen.write_ansi(&mut text);
+    text
+}
+
 struct PanicHookGuard {
     previous: Option<PanicHook>,
 }
@@ -276,16 +293,23 @@ struct PanicHookGuard {
 impl PanicHookGuard {
     fn install() -> Self {
         let previous = panic::take_hook();
+        let tui_thread = std::thread::current().id();
         panic::set_hook(Box::new(move |info| {
+            let current = std::thread::current();
+            diag::log(&format!(
+                "panic in thread '{}': {info}",
+                current.name().unwrap_or("unnamed")
+            ));
+            // A background thread's panic only ends that thread: tearing the
+            // terminal down under a board that keeps running leaves it
+            // drawing over the shell with keys no longer reaching it.
+            if current.id() != tui_thread && diag::logging() {
+                return;
+            }
+            diag::restore_stderr();
             let _ = disable_raw_mode();
-            let mut stdout = io::stdout();
-            let _ = stdout.execute(Show);
-            write_escape(&mut stdout, POP_WINDOW_TITLE);
-            let _ = stdout.execute(PopKeyboardEnhancementFlags);
-            write_escape(&mut stdout, RESET_MODIFY_OTHER_KEYS);
-            let _ = stdout.execute(DisableBracketedPaste);
-            let _ = stdout.execute(DisableMouseCapture);
-            let _ = stdout.execute(LeaveAlternateScreen);
+            let _ = io::stdout().write_all(restore_sequence().as_bytes());
+            let _ = io::stdout().flush();
             eprintln!("{info}");
         }));
         Self {
@@ -317,8 +341,13 @@ pub fn run(start: TuiStart) -> Result<()> {
             "The TUI requires an interactive terminal".to_string(),
         ));
     }
+    // Dropped after the terminal guard (declared first), so teardown errors
+    // still reach the log rather than the alternate screen.
+    let _stderr_log = diag::StderrLog::redirect();
     let _panic_hook = PanicHookGuard::install();
+    diag::spawn_watchdog();
     let mut terminal = TerminalGuard::enter()?;
+    diag::busy("open board");
     let mut app = app_from_start(start)?;
     let store = ProjectStore::open()?;
     let mut network = crate::core::net::Manager::new(store.root())?;
@@ -332,12 +361,14 @@ pub fn run(start: TuiStart) -> Result<()> {
         match event::run_event_loop(terminal.terminal_mut(), &mut app, &threads, &mut network)? {
             LoopOutcome::Quit => break,
             LoopOutcome::OpenProject(project) => {
+                diag::busy("open project");
                 let mut next = app::App::for_project(project)?;
                 next.apply_global_settings();
                 app.hand_off_background(&mut next);
                 app = next;
             }
             LoopOutcome::ShowProjects { return_to } => {
+                diag::busy("open projects list");
                 let mut next = app::App::projects_only(return_to)?;
                 app.hand_off_background(&mut next);
                 app = next;

@@ -3184,8 +3184,10 @@ impl App {
     }
 
     pub fn tick(&mut self) -> Result<()> {
+        super::diag::busy("tick: board reload");
         self.poll_launches();
         self.reload_if_changed()?;
+        super::diag::busy("tick: sync board");
         if let Some(store) = &self.store {
             self.sync_board.poll(
                 store.root(),
@@ -3205,6 +3207,7 @@ impl App {
             self.service_sync_tab(&mut modal);
             self.modal = Some(modal);
         }
+        super::diag::busy("tick: queue pump");
         if self.store.is_some() {
             self.pump_store_throttled();
         } else {
@@ -3216,6 +3219,7 @@ impl App {
         if self.screen == Screen::LogView {
             self.refresh_log_view();
         }
+        super::diag::busy("tick: session progress");
         self.refresh_session_progress();
         Ok(())
     }
@@ -7677,7 +7681,7 @@ pub(super) fn is_paste_shortcut(key: KeyEvent) -> bool {
     }
 }
 
-fn is_ctrl_c(key: KeyEvent) -> bool {
+pub(super) fn is_ctrl_c(key: KeyEvent) -> bool {
     let key = normalize_command_key(key);
     matches!(
         (key.code, key.modifiers),
