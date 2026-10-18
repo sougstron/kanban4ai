@@ -398,7 +398,7 @@ impl ServerLink {
     }
     async fn migrate(&self, cursor: &mut Cursor) -> Result<()> {
         let journal = Journal::open(&self.root)?;
-        let mut after = journal.state()?.compacted;
+        let mut after = journal.state()?.compacted.clone();
         after.insert(
             self.peer.clone(),
             journal.vector()?.get(&self.peer).copied().unwrap_or(0),
@@ -699,6 +699,7 @@ pub(super) fn start(root: &Path) -> Running {
             {
                 eprintln!("sync reconcile: {e}");
             }
+            super::release_memory();
             let interval = discovery::config(&monitor).map_or(30, |c| c.interval);
             tokio::time::sleep(Duration::from_secs(interval)).await;
         }
@@ -1101,6 +1102,48 @@ mod tests {
         );
         assert!(board.task_exists(&created.id));
         restored.abort();
+    }
+    #[test]
+    fn a_client_that_never_pulled_holds_history_only_through_the_bootstrap_grace() {
+        let server = node("server", "server");
+        let phone = node("phone", "mobile");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        Storage::new(&p.data_root)
+            .create_task(NewTask::titled("initial"))
+            .unwrap();
+        Journal::open(server.path()).unwrap().reconcile().unwrap();
+        hub::initialize(server.path()).unwrap();
+        let hub = crate::core::sync::hub::Hub::open(server.path()).unwrap();
+        let head = hub.vector_at(hub.ingest().unwrap()).unwrap();
+        assert!(!head.is_empty());
+        let phone_id = Journal::open(phone.path()).unwrap().node.node_id;
+        let token = issue_token(server.path(), TokenKind::Node).unwrap();
+        hub::register(
+            server.path(),
+            &Journal::open(phone.path()).unwrap().node,
+            &token_hash(&token),
+        )
+        .unwrap();
+        let clients = server.path().join("sync/hub/clients.json");
+        let quiet_since = |seconds: i64, cursor: u64| {
+            let mut all: BTreeMap<String, serde_json::Value> =
+                serde_json::from_str(&fs::read_to_string(&clients).unwrap()).unwrap();
+            all.get_mut(&phone_id).unwrap()["last_seen"] = serde_json::Value::from(
+                (chrono::Utc::now() - chrono::Duration::seconds(seconds)).to_rfc3339(),
+            );
+            all.get_mut(&phone_id).unwrap()["cursor"] = serde_json::Value::from(cursor);
+            fs::write(&clients, serde_json::to_string(&all).unwrap()).unwrap();
+        };
+        // Just paired: its bootstrap may still pull from the start.
+        assert_ne!(hub.stable_vector().unwrap(), head);
+        // Quiet past the grace without ever pulling: it will need a snapshot
+        // anyway, so it no longer holds the history.
+        quiet_since(2 * 3600, 0);
+        assert_eq!(hub.stable_vector().unwrap(), head);
+        // A client that did pull keeps its position for the whole TTL.
+        quiet_since(2 * 3600, 1);
+        assert_eq!(hub.stable_vector().unwrap(), hub.vector_at(1).unwrap());
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn protocol_auth_duplicate_push_and_server_only_routes() {

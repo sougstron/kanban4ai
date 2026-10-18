@@ -105,7 +105,7 @@ fn every_delivery_permutation_converges_with_causal_and_three_way_edits() {
         let conflicts = fs::read_to_string(dir.path().join("sync/meta/conflicts.jsonl")).unwrap();
         let notes = replicated_thread(&root.join(".kanban/threads/TASK-001.yaml"));
         let projection = (
-            serde_json::to_value(journal.state().unwrap().fields).unwrap(),
+            serde_json::to_value(&journal.state().unwrap().fields).unwrap(),
             conflicts,
             notes,
         );

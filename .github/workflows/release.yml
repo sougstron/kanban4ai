@@ -51,7 +51,28 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - name: Build target
+        env:
+          # The kanban-server sync node (Debian 13 LXC) runs this asset; keep
+          # it on the baseline ISA whatever the runner's CPU is.
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-unknown-linux-gnu' && '-C target-cpu=x86-64' || '' }}
         run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Check x86_64 binary runs on the server CPU and glibc
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -eu
+          bin="target/${{ matrix.target }}/release/kanban4ai"
+          if readelf -n "$bin" | grep -q 'x86 ISA needed:.*x86-64-v[234]'; then
+            echo "binary requires x86-64-v2 or newer" >&2
+            readelf -n "$bin" | grep 'x86 ISA needed' >&2
+            exit 1
+          fi
+          newest=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "newest glibc symbol: $newest"
+          # kanban-server is Debian 13 (glibc 2.41).
+          if [ "$(printf '%s\nGLIBC_2.41\n' "$newest" | sort -V | tail -1)" != GLIBC_2.41 ]; then
+            echo "binary needs $newest, newer than the server's glibc 2.41" >&2
+            exit 1
+          fi
       - name: Create release archive and checksum
         env:
           TARGET: ${{ matrix.target }}

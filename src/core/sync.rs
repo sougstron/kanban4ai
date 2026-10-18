@@ -328,15 +328,26 @@ impl Journal {
         Ok(journal)
     }
 
-    pub fn state(&self) -> Result<JournalState> {
+    /// The whole-store projection, shared with the warm cache: read it, do not
+    /// keep it around.
+    pub fn state(&self) -> Result<std::sync::Arc<JournalState>> {
+        self.settled(|| Ok(projection::shared_state(&self.root)?.0))
+    }
+
+    /// Runs `read` after pending remote applies and local intents settled.
+    fn settled<T>(&self, read: impl FnOnce() -> Result<T>) -> Result<T> {
         apply::recover_remote(&self.root)?;
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
-        Ok(projection::load_state(&self.root)?.0)
+        read()
     }
 
     /// State scoped to a few tasks of one board (see `projection::load_tasks`).
-    pub(crate) fn task_state(&self, alias: &str, tasks: &[&str]) -> Result<JournalState> {
+    pub(crate) fn task_state(
+        &self,
+        alias: &str,
+        tasks: &[&str],
+    ) -> Result<std::sync::Arc<JournalState>> {
         apply::recover_remote(&self.root)?;
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
@@ -351,14 +362,14 @@ impl Journal {
         apply::recover_remote(&self.root)?;
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
-        let state = projection::load_state(&self.root)?.0;
+        let compacted = projection::compacted(&self.root)?;
         let nodes = match node {
             Some(node) => vec![node.to_owned()],
             None => segments::node_names(&self.root)?,
         };
         let mut ops = Vec::new();
         for name in nodes {
-            let floor = state.compacted.get(&name).copied().unwrap_or(0);
+            let floor = compacted.get(&name).copied().unwrap_or(0);
             ops.extend(segments::read_retained(&self.root, &name, floor)?);
         }
         ops.sort_by(|a, b| a.hlc.cmp(&b.hlc).then_with(|| a.op.cmp(&b.op)));
