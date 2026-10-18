@@ -1,3 +1,42 @@
+# kanban4ai 0.8.6
+
+- **Sync status light.** The board shows sync state as a coloured dot and a
+  short label on the right of the status bar: grey Offline, red Connection
+  error or Sync error, yellow Syncing with the pending count, green Synced.
+  A narrow terminal keeps only the dot. The top sync header is gone.
+- **TUI diagnostics.** While the TUI runs, stderr goes to
+  `<store>/logs/tui.log` (rotated to `tui.log.1` past 2 MiB), so the embedded
+  sync worker and background-thread panics no longer paint over the board. A
+  main-loop step stuck for 5 s is written to that log with each thread's
+  wait channel and the `/proc/locks` holders of the lock files the process
+  has open, then again at 20 s, 80 s, and so on. Ctrl+C after the loop has
+  been stuck for 2 s restores the terminal and exits 130. A panic off the
+  TUI thread is logged and leaves the terminal up.
+- **Sync server stays small.** `serve` on the production store kept
+  restarting after out-of-memory kills at 6 GB. Every hello, push, pull and
+  file-change ingest cloned the whole sync projection (about 370 MB in memory
+  for that store) only to read its vector or compacted frontier. The cached
+  projection is now shared, and those reads use the checkpoint head and
+  journal segments. A maintenance tick that frees nothing no longer re-reads
+  the retained history to re-derive conflicts and blobs, and the prune
+  frontier is computed in linear time (36 s → 0.4 s on 90k operations). A
+  paired client that never pulled (cursor 0) stops holding the whole history
+  an hour after it was last seen. It needs a snapshot anyway. Serve also
+  caps glibc arenas and returns freed memory after each maintenance tick. On
+  a copy of that store the server now idles at about 400 MB and peaks under
+  750 MB while a client writes once a second; the same copy needed more than
+  6 GB before.
+- **TUI tick work leaves the main loop.** Board stamps, snapshot reloads and
+  live-session progress run on one background worker per open board, so a
+  slow store delays card updates and not key handling. Watcher, pump and
+  stale-generation refreshes compare stamps first: an unchanged board does
+  not replace the status line, and a heartbeat does not re-read the open
+  detail on the UI thread. Only a global config change forces a full reload.
+- **No format or protocol change.** The store format, sync journal records
+  and the sync protocol are the same as 0.8.5. A local crash-recovery intent
+  may include an optional `batch` field; older binaries ignore it. 0.8.5 and
+  0.8.6 peers interoperate, so either side can be updated first.
+
 # kanban4ai 0.8.5
 
 - **Star sync topology.** Pairing and replication go through a hub: only a
@@ -36,20 +75,6 @@
   loads the state once for all boards' runner controls, and writes the hub
   log with one fsync per page. On a copy of the production server store a
   1000-operation push went from 227 s and 4.7 GB to about 12 s and 1.7 GB.
-- **Sync server stays small.** `serve` on the production store kept
-  restarting after out-of-memory kills at 6 GB. Every hello, push, pull and
-  file-change ingest cloned the whole sync projection (about 370 MB in memory
-  for that store) only to read its vector or compacted frontier. The cached
-  projection is now shared, and those reads use the checkpoint head and
-  journal segments. A maintenance tick that frees nothing no longer re-reads
-  the retained history to re-derive conflicts and blobs, and the prune
-  frontier is computed in linear time (36 s → 0.4 s on 90k operations). A
-  paired client that never pulled (cursor 0) stops holding the whole history
-  an hour after it was last seen. It needs a snapshot anyway. Serve also
-  caps glibc arenas and returns freed memory after each maintenance tick. On
-  a copy of that store the server now idles at about 400 MB and peaks under
-  750 MB while a client writes once a second; the same copy needed more than
-  6 GB before.
 - **Conflict notes no longer stall a push.** A conflict note's message id
   embeds the conflict, so a value with a URL put a `/` in it and the server
   refused the whole batch for ever. Message ids are only required to be
@@ -61,20 +86,6 @@
   `SYNC_NODE_ID_IN_USE` instead of having its operations dropped as
   duplicates or mixing two histories; stop the copy or re-pair with
   `join --fresh`.
-- **Sync server stays small.** `serve` on the production store kept
-  restarting after out-of-memory kills at 6 GB. Every hello, push, pull and
-  file-change ingest cloned the whole sync projection (about 370 MB in memory
-  for that store) only to read its vector or compacted frontier. The cached
-  projection is now shared, and those reads use the checkpoint head and
-  journal segments. A maintenance tick that frees nothing no longer re-reads
-  the retained history to re-derive conflicts and blobs, and the prune
-  frontier is computed in linear time (36 s → 0.4 s on 90k operations). A
-  paired client that never pulled (cursor 0) stops holding the whole history
-  an hour after it was last seen. It needs a snapshot anyway. Serve also
-  caps glibc arenas and returns freed memory after each maintenance tick. On
-  a copy of that store the server now idles at about 400 MB and peaks under
-  750 MB while a client writes once a second; the same copy needed more than
-  6 GB before.
 - **`kanban backup`.** New command to snapshot, list, verify, restore, and
   prune store backups with retention buckets; snapshots lock boards in the
   same order the daemon does and verify streamed hashes (see
