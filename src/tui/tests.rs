@@ -13532,3 +13532,60 @@ fn sync_status_light_states_and_colors() {
         assert_eq!(cell.fg, color);
     }
 }
+
+#[test]
+#[ignore]
+fn zz_bench_runner_save() {
+    let board = std::path::PathBuf::from(std::env::var("BENCH_BOARD").unwrap());
+    let ops = Operations::new(&board);
+    for (i, runner) in [None, Some(crate::core::config::Runner::Laptop), None, Some(crate::core::config::Runner::Laptop), None, Some(crate::core::config::Runner::Laptop)].into_iter().enumerate() {
+        if i >= 4 {
+            let t = std::time::Instant::now();
+            let out = std::process::Command::new(std::env::var("BENCH_CMD").unwrap())
+                .args(["context", "TASK-519", "bench note", "--source", "agent"])
+                .env("KANBAN_HOME", board.parent().unwrap().parent().unwrap())
+                .env("KANBAN_PROJECT", "kanban4ai")
+                .output().unwrap();
+            eprintln!("foreign write {:?} ok={}", t.elapsed(), out.status.success());
+        }
+        let t = std::time::Instant::now();
+        ops.update_task("TASK-520", crate::core::operations::TaskPatch { runner: Some(runner.clone()), ..Default::default() }).unwrap();
+        let a = t.elapsed();
+        let t = std::time::Instant::now();
+        let _ = super::app::BoardSnapshot::load(&ops).unwrap();
+        let b = t.elapsed();
+        let t = std::time::Instant::now();
+        let _ = crate::core::sync::remote_runs(&board, "TASK-520");
+        eprintln!("runner={runner:?} update={a:?} snapshot={b:?} remote_runs={:?}", t.elapsed());
+    }
+}
+
+#[test]
+#[ignore]
+fn zz_bench_reconcile() {
+    let board = std::path::PathBuf::from(std::env::var("BENCH_BOARD").unwrap());
+    let store = board.parent().unwrap().parent().unwrap().to_path_buf();
+    for i in 0..4 {
+        if i >= 2 {
+            // An agent heartbeat-like write outside capture: touch a session file.
+            let sessions = board.join(".kanban/sessions");
+            if let Some(entry) = std::fs::read_dir(&sessions).unwrap().flatten().next() {
+                let text = std::fs::read_to_string(entry.path()).unwrap();
+                std::fs::write(entry.path(), format!("{text}\n")).unwrap();
+            }
+        }
+        let t = std::time::Instant::now();
+        let n = crate::core::sync::activate(&store).unwrap();
+        eprintln!("reconcile #{i}: changed={n} took={:?}", t.elapsed());
+    }
+}
+
+#[test]
+#[ignore]
+fn zz_bench_one_update() {
+    let board = std::path::PathBuf::from(std::env::var("BENCH_BOARD").unwrap());
+    let ops = Operations::new(&board);
+    let t = std::time::Instant::now();
+    ops.update_task("TASK-520", crate::core::operations::TaskPatch { runner: Some(Some(crate::core::config::Runner::Laptop)), ..Default::default() }).unwrap();
+    eprintln!("one update {:?}", t.elapsed());
+}
