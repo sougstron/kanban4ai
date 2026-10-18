@@ -25,7 +25,7 @@ expression: output
 │                            ││                            ││                            ││                            │
 │                            ││                            ││                            ││                            │
 └────────────────────────────┘└────────────────────────────┘└────────────────────────────┘└────────────────────────────┘
- TUI ready │ n new · e edit · r queue · m move · y approve · A archive done · b review done · / filter · ? help         
+ TUI ready │ n new · e edit · r queue · m move · y approve · A archive done · / filter · ? help               ● Offline 
 
 --- style runs ---
 0:0-30 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -243,4 +243,6 @@ expression: output
 21:119-120 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 22:0-30 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 22:30-120 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-23:0-120 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+23:0-109 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+23:109-112 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+23:112-120 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)

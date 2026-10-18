@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthStr;
 use super::app::{App, HitAction, Hitbox, Screen, UiAction};
 
 use super::card::{sanitize_terminal_text, truncate_display};
+use super::sync_board::SyncLevel;
 use super::{card, detail, dialogs, limits, projects, search, sessions};
 
 pub(super) const PORTRAIT_WIDTH: u16 = 70;
@@ -37,14 +38,8 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(area);
     match app.screen {
-        Screen::Board => {
-            let body = render_sync_header(frame, app, chunks[0]);
-            render_board(frame, app, body);
-        }
-        Screen::Detail => {
-            let body = render_sync_header(frame, app, chunks[0]);
-            detail::render(frame, app, body);
-        }
+        Screen::Board => render_board(frame, app, chunks[0]),
+        Screen::Detail => detail::render(frame, app, chunks[0]),
         Screen::Sessions => sessions::render_sessions(frame, app, chunks[0]),
         Screen::Archive => sessions::render_archive(frame, app, chunks[0]),
         Screen::LogView => sessions::render_log_view(frame, app, chunks[0]),
@@ -72,23 +67,6 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
     limits::render(frame, app, chunks[1]);
     render_status(frame, app, chunks[2]);
     app.capture_and_highlight(frame.buffer_mut());
-}
-
-fn render_sync_header(frame: &mut Frame<'_>, app: &App, area: Rect) -> Rect {
-    let Some(text) = app.sync_board.header(chrono::Utc::now()) else {
-        return area;
-    };
-    frame.render_widget(
-        Paragraph::new(truncate_display(&text, area.width as usize))
-            .style(Style::default().fg(app.theme.muted)),
-        Rect::new(area.x, area.y, area.width, 1),
-    );
-    Rect::new(
-        area.x,
-        area.y.saturating_add(1),
-        area.width,
-        area.height.saturating_sub(1),
-    )
 }
 
 fn render_board(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -633,9 +611,10 @@ fn fit_segments(segments: Vec<StatusSegment>, available: u16) -> Vec<StatusSegme
     }
 }
 
-/// Screen-specific status bar: warning chips, the last status message, then
-/// hotkey hints for the current screen. Informational only — it registers no
-/// hitboxes, so clicks and hovers pass through to nothing.
+/// Screen-specific status bar: warning chips, the last status message, hotkey
+/// hints for the current screen, and the sync light pinned to the right.
+/// Informational only — it registers no hitboxes, so clicks and hovers pass
+/// through to nothing.
 fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let question_count = app
         .board
@@ -645,6 +624,34 @@ fn render_status(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .flat_map(|(column, _)| app.visible_tasks_for_column(column))
         .filter(|task| task.has_questions)
         .count();
+    let (level, label) = app.sync_board.indicator();
+    let dot = match level {
+        SyncLevel::Offline => app.theme.muted,
+        SyncLevel::Error => app.theme.err,
+        SyncLevel::Syncing => app.theme.warn,
+        SyncLevel::Synced => app.theme.ok,
+    };
+    // Narrow terminals keep the dot and give the label's room to the message.
+    let label = if area.width < 50 {
+        String::new()
+    } else {
+        format!("{label} ")
+    };
+    let light = Line::from(vec![
+        Span::styled(" ● ", Style::default().fg(dot).add_modifier(Modifier::BOLD)),
+        Span::raw(label),
+    ]);
+    let light_width = (light.width() as u16).min(area.width);
+    frame.render_widget(
+        Paragraph::new(light).style(Style::default().bg(app.theme.border).fg(app.theme.fg)),
+        Rect::new(
+            area.x + area.width - light_width,
+            area.y,
+            light_width,
+            area.height,
+        ),
+    );
+    let area = Rect::new(area.x, area.y, area.width - light_width, area.height);
     let mut spans = Vec::new();
     let mut x = area.x;
     let end = area.x.saturating_add(area.width);

@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -13,10 +12,10 @@ use ratatui::widgets::Paragraph;
 use super::app::{App, HitAction, Hitbox};
 use super::card::{sanitize_terminal_text, truncate_display};
 use crate::cli::serve::settings::{self, BoardPeer};
-use crate::core::sync::{Conflict, Journal};
+use crate::core::sync::{Conflict, Journal, NodeRole};
 
 /// Peer probes go over the network and the serve monitor already runs them
-/// every `sync.interval`, so the header refreshes them far less often than
+/// every `sync.interval`, so the status bar refreshes them far less often than
 /// the board ticks.
 const PEER_PROBE_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -128,54 +127,49 @@ impl SyncBoard {
         self.tasks.iter().any(|id| id == task)
     }
 
-    pub fn header(&self, now: DateTime<Utc>) -> Option<String> {
-        if let Some(error) = &self.error {
-            return Some(format!("Sync: {}", sanitize_terminal_text(error)));
+    /// Status-bar indicator. A configured server is the authority when
+    /// present; otherwise any reachable peer counts. Resolved conflicts stay
+    /// in the journal indefinitely, so they mark their cards, not this light.
+    pub fn indicator(&self) -> (SyncLevel, String) {
+        if self.error.is_some() {
+            return (SyncLevel::Error, "Sync error".into());
         }
-        if self.peers.is_empty() {
-            return None;
-        }
-        Some(
-            self.peers
+        let server = self.peers.iter().any(|p| p.role == NodeRole::Server);
+        let relevant: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|p| !server || p.role == NodeRole::Server)
+            .collect();
+        let online: Vec<_> = relevant.iter().filter(|p| p.code == "ONLINE").collect();
+        if online.is_empty() {
+            // Mobile peers come and go; only a dial that should be up and
+            // reports a failure code is a connection error.
+            let failing = relevant
                 .iter()
-                .map(|peer| {
-                    let name = sanitize_terminal_text(&peer.name);
-                    if peer.code == "ONLINE" && peer.pending == 0 {
-                        peer.exchange.map_or_else(
-                            || format!("{name}: ожидание синхронизации"),
-                            |at| {
-                                format!(
-                                    "синхронизировано с {name} {} с назад",
-                                    (now - at).num_seconds().max(0)
-                                )
-                            },
-                        )
-                    } else if peer.code == "ONLINE" {
-                        format!("{name}: {} операций ждут", peer.pending)
-                    } else if peer.role == crate::core::sync::NodeRole::Mobile {
-                        peer.since.or(peer.exchange).map_or_else(
-                            || format!("{name}: ещё не был в сети"),
-                            |at| {
-                                format!(
-                                    "{name}: был в сети {}",
-                                    at.with_timezone(&Local).format("%H:%M")
-                                )
-                            },
-                        )
-                    } else {
-                        let since = peer.since.or(peer.exchange).map_or("—".into(), |at| {
-                            at.with_timezone(&Local).format("%H:%M").to_string()
-                        });
-                        format!(
-                            "{name}: офлайн с {since}, {} операций ждут · {}",
-                            peer.pending, peer.code
-                        )
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join(" | "),
-        )
+                .find(|p| p.code != "OFFLINE" && p.role != NodeRole::Mobile);
+            return match failing {
+                Some(p) if p.code == "NODE_UNREACHABLE" => {
+                    (SyncLevel::Error, "Connection error".into())
+                }
+                Some(_) => (SyncLevel::Error, "Sync error".into()),
+                None => (SyncLevel::Offline, "Offline".into()),
+            };
+        }
+        let pending: u64 = online.iter().map(|p| p.pending).sum();
+        if pending > 0 {
+            (SyncLevel::Syncing, format!("Syncing {pending}"))
+        } else {
+            (SyncLevel::Synced, "Synced".into())
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncLevel {
+    Offline,
+    Error,
+    Syncing,
+    Synced,
 }
 
 fn journal_stamp(root: &Path) -> Option<u64> {

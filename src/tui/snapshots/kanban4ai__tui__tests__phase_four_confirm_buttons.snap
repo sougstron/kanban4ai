@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 4895
 expression: output
 ---
 ┌ To Do (1) ───────┐┌ In Progress (0) ─┐┌ Review (0) ──────┐┌ Done (0) ────────┐
@@ -26,7 +25,7 @@ expression: output
 │                  ││                  ││                  ││                  │
 │                  ││                  ││                  ││                  │
 └──────────────────┘└──────────────────┘└──────────────────┘└──────────────────┘
- TUI ready │ n new · e edit · r queue · Q queue · m move · / filter · ? help    
+ TUI ready │ n new · e edit · r queue · Q queue · / filter · ? help   ● Offline 
 
 --- style runs ---
 0:0-20 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -213,4 +212,6 @@ expression: output
 21:79-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 22:0-20 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 22:20-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-23:0-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+23:0-69 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+23:69-72 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+23:72-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
