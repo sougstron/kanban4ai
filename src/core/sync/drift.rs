@@ -420,18 +420,27 @@ pub(super) fn validate_file(id: &str, values: &Fields) -> Result<()> {
 /// One path, relative to the drift base. Does not take the store lock: recovery
 /// runs it while the board lock is already held.
 pub(super) fn reconcile_path(journal: &Journal, path: &Path) -> Result<()> {
+    reconcile_indexed(journal, path, &index(journal)?).map(|_| ())
+}
+
+/// `reconcile_path` against an index the caller already parsed. True when the
+/// path drifted and was folded in, which appends to the index.
+fn reconcile_indexed(
+    journal: &Journal,
+    path: &Path,
+    index: &BTreeMap<String, Entry>,
+) -> Result<bool> {
     let store = journal.root.parent().expect("sync parent");
     let relative = match path.strip_prefix(store) {
         Ok(relative) => relative
             .to_str()
             .ok_or_else(|| invalid("non-UTF8 drift path"))?
             .to_owned(),
-        Err(_) => return Ok(()),
+        Err(_) => return Ok(false),
     };
     if relative.starts_with("sync/") || transport::allowed_path(&relative).is_err() {
-        return Ok(());
+        return Ok(false);
     }
-    let index = index(journal)?;
     let present = match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() => true,
         Ok(_) => return Err(invalid("drift path is not a regular file")),
@@ -451,13 +460,13 @@ pub(super) fn reconcile_path(journal: &Journal, path: &Path) -> Result<()> {
         None
     };
     if !present && task_location(&relative).is_some() && moved_copy(path).is_some() {
-        return Ok(());
+        return Ok(false);
     }
     let old = index
         .get(&relative)
         .or_else(|| moved_from.and_then(|p| index.get(p)));
     if !present && old.is_none() {
-        return Ok(());
+        return Ok(false);
     }
     let current = if present {
         let meta = fs::symlink_metadata(path)?;
@@ -467,12 +476,12 @@ pub(super) fn reconcile_path(journal: &Journal, path: &Path) -> Result<()> {
             .map_err(|_| invalid("mtime before epoch"))?
             .as_nanos();
         if old.is_some_and(|old| old.mtime == mtime && old.size == meta.len()) {
-            return Ok(());
+            return Ok(false);
         }
         let bytes = fs::read(path)?;
         let digest = hash(&bytes);
         if old.is_some_and(|old| old.hash == digest) {
-            return Ok(());
+            return Ok(false);
         }
         journal.put_blob(&digest, &bytes)?;
         Some((
@@ -487,7 +496,7 @@ pub(super) fn reconcile_path(journal: &Journal, path: &Path) -> Result<()> {
         None
     };
     let Some(target) = target(path) else {
-        return Ok(());
+        return Ok(false);
     };
     let before_bytes = old.map(|old| journal.blob(&old.hash)).transpose()?;
     let file_value = |hash: &str, size: u64| {
@@ -522,7 +531,7 @@ pub(super) fn reconcile_path(journal: &Journal, path: &Path) -> Result<()> {
     if let Some(vanished) = moved_from {
         record_observed(journal, &store.join(vanished), None)?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Fold bypass writes into the journal before capture overwrites `path`.
@@ -531,17 +540,26 @@ pub(super) fn reconcile_path(journal: &Journal, path: &Path) -> Result<()> {
 /// absorbed into the next captured write and never replicated. Checking the
 /// written path — plus the board metadata it depends on and, for a task, its
 /// copy in another column — replaces a full store scan on every CLI start.
+///
+/// Every write runs this, so the index (one line per board file) is parsed
+/// once and reread only after a path actually drifted.
 pub(super) fn reconcile_for_write(journal: &Journal, path: &Path) -> Result<()> {
+    let mut paths = Vec::new();
     if let Some(board) = board_dir(path) {
         let project = board.join("project.yaml");
         if project != path {
-            reconcile_path(journal, &project)?;
+            paths.push(project);
         }
     }
-    if let Some(other) = moved_copy(path) {
-        reconcile_path(journal, &other)?;
+    paths.extend(moved_copy(path));
+    paths.push(path.to_path_buf());
+    let mut index = index(journal)?;
+    for path in paths {
+        if reconcile_indexed(journal, &path, &index)? {
+            index = self::index(journal)?;
+        }
     }
-    reconcile_path(journal, path)
+    Ok(())
 }
 
 fn task_location(path: &str) -> Option<String> {

@@ -581,8 +581,68 @@ pub(super) fn cached_prune(sync: &Path) -> Option<PruneMeta> {
     (slot.token == token).then(|| slot.prune.clone())
 }
 
+/// Bring a stale warm whole-store state up to date in place. Another
+/// process's write (every agent CLI call) changes the token, and the TUI and
+/// serve used to reread every task shard of the store under the sync lock
+/// after each one. Replaying only the operations past the cached vector is the
+/// same fold `load_state_disk` does on top of the checkpoint. Callers hold the
+/// sync lock, so the files cannot move between the token and the replay.
+fn catch_up(sync: &Path) {
+    let Some(token) = sync.parent().and_then(segments::change_token) else {
+        return;
+    };
+    let stale = {
+        let mut cache = state_cache();
+        match cache.get(sync) {
+            Some(slot) if slot.token != token => cache.remove(sync),
+            _ => None,
+        }
+    };
+    let Some(slot) = stale else {
+        return;
+    };
+    // Any failure leaves the cache empty, so the caller reads disk.
+    if let Ok(Some((state, prune))) = replay_onto(sync, slot.state) {
+        state_cache().insert(
+            sync.to_path_buf(),
+            StateSlot {
+                token,
+                state: Arc::new(state),
+                prune,
+            },
+        );
+    }
+}
+
+/// `state` plus the operations written after it. `None` when the store changed
+/// in a way operations do not describe: a prune moved the compacted frontier,
+/// or the projection is still a format 2 single file.
+fn replay_onto(sync: &Path, state: Arc<JournalState>) -> Result<Option<(JournalState, PruneMeta)>> {
+    let Some(head) = read_head(sync)? else {
+        return Ok(None);
+    };
+    if head.compacted != state.compacted || legacy_path(sync).exists() {
+        return Ok(None);
+    }
+    let mut state = Arc::unwrap_or_clone(state);
+    apply_uids(&mut state, load_uids(sync)?);
+    for node in segments::node_names(sync)? {
+        let after = state.vector.get(&node).copied().unwrap_or(0);
+        // Ahead operations are replayed again; applying one twice is a no-op.
+        for op in segments::read_after(sync, &node, after)?
+            .iter()
+            .chain(&segments::read_ahead(sync, &node)?)
+        {
+            apply_meta(&mut state, op);
+        }
+    }
+    state.vector = segments::heads(sync, &head.compacted)?;
+    Ok(Some((state, head.prune)))
+}
+
 /// The warm whole-store state when it still matches the files.
 fn warm(sync: &Path) -> Option<(Arc<JournalState>, PruneMeta)> {
+    catch_up(sync);
     let token = segments::change_token(sync.parent()?)?;
     let cache = state_cache();
     let slot = cache.get(sync).filter(|slot| slot.token == token)?;
@@ -638,6 +698,7 @@ pub(super) fn shared_state(sync: &Path) -> Result<(Arc<JournalState>, PruneMeta)
 /// still holds it. A writer that bails out without remembering leaves the
 /// cache empty, so the next load reads disk again.
 pub(super) fn load_state(sync: &Path) -> Result<(JournalState, PruneMeta)> {
+    catch_up(sync);
     if let Some(parent) = sync.parent()
         && let Some(token) = segments::change_token(parent)
     {
@@ -669,6 +730,37 @@ fn load_state_disk(sync: &Path) -> Result<(JournalState, PruneMeta)> {
     Ok((state, head.prune))
 }
 
+/// Checkpoint input for a writer holding a task-scoped state: `misc` plus the
+/// task shards the unprojected operations touch, which is all
+/// `write_checkpoint` rewrites. A periodic checkpoint used to read every task
+/// shard of the store under the sync lock. `None` when an operation's shard
+/// cannot be told from the operation alone (a message edit without its
+/// `task_id`); the caller then loads the whole store.
+fn load_dirty(sync: &Path) -> Result<Option<JournalState>> {
+    let Some(head) = read_head(sync)? else {
+        return Ok(None);
+    };
+    let ops = unprojected(sync, &head)?;
+    let mut wanted = BTreeSet::new();
+    for op in &ops {
+        match op_task(op) {
+            Some((project, task)) => {
+                wanted.insert(ShardId::Task(project.to_owned(), task.to_owned()));
+            }
+            None if real_entity(op) == "message" => return Ok(None),
+            None => {}
+        }
+    }
+    let (mut state, head) = read_checkpoint(sync, Some(&wanted))?;
+    apply_uids(&mut state, load_uids(sync)?);
+    for op in &ops {
+        apply_meta(&mut state, op);
+    }
+    state.vector = segments::heads(sync, &head.compacted)?;
+    state.compacted = head.compacted;
+    Ok(Some(state))
+}
+
 /// Board alias and display ids to the project UID and task UIDs `load_tasks` reads.
 pub(super) fn task_scope(uids: &Uids, alias: &str, displays: &[&str]) -> (String, Vec<String>) {
     let Some(project) = uids.project_uids.get(alias) else {
@@ -694,6 +786,7 @@ pub(super) fn load_tasks(
     sync: &Path,
     scope: impl FnOnce(&Uids) -> (String, Vec<String>),
 ) -> Result<Arc<JournalState>> {
+    catch_up(sync);
     if let Some(parent) = sync.parent()
         && let Some(token) = segments::change_token(parent)
         && let Some(slot) = state_cache().get(sync)
@@ -712,6 +805,7 @@ pub(super) fn take_tasks(
     sync: &Path,
     scope: impl FnOnce(&Uids) -> (String, Vec<String>),
 ) -> Result<JournalState> {
+    catch_up(sync);
     if let Some(parent) = sync.parent()
         && let Some(token) = segments::change_token(parent)
     {
@@ -818,7 +912,10 @@ pub(super) fn checkpoint(
     }
     if state.partial {
         // The scoped state lacks other tasks; the journal already holds them.
-        let (full, _) = load_state_disk(sync)?;
+        let full = match load_dirty(sync)? {
+            Some(dirty) => dirty,
+            None => load_state_disk(sync)?.0,
+        };
         write_checkpoint(sync, &full, prune)?;
     } else {
         write_checkpoint(sync, state, prune)?;
@@ -848,7 +945,9 @@ pub(super) fn write_checkpoint(sync: &Path, state: &JournalState, prune: &PruneM
     let old = read_head(sync)?;
     let dirty: Option<BTreeSet<ShardId>> = match &old {
         Some(head) => {
-            let mut dirty = BTreeSet::new();
+            // `misc` is rewritten on every checkpoint, so it is always
+            // collected: a task-only window used to truncate it to nothing.
+            let mut dirty = BTreeSet::from([ShardId::Misc]);
             for op in unprojected(sync, head)? {
                 dirty.insert(shard_of(state, &key(&op.project, &op.entity, &op.id)));
                 dirty.insert(shard_of(state, &key(&op.project, real_entity(&op), &op.id)));
@@ -1038,6 +1137,74 @@ mod tests {
             .filter(|k| shard_of(state, k) == shard)
             .cloned()
             .collect()
+    }
+
+    #[test]
+    fn a_stale_warm_state_catches_up_on_new_operations_only() {
+        let (dir, board) = store();
+        let journal = Journal::open(dir.path()).unwrap();
+        write(&board, "TASK-001", "one", &["first"]);
+        write(&board, "TASK-002", "two", &["second"]);
+        snapshot(&journal);
+        let before = journal.state().unwrap();
+        let slot = state_cache().remove(&journal.root).expect("warm state");
+        // Another process writes: this one never sees the commit in memory.
+        write(&board, "TASK-001", "one again", &["first", "reply"]);
+        write(&board, "TASK-003", "three", &["third"]);
+        forget(&journal.root);
+        let (disk, _) = load_state_disk(&journal.root).unwrap();
+        state_cache().insert(journal.root.clone(), slot);
+        // A full reload would lose this clean task: only a replay keeps it.
+        let project = before.project_uids["demo"].clone();
+        let uid = ids::task_uid(&before, &project, "TASK-002");
+        fs::remove_file(shard_path(&journal.root, &ShardId::Task(project, uid))).unwrap();
+
+        let caught = journal.state().unwrap();
+        assert!(!Arc::ptr_eq(&caught, &before));
+        assert_eq!(json_of(&caught.fields), json_of(&disk.fields));
+        assert_eq!(json_of(&caught.lifecycle), json_of(&disk.lifecycle));
+        assert_eq!(caught.task_uids, disk.task_uids);
+        assert_eq!(caught.vector, disk.vector);
+        let token = segments::change_token(dir.path()).unwrap();
+        assert_eq!(state_cache()[&journal.root].token, token);
+    }
+
+    #[test]
+    fn scoped_checkpoint_reads_only_dirty_shards_and_matches_a_full_one() {
+        let (dir, board) = store();
+        let journal = Journal::open(dir.path()).unwrap();
+        write(&board, "TASK-001", "one", &["first"]);
+        write(&board, "TASK-002", "two", &["second"]);
+        snapshot(&journal);
+        write(&board, "TASK-001", "one again", &["first", "reply"]);
+        forget(&journal.root);
+        let full = journal.state().unwrap();
+        forget(&journal.root);
+
+        let dirty = load_dirty(&journal.root)
+            .unwrap()
+            .expect("ops name their shards");
+        let project = full.project_uids["demo"].clone();
+        let untouched = ids::task_uid(&full, &project, "TASK-002");
+        assert!(
+            task_keys(&full, &project, &untouched)
+                .iter()
+                .all(|k| !dirty.fields.contains_key(k)),
+            "a clean task shard is not read"
+        );
+        let _sync = lock_file_reentrant(&journal.root.join(".lock")).unwrap();
+        let scoped = journal.task_state("demo", &["TASK-001"]).unwrap();
+        assert!(scoped.partial);
+        let prune = load_prune(&journal.root).unwrap();
+        assert!(checkpoint(&journal.root, &scoped, &prune, true).unwrap());
+        assert!(
+            unprojected(&journal.root, &read_head(&journal.root).unwrap().unwrap())
+                .unwrap()
+                .is_empty()
+        );
+        let (after, _) = load_state_disk(&journal.root).unwrap();
+        assert_eq!(json_of(&after.fields), json_of(&full.fields));
+        assert_eq!(json_of(&after.lifecycle), json_of(&full.lifecycle));
     }
 
     #[test]

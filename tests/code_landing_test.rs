@@ -326,6 +326,49 @@ fn reconcile_pushes_results_without_holding_the_board_lock() {
     assert!(!probes.contains("held"), "{probes}");
 }
 #[test]
+fn a_refused_result_push_backs_off_and_tells_the_task_once() {
+    let p = pair(false);
+    let a = ops(&p.pa);
+    let task = a.create_task(NewTask::titled("refused push")).unwrap();
+    take(&p.pa, &task.id, "ses-refused", "refused-result");
+    a.complete_task(&task.id, "ses-refused", true).unwrap();
+    for reference in git(
+        &p.remote,
+        &["for-each-ref", "--format=%(refname)", "refs/kanban"],
+    )
+    .lines()
+    {
+        git(&p.remote, &["update-ref", "-d", reference]);
+    }
+    let probe = p.remote.with_extension("probe");
+    let hook = p.remote.join("hooks/pre-receive");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\necho push >> '{}'\necho 'refusing to allow a Personal Access Token to create or update workflow `.github/workflows/release.yml` without `workflow` scope' >&2\nexit 1\n",
+            probe.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(code::reconcile(&p.a).is_err());
+    // The refusal waits instead of pushing again on the next cycle.
+    code::reconcile(&p.a).unwrap();
+    assert_eq!(fs::read_to_string(&probe).unwrap().lines().count(), 1);
+    let notes: Vec<_> = kanban4ai::core::thread::ThreadManager::new(&p.pa.data_root)
+        .unwrap()
+        .load(&task.id)
+        .unwrap()
+        .messages
+        .into_iter()
+        .filter(|m| m.body.starts_with("RUN_TRANSFER_REFUSED"))
+        .collect();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].body.contains("`workflow`"), "{}", notes[0].body);
+}
+
+#[test]
 fn unavailable_remote_retains_completed_code_and_retries_after_reconnection() {
     let p = pair(false);
     let a = ops(&p.pa);
