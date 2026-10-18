@@ -26,6 +26,7 @@ mod run;
 mod segments;
 pub mod transport;
 pub use apply::Conflict;
+use format::SNAPSHOT_FORMAT;
 pub use format::{
     MIN_SYNC_PROTOCOL, OP_FORMAT, STORE_FORMAT, SYNC_PROTOCOL, accept_store_protocol, enable_sync,
     enabled, max_op_version, negotiate, node_role, protocol_bounds,
@@ -351,9 +352,7 @@ impl Journal {
         apply::recover_remote(&self.root)?;
         let _guard = lock_file_reentrant(&self.root.join(".lock"))?;
         self.recover()?;
-        projection::load_tasks(&self.root, |uids| {
-            projection::task_scope(uids, alias, tasks)
-        })
+        projection::load_tasks(&self.root, alias, tasks)
     }
 
     /// Retained operations in HLC order. `node` limits the result to one writer.
@@ -426,9 +425,7 @@ impl Journal {
             state.message_uids = uids.message_uids;
             state.task_uids = uids.task_uids;
             state.task_aliases = uids.task_aliases;
-            if !intent.uids.is_empty() {
-                projection::save_uids(&self.root, &state)?;
-            }
+            projection::save_uids_delta(&self.root, &intent.uids)?;
             if intent.run_projection {
                 project_runs(self, &state)?;
             }
@@ -580,9 +577,7 @@ fn commit_local(
     if span.end_offset < span.start_offset {
         return Err(invalid("journal append shrank"));
     }
-    if !intent.uids.is_empty() {
-        projection::save_uids(&journal.root, &state)?;
-    }
+    projection::save_uids_delta(&journal.root, &intent.uids)?;
     if intent.run_projection {
         project_runs(journal, &state)?;
     }
@@ -1166,13 +1161,11 @@ fn capture_inner(
         drift::reconcile_for_write(&journal, path)?;
     }
     let scoped = scope_display(&target, path, content)?;
-    let mut state = projection::take_tasks(&journal.root, |uids| {
-        projection::task_scope(
-            uids,
-            &target.project,
-            &scoped.iter().map(String::as_str).collect::<Vec<_>>(),
-        )
-    })?;
+    let mut state = projection::take_tasks(
+        &journal.root,
+        &target.project,
+        &scoped.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
     let before_uids = projection::uids_of(&state);
     let mut clock: Hlc = journal.clock()?;
     let mut operations = Vec::new();

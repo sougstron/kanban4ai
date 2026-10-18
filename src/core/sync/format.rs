@@ -7,7 +7,11 @@ use std::time::SystemTime;
 
 use super::*;
 
-pub const STORE_FORMAT: u32 = 4;
+pub const STORE_FORMAT: u32 = 5;
+/// Bootstrap snapshots still carry the format 4 single `meta/uids.json`
+/// (written from the tables, split again on install), so nodes on format 4
+/// and 5 exchange them.
+pub(super) const SNAPSHOT_FORMAT: u32 = 4;
 /// Append-only segments. Format 3 only shards `meta/projection.json` into
 /// `meta/projection/`, which the loader does on the next checkpoint.
 pub(super) const SEGMENTS_FORMAT: u32 = 2;
@@ -179,7 +183,21 @@ pub(super) fn ensure(store: &Path) -> Result<()> {
         write_format(store, 3)?;
         write_stub(&root)?;
     }
-    migrate_v4::migrate(store)
+    migrate_v4::migrate(store)?;
+    migrate_v5(store)
+}
+
+/// 4 → 5: the uid tables move from `meta/uids.json` into one file per project
+/// (`projection::split_uids`). A format 4 binary would read the missing file
+/// as empty tables, so the bump keeps it off the store.
+fn migrate_v5(store: &Path) -> Result<()> {
+    let root = store.join("sync");
+    let _sync = lock_file_reentrant(&root.join(".lock"))?;
+    if read_format(store)?.is_some_and(|v| v >= 5) {
+        return Ok(());
+    }
+    projection::split_uids(&root)?;
+    write_format(store, 5)
 }
 
 fn leftovers(root: &Path) -> Result<bool> {

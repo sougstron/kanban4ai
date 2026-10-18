@@ -243,7 +243,7 @@ pub fn snapshot_spool(store: &Path) -> Result<tempfile::NamedTempFile> {
     let hub = super::hub::Hub::open(store)?;
     let seq = hub.ingest()?;
     let header = SnapshotHeader {
-        format: STORE_FORMAT,
+        format: SNAPSHOT_FORMAT,
         store_id: journal.node.store_id.clone(),
         node_id: journal.node.node_id.clone(),
         hub_epoch: hub.epoch()?,
@@ -303,12 +303,23 @@ pub fn snapshot_spool(store: &Path) -> Result<tempfile::NamedTempFile> {
         },
     )?;
     files += 1;
+    record(
+        &mut writer,
+        &Record::File {
+            path: "sync/meta/uids.json".into(),
+            text: json(&projection::uids_of(&state))?,
+        },
+    )?;
+    files += 1;
+    let uids = projection::uids_dir(&journal.root);
     for path in walk(&journal.root.join("meta"))? {
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         if matches!(
             name,
             "index.json" | "state.json" | "since.json" | "relay-ack.json"
-        ) {
+        ) || path.starts_with(&uids)
+            || path == projection::legacy_uids_path(&journal.root)
+        {
             continue;
         }
         record(
@@ -382,10 +393,10 @@ pub struct StagedSnapshot {
     stage: tempfile::TempDir,
 }
 fn validate_header(header: &SnapshotHeader) -> Result<()> {
-    if header.format > STORE_FORMAT {
+    if header.format > SNAPSHOT_FORMAT {
         return Err(invalid("SYNC_STORE_TOO_NEW: upgrade kanban4ai"));
     }
-    if header.format != STORE_FORMAT {
+    if header.format != SNAPSHOT_FORMAT {
         return Err(invalid(
             "SYNC_PROTOCOL_MISMATCH: snapshot format is obsolete",
         ));
@@ -863,6 +874,7 @@ fn finish_bootstrap(store: &Path, redo: &Bootstrap, boards: &BTreeSet<PathBuf>) 
         "server_node_id":redo.header.node_id,"store_id":redo.header.store_id,
         "hub_epoch":redo.header.hub_epoch,"last_seq":redo.header.seq,"pushed":own,"migrating":false
     }).to_string())?;
+    projection::split_uids(&root)?;
     format::write_format(store, STORE_FORMAT)?;
     format::write_stub(&root)?;
     // Identity is the final live-data commit point; the redo remains until durable.

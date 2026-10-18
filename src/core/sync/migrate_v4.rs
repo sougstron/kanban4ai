@@ -75,7 +75,7 @@ pub(super) fn migrate(store: &Path) -> Result<()> {
         .collect::<Result<_>>()?;
     let root = store.join("sync");
     let _sync = lock_file_reentrant(&root.join(".lock"))?;
-    if format::read_format(store)?.is_some_and(|v| v >= STORE_FORMAT) {
+    if format::read_format(store)?.is_some_and(|v| v >= 4) {
         return Ok(());
     }
     // The segment offset cache may describe journal bytes written by a
@@ -222,5 +222,5 @@ pub(super) fn migrate(store: &Path) -> Result<()> {
             "Sync migration: remove published relay refs with kanban serve --purge-relay-refs; see docs/sync-server.md"
         );
     }
-    format::write_format(store, STORE_FORMAT)
+    format::write_format(store, 4)
 }

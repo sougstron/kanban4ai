@@ -67,12 +67,7 @@ fn finish(root: &Path, pending: &RemotePending) -> Result<()> {
         }
     }
     if let Some(uids) = &pending.uids {
-        let path = root.join("meta/uids.json");
-        let text = serde_json::to_string(uids).map_err(|e| invalid(&e.to_string()))?;
-        if fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
-            fs::create_dir_all(root.join("meta"))?;
-            projection::atomic_write_json(&path, uids)?;
-        }
+        projection::save_all_uids(root, uids)?;
     }
     if !pending.conflicts.is_empty() {
         atomic_write_text_raw(&root.join("meta/conflicts.jsonl"), &pending.conflicts)?;
