@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 4294
 expression: crashed
 ---
 ┌ To Do (4) ───────────┐┌ In Progress (0) ─────┐┌ Review (0) ──────────┐┌ Done (0) ── ▸ Kanban ┐
@@ -20,7 +19,7 @@ expression: crashed
 │                      ││                      ││                      ││                      │
 │                      ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
- TUI ready │ n new · e edit · r queue · Q queue · m move · y approve · / filter · ? help        
+ TUI ready │ n new · e edit · r queue · Q queue · m move · / filter · ? help          ● Offline 
 
 --- style runs ---
 0:0-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -185,4 +184,6 @@ expression: crashed
 15:95-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 16:0-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 16:24-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-17:0-96 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+17:0-85 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+17:85-88 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+17:88-96 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)

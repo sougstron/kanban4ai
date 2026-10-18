@@ -41,7 +41,7 @@ expression: output
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 [ ▶ Queue r ] [ ⚡  Now F ] [ Edit e ] [ Move m ] [ +Ctx c ] [ Del d ]                               
- TUI ready │ r queue · Q unqueue · F run now · w answer · y approve · x reject · q/Esc back         
+ TUI ready │ r queue · Q unqueue · w answer · y approve · x reject · q/Esc back           ● Offline 
 
 --- style runs ---
 0:0-89 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -168,4 +168,6 @@ expression: output
 38:59-60 Style::new().fg(Color::Reset).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 38:60-69 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
 38:69-100 Style::new().fg(Color::Reset).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-39:0-100 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+39:0-89 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+39:89-92 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+39:92-100 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)

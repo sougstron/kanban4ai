@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 6440
 expression: rendered
 ---
 ┌ Projects · Enter open · n new · r rename · p path · s settings · S stats · d delete · / filte┐
@@ -30,7 +29,7 @@ expression: rendered
 │                                                                                              │
 │                                                                                              │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
- Projects │ Enter open · n new · r rename · p path · o folder · d delete · / filter · ? help    
+ Projects │ Enter open · n new · r rename · p path · d delete · / filter · ? help     ● Offline 
 
 --- style runs ---
 0:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
@@ -136,4 +135,6 @@ expression: rendered
 25:1-95 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 25:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 26:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
-27:0-96 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+27:0-85 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+27:85-88 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+27:88-96 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
