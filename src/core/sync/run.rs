@@ -111,14 +111,14 @@ impl Journal {
         task_id: &str,
     ) -> Result<BTreeMap<String, RunDescriptor>> {
         task_runs(
-            &self.task_state(project_alias, &[task_id])?,
+            &*self.task_state(project_alias, &[task_id])?,
             project_alias,
             task_id,
         )
     }
 
     pub fn landings(&self, alias: &str, task: &str) -> Result<BTreeMap<String, LandingDescriptor>> {
-        task_landings(&self.task_state(alias, &[task])?, alias, task)
+        task_landings(&*self.task_state(alias, &[task])?, alias, task)
     }
 
     /// Each node owns its own acknowledgement, independently of the runner.

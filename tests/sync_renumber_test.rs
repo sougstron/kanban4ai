@@ -123,7 +123,7 @@ fn creation_without_server_or_peers_always_succeeds_and_never_reuses_numbers() {
     fs::remove_file(board.tasks_dir.join("archive/TASK-040.md")).unwrap();
     let last = board.create_task(NewTask::titled("last")).unwrap();
     board.delete_task(&last.id).unwrap();
-    let vector = ja.state().unwrap().vector;
+    let vector = ja.state().unwrap().vector.clone();
     ja.prune(&std::collections::BTreeMap::from([("peer".into(), vector)]))
         .unwrap();
     let reopened = Storage::new(a.path().join("projects/demo"));

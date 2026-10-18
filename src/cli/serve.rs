@@ -630,6 +630,7 @@ pub fn run(
     if port == 0 {
         return Err(invalid("serve.port must be greater than zero"));
     }
+    limit_arenas();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -640,6 +641,27 @@ pub fn run(
             Duration::from_secs(settings.shutdown_timeout),
         ))?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// glibc gives every thread that allocates concurrently its own arena and
+/// keeps freed pages in each one. Serve runs requests on the blocking pool,
+/// and a store projection parsed on one of those threads stayed resident in
+/// its arena after the thread went idle. Called before any thread starts.
+fn limit_arenas() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: mallopt only changes allocator tuning; no thread exists yet.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+}
+
+/// Return freed heap pages to the system after a large transient load.
+pub(super) fn release_memory() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: malloc_trim only releases unused pages of the glibc heap.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 #[cfg(test)]

@@ -168,7 +168,7 @@ fn field_diffs_moves_local_exclusions_and_acknowledged_compaction() {
     )
     .unwrap();
     assert_eq!(operations(dir.path(), node).len(), count);
-    let vector = journal.state().unwrap().vector;
+    let vector = journal.state().unwrap().vector.clone();
     let held = journal
         .prune(&BTreeMap::from([("peer".into(), BTreeMap::new())]))
         .unwrap();

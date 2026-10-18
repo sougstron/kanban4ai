@@ -246,7 +246,7 @@ fn concurrent_runners_survive_reordered_delivery_and_next_generation_sees_both()
         journal.runs("demo", &task.id).unwrap()[&journal.node.node_id].generation,
         2
     );
-    let vector = journal.state().unwrap().vector;
+    let vector = journal.state().unwrap().vector.clone();
     journal
         .prune(&std::collections::BTreeMap::from([("peer".into(), vector)]))
         .unwrap();
