@@ -1,3 +1,41 @@
+# kanban4ai 0.8.7
+
+- **Per-project uid tables.** `sync/meta/uids.json` (5 MB on the live store:
+  27k message uids) was parsed on every scoped write and rewritten whole, with
+  fsync, whenever a write minted a uid. The store keeps
+  `sync/meta/uids/projects.json` (board alias → project UID) plus one file per
+  project with its `message_uids`, `task_uids` and `task_aliases`; a write
+  loads the index and its own project's file and applies only that project's
+  uid delta, so only the touched file is rewritten. A CLI context write on a
+  copy of the live store: median 124 ms → 69 ms.
+- **Store format 5.** The first start of a 0.8.7 binary migrates the store
+  from format 4 by splitting `meta/uids.json` per project; the migration is
+  one-way, and 0.8.6 binaries cannot write a migrated store. The sync
+  protocol (3) and the snapshot format (4) are unchanged — snapshots still
+  carry a single format-4 uids file, split again on install — so 0.8.6 and
+  0.8.7 peers keep syncing with each other and either side can be updated
+  first. Back up the store before the first start.
+- **Fewer store-wide loads on the write, open and sync paths.** Renaming a
+  task (`ids::renamed`) read every task shard of the store although it needs
+  only the uid tables; it now uses an empty task scope. A write parsed
+  `drift.jsonl` once per checked path (up to three times per write); it now
+  parses it once. A periodic checkpoint from a task-scoped writer reloaded
+  the whole store; it now loads misc plus the dirty shards. That checkpoint
+  also rewrote `misc.json` empty whenever no misc op fell in the window;
+  misc is now always collected. A stale warm whole-store state (TUI/serve
+  after another process's write) is caught up by replaying the new operations
+  instead of a full reload. TUI detail analytics and limit shares run on a
+  worker, cached per task event-log stamp. Result transfers the remote
+  refuses back off (30 s doubling to 30 min) and post one board note, with a
+  hint for a token lacking the GitHub workflow scope.
+- **Code run results leave the board lock.** The embedded serve loop runs
+  `code::reconcile` every ~30 s and held each task's board lock across git
+  push/fetch to the remote — 12–17 s against GitHub when a push was rejected
+  and retried, freezing every TUI save and task open in the meantime.
+  Transfers now run unlocked; the task is re-read afterwards and only the
+  reconcile-owned fields are applied, and `mark_review_seen` skips the lock
+  when the task is not flagged.
+
 # kanban4ai 0.8.6
 
 - **Sync status light.** The board shows sync state as a coloured dot and a
