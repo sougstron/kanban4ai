@@ -25,7 +25,7 @@ expression: output
 │                  ││                  ││                  ││                  │
 │                  ││                  ││                  ││                  │
 └──────────────────┘└──────────────────┘└──────────────────┘└──────────────────┘
- ? 1 questions  TUI ready │ n new · r queue · Q queue · / filter · ? help       
+ ? 1 questions  TUI ready │ n new · r queue · Q queue · ? help        ● Offline 
 
 --- style runs ---
 0:0-20 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -208,4 +208,6 @@ expression: output
 22:0-20 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 22:20-80 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 23:0-15 Style::new().fg(Color::Rgb(245, 190, 80)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
-23:15-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+23:15-69 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+23:69-72 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+23:72-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)

@@ -47,11 +47,8 @@ pub(crate) struct View {
 }
 #[derive(Debug, Clone)]
 pub(crate) struct BoardPeer {
-    pub name: String,
     pub role: NodeRole,
     pub code: String,
-    pub exchange: Option<chrono::DateTime<chrono::Utc>>,
-    pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub pending: u64,
 }
 fn systemctl(args: &[&str]) -> std::io::Result<std::process::Output> {
@@ -190,15 +187,12 @@ pub(crate) fn board_peers(root: &Path) -> Result<Vec<BoardPeer>> {
         .into_iter()
         .filter(|n| n.node != journal.node.node_id)
         .map(|n| BoardPeer {
-            name: n.name,
             role: n.role,
             code: n.code,
-            exchange: n.last_seen,
-            since: n.since,
             pending: n.lag,
         })
         .collect();
-    if let Some(server) = discovery::config(root)?.server {
+    if discovery::config(root)?.server.is_some() {
         {
             let status: Value = fs::read_to_string(root.join("sync/server-status.json"))
                 .ok()
@@ -220,11 +214,8 @@ pub(crate) fn board_peers(root: &Path) -> Result<Vec<BoardPeer>> {
                 nodes.insert(
                     0,
                     BoardPeer {
-                        name: server.name,
                         role: NodeRole::Server,
                         code: status["code"].as_str().unwrap_or("OFFLINE").into(),
-                        exchange: None,
-                        since: None,
                         pending,
                     },
                 );

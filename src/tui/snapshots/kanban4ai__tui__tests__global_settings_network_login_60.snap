@@ -31,7 +31,7 @@ expression: text
 │                                                          │
 │                                                          │
 └──────────────────────────────────────────────────────────┘
- Projects │ Enter open · n new · r rename · ? help          
+ Projects │ Enter open · n new · ? help           ● Offline 
 
 --- style runs ---
 0:0-60 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
@@ -117,4 +117,6 @@ expression: text
 27:1-59 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 27:59-60 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 28:0-60 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
-29:0-60 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+29:0-49 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+29:49-52 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+29:52-60 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)

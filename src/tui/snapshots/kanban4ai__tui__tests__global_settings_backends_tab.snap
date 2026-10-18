@@ -25,7 +25,7 @@ expression: "render_at(&mut app, 80, 24)"
 │                                                                              │
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
- Projects │ Enter open · n new · r rename · p path · d delete · ? help          
+ Projects │ Enter open · n new · r rename · d delete · ? help         ● Offline 
 
 --- style runs ---
 0:0-80 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
@@ -192,4 +192,6 @@ expression: "render_at(&mut app, 80, 24)"
 21:1-79 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 21:79-80 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
 22:0-80 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)
-23:0-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+23:0-69 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+23:69-72 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+23:72-80 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)

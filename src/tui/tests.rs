@@ -13437,15 +13437,9 @@ fn sync_board_status_and_conflicts_snapshots() {
     use crate::cli::serve::settings::BoardPeer;
     use crate::core::sync::{Conflict, Hlc};
     let (_dir, mut app) = populated_app();
-    let at = chrono::DateTime::parse_from_rfc3339("2026-10-13T18:02:00Z")
-        .unwrap()
-        .with_timezone(&chrono::Utc);
     app.sync_board.peers = vec![BoardPeer {
-        name: "server".into(),
         role: crate::core::sync::NodeRole::Server,
         code: "NODE_UNREACHABLE".into(),
-        exchange: Some(at),
-        since: Some(at),
         pending: 14,
     }];
     let id = app.board.columns[0].tasks[0].id.clone();
@@ -13460,20 +13454,9 @@ fn sync_board_status_and_conflicts_snapshots() {
         winner_value: serde_json::json!("Fix login"),
         loser_value: serde_json::json!("Fix auth"),
     }];
-    // Freeze local-clock formatting without assuming the machine timezone.
-    let mut offline = render_snapshot(&mut app);
-    offline = offline.replace(
-        &at.with_timezone(&chrono::Local).format("%H:%M").to_string(),
-        "18:02",
-    );
-    insta::assert_snapshot!("sync_board_offline_conflict", offline);
+    insta::assert_snapshot!("sync_board_offline_conflict", render_snapshot(&mut app));
     app.handle_key(key(KeyCode::Enter)).unwrap();
-    let mut detail = render_snapshot(&mut app);
-    detail = detail.replace(
-        &at.with_timezone(&chrono::Local).format("%H:%M").to_string(),
-        "18:02",
-    );
-    insta::assert_snapshot!("sync_detail_conflict", detail);
+    insta::assert_snapshot!("sync_detail_conflict", render_snapshot(&mut app));
     app.sync_board.conflicts.push(crate::core::sync::Conflict {
         field: "description".into(),
         ..app.sync_board.conflicts[0].clone()
@@ -13484,14 +13467,68 @@ fn sync_board_status_and_conflicts_snapshots() {
     assert!(render_snapshot(&mut app).contains("task / description"));
     app.screen = Screen::Board;
     app.sync_board.peers[0].code = "ONLINE".into();
+    insta::assert_snapshot!("sync_board_syncing", render_snapshot(&mut app));
     app.sync_board.peers[0].pending = 0;
-    assert_eq!(
-        app.sync_board
-            .header(at + chrono::Duration::seconds(3))
-            .unwrap(),
-        "синхронизировано с server 3 с назад"
-    );
-    // Future exchange clamps clock reversal to zero; stable snapshot.
-    app.sync_board.peers[0].exchange = Some(chrono::Utc::now() + chrono::Duration::days(1));
     insta::assert_snapshot!("sync_board_online", render_snapshot(&mut app));
+}
+
+#[test]
+fn sync_status_light_states_and_colors() {
+    use super::sync_board::SyncLevel;
+    use crate::cli::serve::settings::BoardPeer;
+    use crate::core::sync::NodeRole;
+    let (_dir, mut app) = populated_app();
+    let peer = |role, code: &str, pending| BoardPeer {
+        role,
+        code: code.into(),
+        pending,
+    };
+    let light = |app: &App| app.sync_board.indicator();
+    assert_eq!(light(&app), (SyncLevel::Offline, "Offline".into()));
+    app.sync_board.peers = vec![
+        peer(NodeRole::Mobile, "NODE_UNREACHABLE", 0),
+        peer(NodeRole::Laptop, "OFFLINE", 3),
+    ];
+    assert_eq!(light(&app), (SyncLevel::Offline, "Offline".into()));
+    app.sync_board.peers[1].code = "AUTH_FAILED".into();
+    assert_eq!(light(&app), (SyncLevel::Error, "Sync error".into()));
+    app.sync_board.peers[1].code = "ONLINE".into();
+    assert_eq!(light(&app), (SyncLevel::Syncing, "Syncing 3".into()));
+    app.sync_board.peers[1].pending = 0;
+    assert_eq!(light(&app), (SyncLevel::Synced, "Synced".into()));
+    // A configured server outranks other peers.
+    app.sync_board
+        .peers
+        .push(peer(NodeRole::Server, "NODE_UNREACHABLE", 0));
+    assert_eq!(light(&app), (SyncLevel::Error, "Connection error".into()));
+    app.sync_board.error = Some("journal locked".into());
+    assert_eq!(light(&app), (SyncLevel::Error, "Sync error".into()));
+
+    // The dot takes the theme colour for each level, pinned to the right.
+    let backend = TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    for (peers, error, color) in [
+        (vec![], None, app.theme.muted),
+        (vec![], Some("x".to_string()), app.theme.err),
+        (
+            vec![peer(NodeRole::Server, "ONLINE", 2)],
+            None,
+            app.theme.warn,
+        ),
+        (
+            vec![peer(NodeRole::Server, "ONLINE", 0)],
+            None,
+            app.theme.ok,
+        ),
+    ] {
+        app.sync_board.peers = peers;
+        app.sync_board.error = error;
+        let (_, label) = app.sync_board.indicator();
+        terminal.draw(|frame| board::ui(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let x = 80 - label.chars().count() as u16 - 3;
+        let cell = &buffer[(x, 11)];
+        assert_eq!(cell.symbol(), "●");
+        assert_eq!(cell.fg, color);
+    }
 }

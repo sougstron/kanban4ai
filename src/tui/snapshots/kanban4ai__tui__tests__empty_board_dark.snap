@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 424
 expression: render_snapshot(&mut app)
 ---
 ┌ To Do (0) ───────────┐┌ In Progress (0) ─────┐┌ Review (0) ──────────┐┌ Done (0) ── ▸ Kanban ┐
@@ -30,7 +29,7 @@ expression: render_snapshot(&mut app)
 │                      ││                      ││                      ││                      │
 │                      ││                      ││                      ││                      │
 └──────────────────────┘└──────────────────────┘└──────────────────────┘└──────────────────────┘
- TUI ready │ n new · e edit · r queue · m move · y approve · A archive done · / filter · ? help 
+ TUI ready │ n new · e edit · r queue · m move · y approve · / filter · ? help        ● Offline 
 
 --- style runs ---
 0:0-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -290,4 +289,6 @@ expression: render_snapshot(&mut app)
 25:95-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 26:0-24 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 26:24-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-27:0-96 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+27:0-85 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+27:85-88 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+27:88-96 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)

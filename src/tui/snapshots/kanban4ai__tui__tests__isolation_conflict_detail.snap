@@ -33,7 +33,7 @@ expression: output
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 [ ▶ Queue M-r ] [ ⚡  Now M-F ] [ Approve M-y ] [ Re-run ^R ] [ Edit M-e ] [ Move M-m ] [ +Ctx M-c ] 
- TUI ready │ M-r queue · M-w answer · M-y approve · Tab editor · Ctrl+S save · Esc back             
+ TUI ready │ M-r queue · M-w answer · M-y approve · Tab editor · Ctrl+S save · Esc back   ● Offline 
 
 --- style runs ---
 0:0-89 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
@@ -134,4 +134,6 @@ expression: output
 30:86-87 Style::new().fg(Color::Reset).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 30:87-99 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
 30:99-100 Style::new().fg(Color::Reset).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-31:0-100 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+31:0-89 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
+31:89-92 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset).bold()
+31:92-100 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(72, 76, 92)).underline_color(Color::Reset)
