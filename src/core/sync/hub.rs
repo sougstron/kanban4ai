@@ -168,7 +168,7 @@ impl Hub {
     }
     pub(super) fn ingest_journal(&self, journal: &Journal) -> Result<u64> {
         let mut heads = self.recover()?;
-        let compacted = journal.state()?.compacted;
+        let compacted = super::projection::compacted(&journal.root)?;
         // A newly created hub starts at the retained frontier, not at an
         // unavailable prefix. This baseline survives subsequent compaction.
         if heads.through_seq == 0 && heads.segments.is_empty() {
@@ -184,6 +184,10 @@ impl Hub {
             }
             let mut ops = page.operations;
             ops.sort_by(|a, b| (&a.hlc, &a.op).cmp(&(&b.hlc, &b.op)));
+            // Lines of the page, written per segment with one fsync instead of
+            // an open, append and fsync per operation. `recover` rebuilds the
+            // heads from the files, so a crash mid-page loses nothing durable.
+            let mut pending: Option<(u64, String)> = None;
             for op in ops {
                 let seq = heads
                     .through_seq
@@ -194,6 +198,9 @@ impl Hub {
                     .last()
                     .is_none_or(|s| s.bytes >= limits.segment_bytes);
                 if roll {
+                    if let Some((first, text)) = pending.take() {
+                        self.append_lines(first, &text)?;
+                    }
                     heads.segments.push(Segment {
                         first: seq,
                         last: seq - 1,
@@ -207,12 +214,10 @@ impl Hub {
                     op: op.clone(),
                 })?;
                 bytes.push('\n');
-                let mut file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(self.segment_path(segment.first))?;
-                file.write_all(bytes.as_bytes())?;
-                file.sync_data()?;
+                pending
+                    .get_or_insert_with(|| (segment.first, String::new()))
+                    .1
+                    .push_str(&bytes);
                 if (seq - segment.first).is_multiple_of(128) {
                     segment.offsets.push((seq, segment.bytes));
                 }
@@ -221,9 +226,21 @@ impl Hub {
                 heads.heads.insert(op.hlc.2.clone(), sequence(&op)?);
                 heads.through_seq = seq;
             }
+            if let Some((first, text)) = pending.take() {
+                self.append_lines(first, &text)?;
+            }
             self.save(&heads)?;
         }
         Ok(heads.through_seq)
+    }
+    fn append_lines(&self, first: u64, text: &str) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.segment_path(first))?;
+        file.write_all(text.as_bytes())?;
+        file.sync_data()?;
+        Ok(())
     }
     fn read_segment(
         &self,

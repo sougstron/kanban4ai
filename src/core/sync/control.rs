@@ -117,13 +117,17 @@ pub(crate) fn process(ops: &Operations) -> Result<()> {
         return Ok(());
     }
     let journal = Journal::open(store)?;
+    let state = journal.state()?;
+    process_with(ops, &journal, &state)
+}
+
+fn process_with(ops: &Operations, journal: &Journal, state: &JournalState) -> Result<()> {
     let alias = ops
         .data_root()
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| invalid("invalid board"))?;
     let _control = lock_file_reentrant(&ops.data_root().join(".kanban/runner-control.lock"))?;
-    let state = journal.state()?;
     let Some(project) = state.project_uids.get(alias) else {
         return Ok(());
     };
@@ -143,7 +147,7 @@ pub(crate) fn process(ops: &Operations) -> Result<()> {
         {
             let mut command: Command =
                 serde_json::from_value(value.clone()).map_err(|e| invalid(&e.to_string()))?;
-            command.task = super::ids::task_display(&state, project, &command.task);
+            command.task = super::ids::task_display(state, project, &command.task);
             if command.node == journal.node.node_id
                 && command.action == "stop"
                 && state
@@ -151,7 +155,7 @@ pub(crate) fn process(ops: &Operations) -> Result<()> {
                     .get(&key(
                         project,
                         "run",
-                        &super::ids::task_uid(&state, project, &command.task),
+                        &super::ids::task_uid(state, project, &command.task),
                     ))
                     .and_then(|fields| fields.values.get(&journal.node.node_id))
                     .and_then(|run| run.get("gen"))
@@ -185,7 +189,7 @@ pub(crate) fn process(ops: &Operations) -> Result<()> {
                 && let Some(task) = fields.values.get("task_id").and_then(Value::as_str)
             {
                 answers
-                    .entry(super::ids::task_display(&state, project, task))
+                    .entry(super::ids::task_display(state, project, task))
                     .or_default()
                     .push((receipt, clock.clone()));
             }
@@ -287,9 +291,20 @@ fn pin_runner(ops: &Operations, task: &crate::core::models::Task, name: &str) ->
     Ok(())
 }
 
+/// `process` for every board, on one state: loading (cloning) the whole
+/// projection once per board made every server push pay for it 48 times.
 pub(crate) fn process_store(store: &Path) -> Result<()> {
+    if !enabled(store) {
+        return Ok(());
+    }
+    let journal = Journal::open(store)?;
+    let state = journal.state()?;
     for project in crate::core::project::ProjectStore::at(store).list()? {
-        process(&Operations::for_project(&project))?;
+        let ops = Operations::for_project(&project);
+        if store_for_board(ops.data_root()).is_none() {
+            continue;
+        }
+        process_with(&ops, &journal, &state)?;
     }
     Ok(())
 }

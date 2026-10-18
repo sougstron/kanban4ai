@@ -2,10 +2,10 @@
 //! A participant that has not acked anything contributes a zero vector, so a
 //! store never drops history a peer might still need. With no participants
 //! (only our own operations, no peers) the whole prefix is stable.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::projection::PruneMeta;
@@ -284,7 +284,9 @@ fn write_conflicts(path: &std::path::Path, conflicts: &[Conflict]) -> Result<()>
     }
 }
 
-pub(super) type FieldGroups = BTreeMap<(String, String, String, String), Vec<Operation>>;
+/// Versions of each replicated field. An operation is shared by every field it
+/// sets: a full copy per field made the server's group cache gigabytes.
+pub(super) type FieldGroups = BTreeMap<(String, String, String, String), Vec<Arc<Operation>>>;
 
 pub(super) struct GroupsSlot {
     token: u64,
@@ -346,12 +348,12 @@ pub(super) fn store_groups(
 pub(super) fn group_ops(ops: &[Operation]) -> FieldGroups {
     let mut groups = FieldGroups::new();
     for op in ops {
-        push_group(&mut groups, op);
+        push_group(&mut groups, &Arc::new(op.clone()));
     }
     groups
 }
 
-fn push_group(groups: &mut FieldGroups, op: &Operation) {
+fn push_group(groups: &mut FieldGroups, op: &Arc<Operation>) {
     for field in op
         .set
         .keys()
@@ -365,7 +367,7 @@ fn push_group(groups: &mut FieldGroups, op: &Operation) {
                 field.clone(),
             ))
             .or_default()
-            .push(op.clone());
+            .push(Arc::clone(op));
     }
 }
 
@@ -434,10 +436,12 @@ pub(super) fn ingest(
     prior: &[Conflict],
     new_ops: &[Operation],
 ) -> Result<Vec<Conflict>> {
+    let known: HashSet<&str> = ops.iter().map(|old| old.op.as_str()).collect();
     let fresh: Vec<&Operation> = new_ops
         .iter()
-        .filter(|op| ops.iter().all(|old| old.op != op.op))
+        .filter(|op| !known.contains(op.op.as_str()))
         .collect();
+    drop(known);
     if fresh.is_empty() {
         return Ok(prior.to_vec());
     }
@@ -489,7 +493,7 @@ pub(super) fn ingest(
         }) {
             continue;
         }
-        let mut versions: Vec<&Operation> = existing.iter().collect();
+        let mut versions: Vec<&Operation> = existing.iter().map(Arc::as_ref).collect();
         versions.extend(fresh_ops.iter().copied());
         let lineage = Lineage::new(&key.3, &versions);
         for conflict in prior {
@@ -551,7 +555,7 @@ pub(super) fn ingest(
         }
     }
     for op in &fresh {
-        push_group(groups, op);
+        push_group(groups, &Arc::new((*op).clone()));
     }
     ops.extend(fresh.into_iter().cloned());
     result.sort_by(|a, b| {

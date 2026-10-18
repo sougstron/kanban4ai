@@ -121,6 +121,63 @@ fn every_delivery_permutation_converges_with_causal_and_three_way_edits() {
     });
 }
 
+/// Conflict notes carry `sync-conflict:<conflict JSON>` ids, and a value with a
+/// URL puts `/` in them. A message id never names a path, so it must not block
+/// the push the way it did; ids that do become paths stay strict.
+#[test]
+fn message_ids_with_slashes_apply_but_task_ids_stay_path_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = Journal::open(dir.path()).unwrap();
+    let store = journal.node.store_id.clone();
+    let note_id =
+        r#"sync-conflict:{"field":"body","loser_value":"see https://example.invalid/a/b"}"#;
+    let mut ops = vec![
+        project(),
+        task(),
+        op(
+            "a",
+            3,
+            3,
+            "message",
+            note_id,
+            json!({"task_id":"TASK-001", "id":"NOTE-3-0-1", "body":"conflict note"}),
+        ),
+        op(
+            "a",
+            4,
+            4,
+            "tombstone",
+            note_id,
+            json!({"entity":"message", "deleted":true}),
+        ),
+    ];
+    for op in &mut ops {
+        op.store = store.clone();
+    }
+    journal.apply_remote(&ops[..3], 0).unwrap();
+    let thread = fs::read_to_string(
+        dir.path()
+            .join("projects/demo/.kanban/threads/TASK-001.yaml"),
+    )
+    .unwrap();
+    assert!(thread.contains("conflict note"), "{thread}");
+    journal.apply_remote(&ops[3..], 0).unwrap();
+    let mut bad = op(
+        "a",
+        5,
+        5,
+        "task",
+        "TASK/002",
+        json!({"id":"TASK/002", "title":"x"}),
+    );
+    bad.store = store;
+    let err = journal.apply_remote(&[bad], 0).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid sync path component"),
+        "{err}"
+    );
+}
+
 #[test]
 fn uid_union_collision_parent_links_and_message_tombstones_converge() {
     let parent = op(
