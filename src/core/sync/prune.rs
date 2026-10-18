@@ -23,8 +23,16 @@ impl Journal {
         self.recover()?;
         let (mut state, mut meta) = projection::load_state(&self.root)?;
         let h = frontier(self, &state, &mut meta, acks)?;
+        if h == state.compacted {
+            // Nothing became prunable: conflicts and segments are as the last
+            // run left them. Re-deriving them read and parsed every retained
+            // operation each maintenance tick. Only a blob nothing ever
+            // referenced can have become collectable.
+            gc_blobs(&self.root, &state, || self.retained_ops(&state))?;
+            projection::remember(&self.root, state, &meta);
+            return Ok(h);
+        }
         state.compacted.clone_from(&h);
-        let retained = self.retained_ops(&state)?;
         archive_conflicts(&self.root, &state, &h, &meta.frontier)?;
         // The checkpoint finds its dirty shards in the operations after the
         // old head, so it is written before any of them are dropped.
@@ -35,7 +43,7 @@ impl Journal {
                 segments::drop_sealed(&self.root, &node, through)?;
             }
         }
-        gc_blobs(&self.root, &state, &retained)?;
+        gc_blobs(&self.root, &state, || self.retained_ops(&state))?;
         let _ = segments::rebuild_index(&self.root);
         projection::remember(&self.root, state, &meta);
         Ok(h)
@@ -106,6 +114,11 @@ fn frontier(
         pointwise_max(&meta.stable, &candidate)
     };
     meta.stable = stable.clone();
+    if stable == state.compacted {
+        // `close` only lowers `stable`, and nothing above the floor is left
+        // to check: the frontier stays where it is.
+        return Ok(stable);
+    }
     let (h, frontier_hlc) = close(journal, &state.compacted, &stable, &meta.frontier)?;
     meta.frontier = frontier_hlc;
     Ok(h)
@@ -141,22 +154,36 @@ fn close(
         });
         ops.insert(node.clone(), list);
     }
+    // Sequences parsed once, and each node's clock by sequence for `inside`:
+    // a linear search per `prev` made the fixpoint quadratic in the retained
+    // history (36 s for the server's 90k operations).
+    let mut seqs: BTreeMap<&str, Vec<(u64, &Operation)>> = BTreeMap::new();
+    let mut clocks: HashMap<&str, HashMap<u64, &Hlc>> = HashMap::new();
+    for (node, list) in &ops {
+        let mut numbered = Vec::with_capacity(list.len());
+        let by_seq = clocks.entry(node.as_str()).or_default();
+        for op in list {
+            let seq = sequence(op)?;
+            by_seq.entry(seq).or_insert(&op.hlc);
+            numbered.push((seq, op));
+        }
+        seqs.insert(node.as_str(), numbered);
+    }
     let mut h = stable.clone();
     loop {
         let mut changed = false;
-        for (node, list) in &ops {
-            let limit = h.get(node).copied().unwrap_or(0);
-            for op in list {
-                let seq = sequence(op)?;
-                if seq == 0 || seq > limit {
+        for (node, list) in &seqs {
+            let limit = h.get(*node).copied().unwrap_or(0);
+            for (seq, op) in list {
+                if *seq == 0 || *seq > limit {
                     continue;
                 }
                 if op
                     .prev
                     .values()
-                    .any(|prev| !inside(&h, prev, &ops, compacted, old_frontier))
+                    .any(|prev| !inside(&h, prev, &clocks, compacted, old_frontier))
                 {
-                    h.insert(node.clone(), seq - 1);
+                    h.insert((*node).to_owned(), seq - 1);
                     changed = true;
                     break;
                 }
@@ -167,14 +194,10 @@ fn close(
         }
     }
     let mut frontier = old_frontier.clone();
-    for (node, list) in &ops {
-        let limit = h.get(node).copied().unwrap_or(0);
-        if let Some(op) = list
-            .iter()
-            .rev()
-            .find(|op| sequence(op).ok() == Some(limit))
-        {
-            frontier.insert(node.clone(), op.hlc.clone());
+    for (node, list) in &seqs {
+        let limit = h.get(*node).copied().unwrap_or(0);
+        if let Some((_, op)) = list.iter().rev().find(|(seq, _)| *seq == limit) {
+            frontier.insert((*node).to_owned(), op.hlc.clone());
         }
     }
     Ok((h, frontier))
@@ -183,7 +206,7 @@ fn close(
 fn inside(
     h: &VersionVector,
     prev: &Hlc,
-    ops: &BTreeMap<String, Vec<Operation>>,
+    clocks: &HashMap<&str, HashMap<u64, &Hlc>>,
     compacted: &VersionVector,
     old_frontier: &BTreeMap<String, Hlc>,
 ) -> bool {
@@ -191,10 +214,11 @@ fn inside(
     if bound == 0 {
         return false;
     }
-    if let Some(list) = ops.get(&prev.2)
-        && let Some(op) = list.iter().find(|op| sequence(op).ok() == Some(bound))
+    if let Some(clock) = clocks
+        .get(prev.2.as_str())
+        .and_then(|by_seq| by_seq.get(&bound))
     {
-        return prev <= &op.hlc;
+        return prev <= *clock;
     }
     if compacted.get(&prev.2).copied().unwrap_or(0) >= bound
         && let Some(clock) = old_frontier.get(&prev.2)
@@ -738,7 +762,15 @@ fn covered(field: &str, loser: &Hlc, winner: &Operation) -> bool {
     winner.prev.get(field).is_some_and(|prev| prev > loser)
 }
 
-fn gc_blobs(sync: &std::path::Path, state: &JournalState, ops: &[Operation]) -> Result<()> {
+/// Removes blobs past the grace period that nothing references. `retained`
+/// is read only when such a candidate is left after the cheap references
+/// (drift, current values, pending remote ops): parsing the whole retained
+/// history every maintenance tick was most of the server's cost.
+fn gc_blobs(
+    sync: &std::path::Path,
+    state: &JournalState,
+    retained: impl FnOnce() -> Result<Vec<Operation>>,
+) -> Result<()> {
     let dir = sync.join("blobs");
     if !dir.is_dir() {
         return Ok(());
@@ -764,11 +796,6 @@ fn gc_blobs(sync: &std::path::Path, state: &JournalState, ops: &[Operation]) -> 
             keep.insert(hash.to_owned());
         }
     }
-    for op in ops {
-        if let Some(hash) = op.blob_hash() {
-            keep.insert(hash.to_owned());
-        }
-    }
     if let Ok(text) = fs::read_to_string(sync.join("remote-pending.json")) {
         for token in text.split('"') {
             if token.len() == 64
@@ -781,6 +808,7 @@ fn gc_blobs(sync: &std::path::Path, state: &JournalState, ops: &[Operation]) -> 
         }
     }
     let now = SystemTime::now();
+    let mut candidates = Vec::new();
     for entry in fs::read_dir(&dir)? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -793,7 +821,24 @@ fn gc_blobs(sync: &std::path::Path, state: &JournalState, ops: &[Operation]) -> 
         if now.duration_since(modified).unwrap_or_default() < BLOB_GRACE {
             continue;
         }
-        fs::remove_file(path)?;
+        candidates.push(path);
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    for op in retained()? {
+        if let Some(hash) = op.blob_hash() {
+            keep.insert(hash.to_owned());
+        }
+    }
+    for path in candidates {
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| !keep.contains(name))
+        {
+            fs::remove_file(path)?;
+        }
     }
     Ok(())
 }

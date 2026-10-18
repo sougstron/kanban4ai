@@ -261,21 +261,22 @@ fn deleting_projection_or_index_rebuilds_the_same_state() {
     atomic_write_text(&storage.tasks_dir.join("todo/TASK-001.md"), &task("kept")).unwrap();
     let journal = Journal::open(dir.path()).unwrap();
     kanban4ai::core::sync::transport::snapshot_spool(dir.path()).unwrap();
-    let before = serde_json::to_value(journal.state().unwrap()).unwrap();
+    let before = serde_json::to_value(&*journal.state().unwrap()).unwrap();
     let shards = dir.path().join("sync/meta/projection");
     let saved = tempfile::tempdir().unwrap();
     copy_tree(&shards, saved.path());
     fs::remove_dir_all(&shards).unwrap();
     fs::remove_file(dir.path().join("sync/meta/index.json")).unwrap();
-    let after = serde_json::to_value(Journal::open(dir.path()).unwrap().state().unwrap()).unwrap();
+    let after =
+        serde_json::to_value(&*Journal::open(dir.path()).unwrap().state().unwrap()).unwrap();
     assert_eq!(before, after);
     atomic_write_text(&storage.tasks_dir.join("todo/TASK-001.md"), &task("later")).unwrap();
-    let full = serde_json::to_value(journal.state().unwrap()).unwrap();
+    let full = serde_json::to_value(&*journal.state().unwrap()).unwrap();
     // No checkpoint was due since the deletion, so the directory may be absent.
     let _ = fs::remove_dir_all(&shards);
     copy_tree(saved.path(), &shards);
     let replayed =
-        serde_json::to_value(Journal::open(dir.path()).unwrap().state().unwrap()).unwrap();
+        serde_json::to_value(&*Journal::open(dir.path()).unwrap().state().unwrap()).unwrap();
     assert_eq!(replayed, full);
 }
 
@@ -351,7 +352,7 @@ fn operations_after_matches_the_hlc_oracle_and_refuses_a_pruned_cursor() {
     let dir = tempfile::tempdir().unwrap();
     let journal = Journal::open(dir.path()).unwrap();
     board(dir.path());
-    let cursor = journal.state().unwrap().vector;
+    let cursor = journal.state().unwrap().vector.clone();
     let project = journal.state().unwrap().project_uids["demo"].clone();
     let mut made = Vec::new();
     for node in ["node-a", "node-b", "node-c"] {
@@ -399,7 +400,7 @@ fn operations_after_matches_the_hlc_oracle_and_refuses_a_pruned_cursor() {
         assert_eq!(page.more, more);
         assert_eq!(page.operations, expected);
     }
-    let vector = journal.state().unwrap().vector;
+    let vector = journal.state().unwrap().vector.clone();
     let mut acks = BTreeMap::new();
     for node in vector.keys() {
         if node != &journal.node.node_id {
@@ -439,7 +440,7 @@ fn prune_bounds_acked_history_and_keeps_conflicts_and_fresh_blobs() {
             jb.apply_remote(&page.operations, u64::MAX).unwrap();
             cursor = page.next;
         }
-        let ack = ja.state().unwrap().vector;
+        let ack = ja.state().unwrap().vector.clone();
         ja.prune(&BTreeMap::from([(jb.node.node_id.clone(), ack.clone())]))
             .unwrap();
         jb.prune(&BTreeMap::from([(ja.node.node_id.clone(), ack)]))
@@ -498,7 +499,7 @@ fn prune_bounds_acked_history_and_keeps_conflicts_and_fresh_blobs() {
         item.project = project.clone();
     }
     journal.apply_remote(&[left.clone()], u64::MAX).unwrap();
-    let seen = journal.state().unwrap().vector;
+    let seen = journal.state().unwrap().vector.clone();
     let mut lagging = seen.clone();
     lagging.insert("node-b".into(), 1);
     journal
@@ -513,7 +514,7 @@ fn prune_bounds_acked_history_and_keeps_conflicts_and_fresh_blobs() {
     assert_eq!(journal.operations(Some("node-a")).unwrap().len(), 1);
     journal.apply_remote(&[right], u64::MAX).unwrap();
     assert!(!journal.conflicts().unwrap().is_empty());
-    let vector = journal.state().unwrap().vector;
+    let vector = journal.state().unwrap().vector.clone();
     journal
         .prune(&BTreeMap::from([
             ("node-a".into(), vector.clone()),
@@ -673,4 +674,43 @@ fn unknown_op_fields_round_trip_and_versions_are_negotiated() {
     assert!(negotiate(1, 2, 0, 0).is_some());
     let err = accept_store_protocol(0, 99).unwrap_err().to_string();
     assert!(err.contains("SYNC_PROTOCOL_MISMATCH"), "{err}");
+}
+
+#[test]
+fn a_prune_that_frees_nothing_rewrites_nothing_and_reads_share_the_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = board(dir.path());
+    atomic_write_text(&storage.tasks_dir.join("todo/TASK-001.md"), &task("base")).unwrap();
+    let journal = Journal::open(dir.path()).unwrap();
+    journal.reconcile().unwrap();
+    // A participant that acked nothing holds the whole history.
+    let held = BTreeMap::from([("peer".to_owned(), BTreeMap::new())]);
+    journal.prune(&held).unwrap();
+    let meta = dir.path().join("sync/meta");
+    let stamp = || {
+        let mut files = Vec::new();
+        let mut stack = vec![meta.clone()];
+        while let Some(path) = stack.pop() {
+            for entry in fs::read_dir(&path).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(entry.path());
+                } else {
+                    files.push((entry.path(), entry.metadata().unwrap().modified().unwrap()));
+                }
+            }
+        }
+        files.sort();
+        files
+    };
+    let before = stamp();
+    let retained = journal.operations(None).unwrap().len();
+    assert!(retained > 0);
+    journal.prune(&held).unwrap();
+    assert_eq!(stamp(), before, "a no-op prune rewrote meta files");
+    assert_eq!(journal.operations(None).unwrap().len(), retained);
+    assert!(std::sync::Arc::ptr_eq(
+        &journal.state().unwrap(),
+        &journal.state().unwrap()
+    ));
 }

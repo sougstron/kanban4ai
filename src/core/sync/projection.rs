@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use super::format::{JournalLimits, STORE_FORMAT};
 use super::*;
@@ -407,7 +407,15 @@ pub(super) fn compacted(sync: &Path) -> Result<VersionVector> {
     if let Some(head) = read_head(sync)? {
         return Ok(head.compacted);
     }
-    Ok(load_state(sync)?.0.compacted)
+    Ok(shared_state(sync)?.0.compacted.clone())
+}
+
+/// Highest contiguous sequence per node, without loading the projection.
+pub(super) fn vector(sync: &Path) -> Result<VersionVector> {
+    if let Some((state, _)) = warm(sync) {
+        return Ok(state.vector.clone());
+    }
+    segments::heads(sync, &compacted(sync)?)
 }
 
 fn read_head(sync: &Path) -> Result<Option<Head>> {
@@ -550,7 +558,7 @@ fn write_json_synced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 struct StateSlot {
     token: u64,
-    state: JournalState,
+    state: Arc<JournalState>,
     prune: PruneMeta,
 }
 
@@ -573,10 +581,22 @@ pub(super) fn cached_prune(sync: &Path) -> Option<PruneMeta> {
     (slot.token == token).then(|| slot.prune.clone())
 }
 
+/// The warm whole-store state when it still matches the files.
+fn warm(sync: &Path) -> Option<(Arc<JournalState>, PruneMeta)> {
+    let token = segments::change_token(sync.parent()?)?;
+    let cache = state_cache();
+    let slot = cache.get(sync).filter(|slot| slot.token == token)?;
+    Some((Arc::clone(&slot.state), slot.prune.clone()))
+}
+
 /// Remember a projection that already matches the files `change_token` watches.
 /// Takes the state by value: a whole-store projection is large, and cloning it
 /// on every write made a full drift scan quadratic.
 pub(super) fn remember(sync: &Path, state: JournalState, prune: &PruneMeta) {
+    remember_shared(sync, Arc::new(state), prune);
+}
+
+fn remember_shared(sync: &Path, state: Arc<JournalState>, prune: &PruneMeta) {
     if state.partial {
         return;
     }
@@ -600,20 +620,42 @@ pub(super) fn remember(sync: &Path, state: JournalState, prune: &PruneMeta) {
     );
 }
 
+/// The whole-store state for reading. A warm state is shared, not copied:
+/// the projection of a server store is hundreds of megabytes in memory, and
+/// every request used to clone it.
+pub(super) fn shared_state(sync: &Path) -> Result<(Arc<JournalState>, PruneMeta)> {
+    if let Some(warm) = warm(sync) {
+        return Ok(warm);
+    }
+    let (state, prune) = load_state_disk(sync)?;
+    let state = Arc::new(state);
+    remember_shared(sync, Arc::clone(&state), &prune);
+    Ok((state, prune))
+}
+
+/// The whole-store state for a writer that hands it back through `remember`.
+/// A warm state is moved out of the cache, and copied only while a reader
+/// still holds it. A writer that bails out without remembering leaves the
+/// cache empty, so the next load reads disk again.
 pub(super) fn load_state(sync: &Path) -> Result<(JournalState, PruneMeta)> {
     if let Some(parent) = sync.parent()
         && let Some(token) = segments::change_token(parent)
     {
-        let cache = state_cache();
-        if let Some(slot) = cache.get(sync)
-            && slot.token == token
-        {
-            return Ok((slot.state.clone(), slot.prune.clone()));
+        let mut cache = state_cache();
+        if cache.get(sync).is_some_and(|slot| slot.token == token) {
+            let slot = cache.remove(sync).expect("cached slot");
+            drop(cache);
+            return Ok((Arc::unwrap_or_clone(slot.state), slot.prune));
         }
     }
-    let loaded = load_state_disk(sync)?;
-    remember(sync, loaded.0.clone(), &loaded.1);
-    Ok(loaded)
+    load_state_disk(sync)
+}
+
+/// A private copy of the whole-store state for a caller that changes it but
+/// never remembers it. The warm state stays cached.
+pub(super) fn owned_state(sync: &Path) -> Result<(JournalState, PruneMeta)> {
+    let (state, prune) = shared_state(sync)?;
+    Ok((Arc::unwrap_or_clone(state), prune))
 }
 
 fn load_state_disk(sync: &Path) -> Result<(JournalState, PruneMeta)> {
@@ -651,15 +693,15 @@ pub(super) fn task_scope(uids: &Uids, alias: &str, displays: &[&str]) -> (String
 pub(super) fn load_tasks(
     sync: &Path,
     scope: impl FnOnce(&Uids) -> (String, Vec<String>),
-) -> Result<JournalState> {
+) -> Result<Arc<JournalState>> {
     if let Some(parent) = sync.parent()
         && let Some(token) = segments::change_token(parent)
         && let Some(slot) = state_cache().get(sync)
         && slot.token == token
     {
-        return Ok(slot.state.clone());
+        return Ok(Arc::clone(&slot.state));
     }
-    load_tasks_cold(sync, scope)
+    load_tasks_cold(sync, scope).map(Arc::new)
 }
 
 /// `load_tasks` for a writer that hands the state back through `remember`
@@ -675,7 +717,9 @@ pub(super) fn take_tasks(
     {
         let mut cache = state_cache();
         if cache.get(sync).is_some_and(|slot| slot.token == token) {
-            return Ok(cache.remove(sync).expect("cached slot").state);
+            let slot = cache.remove(sync).expect("cached slot");
+            drop(cache);
+            return Ok(Arc::unwrap_or_clone(slot.state));
         }
     }
     load_tasks_cold(sync, scope)

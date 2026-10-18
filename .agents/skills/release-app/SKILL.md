@@ -315,21 +315,34 @@ The replicated-store server is Debian LXC CT 104 (`kanban-server`,
 `/home/kanban/.local/share/kanban4ai`. Never touch `sync/tokens.yaml`,
 `sync/peers.yaml`, or the journal.
 
-1. Install the x86_64 asset already verified in phase 3; do not rebuild, use
-   the local candidate, or fetch an unverified copy. Push it into the CT and
-   replace atomically:
+1. Install only the x86_64 asset from the release workflow, already verified
+   in phase 3. The workflow builds it for the baseline x86-64 ISA and fails
+   if it needs x86-64-v2+ or a glibc newer than the CT's (Debian 13, 2.41).
+   Never install a binary built on this laptop, including the local
+   candidate: the CachyOS toolchain marks it x86-64-v4. The server CPU
+   cannot run that, and `kanban4ai serve` exits 127 in a restart loop. Do
+   not rebuild or fetch an unverified copy either. Check the asset, keep
+   the running binary as a backup, then push and replace atomically. The
+   `--version` run inside the CT is the real CPU/glibc gate:
 
    ```sh
    SSH='ssh -o BatchMode=yes -o ConnectTimeout=8 root@192.168.0.128'
+   ! readelf -n "$ASSET_DIR/kanban4ai" | grep -q 'x86 ISA needed:.*x86-64-v[234]'
    scp -o BatchMode=yes "$ASSET_DIR/kanban4ai" root@192.168.0.128:/tmp/kanban4ai-$VERSION
    $SSH "pct push 104 /tmp/kanban4ai-$VERSION /usr/local/bin/.kanban4ai.new --perms 0755 \
      && rm -f /tmp/kanban4ai-$VERSION \
      && pct exec 104 -- sh -c '/usr/local/bin/.kanban4ai.new --version | grep -qF $VERSION \
+       && cp -p /usr/local/bin/kanban4ai /usr/local/bin/.kanban4ai.prev \
        && mv -f /usr/local/bin/.kanban4ai.new /usr/local/bin/kanban4ai'"
    ```
 
-   `$ASSET_DIR` is the directory where the x86_64 archive was extracted.
-2. Restart and verify the server unit and sync:
+   `$ASSET_DIR` is the directory where the x86_64 archive was extracted. If
+   `.kanban4ai.new --version` fails, stop: leave the running binary in place
+   and fix the workflow. Do not fall back to a laptop build.
+2. Restart and verify the server unit and sync. If the unit is not `active`
+   or the process is gone within a minute, restore
+   `/usr/local/bin/.kanban4ai.prev` with `mv -f`, restart, and report the
+   failure:
 
    ```sh
    $SSH 'pct exec 104 -- systemctl --user -M kanban@ restart kanban4ai-serve.service'

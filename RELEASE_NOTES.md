@@ -47,6 +47,20 @@
   `SYNC_NODE_ID_IN_USE` instead of having its operations dropped as
   duplicates or mixing two histories; stop the copy or re-pair with
   `join --fresh`.
+- **Sync server stays small.** `serve` on the production store kept
+  restarting after out-of-memory kills at 6 GB. Every hello, push, pull and
+  file-change ingest cloned the whole sync projection (about 370 MB in memory
+  for that store) only to read its vector or compacted frontier. The cached
+  projection is now shared, and those reads use the checkpoint head and
+  journal segments. A maintenance tick that frees nothing no longer re-reads
+  the retained history to re-derive conflicts and blobs, and the prune
+  frontier is computed in linear time (36 s → 0.4 s on 90k operations). A
+  paired client that never pulled (cursor 0) stops holding the whole history
+  an hour after it was last seen. It needs a snapshot anyway. Serve also
+  caps glibc arenas and returns freed memory after each maintenance tick. On
+  a copy of that store the server now idles at about 400 MB and peaks under
+  750 MB while a client writes once a second; the same copy needed more than
+  6 GB before.
 - **`kanban backup`.** New command to snapshot, list, verify, restore, and
   prune store backups with retention buckets; snapshots lock boards in the
   same order the daemon does and verify streamed hashes (see

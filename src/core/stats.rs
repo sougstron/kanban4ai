@@ -492,9 +492,7 @@ pub fn tasks_analytics(
 
 fn record_task_time(record: &Record) -> (&str, NaiveDateTime) {
     match record {
-        Record::Phase { task_id, ts, .. } | Record::Usage { task_id, ts, .. } => {
-            (task_id, *ts)
-        }
+        Record::Phase { task_id, ts, .. } | Record::Usage { task_id, ts, .. } => (task_id, *ts),
     }
 }
 
@@ -509,10 +507,7 @@ impl TaskAnalyticsBuilder {
         let analytics = &mut self.analytics;
         match record {
             Record::Phase {
-                ts,
-                phase,
-                edge,
-                ..
+                ts, phase, edge, ..
             } => self.edges.push((ts, phase, edge)),
             Record::Usage {
                 session_id,

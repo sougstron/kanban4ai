@@ -2,7 +2,10 @@ use super::*;
 use crate::tui::tests::{app_with_board, key, render_snapshot};
 
 fn ready(rx: &Receiver<AppEvent>) -> TickResult {
-    match rx.recv_timeout(Duration::from_secs(10)).expect("worker reply") {
+    match rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("worker reply")
+    {
         AppEvent::TickReady(result) => *result,
         other => panic!("unexpected event: {other:?}"),
     }
@@ -16,20 +19,34 @@ fn background(app: &mut App) -> Receiver<AppEvent> {
 }
 
 fn has_task(app: &App, id: &str) -> bool {
-    app.board.columns.iter().flat_map(|column| &column.tasks).any(|task| task.id == id)
+    app.board
+        .columns
+        .iter()
+        .flat_map(|column| &column.tasks)
+        .any(|task| task.id == id)
 }
 
 #[test]
 fn tick_worker_stale_snapshot_keeps_user_action_and_applies_progress() {
     let (_dir, mut app) = app_with_board();
-    let first = app.ops.create_task(NewTask::titled("Before refresh")).unwrap();
+    let first = app
+        .ops
+        .create_task(NewTask::titled("Before refresh"))
+        .unwrap();
     app.reload_board().unwrap();
     let rx = background(&mut app);
     assert!(app.request_tick_refresh(true));
     let mut result = ready(&rx);
-    let later = app.ops.create_task(NewTask::titled("User action wins")).unwrap();
+    let later = app
+        .ops
+        .create_task(NewTask::titled("User action wins"))
+        .unwrap();
     app.refresh_after_action().unwrap();
-    let progress = SessionProgress { todos_done: 2, todos_total: 3, ..Default::default() };
+    let progress = SessionProgress {
+        todos_done: 2,
+        todos_total: 3,
+        ..Default::default()
+    };
     result.progress.insert(first.id.clone(), progress.clone());
     app.apply_tick_result(result).unwrap();
     assert!(has_task(&app, &later.id));
@@ -51,7 +68,10 @@ fn tick_worker_refresh_preserves_detail_editor_scroll_and_focus() {
     detail.focus = DetailFocus::Thread;
     detail.review_edits.insert_str("Unsaved local edit");
     let rx = background(&mut app);
-    let added = app.ops.create_task(NewTask::titled("External card")).unwrap();
+    let added = app
+        .ops
+        .create_task(NewTask::titled("External card"))
+        .unwrap();
     assert!(app.request_tick_refresh(true));
     app.apply_tick_result(ready(&rx)).unwrap();
     assert!(has_task(&app, &added.id));
@@ -69,7 +89,13 @@ fn tick_worker_ignores_other_board_and_previous_visit() {
     for other_path in [true, false] {
         assert!(app.request_tick_refresh(true));
         let mut result = ready(&rx);
-        result.progress.insert("foreign".into(), SessionProgress { tokens: Some(99), ..Default::default() });
+        result.progress.insert(
+            "foreign".into(),
+            SessionProgress {
+                tokens: Some(99),
+                ..Default::default()
+            },
+        );
         if other_path {
             result.path = app.ops.data_root().join("other-board");
         } else {
@@ -77,7 +103,10 @@ fn tick_worker_ignores_other_board_and_previous_visit() {
         }
         app.apply_tick_result(result).unwrap();
         assert!(!app.session_progress.contains_key("foreign"));
-        assert!(app.tick_in_flight, "foreign reply must not clear current request");
+        assert!(
+            app.tick_in_flight,
+            "foreign reply must not clear current request"
+        );
         // We deliberately altered the only real reply above; no work remains.
         app.tick_in_flight = false;
     }
@@ -121,23 +150,31 @@ fn tick_worker_blocked_refresh_leaves_navigation_responsive_and_coalesces() {
 #[test]
 fn tick_worker_snapshots_match_inline_board_and_live_tokens() {
     let (dir, mut app) = app_with_board();
-    let mut task = app.ops.create_task(NewTask {
-        title: "Live background refresh".into(),
-        agent_backend: Some("claude".into()),
-        ..Default::default()
-    }).unwrap();
+    let mut task = app
+        .ops
+        .create_task(NewTask {
+            title: "Live background refresh".into(),
+            agent_backend: Some("claude".into()),
+            ..Default::default()
+        })
+        .unwrap();
     {
         let _lock = app.ops.storage.lock().unwrap();
         task.session = Some("ses-tick-worker".into());
         app.ops.storage.save_task(&task).unwrap();
-        SessionManager::new(dir.path()).link_session(&task.id, "ses-tick-worker").unwrap();
+        SessionManager::new(dir.path())
+            .link_session(&task.id, "ses-tick-worker")
+            .unwrap();
     }
     app.ops.move_task(&task.id, "in_progress", false).unwrap();
     app.reload_board().unwrap();
     app.settings.project_name = "Tick worker".into();
     insta::assert_snapshot!("tick_worker_before", render_snapshot(&mut app));
     let rx = background(&mut app);
-    let added = app.ops.create_task(NewTask::titled("Arrived from disk")).unwrap();
+    let added = app
+        .ops
+        .create_task(NewTask::titled("Arrived from disk"))
+        .unwrap();
     fs::write(dir.path().join(".kanban/logs/ses-tick-worker.transcript.jsonl"),
         "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":1200,\"output_tokens\":300,\"cache_read_input_tokens\":800},\"content\":[{\"type\":\"tool_use\",\"name\":\"TodoWrite\",\"input\":{\"todos\":[{\"content\":\"Read\",\"status\":\"completed\"},{\"content\":\"Implement\",\"status\":\"in_progress\"}]}}]}}\n"
     ).unwrap();

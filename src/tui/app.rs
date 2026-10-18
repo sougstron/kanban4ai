@@ -3168,7 +3168,10 @@ impl App {
     pub fn apply_tick_result(&mut self, mut result: TickResult) -> Result<()> {
         // Identity also distinguishes leaving and reopening the same board.
         if result.path != self.ops.data_root()
-            || !self.tick_worker.as_ref().is_some_and(|worker| worker.id == result.worker_id)
+            || self
+                .tick_worker
+                .as_ref()
+                .is_none_or(|worker| worker.id != result.worker_id)
         {
             return Ok(());
         }
@@ -3244,10 +3247,17 @@ impl App {
     }
 
     fn detail_session_state(&self) -> Option<SessionState> {
-        self.detail.as_ref().and_then(|detail| self.board.session_states.get(&detail.task_id).copied())
+        self.detail
+            .as_ref()
+            .and_then(|detail| self.board.session_states.get(&detail.task_id).copied())
     }
 
-    fn finish_board_refresh(&mut self, tasks_changed: bool, sessions_changed: bool, session_before: Option<SessionState>) -> Result<()> {
+    fn finish_board_refresh(
+        &mut self,
+        tasks_changed: bool,
+        sessions_changed: bool,
+        session_before: Option<SessionState>,
+    ) -> Result<()> {
         let mut timer = super::diag::PhaseTimer::new("apply board");
         if self.screen == Screen::Sessions && (tasks_changed || sessions_changed) {
             self.refresh_active_sessions()?;
@@ -3360,15 +3370,21 @@ impl App {
     /// the tick. Only Live/Waiting tasks are read — a handful at most — and the
     /// map is rebuilt each pass so a finished agent's line disappears with it.
     fn refresh_session_progress(&mut self) {
-        (self.session_progress, self.task_tokens) = self.progress_cache.refresh(
-            self.ops.data_root(), &tick_worker::live_tasks(&self.board),
-        );
+        (self.session_progress, self.task_tokens) = self
+            .progress_cache
+            .refresh(self.ops.data_root(), &tick_worker::live_tasks(&self.board));
     }
 
     fn refresh_modal_after_catalog_warm(&mut self) {
-        if !self.modal.as_ref().is_some_and(|modal| matches!(modal.modal,
-            Modal::NewTask { .. } | Modal::EditTask { .. } | Modal::Settings | Modal::GlobalSettings
-        )) {
+        if !self.modal.as_ref().is_some_and(|modal| {
+            matches!(
+                modal.modal,
+                Modal::NewTask { .. }
+                    | Modal::EditTask { .. }
+                    | Modal::Settings
+                    | Modal::GlobalSettings
+            )
+        }) {
             return;
         }
         let Ok(config) = self.ops.config.load() else {
@@ -3679,10 +3695,14 @@ impl App {
     /// finished job's report is waiting (see [`Self::poll_launches`]).
     pub fn enable_background_launches(&mut self, wake: Sender<AppEvent>) {
         self.launch_wake = Some(wake);
-        if self.has_board && self.tick_worker.is_none()
+        if self.has_board
+            && self.tick_worker.is_none()
             && let Some(seed) = self.ops.detach()
         {
-            self.tick_worker = Some(TickWorker::spawn(seed, self.launch_wake.as_ref().unwrap().clone()));
+            self.tick_worker = Some(TickWorker::spawn(
+                seed,
+                self.launch_wake.as_ref().unwrap().clone(),
+            ));
         }
         if !self.has_board
             && let Err(err) = self.refresh_projects_if_changed()

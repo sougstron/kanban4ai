@@ -45,22 +45,36 @@ fn profile_tick_reads() {
     assert!(root.join(".kanban").is_dir(), "expected a board data root");
     let ops = Operations::new(&root);
     let snapshot_ops = std::env::var_os("KANBAN_PROFILE_SNAPSHOT_PROJECT").map(|path| {
-        let path = PathBuf::from(path).canonicalize().expect("snapshot copy exists");
-        assert!(path.join(".kanban").is_dir(), "expected copied board data root");
+        let path = PathBuf::from(path)
+            .canonicalize()
+            .expect("snapshot copy exists");
+        assert!(
+            path.join(".kanban").is_dir(),
+            "expected copied board data root"
+        );
         let copy = Operations::new(path);
-        assert!(snapshot_safe(&copy), "snapshot copy must be outside a sync-enabled store");
+        assert!(
+            snapshot_safe(&copy),
+            "snapshot copy must be outside a sync-enabled store"
+        );
         copy
     });
-    let board_ops = snapshot_ops.as_ref().or_else(|| snapshot_safe(&ops).then_some(&ops));
+    let board_ops = snapshot_ops
+        .as_ref()
+        .or_else(|| snapshot_safe(&ops).then_some(&ops));
     eprintln!("read-only profile: live={} rounds={ROUNDS}", root.display());
     if let Some(board_ops) = board_ops {
         eprintln!("snapshot source={}", board_ops.data_root().display());
     } else {
-        eprintln!("SKIP snapshot/sidecars: sync-enabled live loader writes; set KANBAN_PROFILE_SNAPSHOT_PROJECT to an isolated copy");
+        eprintln!(
+            "SKIP snapshot/sidecars: sync-enabled live loader writes; set KANBAN_PROFILE_SNAPSHOT_PROJECT to an isolated copy"
+        );
     }
     // Cold means an empty application cache, not a flushed OS page cache.
     let tasks = ops.storage.list_tasks_cached(&mut TaskCache::default());
-    let heartbeat_timeout = ops.config.get_threshold("session_heartbeat_timeout")
+    let heartbeat_timeout = ops
+        .config
+        .get_threshold("session_heartbeat_timeout")
         .expect("read heartbeat timeout");
     let active_sessions: BTreeMap<_, _> = SessionManager::new(ops.data_root())
         .list_sessions_with_state(heartbeat_timeout)
@@ -69,26 +83,50 @@ fn profile_tick_reads() {
         .map(|(session, _)| (session.id, session.task_id))
         .collect();
     let column_ids = ops.config.load().expect("read board columns").column_ids();
-    let live_tasks: Vec<_> = tasks.iter().filter(|task| {
-        column_ids.iter().any(|column| column == task.status.as_str())
-            && task.session.as_ref().is_some_and(|id| {
-                active_sessions.get(id).is_some_and(|task_id| task_id == &task.id)
-            })
-    }).collect();
-    let requests: Vec<_> = live_tasks.iter()
-        .map(|task| (task.id.clone(), task.created_at)).collect();
-    let sessions: Vec<_> = live_tasks.iter().filter_map(|task| {
-        task.session.as_deref().map(|id| (id, task.agent_backend.as_deref().unwrap_or("claude")))
-    }).collect();
-    eprintln!("tasks={} tick_live_waiting_tasks={} active_session_records={}",
-        tasks.len(), live_tasks.len(), active_sessions.len());
+    let live_tasks: Vec<_> = tasks
+        .iter()
+        .filter(|task| {
+            column_ids
+                .iter()
+                .any(|column| column == task.status.as_str())
+                && task.session.as_ref().is_some_and(|id| {
+                    active_sessions
+                        .get(id)
+                        .is_some_and(|task_id| task_id == &task.id)
+                })
+        })
+        .collect();
+    let requests: Vec<_> = live_tasks
+        .iter()
+        .map(|task| (task.id.clone(), task.created_at))
+        .collect();
+    let sessions: Vec<_> = live_tasks
+        .iter()
+        .filter_map(|task| {
+            task.session
+                .as_deref()
+                .map(|id| (id, task.agent_backend.as_deref().unwrap_or("claude")))
+        })
+        .collect();
+    eprintln!(
+        "tasks={} tick_live_waiting_tasks={} active_session_records={}",
+        tasks.len(),
+        live_tasks.len(),
+        active_sessions.len()
+    );
     let mut samples = BTreeMap::new();
     let mut previous = None;
     for _ in 0..ROUNDS {
         let total = Instant::now();
-        measure(&mut samples, "live board stamps", || ops.storage.board_stamps());
-        measure(&mut samples, "live effective config", || ops.config.load().expect("read config"));
-        measure(&mut samples, "live global config", || ops.config.load_global());
+        measure(&mut samples, "live board stamps", || {
+            ops.storage.board_stamps()
+        });
+        measure(&mut samples, "live effective config", || {
+            ops.config.load().expect("read config")
+        });
+        measure(&mut samples, "live global config", || {
+            ops.config.load_global()
+        });
         if let Some(board_ops) = board_ops {
             let cold = measure(&mut samples, "snapshot cold", || {
                 BoardSnapshot::load_reusing(board_ops, None).expect("read cold snapshot")
@@ -99,22 +137,30 @@ fn profile_tick_reads() {
             });
             let stamps = board_ops.storage.board_stamps();
             measure(&mut samples, "sidecars unchanged", || {
-                warm.refresh_sidecars(board_ops, stamps).expect("read unchanged sidecars")
+                warm.refresh_sidecars(board_ops, stamps)
+                    .expect("read unchanged sidecars")
             });
             // Invalidate only the in-memory signatures to force both sidecar paths.
             warm.stamps.sessions.0 = stamps.sessions.0.wrapping_add(1);
             warm.stamps.threads.0 = stamps.threads.0.wrapping_add(1);
             measure(&mut samples, "sidecars forced", || {
-                warm.refresh_sidecars(board_ops, stamps).expect("read changed sidecars")
+                warm.refresh_sidecars(board_ops, stamps)
+                    .expect("read changed sidecars")
             });
             previous = Some(warm);
         }
         measure(&mut samples, "live session telemetry", || {
             for (id, backend) in &sessions {
-                black_box(telemetry::read_session_progress(ops.data_root(), id, backend));
+                black_box(telemetry::read_session_progress(
+                    ops.data_root(),
+                    id,
+                    backend,
+                ));
             }
         });
-        measure(&mut samples, "live events stamp", || stats::events_stamp(ops.data_root()));
+        measure(&mut samples, "live events stamp", || {
+            stats::events_stamp(ops.data_root())
+        });
         measure(&mut samples, "tick analytics scalar cache miss", || {
             for (id, since) in &requests {
                 black_box(stats::task_analytics(ops.data_root(), id, *since));
@@ -131,22 +177,45 @@ fn profile_tick_reads() {
         // comparisons/config reads that an unchanged production tick skips.
         let latest = |name: &'static str| *samples.get(name).unwrap().last().unwrap();
         let unchanged = latest("live board stamps")
-            + latest("live session telemetry") + latest("live events stamp");
+            + latest("live session telemetry")
+            + latest("live events stamp");
         let forced = board_ops.map(|_| unchanged + latest("snapshot warm"));
         let scalar = latest("tick analytics scalar cache miss");
         let batch = latest("tick analytics batch cache miss");
-        samples.entry("tick unchanged cached total").or_default().push(unchanged);
+        samples
+            .entry("tick unchanged cached total")
+            .or_default()
+            .push(unchanged);
         if let Some(forced) = forced {
-            samples.entry("tick forced reload cached total").or_default().push(forced);
-            samples.entry("tick forced reload scalar miss").or_default().push(forced + scalar);
-            samples.entry("tick forced reload batch miss").or_default().push(forced + batch);
+            samples
+                .entry("tick forced reload cached total")
+                .or_default()
+                .push(forced);
+            samples
+                .entry("tick forced reload scalar miss")
+                .or_default()
+                .push(forced + scalar);
+            samples
+                .entry("tick forced reload batch miss")
+                .or_default()
+                .push(forced + batch);
         }
-        samples.entry("total measured read-only parts").or_default().push(total.elapsed());
+        samples
+            .entry("total measured read-only parts")
+            .or_default()
+            .push(total.elapsed());
     }
-    eprintln!("milliseconds: min / median / max; tick totals sum measured read-only parts (no dispatch/sync work); forced reload uses the reported snapshot source; overall total includes comparisons");
+    eprintln!(
+        "milliseconds: min / median / max; tick totals sum measured read-only parts (no dispatch/sync work); forced reload uses the reported snapshot source; overall total includes comparisons"
+    );
     for (name, mut times) in samples {
         times.sort_unstable();
         let median = (times[ROUNDS / 2 - 1].as_secs_f64() + times[ROUNDS / 2].as_secs_f64()) / 2.0;
-        eprintln!("{name:34} {:10.3} / {:10.3} / {:10.3}", times[0].as_secs_f64() * 1000.0, median * 1000.0, times[ROUNDS - 1].as_secs_f64() * 1000.0);
+        eprintln!(
+            "{name:34} {:10.3} / {:10.3} / {:10.3}",
+            times[0].as_secs_f64() * 1000.0,
+            median * 1000.0,
+            times[ROUNDS - 1].as_secs_f64() * 1000.0
+        );
     }
 }

@@ -26,17 +26,28 @@ pub(super) struct LiveTask {
 }
 
 pub(super) fn live_tasks(board: &BoardSnapshot) -> Vec<LiveTask> {
-    board.columns.iter().flat_map(|column| &column.tasks).filter_map(|task| {
-        if !matches!(board.session_states.get(&task.id), Some(SessionState::Live | SessionState::Waiting)) {
-            return None;
-        }
-        Some(LiveTask {
-            id: task.id.clone(),
-            session: task.session.clone()?,
-            backend: task.agent_backend.clone().unwrap_or_else(|| "claude".into()),
-            created_at: task.created_at,
+    board
+        .columns
+        .iter()
+        .flat_map(|column| &column.tasks)
+        .filter_map(|task| {
+            if !matches!(
+                board.session_states.get(&task.id),
+                Some(SessionState::Live | SessionState::Waiting)
+            ) {
+                return None;
+            }
+            Some(LiveTask {
+                id: task.id.clone(),
+                session: task.session.clone()?,
+                backend: task
+                    .agent_backend
+                    .clone()
+                    .unwrap_or_else(|| "claude".into()),
+                created_at: task.created_at,
+            })
         })
-    }).collect()
+        .collect()
 }
 
 pub(super) struct TickRequest {
@@ -66,12 +77,26 @@ pub(super) struct ProgressCache {
 }
 
 impl ProgressCache {
-    pub(super) fn refresh(&mut self, root: &Path, live: &[LiveTask]) -> (HashMap<String, SessionProgress>, HashMap<String, TokenBreakdown>) {
+    pub(super) fn refresh(
+        &mut self,
+        root: &Path,
+        live: &[LiveTask],
+    ) -> (
+        HashMap<String, SessionProgress>,
+        HashMap<String, TokenBreakdown>,
+    ) {
         let mut timer = PhaseTimer::new("session progress");
         let stamp = stats::events_stamp(root);
-        let missing: Vec<_> = live.iter().filter(|task| {
-            !self.analytics.get(&task.id).is_some_and(|(cached, since, _)| *cached == stamp && *since == task.created_at)
-        }).map(|task| (task.id.clone(), task.created_at)).collect();
+        let missing: Vec<_> = live
+            .iter()
+            .filter(|task| {
+                !self
+                    .analytics
+                    .get(&task.id)
+                    .is_some_and(|(cached, since, _)| *cached == stamp && *since == task.created_at)
+            })
+            .map(|task| (task.id.clone(), task.created_at))
+            .collect();
         let mut loaded = stats::tasks_analytics(root, &missing);
         timer.mark("task_analytics");
         let mut fresh = HashMap::with_capacity(live.len());
@@ -79,7 +104,14 @@ impl ProgressCache {
         let mut tokens = HashMap::new();
         for task in live {
             let found = telemetry::read_session_progress(root, &task.session, &task.backend);
-            let analytics = loaded.remove(&task.id).or_else(|| self.analytics.remove(&task.id).map(|(_, _, analytics)| analytics)).unwrap_or_default();
+            let analytics = loaded
+                .remove(&task.id)
+                .or_else(|| {
+                    self.analytics
+                        .remove(&task.id)
+                        .map(|(_, _, analytics)| analytics)
+                })
+                .unwrap_or_default();
             let total = analytics.tokens_with_live(Some(&task.session), found.breakdown.as_ref());
             if !total.is_empty() {
                 tokens.insert(task.id.clone(), total);
@@ -136,15 +168,27 @@ impl TickWorker {
 
 // Dropping the sender stops the read-only worker after its current request.
 // Never join on project switch: a slow filesystem must not freeze navigation.
-fn refresh(ops: &Operations, worker_id: u64, request: TickRequest, mirror: &mut Option<BoardSnapshot>, cache: &mut ProgressCache) -> TickResult {
+fn refresh(
+    ops: &Operations,
+    worker_id: u64,
+    request: TickRequest,
+    mirror: &mut Option<BoardSnapshot>,
+    cache: &mut ProgressCache,
+) -> TickResult {
     let mut timer = PhaseTimer::new("tick worker");
     let stamps = ops.storage.board_stamps();
     timer.mark("stamps");
     let loaded = (|| -> crate::core::error::Result<()> {
-        if request.force || mirror.as_ref().is_none_or(|board| board.stamps.tasks != stamps.tasks) {
+        if request.force
+            || mirror
+                .as_ref()
+                .is_none_or(|board| board.stamps.tasks != stamps.tasks)
+        {
             ops.config.load_fresh()?;
             *mirror = Some(BoardSnapshot::load_reusing(ops, mirror.as_ref())?);
-        } else if let Some(board) = mirror.as_mut() && board.stamps != stamps {
+        } else if let Some(board) = mirror.as_mut()
+            && board.stamps != stamps
+        {
             board.refresh_sidecars(ops, stamps)?;
         }
         Ok(())
@@ -153,7 +197,10 @@ fn refresh(ops: &Operations, worker_id: u64, request: TickRequest, mirror: &mut 
     let (progress, tokens) = cache.refresh(ops.data_root(), &request.live);
     timer.mark("progress");
     let board = if loaded.is_ok() {
-        mirror.as_ref().filter(|board| request.force || board.stamps != request.main_stamps).cloned()
+        mirror
+            .as_ref()
+            .filter(|board| request.force || board.stamps != request.main_stamps)
+            .cloned()
     } else {
         None
     };

@@ -2,6 +2,10 @@
 use super::*;
 use std::io::{Seek, SeekFrom};
 
+/// How long a client that never pulled (cursor 0) still holds history: long
+/// enough for a bootstrap between its snapshot and its first pull.
+const BOOTSTRAP_GRACE_SECS: i64 = 3600;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubOp {
     pub seq: u64,
@@ -348,21 +352,28 @@ impl Hub {
     }
     /// Clients seen within the TTL whose cursor is still above the floor; a
     /// returning client below the floor holds nothing until it re-bootstraps.
+    /// Neither does a client that never pulled anything (cursor 0) once it
+    /// has been quiet for `BOOTSTRAP_GRACE_SECS`: it needs the snapshot
+    /// anyway, and holding the whole history for it kept every retained
+    /// operation on the server for the full TTL.
     fn active_cursors(&self, ttl_days: u64) -> Result<BTreeMap<String, u64>> {
         let clients: BTreeMap<String, Value> = load(&self.root.join("clients.json"))?;
         let now = chrono::Utc::now();
         let floor = self.floor()?;
+        let ttl = ttl_days.saturating_mul(86400).min(i64::MAX as u64) as i64;
         Ok(clients
             .into_iter()
-            .filter(|(_, c)| c["cursor"].as_u64().unwrap_or(0) >= floor)
             .filter_map(|(id, c)| {
+                let cursor = c["cursor"].as_u64().unwrap_or(0);
                 let seen = c["last_seen"]
                     .as_str()?
                     .parse::<chrono::DateTime<chrono::Utc>>()
                     .ok()?;
-                ((now - seen).num_seconds()
-                    <= ttl_days.saturating_mul(86400).min(i64::MAX as u64) as i64)
-                    .then(|| (id, c["cursor"].as_u64().unwrap_or(0)))
+                let quiet = (now - seen).num_seconds();
+                let holds = cursor >= floor
+                    && quiet <= ttl
+                    && (cursor > 0 || quiet <= BOOTSTRAP_GRACE_SECS);
+                holds.then_some((id, cursor))
             })
             .collect())
     }

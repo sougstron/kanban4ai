@@ -19,20 +19,20 @@ const STATUSES: [&str; 5] = ["todo", "in_progress", "review", "done", "archive"]
 
 impl Journal {
     pub fn vector(&self) -> Result<VersionVector> {
-        Ok(self.state()?.vector)
+        self.settled(|| projection::vector(&self.root))
     }
 
     /// Project alias -> replicated UID.
     pub fn project_uids(&self) -> Result<BTreeMap<String, String>> {
-        Ok(self.state()?.project_uids)
+        Ok(self.state()?.project_uids.clone())
     }
 
     /// Operations newer than `after`, oldest HLC first. A node's HLC grows
     /// with its sequence, so each node's slice of a page is a sequence prefix.
     /// Tombstones lead the page (section 10.2).
     pub fn operations_after(&self, after: &VersionVector, limit: usize) -> Result<Page> {
-        let state = self.state()?;
-        for (node, compacted) in &state.compacted {
+        let compacted = self.settled(|| projection::compacted(&self.root))?;
+        for (node, compacted) in &compacted {
             if *compacted > 0 && after.get(node).copied().unwrap_or(0) < *compacted {
                 return Err(invalid("SYNC_SNAPSHOT_REQUIRED"));
             }
@@ -226,7 +226,7 @@ pub fn snapshot_spool(store: &Path) -> Result<tempfile::NamedTempFile> {
         .collect::<Result<_>>()?;
     let _sync = lock_file_reentrant(&journal.root.join(".lock"))?;
     journal.recover()?;
-    let (mut state, prune_meta) = projection::load_state(&journal.root)?;
+    let (mut state, prune_meta) = projection::owned_state(&journal.root)?;
     for board in &boards {
         if board.join("project.yaml").is_file() {
             let alias = board
