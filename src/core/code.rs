@@ -426,7 +426,7 @@ pub fn reconcile(root: &Path) -> Result<()> {
             if runs.is_empty() {
                 continue;
             }
-            let _guard = storage.lock()?;
+            let guard = storage.lock()?;
             let Some(mut task) = storage.load_task(&task.id)? else {
                 continue;
             };
@@ -465,6 +465,10 @@ pub fn reconcile(root: &Path) -> Result<()> {
             {
                 task.landing_pending = None;
             }
+            // Pushes and fetches run unlocked: a slow or rejecting remote held
+            // the board lock for seconds every cycle, stalling every TUI save
+            // and task open behind it. The task is re-read once they finish.
+            drop(guard);
             let transfer = (|| -> Result<()> {
                 let source = remote(&project)?.ok_or_else(|| invalid("SYNC_NO_REMOTE"))?;
                 let repo = match repository(&project) {
@@ -526,6 +530,23 @@ pub fn reconcile(root: &Path) -> Result<()> {
                 }
                 Ok(())
             })();
+            let renamed = task.branch != before.0;
+            let guard = storage.lock()?;
+            let Some(mut current) = storage.load_task(&task.id)? else {
+                continue;
+            };
+            let before = (
+                current.branch.clone(),
+                current.landing_pending.clone(),
+                current.run_duplicate,
+            );
+            // Keep edits made while unlocked; take only the fields owned here.
+            if renamed {
+                current.branch = task.branch.clone();
+            }
+            current.landing_pending = task.landing_pending.take();
+            current.run_duplicate = task.run_duplicate;
+            let mut task = current;
             let local_pending = task.landing_pending.is_some();
             let selected = if !local_pending {
                 selected_tip(&project.data_root, &task.id)?
@@ -549,7 +570,7 @@ pub fn reconcile(root: &Path) -> Result<()> {
             {
                 storage.save_task(&task)?;
             }
-            drop(_guard);
+            drop(guard);
             if let Err(error) = transfer {
                 failure = Some(error);
                 continue;

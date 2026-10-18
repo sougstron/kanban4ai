@@ -3650,6 +3650,14 @@ impl Operations {
     /// task's detail view: the act of opening it is the "I've seen it" signal.
     /// Returns true when the flag was set and is now cleared (a write happened).
     pub fn mark_review_seen(&self, task_id: &str) -> Result<bool> {
+        // Every TUI open calls this; only a flagged task waits for the lock.
+        if !self
+            .storage
+            .load_task(task_id)?
+            .is_some_and(|task| task.review_unseen)
+        {
+            return Ok(false);
+        }
         let _guard = self.storage.lock()?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(false);
