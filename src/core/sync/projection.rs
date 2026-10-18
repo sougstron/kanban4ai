@@ -375,8 +375,30 @@ fn shard_path(sync: &Path, shard: &ShardId) -> PathBuf {
     }
 }
 
-fn uids_path(sync: &Path) -> PathBuf {
+/// Format 5 keeps the uid tables per project under `meta/uids/`:
+/// `projects.json` maps board aliases to project UIDs and one file per project
+/// holds its message, task and alias tables. A captured write touches one
+/// project, while the single format 4 `meta/uids.json` (megabytes on a busy
+/// store) was parsed, cloned and rewritten whole on every write.
+pub(super) fn uids_dir(sync: &Path) -> PathBuf {
+    sync.join("meta/uids")
+}
+
+/// The format 4 uid file. Snapshots still carry it, and while it exists it is
+/// the authority: the next save splits it (`split_uids`).
+pub(super) fn legacy_uids_path(sync: &Path) -> PathBuf {
     sync.join("meta/uids.json")
+}
+
+fn uid_index_path(sync: &Path) -> PathBuf {
+    uids_dir(sync).join("projects.json")
+}
+
+/// One project's table file. Hashed: a legacy board's project UID is its
+/// alias, which need not make a safe file name.
+fn project_uids_path(sync: &Path, project: &str) -> PathBuf {
+    let name = drift::hash(project.as_bytes());
+    uids_dir(sync).join(format!("{}.json", &name[..32]))
 }
 
 fn since_path(sync: &Path) -> PathBuf {
@@ -513,21 +535,224 @@ fn unprojected(sync: &Path, head: &Head) -> Result<Vec<Operation>> {
     Ok(ops)
 }
 
-pub(super) fn load_uids(sync: &Path) -> Result<Uids> {
-    load(&uids_path(sync))
+/// Picks one of the three per-project tables.
+type Table = fn(&mut ProjectUids) -> &mut BTreeMap<String, String>;
+
+/// One project's part of the message, task and alias tables.
+#[derive(Default, Serialize, Deserialize)]
+struct ProjectUids {
+    #[serde(default)]
+    message_uids: BTreeMap<String, String>,
+    #[serde(default)]
+    task_uids: BTreeMap<String, String>,
+    #[serde(default)]
+    task_aliases: BTreeMap<String, String>,
 }
 
+impl ProjectUids {
+    fn is_empty(&self) -> bool {
+        self.message_uids.is_empty() && self.task_uids.is_empty() && self.task_aliases.is_empty()
+    }
+
+    fn merge_into(self, uids: &mut Uids) {
+        uids.message_uids.extend(self.message_uids);
+        uids.task_uids.extend(self.task_uids);
+        uids.task_aliases.extend(self.task_aliases);
+    }
+}
+
+/// The project UID a table key belongs to; every key starts with it.
+fn key_project(k: &str) -> String {
+    serde_json::from_str::<(String, String, String)>(k)
+        .map(|(project, _, _)| project)
+        .unwrap_or_default()
+}
+
+fn project_uid_files(sync: &Path) -> Result<Vec<PathBuf>> {
+    let index = uid_index_path(sync);
+    let mut files = Vec::new();
+    match fs::read_dir(uids_dir(sync)) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                if path.extension().is_some_and(|e| e == "json") && path != index {
+                    files.push(path);
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(files)
+}
+
+pub(super) fn load_uids(sync: &Path) -> Result<Uids> {
+    let legacy = legacy_uids_path(sync);
+    if legacy.exists() {
+        return load(&legacy);
+    }
+    let mut uids = Uids {
+        project_uids: load(&uid_index_path(sync))?,
+        ..Uids::default()
+    };
+    for path in project_uid_files(sync)? {
+        load::<ProjectUids>(&path)?.merge_into(&mut uids);
+    }
+    Ok(uids)
+}
+
+/// The project index plus one board's tables: all a write scoped to that
+/// board reads or changes.
+fn load_board_uids(sync: &Path, alias: &str) -> Result<Uids> {
+    let legacy = legacy_uids_path(sync);
+    if legacy.exists() {
+        return load(&legacy);
+    }
+    let mut uids = Uids {
+        project_uids: load(&uid_index_path(sync))?,
+        ..Uids::default()
+    };
+    if let Some(project) = uids.project_uids.get(alias).cloned() {
+        load::<ProjectUids>(&project_uids_path(sync, &project))?.merge_into(&mut uids);
+    }
+    Ok(uids)
+}
+
+/// Every table, from a caller holding the whole-store state.
 pub(super) fn save_uids(sync: &Path, state: &JournalState) -> Result<()> {
-    fs::create_dir_all(sync.join("meta"))?;
-    atomic_write_json(
-        &uids_path(sync),
-        &UidsRef {
+    write_all_uids(
+        sync,
+        UidsRef {
             project_uids: &state.project_uids,
             message_uids: &state.message_uids,
             task_uids: &state.task_uids,
             task_aliases: &state.task_aliases,
         },
     )
+}
+
+pub(super) fn save_all_uids(sync: &Path, uids: &Uids) -> Result<()> {
+    write_all_uids(
+        sync,
+        UidsRef {
+            project_uids: &uids.project_uids,
+            message_uids: &uids.message_uids,
+            task_uids: &uids.task_uids,
+            task_aliases: &uids.task_aliases,
+        },
+    )
+}
+
+/// Rewrite the files whose tables changed and drop those of vanished
+/// projects. The index goes last and the format 4 file after it, so a crash
+/// part way leaves the previous authority in place.
+fn write_all_uids(sync: &Path, uids: UidsRef) -> Result<()> {
+    let mut parts: BTreeMap<String, ProjectUids> = BTreeMap::new();
+    let tables: [(_, Table); 3] = [
+        (uids.message_uids, |p| &mut p.message_uids),
+        (uids.task_uids, |p| &mut p.task_uids),
+        (uids.task_aliases, |p| &mut p.task_aliases),
+    ];
+    for (source, table) in tables {
+        for (k, v) in source {
+            table(parts.entry(key_project(k)).or_default()).insert(k.clone(), v.clone());
+        }
+    }
+    let dir = uids_dir(sync);
+    fs::create_dir_all(&dir)?;
+    let mut keep = BTreeSet::new();
+    for (project, part) in &parts {
+        let path = project_uids_path(sync, project);
+        write_if_changed(&path, part)?;
+        keep.insert(path);
+    }
+    for path in project_uid_files(sync)? {
+        if !keep.contains(&path) {
+            fs::remove_file(path)?;
+        }
+    }
+    write_if_changed(&uid_index_path(sync), uids.project_uids)?;
+    File::open(&dir)?.sync_all()?;
+    match fs::remove_file(legacy_uids_path(sync)) {
+        Ok(()) => File::open(sync.join("meta"))?.sync_all()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}
+
+fn write_if_changed<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let text = serde_json::to_vec(value).map_err(|e| invalid(&e.to_string()))?;
+    if fs::read(path).ok().as_deref() == Some(text.as_slice()) {
+        return Ok(());
+    }
+    write_json_synced(path, value)
+}
+
+/// Move a format 4 `meta/uids.json` into the per-project layout.
+pub(super) fn split_uids(sync: &Path) -> Result<()> {
+    let legacy = legacy_uids_path(sync);
+    if !legacy.exists() {
+        return Ok(());
+    }
+    save_all_uids(sync, &load(&legacy)?)
+}
+
+/// Apply a write's uid delta to the files of the projects it touches. A
+/// committed intent replays the same delta, and applying it twice is a no-op.
+pub(super) fn save_uids_delta(sync: &Path, delta: &UidsDelta) -> Result<()> {
+    if delta.is_empty() {
+        return Ok(());
+    }
+    split_uids(sync)?;
+    let mut parts: BTreeMap<String, ProjectUids> = BTreeMap::new();
+    let tables: [(&MapDelta, Table); 3] = [
+        (&delta.message, |p| &mut p.message_uids),
+        (&delta.task, |p| &mut p.task_uids),
+        (&delta.alias, |p| &mut p.task_aliases),
+    ];
+    for (changes, table) in tables {
+        for (k, v) in &changes.set {
+            table(project_part(&mut parts, sync, k)?).insert(k.clone(), v.clone());
+        }
+        for k in &changes.remove {
+            table(project_part(&mut parts, sync, k)?).remove(k);
+        }
+    }
+    let dir = uids_dir(sync);
+    fs::create_dir_all(&dir)?;
+    for (project, part) in &parts {
+        let path = project_uids_path(sync, project);
+        if !part.is_empty() {
+            write_json_synced(&path, part)?;
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if !delta.project.is_empty() {
+        let mut index: BTreeMap<String, String> = load(&uid_index_path(sync))?;
+        delta.project.apply(&mut index);
+        write_json_synced(&uid_index_path(sync), &index)?;
+    }
+    File::open(&dir)?.sync_all()?;
+    Ok(())
+}
+
+fn project_part<'a>(
+    parts: &'a mut BTreeMap<String, ProjectUids>,
+    sync: &Path,
+    k: &str,
+) -> Result<&'a mut ProjectUids> {
+    let project = key_project(k);
+    if !parts.contains_key(&project) {
+        let part = load(&project_uids_path(sync, &project))?;
+        parts.insert(project.clone(), part);
+    }
+    Ok(parts.get_mut(&project).expect("loaded part"))
 }
 
 /// Stream a JSON value to a temp file in the destination directory, then rename.
@@ -780,12 +1005,9 @@ pub(super) fn task_scope(uids: &Uids, alias: &str, displays: &[&str]) -> (String
 
 /// State for writes and reads scoped to a few tasks of one project: `misc`
 /// plus those task shards, and only the later operations that can touch them.
-/// `scope` maps the UID tables to the project UID and task UIDs. A warm
-/// whole-store state is reused when the process already holds one.
-pub(super) fn load_tasks(
-    sync: &Path,
-    scope: impl FnOnce(&Uids) -> (String, Vec<String>),
-) -> Result<Arc<JournalState>> {
+/// `alias` and the display ids name the board and tasks. A warm whole-store
+/// state is reused when the process already holds one.
+pub(super) fn load_tasks(sync: &Path, alias: &str, displays: &[&str]) -> Result<Arc<JournalState>> {
     catch_up(sync);
     if let Some(parent) = sync.parent()
         && let Some(token) = segments::change_token(parent)
@@ -794,17 +1016,14 @@ pub(super) fn load_tasks(
     {
         return Ok(Arc::clone(&slot.state));
     }
-    load_tasks_cold(sync, scope).map(Arc::new)
+    load_tasks_cold(sync, alias, displays).map(Arc::new)
 }
 
 /// `load_tasks` for a writer that hands the state back through `remember`
 /// (`commit_local` does): a warm whole-store state is moved out of the cache
 /// instead of cloned. A writer that fails or bails out without remembering
 /// leaves the cache empty, so the next load reads disk again.
-pub(super) fn take_tasks(
-    sync: &Path,
-    scope: impl FnOnce(&Uids) -> (String, Vec<String>),
-) -> Result<JournalState> {
+pub(super) fn take_tasks(sync: &Path, alias: &str, displays: &[&str]) -> Result<JournalState> {
     catch_up(sync);
     if let Some(parent) = sync.parent()
         && let Some(token) = segments::change_token(parent)
@@ -816,19 +1035,18 @@ pub(super) fn take_tasks(
             return Ok(Arc::unwrap_or_clone(slot.state));
         }
     }
-    load_tasks_cold(sync, scope)
+    load_tasks_cold(sync, alias, displays)
 }
 
-fn load_tasks_cold(
-    sync: &Path,
-    scope: impl FnOnce(&Uids) -> (String, Vec<String>),
-) -> Result<JournalState> {
+fn load_tasks_cold(sync: &Path, alias: &str, displays: &[&str]) -> Result<JournalState> {
     if read_head(sync)?.is_none() {
         // A format 2 projection is one file; read it whole until it is sharded.
         return Ok(load_state_disk(sync)?.0);
     }
-    let uids = load_uids(sync)?;
-    let (project, tasks) = scope(&uids);
+    // Only this board's uid tables: the state is partial and never cached, and
+    // its writes save a delta of the tables they touched.
+    let uids = load_board_uids(sync, alias)?;
+    let (project, tasks) = task_scope(&uids, alias, displays);
     let wanted: BTreeSet<ShardId> = tasks
         .iter()
         .map(|id| ShardId::Task(project.clone(), id.clone()))
@@ -1474,8 +1692,13 @@ mod tests {
         time("format 3: whole-store load", &mut || {
             load_state_disk(&sync).unwrap();
         });
+        let index = Uids {
+            project_uids: [("p".to_owned(), "p".to_owned())].into(),
+            ..Uids::default()
+        };
+        save_all_uids(&sync, &index).unwrap();
         time("format 3: one-task load", &mut || {
-            let scoped = load_tasks(&sync, |_| ("p".into(), vec!["task-7".into()])).unwrap();
+            let scoped = load_tasks(&sync, "p", &["task-7"]).unwrap();
             assert!(scoped.partial && scoped.fields.len() == messages + 1);
         });
         time("format 3: checkpoint with no new ops", &mut || {

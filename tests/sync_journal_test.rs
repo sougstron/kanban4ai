@@ -173,6 +173,83 @@ fn torn_append_reconciles_one_operation_without_a_hole() {
     assert_eq!(journal.operations(Some(&node)).unwrap().len(), ops.len());
 }
 
+/// Format 5 splits `meta/uids.json` per project: a format 4 store migrates on
+/// open, and a write rewrites only its own project's table file.
+#[test]
+fn uid_tables_split_per_project_and_writes_touch_one_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let demo = board(dir.path());
+    let other_root = dir.path().join("projects/other");
+    let other = Storage::new(&other_root);
+    other.init_board().unwrap();
+    atomic_write_text(
+        &other_root.join("project.yaml"),
+        "id: other\nname: Other\ncreated_at: '2026-01-01T00:00:00'\n",
+    )
+    .unwrap();
+    for storage in [&demo, &other] {
+        atomic_write_text(
+            &storage.threads_dir.join("TASK-001.yaml"),
+            "task_id: TASK-001\nrev: 1\nmessages:\n- id: MSG-001\n  body: question\n",
+        )
+        .unwrap();
+    }
+    let state = Journal::open(dir.path()).unwrap().state().unwrap();
+    assert_eq!(state.project_uids.len(), 2);
+
+    // Back to format 4: one uid file, no per-project directory.
+    let meta = dir.path().join("sync/meta");
+    fs::remove_dir_all(meta.join("uids")).unwrap();
+    let legacy = json!({
+        "project_uids": state.project_uids,
+        "message_uids": state.message_uids,
+        "task_uids": state.task_uids,
+        "task_aliases": state.task_aliases,
+    });
+    fs::write(meta.join("uids.json"), legacy.to_string()).unwrap();
+    fs::write(dir.path().join("sync/FORMAT"), "4\n").unwrap();
+
+    let journal = Journal::open(dir.path()).unwrap();
+    assert_eq!(
+        fs::read_to_string(dir.path().join("sync/FORMAT"))
+            .unwrap()
+            .trim(),
+        "5"
+    );
+    assert!(!meta.join("uids.json").exists());
+    let files = |root: &Path| -> BTreeMap<PathBuf, Vec<u8>> {
+        fs::read_dir(root.join("sync/meta/uids"))
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    };
+    let before = files(dir.path());
+    assert_eq!(before.len(), 3, "an index plus one file per project");
+    let migrated = journal.state().unwrap();
+    assert_eq!(migrated.message_uids, state.message_uids);
+    assert_eq!(migrated.task_uids, state.task_uids);
+    assert_eq!(migrated.project_uids, state.project_uids);
+
+    atomic_write_text(
+        &demo.threads_dir.join("TASK-001.yaml"),
+        "task_id: TASK-001\nrev: 2\nmessages:\n- id: MSG-001\n  body: question\n- id: MSG-002\n  body: answer\n",
+    )
+    .unwrap();
+    let after = files(dir.path());
+    let changed: Vec<_> = before
+        .iter()
+        .filter(|(path, bytes)| after.get(*path) != Some(*bytes))
+        .collect();
+    assert_eq!(changed.len(), 1, "only the demo table file is rewritten");
+    let state = Journal::open(dir.path()).unwrap().state().unwrap();
+    assert_eq!(state.message_uids.len(), 3);
+    assert!(!meta.join("uids.json").exists());
+}
+
 #[test]
 fn committed_intent_reapplies_uids_once() {
     let dir = tempfile::tempdir().unwrap();
@@ -189,7 +266,7 @@ fn committed_intent_reapplies_uids_once() {
     let count = journal.operations(Some(&node)).unwrap().len();
     let uids = state.message_uids.clone();
     assert!(!uids.is_empty());
-    fs::remove_file(dir.path().join("sync/meta/uids.json")).unwrap();
+    fs::remove_dir_all(dir.path().join("sync/meta/uids")).unwrap();
     let intent = json!({
         "path": "",
         "segment": "",
@@ -544,7 +621,7 @@ fn prune_bounds_acked_history_and_keeps_conflicts_and_fresh_blobs() {
 fn newer_store_format_is_refused_without_writes() {
     let dir = tempfile::tempdir().unwrap();
     let storage = board(dir.path());
-    fs::write(dir.path().join("sync/FORMAT"), "5\n").unwrap();
+    fs::write(dir.path().join("sync/FORMAT"), "6\n").unwrap();
     let stamp = |root: &Path| {
         let mut names = fs::read_dir(root.join("sync"))
             .unwrap()
@@ -639,7 +716,7 @@ fn v1_fixture_migrates_and_a_partial_migration_restarts() {
         fs::read_to_string(again.path().join("sync/FORMAT"))
             .unwrap()
             .trim(),
-        "4"
+        "5"
     );
 }
 

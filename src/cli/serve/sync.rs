@@ -1666,7 +1666,7 @@ mod tests {
             Journal::open(root).unwrap();
             assert_eq!(
                 fs::read_to_string(root.join("sync/FORMAT")).unwrap().trim(),
-                "4"
+                crate::core::sync::STORE_FORMAT.to_string()
             );
             for gone in [
                 "sync/peers.yaml",
@@ -1728,7 +1728,7 @@ mod tests {
             fs::read_to_string(laptop.path().join("sync/FORMAT"))
                 .unwrap()
                 .trim(),
-            "4"
+            crate::core::sync::STORE_FORMAT.to_string()
         );
         assert!(
             !laptop.path().join("sync/peers.yaml").exists()

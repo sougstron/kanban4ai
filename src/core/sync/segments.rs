@@ -697,6 +697,8 @@ pub fn change_token(store: &Path) -> Option<u64> {
         "meta/projection.json",
         "meta/projection/head.json",
         "meta/uids.json",
+        // Table files are replaced by renames, which move the directory mtime.
+        "meta/uids",
         "meta/conflicts.jsonl",
         "meta/conflicts-archive.jsonl",
     ] {

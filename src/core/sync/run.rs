@@ -137,9 +137,7 @@ impl Journal {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| invalid("invalid board"))?;
-        let mut state = projection::take_tasks(&self.root, |uids| {
-            projection::task_scope(uids, alias, &[task])
-        })?;
+        let mut state = projection::take_tasks(&self.root, alias, &[task])?;
         let before_uids = projection::uids_of(&state);
         let project = state
             .project_uids
