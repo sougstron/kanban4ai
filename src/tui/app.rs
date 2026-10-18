@@ -439,7 +439,9 @@ pub struct App {
     progress_cache: ProgressCache,
     tick_worker: Option<TickWorker>,
     tick_in_flight: bool,
-    tick_force_pending: bool,
+    /// A refresh was asked for while one was in flight.
+    tick_pending: bool,
+    tick_global_pending: bool,
     board_generation: u64,
     /// Provider subscription limits drawn above the status bar. Pulled from the
     /// background-refreshed cache by the event loop, so rendering never reaches
@@ -958,7 +960,8 @@ impl App {
             progress_cache: ProgressCache::default(),
             tick_worker: None,
             tick_in_flight: false,
-            tick_force_pending: false,
+            tick_pending: false,
+            tick_global_pending: false,
             board_generation: 0,
             limits: None,
             archived_tasks,
@@ -1082,7 +1085,8 @@ impl App {
             progress_cache: ProgressCache::default(),
             tick_worker: None,
             tick_in_flight: false,
-            tick_force_pending: false,
+            tick_pending: false,
+            tick_global_pending: false,
             board_generation: 0,
             limits: None,
             archived_tasks: Vec::new(),
@@ -3128,39 +3132,43 @@ impl App {
             return Ok(());
         }
         self.pending_fs_reload = false;
-        if !self.request_tick_refresh(true) {
+        if !self.request_tick_refresh(false) {
             self.reload_if_changed()?;
         }
         Ok(())
     }
 
     /// Coalesce refreshes while the single worker is busy. No board I/O here.
-    fn request_tick_refresh(&mut self, force: bool) -> bool {
+    /// The worker compares stamps, so only a global config change forces a reload.
+    fn request_tick_refresh(&mut self, global_changed: bool) -> bool {
         let Some(worker) = self.tick_worker.as_ref() else {
             return false;
         };
         if !worker.finished() {
-            self.tick_force_pending |= force;
+            self.tick_global_pending |= global_changed;
             if self.tick_in_flight {
+                self.tick_pending = true;
                 return true;
             }
             let request = TickRequest {
                 generation: self.board_generation,
                 main_stamps: self.board.stamps,
-                force: self.tick_force_pending,
+                global_changed: self.tick_global_pending,
                 live: tick_worker::live_tasks(&self.board),
                 #[cfg(test)]
                 before_read: None,
             };
             if worker.request(request) {
                 self.tick_in_flight = true;
-                self.tick_force_pending = false;
+                self.tick_pending = false;
+                self.tick_global_pending = false;
                 return true;
             }
         }
         self.tick_worker = None;
         self.tick_in_flight = false;
-        self.tick_force_pending = false;
+        self.tick_pending = false;
+        self.tick_global_pending = false;
         self.status = "Tick worker stopped; using synchronous refresh".into();
         false
     }
@@ -3189,14 +3197,14 @@ impl App {
                 self.expire_session_states_at(timefmt::now());
             }
         } else {
-            // A user action won the race; request a fresh snapshot, not the old one.
-            self.tick_force_pending = true;
+            // A user action won the race; compare against its board next.
+            self.tick_pending = true;
         }
         if let Some(error) = result.error {
             self.status = error;
         }
-        if self.tick_force_pending {
-            self.request_tick_refresh(true);
+        if self.tick_pending {
+            self.request_tick_refresh(false);
         }
         Ok(())
     }
@@ -3762,7 +3770,7 @@ impl App {
             self.request_full_redraw();
         }
         if report.refresh
-            && !(report.background_refresh && self.request_tick_refresh(true))
+            && !(report.background_refresh && self.request_tick_refresh(false))
             && let Err(err) = self.refresh_after_action()
         {
             self.status = err.to_string();

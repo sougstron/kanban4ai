@@ -55,7 +55,8 @@ pub(super) struct TickRequest {
     pub main_stamps: BoardStamps,
     #[cfg(test)]
     pub before_read: Option<(mpsc::Receiver<()>, Sender<()>)>,
-    pub force: bool,
+    /// The global config changed: reload even if the board stamps match.
+    pub global_changed: bool,
     pub live: Vec<LiveTask>,
 }
 
@@ -179,7 +180,7 @@ fn refresh(
     let stamps = ops.storage.board_stamps();
     timer.mark("stamps");
     let loaded = (|| -> crate::core::error::Result<()> {
-        if request.force
+        if request.global_changed
             || mirror
                 .as_ref()
                 .is_none_or(|board| board.stamps.tasks != stamps.tasks)
@@ -199,7 +200,7 @@ fn refresh(
     let board = if loaded.is_ok() {
         mirror
             .as_ref()
-            .filter(|board| request.force || board.stamps != request.main_stamps)
+            .filter(|board| request.global_changed || board.stamps != request.main_stamps)
             .cloned()
     } else {
         None
@@ -208,7 +209,7 @@ fn refresh(
         worker_id,
         path: ops.data_root().to_path_buf(),
         generation: request.generation,
-        tasks_changed: request.force || stamps.tasks != request.main_stamps.tasks,
+        tasks_changed: request.global_changed || stamps.tasks != request.main_stamps.tasks,
         board,
         progress,
         tokens,

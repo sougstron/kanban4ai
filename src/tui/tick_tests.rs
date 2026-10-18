@@ -72,7 +72,7 @@ fn tick_worker_refresh_preserves_detail_editor_scroll_and_focus() {
         .ops
         .create_task(NewTask::titled("External card"))
         .unwrap();
-    assert!(app.request_tick_refresh(true));
+    assert!(app.request_tick_refresh(false));
     app.apply_tick_result(ready(&rx)).unwrap();
     assert!(has_task(&app, &added.id));
     let detail = app.detail.as_ref().unwrap();
@@ -125,7 +125,7 @@ fn tick_worker_blocked_refresh_leaves_navigation_responsive_and_coalesces() {
     assert!(app.tick_worker.as_ref().unwrap().request(TickRequest {
         generation: app.board_generation,
         main_stamps: app.board.stamps,
-        force: true,
+        global_changed: false,
         live: tick_worker::live_tasks(&app.board),
         before_read: Some((gate, entered)),
     }));
@@ -142,7 +142,7 @@ fn tick_worker_blocked_refresh_leaves_navigation_responsive_and_coalesces() {
     app.apply_tick_result(ready(&rx)).unwrap();
     app.apply_tick_result(ready(&rx)).unwrap();
     assert!(!app.tick_in_flight);
-    assert!(!app.tick_force_pending);
+    assert!(!app.tick_pending);
     assert_eq!(app.focused_card, 1);
     assert!(rx.try_recv().is_err(), "burst coalesced into one follow-up");
 }
@@ -194,4 +194,61 @@ fn tick_worker_snapshots_match_inline_board_and_live_tokens() {
     inline.status = "Board updated from disk".into();
     inline.refresh_session_progress();
     assert_eq!(render_snapshot(&mut inline), after);
+}
+
+#[test]
+fn tick_worker_unchanged_fs_event_keeps_action_status() {
+    let (_dir, mut app) = app_with_board();
+    let rx = background(&mut app);
+    app.ops
+        .create_task(NewTask::titled("Moved by user"))
+        .unwrap();
+    app.refresh_after_action().unwrap();
+    app.status = "Moved TASK-001 to In Progress".into();
+    // The watcher's debounced event for the action's own writes.
+    let generation = app.note_fs_changed();
+    app.reload_debounced_change(generation).unwrap();
+    assert!(app.tick_in_flight);
+    let result = ready(&rx);
+    assert!(result.board.is_none(), "nothing changed since the action");
+    assert!(!result.tasks_changed);
+    app.apply_tick_result(result).unwrap();
+    assert_eq!(app.status, "Moved TASK-001 to In Progress");
+}
+
+#[test]
+fn tick_worker_heartbeat_does_not_reload_open_detail() {
+    let (dir, mut app) = app_with_board();
+    let mut task = app.ops.create_task(NewTask::titled("Watched")).unwrap();
+    {
+        let _lock = app.ops.storage.lock().unwrap();
+        task.session = Some("ses-heartbeat".into());
+        app.ops.storage.save_task(&task).unwrap();
+        SessionManager::new(dir.path())
+            .link_session(&task.id, "ses-heartbeat")
+            .unwrap();
+    }
+    app.reload_board().unwrap();
+    app.open_focused_detail().unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
+    let state = app.detail_session_state();
+    assert!(state.is_some());
+    // load_detail would reset this: the task has no prompt dump.
+    app.detail.as_mut().unwrap().has_prompt = true;
+    let rx = background(&mut app);
+    std::thread::sleep(Duration::from_millis(20));
+    SessionManager::new(dir.path())
+        .heartbeat("ses-heartbeat")
+        .unwrap();
+    let generation = app.note_fs_changed();
+    app.reload_debounced_change(generation).unwrap();
+    let result = ready(&rx);
+    assert!(!result.tasks_changed);
+    assert!(result.board.is_some(), "session stamp changed");
+    app.apply_tick_result(result).unwrap();
+    assert_eq!(app.detail_session_state(), state);
+    assert!(
+        app.detail.as_ref().unwrap().has_prompt,
+        "heartbeat must not re-read the detail on the UI thread"
+    );
 }
