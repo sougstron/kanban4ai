@@ -17,9 +17,13 @@ mod sync_board;
 mod sync_tab;
 mod theme;
 mod thread_view;
+mod tick_worker;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tick_profile;
 
 use std::io::{self, IsTerminal, Stdout, Write};
 use std::panic;

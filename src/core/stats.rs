@@ -452,20 +452,69 @@ pub fn events_stamp(project_path: &Path) -> EventsStamp {
 /// task's `created_at`) count, so a recycled task id does not inherit the
 /// history of the abandoned task that held it before.
 pub fn task_analytics(project_path: &Path, task_id: &str, since: NaiveDateTime) -> TaskAnalytics {
-    let mut analytics = TaskAnalytics::default();
-    let mut edges = Vec::new();
+    let mut pending = TaskAnalyticsBuilder::default();
     for record in load_records(project_path) {
+        let (id, ts) = record_task_time(&record);
+        if id == task_id && ts >= since {
+            pending.record(project_path, record);
+        }
+    }
+    pending.finish()
+}
+
+/// Aggregate all requested tasks with one read of the project's event log.
+/// Cutoffs, session deduplication and legacy transcript recovery match
+/// [`task_analytics`]. Tasks without matching events receive empty totals;
+/// if an id is repeated, its last supplied creation time wins.
+pub fn tasks_analytics(
+    project_path: &Path,
+    tasks: &[(String, NaiveDateTime)],
+) -> HashMap<String, TaskAnalytics> {
+    let mut pending: HashMap<_, _> = tasks
+        .iter()
+        .map(|(id, since)| (id.as_str(), (*since, TaskAnalyticsBuilder::default())))
+        .collect();
+    if !pending.is_empty() {
+        for record in load_records(project_path) {
+            let (id, ts) = record_task_time(&record);
+            if let Some((since, builder)) = pending.get_mut(id)
+                && ts >= *since
+            {
+                builder.record(project_path, record);
+            }
+        }
+    }
+    pending
+        .into_iter()
+        .map(|(id, (_, builder))| (id.to_owned(), builder.finish()))
+        .collect()
+}
+
+fn record_task_time(record: &Record) -> (&str, NaiveDateTime) {
+    match record {
+        Record::Phase { task_id, ts, .. } | Record::Usage { task_id, ts, .. } => {
+            (task_id, *ts)
+        }
+    }
+}
+
+#[derive(Default)]
+struct TaskAnalyticsBuilder {
+    analytics: TaskAnalytics,
+    edges: Vec<(NaiveDateTime, Phase, Edge)>,
+}
+
+impl TaskAnalyticsBuilder {
+    fn record(&mut self, project_path: &Path, record: Record) {
+        let analytics = &mut self.analytics;
         match record {
             Record::Phase {
                 ts,
-                task_id: id,
                 phase,
                 edge,
                 ..
-            } if id == task_id && ts >= since => edges.push((ts, phase, edge)),
+            } => self.edges.push((ts, phase, edge)),
             Record::Usage {
-                ts,
-                task_id: id,
                 session_id,
                 tokens,
                 backend,
@@ -474,11 +523,11 @@ pub fn task_analytics(project_path: &Path, task_id: &str, since: NaiveDateTime) 
                 cache_read,
                 cache_write,
                 ..
-            } if id == task_id && ts >= since => {
+            } => {
                 if let Some(session_id) = &session_id
                     && !analytics.counted_sessions.insert(session_id.clone())
                 {
-                    continue;
+                    return;
                 }
                 let recorded = (input.is_some() || output.is_some()).then(|| TokenBreakdown {
                     input: input.unwrap_or(0),
@@ -500,32 +549,38 @@ pub fn task_analytics(project_path: &Path, task_id: &str, since: NaiveDateTime) 
                     None => analytics.unsplit_tokens += tokens,
                 }
             }
-            _ => {}
         }
     }
-    edges.sort_by_key(|edge| edge.0);
-    let mut open_waiting = None;
-    for (ts, phase, edge) in edges {
-        match (phase, edge) {
-            (Phase::Running, Edge::Enter) => {
-                analytics.runs += 1;
-                analytics.running_since = Some(ts);
-            }
-            (Phase::Running, Edge::Exit) => {
-                if let Some(start) = analytics.running_since.take() {
-                    analytics.running_seconds += (ts - start).num_seconds().max(0);
+
+    fn finish(self) -> TaskAnalytics {
+        let Self {
+            mut analytics,
+            mut edges,
+        } = self;
+        edges.sort_by_key(|edge| edge.0);
+        let mut open_waiting = None;
+        for (ts, phase, edge) in edges {
+            match (phase, edge) {
+                (Phase::Running, Edge::Enter) => {
+                    analytics.runs += 1;
+                    analytics.running_since = Some(ts);
                 }
-            }
-            (Phase::Waiting, Edge::Enter) => open_waiting = Some(ts),
-            (Phase::Waiting, Edge::Exit) => {
-                if let Some(start) = open_waiting.take() {
-                    analytics.waiting_seconds += (ts - start).num_seconds().max(0);
+                (Phase::Running, Edge::Exit) => {
+                    if let Some(start) = analytics.running_since.take() {
+                        analytics.running_seconds += (ts - start).num_seconds().max(0);
+                    }
                 }
+                (Phase::Waiting, Edge::Enter) => open_waiting = Some(ts),
+                (Phase::Waiting, Edge::Exit) => {
+                    if let Some(start) = open_waiting.take() {
+                        analytics.waiting_seconds += (ts - start).num_seconds().max(0);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
+        analytics
     }
-    analytics
 }
 
 /// Recover the token split of a closed session recorded before splits were
@@ -1120,6 +1175,80 @@ mod tests {
             effort: None,
             agent: None,
         }
+    }
+
+    #[test]
+    fn tasks_analytics_matches_individual_totals_and_transcript_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let since = at(2026, 2, 1, 0, 0);
+        let tasks = vec![
+            ("TASK-1".to_string(), since),
+            ("TASK-2".to_string(), at(2026, 2, 1, 10, 0)),
+            ("TASK-empty".to_string(), since),
+        ];
+        let lines = [
+            // Recycled-id history must not leak into this task.
+            r#"{"kind":"usage","ts":"2026-01-01T10:00:00","task_id":"TASK-1","session_id":"old","tokens":999}"#,
+            // Deliberately out-of-order edges still pair by timestamp.
+            r#"{"kind":"phase","ts":"2026-02-01T10:10:00","task_id":"TASK-1","phase":"running","edge":"exit"}"#,
+            r#"{"kind":"phase","ts":"2026-02-01T10:00:00","task_id":"TASK-2","phase":"running","edge":"enter"}"#,
+            r#"{"kind":"phase","ts":"2026-02-01T10:00:00","task_id":"TASK-1","phase":"running","edge":"enter"}"#,
+            r#"{"kind":"phase","ts":"2026-02-01T10:15:00","task_id":"TASK-1","phase":"waiting","edge":"exit"}"#,
+            r#"{"kind":"phase","ts":"2026-02-01T10:10:00","task_id":"TASK-1","phase":"waiting","edge":"enter"}"#,
+            r#"{"kind":"usage","ts":"2026-02-01T10:10:00","task_id":"TASK-1","session_id":"recorded","tokens":15,"input":10,"output":5}"#,
+            // Duplicate usage is ignored even when its values differ.
+            r#"{"kind":"usage","ts":"2026-02-01T10:11:00","task_id":"TASK-1","session_id":"recorded","tokens":999,"input":999,"output":999}"#,
+            r#"{"kind":"usage","ts":"2026-02-01T10:12:00","task_id":"TASK-1","session_id":"legacy","tokens":115}"#,
+            r#"{"kind":"usage","ts":"2026-02-01T10:13:00","task_id":"TASK-1","session_id":"missing","tokens":300}"#,
+            // Session deduplication is per task, not per batch.
+            r#"{"kind":"usage","ts":"2026-02-01T10:10:00","task_id":"TASK-2","session_id":"recorded","tokens":22,"input":20,"output":2}"#,
+            r#"{"kind":"usage","ts":"2026-02-01T09:59:00","task_id":"TASK-2","session_id":"early","tokens":800}"#,
+            r#"{"kind":"usage","ts":"2026-02-01T10:11:00","task_id":"TASK-2","tokens":7}"#,
+            r#"{"kind":"usage","ts":"2026-02-01T10:12:00","task_id":"TASK-2","tokens":8}"#,
+            r#"{"kind":"usage","ts":"2026-02-01T10:00:00","task_id":"unrequested","tokens":999}"#,
+        ];
+        let path = events_path(dir.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, lines.join("\n")).unwrap();
+        let logs = dir.path().join(".kanban/logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("legacy.transcript.jsonl"),
+            concat!(
+                r#"{"type":"result","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":90,"cache_creation_input_tokens":10}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let batch = tasks_analytics(dir.path(), &tasks);
+        assert_eq!(batch.len(), tasks.len());
+        for (id, since) in &tasks {
+            assert_eq!(batch[id], task_analytics(dir.path(), id, *since));
+        }
+        let first = &batch["TASK-1"];
+        assert_eq!(first.runs, 1);
+        assert_eq!(first.running_seconds, 600);
+        assert_eq!(first.waiting_seconds, 300);
+        assert_eq!(first.running_since, None);
+        assert_eq!(first.unsplit_tokens, 300);
+        assert_eq!(first.counted_sessions.len(), 3);
+        assert_eq!(
+            first.breakdown,
+            TokenBreakdown {
+                input: 120,
+                output: 10,
+                cache_read: 90,
+                cache_write: 10,
+            }
+        );
+        let second = &batch["TASK-2"];
+        assert_eq!(second.runs, 1);
+        assert_eq!(second.running_since, Some(at(2026, 2, 1, 10, 0)));
+        assert_eq!(second.unsplit_tokens, 15);
+        assert_eq!(second.breakdown.input, 20);
+        assert_eq!(batch["TASK-empty"], TaskAnalytics::default());
+        assert!(tasks_analytics(dir.path(), &[]).is_empty());
     }
 
     #[test]

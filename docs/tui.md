@@ -228,6 +228,12 @@ the process has open, with their command lines. A panic off the TUI thread
 is logged and leaves the terminal alone; only a TUI-thread panic tears it
 down.
 
+Each main-loop event, tick, board refresh and background tick-worker pass
+that takes 50 ms or more logs one `profile <name> total=… <phase>=…` line
+with its phase timings; set `KANBAN_TUI_PROFILE=1` before starting the TUI to
+log every pass. Board stamps, snapshot reloads and live-session progress run
+on that tick worker, so a slow store delays card updates, never key handling.
+
 Clipboard pastes use bracketed paste: the whole block is inserted into the
 focused text field in one edit (flattened to a single line for one-line fields
 such as Title, search, and the answer box). Without it the terminal replays a

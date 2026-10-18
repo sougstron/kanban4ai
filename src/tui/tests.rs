@@ -26,7 +26,7 @@ use super::dialogs::{
 use super::event::LoopOutcome;
 use super::theme::Theme;
 
-fn app_with_board() -> (tempfile::TempDir, App) {
+pub(super) fn app_with_board() -> (tempfile::TempDir, App) {
     let dir = tempfile::tempdir().expect("tempdir");
     Storage::new(dir.path()).init_board().expect("init board");
     // Point opencode at a nonexistent binary so option lists come from the
@@ -380,7 +380,7 @@ fn plain_tasks_app(count: usize) -> (tempfile::TempDir, App) {
     (dir, app)
 }
 
-fn key(code: KeyCode) -> KeyEvent {
+pub(super) fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
 
@@ -464,7 +464,7 @@ fn card_hits(app: &App) -> Vec<(usize, usize, ratatui::layout::Rect)> {
         .collect()
 }
 
-fn render_snapshot(app: &mut App) -> String {
+pub(super) fn render_snapshot(app: &mut App) -> String {
     render_at(app, 96, 28)
 }
 
