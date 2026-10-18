@@ -545,6 +545,23 @@ impl ServerLink {
             self.bootstrap(&hello, &mut cursor).await?;
             hello = self.hello().await?;
         }
+        // Our own operations are journaled before they are pushed, so the
+        // server can never be ahead of us for our node id. If it is, another
+        // store (a copy of this one) writes under the same id: the server
+        // would drop our operations as duplicates and mix the two histories.
+        let own = journal
+            .vector()?
+            .get(&journal.node.node_id)
+            .copied()
+            .unwrap_or(0);
+        if hello.your_head > own {
+            return Err(invalid(format!(
+                "SYNC_NODE_ID_IN_USE: the server holds operations {}..{} of node {} that this store never wrote; another store (a copy of this one) uses the same node id. Stop that copy, or re-pair this store with join --fresh",
+                own + 1,
+                hello.your_head,
+                journal.node.node_id
+            )));
+        }
         if cursor.hub_epoch != hello.hub_epoch || cursor.last_seq > hello.head {
             cursor.last_seq = 0;
         }
@@ -985,6 +1002,47 @@ mod tests {
         assert_eq!(conflicts[0][0].2, json!(expected));
         http.abort();
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_copied_store_refuses_to_sync_under_the_same_node_id() {
+        let _serial = NETWORK.lock().await;
+        let server = node("server", "server");
+        let a = node("laptop", "laptop");
+        let work = tempfile::tempdir().unwrap();
+        let p = project(server.path(), &work.path().join("demo"));
+        Storage::new(&p.data_root)
+            .create_task(NewTask::titled("shared"))
+            .unwrap();
+        let (http, base) = http(server.path()).await;
+        let la = connect(a.path(), server.path(), &base).await;
+        la.cycle(true).await.unwrap();
+        // A copy of the laptop store keeps its node id; the original then
+        // pushes more of its own operations than the copy will ever have.
+        let copy = tempfile::tempdir().unwrap();
+        copy_tree(a.path(), copy.path());
+        let pa = ProjectStore::at(a.path()).get(&p.id).unwrap().unwrap();
+        for title in ["one", "two", "three"] {
+            Storage::new(&pa.data_root)
+                .create_task(NewTask::titled(title))
+                .unwrap();
+        }
+        la.cycle(true).await.unwrap();
+        let pc = ProjectStore::at(copy.path()).get(&p.id).unwrap().unwrap();
+        Storage::new(&pc.data_root)
+            .create_task(NewTask::titled("only in the copy"))
+            .unwrap();
+        let head = la.hello().await.unwrap().head;
+        let lc = ServerLink::connect(copy.path(), &discovery::config(copy.path()).unwrap())
+            .await
+            .unwrap()
+            .0;
+        let Err(err) = lc.cycle(true).await else {
+            panic!("a copy with the same node id must not sync");
+        };
+        assert!(err.to_string().contains("SYNC_NODE_ID_IN_USE"), "{err}");
+        assert_eq!(la.hello().await.unwrap().head, head, "copy pushed nothing");
+        http.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn server_unavailable_keeps_everything_local_then_delivers() {
         let _serial = NETWORK.lock().await;

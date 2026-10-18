@@ -49,12 +49,15 @@ fn finish(root: &Path, pending: &RemotePending) -> Result<()> {
         for (node, ops) in &by_node {
             let head = segments::head_seq(&root.join("journal").join(node)).unwrap_or(0);
             let ahead = segments::ahead_seqs(root, node).unwrap_or_default();
+            // Once per node: it loads the whole projection, and calling it per
+            // operation made a 1000-op push take minutes and gigabytes.
+            let compacted = journal_compacted(root, node);
             let fresh: Vec<_> = ops
                 .iter()
                 .filter(|op| {
-                    sequence(op).ok().is_some_and(|seq| {
-                        seq > head && seq > journal_compacted(root, node) && !ahead.contains(&seq)
-                    })
+                    sequence(op)
+                        .ok()
+                        .is_some_and(|seq| seq > head && seq > compacted && !ahead.contains(&seq))
                 })
                 .cloned()
                 .collect();
@@ -399,9 +402,9 @@ fn component(value: &str) -> Result<&str> {
 }
 
 fn journal_compacted(root: &Path, node: &str) -> u64 {
-    projection::load_state(root)
+    projection::compacted(root)
         .ok()
-        .and_then(|(state, _)| state.compacted.get(node).copied())
+        .and_then(|compacted| compacted.get(node).copied())
         .unwrap_or(0)
 }
 
@@ -413,11 +416,20 @@ pub(super) fn validate(op: &Operation, store: &str) -> Result<()> {
         return Err(invalid("SYNC_STORE_MISMATCH"));
     }
     component(&op.hlc.2)?;
-    if op.entity == "file"
-        || (matches!(op.entity.as_str(), "tombstone" | "restore")
-            && op.set.get("entity").and_then(Value::as_str) == Some("file"))
-    {
+    let real = if matches!(op.entity.as_str(), "tombstone" | "restore") {
+        op.set.get("entity").and_then(Value::as_str).unwrap_or("")
+    } else {
+        op.entity.as_str()
+    };
+    if real == "file" {
         drift::validate_file(&op.id, &op.set)?;
+    } else if real == "message" {
+        // A message id lives inside its thread file and never names a path.
+        // Conflict notes use `sync-conflict:<conflict JSON>`, which may hold a
+        // `/` from a URL; rejecting it refused the whole push for ever.
+        if op.id.is_empty() || op.id.contains('\0') {
+            return Err(invalid("invalid message id"));
+        }
     } else {
         component(&op.id)?;
     }

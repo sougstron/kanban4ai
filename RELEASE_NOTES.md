@@ -25,7 +25,28 @@
   conflict on every replica instead of being silently dropped on some of them.
 - **Cheaper drift handling.** The CLI folds drift per written path instead of
   rescanning the whole board at every start, and an unchanged drift scan
-  answers without taking the board locks.
+  answers without taking the board locks. A full scan now commits every
+  drifted file in one transaction, so the first import after the format-4
+  migration takes seconds instead of holding every board lock for minutes
+  (about 8 minutes for ~20k operations on a real store, which hung other
+  writers).
+- **Sync server ingest fixed.** Applying a pushed batch no longer reloads the
+  whole projection per operation, keeps one copy of an operation instead of
+  one per field in the conflict-group cache, finds known operations by hash,
+  loads the state once for all boards' runner controls, and writes the hub
+  log with one fsync per page. On a copy of the production server store a
+  1000-operation push went from 227 s and 4.7 GB to about 12 s and 1.7 GB.
+- **Conflict notes no longer stall a push.** A conflict note's message id
+  embeds the conflict, so a value with a URL put a `/` in it and the server
+  refused the whole batch for ever. Message ids are only required to be
+  non-empty and free of NUL; task, thread and project ids stay path-safe.
+  Update the server before clients so it accepts these operations.
+- **Copied stores refuse to sync.** If the server already holds operations of
+  this node id that the local journal never wrote, another store (a copy with
+  the same `sync/node.yaml`) syncs under that id. The cycle now stops with
+  `SYNC_NODE_ID_IN_USE` instead of having its operations dropped as
+  duplicates or mixing two histories; stop the copy or re-pair with
+  `join --fresh`.
 - **`kanban backup`.** New command to snapshot, list, verify, restore, and
   prune store backups with retention buckets; snapshots lock boards in the
   same order the daemon does and verify streamed hashes (see

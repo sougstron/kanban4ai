@@ -394,6 +394,22 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     }
 }
 
+/// The compacted frontier without loading or cloning the whole projection:
+/// the warm state when it is current, else the checkpoint head it came from.
+pub(super) fn compacted(sync: &Path) -> Result<VersionVector> {
+    if let Some(parent) = sync.parent()
+        && let Some(token) = segments::change_token(parent)
+        && let Some(slot) = state_cache().get(sync)
+        && slot.token == token
+    {
+        return Ok(slot.state.compacted.clone());
+    }
+    if let Some(head) = read_head(sync)? {
+        return Ok(head.compacted);
+    }
+    Ok(load_state(sync)?.0.compacted)
+}
+
 fn read_head(sync: &Path) -> Result<Option<Head>> {
     read_json(&head_path(sync))
 }

@@ -186,7 +186,7 @@ impl Journal {
         };
         validate(&operation)?;
         apply_meta(&mut state, &operation);
-        commit_local(self, state, &before_uids, &[operation], None)?;
+        commit_local(self, state, &before_uids, &[operation], None, &[])?;
         Ok(())
     }
 }
