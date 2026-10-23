@@ -1,7 +1,14 @@
 //! Desktop notifications via a configurable command (default `notify-send`).
 //! Failures are silent: a missing binary or timeout never breaks board logic.
+//!
+//! A `cargo test` process, and a `kanban4ai` binary it spawned, does not
+//! deliver a session notifier (`notify-send`, `dunstify`, `notify-desktop`)
+//! to the desktop. A test that points `command` at its own program still
+//! receives the alert.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use serde_yaml_ng::Mapping;
 
@@ -146,6 +153,13 @@ impl DesktopNotifier {
         let Some((program, args)) = parts.split_first() else {
             return false;
         };
+        // Tests run inside the developer's desktop session and inherit its
+        // D-Bus address, so a real notify-send pops a bubble they have to
+        // dismiss. A custom command (the alert-spy scripts) is not a session
+        // notifier and still runs.
+        if session_notifier_suppressed(program) {
+            return false;
+        }
         if which(program).is_none() {
             return false;
         }
@@ -176,7 +190,7 @@ impl DesktopNotifier {
 }
 
 /// Minimal PATH lookup (avoids a dependency for one call).
-pub fn which(program: &str) -> Option<std::path::PathBuf> {
+pub fn which(program: &str) -> Option<PathBuf> {
     if program.contains('/') {
         let path = std::path::PathBuf::from(program);
         return if is_executable(&path) {
@@ -191,12 +205,91 @@ pub fn which(program: &str) -> Option<std::path::PathBuf> {
         .find(|candidate| is_executable(candidate))
 }
 
-fn is_executable(path: &std::path::Path) -> bool {
+fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     path.is_file()
         && std::fs::metadata(path)
             .map(|m| m.permissions().mode() & 0o111 != 0)
             .unwrap_or(false)
+}
+
+/// `notify-send` and the drop-in replacements that talk to the session
+/// notification daemon. Anything else is a test spy or a user-supplied
+/// program and must still be spawned.
+fn is_session_notifier(program: &str) -> bool {
+    let name = Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    matches!(name, "notify-send" | "dunstify" | "notify-desktop")
+}
+
+fn session_notifier_suppressed(program: &str) -> bool {
+    is_session_notifier(program) && in_cargo_test_process()
+}
+
+fn in_cargo_test_process() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(detect_cargo_test_process)
+}
+
+fn detect_cargo_test_process() -> bool {
+    if std::env::current_exe().is_ok_and(|path| looks_like_cargo_test_exe(&path)) {
+        return true;
+    }
+    // `assert_cmd` runs the real `target/debug/kanban4ai`, whose own path is
+    // not a test artifact. Its parent (the harness in `target/*/deps`) is.
+    #[cfg(target_os = "linux")]
+    {
+        let mut pid = std::process::id();
+        for _ in 0..16 {
+            let Some(parent) = parent_pid(pid) else {
+                break;
+            };
+            if parent <= 1 || parent == pid {
+                break;
+            }
+            if proc_exe(parent).is_some_and(|path| looks_like_cargo_test_exe(&path)) {
+                return true;
+            }
+            pid = parent;
+        }
+    }
+    false
+}
+
+/// Cargo names test harnesses `{name}-{16 hex}` and puts them in `deps/`.
+/// `target/debug/kanban4ai` and the installed binary do not match.
+fn looks_like_cargo_test_exe(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some((stem, hash)) = name.rsplit_once('-') else {
+        return false;
+    };
+    if stem.is_empty() || hash.len() != 16 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
+    path.parent()
+        .and_then(|dir| dir.file_name())
+        .and_then(|name| name.to_str())
+        == Some("deps")
+}
+
+#[cfg(target_os = "linux")]
+fn parent_pid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("PPid:") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn proc_exe(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
 #[cfg(test)]
@@ -211,5 +304,122 @@ mod tests {
         let config = NotificationConfig::from_mapping(&mapping);
         assert!(!config.crash);
         assert!(!config.waiting);
+    }
+
+    #[test]
+    fn cargo_test_binaries_live_in_deps_with_a_hash_suffix() {
+        assert!(looks_like_cargo_test_exe(Path::new(
+            "target/debug/deps/scheduler_test-0123456789abcdef"
+        )));
+        assert!(looks_like_cargo_test_exe(Path::new(
+            "target/release/deps/kanban4ai-0123456789ABCDEF"
+        )));
+        assert!(!looks_like_cargo_test_exe(Path::new(
+            "target/debug/kanban4ai"
+        )));
+        assert!(!looks_like_cargo_test_exe(Path::new(
+            "/home/shmon/.local/opt/kanban4ai/0.8.8/kanban4ai"
+        )));
+        assert!(!looks_like_cargo_test_exe(Path::new(
+            "target/debug/deps/libindoc-aed9338965289d28.so"
+        )));
+        assert!(!looks_like_cargo_test_exe(Path::new(
+            "/usr/bin/notify-send"
+        )));
+    }
+
+    #[test]
+    fn only_session_notifiers_are_hidden_during_tests() {
+        assert!(is_session_notifier("notify-send"));
+        assert!(is_session_notifier("/usr/bin/notify-send"));
+        assert!(is_session_notifier("dunstify"));
+        assert!(is_session_notifier("/usr/bin/notify-desktop"));
+        assert!(!is_session_notifier("/tmp/board/notify-spy"));
+        assert!(!is_session_notifier("echo"));
+    }
+
+    #[test]
+    fn this_harness_is_a_cargo_test_process() {
+        let exe = std::env::current_exe().expect("current exe");
+        assert!(
+            looks_like_cargo_test_exe(&exe),
+            "cargo test binary {exe:?} must match session-notifier suppression"
+        );
+        assert!(in_cargo_test_process());
+    }
+
+    /// `kanban4ai` spawned by a test is not itself under `deps/`. Suppression
+    /// depends on `/proc/<pid>/exe` of the parent harness matching the same
+    /// predicate as `current_exe`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_spawned_child_sees_this_harness_as_its_parent() {
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("readlink /proc/$PPID/exe")
+            .output()
+            .expect("spawn sh");
+        assert!(output.status.success(), "readlink failed");
+        let path = String::from_utf8(output.stdout).expect("utf8");
+        let path = path.trim();
+        assert!(
+            looks_like_cargo_test_exe(Path::new(path)),
+            "parent exe {path:?} should be the cargo test harness"
+        );
+    }
+
+    #[cfg(unix)]
+    fn write_marker_script(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\ntouch \"$(dirname \"$0\")/called\"\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_test_does_not_deliver_notify_send_to_the_desktop() {
+        let dir = tempfile::tempdir().unwrap();
+        let spy = write_marker_script(dir.path(), "notify-send");
+        let notifier = DesktopNotifier::new(NotificationConfig {
+            command: spy.display().to_string(),
+            ..NotificationConfig::default()
+        });
+
+        assert!(!notifier.send("Kanban task failed: TASK-1", "body", "critical"));
+
+        let marker = dir.path().join("called");
+        for _ in 0..20 {
+            assert!(
+                !marker.exists(),
+                "notify-send must not run inside cargo test"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_custom_notification_command_still_runs_under_cargo_test() {
+        let dir = tempfile::tempdir().unwrap();
+        let spy = write_marker_script(dir.path(), "notify-spy");
+        let notifier = DesktopNotifier::new(NotificationConfig {
+            command: spy.display().to_string(),
+            ..NotificationConfig::default()
+        });
+
+        assert!(notifier.send("Kanban task failed: TASK-1", "body", "normal"));
+
+        let marker = dir.path().join("called");
+        for _ in 0..20 {
+            if marker.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("custom notification command was not executed");
     }
 }

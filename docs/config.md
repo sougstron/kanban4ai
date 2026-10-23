@@ -248,7 +248,7 @@ selection, resolving `here`/`auto` at launch, and routing execution are Runner 0
 - `crash`: true - notify when a task run fails (non-zero exit, heartbeat
   timeout, failed launch); the body names the scheduled retry, or that no
   automatic retry is configured
-- `command`: `notify-send` - notification command
+- `command`: `notify-send` - notification command. During `cargo test`, a session notifier (`notify-send`, `dunstify`, `notify-desktop`) is not delivered to the desktop, including from a `kanban4ai` binary the test spawned. A test that sets `command` to its own program still receives the alert.
 - `timeout`: 3 - command timeout in seconds
 - `max_body_chars`: 240 - truncate notification body beyond this length
 
