@@ -779,15 +779,17 @@ async fn target(
     Ok((node != journal.node.name).then_some(node))
 }
 
-fn publish_launch_code(root: &Path, id: &str, task: &str, remote: &str) -> Result<()> {
+fn publish_launch_code(root: &Path, id: &str, task: &str) -> Result<String> {
     let project = project(root, id)?;
-    let task = found(Storage::new(project.data_root).load_task(task)?)?;
+    let task = found(Storage::new(&project.data_root).load_task(task)?)?;
+    let remote = crate::core::code::publication_remote(root, &project)?
+        .ok_or_else(|| invalid("SYNC_NO_REMOTE: service ref publication is disabled"))?;
     if task.continue_from.is_none() {
-        crate::core::code::publish_live(root, id, remote)?;
+        crate::core::code::publish_live(root, id)?;
     }
     // Continuations already published their exact WIP; never reseed them from
     // this frontend's potentially divergent human working directory.
-    Ok(())
+    Ok(remote)
 }
 
 pub(super) async fn runner_action(
@@ -803,9 +805,8 @@ pub(super) async fn runner_action(
     };
     let (remote_root, remote_id) = (root.to_path_buf(), id.to_owned());
     let has_remote = blocking(move || {
-        Ok(crate::core::code::status(&remote_root, &remote_id)?
-            .remote
-            .is_some())
+        let project = project(&remote_root, &remote_id)?;
+        Ok(crate::core::code::publication_remote(&remote_root, &project)?.is_some())
     })
     .await?;
     if !has_remote {
@@ -857,14 +858,7 @@ pub(super) async fn runner_action(
         // never consume a request for a snapshot which has not been published.
         let (code_root, code_id, code_task) = (root.to_path_buf(), id.to_owned(), task.to_owned());
         blocking(move || {
-            let remote = crate::core::code::status(&code_root, &code_id)?.remote.ok_or_else(
-                || {
-                    invalid(
-                        "SYNC_NO_REMOTE: offline runner queue needs a git remote; pass --runner <local> to run here",
-                    )
-                },
-            )?;
-            publish_launch_code(&code_root, &code_id, &code_task, &remote)?;
+            publish_launch_code(&code_root, &code_id, &code_task)?;
             Ok(())
         })
         .await?;
@@ -957,13 +951,7 @@ async fn proxy(
                 let p = project(&root, &id)?;
                 let ops = Operations::for_project(&p);
                 if action == "launch" {
-                    let remote =
-                        crate::core::code::status(&root, &id)?
-                            .remote
-                            .ok_or_else(|| {
-                                invalid("SYNC_NO_REMOTE: client runner requires a code remote")
-                            })?;
-                    publish_launch_code(&root, &id, &task, &remote)?;
+                    publish_launch_code(&root, &id, &task)?;
                     found(ops.update_task(
                         &task,
                         TaskPatch {
@@ -1210,16 +1198,16 @@ async fn proxy(
             let (code_root, code_id, code_task) =
                 (root.to_path_buf(), id.to_owned(), task.to_owned());
             let transfer = match blocking(move || {
-                let remote = crate::core::code::status(&code_root, &code_id)?.remote;
-                if role == NodeRole::Mobile && remote.is_none() {
-                    return Err(invalid("SYNC_NO_REMOTE"));
-                }
-                if let Some(remote) = remote {
-                    publish_launch_code(&code_root, &code_id, &code_task, &remote)?;
+                let project = project(&code_root, &code_id)?;
+                if crate::core::code::publication_remote(&code_root, &project)?.is_some() {
+                    let remote = publish_launch_code(&code_root, &code_id, &code_task)?;
                     Ok((None, Some(remote)))
                 } else {
-                    let (bundle, _) = crate::core::code::export(&code_root, &code_id, &[])?;
-                    Ok((Some(bundle), None))
+                    let (bundle, source) = crate::core::code::export(&code_root, &code_id, &[])?;
+                    if role == NodeRole::Mobile && source.is_none() {
+                        return Err(invalid("SYNC_NO_REMOTE"));
+                    }
+                    Ok((Some(bundle), source))
                 }
             })
             .await
@@ -1602,7 +1590,8 @@ async fn continue_task(root: PathBuf, id: String, task_id: String, request: Acti
             let mut task = found(storage.load_task(&t)?)?;
             let repo = crate::core::vcs::detect(&project.work_path).ok_or_else(|| invalid("RUNNER_REPO_MISSING"))?;
             let reference = format!("refs/kanban/wip-runs/{t}/{generation}/{source_id}");
-            let remote = crate::core::code::status(&r, &i)?.remote.ok_or_else(|| invalid("SYNC_NO_REMOTE"))?;
+            let remote = crate::core::code::publication_remote(&r, &project)?
+                .ok_or_else(|| invalid("SYNC_NO_REMOTE"))?;
             repo.fetch_run(&remote, &reference)?;
             let tip = repo.read_ref(&reference)?.ok_or_else(|| invalid("No published WIP for this source generation"))?;
             task.continue_from = Some(tip.as_str().into());

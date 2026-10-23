@@ -436,6 +436,121 @@ impl GitRepo {
         Ok(())
     }
 
+    /// Tree named by a commit-ish. Comparing this rather than the commit ID
+    /// avoids republishing identical snapshots created by `commit-tree`.
+    pub fn tree_oid(&self, commit: &str) -> Result<Oid> {
+        let revision = format!("{commit}^{{tree}}");
+        let out = require(self.git(&["rev-parse", &revision])?, "resolve tree")?;
+        parse_oid(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    pub fn delete_refs(&self, remote: &str, refs: &[String]) -> Result<()> {
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let specs: Vec<_> = refs.iter().map(|name| format!(":{name}")).collect();
+        let mut args = vec!["push", "--", remote];
+        args.extend(specs.iter().map(String::as_str));
+        require(self.git(&args)?, "delete service refs")?;
+        Ok(())
+    }
+
+    pub fn delete_local_refs(&self, refs: &[String]) -> Result<()> {
+        for reference in refs {
+            let out = self.git(&["update-ref", "-d", reference])?;
+            if !out.status.success() {
+                return Err(KanbanError::Invalid(format!(
+                    "delete local ref failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn refs_with_prefixes(&self, prefixes: &[String]) -> Result<Vec<String>> {
+        let mut args = vec!["for-each-ref", "--format=%(refname)"];
+        args.extend(prefixes.iter().map(String::as_str));
+        let out = require(self.git(&args)?, "list service refs")?;
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+
+    pub fn publish_all_service_refs(&self, remote: &str) -> Result<()> {
+        let prefixes = [
+            "refs/heads/kanban/",
+            "refs/kanban/integration",
+            "refs/kanban/wip/",
+            "refs/kanban/wip-runs/",
+            "refs/kanban/runs/",
+        ]
+        .map(str::to_owned);
+        let refs = self.refs_with_prefixes(&prefixes)?;
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let specs: Vec<_> = refs.iter().map(|name| format!("+{name}:{name}")).collect();
+        let mut args = vec!["push", "--", remote];
+        args.extend(specs.iter().map(String::as_str));
+        require(self.git(&args)?, "publish service refs")?;
+        Ok(())
+    }
+
+    pub fn remote_service_refs(&self, remote: &str) -> Result<Vec<String>> {
+        let out = require(
+            self.git(&[
+                "ls-remote",
+                "--refs",
+                remote,
+                "refs/heads/kanban/*",
+                "refs/kanban/integration",
+                "refs/kanban/wip/*",
+                "refs/kanban/wip-runs/*",
+                "refs/kanban/runs/*",
+            ])?,
+            "list remote service refs",
+        )?;
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .map(str::to_owned)
+            .collect())
+    }
+
+    /// Copy every advertised service ref without updating a checked-out local
+    /// task branch. Temporary refs only keep fetched objects reachable for the
+    /// subsequent push and are removed on both success and failure.
+    pub fn copy_remote_service_refs(&self, source: &str, destination: &str) -> Result<()> {
+        let refs = self.remote_service_refs(source)?;
+        let mut temporary = Vec::new();
+        let copied = (|| -> Result<()> {
+            for (index, reference) in refs.iter().enumerate() {
+                let temp = format!("refs/kanban/migration/{index}");
+                let spec = format!("+{reference}:{temp}");
+                require(
+                    self.git(&["fetch", "--no-tags", "--", source, &spec])?,
+                    "fetch migration ref",
+                )?;
+                temporary.push((temp, reference.clone()));
+            }
+            if !temporary.is_empty() {
+                let specs: Vec<_> = temporary
+                    .iter()
+                    .map(|(temp, reference)| format!("+{temp}:{reference}"))
+                    .collect();
+                let mut args = vec!["push", "--", destination];
+                args.extend(specs.iter().map(String::as_str));
+                require(self.git(&args)?, "migrate service refs")?;
+            }
+            Ok(())
+        })();
+        let temps: Vec<_> = temporary.into_iter().map(|(temp, _)| temp).collect();
+        let cleaned = self.delete_local_refs(&temps);
+        copied.and(cleaned)
+    }
+
     /// Do not move a ref underneath a running/retained isolated checkout.
     pub fn install_run_branch(&self, branch: &str, tip: &Oid) -> Result<bool> {
         let reference = format!("refs/heads/{branch}");

@@ -39,6 +39,78 @@ fn fixture(root: &Path) -> (std::path::PathBuf, kanban4ai::core::project::Projec
     Storage::new(&p.data_root).init_board().unwrap();
     (work, p)
 }
+
+#[test]
+fn service_remote_is_private_by_default_and_supports_template_or_origin_opt_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let (work, project) = fixture(temp.path());
+    let origin = temp.path().join("origin.git");
+    git(
+        temp.path(),
+        &["init", "--bare", "-q", origin.to_str().unwrap()],
+    );
+    git(
+        &work,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    let root = temp.path().join("sender");
+    assert_eq!(code::publication_remote(&root, &project).unwrap(), None);
+    fs::write(root.join("config.yaml"), "sync:\n  wip_push: true\n").unwrap();
+    assert_eq!(
+        code::publication_remote(&root, &project).unwrap(),
+        Some(origin.to_string_lossy().into_owned())
+    );
+    fs::write(
+        root.join("config.yaml"),
+        "sync:\n  code_remote: ssh://sync/code/{project}.git\n  wip_push: true\n",
+    )
+    .unwrap();
+    assert_eq!(
+        code::publication_remote(&root, &project)
+            .unwrap()
+            .as_deref(),
+        Some("ssh://sync/code/work.git")
+    );
+}
+
+#[test]
+fn service_ref_migration_copies_origin_without_touching_human_branch() {
+    let temp = tempfile::tempdir().unwrap();
+    let (work, _) = fixture(temp.path());
+    let origin = temp.path().join("origin.git");
+    let private = temp.path().join("private.git");
+    git(
+        temp.path(),
+        &["init", "--bare", "-q", origin.to_str().unwrap()],
+    );
+    git(
+        temp.path(),
+        &["init", "--bare", "-q", private.to_str().unwrap()],
+    );
+    let head = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["update-ref", "refs/kanban/wip/TASK-9", &head]);
+    git(
+        &work,
+        &["update-ref", "refs/kanban/runs/TASK-9/1/node", &head],
+    );
+    git(&work, &["branch", "kanban/TASK-9", &head]);
+    let repo = vcs::detect(&work).unwrap();
+    repo.publish_all_service_refs(origin.to_str().unwrap())
+        .unwrap();
+    repo.copy_remote_service_refs(origin.to_str().unwrap(), private.to_str().unwrap())
+        .unwrap();
+    let refs = repo.remote_service_refs(private.to_str().unwrap()).unwrap();
+    assert!(refs.contains(&"refs/heads/kanban/TASK-9".to_string()));
+    assert!(refs.contains(&"refs/kanban/wip/TASK-9".to_string()));
+    assert!(refs.contains(&"refs/kanban/runs/TASK-9/1/node".to_string()));
+    assert!(
+        git(
+            &private,
+            &["for-each-ref", "--format=%(refname)", "refs/heads/main"]
+        )
+        .is_empty()
+    );
+}
 fn replicate_project(root: &Path, p: &kanban4ai::core::project::Project) {
     let dest = root.join("projects").join(&p.id);
     fs::create_dir_all(dest.join(".kanban")).unwrap();
@@ -149,6 +221,7 @@ fn remote_preparation_transfers_unpublished_spine_without_pushing_main() {
         .unwrap();
     let receiver = temp.path().join("receiver");
     replicate_project(&receiver, &p);
+    fs::write(receiver.join("config.yaml"), "sync:\n  wip_push: true\n").unwrap();
     let status = code::prepare_from_remote(&receiver, &p.id, source.as_deref().unwrap()).unwrap();
     assert_eq!(
         git(&status.path, &["show", "refs/kanban/integration:tracked"]),

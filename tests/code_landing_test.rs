@@ -50,7 +50,7 @@ fn pair_with_role(manual: bool, role: &str) -> Pair {
     fs::create_dir_all(&a).unwrap();
     fs::write(
         a.join("config.yaml"),
-        "node:\n  name: server\n  role: server\n",
+        "node:\n  name: server\n  role: server\nsync:\n  wip_push: true\n",
     )
     .unwrap();
     Journal::open(&a).unwrap();
@@ -80,7 +80,7 @@ fn pair_with_role(manual: bool, role: &str) -> Pair {
     fs::create_dir_all(&b).unwrap();
     fs::write(
         b.join("config.yaml"),
-        format!("node:\n  name: {role}\n  role: {role}\n"),
+        format!("node:\n  name: {role}\n  role: {role}\nsync:\n  wip_push: true\n"),
     )
     .unwrap();
     Journal::open(&b).unwrap();
@@ -492,6 +492,96 @@ fn mobile_server_wip_roundtrip_preserves_dirty_files_and_retained_checkouts() {
         .runs(&p.pb.id, &task.id)
         .unwrap();
     assert_eq!(runs.values().map(|r| r.generation).max(), Some(3));
+}
+
+#[test]
+fn unchanged_wip_tree_does_not_push_again() {
+    let p = pair(false);
+    let task = ops(&p.pa)
+        .create_task(NewTask::titled("stable WIP"))
+        .unwrap();
+    take(&p.pa, &task.id, "ses-stable-wip", "stable");
+    let log = p.remote.with_extension("pushes");
+    let hook = p.remote.join("hooks/pre-receive");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\necho push >> '{}'\n", log.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let current = ops(&p.pa).get_task(&task.id).unwrap().unwrap();
+    let first = kanban4ai::core::wip::checkpoint(&p.pa, &current).unwrap();
+    let pushes = fs::read_to_string(&log).unwrap().lines().count();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let second = kanban4ai::core::wip::checkpoint(&p.pa, &current).unwrap();
+    assert_ne!(first, second, "test must exercise distinct commit IDs");
+    assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), pushes);
+    let neighbor = format!("refs/kanban/wip/{}0", task.id);
+    git(&p.pa.work_path, &["update-ref", &neighbor, &second]);
+    git(
+        &p.pa.work_path,
+        &["push", "-q", "origin", &format!("{neighbor}:{neighbor}")],
+    );
+    let operations = ops(&p.pa);
+    operations
+        .complete_task(&task.id, "ses-stable-wip", true)
+        .unwrap();
+    operations.mark_review_tasks_done().unwrap();
+    assert!(
+        git(
+            &p.remote,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                &format!("refs/kanban/wip/{}", task.id),
+                &format!("refs/kanban/wip-runs/{}/", task.id),
+            ],
+        )
+        .is_empty()
+    );
+    assert_eq!(git(&p.remote, &["rev-parse", &neighbor]), second);
+}
+
+#[test]
+fn offline_checkpoint_is_flushed_after_publication_is_enabled() {
+    let p = pair(false);
+    let config_path = p.a.join("config.yaml");
+    let mut config: serde_yaml_ng::Value =
+        serde_yaml_ng::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config["sync"]["wip_push"] = false.into();
+    fs::write(&config_path, serde_yaml_ng::to_string(&config).unwrap()).unwrap();
+    let task = ops(&p.pa)
+        .create_task(NewTask::titled("offline WIP"))
+        .unwrap();
+    take(&p.pa, &task.id, "ses-offline-wip", "offline-wip");
+    let tip =
+        kanban4ai::core::wip::checkpoint(&p.pa, &ops(&p.pa).get_task(&task.id).unwrap().unwrap())
+            .unwrap();
+    assert!(
+        git(
+            &p.remote,
+            &[
+                "for-each-ref",
+                "--format=%(refname)",
+                &format!("refs/kanban/wip/{}", task.id),
+            ],
+        )
+        .is_empty()
+    );
+    kanban4ai::core::session::SessionManager::new(&p.pa.data_root)
+        .close_session("ses-offline-wip")
+        .unwrap();
+    config["sync"]["wip_push"] = true.into();
+    fs::write(&config_path, serde_yaml_ng::to_string(&config).unwrap()).unwrap();
+    kanban4ai::core::wip::publish(&p.a, 60, true).unwrap();
+    assert_eq!(
+        git(
+            &p.remote,
+            &["rev-parse", &format!("refs/kanban/wip/{}", task.id)]
+        ),
+        tip
+    );
 }
 
 #[test]
