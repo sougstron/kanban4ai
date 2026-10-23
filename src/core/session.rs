@@ -191,9 +191,12 @@ impl SessionManager {
     /// and tally its final tokens. Called from [`Self::close_session`] and
     /// [`Self::crash_session`] before the session record is mutated, so
     /// `session` still carries its pre-close `wait_until`/status.
-    fn record_stats_session_end(&self, session: &Session) {
+    ///
+    /// Returns the run's tags when its transcript carried no tokens yet, for
+    /// the caller to keep on the session as [`Session::pending_usage`].
+    fn record_stats_session_end(&self, session: &Session) -> Option<stats::Tags> {
         if session.status != SessionStatus::Active {
-            return; // already ended — never double-record a re-close.
+            return None; // already ended — never double-record a re-close.
         }
         let phase = if session.wait_until.is_some() {
             stats::Phase::Waiting
@@ -202,28 +205,60 @@ impl SessionManager {
         };
         stats::record_exit(&self.project_path, &session.task_id, phase);
 
-        let Some(task) = Storage::new(&self.project_path)
+        let task = Storage::new(&self.project_path)
             .load_task(&session.task_id)
             .ok()
-            .flatten()
-        else {
-            return;
-        };
-        let backend = task.agent_backend.as_deref().unwrap_or("claude");
-        let progress = telemetry::read_session_progress(&self.project_path, &session.id, backend);
+            .flatten()?;
+        let tags = stats::Tags::from_task(&task);
+        if self.record_session_usage(&task, &session.id, &tags) {
+            None
+        } else {
+            Some(tags)
+        }
+    }
+
+    /// Record a session's token sample and final usage under `tags`. False
+    /// when its transcript has no token count (yet).
+    fn record_session_usage(&self, task: &Task, session_id: &str, tags: &stats::Tags) -> bool {
+        let backend = tags.backend.as_deref().unwrap_or("claude");
+        let progress = telemetry::read_session_progress(&self.project_path, session_id, backend);
         if let Some(weight) = limit_share::weigh_progress(&progress) {
-            self.record_token_sample(&task, &session.id, weight);
+            self.record_token_sample(task, session_id, weight);
         }
-        if let Some(tokens) = progress.tokens {
-            stats::record_usage(
-                &self.project_path,
-                &session.task_id,
-                &session.id,
-                tokens,
-                progress.breakdown.as_ref(),
-                &stats::Tags::from_task(&task),
-            );
+        let Some(tokens) = progress.tokens else {
+            return false;
+        };
+        stats::record_usage(
+            &self.project_path,
+            &task.id,
+            session_id,
+            tokens,
+            progress.breakdown.as_ref(),
+            tags,
+        );
+        true
+    }
+
+    /// Record the usage a session's close could not see yet. Called once its
+    /// agent process has exited and the transcript is final, so the pending
+    /// mark is cleared whether or not tokens turned up.
+    pub fn settle_pending_usage(&self, session_id: &str) -> Result<()> {
+        Self::validate_session_id(session_id)?;
+        let storage = Storage::new(&self.project_path);
+        let _guard = storage.lock()?;
+        let Some(mut session) = self.load_session(session_id) else {
+            return Ok(());
+        };
+        if session.status == SessionStatus::Active {
+            return Ok(());
         }
+        let Some(tags) = session.pending_usage.take() else {
+            return Ok(());
+        };
+        if let Some(task) = storage.load_task(&session.task_id).ok().flatten() {
+            self.record_session_usage(&task, session_id, &tags);
+        }
+        self.save_session(&session)
     }
 
     pub fn unlink_session(&self, session_id: &str) {
@@ -367,7 +402,9 @@ impl SessionManager {
         Self::validate_session_id(session_id)?;
         let _guard = Storage::new(&self.project_path).lock()?;
         if let Some(mut session) = self.load_session(session_id) {
-            self.record_stats_session_end(&session);
+            if let Some(tags) = self.record_stats_session_end(&session) {
+                session.pending_usage = Some(tags);
+            }
             session.status = SessionStatus::Closed;
             session.ended_at = Some(timefmt::now());
             self.save_session(&session)?;
@@ -385,7 +422,9 @@ impl SessionManager {
         if session.status != SessionStatus::Active {
             return Ok(());
         }
-        self.record_stats_session_end(&session);
+        if let Some(tags) = self.record_stats_session_end(&session) {
+            session.pending_usage = Some(tags);
+        }
         let now = timefmt::now();
         session.status = SessionStatus::Crashed;
         self.save_session(&session)?;

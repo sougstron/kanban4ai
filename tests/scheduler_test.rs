@@ -1325,6 +1325,60 @@ fn crash_restart_backoff_records_a_closed_retry_span() {
     assert_eq!(retry.len(), 1);
 }
 
+#[test]
+fn codex_usage_written_after_done_is_recorded_at_agent_exit() {
+    let (_dir, ops) = ops_with_config("");
+    let session_id = live_task(&ops, "Codex run", "codex", Some("gpt-5"));
+    let id = SessionManager::new(&ops.storage.project_path)
+        .load_session(&session_id)
+        .unwrap()
+        .task_id;
+    let transcript = ops
+        .storage
+        .logs_dir
+        .join(format!("{session_id}.transcript.jsonl"));
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(
+        &transcript,
+        "{\"type\":\"turn.started\"}\n{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"command\":\"kanban done\"}}\n",
+    )
+    .unwrap();
+
+    // The agent's own `done` closes the session mid-turn: no usage yet.
+    ContextManager::new(&ops.storage.project_path)
+        .append_context(&id, "finished the work", "agent", &ops.storage)
+        .unwrap();
+    ops.complete_task(&id, &session_id, true).unwrap();
+    assert!(stats::load(&ops.storage.project_path).usage.is_empty());
+
+    // Codex then ends the turn with its only usage event and exits; a later
+    // launch has meanwhile retagged the task.
+    let mut text = fs::read_to_string(&transcript).unwrap();
+    text.push_str("{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1000,\"cached_input_tokens\":800,\"output_tokens\":50}}\n");
+    fs::write(&transcript, text).unwrap();
+    let mut task = ops.get_task(&id).unwrap().unwrap();
+    task.agent_backend = Some("claude".into());
+    ops.storage.save_task(&task).unwrap();
+    ops.reconcile_agent_exit(&id, &session_id, 0).unwrap();
+
+    let usage = stats::load(&ops.storage.project_path).usage;
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].session_id.as_deref(), Some(session_id.as_str()));
+    assert_eq!(usage[0].tokens, 1050);
+    assert_eq!(usage[0].backend.as_deref(), Some("codex"));
+    assert_eq!(usage[0].model.as_deref(), Some("gpt-5"));
+    let breakdown = usage[0].breakdown.unwrap();
+    assert_eq!((breakdown.input, breakdown.cache_read), (200, 800));
+    let session = SessionManager::new(&ops.storage.project_path)
+        .load_session(&session_id)
+        .unwrap();
+    assert!(session.pending_usage.is_none());
+
+    // A repeated exit callback never records the session twice.
+    ops.reconcile_agent_exit(&id, &session_id, 0).unwrap();
+    assert_eq!(stats::load(&ops.storage.project_path).usage.len(), 1);
+}
+
 /// A board whose notifications go to a spy script appending its argv to a log
 /// file (returned as the third element). `auto_restart` drives the retry
 /// ladder; `crash_toggle` is the `notifications.crash` value.

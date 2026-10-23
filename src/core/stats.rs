@@ -85,11 +85,15 @@ enum Edge {
 /// [`Usage`] record. Captured at the moment it is recorded, not looked up
 /// later — a task's fields describe only its *last* launch, so recording
 /// late would mislabel a re-run under a different backend.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tags {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
 }
 
