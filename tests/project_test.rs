@@ -495,6 +495,7 @@ fn write_live_session(data_root: &Path) {
             wait_until: None,
             wait_note: None,
             wait_exited: false,
+            pending_usage: None,
         })
         .unwrap();
 }

@@ -5146,6 +5146,10 @@ impl Operations {
         }
         let outcome = self.reconcile_agent_exit_inner(task_id, session_id, exit_status)?;
         if session_matched_task {
+            // A run that closed itself (`kanban done`) before its transcript
+            // carried usage — Codex reports tokens only at turn end — is
+            // tallied now that the process is gone.
+            let _ = self.session_manager().settle_pending_usage(session_id);
             self.finish_deferred_cleanup(task_id);
         }
         if session_matched_task {

@@ -635,6 +635,12 @@ pub struct Session {
     /// to know the process is gone.
     #[serde(default, skip_serializing_if = "is_false")]
     pub wait_exited: bool,
+    /// Tags of a run that closed before its transcript carried any token
+    /// usage. Codex writes its only usage event when the turn ends, after the
+    /// agent's own `kanban done` closed the session; the agent-exit reconcile
+    /// records the usage then, under these launch-time tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_usage: Option<crate::core::stats::Tags>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -659,6 +665,7 @@ impl Session {
             wait_until: None,
             wait_note: None,
             wait_exited: false,
+            pending_usage: None,
         }
     }
 
