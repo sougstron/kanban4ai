@@ -1,3 +1,15 @@
+# kanban4ai 0.8.9
+
+Notes are from the reviewed diff since 0.8.8. There were no `.changes/` logs.
+
+- **Stats show the token split and a cost equivalent.** Usage records keep `input` as the whole prompt and add optional `input_fresh`. `kanban stats` and the TUI Stats window show fresh input, cache read, cache write, output, a mixed bucket for tokens-only events, and a fresh-input-equivalent cost. Weights come from store `token_costs` (built-in `default`/`anthropic` and `openai` rows; optional `usd_per_mtok_input` adds an `≈ $` column). Task detail Analytics uses the same split. A record written before `input_fresh` recovers fresh as `input - cache_read - cache_write`.
+- **Incomplete stats stay visible.** Malformed event lines and unreadable events files are named in a DATA QUALITY section in the CLI, compact mode, the saved full report, and the TUI Stats window. Readable totals are still printed and `kanban stats` exits 0. `thresholds.stats_issue_samples` caps the samples (default 3). `kanban stats` reads thresholds from an unregistered `<cwd>/.kanban` in place and does not adopt that board into the store. Sample reasons keep the column and drop serde's per-line "at line 1".
+- **Codex usage that arrives after `kanban done` is recorded.** Codex writes its only usage event when the turn ends, after the session is already closed. The close keeps the run's tags on the session as optional `pending_usage`, and the agent-exit reconcile records the tokens from the final transcript.
+- **Service Git refs stay off project origin.** WIP and completed run refs publish to optional `sync.code_remote`. Pairing can pass that URL; protocol 3 is unchanged and an older peer ignores the field. With no code remote, refs stay local and go out on a later heartbeat or reconcile. `sync.wip_push: true` restores publication to the project `origin`; the default is false, so a public GitHub remote does not receive unfinished code. Reconcile takes the store lock only for the journal and project snapshot, skips refs already marked published for that remote, and rechecks a mark older than one hour. `kanban serve --migrate-code-refs` and `kanban serve --purge-origin-code-refs` (each accepts `--dry-run`) copy or delete the old origin refs. Done or Archive drops local and remote `wip` / `wip-runs` refs; `sync.cleanup_runs: true` also drops completed `runs` refs, which are kept by default.
+- **Interrupted journal recovery compares file content.** A torn append no longer trusts a matching size and mtime. The journal record schema is unchanged.
+
+Board files, `config.yaml`, and journal records stay readable by 0.8.8. The new session field, stats field, and config keys are optional. Sync protocol stays at 3.
+
 # kanban4ai 0.8.8
 
 First published release since 0.8.4: it also carries the unpublished 0.8.5,
