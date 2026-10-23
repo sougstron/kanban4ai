@@ -811,7 +811,26 @@ fn fmt_avg_rows(
 /// projects) is shown in full — both per the task description.
 const MODEL_TOP_N: usize = 10;
 
-fn tokens_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveDateTime) -> String {
+/// Table row caps for one report: `None` renders the default report (full
+/// tables, models at [`MODEL_TOP_N`]); `Some(n)` renders the compact report
+/// with every breakdown capped at `n` rows (models additionally at
+/// `MODEL_TOP_N`, whichever is smaller).
+fn table_caps(cap: Option<usize>) -> (Option<usize>, Option<usize>) {
+    match cap {
+        Some(n) => (Some(n), Some(n.min(MODEL_TOP_N))),
+        None => (None, Some(MODEL_TOP_N)),
+    }
+}
+
+fn tokens_window(
+    entries: &[(String, ProjectStats)],
+    window: Window,
+    now: NaiveDateTime,
+    cap: Option<usize>,
+) -> String {
+    // Default report: full backend/provider/project tables, models capped at
+    // MODEL_TOP_N. Compact report: every table capped at `cap`.
+    let (other_cap, model_cap) = table_caps(cap);
     let mut total = 0i64;
     let mut by_backend: Vec<(Option<String>, i64)> = Vec::new();
     let mut by_provider: Vec<(Option<String>, i64)> = Vec::new();
@@ -840,34 +859,40 @@ fn tokens_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveD
     push_top_table(
         &mut out,
         "Top backends:",
-        &fmt_rows(&group_sum(by_backend.into_iter()), format_tokens, None),
+        &fmt_rows(&group_sum(by_backend.into_iter()), format_tokens, other_cap),
     );
     out.push('\n');
     push_top_table(
         &mut out,
         "Top providers:",
-        &fmt_rows(&group_sum(by_provider.into_iter()), format_tokens, None),
-    );
-    out.push('\n');
-    push_top_table(
-        &mut out,
-        "Top models (max 10):",
         &fmt_rows(
-            &group_sum(by_model.into_iter()),
+            &group_sum(by_provider.into_iter()),
             format_tokens,
-            Some(MODEL_TOP_N),
+            other_cap,
         ),
     );
     out.push('\n');
     push_top_table(
         &mut out,
+        "Top models (max 10):",
+        &fmt_rows(&group_sum(by_model.into_iter()), format_tokens, model_cap),
+    );
+    out.push('\n');
+    push_top_table(
+        &mut out,
         "Top projects:",
-        &fmt_rows(&by_project, format_tokens, None),
+        &fmt_rows(&by_project, format_tokens, other_cap),
     );
     out
 }
 
-fn time_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveDateTime) -> String {
+fn time_window(
+    entries: &[(String, ProjectStats)],
+    window: Window,
+    now: NaiveDateTime,
+    cap: Option<usize>,
+) -> String {
+    let (other_cap, model_cap) = table_caps(cap);
     let mut running: Vec<Span> = Vec::new();
     let mut by_backend: Vec<(Option<String>, i64)> = Vec::new();
     let mut by_provider: Vec<(Option<String>, i64)> = Vec::new();
@@ -902,29 +927,25 @@ fn time_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveDat
     push_top_table(
         &mut out,
         "Top backends:",
-        &fmt_rows(&group_sum(by_backend.into_iter()), format_span, None),
+        &fmt_rows(&group_sum(by_backend.into_iter()), format_span, other_cap),
     );
     out.push('\n');
     push_top_table(
         &mut out,
         "Top providers:",
-        &fmt_rows(&group_sum(by_provider.into_iter()), format_span, None),
+        &fmt_rows(&group_sum(by_provider.into_iter()), format_span, other_cap),
     );
     out.push('\n');
     push_top_table(
         &mut out,
         "Top models (max 10):",
-        &fmt_rows(
-            &group_sum(by_model.into_iter()),
-            format_span,
-            Some(MODEL_TOP_N),
-        ),
+        &fmt_rows(&group_sum(by_model.into_iter()), format_span, model_cap),
     );
     out.push('\n');
     push_top_table(
         &mut out,
         "Top projects:",
-        &fmt_rows(&by_project, format_span, None),
+        &fmt_rows(&by_project, format_span, other_cap),
     );
     out
 }
@@ -932,7 +953,8 @@ fn time_window(entries: &[(String, ProjectStats)], window: Window, now: NaiveDat
 /// The "Задачи" section: task counts and per-task averages, plus the four
 /// cumulative (parallel tasks summed, not deduplicated) phase totals. All
 /// time only — the task description does not split this section by month/week.
-fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
+fn tasks_section(entries: &[(String, ProjectStats)], cap: Option<usize>) -> String {
+    let (other_cap, model_cap) = table_caps(cap);
     let mut task_ids: HashSet<String> = HashSet::new();
     let mut by_backend_count: Vec<(Option<String>, String)> = Vec::new();
     let mut by_provider_count: Vec<(Option<String>, String)> = Vec::new();
@@ -1009,7 +1031,7 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         &fmt_rows(
             &group_task_count(by_backend_count.into_iter()),
             |n| n.to_string(),
-            None,
+            other_cap,
         ),
     );
     out.push('\n');
@@ -1019,7 +1041,7 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         &fmt_rows(
             &group_task_count(by_provider_count.into_iter()),
             |n| n.to_string(),
-            None,
+            other_cap,
         ),
     );
     out.push('\n');
@@ -1029,7 +1051,7 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         &fmt_rows(
             &group_task_count(by_model_count.into_iter()),
             |n| n.to_string(),
-            Some(MODEL_TOP_N),
+            model_cap,
         ),
     );
     out.push('\n');
@@ -1047,7 +1069,7 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         &fmt_avg_rows(
             &group_average_per_task(by_backend_tokens.into_iter()),
             format_avg_tokens,
-            None,
+            other_cap,
         ),
     );
     out.push('\n');
@@ -1057,7 +1079,7 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         &fmt_avg_rows(
             &group_average_per_task(by_provider_tokens.into_iter()),
             format_avg_tokens,
-            None,
+            other_cap,
         ),
     );
     out.push('\n');
@@ -1067,7 +1089,7 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         &fmt_avg_rows(
             &group_average_per_task(by_model_tokens.into_iter()),
             format_avg_tokens,
-            Some(MODEL_TOP_N),
+            model_cap,
         ),
     );
     out.push('\n');
@@ -1077,7 +1099,7 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         &fmt_avg_rows(
             &group_average_per_task(by_backend_time.into_iter()),
             format_avg_span,
-            None,
+            other_cap,
         ),
     );
     out.push('\n');
@@ -1087,7 +1109,7 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         &fmt_avg_rows(
             &group_average_per_task(by_provider_time.into_iter()),
             format_avg_span,
-            None,
+            other_cap,
         ),
     );
     out.push('\n');
@@ -1097,7 +1119,7 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
         &fmt_avg_rows(
             &group_average_per_task(by_model_time.into_iter()),
             format_avg_span,
-            Some(MODEL_TOP_N),
+            model_cap,
         ),
     );
     out.push('\n');
@@ -1125,21 +1147,45 @@ fn tasks_section(entries: &[(String, ProjectStats)]) -> String {
 pub fn render_report(entries: &[(String, ProjectStats)], now: NaiveDateTime) -> String {
     let mut out = String::from("=== TOKENS ===\n\n");
     for window in Window::ALL {
-        out.push_str(&tokens_window(entries, window, now));
+        out.push_str(&tokens_window(entries, window, now, None));
         out.push('\n');
     }
     out.push_str("=== TIME ===\n\n");
     for window in Window::ALL {
-        out.push_str(&time_window(entries, window, now));
+        out.push_str(&time_window(entries, window, now, None));
         out.push('\n');
     }
-    out.push_str(&tasks_section(entries));
+    out.push_str(&tasks_section(entries, None));
     out
 }
 
-/// Load every registered project's stats and render the combined report —
-/// the single entry point the TUI Stats window and `kanban stats` both call.
-pub fn collect_store_report(now: NaiveDateTime) -> Result<String> {
+/// Render the compact report for `kanban stats --compact`: the same sections
+/// and totals, but every breakdown table is capped at `top_n` rows. The full
+/// report stays available — the CLI writes it to a file next to this output.
+pub fn render_compact_report(
+    entries: &[(String, ProjectStats)],
+    now: NaiveDateTime,
+    top_n: usize,
+) -> String {
+    let mut out = format!(
+        "Compact report: at most {top_n} rows per breakdown (models max 10); omitted rows remain in the full report.\n\n=== TOKENS (compact) ===\n\n"
+    );
+    for window in Window::ALL {
+        out.push_str(&tokens_window(entries, window, now, Some(top_n)));
+        out.push('\n');
+    }
+    out.push_str("=== TIME (compact) ===\n\n");
+    for window in Window::ALL {
+        out.push_str(&time_window(entries, window, now, Some(top_n)));
+        out.push('\n');
+    }
+    out.push_str(&tasks_section(entries, Some(top_n)));
+    out
+}
+
+/// Load every registered project's stats — the shared entry collection for
+/// [`render_report`] / [`render_compact_report`].
+pub fn collect_store_entries() -> Result<Vec<(String, ProjectStats)>> {
     let store = ProjectStore::open()?;
     let entries: Vec<(String, ProjectStats)> = store
         .list()?
@@ -1149,7 +1195,13 @@ pub fn collect_store_report(now: NaiveDateTime) -> Result<String> {
             (project.name, stats)
         })
         .collect();
-    Ok(render_report(&entries, now))
+    Ok(entries)
+}
+
+/// Load every registered project's stats and render the combined report —
+/// the single entry point the TUI Stats window and `kanban stats` both call.
+pub fn collect_store_report(now: NaiveDateTime) -> Result<String> {
+    Ok(render_report(&collect_store_entries()?, now))
 }
 
 #[cfg(test)]
@@ -1531,7 +1583,7 @@ mod tests {
             ("proj-a".to_string(), stats_a),
             ("proj-b".to_string(), stats_b),
         ];
-        let report = tasks_section(&entries);
+        let report = tasks_section(&entries, None);
         assert!(report.contains("Total tasks completed: 2"));
     }
 
