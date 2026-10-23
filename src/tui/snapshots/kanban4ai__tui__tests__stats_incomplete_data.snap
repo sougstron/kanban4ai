@@ -11,7 +11,7 @@ expression: rendered
 │Quality Board:                                                                                ║
 │/tmp/k4ai-stats-quality-store/projects/k4ai-stats-quality-work/.kanban/stats/events.jsonl     ║
 │  1 malformed line skipped, 1 record loaded                                                   ║
-│  line 2: key must be a string at line 1 column 2                                             ║
+│  line 2: key must be a string (column 2)                                                     ║
 │                                                                                              ║
 │=== TOKENS ===                                                                                ║
 │                                                                                              ║

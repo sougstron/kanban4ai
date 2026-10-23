@@ -251,6 +251,30 @@ fn stats_reports_an_unreadable_events_file() {
 }
 
 #[test]
+fn stats_reads_an_unregistered_local_board_in_place() {
+    let env = Env::new();
+    let local = env.work().join(".kanban");
+    std::fs::create_dir_all(&local).unwrap();
+    std::fs::write(
+        local.join("config.yaml"),
+        "thresholds:\n  stats_issue_samples: -1\n",
+    )
+    .unwrap();
+    // The local config is read (its invalid threshold is reported) ...
+    kanban(&env)
+        .arg("stats")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("stats_issue_samples"));
+    std::fs::write(local.join("config.yaml"), "thresholds:\n").unwrap();
+    kanban(&env).arg("stats").assert().success();
+    kanban(&env).args(["stats", "--compact"]).assert().success();
+    // ... but a read-only report never adopts the board into the store.
+    assert!(local.join("config.yaml").is_file());
+    assert!(ProjectStore::at(env.store()).list().unwrap().is_empty());
+}
+
+#[test]
 fn compact_stats_works_outside_a_board_and_is_scoped_to_stats() {
     let env = Env::new();
     kanban(&env)

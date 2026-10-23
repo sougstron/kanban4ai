@@ -379,7 +379,9 @@ fn consider_line(
     let text = match std::str::from_utf8(raw) {
         Ok(text) => text,
         Err(_) => {
-            note_issue(source, line_no, "invalid UTF-8", unterminated);
+            note_issue(source, line_no, unterminated, || {
+                "invalid UTF-8".to_string()
+            });
             return;
         }
     };
@@ -391,19 +393,39 @@ fn consider_line(
             records.push(record);
             source.loaded += 1;
         }
-        Err(err) => note_issue(source, line_no, &err.to_string(), unterminated),
+        Err(err) => note_issue(source, line_no, unterminated, || parse_reason(&err)),
     }
 }
 
-fn note_issue(source: &mut SourceDiagnostics, line: usize, reason: &str, unterminated: bool) {
+/// serde's text without its " at line 1 column N" suffix: every line is
+/// parsed on its own, so its line is always 1 and would contradict the file
+/// line the report shows. The column is kept.
+fn parse_reason(err: &serde_json::Error) -> String {
+    let text = err.to_string();
+    let suffix = format!(" at line {} column {}", err.line(), err.column());
+    match text.strip_suffix(&suffix) {
+        Some(message) => format!("{message} (column {})", err.column()),
+        None => text,
+    }
+}
+
+/// Count one skipped line; `reason` is only built while samples are kept,
+/// so a huge corrupt log costs no formatting past the cap.
+fn note_issue(
+    source: &mut SourceDiagnostics,
+    line: usize,
+    unterminated: bool,
+    reason: impl FnOnce() -> String,
+) {
     source.skipped_lines += 1;
     if source.samples.len() >= MAX_STORED_LINE_ISSUES {
         return;
     }
+    let reason = reason();
     let reason = if unterminated {
         format!("incomplete final line (possibly still being written): {reason}")
     } else {
-        reason.to_string()
+        reason
     };
     source.samples.push(LineIssue { line, reason });
 }
@@ -2272,6 +2294,12 @@ mod tests {
         assert_eq!(dirty.source.samples[0].line, 2);
         assert!(!dirty.source.samples[0].reason.contains("secret-token"));
         assert!(dirty.source.samples[0].reason.contains("expected value"));
+        assert!(
+            !dirty.source.samples[0].reason.contains("at line"),
+            "serde's per-line `line 1` must not contradict the file line: {}",
+            dirty.source.samples[0].reason
+        );
+        assert!(dirty.source.samples[0].reason.ends_with("(column 1)"));
     }
 
     #[test]
@@ -2322,6 +2350,24 @@ mod tests {
         assert!(report.contains(&events_path(bad.path()).display().to_string()));
         assert!(entries[0].1.source.is_clean());
         assert!(entries[1].1.source.read_error.is_some());
+    }
+
+    #[test]
+    fn stored_samples_are_capped_but_the_skip_count_stays_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = MAX_STORED_LINE_ISSUES + 5;
+        let mut body = "{bad\n".repeat(bad);
+        body.push_str(&usage_line("TASK-1", 4));
+        body.push('\n');
+        write_events(dir.path(), body.as_bytes());
+        let stats = load(dir.path());
+        assert_eq!(stats.source.skipped_lines, bad);
+        assert_eq!(stats.source.samples.len(), MAX_STORED_LINE_ISSUES);
+        assert_eq!(stats.source.loaded, 1);
+        assert_eq!(stats.usage[0].tokens, 4);
+        let entries = vec![("demo".to_string(), stats)];
+        let report = render_report(&entries, at(2026, 6, 15, 12, 0), 2, &TokenCosts::builtin());
+        assert!(report.contains(&format!("… {} more malformed lines not shown", bad - 2)));
     }
 
     #[test]
