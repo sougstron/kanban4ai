@@ -5272,6 +5272,68 @@ fn review_rerun_from_board_focuses_in_progress() {
     );
 }
 
+/// A runner-accepted re-run must end the review window exactly like the
+/// local route: TASK-543 — on a sync-enabled board every runner-less task
+/// counts as "remote", and the early return used to skip the close, so the
+/// Review detail stayed open after Ctrl+R.
+#[test]
+fn rerun_report_closes_the_review_detail_on_the_runner_route_too() {
+    let (_dir, app) = app_with_board();
+    let report = super::app::rerun_launch_report(
+        &app.ops,
+        "TASK-001",
+        true,
+        true,
+        true,
+        true,
+        crate::core::models::RunMode::Immediate,
+    );
+    assert_eq!(report.close_detail_for.as_deref(), Some("TASK-001"));
+    assert_eq!(report.focus.as_deref(), Some("TASK-001"));
+    assert_eq!(
+        report.status.as_deref(),
+        Some("Re-run requested for TASK-001 on its runner")
+    );
+}
+
+#[test]
+fn rerun_report_keeps_the_detail_for_in_progress_reruns() {
+    let (_dir, app) = app_with_board();
+    for remote in [false, true] {
+        let report = super::app::rerun_launch_report(
+            &app.ops,
+            "TASK-001",
+            true,
+            false,
+            true,
+            remote,
+            crate::core::models::RunMode::Immediate,
+        );
+        assert!(report.close_detail_for.is_none());
+        assert!(report.focus.is_none());
+    }
+}
+
+/// Nothing was started (busy runner refused, task gone): no close on either
+/// route, and the local route says so in the status line.
+#[test]
+fn rerun_report_without_a_started_run_never_closes_the_detail() {
+    let (_dir, app) = app_with_board();
+    for remote in [false, true] {
+        let report = super::app::rerun_launch_report(
+            &app.ops,
+            "TASK-001",
+            false,
+            true,
+            true,
+            remote,
+            crate::core::models::RunMode::Queued,
+        );
+        assert!(report.close_detail_for.is_none());
+        assert!(report.focus.is_none());
+    }
+}
+
 #[test]
 fn run_hotkey_falls_back_to_direct_start_when_auto_launch_is_off() {
     let (dir, mut app) = app_with_board();

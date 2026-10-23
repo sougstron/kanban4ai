@@ -565,12 +565,12 @@ struct LaunchJob {
 
 /// What a finished launch job asks the UI thread to do.
 #[derive(Default)]
-struct LaunchReport {
-    status: Option<String>,
+pub(super) struct LaunchReport {
+    pub(super) status: Option<String>,
     modal: Option<Modal>,
     /// Close the detail screen if it still shows this task.
-    close_detail_for: Option<String>,
-    focus: Option<String>,
+    pub(super) close_detail_for: Option<String>,
+    pub(super) focus: Option<String>,
     refresh: bool,
     redraw: bool,
     background_refresh: bool,
@@ -631,6 +631,58 @@ fn task_started_after_queue_run(ops: &Operations, task_id: &str) -> bool {
         .ok()
         .flatten()
         .is_some_and(|task| task.run_phase != Some(RunPhase::Queued) && task.session.is_some())
+}
+
+/// Report for a finished re-run. A runner-accepted re-run (`remote`) gets the
+/// same review-window close as the local route: the edits left with the
+/// request, so the detail must not stay pinned to a task that has moved on.
+/// In-Progress re-runs keep the window open on both routes, like the local
+/// path always did.
+pub(super) fn rerun_launch_report(
+    ops: &Operations,
+    task_id: &str,
+    reran: bool,
+    from_review: bool,
+    should_close_detail: bool,
+    remote: bool,
+    mode: RunMode,
+) -> LaunchReport {
+    if remote && reran {
+        let moved = (from_review && should_close_detail).then(|| task_id.to_string());
+        return LaunchReport {
+            status: Some(format!("Re-run requested for {task_id} on its runner")),
+            close_detail_for: moved.clone(),
+            focus: moved,
+            refresh: true,
+            redraw: true,
+            ..LaunchReport::default()
+        };
+    }
+    // Same pump as `r`: with free caps the re-run starts on the spot;
+    // otherwise the task waits in the queue with the edits folded in.
+    if reran && mode == RunMode::Queued {
+        pump_queue(ops);
+    }
+    let status = if !reran {
+        format!("Re-run of {task_id} was not started")
+    } else if mode == RunMode::Immediate {
+        format!("Re-ran {task_id}")
+    } else if task_started_after_queue_run(ops, task_id) {
+        post_queue_run_status(ops, task_id)
+    } else {
+        format!("Queued {task_id} for re-run")
+    };
+    // Leave the Review column/detail and show the task where it now
+    // lives — In Progress — so the rework send is visible immediately.
+    let moved = (reran && from_review).then(|| task_id.to_string());
+    LaunchReport {
+        status: Some(status),
+        close_detail_for: moved.clone(),
+        focus: moved,
+        refresh: true,
+        redraw: true,
+        ..Default::default()
+    }
 }
 
 impl App {
@@ -5809,6 +5861,13 @@ impl App {
             return Ok(());
         }
         let from_review = task.status == TaskStatus::Review;
+        // Same request-time capture as `r`: the report may land after the
+        // user opened another task's detail, and that window must survive.
+        let should_close_detail = self.screen == Screen::Detail
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.task_id == task.id);
         let remote =
             self.board.remote_runs.contains_key(&task.id) || !self.ops.owns_queued_run(&task)?;
         // Same hard fallback as `r`: never park a re-run in a queue nothing
@@ -5849,39 +5908,15 @@ impl App {
                     };
                 }
             };
-            if remote && reran {
-                return LaunchReport {
-                    status: Some(format!("Re-run requested for {task_id} on its runner")),
-                    refresh: true,
-                    redraw: true,
-                    ..LaunchReport::default()
-                };
-            }
-            // Same pump as `r`: with free caps the re-run starts on the spot;
-            // otherwise the task waits in the queue with the edits folded in.
-            if reran && mode == RunMode::Queued {
-                pump_queue(ops);
-            }
-            let status = if !reran {
-                format!("Re-run of {task_id} was not started")
-            } else if mode == RunMode::Immediate {
-                format!("Re-ran {task_id}")
-            } else if task_started_after_queue_run(ops, &task_id) {
-                post_queue_run_status(ops, &task_id)
-            } else {
-                format!("Queued {task_id} for re-run")
-            };
-            // Leave the Review column/detail and show the task where it now
-            // lives — In Progress — so the rework send is visible immediately.
-            let moved = (reran && from_review).then(|| task_id.clone());
-            LaunchReport {
-                status: Some(status),
-                close_detail_for: moved.clone(),
-                focus: moved,
-                refresh: true,
-                redraw: true,
-                ..Default::default()
-            }
+            rerun_launch_report(
+                ops,
+                &task_id,
+                reran,
+                from_review,
+                should_close_detail,
+                remote,
+                mode,
+            )
         });
         Ok(())
     }
