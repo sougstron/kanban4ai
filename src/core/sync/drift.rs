@@ -420,7 +420,10 @@ pub(super) fn validate_file(id: &str, values: &Fields) -> Result<()> {
 /// One path, relative to the drift base. Does not take the store lock: recovery
 /// runs it while the board lock is already held.
 pub(super) fn reconcile_path(journal: &Journal, path: &Path) -> Result<()> {
-    reconcile_indexed(journal, path, &index(journal)?).map(|_| ())
+    // Recovery has positive evidence that a transaction touching this path was
+    // interrupted. Do not trust the stat shortcut here: a same-size rewrite
+    // can retain the old mtime on coarse filesystems and still need journaling.
+    reconcile_indexed(journal, path, &index(journal)?, true).map(|_| ())
 }
 
 /// `reconcile_path` against an index the caller already parsed. True when the
@@ -429,6 +432,7 @@ fn reconcile_indexed(
     journal: &Journal,
     path: &Path,
     index: &BTreeMap<String, Entry>,
+    verify_content: bool,
 ) -> Result<bool> {
     let store = journal.root.parent().expect("sync parent");
     let relative = match path.strip_prefix(store) {
@@ -475,7 +479,7 @@ fn reconcile_indexed(
             .duration_since(UNIX_EPOCH)
             .map_err(|_| invalid("mtime before epoch"))?
             .as_nanos();
-        if old.is_some_and(|old| old.mtime == mtime && old.size == meta.len()) {
+        if !verify_content && old.is_some_and(|old| old.mtime == mtime && old.size == meta.len()) {
             return Ok(false);
         }
         let bytes = fs::read(path)?;
@@ -555,7 +559,7 @@ pub(super) fn reconcile_for_write(journal: &Journal, path: &Path) -> Result<()> 
     paths.push(path.to_path_buf());
     let mut index = index(journal)?;
     for path in paths {
-        if reconcile_indexed(journal, &path, &index)? {
+        if reconcile_indexed(journal, &path, &index, false)? {
             index = self::index(journal)?;
         }
     }
