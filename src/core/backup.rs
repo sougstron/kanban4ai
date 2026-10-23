@@ -336,6 +336,10 @@ fn create_locked(store: &Path, request: &CreateRequest, _guard: &DirLock) -> Res
     let seq = free_seq(&request.dir, &stamp, request.kind)?;
     let staging_path = request.dir.join(format!(".staging-{stamp}-{seq}"));
     let _staging = TempDir::new(staging_path);
+    // Copy everything once without locks; under them only files that changed
+    // since are copied again. A daily backup used to hold the store, every
+    // board, and sync for seconds (tens when cold), freezing the TUI.
+    let mut precopied = precopy(store, &_staging.path);
     let (boards, core_items) = {
         let _store_lock = ProjectStore::at(store).lock()?;
         let boards = boards_of(store)?;
@@ -353,12 +357,12 @@ fn create_locked(store: &Path, request: &CreateRequest, _guard: &DirLock) -> Res
         };
         let started = Instant::now();
         let items = core_items(store, &boards)?;
-        let staged = stage_copy(&items, &_staging.path)?;
+        let copied = stage_copy(&items, &_staging.path, &mut precopied)?;
         let locked_copy = started.elapsed();
         drop(sync_guard);
         drop(guards);
         drop(_store_lock);
-        (boards, (staged, locked_copy))
+        (boards, (hash_staged(copied)?, locked_copy))
     };
     let (core_staged, locked_copy) = core_items;
     let projects = manifest_projects(&boards);
@@ -1833,30 +1837,99 @@ fn manifest_projects(boards: &[Board]) -> Vec<ManifestProject> {
         .collect()
 }
 
-fn stage_copy(items: &[Item], staging: &Path) -> Result<Vec<Staged>> {
-    let mut staged = Vec::new();
+/// What identifies a source file's content without reading it: an atomic
+/// write is a new inode, an in-place write moves the size or a timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+impl Fingerprint {
+    fn of(meta: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            #[cfg(unix)]
+            identity: (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+}
+
+/// Unlocked best-effort copy of the core items into `staging`, keyed by
+/// archive path. The fingerprint is taken before copying, so a write that
+/// races the copy shows up as a change under the locks. Anything that fails
+/// here is simply copied again under the locks.
+fn precopy(store: &Path, staging: &Path) -> HashMap<String, Fingerprint> {
+    let mut copied = HashMap::new();
+    let Ok(items) = boards_of(store).and_then(|boards| core_items(store, &boards)) else {
+        return copied;
+    };
+    for item in &items {
+        let dest = staging.join(&item.archive_path);
+        let Ok(meta) = fs::symlink_metadata(&item.abs) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let ok = dest
+            .parent()
+            .is_none_or(|parent| fs::create_dir_all(parent).is_ok())
+            && fs::copy(&item.abs, &dest).is_ok();
+        if ok {
+            copied.insert(item.archive_path.clone(), Fingerprint::of(&meta));
+        }
+    }
+    copied
+}
+
+/// The locked copy: reuse every pre-copied file whose source is unchanged,
+/// copy the rest. Hashing waits for [`hash_staged`], after the locks.
+fn stage_copy(
+    items: &[Item],
+    staging: &Path,
+    precopied: &mut HashMap<String, Fingerprint>,
+) -> Result<Vec<(String, PathBuf, u32)>> {
+    let mut copied = Vec::new();
     for item in items {
         let dest = staging.join(&item.archive_path);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let meta = fs::symlink_metadata(&item.abs)?;
         if !meta.is_file() {
             continue;
         }
-        fs::copy(&item.abs, &dest)?;
+        if precopied.remove(&item.archive_path) != Some(Fingerprint::of(&meta)) {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&item.abs, &dest)?;
+        }
         let mode = file_mode(&meta);
         set_mode(&dest, mode)?;
-        let (size, sha256) = hash_file(&dest)?;
-        staged.push(Staged {
-            archive_path: item.archive_path.clone(),
-            path: dest,
-            mode,
-            size,
-            sha256,
-        });
+        copied.push((item.archive_path.clone(), dest, mode));
     }
-    Ok(staged)
+    Ok(copied)
+}
+
+/// Staged copies are private to this backup, so hashing them needs no lock.
+fn hash_staged(copied: Vec<(String, PathBuf, u32)>) -> Result<Vec<Staged>> {
+    copied
+        .into_iter()
+        .map(|(archive_path, path, mode)| {
+            let (size, sha256) = hash_file(&path)?;
+            Ok(Staged {
+                archive_path,
+                path,
+                mode,
+                size,
+                sha256,
+            })
+        })
+        .collect()
 }
 
 fn stage_stable(items: &[Item], staging: &Path, skipped: &mut Vec<String>) -> Result<Vec<Staged>> {
@@ -2487,6 +2560,31 @@ mod tests {
         assert_eq!(parsed.seq, 1);
         assert_eq!(parsed.kind, Kind::Manual);
         assert_eq!(parsed.part, Part::Artifacts);
+    }
+
+    #[test]
+    fn locked_copy_redoes_files_changed_after_precopy() {
+        let fix = fix();
+        let storage = storage::Storage::new(&fix.data_root);
+        let kept = storage.create_task(NewTask::titled("kept")).unwrap();
+        let edited = storage.create_task(NewTask::titled("before")).unwrap();
+        let staging = fix.dir.join("staging");
+        let mut precopied = precopy(&fix.store, &staging);
+        assert!(!precopied.is_empty());
+        let mut task = storage.load_task(&edited.id).unwrap().unwrap();
+        task.title = "after the unlocked copy".into();
+        storage.save_task(&task).unwrap();
+        storage.create_task(NewTask::titled("new")).unwrap();
+
+        let items = core_items(&fix.store, &boards_of(&fix.store).unwrap()).unwrap();
+        let staged = hash_staged(stage_copy(&items, &staging, &mut precopied).unwrap()).unwrap();
+        let live = allowlist(&fix.store);
+        assert_eq!(staged.len(), live.len());
+        for file in &staged {
+            assert_eq!(fs::read(&file.path).unwrap(), live[&file.archive_path]);
+        }
+        let kept = format!("/{}.md", kept.id);
+        assert!(staged.iter().any(|f| f.archive_path.ends_with(&kept)));
     }
 
     #[test]

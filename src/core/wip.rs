@@ -4,7 +4,7 @@ use super::{
     models::Task,
     project::{Project, ProjectStore},
     session::SessionManager,
-    storage::{Storage, atomic_write_text},
+    storage::{BoardGuard, Storage, atomic_write_text, lock_file_reentrant},
     sync::Journal,
     vcs,
 };
@@ -21,6 +21,21 @@ pub fn reference(task: &str) -> String {
 /// The caller holds the board lock, including while stopping the source agent.
 pub fn checkpoint(project: &Project, task: &Task) -> Result<String> {
     let _guard = Storage::new(&project.data_root).lock()?;
+    let _push = push_lock(project, &task.id)?;
+    capture(project, task)?.push(project, &task.id)
+}
+
+/// A checkpoint recorded locally whose refs still have to reach the remote.
+struct Captured {
+    repo: vcs::GitRepo,
+    remote: String,
+    retained: String,
+    tip: String,
+}
+
+/// The local half of a checkpoint: snapshot the worktree and move the WIP
+/// refs. Needs the board lock; touches no network.
+fn capture(project: &Project, task: &Task) -> Result<Captured> {
     let path = task
         .worktree
         .as_ref()
@@ -51,15 +66,37 @@ pub fn checkpoint(project: &Project, task: &Task) -> Result<String> {
     let remote = super::code::status(root, &project.id)?
         .remote
         .ok_or_else(|| invalid("SYNC_NO_REMOTE"))?;
-    repo.push_checkpoint(&remote, &retained)?;
-    repo.push_checkpoint(&remote, &reference(&task.id))?;
+    Ok(Captured {
+        repo,
+        remote,
+        retained,
+        tip: tip.as_str().into(),
+    })
+}
+
+impl Captured {
+    /// The network half: push both refs, then stamp the publication. Callers
+    /// hold the task's [`push_lock`].
+    fn push(self, project: &Project, task_id: &str) -> Result<String> {
+        self.repo.push_checkpoint(&self.remote, &self.retained)?;
+        self.repo
+            .push_checkpoint(&self.remote, &reference(task_id))?;
+        let directory = project.data_root.join(".kanban/wip");
+        fs::create_dir_all(&directory)?;
+        atomic_write_text(
+            &directory.join(format!("{task_id}.published")),
+            &super::timefmt::format(&super::timefmt::now()),
+        )?;
+        Ok(self.tip)
+    }
+}
+
+/// Serializes one task's WIP pushes, so a slow periodic push that started
+/// first cannot land after (and overwrite) a newer continuation checkpoint.
+fn push_lock(project: &Project, task_id: &str) -> Result<BoardGuard> {
     let directory = project.data_root.join(".kanban/wip");
     fs::create_dir_all(&directory)?;
-    atomic_write_text(
-        &directory.join(format!("{}.published", task.id)),
-        &super::timefmt::format(&super::timefmt::now()),
-    )?;
-    Ok(tip.as_str().into())
+    lock_file_reentrant(&directory.join(format!("{task_id}.push.lock")))
 }
 
 /// Free the canonical Review branch without removing the stopped source checkout.
@@ -124,19 +161,28 @@ pub fn publish(root: &Path, interval: u64, force: bool) -> Result<()> {
             {
                 continue;
             }
+            // Only the local snapshot holds the board lock. The two pushes
+            // to the code remote take seconds per running task, and holding
+            // the lock through them stalled every start, queue, and save on
+            // the board once a minute. Lock order matches `checkpoint`:
+            // board, then push.
             let result = (|| {
-                let _guard = storage.lock()?;
-                let current = storage
-                    .load_task(&task.id)?
-                    .ok_or_else(|| invalid("task disappeared"))?;
-                if current
-                    .session
-                    .as_deref()
-                    .is_some_and(|id| sessions.is_session_active(id))
-                {
-                    checkpoint(&project, &current)?;
-                }
-                Ok(())
+                let (captured, _push) = {
+                    let _guard = storage.lock()?;
+                    let current = storage
+                        .load_task(&task.id)?
+                        .ok_or_else(|| invalid("task disappeared"))?;
+                    if !current
+                        .session
+                        .as_deref()
+                        .is_some_and(|id| sessions.is_session_active(id))
+                    {
+                        return Ok(());
+                    }
+                    let push = push_lock(&project, &task.id)?;
+                    (capture(&project, &current)?, push)
+                };
+                captured.push(&project, &task.id).map(drop)
             })();
             if let Err(e) = result {
                 failure = Some(e);
