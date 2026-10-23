@@ -426,17 +426,40 @@ pub(crate) fn validate_review_branch(board: &Path, task: &str, branch: &str) -> 
         .ok_or_else(|| invalid("branch is not a completed result of this task"))
 }
 
+/// Serializes reconcile passes (serve's loop and operations) with each other
+/// without holding the store lock across network transfers.
+const RECONCILE_LOCK: &str = ".code-reconcile.lock";
+
+/// Whether `project` is still registered at the same board and work folder;
+/// a pass that raced a delete or repoint drops its results for that project.
+fn unchanged(root: &Path, project: &Project, work: &Path) -> Result<bool> {
+    Ok(ProjectStore::at(root)
+        .get(&project.id)?
+        .is_some_and(|p| p.data_root == project.data_root && p.work_path == work))
+}
+
 /// Remote exchange is retried by serve even with no HTTP peer reachable.
 /// Fetch only per-run refs: never replace this node's integration spine.
 pub fn reconcile(root: &Path) -> Result<()> {
     if !super::sync::enabled(root) {
         return Ok(());
     }
-    let _store = ProjectStore::at(root).lock()?;
-    let journal = Journal::open(root)?;
-    let state = journal.state()?;
+    let _reconcile = lock_file_reentrant(&root.join(RECONCILE_LOCK))?;
+    // The store lock covers only this snapshot: project add/rename/delete
+    // must not wait behind pushes to a slow code remote.
+    let (journal, state, projects) = {
+        let store = ProjectStore::at(root);
+        let _store = store.lock()?;
+        let journal = Journal::open(root)?;
+        let state = journal.state()?;
+        let projects = store.list()?;
+        (journal, state, projects)
+    };
     let mut failure = None;
-    for project in ProjectStore::at(root).list()? {
+    for project in projects {
+        if !unchanged(root, &project, &project.work_path)? {
+            continue;
+        }
         let storage = Storage::new(&project.data_root);
         for task in storage.list_unarchived_tasks()? {
             let runs = select_runs(super::sync::task_runs(&state, &project.id, &task.id)?);
@@ -502,6 +525,8 @@ pub fn reconcile(root: &Path) -> Result<()> {
             // the board lock for seconds every cycle, stalling every TUI save
             // and task open behind it. The task is re-read once they finish.
             drop(guard);
+            let mut work = project.work_path.clone();
+            let mut published = Publications::load(&project.data_root, &task.id);
             let transfer = (|| -> Result<()> {
                 let repo = match repository(&project) {
                     Some(repo) => repo,
@@ -510,12 +535,19 @@ pub fn reconcile(root: &Path) -> Result<()> {
                         let refreshed = ProjectStore::at(root)
                             .get(&project.id)?
                             .ok_or_else(|| invalid("project missing"))?;
+                        work = refreshed.work_path.clone();
                         repository(&refreshed).ok_or_else(|| invalid("RUNNER_REPO_MISSING"))?
                     }
                 };
                 for (_, run) in finished.clone() {
                     if run.node_id == journal.node.node_id {
-                        repo.push_run(&source, &run_ref(&task.id, run))?;
+                        let reference = run_ref(&task.id, run);
+                        let tip = repo
+                            .read_ref(&reference)?
+                            .ok_or_else(|| invalid("local result missing"))?;
+                        published.publish(&source, &reference, tip.as_str(), || {
+                            repo.push_run(&source, &reference)
+                        })?;
                     }
                 }
                 if let Some((index, local)) = finished
@@ -547,7 +579,12 @@ pub fn reconcile(root: &Path) -> Result<()> {
                     if !repo.install_run_branch(&branch, &tip)? {
                         return Err(invalid("Review branch is still owned by a live checkout"));
                     }
-                    repo.publish_run_branch(&source, &branch)?;
+                    published.publish(
+                        &source,
+                        &format!("refs/heads/{branch}"),
+                        tip.as_str(),
+                        || repo.publish_run_branch(&source, &branch),
+                    )?;
                 }
                 if !task.run_duplicate {
                     let branch = review_branch(&task.id, first_finished, first_index, &runs);
@@ -562,6 +599,12 @@ pub fn reconcile(root: &Path) -> Result<()> {
                 }
                 Ok(())
             })();
+            published.save()?;
+            // Re-read after the unlocked transfer: skip a project deleted or
+            // repointed meanwhile instead of writing into its old board.
+            if !unchanged(root, &project, &work)? {
+                continue;
+            }
             let renamed = task.branch != before.0;
             let guard = storage.lock()?;
             let Some(mut current) = storage.load_task(&task.id)? else {
@@ -631,6 +674,99 @@ pub fn reconcile(root: &Path) -> Result<()> {
     match failure {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+/// A ref this node already sent to a code remote. Keyed by the remote URL,
+/// so repointing the remote republishes everything.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct Publication {
+    remote: String,
+    reference: String,
+    oid: String,
+    /// Unix seconds of the push.
+    at: u64,
+}
+
+/// A mark older than this is pushed again (a no-op when the remote still
+/// has it), restoring refs deleted on the remote by hand. Deleting
+/// `.kanban/code/<task>.published` resets the marks at once.
+const PUBLICATION_TTL_SECS: u64 = 3600;
+
+/// Per-task publication marks in `.kanban/code/<task>.published`, the
+/// completed-run counterpart of `.kanban/wip/<task>.published`: a steady
+/// reconcile pass then makes no network call. Only refs confirmed in this
+/// pass are kept, so marks for superseded tips drop out on save.
+struct Publications {
+    path: PathBuf,
+    previous: Vec<Publication>,
+    current: Vec<Publication>,
+    now: u64,
+}
+
+impl Publications {
+    fn load(board: &Path, task: &str) -> Self {
+        let path = board.join(".kanban/code").join(format!("{task}.published"));
+        let previous = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Publications {
+            path,
+            previous,
+            current: Vec::new(),
+            now,
+        }
+    }
+
+    /// Run `push` unless `remote` got `oid` at `reference` within the TTL.
+    fn publish(
+        &mut self,
+        remote: &str,
+        reference: &str,
+        oid: &str,
+        push: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let fresh = self.previous.iter().find(|p| {
+            p.remote == remote
+                && p.reference == reference
+                && p.oid == oid
+                && self.now.saturating_sub(p.at) < PUBLICATION_TTL_SECS
+        });
+        let mark = match fresh {
+            Some(mark) => mark.clone(),
+            None => {
+                push()?;
+                Publication {
+                    remote: remote.into(),
+                    reference: reference.into(),
+                    oid: oid.into(),
+                    at: self.now,
+                }
+            }
+        };
+        self.current.push(mark);
+        Ok(())
+    }
+
+    fn save(self) -> Result<()> {
+        if self.current == self.previous {
+            return Ok(());
+        }
+        if self.current.is_empty() {
+            return match fs::remove_file(&self.path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            };
+        }
+        fs::create_dir_all(self.path.parent().expect("code directory"))?;
+        atomic_write_text(
+            &self.path,
+            &serde_json::to_string(&self.current).map_err(|e| invalid(&e.to_string()))?,
+        )
     }
 }
 
