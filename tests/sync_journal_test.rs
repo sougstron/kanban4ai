@@ -135,6 +135,7 @@ fn torn_append_reconciles_one_operation_without_a_hole() {
     let next = journal.state().unwrap().vector[&node] + 1;
     let segment = active_segment(dir.path(), &node);
     let start = fs::metadata(&segment).unwrap().len();
+    let old_meta = fs::metadata(&path).unwrap();
     use std::io::Write;
     fs::OpenOptions::new()
         .append(true)
@@ -143,6 +144,24 @@ fn torn_append_reconciles_one_operation_without_a_hole() {
         .write_all(b"{\"op\":")
         .unwrap();
     fs::write(&path, task("new")).unwrap();
+    // Model a coarse filesystem deterministically: the rewrite has the same
+    // size and timestamp, so recovery must inspect its content rather than
+    // accepting the drift index's stat tuple.
+    let times = fs::FileTimes::new()
+        .set_accessed(old_meta.accessed().unwrap())
+        .set_modified(old_meta.modified().unwrap());
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
+    let rewritten_meta = fs::metadata(&path).unwrap();
+    assert_eq!(rewritten_meta.len(), old_meta.len());
+    assert_eq!(
+        rewritten_meta.modified().unwrap(),
+        old_meta.modified().unwrap()
+    );
     let intent = json!({
         "path": path,
         "external": false,
