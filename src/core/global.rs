@@ -160,6 +160,10 @@ pub struct GlobalConfig {
     /// under sync, like `node` and `tui`.
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
     pub backup: Mapping,
+    /// Fresh-input-equivalent weights for the store-wide stats report.
+    /// See [`crate::core::token_costs`].
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub token_costs: Mapping,
     #[serde(flatten, default)]
     pub extras: Mapping,
 }
@@ -214,6 +218,11 @@ impl GlobalConfig {
                 }
             }
         }
+    }
+
+    /// Cost-equivalent table, or the compiled defaults when the key is absent.
+    pub fn token_costs(&self) -> crate::core::token_costs::TokenCosts {
+        crate::core::token_costs::TokenCosts::from_mapping(&self.token_costs)
     }
 
     /// Whatever its storage shape, the effective default is off.
@@ -763,5 +772,24 @@ mod tests {
                 .update_check_interval_hours(),
             DEFAULT_CHECK_INTERVAL_HOURS
         );
+    }
+
+    #[test]
+    fn token_costs_round_trip_keeps_unknown_keys() {
+        let dir = tempfile::tempdir().expect("store");
+        let store = ProjectStore::at(dir.path());
+        std::fs::write(
+            store.global_config_path(),
+            "token_costs:\n  anthropic:\n    cache_read: 0.2\n    note: keep-me\nextra_root: 1\n",
+        )
+        .expect("seed");
+        let config = store.load_global_config().unwrap();
+        let weights = config.token_costs().weights_for(Some("claude"), None);
+        assert!((weights.cache_read - 0.2).abs() < 1e-9);
+        assert!((weights.cache_write - 1.25).abs() < 1e-9);
+        store.save_global_config(&config).expect("save");
+        let raw = std::fs::read_to_string(store.global_config_path()).expect("raw");
+        assert!(raw.contains("keep-me"), "{raw}");
+        assert!(raw.contains("extra_root"), "{raw}");
     }
 }

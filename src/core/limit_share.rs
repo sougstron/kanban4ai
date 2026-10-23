@@ -93,9 +93,9 @@ pub struct LimitShare {
 }
 
 /// Cost-weighted size of a token split (see the `WEIGHT_*` constants).
+/// `breakdown.input` is already the uncached prompt.
 pub fn weigh(breakdown: &TokenBreakdown) -> f64 {
-    let uncached = (breakdown.input - breakdown.cache_read - breakdown.cache_write).max(0);
-    uncached as f64 * WEIGHT_UNCACHED_INPUT
+    breakdown.input as f64 * WEIGHT_UNCACHED_INPUT
         + breakdown.cache_write as f64 * WEIGHT_CACHE_WRITE
         + breakdown.cache_read as f64 * WEIGHT_CACHE_READ
         + breakdown.output as f64 * WEIGHT_OUTPUT
@@ -525,7 +525,6 @@ mod tests {
             ..Default::default()
         };
         let cached = TokenBreakdown {
-            input: 100,
             cache_read: 100,
             ..Default::default()
         };

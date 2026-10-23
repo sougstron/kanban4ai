@@ -435,6 +435,9 @@ pub struct App {
     /// one), the same figure the detail Analytics panel shows. Refreshed with
     /// [`Self::session_progress`].
     pub task_tokens: HashMap<String, TokenBreakdown>,
+    /// Store-wide cost weights for the Analytics line and the Stats window.
+    /// Loaded with the global config, never re-read per frame.
+    pub token_costs: crate::core::token_costs::TokenCosts,
     /// Inline fallback cache; the real event loop keeps its cache on the worker.
     progress_cache: ProgressCache,
     tick_worker: Option<TickWorker>,
@@ -1028,6 +1031,7 @@ impl App {
             session_selected: 0,
             session_progress: HashMap::new(),
             task_tokens: HashMap::new(),
+            token_costs: crate::core::token_costs::TokenCosts::builtin(),
             progress_cache: ProgressCache::default(),
             tick_worker: None,
             tick_in_flight: false,
@@ -1155,6 +1159,7 @@ impl App {
             session_selected: 0,
             session_progress: HashMap::new(),
             task_tokens: HashMap::new(),
+            token_costs: crate::core::token_costs::TokenCosts::builtin(),
             progress_cache: ProgressCache::default(),
             tick_worker: None,
             tick_in_flight: false,
@@ -1228,6 +1233,7 @@ impl App {
             app.settings.project_sort = config.project_sort().to_string();
             app.settings.hidden_projects = config.hidden_projects();
             app.settings.backend_order = config.backend_order();
+            app.token_costs = config.token_costs();
         }
         // The projects list is an entry screen too (bare `kanban4ai` with no
         // resolvable project), so its open runs the same on-open check.
@@ -3304,7 +3310,9 @@ impl App {
         if global_changed && let Ok(effective) = load_settings(&self.ops) {
             self.settings.task_sort = effective.task_sort;
             self.settings.hide_kanban_messages = effective.hide_kanban_messages;
-            self.settings.backend_order = self.ops.config.load_global().0.backend_order();
+            let global = self.ops.config.load_global().0;
+            self.settings.backend_order = global.backend_order();
+            self.token_costs = global.token_costs();
         }
         if self.request_tick_refresh(global_changed) {
             return Ok(());
@@ -4897,6 +4905,7 @@ impl App {
             self.settings.project_sort = config.project_sort().to_string();
             self.settings.hidden_projects = config.hidden_projects();
             self.settings.backend_order = config.backend_order();
+            self.token_costs = config.token_costs();
         }
     }
 
@@ -6242,7 +6251,17 @@ impl App {
         } else {
             "Stats".to_string()
         };
-        let report = stats::render_report(&entries, timefmt::now(), samples);
+        let costs = match &self.store {
+            Some(store) => store
+                .load_global_config()
+                .map(|config| config.token_costs())
+                .unwrap_or_else(|_| self.token_costs.clone()),
+            None => crate::core::project::ProjectStore::open()
+                .and_then(|store| store.load_global_config())
+                .map(|config| config.token_costs())
+                .unwrap_or_else(|_| self.token_costs.clone()),
+        };
+        let report = stats::render_report(&entries, timefmt::now(), samples, &costs);
         self.open_text_view(title, &report, Screen::Projects);
         if let Some(summary) = incomplete {
             self.status = summary;
