@@ -43,7 +43,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
@@ -243,13 +243,123 @@ pub fn record_usage(
     );
 }
 
+/// How many bad lines one file keeps in [`SourceDiagnostics::samples`].
+/// Rendering applies `stats_issue_samples` on top of this; the cap only stops
+/// a huge corrupt log from retaining every bad line. `skipped_lines` stays exact.
+const MAX_STORED_LINE_ISSUES: usize = 1000;
+const DIAGNOSTIC_REASON_CHARS: usize = 160;
+
+/// One skipped events line. `line` is 1-based in the file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineIssue {
+    pub line: usize,
+    pub reason: String,
+}
+
+/// What [`read_records`] could and could not read from one events file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SourceDiagnostics {
+    pub path: PathBuf,
+    pub loaded: usize,
+    pub skipped_lines: usize,
+    pub samples: Vec<LineIssue>,
+    pub read_error: Option<String>,
+}
+
+impl SourceDiagnostics {
+    pub fn is_clean(&self) -> bool {
+        self.read_error.is_none() && self.skipped_lines == 0
+    }
+}
+
 fn load_records(project_path: &Path) -> Vec<Record> {
-    let Ok(text) = fs::read_to_string(events_path(project_path)) else {
-        return Vec::new();
+    read_records(&events_path(project_path)).0
+}
+
+/// Read one events file. A missing file is empty and clean (the project never
+/// recorded a session). Any other I/O error yields no records and
+/// [`SourceDiagnostics::read_error`]. Lines are split on `b'\n'` so one
+/// non-UTF-8 byte does not drop the rest of the file. Whitespace-only lines
+/// are ignored. A failing unterminated final line is marked as possibly still
+/// being written.
+fn read_records(path: &Path) -> (Vec<Record>, SourceDiagnostics) {
+    let mut source = SourceDiagnostics {
+        path: path.to_path_buf(),
+        ..SourceDiagnostics::default()
     };
-    text.lines()
-        .filter_map(|line| serde_json::from_str(line.trim()).ok())
-        .collect()
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == ErrorKind::NotFound => return (Vec::new(), source),
+        Err(err) => {
+            source.read_error = Some(err.to_string());
+            return (Vec::new(), source);
+        }
+    };
+    let mut records = Vec::new();
+    if bytes.is_empty() {
+        return (records, source);
+    }
+    let mut start = 0usize;
+    let mut line_no = 1usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\n' {
+            consider_line(
+                &bytes[start..index],
+                line_no,
+                false,
+                &mut records,
+                &mut source,
+            );
+            start = index + 1;
+            line_no += 1;
+        }
+        index += 1;
+    }
+    if start < bytes.len() {
+        consider_line(&bytes[start..], line_no, true, &mut records, &mut source);
+    }
+    (records, source)
+}
+
+fn consider_line(
+    raw: &[u8],
+    line_no: usize,
+    unterminated: bool,
+    records: &mut Vec<Record>,
+    source: &mut SourceDiagnostics,
+) {
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let text = match std::str::from_utf8(raw) {
+        Ok(text) => text,
+        Err(_) => {
+            note_issue(source, line_no, "invalid UTF-8", unterminated);
+            return;
+        }
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    match serde_json::from_str::<Record>(text.trim()) {
+        Ok(record) => {
+            records.push(record);
+            source.loaded += 1;
+        }
+        Err(err) => note_issue(source, line_no, &err.to_string(), unterminated),
+    }
+}
+
+fn note_issue(source: &mut SourceDiagnostics, line: usize, reason: &str, unterminated: bool) {
+    source.skipped_lines += 1;
+    if source.samples.len() >= MAX_STORED_LINE_ISSUES {
+        return;
+    }
+    let reason = if unterminated {
+        format!("incomplete final line (possibly still being written): {reason}")
+    } else {
+        reason.to_string()
+    };
+    source.samples.push(LineIssue { line, reason });
 }
 
 /// One closed `[start, end)` phase span, tagged from its `Enter` edge.
@@ -289,11 +399,16 @@ pub struct Usage {
 pub struct ProjectStats {
     pub spans: Vec<Span>,
     pub usage: Vec<Usage>,
+    pub source: SourceDiagnostics,
 }
 
 /// Load and reconstruct one project's stats from its events file.
 pub fn load(project_path: &Path) -> ProjectStats {
-    pair_records(load_records(project_path))
+    let (records, source) = read_records(&events_path(project_path));
+    ProjectStats {
+        source,
+        ..pair_records(records)
+    }
 }
 
 /// Pair `Enter`/`Exit` phase edges per `(task_id, phase)` in timestamp order
@@ -390,7 +505,11 @@ fn pair_records(records: Vec<Record>) -> ProjectStats {
             }
         }
     }
-    ProjectStats { spans, usage }
+    ProjectStats {
+        spans,
+        usage,
+        ..ProjectStats::default()
+    }
 }
 
 /// Per-task totals behind the TUI detail's Analytics panel: every agent
@@ -1142,10 +1261,130 @@ fn tasks_section(entries: &[(String, ProjectStats)], cap: Option<usize>) -> Stri
     out
 }
 
+fn count_label(n: usize, singular: &str, plural: &str) -> String {
+    format!("{n} {}", if n == 1 { singular } else { plural })
+}
+
+fn truncate_reason(reason: &str) -> String {
+    let mut out = String::new();
+    for (index, ch) in reason.chars().enumerate() {
+        if index == DIAGNOSTIC_REASON_CHARS {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Data-quality block, or an empty string when every project read cleanly.
+/// Affected paths are always listed. Only per-line samples are capped at
+/// `samples` (`0` keeps the counts and paths and shows no sample lines).
+fn diagnostics_section(entries: &[(String, ProjectStats)], samples: usize) -> String {
+    let affected: Vec<_> = entries
+        .iter()
+        .filter(|(_, stats)| !stats.source.is_clean())
+        .collect();
+    if affected.is_empty() {
+        return String::new();
+    }
+    let malformed: usize = entries
+        .iter()
+        .map(|(_, stats)| stats.source.skipped_lines)
+        .sum();
+    let unreadable = entries
+        .iter()
+        .filter(|(_, stats)| stats.source.read_error.is_some())
+        .count();
+    let mut out = String::from("=== DATA QUALITY: REPORT INCOMPLETE ===\n\n");
+    out.push_str(&format!(
+        "Totals below include only readable records: {}, {} ({} of {} projects affected).\n\n",
+        count_label(
+            malformed,
+            "malformed line skipped",
+            "malformed lines skipped"
+        ),
+        count_label(
+            unreadable,
+            "events file unreadable",
+            "events files unreadable"
+        ),
+        affected.len(),
+        entries.len()
+    ));
+    for (name, stats) in affected {
+        out.push_str(&format!("{name}: {}\n", stats.source.path.display()));
+        if let Some(err) = &stats.source.read_error {
+            out.push_str(&format!("  unreadable: {err}\n"));
+        }
+        if stats.source.read_error.is_none() {
+            out.push_str(&format!(
+                "  {}, {}\n",
+                count_label(
+                    stats.source.skipped_lines,
+                    "malformed line skipped",
+                    "malformed lines skipped"
+                ),
+                count_label(stats.source.loaded, "record loaded", "records loaded")
+            ));
+        }
+        let shown = stats.source.samples.len().min(samples);
+        for issue in stats.source.samples.iter().take(shown) {
+            out.push_str(&format!(
+                "  line {}: {}\n",
+                issue.line,
+                truncate_reason(&issue.reason)
+            ));
+        }
+        let hidden = stats.source.skipped_lines.saturating_sub(shown);
+        if samples > 0 && hidden > 0 {
+            out.push_str(&format!(
+                "  … {} not shown (stats_issue_samples = {samples})\n",
+                count_label(hidden, "more malformed line", "more malformed lines")
+            ));
+        }
+    }
+    out.push('\n');
+    out
+}
+
+/// One-line summary for stderr and the TUI status, when any source is dirty.
+pub fn incomplete_summary(entries: &[(String, ProjectStats)]) -> Option<String> {
+    if entries.iter().all(|(_, stats)| stats.source.is_clean()) {
+        return None;
+    }
+    let malformed: usize = entries
+        .iter()
+        .map(|(_, stats)| stats.source.skipped_lines)
+        .sum();
+    let unreadable = entries
+        .iter()
+        .filter(|(_, stats)| stats.source.read_error.is_some())
+        .count();
+    Some(format!(
+        "stats report incomplete: {}, {}",
+        count_label(
+            malformed,
+            "malformed line skipped",
+            "malformed lines skipped"
+        ),
+        count_label(
+            unreadable,
+            "events file unreadable",
+            "events files unreadable"
+        )
+    ))
+}
+
 /// Render the full report (tokens, time, tasks) for a set of `(project name,
 /// stats)` pairs, as plain text for the TUI text pager / `kanban stats`.
-pub fn render_report(entries: &[(String, ProjectStats)], now: NaiveDateTime) -> String {
-    let mut out = String::from("=== TOKENS ===\n\n");
+/// `diagnostic_samples` caps per-file sample lines in the data-quality section.
+pub fn render_report(
+    entries: &[(String, ProjectStats)],
+    now: NaiveDateTime,
+    diagnostic_samples: usize,
+) -> String {
+    let mut out = diagnostics_section(entries, diagnostic_samples);
+    out.push_str("=== TOKENS ===\n\n");
     for window in Window::ALL {
         out.push_str(&tokens_window(entries, window, now, None));
         out.push('\n');
@@ -1162,14 +1401,18 @@ pub fn render_report(entries: &[(String, ProjectStats)], now: NaiveDateTime) -> 
 /// Render the compact report for `kanban stats --compact`: the same sections
 /// and totals, but every breakdown table is capped at `top_n` rows. The full
 /// report stays available — the CLI writes it to a file next to this output.
+/// The data-quality section uses the same text and sample cap as the full report.
 pub fn render_compact_report(
     entries: &[(String, ProjectStats)],
     now: NaiveDateTime,
     top_n: usize,
+    diagnostic_samples: usize,
 ) -> String {
     let mut out = format!(
-        "Compact report: at most {top_n} rows per breakdown (models max 10); omitted rows remain in the full report.\n\n=== TOKENS (compact) ===\n\n"
+        "Compact report: at most {top_n} rows per breakdown (models max 10); omitted rows remain in the full report.\n\n"
     );
+    out.push_str(&diagnostics_section(entries, diagnostic_samples));
+    out.push_str("=== TOKENS (compact) ===\n\n");
     for window in Window::ALL {
         out.push_str(&tokens_window(entries, window, now, Some(top_n)));
         out.push('\n');
@@ -1186,7 +1429,12 @@ pub fn render_compact_report(
 /// Load every registered project's stats — the shared entry collection for
 /// [`render_report`] / [`render_compact_report`].
 pub fn collect_store_entries() -> Result<Vec<(String, ProjectStats)>> {
-    let store = ProjectStore::open()?;
+    collect_store_entries_from(&ProjectStore::open()?)
+}
+
+/// Same collection as [`collect_store_entries`], from an already-open store.
+/// The TUI Projects screen passes the store it is showing.
+pub fn collect_store_entries_from(store: &ProjectStore) -> Result<Vec<(String, ProjectStats)>> {
     let entries: Vec<(String, ProjectStats)> = store
         .list()?
         .into_iter()
@@ -1198,10 +1446,13 @@ pub fn collect_store_entries() -> Result<Vec<(String, ProjectStats)>> {
     Ok(entries)
 }
 
-/// Load every registered project's stats and render the combined report —
-/// the single entry point the TUI Stats window and `kanban stats` both call.
-pub fn collect_store_report(now: NaiveDateTime) -> Result<String> {
-    Ok(render_report(&collect_store_entries()?, now))
+/// Load every registered project's stats and render the combined report.
+pub fn collect_store_report(now: NaiveDateTime, diagnostic_samples: usize) -> Result<String> {
+    Ok(render_report(
+        &collect_store_entries()?,
+        now,
+        diagnostic_samples,
+    ))
 }
 
 #[cfg(test)]
@@ -1623,7 +1874,7 @@ mod tests {
 
         let stats = load(dir.path());
         let entries = vec![("demo".to_string(), stats)];
-        let report = render_report(&entries, timefmt::now());
+        let report = render_report(&entries, timefmt::now(), 3);
         assert!(report.contains("=== TOKENS ==="));
         assert!(report.contains("=== TIME ==="));
         assert!(report.contains("=== TASKS (all time) ==="));
@@ -1635,5 +1886,247 @@ mod tests {
         assert!(report.contains("Top providers by task count:\n  anthropic"));
         assert!(report.contains("Top providers by avg tokens/task:\n  anthropic"));
         assert!(report.contains("Top providers by avg time/task:\n  anthropic"));
+        assert!(!report.contains("DATA QUALITY"));
+    }
+
+    fn write_events(dir: &Path, bytes: &[u8]) -> PathBuf {
+        let path = events_path(dir);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn usage_line(task: &str, tokens: i64) -> String {
+        format!(
+            r#"{{"kind":"usage","ts":"2026-06-01T10:00:00","task_id":"{task}","tokens":{tokens},"backend":"claude","model":"anthropic/opus"}}"#
+        )
+    }
+
+    fn phase_lines() -> String {
+        format!(
+            "{}\n{}",
+            r#"{"kind":"phase","ts":"2026-06-01T10:00:00","task_id":"TASK-1","phase":"running","edge":"enter","backend":"claude"}"#,
+            r#"{"kind":"phase","ts":"2026-06-01T10:10:00","task_id":"TASK-1","phase":"running","edge":"exit"}"#
+        )
+    }
+
+    #[test]
+    fn malformed_line_keeps_valid_records_and_reports_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body = usage_line("TASK-1", 40);
+        body.push('\n');
+        body.push_str("NOT-JSON secret-token\n");
+        body.push_str(&phase_lines());
+        body.push('\n');
+        write_events(dir.path(), body.as_bytes());
+
+        let clean_dir = tempfile::tempdir().unwrap();
+        let mut clean = usage_line("TASK-1", 40);
+        clean.push('\n');
+        clean.push_str(&phase_lines());
+        clean.push('\n');
+        write_events(clean_dir.path(), clean.as_bytes());
+
+        let dirty = load(dir.path());
+        let clean_stats = load(clean_dir.path());
+        assert_eq!(dirty.usage, clean_stats.usage);
+        assert_eq!(dirty.spans, clean_stats.spans);
+        assert_eq!(dirty.usage[0].tokens, 40);
+        assert_eq!(dirty.spans.len(), 1);
+        assert_eq!(dirty.source.loaded, 3);
+        assert_eq!(dirty.source.skipped_lines, 1);
+        assert_eq!(dirty.source.samples.len(), 1);
+        assert_eq!(dirty.source.samples[0].line, 2);
+        assert!(!dirty.source.samples[0].reason.contains("secret-token"));
+        assert!(dirty.source.samples[0].reason.contains("expected value"));
+    }
+
+    #[test]
+    fn non_utf8_line_does_not_drop_the_rest_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = usage_line("TASK-1", 7).into_bytes();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[0xff, 0xfe]);
+        bytes.push(b'\n');
+        bytes.extend(usage_line("TASK-2", 9).into_bytes());
+        bytes.push(b'\n');
+        write_events(dir.path(), &bytes);
+
+        let stats = load(dir.path());
+        assert_eq!(stats.source.loaded, 2);
+        assert_eq!(stats.source.skipped_lines, 1);
+        assert_eq!(stats.usage.len(), 2);
+        assert_eq!(stats.usage.iter().map(|u| u.tokens).sum::<i64>(), 16);
+        assert_eq!(stats.source.samples[0].line, 2);
+        assert_eq!(stats.source.samples[0].reason, "invalid UTF-8");
+    }
+
+    #[test]
+    fn directory_events_file_is_a_read_error_and_other_projects_stay_intact() {
+        let good = tempfile::tempdir().unwrap();
+        write_events(
+            good.path(),
+            format!("{}\n", usage_line("TASK-1", 50)).as_bytes(),
+        );
+        let bad = tempfile::tempdir().unwrap();
+        let bad_path = events_path(bad.path());
+        fs::create_dir_all(&bad_path).unwrap();
+
+        let good_stats = load(good.path());
+        let bad_stats = load(bad.path());
+        assert!(bad_stats.source.read_error.is_some());
+        assert!(bad_stats.usage.is_empty());
+        assert!(bad_stats.spans.is_empty());
+        assert_eq!(good_stats.usage[0].tokens, 50);
+
+        let entries = vec![
+            ("good".to_string(), good_stats),
+            ("bad".to_string(), bad_stats),
+        ];
+        let report = render_report(&entries, at(2026, 6, 15, 12, 0), 3);
+        assert!(report.contains("Total tokens: 50"));
+        assert!(report.contains("unreadable"));
+        assert!(report.contains(&events_path(bad.path()).display().to_string()));
+        assert!(entries[0].1.source.is_clean());
+        assert!(entries[1].1.source.read_error.is_some());
+    }
+
+    #[test]
+    fn missing_file_and_blank_lines_are_clean() {
+        let missing = tempfile::tempdir().unwrap();
+        let (records, source) = read_records(&events_path(missing.path()));
+        assert!(records.is_empty());
+        assert!(source.is_clean());
+        assert!(source.read_error.is_none());
+
+        let blanks = tempfile::tempdir().unwrap();
+        write_events(blanks.path(), b"\n\n  \n\r\n");
+        let stats = load(blanks.path());
+        assert!(stats.source.is_clean());
+        assert_eq!(stats.source.loaded, 0);
+        assert!(stats.usage.is_empty());
+    }
+
+    #[test]
+    fn unterminated_final_garbage_line_is_marked_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut bytes = usage_line("TASK-1", 3).into_bytes();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(br#"{"kind":"usage""#);
+        write_events(dir.path(), &bytes);
+        let stats = load(dir.path());
+        assert_eq!(stats.source.loaded, 1);
+        assert_eq!(stats.source.skipped_lines, 1);
+        assert_eq!(stats.usage[0].tokens, 3);
+        assert!(
+            stats.source.samples[0]
+                .reason
+                .starts_with("incomplete final line (possibly still being written):")
+        );
+        assert_eq!(stats.source.samples[0].line, 2);
+    }
+
+    fn quality_section(report: &str) -> &str {
+        let start = report.find("=== DATA QUALITY").expect("section present");
+        let rest = &report[start..];
+        let end = rest.find("=== TOKENS").expect("tokens follow the section");
+        &rest[..end]
+    }
+
+    #[test]
+    fn clean_reports_omit_the_data_quality_section() {
+        let dir = tempfile::tempdir().unwrap();
+        write_events(
+            dir.path(),
+            format!("{}\n", usage_line("TASK-1", 11)).as_bytes(),
+        );
+        let stats = load(dir.path());
+        assert!(stats.source.is_clean());
+        let entries = vec![("demo".to_string(), stats)];
+        let now = at(2026, 6, 15, 12, 0);
+        let report = render_report(&entries, now, 3);
+        let compact = render_compact_report(&entries, now, 5, 3);
+        assert!(!report.contains("DATA QUALITY"));
+        assert!(!compact.contains("DATA QUALITY"));
+        assert!(report.starts_with("=== TOKENS ===\n"));
+        let mut cleared = entries.clone();
+        cleared[0].1.source = SourceDiagnostics::default();
+        assert_eq!(report, render_report(&cleared, now, 3));
+        assert_eq!(compact, render_compact_report(&cleared, now, 5, 3));
+        assert!(incomplete_summary(&entries).is_none());
+    }
+
+    #[test]
+    fn dirty_reports_list_paths_cap_samples_and_share_the_section() {
+        let path = PathBuf::from("/abs/path/.kanban/stats/events.jsonl");
+        let mut samples = Vec::new();
+        for line in [4usize, 9, 12, 20] {
+            samples.push(LineIssue {
+                line,
+                reason: format!("reason {line} {}", "x".repeat(200)),
+            });
+        }
+        let dirty = ProjectStats {
+            source: SourceDiagnostics {
+                path: path.clone(),
+                loaded: 120,
+                skipped_lines: 4,
+                samples,
+                read_error: None,
+            },
+            ..ProjectStats::default()
+        };
+        let unreadable = ProjectStats {
+            source: SourceDiagnostics {
+                path: PathBuf::from("/abs/other/.kanban/stats/events.jsonl"),
+                read_error: Some("Permission denied (os error 13)".to_string()),
+                ..SourceDiagnostics::default()
+            },
+            ..ProjectStats::default()
+        };
+        let clean = ProjectStats::default();
+        let entries = vec![
+            ("alpha".to_string(), unreadable),
+            ("clean".to_string(), clean),
+            ("beta".to_string(), dirty),
+        ];
+        let now = at(2026, 6, 15, 12, 0);
+        let report = render_report(&entries, now, 3);
+        let compact = render_compact_report(&entries, now, 5, 3);
+        assert!(report.find("=== DATA QUALITY").unwrap() < report.find("=== TOKENS ===").unwrap());
+        let section = quality_section(&report);
+        assert_eq!(section, quality_section(&compact));
+        assert!(section.contains(
+            "4 malformed lines skipped, 1 events file unreadable (2 of 3 projects affected)"
+        ));
+        assert!(section.contains("alpha: /abs/other/.kanban/stats/events.jsonl"));
+        assert!(section.contains("unreadable: Permission denied (os error 13)"));
+        assert!(section.contains(&format!("beta: {}", path.display())));
+        assert!(section.contains("4 malformed lines skipped, 120 records loaded"));
+        assert!(section.contains("line 4:"));
+        assert!(section.contains("line 12:"));
+        assert!(!section.contains("line 20:"));
+        assert!(section.contains("… 1 more malformed line not shown (stats_issue_samples = 3)"));
+        let rendered_reason = section
+            .lines()
+            .find(|line| line.contains("line 4:"))
+            .unwrap();
+        let reason = rendered_reason.split_once(": ").unwrap().1;
+        assert!(reason.chars().count() <= DIAGNOSTIC_REASON_CHARS);
+
+        let counts_only = render_report(&entries, now, 0);
+        let counts = quality_section(&counts_only);
+        assert!(counts.contains(&format!("beta: {}", path.display())));
+        assert!(counts.contains("4 malformed lines skipped, 120 records loaded"));
+        assert!(
+            !counts
+                .lines()
+                .any(|line| line.trim_start().starts_with("line "))
+        );
+        assert!(!counts.contains("more malformed"));
+        assert_eq!(
+            incomplete_summary(&entries).as_deref(),
+            Some("stats report incomplete: 4 malformed lines skipped, 1 events file unreadable")
+        );
     }
 }

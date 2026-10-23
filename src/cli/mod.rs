@@ -871,11 +871,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Command::Stats { compact } => {
-            if compact {
-                return stats_command(cli.project.as_deref());
-            }
-            println!("{}", stats::collect_store_report(timefmt::now())?);
-            return Ok(ExitCode::SUCCESS);
+            return stats_command(cli.project.as_deref(), compact);
         }
         Command::CompactThreads {
             all_projects: true, ..
@@ -2084,32 +2080,62 @@ fn truncate_chars(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
 }
 
-// Explicit compact reporting never changes external command stdout.
-fn stats_command(project: Option<&str>) -> Result<ExitCode> {
-    let top_n = match resolve::resolve_tui(project)? {
-        Some(resolved) => {
-            Config::new(resolved.operations().data_root()).get_threshold("compact_report_top_n")?
+/// Store-wide stats. `--project` selects the board whose thresholds apply
+/// (`compact_report_top_n` for `--compact`, `stats_issue_samples` for both).
+/// Outside a board the built-in defaults apply. A missing project fails.
+/// Readable records are still printed when some lines or files are bad; the
+/// exit code stays success and a stderr warning points at the report section.
+fn stats_command(project: Option<&str>, compact: bool) -> Result<ExitCode> {
+    let resolved = resolve::resolve_tui(project)?;
+    let threshold = |key: &str| -> Result<i64> {
+        match &resolved {
+            Some(resolved) => Config::new(resolved.operations().data_root()).get_threshold(key),
+            None => Config::default_threshold(key),
         }
-        None => Config::default_threshold("compact_report_top_n")?,
     };
-    let top_n = usize::try_from(top_n)
-        .ok()
-        .filter(|n| *n > 0)
-        .ok_or_else(|| {
-            KanbanError::Invalid("compact_report_top_n must be a positive integer".into())
-        })?;
+    let samples = usize::try_from(threshold("stats_issue_samples")?).map_err(|_| {
+        KanbanError::Invalid("stats_issue_samples must be a non-negative integer".into())
+    })?;
+    let top_n = if compact {
+        Some(
+            usize::try_from(threshold("compact_report_top_n")?)
+                .ok()
+                .filter(|n| *n > 0)
+                .ok_or_else(|| {
+                    KanbanError::Invalid("compact_report_top_n must be a positive integer".into())
+                })?,
+        )
+    } else {
+        None
+    };
     let now = timefmt::now();
     let entries = stats::collect_store_entries()?;
-    let full = stats::render_report(&entries, now);
-    let reports_dir = ProjectStore::open()?.root().join("reports");
-    fs::create_dir_all(&reports_dir)?;
-    let path = reports_dir.join(format!(
-        "stats-{}-{}.txt",
-        now.format("%Y%m%d-%H%M%S-%f"),
-        std::process::id()
-    ));
-    atomic_write_text(&path, &full)?;
-    println!("{}", stats::render_compact_report(&entries, now, top_n));
-    println!("Full report: {}", path.display());
+    let full = stats::render_report(&entries, now, samples);
+    if let Some(top_n) = top_n {
+        let reports_dir = ProjectStore::open()?.root().join("reports");
+        fs::create_dir_all(&reports_dir)?;
+        let path = reports_dir.join(format!(
+            "stats-{}-{}.txt",
+            now.format("%Y%m%d-%H%M%S-%f"),
+            std::process::id()
+        ));
+        atomic_write_text(&path, &full)?;
+        println!(
+            "{}",
+            stats::render_compact_report(&entries, now, top_n, samples)
+        );
+        println!("Full report: {}", path.display());
+        if let Some(summary) = stats::incomplete_summary(&entries) {
+            eprintln!(
+                "warning: {summary}; see DATA QUALITY section; full report: {}",
+                path.display()
+            );
+        }
+    } else {
+        println!("{full}");
+        if let Some(summary) = stats::incomplete_summary(&entries) {
+            eprintln!("warning: {summary}; see DATA QUALITY section");
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }

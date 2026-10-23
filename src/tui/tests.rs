@@ -9855,6 +9855,50 @@ fn projects_russian_uppercase_yeru_opens_stats() {
 }
 
 #[test]
+fn projects_stats_shows_incomplete_events_at_the_top() {
+    let store_dir = std::path::PathBuf::from("/tmp/k4ai-stats-quality-store");
+    let work = std::path::PathBuf::from("/tmp/k4ai-stats-quality-work");
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).expect("work dir");
+    let store = ProjectStore::at(&store_dir);
+    let added = store
+        .add(&work, Some("Quality Board"))
+        .expect("add project");
+    let events = added.project.data_root.join(".kanban/stats/events.jsonl");
+    std::fs::create_dir_all(events.parent().unwrap()).expect("stats dir");
+    std::fs::write(
+        &events,
+        b"{\"kind\":\"usage\",\"ts\":\"2026-01-01T12:00:00\",\"task_id\":\"TASK-1\",\"tokens\":10}\n{bad\n",
+    )
+    .expect("broken events");
+    let mut app = loaded_projects_at(store, None, None).expect("projects app");
+    app.handle_key(key(KeyCode::Char('S'))).expect("open stats");
+    assert_eq!(app.screen, Screen::TextView);
+    let view = app.text_view.as_ref().expect("stats view");
+    assert_eq!(view.title, "Stats · incomplete data");
+    assert!(
+        view.lines
+            .iter()
+            .take(4)
+            .any(|line| line.contains("DATA QUALITY")),
+        "section should be visible without scrolling: {:?}",
+        view.lines.iter().take(6).collect::<Vec<_>>()
+    );
+    assert!(
+        app.status.contains("stats report incomplete"),
+        "{}",
+        app.status
+    );
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("incomplete"), "{rendered}");
+    assert!(rendered.contains("DATA QUALITY"), "{rendered}");
+    insta::assert_snapshot!("stats_incomplete_data", rendered);
+    let _ = std::fs::remove_dir_all(&store_dir);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
 fn board_escape_stays_on_board_when_escape_to_projects_is_off() {
     let (_dir, mut app) = app_with_board();
     assert!(!app.settings.escape_to_projects);

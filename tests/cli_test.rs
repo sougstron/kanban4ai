@@ -150,6 +150,106 @@ fn compact_stats_preserves_totals_report_and_errors() {
         .stderr(predicate::str::contains("no such project"));
 }
 
+fn quality_section(report: &str) -> &str {
+    let start = report
+        .find("=== DATA QUALITY")
+        .expect("data-quality section");
+    let rest = &report[start..];
+    let end = rest.find("=== TOKENS").expect("tokens follow the section");
+    &rest[..end]
+}
+
+#[test]
+fn stats_reports_malformed_lines_and_keeps_valid_totals() {
+    let env = board();
+    let stats_dir = env.kanban().join("stats");
+    std::fs::create_dir_all(&stats_dir).unwrap();
+    let path = stats_dir.join("events.jsonl");
+    let mut bytes = Vec::new();
+    bytes.extend(
+        br#"{"kind":"usage","ts":"2026-01-01T12:00:00","task_id":"TASK-1","tokens":1000,"backend":"claude","model":"anthropic/opus"}"#
+            ,
+    );
+    bytes.push(b'\n');
+    bytes.extend(br#"{"kind":"nope"}"#);
+    bytes.push(b'\n');
+    bytes.extend([0xff, 0xfe]);
+    bytes.push(b'\n');
+    std::fs::write(&path, &bytes).unwrap();
+
+    let plain = kanban(&env).arg("stats").assert().success();
+    let stdout = String::from_utf8(plain.get_output().stdout.clone()).unwrap();
+    let stderr = String::from_utf8(plain.get_output().stderr.clone()).unwrap();
+    assert!(stdout.contains("=== DATA QUALITY: REPORT INCOMPLETE ==="));
+    assert!(stdout.contains(&path.display().to_string()));
+    assert!(stdout.contains("2 malformed lines"));
+    assert!(stdout.contains("Total tokens: 1,000"));
+    assert!(stderr.contains("warning:"));
+    assert!(stderr.contains("DATA QUALITY"));
+
+    let compact_cmd = kanban(&env).args(["stats", "--compact"]).assert().success();
+    let compact = String::from_utf8(compact_cmd.get_output().stdout.clone()).unwrap();
+    let compact_err = String::from_utf8(compact_cmd.get_output().stderr.clone()).unwrap();
+    assert_eq!(quality_section(&stdout), quality_section(&compact));
+    assert!(compact_err.contains("warning:"));
+    let report = compact
+        .lines()
+        .find_map(|line| line.strip_prefix("Full report: "))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(report).unwrap() + "\n", stdout);
+
+    std::fs::write(
+        env.kanban().join("config.yaml"),
+        "thresholds:\n  stats_issue_samples: 0\n",
+    )
+    .unwrap();
+    let hidden = String::from_utf8(
+        kanban(&env)
+            .arg("stats")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(hidden.contains(&path.display().to_string()));
+    assert!(hidden.contains("2 malformed lines"));
+    assert!(
+        !hidden
+            .lines()
+            .any(|line| line.trim_start().starts_with("line "))
+    );
+
+    std::fs::write(
+        env.kanban().join("config.yaml"),
+        "thresholds:\n  stats_issue_samples: -1\n",
+    )
+    .unwrap();
+    kanban(&env)
+        .arg("stats")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("non-negative"));
+    kanban(&env)
+        .args(["--project", "missing-project", "stats"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no such project"));
+}
+
+#[test]
+fn stats_reports_an_unreadable_events_file() {
+    let env = board();
+    let path = env.kanban().join("stats").join("events.jsonl");
+    std::fs::create_dir_all(&path).unwrap();
+    let asserted = kanban(&env).arg("stats").assert().success();
+    let stdout = String::from_utf8(asserted.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("unreadable"));
+    assert!(stdout.contains(&path.display().to_string()));
+    assert!(stdout.contains("=== DATA QUALITY: REPORT INCOMPLETE ==="));
+}
+
 #[test]
 fn compact_stats_works_outside_a_board_and_is_scoped_to_stats() {
     let env = Env::new();

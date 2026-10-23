@@ -24,8 +24,8 @@ use crate::agent::{
 };
 use crate::core::config::RoleCandidate;
 use crate::core::config::{
-    BoardConfig, InheritFlags, InheritGroup, OnChangesRequested, OrchestrationSettings, copy_group,
-    resolve_inherited,
+    BoardConfig, Config, InheritFlags, InheritGroup, OnChangesRequested, OrchestrationSettings,
+    copy_group, resolve_inherited,
 };
 use crate::core::context::ContextManager;
 use crate::core::daemon;
@@ -6226,8 +6226,27 @@ impl App {
     /// the text pager; `Screen::Projects` is the only place with no single
     /// project in context, matching where the report aggregates from.
     fn open_stats_view(&mut self) -> Result<()> {
-        let report = stats::collect_store_report(timefmt::now())?;
-        self.open_text_view("Stats".to_string(), &report, Screen::Projects);
+        // The Projects screen has no single board in context, so the sample
+        // cap is the built-in default rather than one project's config.
+        let samples =
+            usize::try_from(Config::default_threshold("stats_issue_samples")?).map_err(|_| {
+                KanbanError::Invalid("stats_issue_samples must be a non-negative integer".into())
+            })?;
+        let entries = match &self.store {
+            Some(store) => stats::collect_store_entries_from(store)?,
+            None => stats::collect_store_entries()?,
+        };
+        let incomplete = stats::incomplete_summary(&entries);
+        let title = if incomplete.is_some() {
+            "Stats · incomplete data".to_string()
+        } else {
+            "Stats".to_string()
+        };
+        let report = stats::render_report(&entries, timefmt::now(), samples);
+        self.open_text_view(title, &report, Screen::Projects);
+        if let Some(summary) = incomplete {
+            self.status = summary;
+        }
         Ok(())
     }
 
