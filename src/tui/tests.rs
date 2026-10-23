@@ -5491,10 +5491,16 @@ fn run_hotkey_launches_on_a_worker_without_blocking_the_ui() {
     app.handle_key(key(KeyCode::Char('r'))).expect("run");
     assert!(app.status.contains("dispatching"), "status: {}", app.status);
     assert!(launcher.spy.calls().is_empty(), "launch is still gated");
-    let queued = app.ops.get_task(&task.id).unwrap().unwrap();
-    assert_eq!(queued.run_phase, Some(RunPhase::Queued));
+    // Queueing runs on the worker too (it waits for the board lock); the
+    // pump then parks on the gate with the task still queued.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.ops.get_task(&task.id).unwrap().unwrap().run_phase != Some(RunPhase::Queued) {
+        assert!(Instant::now() < deadline, "the worker queues the task");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 
     // A second press of the same task is refused, not double-started.
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
     app.focused_column = app
         .board
         .columns

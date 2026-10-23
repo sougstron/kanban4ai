@@ -574,6 +574,8 @@ struct LaunchReport {
     refresh: bool,
     redraw: bool,
     background_refresh: bool,
+    /// Switch to this project once the report is applied.
+    open_project: Option<Project>,
 }
 
 /// One queue pump's outcome: the tasks it started and any failure line.
@@ -3818,6 +3820,9 @@ impl App {
         if let Some(status) = report.status {
             self.status = status;
         }
+        if let Some(project) = report.open_project {
+            self.pending_switch = Some(LoopOutcome::OpenProject(project));
+        }
     }
 
     fn pump_in_flight(&self) -> bool {
@@ -5046,20 +5051,36 @@ impl App {
     }
 
     fn add_and_open_project(&mut self, path: &Path, name: Option<&str>) -> Result<()> {
-        let Some(store) = self.store.as_ref() else {
+        let Some(store) = self.store.clone() else {
             self.status = "Project store is not available".to_string();
             return Ok(());
         };
-        match store.add(path, name) {
-            Ok(added) => {
-                if let Err(err) = Storage::new(&added.project.data_root).init_board() {
-                    self.status = format!("Could not initialize board: {err}");
-                    return Ok(());
-                }
-                self.pending_switch = Some(LoopOutcome::OpenProject(added.project));
-            }
-            Err(err) => self.status = format!("Could not add project: {err}"),
+        // Registration waits for the store lock, which a backup or a code
+        // sync can hold for seconds: a worker waits instead of the UI.
+        let job = format!("project {}", path.display());
+        if self.launch_busy(&job) {
+            return Ok(());
         }
+        self.status = format!("Creating project in {}…", path.display());
+        let (path, name) = (path.to_path_buf(), name.map(str::to_string));
+        self.spawn_launch(Some(job), move |_| {
+            let status = match store.add(&path, name.as_deref()) {
+                Ok(added) => match Storage::new(&added.project.data_root).init_board() {
+                    Ok(()) => {
+                        return LaunchReport {
+                            open_project: Some(added.project),
+                            ..LaunchReport::default()
+                        };
+                    }
+                    Err(err) => format!("Could not initialize board: {err}"),
+                },
+                Err(err) => format!("Could not add project: {err}"),
+            };
+            LaunchReport {
+                status: Some(status),
+                ..LaunchReport::default()
+            }
+        });
         Ok(())
     }
 
@@ -5562,15 +5583,20 @@ impl App {
         }
         let should_close_detail = self.screen == Screen::Detail;
         self.request_full_redraw();
-        if let Err(err) = self.ops.queue_run(&task_id) {
-            self.status = err.to_string();
-            return Ok(());
-        }
-        self.refresh_after_action()?;
         self.status = format!("Queued {task_id} — dispatching…");
         // The pump below replaces the tick's next one.
         self.last_queue_dispatch = Some(Instant::now());
+        // Queueing takes the board lock, which sync and WIP publication can
+        // hold for seconds; on the worker that wait never freezes the UI.
         self.spawn_launch(Some(task_id.clone()), move |ops| {
+            if let Err(err) = ops.queue_run(&task_id) {
+                return LaunchReport {
+                    status: Some(err.to_string()),
+                    refresh: true,
+                    redraw: true,
+                    ..LaunchReport::default()
+                };
+            }
             let pump = pump_queue(ops);
             let started = task_started_after_queue_run(ops, &task_id);
             let status = match pump.error {
