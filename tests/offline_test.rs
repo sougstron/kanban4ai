@@ -452,7 +452,9 @@ fn pair_closed(env: &Env) {
     drop(listener);
     write_server(
         env.store(),
-        &format!("server: {{node_id: n-peer, name: peer, urls: ['http://127.0.0.1:{port}']}}\n"),
+        &format!(
+            "server: {{node_id: n-peer, name: peer, urls: ['http://127.0.0.1:{port}']}}\nwip_push: true\n"
+        ),
     );
     fs::create_dir_all(env.store().join("sync")).unwrap();
     fs::write(

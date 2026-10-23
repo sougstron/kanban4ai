@@ -28,9 +28,15 @@ pub struct DiscoveryOptions {
     /// Explicitly delete this node's old sync/log refs from project origins.
     #[arg(long, conflicts_with_all=["discover","probe","bye","hello","sync","pair","pair_code","revoke_token","phone_qr","issue_token"])]
     purge_relay_refs: bool,
-    /// List refs without deleting them (with --purge-relay-refs).
-    #[arg(long, requires = "purge_relay_refs")]
+    /// Preview a ref migration or deletion without changing remotes.
+    #[arg(long)]
     dry_run: bool,
+    /// Copy existing kanban service refs from origin to sync.code_remote.
+    #[arg(long, conflicts_with_all=["discover","probe","bye","hello","sync","pair","pair_code","revoke_token","phone_qr","issue_token","purge_relay_refs","purge_origin_code_refs"])]
+    migrate_code_refs: bool,
+    /// Explicitly delete kanban WIP/run/task refs from project origins.
+    #[arg(long, conflicts_with_all=["discover","probe","bye","hello","sync","pair","pair_code","revoke_token","phone_qr","issue_token","purge_relay_refs","migrate_code_refs"])]
+    purge_origin_code_refs: bool,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -536,6 +542,15 @@ pub(super) fn run(store: &ProjectStore, options: DiscoveryOptions) -> Result<boo
         purge_relay_refs(store, options.dry_run)?;
         return Ok(true);
     }
+    if options.migrate_code_refs || options.purge_origin_code_refs {
+        migrate_code_refs(
+            store,
+            options.migrate_code_refs,
+            options.purge_origin_code_refs,
+            options.dry_run,
+        )?;
+        return Ok(true);
+    }
     if !options.discover
         && !options.probe
         && options.bye.is_none()
@@ -580,6 +595,56 @@ pub(super) fn run(store: &ProjectStore, options: DiscoveryOptions) -> Result<boo
             Ok::<(), KanbanError>(())
         })?;
     Ok(true)
+}
+
+fn migrate_code_refs(
+    store: &ProjectStore,
+    migrate: bool,
+    purge_origin: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let settings =
+        crate::core::config::SyncCodeSettings::from_global(&store.load_global_config()?)?;
+    if migrate && settings.code_remote.is_none() {
+        return Err(invalid("sync.code_remote is required for migration"));
+    }
+    for project in store.list()? {
+        let Some(repo) = crate::core::vcs::detect(&project.work_path) else {
+            continue;
+        };
+        let Some(origin) = repo.code_remote()? else {
+            println!("{} has no origin; skipped", project.id);
+            continue;
+        };
+        if migrate {
+            let target = settings.remote_for(&project.id).expect("checked above");
+            if dry_run {
+                println!(
+                    "{} would migrate origin service refs to {target}",
+                    project.id
+                );
+            } else {
+                repo.copy_remote_service_refs(&origin, &target)?;
+                // Also send refs accumulated only on this offline node.
+                repo.publish_all_service_refs(&target)?;
+                println!("{} migrated service refs to {target}", project.id);
+            }
+        }
+        if purge_origin {
+            let refs = repo.remote_service_refs(&origin)?;
+            for reference in &refs {
+                println!(
+                    "{} origin {} {reference}",
+                    project.id,
+                    if dry_run { "would delete" } else { "deleting" }
+                );
+            }
+            if !dry_run {
+                repo.delete_refs(&origin, &refs)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn purge_relay_refs(store: &ProjectStore, dry_run: bool) -> Result<()> {

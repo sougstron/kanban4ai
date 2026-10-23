@@ -21,6 +21,49 @@ use crate::core::storage::atomic_write_text;
 
 pub const DEFAULT_DEFERRED_CLEANUP_RETRY_SECS: i64 = 600;
 
+/// Machine-local publication policy for kanban's private Git refs.
+///
+/// `code_remote` is deliberately absent by default: an ordinary project
+/// `origin` must never receive WIP merely because sync was enabled.  A remote
+/// may contain `{project}`, allowing one bare repository per project on the
+/// sync server.  `wip_push` is the explicit legacy fallback to the project's
+/// ordinary code remote when no dedicated remote is configured.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncCodeSettings {
+    pub code_remote: Option<String>,
+    pub wip_push: bool,
+    pub cleanup_runs: bool,
+}
+
+impl SyncCodeSettings {
+    pub fn from_global(global: &GlobalConfig) -> Result<Self> {
+        let settings: Self = global
+            .extras
+            .get("sync")
+            .cloned()
+            .map(serde_yaml_ng::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        if settings
+            .code_remote
+            .as_deref()
+            .is_some_and(|remote| remote.trim().is_empty())
+        {
+            return Err(KanbanError::Invalid(
+                "sync.code_remote must not be blank".into(),
+            ));
+        }
+        Ok(settings)
+    }
+
+    pub fn remote_for(&self, project: &str) -> Option<String> {
+        self.code_remote
+            .as_deref()
+            .map(|remote| remote.replace("{project}", project))
+    }
+}
+
 /// Written verbatim by `kanban init`; also the source of per-key fallbacks.
 /// Mirrors the Python `DEFAULT_CONFIG` exactly.
 pub const DEFAULT_CONFIG_YAML: &str = r#"runner:

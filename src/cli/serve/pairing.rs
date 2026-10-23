@@ -50,6 +50,15 @@ pub(super) struct PairRequest {
 struct PairReply {
     node_card: Card,
     token: String,
+    /// Optional for wire compatibility with peers predating dedicated code
+    /// remotes. The server is the authority so paired nodes cannot silently
+    /// publish service refs to different repositories.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code_remote: Option<String>,
+    /// Distinguishes a new server explicitly advertising "none" from an old
+    /// peer whose reply predates this field.
+    #[serde(default)]
+    code_remote_authoritative: bool,
 }
 #[derive(Deserialize)]
 #[serde(default)]
@@ -178,10 +187,15 @@ fn accept_sync(root: &Path, request: PairRequest) -> Result<PairReply> {
     code.expires = 0;
     save(&path, &code)?;
     let token = issue_token(root, TokenKind::Node)?;
+    let code_remote =
+        crate::core::config::SyncCodeSettings::from_global(&store.load_global_config()?)?
+            .code_remote;
     super::hub::register(root, &request.node_card.node, &token_hash(&token))?;
     Ok(PairReply {
         node_card: local,
         token,
+        code_remote,
+        code_remote_authoritative: true,
     })
 }
 
@@ -315,6 +329,15 @@ pub(super) fn pair(store: &ProjectStore, address: &str, code: String) -> Result<
             return Err(invalid("sync must be a mapping"));
         }
         sync["server"] = serde_yaml_ng::to_value(&server)?;
+        if reply.code_remote_authoritative {
+            if let Some(remote) = reply.code_remote {
+                sync["code_remote"] = remote.into();
+            } else {
+                sync.as_mapping_mut()
+                    .expect("validated mapping")
+                    .remove(serde_yaml_ng::Value::String("code_remote".into()));
+            }
+        }
         save(&root.join("sync/server.yaml"), &credential)?;
         store.save_global_config(&config)?;
     }
