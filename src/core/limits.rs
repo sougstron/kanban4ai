@@ -1020,7 +1020,17 @@ fn resolve_codex(previous: Option<&LimitsSnapshot>, force: bool) -> ProviderLimi
             return prefer_newer_observation(previous_entry, fresh);
         }
     }
-    prefer_newer_observation(previous_entry, fetch_codex())
+    let rollout = fetch_codex();
+    // A revoked login leaves the last rollout's numbers behind, and nothing
+    // newer will ever arrive. Only a rollout written after the poll that saw
+    // the sign-out (a codex run that worked, so the user signed back in) may
+    // replace it before the next poll.
+    if let Some(signed_out) = previous_entry.filter(|entry| entry.state == ProviderState::SignedOut)
+        && observation_time(&rollout) <= codex_rpc_polled_at()
+    {
+        return signed_out.clone();
+    }
+    prefer_newer_observation(previous_entry, rollout)
 }
 
 /// Merge a codex reading observed elsewhere — the `x-codex-*` headers on the
@@ -2184,6 +2194,9 @@ fn codex_rpc_exchange(child: &mut Child) -> std::result::Result<ProviderLimits, 
         }
         if id == 2 {
             if let Some(error) = message.get("error") {
+                if codex_rpc_auth_failed(error) {
+                    return Ok(ProviderLimits::new("codex", ProviderState::SignedOut));
+                }
                 return Err(format!("rateLimits: {error}"));
             }
             let windows = message
@@ -2200,6 +2213,24 @@ fn codex_rpc_exchange(child: &mut Child) -> std::result::Result<ProviderLimits, 
             });
         }
     }
+}
+
+/// The app-server reports a rejected ChatGPT login only inside the error
+/// text (`... wham/usage failed: 401 Unauthorized ... token_revoked`), with the
+/// generic internal-error code, so the status is read from the message.
+fn codex_rpc_auth_failed(error: &Value) -> bool {
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    [
+        "401 Unauthorized",
+        "403 Forbidden",
+        "token_revoked",
+        "token_invalidated",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 fn spawn_line_reader(stdout: std::process::ChildStdout) -> Receiver<String> {
@@ -2383,13 +2414,20 @@ fn observation_time(entry: &ProviderLimits) -> i64 {
 }
 
 /// Ready numbers with a later `observed_at` win; a failed fetch never displaces
-/// a ready cache. Equal timestamps take the incoming row (the source just read).
+/// a ready cache, but a sign-out does — the cached numbers will never refresh
+/// again. Equal timestamps take the incoming row (the source just read).
 fn prefer_newer_observation(
     previous: Option<&ProviderLimits>,
     incoming: ProviderLimits,
 ) -> ProviderLimits {
     match previous {
-        Some(previous) if previous.is_ready() && !incoming.is_ready() => previous.clone(),
+        Some(previous)
+            if previous.is_ready()
+                && !incoming.is_ready()
+                && incoming.state != ProviderState::SignedOut =>
+        {
+            previous.clone()
+        }
         Some(previous)
             if previous.is_ready()
                 && incoming.is_ready()
@@ -3687,6 +3725,37 @@ mod tests {
         let kept = retain_fresher_providers(Some(&previous), vec![failed], now);
 
         assert_eq!(kept[0], cached);
+    }
+
+    #[test]
+    fn a_codex_sign_out_replaces_the_cached_windows() {
+        let now = 1_700_000_000;
+        let cached = ProviderLimits {
+            windows: vec![LimitWindow::new("7d", 0.0, Some(now + 200_000))],
+            observed_at: Some(now - 400_000),
+            ..ProviderLimits::new("codex", ProviderState::Ready)
+        };
+        let previous = LimitsSnapshot {
+            fetched_at: now - 60,
+            providers: vec![cached],
+        };
+        let signed_out = ProviderLimits::new("codex", ProviderState::SignedOut);
+
+        let kept = retain_fresher_providers(Some(&previous), vec![signed_out.clone()], now);
+
+        assert_eq!(kept[0], signed_out);
+    }
+
+    #[test]
+    fn codex_rpc_auth_errors_read_as_signed_out() {
+        let revoked = json!({"code": -32603, "message": "failed to fetch codex rate limits: \
+            GET https://chatgpt.com/backend-api/wham/usage failed: 401 Unauthorized; \
+            body={\"error\": {\"code\": \"token_revoked\"}}"});
+        let other =
+            json!({"code": -32603, "message": "failed to fetch codex rate limits: timeout"});
+
+        assert!(codex_rpc_auth_failed(&revoked));
+        assert!(!codex_rpc_auth_failed(&other));
     }
 
     #[test]

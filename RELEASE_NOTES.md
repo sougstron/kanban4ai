@@ -35,6 +35,12 @@
   Transfers now run unlocked; the task is re-read afterwards and only the
   reconcile-owned fields are applied, and `mark_review_seen` skips the lock
   when the task is not flagged.
+- **Codex limits report a revoked login.** When the ChatGPT session behind
+  codex is revoked, the app-server answers `account/rateLimits/read` with a
+  401. kanban4ai dropped that error and kept showing the last rollout's
+  numbers, days old, as if they were current. The codex row now reads
+  `signed out` until `codex login` (or a codex run that works) brings fresh
+  numbers back.
 
 # kanban4ai 0.8.6
 
