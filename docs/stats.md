@@ -205,10 +205,46 @@ Before printing the summary, the command atomically writes the standard
 report to `<store>/reports/stats-<timestamp>-<pid>.txt` and prints
 `Full report: <path>`. A banner explicitly identifies the row cap. Report
 files remain until manually removed. Write failures and invalid project
-selectors fail visibly; a negative or zero row limit is rejected. The default
-`stats` command and TUI report are unchanged. As before, the stats reader
-ignores malformed event lines and unavailable event files; compact mode does
-not introduce any additional filtering.
+selectors fail visibly; a negative or zero row limit is rejected. Clean
+inputs keep the previous report text. Incomplete inputs add the data-quality
+section below to the default command, the compact summary, the saved full
+report, and the TUI Stats window. Compact mode does not drop any readable
+record the full report counts.
+
+## Data-quality diagnostics
+
+`kanban stats`, `kanban stats --compact`, and the TUI Projects `S` Stats
+window say when the events they read are incomplete. A missing
+`.kanban/stats/events.jsonl` is normal (the project never recorded a session)
+and is not an issue. Blank and whitespace-only lines are ignored. Each other
+line is decoded as UTF-8 on its own: a non-UTF-8 line is skipped with reason
+`invalid UTF-8` and does not drop the rest of the file. A line `serde_json`
+rejects is skipped with the serde error text only (the raw line is never
+echoed). An unterminated final line that fails to parse is reported as
+`incomplete final line (possibly still being written): …`, because a live
+writer may still be appending it.
+
+When anything was skipped or an events file could not be read, the report
+starts with `=== DATA QUALITY: REPORT INCOMPLETE ===` (in the compact report,
+immediately after the compact banner). The section lists every affected path,
+the skip or read error, and up to `thresholds.stats_issue_samples` sample
+lines per file (default 3; `0` lists paths and counts only). Reasons are
+truncated to 160 characters. The same section text is written into the saved
+full report, so that file still matches plain `kanban stats` stdout. Totals
+still count only the readable records. The command prints
+`warning: stats report incomplete: …; see DATA QUALITY section` on stderr
+(compact also names the full-report path) and exits 0.
+
+`--project` selects the board whose `stats_issue_samples` and
+`compact_report_top_n` apply, for both the plain and compact commands. A
+missing project fails visibly. Outside a board the built-in defaults apply.
+The TUI Projects screen has no project in context and uses the built-in
+`stats_issue_samples`. Its window title is `Stats · incomplete data` when the
+report is incomplete, and the status line carries the one-line summary.
+
+The per-task Analytics panel still skips malformed lines and unreadable files
+without a diagnostic section. It does read each line as UTF-8, so one bad
+byte no longer drops the whole file.
 
 Reproduce the output comparison in an isolated temporary store:
 

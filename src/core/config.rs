@@ -62,6 +62,7 @@ thresholds:
   agent_reply_max_chars: 32768
   agent_reply_message_max_chars: 8192
   compact_report_top_n: 5
+  stats_issue_samples: 3
   limits_refresh_interval: 120
   deferred_cleanup_retry_interval: 600
 verification:
