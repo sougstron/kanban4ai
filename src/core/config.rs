@@ -61,6 +61,8 @@ thresholds:
   waiting_note_max_chars: 1000
   agent_reply_max_chars: 32768
   agent_reply_message_max_chars: 8192
+  compact_text_max_chars: 2000
+  compact_report_top_n: 5
   limits_refresh_interval: 120
   deferred_cleanup_retry_interval: 600
 verification:
@@ -2516,6 +2518,13 @@ impl Config {
         if let Some(value) = config.thresholds.get(key).and_then(as_int) {
             return Ok(value);
         }
+        Self::default_threshold(key)
+    }
+
+    /// A built-in default threshold that needs no project on disk. Store-wide
+    /// commands (e.g. `kanban stats --compact`) can run outside any single
+    /// board; they read the same defaults a board file would start from.
+    pub fn default_threshold(key: &str) -> Result<i64> {
         BoardConfig::default()
             .thresholds
             .get(key)

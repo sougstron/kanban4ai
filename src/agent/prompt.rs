@@ -72,6 +72,19 @@ fn append_interactive_wait(prompt: &mut String, task: &Task, session_id: &str) {
     ));
 }
 
+/// Context-economy rules shared by every role: keep tool output small without
+/// hiding what the task needs. This text is charged to every run, so keep it
+/// tight.
+fn append_context_economy(prompt: &mut String) {
+    prompt.push_str(
+        "\nContext economy (keep tool output small; never hide what the task needs):\n\
+- Start narrow: search first and read only the files and line ranges you need; never re-read output you already have without a reason.\n\
+- Large outputs (test runs, logs, diffs, wide searches): print a short summary with a limited number of examples/failures/conflicts, write the full output to a file, and name its path; then read only the slices you need.\n\
+- Never hide errors or facts needed to solve the task, and never silently cap stdout of external tools — if you truncate, say so and point to the full output.\n\
+- kanban4ai's own large reports have a compact mode with the full result kept reachable: \"$KANBAN_CMD\" stats --compact, \"$KANBAN_CMD\" show <id> --compact, \"$KANBAN_CMD\" questions <id> --compact.\n",
+    );
+}
+
 /// Assemble the prompt handed to a delegated agent.
 ///
 /// Every board path in it is absolute: the agent's working directory is the
@@ -257,6 +270,10 @@ record each dispute with \"$KANBAN_CMD\" suggest.",
     }
     append_project_instructions(roots, &mut prompt);
     append_thread_delta(roots, task, previous_session_id, &mut prompt)?;
+    prompt.push_str(
+        "\nContext economy guidance from the original launch still applies: narrow reads first, \
+summarized large outputs with the full result in a named file, no silent truncation.\n",
+    );
     Ok(prompt)
 }
 
@@ -328,6 +345,7 @@ Ending a reply without one of those strands the design phase and forces an autom
         task.id
     ));
     append_question_guidance(&mut prompt, task, session_id, &form_file, true);
+    append_context_economy(&mut prompt);
     append_interactive_wait(&mut prompt, task, session_id);
     prompt.push_str(role_column_block(Role::Designer));
     append_role_instructions(roots, Role::Designer, &mut prompt);
@@ -504,6 +522,7 @@ inherit this task's own backend and model.\n\n",
         task.id, task.id, task.id, task.id
     ));
     prompt.push_str(role_column_block(Role::Orchestrator));
+    append_context_economy(&mut prompt);
     append_role_instructions(roots, Role::Orchestrator, &mut prompt);
     prompt.push_str("\nUser task:\n");
     if task.description.trim().is_empty() {
@@ -564,6 +583,7 @@ monitors, and \"notifications\" die with it, so nothing you launch can re-invoke
         task.id
     ));
     append_question_guidance(&mut prompt, task, session_id, &form_file, false);
+    append_context_economy(&mut prompt);
     append_interactive_wait(&mut prompt, task, session_id);
     prompt.push_str(role_column_block(Role::Reviewer));
     append_role_instructions(roots, Role::Reviewer, &mut prompt);
