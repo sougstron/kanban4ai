@@ -12,6 +12,7 @@ pub(crate) mod serve;
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::fs;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
@@ -34,7 +35,7 @@ use crate::core::operations::{
 use crate::core::project::ProjectStore;
 use crate::core::session::{SessionManager, estimate_session_tokens};
 use crate::core::stats;
-use crate::core::storage::NewTask;
+use crate::core::storage::{NewTask, atomic_write_text};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 use crate::core::update;
@@ -49,6 +50,12 @@ pub struct Cli {
     /// Project id, name, or work path (overrides cwd / $KANBAN_PROJECT)
     #[arg(long, global = true)]
     project: Option<String>,
+    /// Compact output: long text fields are truncated with an explicit note
+    /// (the full data stays reachable on the board), and large reports also
+    /// write their full form to a file whose path is printed. Caps come from
+    /// thresholds.compact_text_max_chars / compact_report_top_n.
+    #[arg(long, global = true)]
+    compact: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -866,6 +873,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             return Ok(ExitCode::SUCCESS);
         }
         Command::Stats => {
+            if cli.compact {
+                return stats_command(cli.project.as_deref());
+            }
             println!("{}", stats::collect_store_report(timefmt::now())?);
             return Ok(ExitCode::SUCCESS);
         }
@@ -1219,16 +1229,33 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             if messages.is_empty() {
                 println!("No open messages.");
             } else {
+                let compact_max = if cli.compact {
+                    Some(
+                        Config::new(ops.data_root()).get_threshold("compact_text_max_chars")?
+                            as usize,
+                    )
+                } else {
+                    None
+                };
+                let full_hint = format!("\"$KANBAN_CMD\" questions {task_id}");
                 for message in messages {
                     let variants = if message.variants.is_empty() {
                         String::new()
                     } else {
-                        format!(" | variants: {}", message.variants.join(", "))
+                        let joined = message.variants.join(", ");
+                        format!(
+                            " | variants: {}",
+                            match compact_max {
+                                Some(max) => truncate_chars_with_note(&joined, max, &full_hint),
+                                None => joined,
+                            }
+                        )
                     };
-                    println!(
-                        "{} [{}] {}{}",
-                        message.id, message.kind, message.body, variants
-                    );
+                    let body = match compact_max {
+                        Some(max) => truncate_chars_with_note(&message.body, max, &full_hint),
+                        None => message.body.clone(),
+                    };
+                    println!("{} [{}] {}{}", message.id, message.kind, body, variants);
                 }
             }
         }
@@ -1377,6 +1404,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             task_id,
             with_context,
         } => {
+            let compact_max = if cli.compact {
+                Some(
+                    Config::new(ops.data_root()).get_threshold("compact_text_max_chars")?
+                        as usize,
+                )
+            } else {
+                None
+            };
             let Some(task) = ops.get_task(&task_id)? else {
                 eprintln!("Task {task_id} not found");
                 return Ok(ExitCode::SUCCESS);
@@ -1459,13 +1494,35 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             println!("Created: {}", timefmt::format(&task.created_at));
             println!("Updated: {}", timefmt::format(&task.updated_at));
             if !task.description.is_empty() {
-                println!("\nDescription:\n{}", task.description);
+                if let Some(max) = compact_max {
+                    println!(
+                        "\nDescription:\n{}",
+                        truncate_chars_with_note(
+                            &task.description,
+                            max,
+                            &format!("\"$KANBAN_CMD\" show {task_id}"),
+                        )
+                    );
+                } else {
+                    println!("\nDescription:\n{}", task.description);
+                }
             }
             if with_context {
                 let context =
                     ContextManager::new(ops.data_root()).get_context(&task_id, &ops.storage)?;
                 if !context.is_empty() {
-                    println!("\nContext:\n{context}");
+                    if let Some(max) = compact_max {
+                        println!(
+                            "\nContext:\n{}",
+                            truncate_chars_with_note(
+                                &context,
+                                max,
+                                &format!("\"$KANBAN_CMD\" show {task_id} --with-context"),
+                            )
+                        );
+                    } else {
+                        println!("\nContext:\n{context}");
+                    }
                 }
             }
         }
@@ -2074,4 +2131,38 @@ fn format_thousands(value: i64) -> String {
 
 fn truncate_chars(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
+}
+
+/// Head of `text` at `max_chars` with an explicit truncation note naming the
+/// total length and how to reach the full data. Compact modes must never
+/// silently drop output — the note keeps the remainder reachable.
+fn truncate_chars_with_note(text: &str, max_chars: usize, full_hint: &str) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max_chars).collect();
+    format!("{head}\n... (truncated: {total} chars total; full via {full_hint})")
+}
+
+/// `kanban stats --compact`: print the capped report and park the full one in
+/// `<store>/reports/`, printing its path so the complete result stays
+/// reachable without re-running the collection.
+fn stats_command(project: Option<&str>) -> Result<ExitCode> {
+    let top_n = match resolve::resolve_project(project) {
+        Ok(resolved) => {
+            Config::new(resolved.operations().data_root()).get_threshold("compact_report_top_n")?
+        }
+        Err(_) => Config::default_threshold("compact_report_top_n")?,
+    } as usize;
+    let now = timefmt::now();
+    let entries = stats::collect_store_entries()?;
+    let full = stats::render_report(&entries, now);
+    let reports_dir = ProjectStore::open()?.root().join("reports");
+    fs::create_dir_all(&reports_dir)?;
+    let path = reports_dir.join(format!("stats-{}.txt", now.format("%Y%m%d-%H%M%S")));
+    atomic_write_text(&path, &full)?;
+    println!("{}", stats::render_compact_report(&entries, now, top_n));
+    println!("Full report: {}", path.display());
+    Ok(ExitCode::SUCCESS)
 }
