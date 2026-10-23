@@ -1669,11 +1669,14 @@ impl Operations {
         };
 
         self.session_manager().close_session(session_id)?;
-        self.replicate_completed_code(&task.id);
 
-        // The task just entered Review: launch any task chained to its completion.
-        self.trigger_chained_tasks(&task.id)?;
+        // The task just entered Review: launch any task chained to its
+        // completion. Before replication, which waits for the store lock and
+        // pushes every finished run, so a chain never sits behind the network.
+        let chained = self.trigger_chained_tasks(&task.id);
         self.notify_completion(&task);
+        self.replicate_completed_code(&task.id);
+        chained?;
 
         // `on_conflict: resolver`: a conflicted landing re-dispatches the
         // agent immediately; the conflict report is already in the thread.
@@ -1978,11 +1981,12 @@ impl Operations {
         };
 
         self.session_manager().close_session(session_id)?;
-        self.replicate_completed_code(task_id);
 
-        match route {
+        // Chain and requeue first, replication last, like `complete_task`:
+        // replication waits for the store lock and pushes every finished run.
+        let routed = match route {
             VerdictRoute::HumanReview { exhausted } => {
-                self.trigger_chained_tasks(&task.id)?;
+                let chained = self.trigger_chained_tasks(&task.id).map(drop);
                 self.notify_completion(&task);
                 if exhausted && let Ok(notifier) = self.notifier() {
                     notifier.stranded(
@@ -1991,12 +1995,13 @@ impl Operations {
                         "Bot review budget spent; task is in human Review.",
                     );
                 }
+                chained
             }
-            VerdictRoute::Todo => {}
-            VerdictRoute::Requeue => {
-                let _ = self.dispatch_queue()?;
-            }
-        }
+            VerdictRoute::Todo => Ok(()),
+            VerdictRoute::Requeue => self.dispatch_queue().map(drop),
+        };
+        self.replicate_completed_code(task_id);
+        routed?;
         if resolver {
             self.dispatch_resolver(task_id);
         }
