@@ -1483,13 +1483,28 @@ pub(crate) fn launch_on_board(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid("Invalid project path"))?;
+    // Own thread, like `runner_action`: the daemon tick and the HTTP handlers
+    // already run inside a runtime, and a nested `block_on` panics there.
+    let (root, id, task) = (root.to_path_buf(), id.to_owned(), task.to_owned());
+    std::thread::spawn(move || launch_on_board_blocking(root, id, task, runner, queue))
+        .join()
+        .map_err(|_| invalid("Launch worker panicked"))?
+}
+
+fn launch_on_board_blocking(
+    root: PathBuf,
+    id: String,
+    task: String,
+    runner: Option<NodeRole>,
+    queue: bool,
+) -> Result<Option<Value>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
         let response = action(
-            State(root.to_path_buf()),
-            Params((id.into(), task.into(), "launch".into())),
+            State(root),
+            Params((id, task, "launch".into())),
             Ok(Json(Action {
                 runner: runner.map(role_runner),
                 on_unavailable: if queue {
