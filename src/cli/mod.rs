@@ -2082,11 +2082,12 @@ fn truncate_chars(text: &str, limit: usize) -> String {
 
 /// Store-wide stats. `--project` selects the board whose thresholds apply
 /// (`compact_report_top_n` for `--compact`, `stats_issue_samples` for both).
-/// Outside a board the built-in defaults apply. A missing project fails.
+/// Outside a board the built-in defaults apply. A missing project fails; an
+/// unregistered `<cwd>/.kanban` is read in place, never adopted into the store.
 /// Readable records are still printed when some lines or files are bad; the
 /// exit code stays success and a stderr warning points at the report section.
 fn stats_command(project: Option<&str>, compact: bool) -> Result<ExitCode> {
-    let resolved = resolve::resolve_tui(project)?;
+    let resolved = resolve::resolve_settings(project)?;
     let threshold = |key: &str| -> Result<i64> {
         match &resolved {
             Some(resolved) => Config::new(resolved.operations().data_root()).get_threshold(key),

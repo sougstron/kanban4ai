@@ -40,23 +40,49 @@ pub fn resolve_tui(selector: Option<&str>) -> Result<Option<Resolved>> {
 /// silent adoption of an unregistered `<cwd>/.kanban`, else an error.
 pub fn resolve_project(selector: Option<&str>) -> Result<Resolved> {
     let store = ProjectStore::open()?;
-    if let Some(needle) = selector
-        .map(str::trim)
-        .filter(|needle| !needle.is_empty())
-        .map(str::to_string)
-        .or_else(|| env::var(PROJECT_ENV).ok().filter(|v| !v.trim().is_empty()))
-    {
-        return store
-            .find(&needle)?
-            .map(Resolved::Project)
-            .ok_or_else(|| KanbanError::Invalid(format!("no such project: {needle}")));
+    if let Some(resolved) = resolve_selected(&store, selector)? {
+        return Ok(resolved);
     }
-
     let cwd = env::current_dir()?;
     if let Some(project) = registered_at_or_above(&store, &cwd)? {
         return Ok(Resolved::Project(project));
     }
     adopt_or_inplace(&store, &cwd)
+}
+
+/// Read-only lookup for store-wide reports that only borrow one board's
+/// settings (`kanban stats`). Same order as [`resolve_project`], except an
+/// unregistered `<cwd>/.kanban` is read in place and never moved into the
+/// store; `None` outside any board.
+pub fn resolve_settings(selector: Option<&str>) -> Result<Option<Resolved>> {
+    let store = ProjectStore::open()?;
+    if let Some(resolved) = resolve_selected(&store, selector)? {
+        return Ok(Some(resolved));
+    }
+    let cwd = env::current_dir()?;
+    if let Some(project) = registered_at_or_above(&store, &cwd)? {
+        return Ok(Some(Resolved::Project(project)));
+    }
+    Ok(cwd
+        .join(".kanban")
+        .is_dir()
+        .then_some(Resolved::InPlace(cwd)))
+}
+
+/// `--project` / `$KANBAN_PROJECT`, when either is set; an unknown one fails.
+fn resolve_selected(store: &ProjectStore, selector: Option<&str>) -> Result<Option<Resolved>> {
+    let Some(needle) = selector
+        .map(str::trim)
+        .filter(|needle| !needle.is_empty())
+        .map(str::to_string)
+        .or_else(|| env::var(PROJECT_ENV).ok().filter(|v| !v.trim().is_empty()))
+    else {
+        return Ok(None);
+    };
+    store
+        .find(&needle)?
+        .map(|project| Some(Resolved::Project(project)))
+        .ok_or_else(|| KanbanError::Invalid(format!("no such project: {needle}")))
 }
 
 fn registered_at_or_above(store: &ProjectStore, cwd: &Path) -> Result<Option<Project>> {
