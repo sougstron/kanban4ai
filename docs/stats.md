@@ -250,8 +250,9 @@ window say when the events they read are incomplete. A missing
 and is not an issue. Blank and whitespace-only lines are ignored. Each other
 line is decoded as UTF-8 on its own: a non-UTF-8 line is skipped with reason
 `invalid UTF-8` and does not drop the rest of the file. A line `serde_json`
-rejects is skipped with the serde error text only (the raw line is never
-echoed). An unterminated final line that fails to parse is reported as
+rejects is skipped with the serde error text and column only (the raw line
+is never echoed, and serde's per-line `at line 1` is dropped so it cannot
+contradict the file line number). An unterminated final line that fails to parse is reported as
 `incomplete final line (possibly still being written): …`, because a live
 writer may still be appending it.
 
@@ -269,6 +270,8 @@ still count only the readable records. The command prints
 `--project` selects the board whose `stats_issue_samples` and
 `compact_report_top_n` apply, for both the plain and compact commands. A
 missing project fails visibly. Outside a board the built-in defaults apply.
+An unregistered `<cwd>/.kanban` supplies its thresholds in place; the report
+never adopts it into the store.
 The TUI Projects screen has no project in context and uses the built-in
 `stats_issue_samples`. Its window title is `Stats · incomplete data` when the
 report is incomplete, and the status line carries the one-line summary.
