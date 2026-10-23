@@ -1483,13 +1483,28 @@ pub(crate) fn launch_on_board(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid("Invalid project path"))?;
+    // Own thread, like `runner_action`: the daemon tick and the HTTP handlers
+    // already run inside a runtime, and a nested `block_on` panics there.
+    let (root, id, task) = (root.to_path_buf(), id.to_owned(), task.to_owned());
+    std::thread::spawn(move || launch_on_board_blocking(root, id, task, runner, queue))
+        .join()
+        .map_err(|_| invalid("Launch worker panicked"))?
+}
+
+fn launch_on_board_blocking(
+    root: PathBuf,
+    id: String,
+    task: String,
+    runner: Option<NodeRole>,
+    queue: bool,
+) -> Result<Option<Value>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
         let response = action(
-            State(root.to_path_buf()),
-            Params((id.into(), task.into(), "launch".into())),
+            State(root),
+            Params((id, task, "launch".into())),
             Ok(Json(Action {
                 runner: runner.map(role_runner),
                 on_unavailable: if queue {
@@ -2156,6 +2171,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_launch_inside_runtime_returns_error_without_panicking() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let work = temp.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let p = ProjectStore::at(&root).add(&work, None).unwrap().project;
+        Storage::new(&p.data_root).init_board().unwrap();
+        Journal::open(&root).unwrap();
+        atomic_write_text_raw(
+            &root.join("config.yaml"),
+            "sync:\n  server:\n    node_id: server-node\n    name: home\n    urls: [http://127.0.0.1:1]\n",
+        ).unwrap();
+        let response = launch_on_board(&p.data_root, "TASK-999999", None, true)
+            .unwrap()
+            .unwrap();
+        assert!(response.get("error").is_some(), "{response}");
+    }
+
+    #[tokio::test]
     async fn placement_pins_here_and_distinguishes_same_role_nodes() {
         use crate::core::config::Runner;
         let temp = tempfile::tempdir().unwrap();
@@ -2216,5 +2250,14 @@ mod tests {
             .unwrap();
         assert!(!local_runner(&p.data_root, pinned.runner.as_ref()).unwrap());
         assert!(pinned.session.is_none());
+        let ops = Operations::for_project(&p);
+        assert!(!ops.owns_queued_run(&pinned).unwrap());
+        let mut queued = pinned;
+        for runner in [Runner::Here, Runner::Node("desk".into())] {
+            queued.runner = Some(runner);
+            assert!(ops.owns_queued_run(&queued).unwrap());
+        }
+        queued.runner = Some(Runner::Auto);
+        assert!(!ops.owns_queued_run(&queued).unwrap());
     }
 }
