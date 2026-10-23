@@ -221,7 +221,9 @@ pub fn for_launch(root: &Path, id: &str) -> Result<Project> {
     if node_role(root)? == Some(NodeRole::Mobile) && remote(&project)?.is_none() {
         return Err(invalid("SYNC_NO_REMOTE"));
     }
-    if repository(&project).is_some() {
+    // Existing non-git work folders need no clone preparation either. Taking
+    // the store lock here would stall their launch behind code replication.
+    if repository(&project).is_some() || project.work_path.is_dir() {
         return Ok(project);
     }
     prepare(root, id).map_err(|e| {
