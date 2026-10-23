@@ -22,6 +22,8 @@ auto-loaded into every agent session. Read it when you are reading or adding a s
 - `waiting_note_max_chars`: 1000 - maximum stored wait note length
 - `agent_reply_max_chars`: 32768 - maximum length of the agent's session answer (every assistant text of the run, in order) recorded on the thread at exit (`0` disables recording it); the budget is spent from the last message backwards
 - `agent_reply_message_max_chars`: 8192 - maximum length kept from any single *earlier* message of that answer, so one long mid-run message cannot eat the whole budget (`0` disables the per-message cap)
+- `compact_report_top_n`: 5 - maximum rows in each breakdown table of `kanban stats --compact` (a positive integer; the model cap of 10 still applies). `--project` selects the board; outside a board the built-in default applies
+- `stats_issue_samples`: 3 - malformed-line samples shown per events file in the stats data-quality section (`0` shows counts and paths only; a negative value is rejected). Same `--project` resolution as `compact_report_top_n`. The TUI Projects screen uses the built-in default. See `docs/stats.md`
 - `limits_refresh_interval`: 120 (sec) - how long a provider-limits snapshot stays fresh before the TUI refreshes it in the background
 
 ## Project Instructions (.kanban/config.yaml `instructions:`)
