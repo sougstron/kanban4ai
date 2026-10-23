@@ -10,6 +10,7 @@ mod project;
 mod resolve;
 pub(crate) mod serve;
 
+use std::fs;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -34,7 +35,7 @@ use crate::core::operations::{
 use crate::core::project::ProjectStore;
 use crate::core::session::{SessionManager, estimate_session_tokens};
 use crate::core::stats;
-use crate::core::storage::NewTask;
+use crate::core::storage::{NewTask, atomic_write_text};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 use crate::core::update;
@@ -491,7 +492,11 @@ enum Command {
     /// by backend/model/project) across every registered project. The board
     /// collects this itself, purely from state transitions it already
     /// drives — never from anything an agent writes.
-    Stats,
+    Stats {
+        /// Limit breakdown rows and save the standard report to a file.
+        #[arg(long)]
+        compact: bool,
+    },
     /// Check GitHub Releases for a newer kanban4ai; without --check also
     /// install it: download, verify the published SHA-256, and atomically
     /// replace the running binary. A pacman-owned binary is never touched —
@@ -865,7 +870,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             return Ok(ExitCode::SUCCESS);
         }
-        Command::Stats => {
+        Command::Stats { compact } => {
+            if compact {
+                return stats_command(cli.project.as_deref());
+            }
             println!("{}", stats::collect_store_report(timefmt::now())?);
             return Ok(ExitCode::SUCCESS);
         }
@@ -1721,7 +1729,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Tui
         | Command::Net { .. }
         | Command::Limits { .. }
-        | Command::Stats
+        | Command::Stats { .. }
         | Command::Update { .. }
         | Command::StatuslineBridge
         | Command::Serve { .. }
@@ -2074,4 +2082,34 @@ fn format_thousands(value: i64) -> String {
 
 fn truncate_chars(text: &str, limit: usize) -> String {
     text.chars().take(limit).collect()
+}
+
+// Explicit compact reporting never changes external command stdout.
+fn stats_command(project: Option<&str>) -> Result<ExitCode> {
+    let top_n = match resolve::resolve_tui(project)? {
+        Some(resolved) => {
+            Config::new(resolved.operations().data_root()).get_threshold("compact_report_top_n")?
+        }
+        None => Config::default_threshold("compact_report_top_n")?,
+    };
+    let top_n = usize::try_from(top_n)
+        .ok()
+        .filter(|n| *n > 0)
+        .ok_or_else(|| {
+            KanbanError::Invalid("compact_report_top_n must be a positive integer".into())
+        })?;
+    let now = timefmt::now();
+    let entries = stats::collect_store_entries()?;
+    let full = stats::render_report(&entries, now);
+    let reports_dir = ProjectStore::open()?.root().join("reports");
+    fs::create_dir_all(&reports_dir)?;
+    let path = reports_dir.join(format!(
+        "stats-{}-{}.txt",
+        now.format("%Y%m%d-%H%M%S-%f"),
+        std::process::id()
+    ));
+    atomic_write_text(&path, &full)?;
+    println!("{}", stats::render_compact_report(&entries, now, top_n));
+    println!("Full report: {}", path.display());
+    Ok(ExitCode::SUCCESS)
 }
