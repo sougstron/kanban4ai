@@ -292,8 +292,10 @@ fn reconcile_pushes_results_without_holding_the_board_lock() {
     let task = a.create_task(NewTask::titled("unlocked push")).unwrap();
     take(&p.pa, &task.id, "ses-unlocked", "unlocked-result");
     a.complete_task(&task.id, "ses-unlocked", true).unwrap();
-    // Completion already published; drop the remote copies so reconcile
-    // pushes again while the remote probes the pushing board's lock.
+    // Completion already published; drop the remote copies and the local
+    // publication mark so reconcile pushes again while the remote probes
+    // the pushing board's and the store's locks.
+    forget_publications(&p.pa, &task.id);
     for reference in git(
         &p.remote,
         &[
@@ -312,8 +314,9 @@ fn reconcile_pushes_results_without_holding_the_board_lock() {
     fs::write(
         &hook,
         format!(
-            "#!/bin/sh\nif flock -n '{}' true; then echo free; else echo held; fi >> '{}'\n",
+            "#!/bin/sh\nfor lock in '{}' '{}'; do if flock -n \"$lock\" true; then echo free; else echo held; fi; done >> '{}'\n",
             p.pa.kanban_dir().join(".lock").display(),
+            p.a.join(".lock").display(),
             probe.display()
         ),
     )
@@ -325,6 +328,100 @@ fn reconcile_pushes_results_without_holding_the_board_lock() {
     assert!(probes.contains("free"), "{probes}");
     assert!(!probes.contains("held"), "{probes}");
 }
+fn forget_publications(p: &Project, task: &str) {
+    fs::remove_file(
+        p.kanban_dir()
+            .join("code")
+            .join(format!("{task}.published")),
+    )
+    .unwrap();
+}
+
+#[test]
+fn project_creation_is_not_blocked_by_a_slow_code_remote() {
+    let p = pair(false);
+    let a = ops(&p.pa);
+    let task = a.create_task(NewTask::titled("slow remote")).unwrap();
+    take(&p.pa, &task.id, "ses-slow", "slow-result");
+    a.complete_task(&task.id, "ses-slow", true).unwrap();
+    forget_publications(&p.pa, &task.id);
+    for reference in git(
+        &p.remote,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/kanban",
+            "refs/heads/kanban",
+        ],
+    )
+    .lines()
+    {
+        git(&p.remote, &["update-ref", "-d", reference]);
+    }
+    let started = p.remote.with_extension("started");
+    let release = p.remote.with_extension("release");
+    let hook = p.remote.join("hooks/pre-receive");
+    // The push stalls until the test releases it (bounded, so a regression
+    // fails on the timing assertion instead of hanging).
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ntouch '{}'\ni=0\nwhile [ ! -e '{}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done\n",
+            started.display(),
+            release.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let root = p.a.clone();
+    let pass = std::thread::spawn(move || code::reconcile(&root));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline && !pass.is_finished(),
+            "push never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let other = p.a.parent().unwrap().join("other");
+    fs::create_dir_all(&other).unwrap();
+    let clock = std::time::Instant::now();
+    ProjectStore::at(&p.a).add(&other, None).unwrap();
+    let waited = clock.elapsed();
+    let still_pushing = !release.exists();
+    fs::write(&release, "").unwrap();
+    pass.join().unwrap().unwrap();
+    assert!(still_pushing);
+    assert!(waited < std::time::Duration::from_secs(5), "{waited:?}");
+}
+
+#[test]
+fn an_unchanged_reconcile_makes_no_network_call() {
+    let p = pair(false);
+    let a = ops(&p.pa);
+    let task = a.create_task(NewTask::titled("steady")).unwrap();
+    take(&p.pa, &task.id, "ses-steady", "steady-result");
+    a.complete_task(&task.id, "ses-steady", true).unwrap();
+    code::reconcile(&p.a).unwrap();
+    // Any push or fetch now fails: the steady pass must not attempt one.
+    let hidden = p.remote.with_extension("offline");
+    fs::rename(&p.remote, &hidden).unwrap();
+    code::reconcile(&p.a).unwrap();
+    code::reconcile(&p.a).unwrap();
+    // Resetting the marks republishes (here: fails against the gone remote).
+    forget_publications(&p.pa, &task.id);
+    assert!(code::reconcile(&p.a).is_err());
+    fs::rename(&hidden, &p.remote).unwrap();
+    code::reconcile(&p.a).unwrap();
+    assert!(
+        p.pa.kanban_dir()
+            .join("code")
+            .join(format!("{}.published", task.id))
+            .exists()
+    );
+}
+
 #[test]
 fn a_refused_result_push_backs_off_and_tells_the_task_once() {
     let p = pair(false);
@@ -332,6 +429,7 @@ fn a_refused_result_push_backs_off_and_tells_the_task_once() {
     let task = a.create_task(NewTask::titled("refused push")).unwrap();
     take(&p.pa, &task.id, "ses-refused", "refused-result");
     a.complete_task(&task.id, "ses-refused", true).unwrap();
+    forget_publications(&p.pa, &task.id);
     for reference in git(
         &p.remote,
         &["for-each-ref", "--format=%(refname)", "refs/kanban"],
