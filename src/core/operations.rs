@@ -992,6 +992,13 @@ impl Operations {
             } else {
                 if target_status == TaskStatus::Archive.as_str() {
                     self.clear_task_session_logs(&task);
+                    if let Err(error) = crate::core::wip::cleanup_board(self.data_root(), &task.id)
+                    {
+                        self.post_queue_note(
+                            &task.id,
+                            &format!("Service ref cleanup pending: {error}"),
+                        );
+                    }
                 }
                 let moved = self.storage.move_task(task_id, target_status, is_agent)?;
                 let entered_review = moved.as_ref().is_some_and(|m| {
@@ -1081,6 +1088,13 @@ impl Operations {
             } else {
                 if to == TaskStatus::Archive {
                     self.clear_task_session_logs(&task);
+                    if let Err(error) = crate::core::wip::cleanup_board(self.data_root(), &task.id)
+                    {
+                        self.post_queue_note(
+                            &task.id,
+                            &format!("Service ref cleanup pending: {error}"),
+                        );
+                    }
                 }
                 self.storage.move_task(&task.id, to.as_str(), false)?
             };
@@ -1112,6 +1126,9 @@ impl Operations {
     /// record of which session last worked the task.
     fn move_task_to_done(&self, task: &Task) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
+        if let Err(error) = crate::core::wip::cleanup_board(self.data_root(), &task.id) {
+            self.post_queue_note(&task.id, &format!("Service ref cleanup pending: {error}"));
+        }
         self.clear_task_assets(task);
         self.context_manager()
             .clear_context(&task.id, &self.storage)?;
@@ -4095,12 +4112,24 @@ impl Operations {
         if crate::core::code::managed_clone(self.data_root(), self.work_path())
             .map_err(|e| e.to_string())?
         {
-            let published = repo.code_remote().and_then(|remote| {
-                if let Some(remote) = remote {
+            let published = (|| {
+                let Some(root) = crate::core::sync::store_for_board(self.data_root()) else {
+                    return Ok(());
+                };
+                let Some(project) = self
+                    .project_id
+                    .as_deref()
+                    .map(|id| crate::core::project::ProjectStore::at(root).get(id))
+                    .transpose()?
+                    .flatten()
+                else {
+                    return Ok(());
+                };
+                if let Some(remote) = crate::core::code::publication_remote(root, &project)? {
                     repo.publish_code(&remote)?;
                 }
-                Ok(())
-            });
+                Ok::<(), KanbanError>(())
+            })();
             if let Err(error) = published {
                 self.post_queue_note(&task.id, &format!("Code publication pending: {error}"));
             }
@@ -4135,10 +4164,11 @@ impl Operations {
             if repo.read_ref(&commit)?.is_none() {
                 let root = crate::core::sync::store_for_board(self.data_root())
                     .ok_or_else(|| KanbanError::Invalid("not a synchronized board".into()))?;
-                let remote =
-                    crate::core::code::status(root, self.project_id.as_deref().unwrap_or(""))?
-                        .remote
-                        .ok_or_else(|| KanbanError::Invalid("SYNC_NO_REMOTE".into()))?;
+                let project = crate::core::project::ProjectStore::at(root)
+                    .get(self.project_id.as_deref().unwrap_or(""))?
+                    .ok_or_else(|| KanbanError::Invalid("project missing".into()))?;
+                let remote = crate::core::code::publication_remote(root, &project)?
+                    .ok_or_else(|| KanbanError::Invalid("SYNC_NO_REMOTE".into()))?;
                 repo.fetch_run(&remote, &crate::core::wip::reference(&task.id))?;
             }
             return repo

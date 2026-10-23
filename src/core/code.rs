@@ -40,6 +40,21 @@ fn remote(project: &Project) -> Result<Option<String>> {
     }
     Ok(record(project)?["git_remote"].as_str().map(str::to_owned))
 }
+
+/// Remote used exclusively for kanban's service refs.  A dedicated remote
+/// wins; falling back to the project's code origin is explicitly opt-in.
+pub fn publication_remote(root: &Path, project: &Project) -> Result<Option<String>> {
+    let settings = super::config::SyncCodeSettings::from_global(
+        &ProjectStore::at(root).load_global_config()?,
+    )?;
+    if let Some(remote) = settings.remote_for(&project.id) {
+        return Ok(Some(remote));
+    }
+    if settings.wip_push {
+        return remote(project);
+    }
+    Ok(None)
+}
 fn clone_path(root: &Path, id: &str) -> Result<PathBuf> {
     let config: serde_yaml_ng::Value = match fs::read_to_string(root.join("config.yaml")) {
         Ok(text) => serde_yaml_ng::from_str(&text)?,
@@ -133,16 +148,16 @@ pub fn export(
     Ok((bundle, remote))
 }
 
-pub fn publish_live(root: &Path, id: &str, remote: &str) -> Result<()> {
+pub fn publish_live(root: &Path, id: &str) -> Result<()> {
     let _store = ProjectStore::at(root).lock()?;
     let project = project(root, id)?;
     let _guard = lock_file_reentrant(&project.kanban_dir().join(".lock"))?;
     let repo = repository(&project).ok_or_else(|| invalid("RUNNER_REPO_MISSING"))?;
-    let mut value = record(&project)?;
-    value["git_remote"] = remote.into();
-    save(&project, &value)?;
     repo.capture_code_snapshot(!managed_clone(&project.data_root, &project.work_path)?)?;
-    repo.publish_code(remote)
+    if let Some(service_remote) = publication_remote(root, &project)? {
+        repo.publish_code(&service_remote)?;
+    }
+    Ok(())
 }
 
 pub fn prepare_from_remote(root: &Path, id: &str, remote: &str) -> Result<CloneStatus> {
@@ -475,12 +490,19 @@ pub fn reconcile(root: &Path) -> Result<()> {
             if refusal_pending(&project.data_root, &task.id, &tips) {
                 continue;
             }
+            let Some(source) = publication_remote(root, &project)? else {
+                // Completed refs remain local and are retried after a
+                // dedicated remote is configured (or origin is opted in).
+                if task.run_duplicate != before.2 {
+                    storage.save_task(&task)?;
+                }
+                continue;
+            };
             // Pushes and fetches run unlocked: a slow or rejecting remote held
             // the board lock for seconds every cycle, stalling every TUI save
             // and task open behind it. The task is re-read once they finish.
             drop(guard);
             let transfer = (|| -> Result<()> {
-                let source = remote(&project)?.ok_or_else(|| invalid("SYNC_NO_REMOTE"))?;
                 let repo = match repository(&project) {
                     Some(repo) => repo,
                     None => {

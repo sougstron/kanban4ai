@@ -892,6 +892,57 @@ runs:
   `.kanban/wip/TASK-N.published`, не реплицируется.
 - `POST /api/v1/projects/<p>/tasks/<t>/continue` принимает
   `{runner: "<имя>", generation: <gen>, last_published: false}`.
+
+### Служебный code remote и политика публикации
+
+Git refs синхронизации отделены от обычного project `origin`. В глобальном
+`config.yaml` узла настройте, например:
+
+```yaml
+sync:
+  code_remote: ssh://kanban-server/srv/kanban-code/{project}.git
+  wip_push: false
+  cleanup_runs: false
+```
+
+`{project}` заменяется стабильным id проекта. Рекомендуемый remote — приватный
+bare repository на sync-сервере, доступный по одному и тому же URL со всех
+узлов. Сервер передаёт опциональный `code_remote` новому узлу при pairing;
+старые реализации просто игнорируют это поле, поэтому protocol 3 не меняется.
+URL должен быть сетевым и пригодным для клиентов: локальный путь сервера не
+станет доступным на ноутбуке автоматически.
+
+Без `sync.code_remote` публикация выключена: WIP и завершённые run refs
+остаются в локальном object store и досылаются очередным heartbeat/reconcile
+после появления remote. Это штатный offline-режим; HTTP bundle по-прежнему
+переносит код при доступном прямом sync. Для старого поведения можно явно
+задать `sync.wip_push: true` — тогда служебные refs публикуются в project
+`origin`. Значение по умолчанию `false`, поэтому публичный GitHub не получает
+незаконченный код автоматически.
+
+Повторный heartbeat сравнивает tree OID с последней успешной публикацией для
+текущего remote и run generation. Если дерево не менялось, Git push не
+выполняется (commit SHA не сравнивается, так как `commit-tree` создаёт новый
+commit с новой датой).
+
+Однократная миграция уже существующих локальных/origin refs выполняется явно:
+
+```sh
+kanban serve --migrate-code-refs
+kanban serve --migrate-code-refs --dry-run
+```
+
+После проверки нового remote старые refs с `origin` можно удалить отдельной,
+никогда не автоматической командой:
+
+```sh
+kanban serve --purge-origin-code-refs --dry-run
+kanban serve --purge-origin-code-refs
+```
+
+При переходе задачи в Done или Archive удаляются её локальные и remote
+`wip`/`wip-runs` refs. Завершённые `runs` по умолчанию сохраняются для
+восстановления; `sync.cleanup_runs: true` удаляет и их.
   Устаревшее поколение даёт `RUN_ALREADY_RUNNING`, несколько активных
   источников — `RUN_DUPLICATE`. Онлайн-источник публикует WIP, закрывает session,
   останавливает tmux либо проверенную по PID/start-time background process group,
@@ -1861,7 +1912,8 @@ tmux server на общем тестовом host. Полный E2E не зел�
 
 ## 15. Настройки
 
-Ключи. Всё меняется кнопками во вкладке Sync (TASK-415); CLI не нужен.
+Ключи. Основные сетевые настройки меняются во вкладке Sync; policy служебных
+Git refs пока задаётся в `<store>/config.yaml`.
 
 | Ключ | Где | По умолчанию |
 |---|---|---|
@@ -1872,6 +1924,9 @@ tmux server на общем тестовом host. Полный E2E не зел�
 | `sync.max_skew` | локально | 5 мин |
 | `sync.probe_timeout` | локально | 3 с |
 | `sync.run_heartbeat` | реплицируется | 60 с |
+| `sync.code_remote` | локально; сервер передаёт при pairing | отсутствует |
+| `sync.wip_push` | локально | false |
+| `sync.cleanup_runs` | локально | false |
 | `sync.wake_timeout` | локально | 180 с |
 | `sync.auto_wake` | реплицируется | false |
 | `sync.log_interval` | локально | 60 с |
