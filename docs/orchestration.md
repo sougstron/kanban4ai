@@ -191,6 +191,12 @@ entry is unlimited.
 - Every other cap only **skips** its own candidate and the walk continues, so a
   full claude quota never holds back an opencode task.
 
+**Placement.** On a paired store, an unpinned queued task whose effective
+runner is `here` (or this node’s name/role) uses the local dispatcher and its
+normal caps. Remote and `auto` placement still goes through runner selection.
+An existing non-Git work folder does not wait for clone preparation or the
+store lock held by code publication.
+
 **Claiming.** Because several pumps can run at once, a start is claimed under
 the board lock: re-read the task, verify it is still In Progress with phase
 `queued`, no live session and no future `restart_at`, re-measure the caps, mint
@@ -451,6 +457,10 @@ names one.
 
 ## Task Chaining
 A task may carry a `chained_to` target task id. When the **target** task enters Review — via `move` or an agent's `done` — every task whose `chained_to` equals that id and is still in **To Do** is auto-run with a fresh per-task session (its own backend/model/persona/description). Only the To-Do→Review transition fires it (re-entering Review does not). Gated by the `auto_launch_chained` rule and `auto_launch.enabled`.
+
+Completion triggers chained starts and completion notifications before publishing
+finished code to the sync remote, so a slow publication cannot delay the chain.
+Reviewer verdicts likewise route the next run before publication.
 
 ## Task Dependencies (the DAG)
 

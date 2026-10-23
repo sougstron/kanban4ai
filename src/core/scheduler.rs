@@ -13,9 +13,9 @@ use std::collections::HashMap;
 use chrono::NaiveDateTime;
 
 use crate::agent::{resolve_launch_settings, upcoming_run_plan};
-use crate::core::config::{BoardConfig, OrchestrationSettings};
+use crate::core::config::{BoardConfig, OrchestrationSettings, Runner};
 use crate::core::error::{KanbanError, Result};
-use crate::core::models::{IntegrationState, Role, RunPhase, TaskStatus};
+use crate::core::models::{IntegrationState, Role, RunPhase, Task, TaskStatus};
 use crate::core::operations::{Operations, PoolOutcome, safe_session_component, sort_tasks};
 use crate::core::session::{SessionManager, SessionState};
 use crate::core::stats;
@@ -336,7 +336,7 @@ impl Operations {
             {
                 continue;
             }
-            if !crate::cli::serve::local_runner(self.data_root(), candidate.runner.as_ref())? {
+            if !self.owns_queued_run(&candidate)? {
                 // A human waiting queue belongs to the frontend, unlike a
                 // runner_request already durably delivered through the journal.
                 crate::cli::serve::launch_on_board(self.data_root(), &candidate.id, None, true)?;
@@ -386,6 +386,24 @@ impl Operations {
         Ok(dispatched)
     }
 
+    /// Whether this node's dispatcher starts `task`'s queued run. A pinned
+    /// runner decides as before. An unpinned task on a paired store follows
+    /// the board's placement default: `here` (or this node's name or role)
+    /// runs through the ordinary claim, under the caps. Only `auto` still goes
+    /// to the frontend, which needs the peers' presence to pick a node.
+    /// Without this, every unpinned queued task took the frontend launch path,
+    /// which waits for the store lock and bypasses the caps.
+    pub(crate) fn owns_queued_run(&self, task: &Task) -> Result<bool> {
+        if crate::cli::serve::local_runner(self.data_root(), task.runner.as_ref())? {
+            return Ok(true);
+        }
+        match self.config.load()?.runner_for(task.runner.clone()) {
+            Runner::Here => Ok(true),
+            Runner::Auto => Ok(false),
+            placement => crate::cli::serve::local_runner(self.data_root(), Some(&placement)),
+        }
+    }
+
     /// Flip a queued task to running under the board lock: re-read it, verify
     /// it is still In Progress with phase `queued` and no live session, mint
     /// the session id, and persist the claim — all inside one locked
@@ -407,7 +425,7 @@ impl Operations {
             if task.status != TaskStatus::InProgress || task.run_phase != Some(RunPhase::Queued) {
                 return Ok(None);
             }
-            if !crate::cli::serve::local_runner(self.data_root(), task.runner.as_ref())? {
+            if !self.owns_queued_run(&task)? {
                 return Ok(None);
             }
             if task.restart_at.is_some_and(|at| at > timefmt::now()) {
