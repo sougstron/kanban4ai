@@ -184,7 +184,8 @@ fn tick_worker_snapshots_match_inline_board_and_live_tokens() {
     app.apply_tick_result(result).unwrap();
     assert!(has_task(&app, &added.id));
     assert_eq!(app.session_progress[&task.id].todos(), Some((1, 2)));
-    assert_eq!(app.task_tokens[&task.id].input, 2000);
+    assert_eq!(app.task_tokens[&task.id].input, 1200);
+    assert_eq!(app.task_tokens[&task.id].cache_read, 800);
     assert_eq!(app.task_tokens[&task.id].output, 300);
     let after = render_snapshot(&mut app);
     insta::assert_snapshot!("tick_worker_after", after);

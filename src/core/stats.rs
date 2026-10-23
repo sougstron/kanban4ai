@@ -56,6 +56,7 @@ use crate::core::models::Task;
 use crate::core::project::ProjectStore;
 use crate::core::telemetry::{self, TokenBreakdown};
 use crate::core::timefmt;
+use crate::core::token_costs::{CostWeights, TokenCosts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,10 +137,16 @@ enum Record {
         effort: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
-        /// Input/output/cache split (see [`TokenBreakdown`]); absent on
-        /// records written before the per-task analytics existed.
+        /// Whole prompt (fresh + cache read + cache write). Kept as the
+        /// historical total so an older binary reading this file still sees
+        /// the prompt size it always did. Absent when the record has no split.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input: Option<i64>,
+        /// Fresh (uncached) prompt tokens. Absent on records written before
+        /// the split was stored separately; those are recovered as
+        /// `input - cache_read - cache_write`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_fresh: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,6 +154,40 @@ enum Record {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cache_write: Option<i64>,
     },
+}
+
+/// In-memory split of one usage record.
+///
+/// `input_fresh` present → that value is the fresh prompt. An older split
+/// (input/output present, no `input_fresh`) recovers fresh as
+/// `input - cache_read - cache_write`. A tokens-only record returns `None`
+/// and is counted as mixed, never folded into the fresh or cache columns.
+fn usage_breakdown(
+    input: Option<i64>,
+    input_fresh: Option<i64>,
+    output: Option<i64>,
+    cache_read: Option<i64>,
+    cache_write: Option<i64>,
+) -> Option<TokenBreakdown> {
+    if let Some(fresh) = input_fresh {
+        return Some(TokenBreakdown {
+            input: fresh,
+            output: output.unwrap_or(0),
+            cache_read: cache_read.unwrap_or(0),
+            cache_write: cache_write.unwrap_or(0),
+        });
+    }
+    if input.is_some() || output.is_some() {
+        let cache_read = cache_read.unwrap_or(0);
+        let cache_write = cache_write.unwrap_or(0);
+        return Some(TokenBreakdown {
+            input: (input.unwrap_or(0) - cache_read - cache_write).max(0),
+            output: output.unwrap_or(0),
+            cache_read,
+            cache_write,
+        });
+    }
+    None
 }
 
 fn events_path(project_path: &Path) -> PathBuf {
@@ -235,7 +276,8 @@ pub fn record_usage(
             model: tags.model.clone(),
             effort: tags.effort.clone(),
             agent: tags.agent.clone(),
-            input: breakdown.map(|b| b.input),
+            input: breakdown.map(|b| b.prompt_total()),
+            input_fresh: breakdown.map(|b| b.input),
             output: breakdown.map(|b| b.output),
             cache_read: breakdown.map(|b| b.cache_read),
             cache_write: breakdown.map(|b| b.cache_write),
@@ -451,6 +493,7 @@ fn pair_records(records: Vec<Record>) -> ProjectStats {
                 effort,
                 agent,
                 input,
+                input_fresh,
                 output,
                 cache_read,
                 cache_write,
@@ -459,12 +502,7 @@ fn pair_records(records: Vec<Record>) -> ProjectStats {
                 session_id,
                 ts,
                 tokens,
-                breakdown: (input.is_some() || output.is_some()).then(|| TokenBreakdown {
-                    input: input.unwrap_or(0),
-                    output: output.unwrap_or(0),
-                    cache_read: cache_read.unwrap_or(0),
-                    cache_write: cache_write.unwrap_or(0),
-                }),
+                breakdown: usage_breakdown(input, input_fresh, output, cache_read, cache_write),
                 backend,
                 model,
                 effort,
@@ -633,6 +671,7 @@ impl TaskAnalyticsBuilder {
                 tokens,
                 backend,
                 input,
+                input_fresh,
                 output,
                 cache_read,
                 cache_write,
@@ -643,12 +682,7 @@ impl TaskAnalyticsBuilder {
                 {
                     return;
                 }
-                let recorded = (input.is_some() || output.is_some()).then(|| TokenBreakdown {
-                    input: input.unwrap_or(0),
-                    output: output.unwrap_or(0),
-                    cache_read: cache_read.unwrap_or(0),
-                    cache_write: cache_write.unwrap_or(0),
-                });
+                let recorded = usage_breakdown(input, input_fresh, output, cache_read, cache_write);
                 let breakdown = recorded.or_else(|| {
                     session_id.as_deref().and_then(|session_id| {
                         transcript_breakdown(
@@ -803,6 +837,32 @@ fn group_task_count(pairs: impl Iterator<Item = (Option<String>, String)>) -> Ve
 }
 
 /// Average `value` per distinct task id, grouped by `key`.
+fn group_average_f64(
+    pairs: impl Iterator<Item = (Option<String>, String, f64)>,
+) -> Vec<(String, f64)> {
+    let mut sums: HashMap<String, f64> = HashMap::new();
+    let mut tasks: HashMap<String, HashSet<String>> = HashMap::new();
+    for (key, task_id, value) in pairs {
+        let key = key.unwrap_or_else(|| "unknown".to_string());
+        *sums.entry(key.clone()).or_insert(0.0) += value;
+        tasks.entry(key).or_default().insert(task_id);
+    }
+    let mut rows: Vec<(String, f64)> = sums
+        .into_iter()
+        .map(|(key, sum)| {
+            let count = tasks.get(&key).map_or(1, HashSet::len).max(1);
+            (key, sum / count as f64)
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    rows
+}
+
+/// Average `value` per distinct task id, grouped by `key`.
 fn group_average_per_task(
     pairs: impl Iterator<Item = (Option<String>, String, i64)>,
 ) -> Vec<(String, f64)> {
@@ -941,68 +1001,276 @@ fn table_caps(cap: Option<usize>) -> (Option<usize>, Option<usize>) {
     }
 }
 
+/// One usage record, or a sum of them, split the way the report prints it.
+/// `tokens` is the historical total (what `Total tokens` has always summed).
+/// `mixed` is the tokens-only part of that total. `eq` is fresh-input
+/// equivalent; `usd` is set only when every contributing record had a price.
+#[derive(Debug, Clone, Copy)]
+struct TokenTotals {
+    tokens: i64,
+    fresh: i64,
+    cache_read: i64,
+    cache_write: i64,
+    output: i64,
+    mixed: i64,
+    eq: f64,
+    usd: UsdSum,
+}
+
+impl Default for TokenTotals {
+    fn default() -> Self {
+        Self {
+            tokens: 0,
+            fresh: 0,
+            cache_read: 0,
+            cache_write: 0,
+            output: 0,
+            mixed: 0,
+            eq: 0.0,
+            usd: UsdSum::Unset,
+        }
+    }
+}
+
+/// Dollar sum that becomes unavailable as soon as one record has no price.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum UsdSum {
+    Unset,
+    Total(f64),
+    Missing,
+}
+
+impl TokenTotals {
+    fn add(&mut self, other: &TokenTotals) {
+        self.tokens += other.tokens;
+        self.fresh += other.fresh;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.output += other.output;
+        self.mixed += other.mixed;
+        self.eq += other.eq;
+        self.usd = merge_usd(self.usd, other.usd);
+    }
+
+    fn usd_total(&self) -> Option<f64> {
+        match self.usd {
+            UsdSum::Total(value) => Some(value),
+            UsdSum::Unset | UsdSum::Missing => None,
+        }
+    }
+}
+
+fn merge_usd(left: UsdSum, right: UsdSum) -> UsdSum {
+    match (left, right) {
+        (UsdSum::Missing, _) | (_, UsdSum::Missing) => UsdSum::Missing,
+        (UsdSum::Unset, other) | (other, UsdSum::Unset) => other,
+        (UsdSum::Total(left), UsdSum::Total(right)) => UsdSum::Total(left + right),
+    }
+}
+
+fn usage_totals(usage: &Usage, costs: &TokenCosts) -> TokenTotals {
+    let weights = costs.weights_for(usage.backend.as_deref(), usage.model.as_deref());
+    match &usage.breakdown {
+        Some(breakdown) => {
+            let eq = weights.equivalent(breakdown);
+            TokenTotals {
+                tokens: usage.tokens,
+                fresh: breakdown.input,
+                cache_read: breakdown.cache_read,
+                cache_write: breakdown.cache_write,
+                output: breakdown.output,
+                mixed: 0,
+                eq,
+                usd: usd_part(weights, eq),
+            }
+        }
+        None => TokenTotals {
+            tokens: usage.tokens,
+            mixed: usage.tokens,
+            eq: usage.tokens as f64,
+            usd: usd_part(weights, usage.tokens as f64),
+            ..TokenTotals::default()
+        },
+    }
+}
+
+fn usd_part(weights: CostWeights, fresh_equivalent: f64) -> UsdSum {
+    match weights.usd(fresh_equivalent) {
+        Some(value) => UsdSum::Total(value),
+        None => UsdSum::Missing,
+    }
+}
+
+fn group_totals(
+    pairs: impl Iterator<Item = (Option<String>, TokenTotals)>,
+) -> Vec<(String, TokenTotals)> {
+    let mut totals: HashMap<String, TokenTotals> = HashMap::new();
+    for (key, value) in pairs {
+        totals
+            .entry(key.unwrap_or_else(|| "unknown".to_string()))
+            .or_default()
+            .add(&value);
+    }
+    let mut rows: Vec<(String, TokenTotals)> = totals.into_iter().collect();
+    rows.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens).then_with(|| a.0.cmp(&b.0)));
+    rows
+}
+
 fn tokens_window(
     entries: &[(String, ProjectStats)],
     window: Window,
     now: NaiveDateTime,
     cap: Option<usize>,
+    costs: &TokenCosts,
 ) -> String {
     // Default report: full backend/provider/project tables, models capped at
     // MODEL_TOP_N. Compact report: every table capped at `cap`.
     let (other_cap, model_cap) = table_caps(cap);
-    let mut total = 0i64;
-    let mut by_backend: Vec<(Option<String>, i64)> = Vec::new();
-    let mut by_provider: Vec<(Option<String>, i64)> = Vec::new();
-    let mut by_model: Vec<(Option<String>, i64)> = Vec::new();
-    let mut by_project: Vec<(String, i64)> = Vec::new();
+    let mut total = TokenTotals::default();
+    let mut by_backend: Vec<(Option<String>, TokenTotals)> = Vec::new();
+    let mut by_provider: Vec<(Option<String>, TokenTotals)> = Vec::new();
+    let mut by_model: Vec<(Option<String>, TokenTotals)> = Vec::new();
+    let mut by_project: Vec<(String, TokenTotals)> = Vec::new();
     for (project, stats) in entries {
-        let mut project_total = 0i64;
+        let mut project_total = TokenTotals::default();
         for usage in &stats.usage {
             if !window.includes(usage.ts, now) {
                 continue;
             }
-            total += usage.tokens;
-            project_total += usage.tokens;
-            by_backend.push((usage.backend.clone(), usage.tokens));
-            by_provider.push((model_provider(usage.model.as_deref()), usage.tokens));
-            by_model.push((usage.model.clone(), usage.tokens));
+            let row = usage_totals(usage, costs);
+            total.add(&row);
+            project_total.add(&row);
+            by_backend.push((usage.backend.clone(), row));
+            by_provider.push((model_provider(usage.model.as_deref()), row));
+            by_model.push((usage.model.clone(), row));
         }
-        if project_total > 0 {
+        if project_total.tokens > 0 {
             by_project.push((project.clone(), project_total));
         }
     }
-    by_project.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    by_project.sort_by(|a, b| b.1.tokens.cmp(&a.1.tokens).then_with(|| a.0.cmp(&b.0)));
 
     let mut out = format!("-- {} --\n", window.label());
-    out.push_str(&format!("Total tokens: {}\n\n", format_tokens(total)));
-    push_top_table(
+    out.push_str(&format!("Total tokens: {}\n", format_tokens(total.tokens)));
+    push_split_line(&mut out, "Fresh input:", total.fresh);
+    push_split_line(&mut out, "Cache read:", total.cache_read);
+    push_split_line(&mut out, "Cache write:", total.cache_write);
+    push_split_line(&mut out, "Output:", total.output);
+    push_split_line(&mut out, "Mixed (no split):", total.mixed);
+    out.push_str(&cost_line(&total));
+    out.push('\n');
+    push_token_table(
         &mut out,
         "Top backends:",
-        &fmt_rows(&group_sum(by_backend.into_iter()), format_tokens, other_cap),
+        &group_totals(by_backend.into_iter()),
+        other_cap,
     );
     out.push('\n');
-    push_top_table(
+    push_token_table(
         &mut out,
         "Top providers:",
-        &fmt_rows(
-            &group_sum(by_provider.into_iter()),
-            format_tokens,
-            other_cap,
-        ),
+        &group_totals(by_provider.into_iter()),
+        other_cap,
     );
     out.push('\n');
-    push_top_table(
+    push_token_table(
         &mut out,
         "Top models (max 10):",
-        &fmt_rows(&group_sum(by_model.into_iter()), format_tokens, model_cap),
+        &group_totals(by_model.into_iter()),
+        model_cap,
     );
     out.push('\n');
-    push_top_table(
-        &mut out,
-        "Top projects:",
-        &fmt_rows(&by_project, format_tokens, other_cap),
-    );
+    push_token_table(&mut out, "Top projects:", &by_project, other_cap);
     out
+}
+
+fn push_split_line(out: &mut String, label: &str, value: i64) {
+    out.push_str(&format!("  {label:<22}{:>16}\n", format_tokens(value)));
+}
+
+fn cost_line(total: &TokenTotals) -> String {
+    let mut line = format!(
+        "  {:<22}{} fresh-input tok",
+        "Cost equivalent:",
+        format_eq(total.eq)
+    );
+    if let Some(usd) = total.usd_total() {
+        line.push_str(&format!("  [≈ {}]", format_usd(usd)));
+    }
+    if total.mixed > 0 {
+        line.push_str(&format!(
+            "  (incl. {} mixed tok at 1.0×)",
+            format_tokens(total.mixed)
+        ));
+    }
+    line.push('\n');
+    line
+}
+
+fn format_eq(eq: f64) -> String {
+    format!("~{}", format_tokens(eq.round() as i64))
+}
+
+fn format_usd(usd: f64) -> String {
+    if usd.abs() >= 0.01 {
+        format!("${usd:.2}")
+    } else {
+        format!("${usd:.4}")
+    }
+}
+
+/// Compact column figure: `842`, `12.4k`, `35.4M`, `1.79G`.
+fn format_compact(n: i64) -> String {
+    let negative = n < 0;
+    let n = n.unsigned_abs();
+    let body = match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),
+        1_000_000..1_000_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        _ => format!("{:.2}G", n as f64 / 1_000_000_000.0),
+    };
+    if negative { format!("-{body}") } else { body }
+}
+
+fn push_token_table(
+    out: &mut String,
+    title: &str,
+    rows: &[(String, TokenTotals)],
+    limit: Option<usize>,
+) {
+    out.push_str(title);
+    out.push('\n');
+    let rows = limited(rows, limit);
+    if rows.is_empty() {
+        out.push_str("  (no data)\n");
+        return;
+    }
+    push_token_row(
+        out,
+        "name",
+        ["tokens", "fresh", "cache_r", "cache_w", "output", "eq"],
+    );
+    for (name, totals) in rows {
+        push_token_row(
+            out,
+            name,
+            [
+                &format_compact(totals.tokens),
+                &format_compact(totals.fresh),
+                &format_compact(totals.cache_read),
+                &format_compact(totals.cache_write),
+                &format_compact(totals.output),
+                &format_compact(totals.eq.round() as i64),
+            ],
+        );
+    }
+}
+
+fn push_token_row(out: &mut String, name: &str, cols: [&str; 6]) {
+    out.push_str(&format!(
+        "  {:<28} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}\n",
+        name, cols[0], cols[1], cols[2], cols[3], cols[4], cols[5]
+    ));
 }
 
 fn time_window(
@@ -1072,7 +1340,11 @@ fn time_window(
 /// The "Задачи" section: task counts and per-task averages, plus the four
 /// cumulative (parallel tasks summed, not deduplicated) phase totals. All
 /// time only — the task description does not split this section by month/week.
-fn tasks_section(entries: &[(String, ProjectStats)], cap: Option<usize>) -> String {
+fn tasks_section(
+    entries: &[(String, ProjectStats)],
+    cap: Option<usize>,
+    costs: &TokenCosts,
+) -> String {
     let (other_cap, model_cap) = table_caps(cap);
     let mut task_ids: HashSet<String> = HashSet::new();
     let mut by_backend_count: Vec<(Option<String>, String)> = Vec::new();
@@ -1081,20 +1353,29 @@ fn tasks_section(entries: &[(String, ProjectStats)], cap: Option<usize>) -> Stri
     let mut by_backend_tokens: Vec<(Option<String>, String, i64)> = Vec::new();
     let mut by_provider_tokens: Vec<(Option<String>, String, i64)> = Vec::new();
     let mut by_model_tokens: Vec<(Option<String>, String, i64)> = Vec::new();
+    let mut by_backend_eq: Vec<(Option<String>, String, f64)> = Vec::new();
+    let mut by_provider_eq: Vec<(Option<String>, String, f64)> = Vec::new();
+    let mut by_model_eq: Vec<(Option<String>, String, f64)> = Vec::new();
     let mut total_tokens = 0i64;
+    let mut total_eq = 0.0f64;
 
     for (project, stats) in entries {
         for usage in &stats.usage {
             let key = project_task_key(project, &usage.task_id);
             task_ids.insert(key.clone());
             let provider = model_provider(usage.model.as_deref());
+            let eq = usage_totals(usage, costs).eq;
             by_backend_count.push((usage.backend.clone(), key.clone()));
             by_provider_count.push((provider.clone(), key.clone()));
             by_model_count.push((usage.model.clone(), key.clone()));
             by_backend_tokens.push((usage.backend.clone(), key.clone(), usage.tokens));
-            by_provider_tokens.push((provider, key.clone(), usage.tokens));
-            by_model_tokens.push((usage.model.clone(), key, usage.tokens));
+            by_provider_tokens.push((provider.clone(), key.clone(), usage.tokens));
+            by_model_tokens.push((usage.model.clone(), key.clone(), usage.tokens));
+            by_backend_eq.push((usage.backend.clone(), key.clone(), eq));
+            by_provider_eq.push((provider, key.clone(), eq));
+            by_model_eq.push((usage.model.clone(), key, eq));
             total_tokens += usage.tokens;
+            total_eq += eq;
         }
     }
 
@@ -1135,6 +1416,11 @@ fn tasks_section(entries: &[(String, ProjectStats)], cap: Option<usize>) -> Stri
         0.0
     } else {
         total_tokens as f64 / task_ids.len() as f64
+    };
+    let avg_eq = if task_ids.is_empty() {
+        0.0
+    } else {
+        total_eq / task_ids.len() as f64
     };
     let avg_time = if running_task_ids.is_empty() {
         0.0
@@ -1179,6 +1465,10 @@ fn tasks_section(entries: &[(String, ProjectStats)], cap: Option<usize>) -> Stri
         format_avg_tokens(avg_tokens)
     ));
     out.push_str(&format!(
+        "Average cost-equivalent per task: {}\n",
+        format_avg_tokens(avg_eq)
+    ));
+    out.push_str(&format!(
         "Average time per task: {}\n\n",
         format_avg_span(avg_time)
     ));
@@ -1207,6 +1497,36 @@ fn tasks_section(entries: &[(String, ProjectStats)], cap: Option<usize>) -> Stri
         "Top models by avg tokens/task (max 10):",
         &fmt_avg_rows(
             &group_average_per_task(by_model_tokens.into_iter()),
+            format_avg_tokens,
+            model_cap,
+        ),
+    );
+    out.push('\n');
+    push_top_table(
+        &mut out,
+        "Top backends by avg cost-eq/task:",
+        &fmt_avg_rows(
+            &group_average_f64(by_backend_eq.into_iter()),
+            format_avg_tokens,
+            other_cap,
+        ),
+    );
+    out.push('\n');
+    push_top_table(
+        &mut out,
+        "Top providers by avg cost-eq/task:",
+        &fmt_avg_rows(
+            &group_average_f64(by_provider_eq.into_iter()),
+            format_avg_tokens,
+            other_cap,
+        ),
+    );
+    out.push('\n');
+    push_top_table(
+        &mut out,
+        "Top models by avg cost-eq/task (max 10):",
+        &fmt_avg_rows(
+            &group_average_f64(by_model_eq.into_iter()),
             format_avg_tokens,
             model_cap,
         ),
@@ -1382,11 +1702,12 @@ pub fn render_report(
     entries: &[(String, ProjectStats)],
     now: NaiveDateTime,
     diagnostic_samples: usize,
+    costs: &TokenCosts,
 ) -> String {
     let mut out = diagnostics_section(entries, diagnostic_samples);
     out.push_str("=== TOKENS ===\n\n");
     for window in Window::ALL {
-        out.push_str(&tokens_window(entries, window, now, None));
+        out.push_str(&tokens_window(entries, window, now, None, costs));
         out.push('\n');
     }
     out.push_str("=== TIME ===\n\n");
@@ -1394,7 +1715,7 @@ pub fn render_report(
         out.push_str(&time_window(entries, window, now, None));
         out.push('\n');
     }
-    out.push_str(&tasks_section(entries, None));
+    out.push_str(&tasks_section(entries, None, costs));
     out
 }
 
@@ -1407,6 +1728,7 @@ pub fn render_compact_report(
     now: NaiveDateTime,
     top_n: usize,
     diagnostic_samples: usize,
+    costs: &TokenCosts,
 ) -> String {
     let mut out = format!(
         "Compact report: at most {top_n} rows per breakdown (models max 10); omitted rows remain in the full report.\n\n"
@@ -1414,7 +1736,7 @@ pub fn render_compact_report(
     out.push_str(&diagnostics_section(entries, diagnostic_samples));
     out.push_str("=== TOKENS (compact) ===\n\n");
     for window in Window::ALL {
-        out.push_str(&tokens_window(entries, window, now, Some(top_n)));
+        out.push_str(&tokens_window(entries, window, now, Some(top_n), costs));
         out.push('\n');
     }
     out.push_str("=== TIME (compact) ===\n\n");
@@ -1422,7 +1744,7 @@ pub fn render_compact_report(
         out.push_str(&time_window(entries, window, now, Some(top_n)));
         out.push('\n');
     }
-    out.push_str(&tasks_section(entries, Some(top_n)));
+    out.push_str(&tasks_section(entries, Some(top_n), costs));
     out
 }
 
@@ -1447,16 +1769,23 @@ pub fn collect_store_entries_from(store: &ProjectStore) -> Result<Vec<(String, P
 }
 
 /// Load every registered project's stats and render the combined report.
-pub fn collect_store_report(now: NaiveDateTime, diagnostic_samples: usize) -> Result<String> {
+pub fn collect_store_report(
+    now: NaiveDateTime,
+    diagnostic_samples: usize,
+    costs: &TokenCosts,
+) -> Result<String> {
     Ok(render_report(
         &collect_store_entries()?,
         now,
         diagnostic_samples,
+        costs,
     ))
 }
 
 #[cfg(test)]
 mod tests {
+    use serde::Deserialize;
+
     use super::*;
 
     fn at(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
@@ -1534,7 +1863,7 @@ mod tests {
         assert_eq!(
             first.breakdown,
             TokenBreakdown {
-                input: 120,
+                input: 20,
                 output: 10,
                 cache_read: 90,
                 cache_write: 10,
@@ -1599,7 +1928,7 @@ mod tests {
         assert_eq!(
             analytics.breakdown,
             TokenBreakdown {
-                input: 1200,
+                input: 300,
                 output: 120,
                 cache_read: 1000,
                 cache_write: 100,
@@ -1834,7 +2163,7 @@ mod tests {
             ("proj-a".to_string(), stats_a),
             ("proj-b".to_string(), stats_b),
         ];
-        let report = tasks_section(&entries, None);
+        let report = tasks_section(&entries, None, &TokenCosts::builtin());
         assert!(report.contains("Total tasks completed: 2"));
     }
 
@@ -1874,7 +2203,7 @@ mod tests {
 
         let stats = load(dir.path());
         let entries = vec![("demo".to_string(), stats)];
-        let report = render_report(&entries, timefmt::now(), 3);
+        let report = render_report(&entries, timefmt::now(), 3, &TokenCosts::builtin());
         assert!(report.contains("=== TOKENS ==="));
         assert!(report.contains("=== TIME ==="));
         assert!(report.contains("=== TASKS (all time) ==="));
@@ -1983,7 +2312,7 @@ mod tests {
             ("good".to_string(), good_stats),
             ("bad".to_string(), bad_stats),
         ];
-        let report = render_report(&entries, at(2026, 6, 15, 12, 0), 3);
+        let report = render_report(&entries, at(2026, 6, 15, 12, 0), 3, &TokenCosts::builtin());
         assert!(report.contains("Total tokens: 50"));
         assert!(report.contains("unreadable"));
         assert!(report.contains(&events_path(bad.path()).display().to_string()));
@@ -2044,15 +2373,21 @@ mod tests {
         assert!(stats.source.is_clean());
         let entries = vec![("demo".to_string(), stats)];
         let now = at(2026, 6, 15, 12, 0);
-        let report = render_report(&entries, now, 3);
-        let compact = render_compact_report(&entries, now, 5, 3);
+        let report = render_report(&entries, now, 3, &TokenCosts::builtin());
+        let compact = render_compact_report(&entries, now, 5, 3, &TokenCosts::builtin());
         assert!(!report.contains("DATA QUALITY"));
         assert!(!compact.contains("DATA QUALITY"));
         assert!(report.starts_with("=== TOKENS ===\n"));
         let mut cleared = entries.clone();
         cleared[0].1.source = SourceDiagnostics::default();
-        assert_eq!(report, render_report(&cleared, now, 3));
-        assert_eq!(compact, render_compact_report(&cleared, now, 5, 3));
+        assert_eq!(
+            report,
+            render_report(&cleared, now, 3, &TokenCosts::builtin())
+        );
+        assert_eq!(
+            compact,
+            render_compact_report(&cleared, now, 5, 3, &TokenCosts::builtin())
+        );
         assert!(incomplete_summary(&entries).is_none());
     }
 
@@ -2091,8 +2426,8 @@ mod tests {
             ("beta".to_string(), dirty),
         ];
         let now = at(2026, 6, 15, 12, 0);
-        let report = render_report(&entries, now, 3);
-        let compact = render_compact_report(&entries, now, 5, 3);
+        let report = render_report(&entries, now, 3, &TokenCosts::builtin());
+        let compact = render_compact_report(&entries, now, 5, 3, &TokenCosts::builtin());
         assert!(report.find("=== DATA QUALITY").unwrap() < report.find("=== TOKENS ===").unwrap());
         let section = quality_section(&report);
         assert_eq!(section, quality_section(&compact));
@@ -2114,7 +2449,7 @@ mod tests {
         let reason = rendered_reason.split_once(": ").unwrap().1;
         assert!(reason.chars().count() <= DIAGNOSTIC_REASON_CHARS);
 
-        let counts_only = render_report(&entries, now, 0);
+        let counts_only = render_report(&entries, now, 0, &TokenCosts::builtin());
         let counts = quality_section(&counts_only);
         assert!(counts.contains(&format!("beta: {}", path.display())));
         assert!(counts.contains("4 malformed lines skipped, 120 records loaded"));
@@ -2128,5 +2463,139 @@ mod tests {
             incomplete_summary(&entries).as_deref(),
             Some("stats report incomplete: 4 malformed lines skipped, 1 events file unreadable")
         );
+    }
+
+    #[test]
+    fn record_usage_keeps_the_whole_prompt_in_input_and_fresh_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        record_usage(
+            dir.path(),
+            "TASK-1",
+            "ses-1",
+            50,
+            Some(&TokenBreakdown {
+                input: 200,
+                output: 20,
+                cache_read: 800,
+                cache_write: 10,
+            }),
+            &tags("claude", "anthropic/opus"),
+        );
+        let raw = fs::read_to_string(events_path(dir.path())).unwrap();
+        let line = raw.lines().next().unwrap();
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["input"], 1010);
+        assert_eq!(value["input_fresh"], 200);
+        #[derive(Deserialize)]
+        struct OldView {
+            input: i64,
+        }
+        let old: OldView = serde_json::from_str(line).unwrap();
+        assert_eq!(old.input, 1010);
+        let loaded = load(dir.path());
+        let breakdown = loaded.usage[0].breakdown.unwrap();
+        assert_eq!(breakdown.input, 200);
+        assert_eq!(breakdown.prompt_total(), 1010);
+    }
+
+    #[test]
+    fn fresh_cache_and_mixed_aggregate_without_moving_the_token_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let lines = [
+            // New record: input is the whole prompt, input_fresh is uncached.
+            r#"{"kind":"usage","ts":"2026-06-01T10:00:00","task_id":"TASK-1","tokens":1110,"backend":"claude","model":"anthropic/claude","input":1010,"input_fresh":200,"output":20,"cache_read":800,"cache_write":10}"#,
+            // Old split: fresh is recovered as input - cache_read - cache_write.
+            r#"{"kind":"usage","ts":"2026-06-01T11:00:00","task_id":"TASK-1","tokens":500,"backend":"codex","model":"openai/gpt","input":1000,"output":100,"cache_read":800,"cache_write":100}"#,
+            // Tokens only: mixed, never added to the fresh or cache columns.
+            r#"{"kind":"usage","ts":"2026-06-01T12:00:00","task_id":"TASK-2","tokens":300,"backend":"claude","model":"opus"}"#,
+        ];
+        write_events(dir.path(), format!("{}\n", lines.join("\n")).as_bytes());
+        let stats = load(dir.path());
+        assert_eq!(
+            stats.usage.iter().map(|usage| usage.tokens).sum::<i64>(),
+            1910
+        );
+        let split: Vec<_> = stats
+            .usage
+            .iter()
+            .filter_map(|usage| usage.breakdown.as_ref())
+            .collect();
+        assert_eq!(split.len(), 2);
+        let fresh: i64 = split.iter().map(|row| row.input).sum();
+        let cache_read: i64 = split.iter().map(|row| row.cache_read).sum();
+        let cache_write: i64 = split.iter().map(|row| row.cache_write).sum();
+        let output: i64 = split.iter().map(|row| row.output).sum();
+        assert_eq!(
+            (fresh, cache_read, cache_write, output),
+            (300, 1600, 110, 120)
+        );
+        assert_eq!(fresh + cache_read + cache_write, 1010 + 1000);
+        assert!(stats.usage[2].breakdown.is_none());
+
+        let raw: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            r#"
+            anthropic:
+              usd_per_mtok_input: 3.0
+            openai:
+              usd_per_mtok_input: 2.0
+            default:
+              usd_per_mtok_input: 1.0
+            "#,
+        )
+        .unwrap();
+        let costs = TokenCosts::from_mapping(raw.as_mapping().unwrap());
+        let entries = vec![("demo".to_string(), stats)];
+        let now = at(2026, 6, 1, 18, 0);
+        let report = render_report(&entries, now, 3, &costs);
+        let compact = render_compact_report(&entries, now, 5, 3, &costs);
+        for body in [&report, &compact] {
+            assert!(body.contains("Total tokens: 1,910"), "{body}");
+            assert!(body.contains("Fresh input:"), "{body}");
+            assert!(body.contains("300"), "{body}");
+            assert!(body.contains("Cache read:"), "{body}");
+            assert!(body.contains("1,600"), "{body}");
+            assert!(body.contains("Cache write:"), "{body}");
+            assert!(body.contains("Mixed (no split):"), "{body}");
+            assert!(body.contains("Cost equivalent:"), "{body}");
+            assert!(body.contains("incl. 300 mixed tok at 1.0×"), "{body}");
+            assert!(body.contains("[≈ $"), "{body}");
+            assert!(
+                body.contains("name") && body.contains("cache_r") && body.contains("eq"),
+                "{body}"
+            );
+        }
+        // June 1 2026 is a Monday, so every window in the report includes the rows.
+        assert_eq!(report.matches("Mixed (no split):").count(), 3);
+
+        let priced = costs.weights_for(Some("claude"), Some("anthropic/claude"));
+        let eq = priced.equivalent(&TokenBreakdown {
+            input: 200,
+            output: 20,
+            cache_read: 800,
+            cache_write: 10,
+        });
+        assert!((eq - 392.5).abs() < 1e-9, "{eq}");
+    }
+
+    #[test]
+    fn a_mixed_only_window_names_the_mixed_bucket() {
+        let mut stats = ProjectStats::default();
+        stats.usage.push(Usage {
+            task_id: "TASK-1".to_string(),
+            session_id: None,
+            breakdown: None,
+            ts: at(2026, 6, 1, 10, 0),
+            tokens: 40,
+            backend: Some("claude".to_string()),
+            model: None,
+            effort: None,
+            agent: None,
+        });
+        let entries = vec![("demo".to_string(), stats)];
+        let report = render_report(&entries, at(2026, 6, 15, 12, 0), 3, &TokenCosts::builtin());
+        assert!(report.contains("Mixed (no split):"));
+        assert!(report.contains("40"));
+        assert!(report.contains("incl. 40 mixed tok at 1.0×"));
+        assert!(!report.contains("[≈ $"));
     }
 }

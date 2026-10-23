@@ -7,7 +7,7 @@ expression: rendered
 │                                                                                              █
 │Totals below include only readable records: 1 malformed line skipped, 0 events files          █
 │unreadable (1 of 1 projects affected).                                                        █
-│                                                                                              █
+│                                                                                              ║
 │Quality Board:                                                                                ║
 │/tmp/k4ai-stats-quality-store/projects/k4ai-stats-quality-work/.kanban/stats/events.jsonl     ║
 │  1 malformed line skipped, 1 record loaded                                                   ║
@@ -17,17 +17,17 @@ expression: rendered
 │                                                                                              ║
 │-- All time --                                                                                ║
 │Total tokens: 10                                                                              ║
+│  Fresh input:                         0                                                      ║
+│  Cache read:                          0                                                      ║
+│  Cache write:                         0                                                      ║
+│  Output:                              0                                                      ║
+│  Mixed (no split):                   10                                                      ║
+│  Cost equivalent:      ~10 fresh-input tok  (incl. 10 mixed tok at 1.0×)                     ║
 │                                                                                              ║
 │Top backends:                                                                                 ║
-│  unknown                      10                                                             ║
+│  name                           tokens    fresh  cache_r  cache_w   output       eq          ║
+│  unknown                            10        0        0        0        0       10          ║
 │                                                                                              ║
-│Top providers:                                                                                ║
-│  unknown                      10                                                             ║
-│                                                                                              ║
-│Top models (max 10):                                                                          ║
-│  unknown                      10                                                             ║
-│                                                                                              ║
-│Top projects:                                                                                 ║
 └──────────────────────────────────────────────────────────────────────────────────────────────▼
  stats report incomplete: 1 malformed line skipped, 0 events fil… q back              ● Offline 
 

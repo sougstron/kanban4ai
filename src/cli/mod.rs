@@ -2110,7 +2110,11 @@ fn stats_command(project: Option<&str>, compact: bool) -> Result<ExitCode> {
     };
     let now = timefmt::now();
     let entries = stats::collect_store_entries()?;
-    let full = stats::render_report(&entries, now, samples);
+    let costs = ProjectStore::open()
+        .and_then(|store| store.load_global_config())
+        .map(|config| config.token_costs())
+        .unwrap_or_default();
+    let full = stats::render_report(&entries, now, samples, &costs);
     if let Some(top_n) = top_n {
         let reports_dir = ProjectStore::open()?.root().join("reports");
         fs::create_dir_all(&reports_dir)?;
@@ -2122,7 +2126,7 @@ fn stats_command(project: Option<&str>, compact: bool) -> Result<ExitCode> {
         atomic_write_text(&path, &full)?;
         println!(
             "{}",
-            stats::render_compact_report(&entries, now, top_n, samples)
+            stats::render_compact_report(&entries, now, top_n, samples, &costs)
         );
         println!("Full report: {}", path.display());
         if let Some(summary) = stats::incomplete_summary(&entries) {

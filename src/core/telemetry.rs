@@ -42,19 +42,20 @@ pub struct SessionProgress {
     pub todos_total: usize,
     /// Human-readable summary of the last tool call (`Edit src/x.rs`, …).
     pub last_activity: Option<String>,
-    /// Cumulative input/output/cache split for the per-task analytics panel.
-    /// Unlike [`Self::tokens`] it counts cached prompt tokens too, so the cache
-    /// hit rate can be derived. `None` when the transcript carried no usage.
+    /// Cumulative fresh-input/output/cache split for the per-task analytics
+    /// panel. `None` when the transcript carried no usage. [`Self::tokens`]
+    /// stays the backend's own total and does not follow this split.
     pub breakdown: Option<TokenBreakdown>,
 }
 
 /// Cumulative token usage of one or more runs, normalized across backends.
-/// `input` is the *whole* prompt side — uncached, cache reads and cache writes
-/// alike — so `cache_read / input` is the cache hit rate whichever convention
-/// the backend reports in (claude/pi split the cached part out of `input`,
-/// codex folds it in).
+/// `input` is the *fresh* (uncached) prompt. Cache reads and writes are
+/// separate, so a backend that folds them into its own input count (codex)
+/// and one that leaves them out (claude, pi, opencode) land on the same
+/// shape. [`Self::prompt_total`] is the whole prompt.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenBreakdown {
+    /// Uncached prompt tokens.
     pub input: i64,
     pub output: i64,
     pub cache_read: i64,
@@ -65,11 +66,16 @@ impl TokenBreakdown {
     /// Build from a split where `uncached` excludes both cache fields.
     fn from_split(uncached: i64, output: i64, cache_read: i64, cache_write: i64) -> Self {
         TokenBreakdown {
-            input: uncached + cache_read + cache_write,
+            input: uncached,
             output,
             cache_read,
             cache_write,
         }
+    }
+
+    /// Whole prompt: fresh input plus both cache sides.
+    pub fn prompt_total(&self) -> i64 {
+        self.input + self.cache_read + self.cache_write
     }
 
     pub fn add(&mut self, other: &TokenBreakdown) {
@@ -80,13 +86,14 @@ impl TokenBreakdown {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.input == 0 && self.output == 0
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0
     }
 
-    /// Share of prompt tokens served from cache, in percent; `None` with no
-    /// input to divide by.
+    /// Share of prompt tokens served from cache, in percent; `None` when the
+    /// prompt total is zero.
     pub fn cache_hit_rate(&self) -> Option<f64> {
-        (self.input > 0).then(|| self.cache_read as f64 * 100.0 / self.input as f64)
+        let total = self.prompt_total();
+        (total > 0).then(|| self.cache_read as f64 * 100.0 / total as f64)
     }
 }
 
@@ -569,16 +576,17 @@ fn feed_codex(value: &Value, progress: &mut SessionProgress) {
                 if total.is_some() {
                     progress.tokens = total;
                 }
-                // OpenAI convention: `input_tokens` already includes the
-                // cached part.
+                // OpenAI convention: `input_tokens` already includes
+                // `cached_input_tokens`. There is no cache-write field.
                 if input.is_some() || output.is_some() {
                     let cached = int_field(usage, "cached_input_tokens");
-                    progress.breakdown = Some(TokenBreakdown {
-                        input: input.unwrap_or(0),
-                        output: output.unwrap_or(0),
-                        cache_read: cached,
-                        cache_write: 0,
-                    });
+                    let fresh = (input.unwrap_or(0) - cached).max(0);
+                    progress.breakdown = Some(TokenBreakdown::from_split(
+                        fresh,
+                        output.unwrap_or(0),
+                        cached,
+                        0,
+                    ));
                 }
             }
             if let Some(cost) = value
@@ -880,12 +888,13 @@ mod tests {
         assert_eq!(
             live,
             TokenBreakdown {
-                input: 10 + 900 + 90 + 20 + 980,
+                input: 10 + 20,
                 output: 12,
                 cache_read: 1880,
                 cache_write: 90,
             }
         );
+        assert_eq!(live.prompt_total(), 2000);
         assert_eq!(live.cache_hit_rate(), Some(1880.0 * 100.0 / 2000.0));
 
         let finished = format!(
@@ -896,9 +905,15 @@ mod tests {
         parse_claude(&finished, &mut progress);
         let total = progress.breakdown.expect("result breakdown");
         assert_eq!(
-            (total.input, total.output, total.cache_read),
-            (1000, 50, 900)
+            (
+                total.input,
+                total.output,
+                total.cache_read,
+                total.cache_write
+            ),
+            (34, 50, 900, 66)
         );
+        assert_eq!(total.prompt_total(), 1000);
     }
 
     #[test]
@@ -911,8 +926,9 @@ mod tests {
         let codex = progress.breakdown.expect("codex");
         assert_eq!(
             (codex.input, codex.output, codex.cache_read),
-            (1000, 40, 800)
+            (200, 40, 800)
         );
+        assert_eq!(codex.prompt_total(), 1000);
 
         let mut progress = SessionProgress::default();
         parse_opencode(
@@ -924,9 +940,15 @@ mod tests {
         );
         let opencode = progress.breakdown.expect("opencode");
         assert_eq!(
-            (opencode.input, opencode.output, opencode.cache_read),
-            (810, 35, 650)
+            (
+                opencode.input,
+                opencode.output,
+                opencode.cache_read,
+                opencode.cache_write
+            ),
+            (150, 35, 650, 10)
         );
+        assert_eq!(opencode.prompt_total(), 810);
 
         let mut progress = SessionProgress::default();
         parse_pi_family(
@@ -937,7 +959,11 @@ mod tests {
             &mut progress,
         );
         let pi = progress.breakdown.expect("pi");
-        assert_eq!((pi.input, pi.output, pi.cache_read), (34_000, 100, 33_000));
+        assert_eq!(
+            (pi.input, pi.output, pi.cache_read, pi.cache_write),
+            (800, 100, 33_000, 200)
+        );
+        assert_eq!(pi.prompt_total(), 34_000);
     }
 
     #[test]
