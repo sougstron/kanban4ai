@@ -1613,6 +1613,59 @@ fn write_board_config(env: &Env, body: &str) {
     std::fs::write(env.kanban().join("config.yaml"), body).expect("config");
 }
 
+/// Notifications stay enabled in the board file, but the test harness must
+/// not deliver `notify-send` into the desktop session that launched `cargo test`.
+#[test]
+fn desktop_notifications_stay_off_the_session_during_cargo_test() {
+    let env = Env::new();
+    kanban(&env).arg("init").assert().success();
+    write_board_config(
+        &env,
+        "notifications:\n  enabled: true\nauto_launch:\n  enabled: false\n",
+    );
+
+    let spy_dir = env.work().join("spy-bin");
+    std::fs::create_dir_all(&spy_dir).unwrap();
+    let log = env.work().join("notify.log");
+    let spy = spy_dir.join("notify-send");
+    std::fs::write(
+        &spy,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\n", log.display()),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&spy).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&spy, perms).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        spy_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let run = |args: &[&str]| {
+        kanban(&env)
+            .env("PATH", &path)
+            .args(args)
+            .assert()
+            .success();
+    };
+    run(&["create", "Quiet job"]);
+    run(&["take", "TASK-001", "--session", "ses-quiet", "--agent"]);
+    run(&["context", "TASK-001", "implemented the fix"]);
+    run(&["done", "TASK-001", "--session", "ses-quiet", "--agent"]);
+    run(&["done", "TASK-001"]);
+
+    assert!(
+        !log.exists(),
+        "cargo test must not deliver notify-send to the desktop session: {}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+}
+
 #[test]
 fn daemon_once_is_quiet_on_an_empty_store() {
     let env = Env::new();
