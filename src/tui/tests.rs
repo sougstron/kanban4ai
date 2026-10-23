@@ -12454,9 +12454,19 @@ fn detail_analytics_panel_sums_runs_and_tokens() {
 
     let rendered = render_snapshot(&mut app);
     assert!(
-        rendered.contains("│Time 45m · 2 runs │ Input 1.2M · Output 45.6k · Cache hit 90.0%"),
+        rendered.contains("│Time 45m · 2 runs │ Input 120.0k · Cache R 1.1M · Cache W 0 · Output 45.6k · Cache hit 90.0%"),
         "analytics row missing:\n{rendered}"
     );
+    let wide = render_at(&mut app, 160, 24);
+    // The card's model is openai/gpt-5.5, so output weighs 8×:
+    // 120_000 + 1_080_000×0.1 + 45_600×8 = 592_800.
+    assert!(
+        wide.contains(
+            "Input 120.0k · Cache R 1.1M · Cache W 0 · Output 45.6k · Cache hit 90.0% · ≈592.8k eq"
+        ),
+        "full analytics line missing:\n{wide}"
+    );
+    insta::assert_snapshot!("detail_analytics_split", wide);
 }
 
 /// The task's limit shares get a second Analytics row: one value per role,

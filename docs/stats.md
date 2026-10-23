@@ -23,11 +23,19 @@ One JSON object per line, one of two shapes:
   Tags are only ever present on a `running` `enter` — the other phases carry
   no backend/model breakdown in the report, so recording them there would be
   dead weight.
-- **Usage**: `{"kind":"usage","ts":...,"task_id":...,"session_id":...,"tokens":N, backend?, model?, effort?, agent?, input?, output?, cache_read?, cache_write?}` —
+- **Usage**: `{"kind":"usage","ts":...,"task_id":...,"session_id":...,"tokens":N, backend?, model?, effort?, agent?, input?, input_fresh?, output?, cache_read?, cache_write?}` —
   one session's final token tally, recorded once when the session closes.
-  `input`/`output`/`cache_*` are the transcript's `TokenBreakdown`
-  (`core/telemetry.rs`); `input` is the whole prompt side including cached
-  tokens. Records written before the split existed simply lack them.
+  `input` stays the whole prompt (fresh + cache read + cache write) so an
+  older binary reading the same file still sees the total it always did.
+  `input_fresh` is the uncached prompt. `output` / `cache_read` /
+  `cache_write` are the other sides of the transcript's `TokenBreakdown`
+  (`core/telemetry.rs`), where `input` in memory is the fresh part.
+  A record with `input`/`output` but no `input_fresh` (written by 0.8.x
+  before this field) recovers fresh as `input - cache_read - cache_write`.
+  A record with only `tokens` is **mixed**: it stays in the historical total
+  and in its own "Mixed (no split)" bucket, and is never added to the fresh
+  or cache columns. kimi's stream-json transcript has no usage object, so a
+  kimi session has no split to record.
 
 A call site never has to know when the *previous* edge happened; it only
 records the edge in front of it. Pairing `enter`/`exit` per `(task_id, phase)`
@@ -100,9 +108,17 @@ plain text, read by both `kanban stats` and the TUI Stats window
 with no single project in context, matching where the report aggregates
 from):
 
-1. **Tokens** — total, top backends, top providers, top models (max 10), top
-   projects; for all time, this month (resets the 1st), and this week
-   (resets Monday).
+1. **Tokens** — historical total, then a split block (fresh input, cache
+   read, cache write, output, mixed, cost equivalent), then top backends,
+   providers, models (max 10) and projects. Each of those tables is
+   `name  tokens  fresh  cache_r  cache_w  output  eq`, still sorted by
+   `tokens`. Windows: all time, this month (resets the 1st), this week
+   (resets Monday). Cost equivalent is fresh-input-equivalent tokens
+   (`fresh×1 + cache_read×w_r + cache_write×w_w + output×w_o`); mixed
+   records add their `tokens` at 1.0× and the line says so. A `≈ $` figure
+   is added only when every record in that total had `usd_per_mtok_input`.
+   The Tasks section also prints average cost-equivalent per task, with the
+   same backend/provider/model breakdown as average tokens.
 2. **Time** — same shape, but only the `Running` phase. The single grand
    total is a wall-clock **union** of every running span (`union_seconds`):
    two tasks running at the same moment must not double the clock. The
@@ -122,18 +138,33 @@ projects are shown in full.
 before its first slash (`openai/gpt-5.5` → `openai`, `zai/glm-4.7` → `zai`);
 a bare model id has no provider and lands in `unknown`. Nothing new is stored
 in the events file — existing logs report providers without re-recording.
+Cost weights use that prefix when it exists, and otherwise infer a provider
+from the backend (`claude` → `anthropic`, `codex` → `openai`, `grok` →
+`xai`). The table itself is `token_costs` in the machine-wide store config
+(see `docs/config.md`). Lookup per field is model id, then provider, then
+the user's `default` row, then the compiled provider row when that provider
+was not configured, then the compiled default
+(`default`/`anthropic`: cache read 0.1, cache write 1.25, output 5;
+`openai`: cache read 0.1, cache write 1.0, output 8). Fresh input is weight
+1. A negative or non-numeric coefficient is ignored. `usd_per_mtok_input`
+on a row turns the equivalent into dollars. Limit-share weights in
+`core/limit_share.rs` stay the compiled anthropic ratios; they are not read
+from this table.
 
 ## Per-task analytics (TUI detail)
 
 `task_analytics(project, task_id, since)` feeds the detail view's
 **Analytics** panel (between Task and Thread): run time, run count, declared
-wait time, and input/output tokens with the cache hit rate
-(`cache_read / input`), cumulative over every session of the task — first
-run, review passes, reruns and crash restarts. Only events at or after the
-task's `created_at` count, so a recycled id does not inherit an abandoned
-task's history. A `Usage` record with no split is backfilled from its
-session's transcript when that is still in `.kanban/logs/` (memoized per
-process); otherwise its total shows as "without split". The live session is
+wait time, and the token split (fresh input, cache read, cache write,
+output, cache hit rate, fresh-input equivalent), cumulative over every
+session of the task — first run, review passes, reruns and crash restarts.
+The hit rate is `cache_read / (fresh + cache_read + cache_write)`. The
+equivalent uses the task's current backend and model (one approximation
+when several models ran). Only events at or after the task's `created_at`
+count, so a recycled id does not inherit an abandoned task's history. A
+`Usage` record with no split is backfilled from its session's transcript
+when that is still in `.kanban/logs/` (memoized per process); otherwise its
+total shows as "+N mixed tok" and counts at 1.0× in the equivalent. The live session is
 added at render time: its open `Running` span (`running_since`) while the
 session is Live, and its tokens from `App::session_progress` unless its
 `Usage` is already counted. Nothing involves the agent.

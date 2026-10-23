@@ -513,6 +513,14 @@ fn telemetry_lines(
     if let Some(cost) = progress.cost_usd {
         stats.push(format!("${cost:.2}"));
     }
+    if let Some(tokens) = tokens.filter(|tokens| tokens.cache_read > 0) {
+        let cache = format!("· cr {}", format_tokens(tokens.cache_read));
+        let current = stats.join("  ");
+        let gap = usize::from(!current.is_empty()) * 2;
+        if current.width() + gap + cache.width() <= line_width {
+            stats.push(cache);
+        }
+    }
     if !stats.is_empty() {
         rows.push(Line::from(Span::styled(
             truncate_display(&stats.join("  "), line_width),

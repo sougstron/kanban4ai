@@ -135,6 +135,15 @@ they are edited: press `s` on the Projects screen. Saved under the store
 - `backup.keep_daily` / `backup.keep_weekly` / `backup.keep_monthly` / `backup.keep_manual`: 7 / 4 / 6 / 10. Grandfather-father-son counts. Zero is allowed and keeps none of that bucket. `pre-restore` archives are kept for 7 days and are not part of these counts.
 - `backup.max_total_mb`: 2048 - cap on core and artifact archives together. The newest verified core archive is never deleted to meet the cap. A non-positive value is ignored.
 - `backup.artifacts`: `weekly` (`off`, `weekly`, or `always`). `weekly` adds the artifacts archive when the newest one is at least 7 days old; `always` adds it to every due core snapshot. Unknown values read as `weekly`.
+- `token_costs`: fresh-input-equivalent weights for `kanban stats` and the
+  TUI Stats window. Fresh input is always weight 1. Built-in rows, used when
+  a row is absent: `default` and `anthropic` are cache read 0.1, cache write
+  1.25, output 5; `openai` is cache read 0.1, cache write 1.0, output 8.
+  A row overrides only the fields it sets. Lookup is model id, then provider
+  (model prefix, else `claude`→`anthropic`, `codex`→`openai`, `grok`→`xai`),
+  then `default`. Optional `usd_per_mtok_input` enables the `≈ $` column.
+  Negative or non-numeric values are ignored. Edited in the file; there is
+  no dialog field. Detail: `docs/stats.md`.
 
 `backup` is machine-local and is not replicated. Detail: `docs/backup.md`.
 

@@ -16,6 +16,7 @@ use crate::core::session::SessionState;
 use crate::core::stats::TaskAnalytics;
 use crate::core::telemetry::SessionProgress;
 use crate::core::timefmt;
+use crate::core::token_costs::TokenCosts;
 
 use super::app::{App, DetailFocus, HitAction, Hitbox, TextRegion, UiAction};
 use super::board;
@@ -166,6 +167,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         &app.detail.as_ref().unwrap().analytics,
         live_progress,
         session_state,
+        &app.token_costs,
         chunks[1],
     );
 
@@ -526,6 +528,7 @@ fn render_meta(
 /// time and tokens, cumulative over the first run, review passes, reruns and
 /// crash restarts. Purely programmatic: closed sessions come from the stats
 /// events file ([`TaskAnalytics`]), the live one from transcript telemetry.
+#[allow(clippy::too_many_arguments)]
 fn render_analytics(
     frame: &mut Frame<'_>,
     theme: &Theme,
@@ -533,6 +536,7 @@ fn render_analytics(
     analytics: &TaskAnalytics,
     live: Option<&SessionProgress>,
     session_state: Option<SessionState>,
+    costs: &TokenCosts,
     area: Rect,
 ) {
     let mut running_seconds = analytics.running_seconds;
@@ -570,8 +574,19 @@ fn render_analytics(
             ));
         }
         spans.push(Span::styled(" │ ", Style::default().fg(theme.border)));
+        // The task's current backend/model stands in for every run. A task
+        // that switched models mid-way is priced as its latest one.
+        let weights = costs.weights_for(task.agent_backend.as_deref(), task.ai_model.as_deref());
+        let mut equivalent = weights.equivalent(&tokens);
+        if analytics.unsplit_tokens > 0 {
+            equivalent += analytics.unsplit_tokens as f64;
+        }
         spans.push(Span::styled("Input ", muted));
         spans.push(Span::styled(format_tokens(tokens.input), value));
+        spans.push(Span::styled(" · Cache R ", muted));
+        spans.push(Span::styled(format_tokens(tokens.cache_read), value));
+        spans.push(Span::styled(" · Cache W ", muted));
+        spans.push(Span::styled(format_tokens(tokens.cache_write), value));
         spans.push(Span::styled(" · Output ", muted));
         spans.push(Span::styled(format_tokens(tokens.output), value));
         spans.push(Span::styled(" · Cache hit ", muted));
@@ -582,12 +597,13 @@ fn render_analytics(
                 .unwrap_or_else(|| "-".to_string()),
             value,
         ));
+        spans.push(Span::styled(
+            format!(" · ≈{} eq", format_tokens(equivalent.round() as i64)),
+            value,
+        ));
         if analytics.unsplit_tokens > 0 {
             spans.push(Span::styled(
-                format!(
-                    " · +{} tok without split",
-                    format_tokens(analytics.unsplit_tokens)
-                ),
+                format!(" · +{} mixed tok", format_tokens(analytics.unsplit_tokens)),
                 muted,
             ));
         }
