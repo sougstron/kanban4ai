@@ -64,6 +64,107 @@ fn board() -> Env {
 }
 
 #[test]
+fn compact_stats_preserves_totals_report_and_errors() {
+    let env = board();
+    let stats_dir = env.kanban().join("stats");
+    std::fs::create_dir_all(&stats_dir).unwrap();
+    let events: String = (0..80)
+        .map(|i| {
+            serde_json::json!({"kind": "usage", "ts": "2026-01-01T12:00:00",
+                "task_id": format!("TASK-{i}"), "tokens": 1000,
+                "backend": format!("backend-{i:03}"), "model": format!("provider-{i:03}/model")
+            })
+            .to_string()
+                + "\n"
+        })
+        .collect();
+    std::fs::write(stats_dir.join("events.jsonl"), events).unwrap();
+    let full = kanban(&env)
+        .arg("stats")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let compact = kanban(&env)
+        .args(["stats", "--compact"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let full = String::from_utf8(full).unwrap();
+    let compact = String::from_utf8(compact).unwrap();
+    assert!(compact.len() < full.len() / 2);
+    for line in full
+        .lines()
+        .filter(|line| line.starts_with("Total") || line.starts_with("Average"))
+    {
+        assert!(compact.lines().any(|candidate| candidate == line), "{line}");
+    }
+    assert!(compact.contains("80,000"));
+    let report = compact
+        .lines()
+        .find_map(|line| line.strip_prefix("Full report: "))
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(report).unwrap() + "\n", full);
+    std::fs::write(
+        env.kanban().join("config.yaml"),
+        "thresholds:\n  compact_report_top_n: 1\n",
+    )
+    .unwrap();
+    let smaller = kanban(&env)
+        .args(["stats", "--compact"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(smaller.len() < compact.len());
+    std::fs::write(
+        env.kanban().join("config.yaml"),
+        "thresholds:\n  compact_report_top_n: -1\n",
+    )
+    .unwrap();
+    kanban(&env)
+        .args(["stats", "--compact"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("must be a positive integer"));
+    std::fs::write(
+        env.kanban().join("config.yaml"),
+        "thresholds:\n  compact_report_top_n: 5\n",
+    )
+    .unwrap();
+    std::fs::remove_dir_all(env.store().join("reports")).unwrap();
+    std::fs::write(env.store().join("reports"), "blocked").unwrap();
+    kanban(&env)
+        .args(["stats", "--compact"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("Full report:").not());
+    kanban(&env)
+        .args(["--project", "missing-project", "stats", "--compact"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no such project"));
+}
+
+#[test]
+fn compact_stats_works_outside_a_board_and_is_scoped_to_stats() {
+    let env = Env::new();
+    kanban(&env)
+        .args(["stats", "--compact"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Full report:"));
+    kanban(&env)
+        .args(["show", "TASK-001", "--compact"])
+        .assert()
+        .failure();
+}
+
+#[test]
 fn init_creates_board() {
     let dir = Env::new();
     kanban(&dir)

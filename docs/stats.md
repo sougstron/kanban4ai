@@ -191,3 +191,58 @@ Both fine for a for-fun feature, neither for anything load-bearing:
   accounted for), not "reached the Done column" — Done status is not stable
   history (tasks get reopened, archived, or deleted) while the event log is
   append-only.
+
+## Compact CLI report
+
+Opt in with `kanban stats --compact`. Totals, time windows, task counts,
+averages and cumulative phase durations stay visible. Breakdown tables show
+at most `thresholds.compact_report_top_n` rows (default 5, positive integer)
+from the selected/current project's `.kanban/config.yaml`; outside a project
+the built-in default applies. `--project` selects the configuration, while
+statistics still cover the whole store. The existing model cap of 10 remains.
+
+Before printing the summary, the command atomically writes the standard
+report to `<store>/reports/stats-<timestamp>-<pid>.txt` and prints
+`Full report: <path>`. A banner explicitly identifies the row cap. Report
+files remain until manually removed. Write failures and invalid project
+selectors fail visibly; a negative or zero row limit is rejected. The default
+`stats` command and TUI report are unchanged. As before, the stats reader
+ignores malformed event lines and unavailable event files; compact mode does
+not introduce any additional filtering.
+
+Reproduce the output comparison in an isolated temporary store:
+
+```sh
+python3 scripts/measure-compact-stats.py target/debug/kanban4ai
+```
+
+The fixture has 80 tasks, backends and providers, 1,000 tokens per task.
+The script saves before/after stdout, verifies totals and the full-report
+file, and prints character counts and artifact paths. CLI regression tests
+also cover configurable caps, operation outside a board, invalid selectors
+and report-write failures.
+
+### Output audit (TASK-544)
+
+- `stats`: repeated backend/provider/project tables across time windows and
+  task metrics grow with store diversity. An explicit compact mode is safe
+  because aggregates retain their meaning and the full standard report is saved.
+- `show --with-context` and `questions`: unbounded prose can contain required
+  constraints, errors or answer choices. No automatic truncation was added;
+  save large results to a named file and inspect relevant ranges.
+- `list`, `sessions`, project listings and JSON output grow with board/store
+  size but have existing consumers. Their default contracts remain unchanged.
+- External test, search, diff and merge output is controlled by the agent:
+  narrow searches first, limited examples in summaries, full logs at a stated
+  path, preserve errors and decision-relevant details. Never silently limit
+  arbitrary tool stdout or re-read data already in context without a reason.
+
+The launch guidance applies to executor, designer, reviewer and orchestrator.
+AGENTS.md and native-resume behavior are unchanged.
+
+Measured on 2026-10-23 on the test VM: **19,913 → 3,549 characters
+(82.2% less)** with the default cap of 5. Counts include stdout's report-path
+line; timestamp/path length and current month/week can change the exact size.
+All 80,000 tokens and task totals survived, and the saved standard report
+matched uncapped stdout byte-for-byte except its final print newline.
+This measures command output, not a claimed reduction in total model tokens.
