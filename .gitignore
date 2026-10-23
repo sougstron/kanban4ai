@@ -19,3 +19,7 @@
 
 # Unreleased change logs (local input for the next version release)
 .changes/
+
+# Local tool state
+.omo/
+__pycache__/

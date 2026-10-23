@@ -1,3 +1,40 @@
+# kanban4ai 0.8.8
+
+First published release since 0.8.4: it also carries the unpublished 0.8.5,
+0.8.6 and 0.8.7 changes below, including the one-way store migration to
+format 5. Back up the store before the first start.
+
+- **Fewer UI freezes behind task starts and project creation.** The TUI
+  thread was parked in flock waits (19.6 s in one `tui.log`) while
+  background work held store and board locks. `wip::publish` no longer keeps
+  the board lock across its git pushes; a per-task push lock (taken after the
+  board lock) stops a slow periodic push from overwriting a newer
+  continuation checkpoint. `backup::create` pre-copies files unlocked,
+  re-copies only changed ones under the locks and hashes after releasing
+  them (locked copy on a copy of the live store: 3.0 s → 0.15 s). TUI `r`
+  queues on the launch worker, and project creation registers on a worker.
+- **Local queue routing on a paired store.** An unpinned queued task whose
+  effective runner is `here` (or this node's name/role) now uses the local
+  dispatcher and its caps instead of remote runner selection, and an existing
+  non-Git work folder no longer waits for clone preparation or the store lock
+  held by code publication. Completion triggers, chained starts, completion
+  notifications and reviewer verdict routing now run before finished code is
+  published to the sync remote, so a slow publication cannot delay the chain.
+- **Review detail closes after a runner re-run.** On a sync-enabled board
+  Ctrl+R on a Review task took the remote-runner route and left the detail
+  open; it now closes as on the local route. In-Progress re-runs keep the
+  window open on both routes.
+- **`kanban stats --compact`.** Caps breakdown rows at the new
+  `thresholds.compact_report_top_n` (default 5) and saves the full report to
+  a printed file path. Agent prompts gain short context-economy guidance that
+  points at it.
+- **Codex limits report a revoked login.** When the ChatGPT session behind
+  codex is revoked, the app-server answers `account/rateLimits/read` with a
+  401. kanban4ai dropped that error and kept showing the last rollout's
+  numbers, days old, as if they were current. The codex row now reads
+  `signed out` until `codex login` (or a codex run that works) brings fresh
+  numbers back.
+
 # kanban4ai 0.8.7
 
 - **Per-project uid tables.** `sync/meta/uids.json` (5 MB on the live store:
@@ -35,12 +72,6 @@
   Transfers now run unlocked; the task is re-read afterwards and only the
   reconcile-owned fields are applied, and `mark_review_seen` skips the lock
   when the task is not flagged.
-- **Codex limits report a revoked login.** When the ChatGPT session behind
-  codex is revoked, the app-server answers `account/rateLimits/read` with a
-  401. kanban4ai dropped that error and kept showing the last rollout's
-  numbers, days old, as if they were current. The codex row now reads
-  `signed out` until `codex login` (or a codex run that works) brings fresh
-  numbers back.
 
 # kanban4ai 0.8.6
 
