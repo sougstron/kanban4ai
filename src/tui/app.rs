@@ -5868,8 +5868,8 @@ impl App {
                 .detail
                 .as_ref()
                 .is_some_and(|detail| detail.task_id == task.id);
-        let remote = self.board.remote_runs.contains_key(&task.id)
-            || !crate::cli::serve::local_runner(self.ops.data_root(), task.runner.as_ref())?;
+        let remote =
+            self.board.remote_runs.contains_key(&task.id) || !self.ops.owns_queued_run(&task)?;
         // Same hard fallback as `r`: never park a re-run in a queue nothing
         // can drain (queue or auto-launch switched off) — start it directly.
         let mode = if self.ops.queue_can_dispatch()? {
