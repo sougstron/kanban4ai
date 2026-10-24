@@ -1,3 +1,40 @@
+# kanban4ai 0.8.10
+
+Notes are from the reviewed diff since 0.8.9. There were no `.changes/` logs.
+
+- **Task creation and background sync readers stop loading the whole store.**
+  Creating a task minted its id through `sync::historical_max`, which loaded
+  the whole-store projection (every shard of every project, ~5.6k files) under
+  the sync lock; it now reads the board-scoped uid tables, and a cold create
+  drops from ~575 ms to ~28 ms. Two background readers that rebuilt the same
+  whole-store state under the sync lock after every journal change no longer
+  stall a foreground save: the pump's runner-control scan runs only when a
+  remote node's journal grew (plus a 5-minute rescan), and the TUI conflict
+  poller skips the load when the board has no stored conflicts.
+- **Terminal-move WIP ref cleanup moves off the UI thread.** Bulk Archive/Done
+  ran a git push per task to delete remote WIP refs; moves now drop a
+  `.kanban/wip/<task>.cleanup` marker that serve's sync timer drains, and a
+  task restored before then keeps its refs. Auto-launched chained tasks also
+  no longer push `kanban/*` and the integration ref inline: a managed-clone
+  launch drops `.kanban/wip/code.publish` for the same timer. Quitting while a
+  sync is in flight opens a confirmation with remaining/total counts.
+- **The task detail closes as soon as Run/Re-run is pressed.** The launch runs
+  on a worker and can take seconds; the detail used to stay open until the
+  report landed, looking frozen. Now the detail closes on the press, the board
+  focuses the card, and queued/running progress shows on the board.
+  In-Progress re-runs keep the detail open as before.
+- **Task-failure desktop notifications name the project.** Crash and stranded
+  alerts read `Kanban task failed: TASK-7 (api-server)` so failures from
+  several boards are tellable apart; unregistered boards keep the old title.
+- **Kimi K3.1 Pro models join the kimi fallback list**
+  (`kimi-code/k3.1-pro`, `kimi-code/k3.1-pro-highspeed`).
+
+Board files, `config.yaml`, journal records, and the sync protocol (3) stay
+readable by 0.8.9. The new model entries extend the built-in kimi fallback
+list; the sync-side changes are internal (vector-vector caching, board-scoped
+reads), and the `.kanban/wip/` markers are node-local work queues that older
+peers never read.
+
 # kanban4ai 0.8.9
 
 Notes are from the reviewed diff since 0.8.8. There were no `.changes/` logs.
