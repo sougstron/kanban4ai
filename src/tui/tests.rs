@@ -5272,12 +5272,11 @@ fn review_rerun_from_board_focuses_in_progress() {
     );
 }
 
-/// A runner-accepted re-run must end the review window exactly like the
-/// local route: TASK-543 — on a sync-enabled board every runner-less task
-/// counts as "remote", and the early return used to skip the close, so the
-/// Review detail stayed open after Ctrl+R.
+/// A runner-accepted re-run out of Review refocuses the board on the task
+/// exactly like the local route (TASK-543: on a sync-enabled board every
+/// runner-less task counts as "remote").
 #[test]
-fn rerun_report_closes_the_review_detail_on_the_runner_route_too() {
+fn rerun_report_focuses_the_review_task_on_the_runner_route_too() {
     let (_dir, app) = app_with_board();
     let report = super::app::rerun_launch_report(
         &app.ops,
@@ -5285,10 +5284,8 @@ fn rerun_report_closes_the_review_detail_on_the_runner_route_too() {
         true,
         true,
         true,
-        true,
         crate::core::models::RunMode::Immediate,
     );
-    assert_eq!(report.close_detail_for.as_deref(), Some("TASK-001"));
     assert_eq!(report.focus.as_deref(), Some("TASK-001"));
     assert_eq!(
         report.status.as_deref(),
@@ -5297,7 +5294,7 @@ fn rerun_report_closes_the_review_detail_on_the_runner_route_too() {
 }
 
 #[test]
-fn rerun_report_keeps_the_detail_for_in_progress_reruns() {
+fn rerun_report_keeps_focus_for_in_progress_reruns() {
     let (_dir, app) = app_with_board();
     for remote in [false, true] {
         let report = super::app::rerun_launch_report(
@@ -5305,19 +5302,17 @@ fn rerun_report_keeps_the_detail_for_in_progress_reruns() {
             "TASK-001",
             true,
             false,
-            true,
             remote,
             crate::core::models::RunMode::Immediate,
         );
-        assert!(report.close_detail_for.is_none());
         assert!(report.focus.is_none());
     }
 }
 
-/// Nothing was started (busy runner refused, task gone): no close on either
-/// route, and the local route says so in the status line.
+/// Nothing was started (busy runner refused, task gone): no refocus on
+/// either route.
 #[test]
-fn rerun_report_without_a_started_run_never_closes_the_detail() {
+fn rerun_report_without_a_started_run_never_moves_focus() {
     let (_dir, app) = app_with_board();
     for remote in [false, true] {
         let report = super::app::rerun_launch_report(
@@ -5325,11 +5320,9 @@ fn rerun_report_without_a_started_run_never_closes_the_detail() {
             "TASK-001",
             false,
             true,
-            true,
             remote,
             crate::core::models::RunMode::Queued,
         );
-        assert!(report.close_detail_for.is_none());
         assert!(report.focus.is_none());
     }
 }
@@ -5587,6 +5580,102 @@ fn run_hotkey_launches_on_a_worker_without_blocking_the_ui() {
     let started = app.ops.get_task(&task.id).unwrap().unwrap();
     assert!(started.session.is_some());
     assert_ne!(started.run_phase, Some(RunPhase::Queued));
+}
+
+/// Poll launch reports until the status no longer shows `pending`; the tick
+/// worker shares the wake channel, so one wake is not necessarily the launch.
+fn drain_launch_reports(
+    app: &mut App,
+    wake_rx: &std::sync::mpsc::Receiver<super::event::AppEvent>,
+    pending: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.status.contains(pending) {
+        assert!(Instant::now() < deadline, "launch report never landed");
+        let _ = wake_rx.recv_timeout(Duration::from_millis(50));
+        app.poll_launches();
+    }
+}
+
+/// TASK-556: Run on the detail screen hides it at once, before the slow
+/// launch finishes, so the queued → running progress plays out on the board.
+#[test]
+fn detail_run_closes_the_detail_before_the_launch_finishes() {
+    let (_dir, mut app, _) = queue_run_app();
+    let launcher = GatedLauncher::default();
+    app.ops = Operations::with_launcher(app.ops.data_root(), Box::new(launcher.clone()));
+    let _release = OpenOnDrop(launcher.clone());
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    app.enable_background_launches(wake_tx);
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Slow detail start"))
+        .expect("create task");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    assert_eq!(app.screen, Screen::Detail);
+
+    app.handle_key(key(KeyCode::Char('r'))).expect("run");
+    assert_eq!(app.screen, Screen::Board, "detail must close on the press");
+    assert!(app.detail.is_none());
+    assert!(launcher.spy.calls().is_empty(), "launch is still gated");
+
+    launcher.open();
+    drain_launch_reports(&mut app, &wake_rx, "dispatching");
+    assert_eq!(app.screen, Screen::Board);
+    assert_eq!(app.focused_column, in_progress_column(&app));
+    assert_eq!(
+        app.focused_task().map(|focused| focused.id.as_str()),
+        Some(task.id.as_str())
+    );
+}
+
+/// TASK-556: Ctrl+R on the Review detail hides it at once, before the slow
+/// re-run lands, and the board follows the task to In Progress.
+#[test]
+fn review_detail_rerun_closes_the_detail_before_the_launch_finishes() {
+    let (_dir, mut app, _) = queue_run_app();
+    let launcher = GatedLauncher::default();
+    app.ops = Operations::with_launcher(app.ops.data_root(), Box::new(launcher.clone()));
+    let _release = OpenOnDrop(launcher.clone());
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    app.enable_background_launches(wake_tx);
+    let task = app
+        .ops
+        .create_task(NewTask::titled("Slow rework"))
+        .expect("create task");
+    app.ops
+        .move_task(&task.id, "review", false)
+        .expect("move to review");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    app.focused_column = review_column(&app);
+    app.focused_card = 0;
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    app.detail
+        .as_mut()
+        .expect("detail")
+        .review_edits
+        .insert_str("Rework this");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))
+        .expect("rerun");
+    assert_eq!(app.screen, Screen::Board, "detail must close on the press");
+    assert!(app.detail.is_none());
+    assert_eq!(
+        app.ops.get_task(&task.id).unwrap().unwrap().review_edits,
+        "Rework this",
+        "visible edits are saved before the detail closes"
+    );
+
+    launcher.open();
+    drain_launch_reports(&mut app, &wake_rx, "Re-running");
+    assert_eq!(app.screen, Screen::Board);
+    assert_eq!(app.focused_column, in_progress_column(&app));
+    assert_eq!(
+        app.focused_task().map(|focused| focused.id.as_str()),
+        Some(task.id.as_str())
+    );
 }
 
 #[test]

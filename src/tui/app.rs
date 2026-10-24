@@ -571,8 +571,6 @@ struct LaunchJob {
 pub(super) struct LaunchReport {
     pub(super) status: Option<String>,
     modal: Option<Modal>,
-    /// Close the detail screen if it still shows this task.
-    pub(super) close_detail_for: Option<String>,
     pub(super) focus: Option<String>,
     refresh: bool,
     redraw: bool,
@@ -636,26 +634,21 @@ fn task_started_after_queue_run(ops: &Operations, task_id: &str) -> bool {
         .is_some_and(|task| task.run_phase != Some(RunPhase::Queued) && task.session.is_some())
 }
 
-/// Report for a finished re-run. A runner-accepted re-run (`remote`) gets the
-/// same review-window close as the local route: the edits left with the
-/// request, so the detail must not stay pinned to a task that has moved on.
-/// In-Progress re-runs keep the window open on both routes, like the local
-/// path always did.
+/// Report for a finished re-run. The Review detail was already closed when the
+/// re-run was requested; a started re-run out of Review refocuses the board on
+/// the task where it now lives, on both the local and the runner route.
 pub(super) fn rerun_launch_report(
     ops: &Operations,
     task_id: &str,
     reran: bool,
     from_review: bool,
-    should_close_detail: bool,
     remote: bool,
     mode: RunMode,
 ) -> LaunchReport {
     if remote && reran {
-        let moved = (from_review && should_close_detail).then(|| task_id.to_string());
         return LaunchReport {
             status: Some(format!("Re-run requested for {task_id} on its runner")),
-            close_detail_for: moved.clone(),
-            focus: moved,
+            focus: from_review.then(|| task_id.to_string()),
             refresh: true,
             redraw: true,
             ..LaunchReport::default()
@@ -675,13 +668,11 @@ pub(super) fn rerun_launch_report(
     } else {
         format!("Queued {task_id} for re-run")
     };
-    // Leave the Review column/detail and show the task where it now
-    // lives — In Progress — so the rework send is visible immediately.
-    let moved = (reran && from_review).then(|| task_id.to_string());
+    // Show the task where it now lives — In Progress — so the rework send is
+    // visible immediately.
     LaunchReport {
         status: Some(status),
-        close_detail_for: moved.clone(),
-        focus: moved,
+        focus: (reran && from_review).then(|| task_id.to_string()),
         refresh: true,
         redraw: true,
         ..Default::default()
@@ -3860,17 +3851,6 @@ impl App {
             self.status = err.to_string();
             return;
         }
-        if let Some(task_id) = report.close_detail_for
-            && self.screen == Screen::Detail
-            && self
-                .detail
-                .as_ref()
-                .is_some_and(|detail| detail.task_id == task_id)
-            && let Err(err) = self.close_detail()
-        {
-            self.status = err.to_string();
-            return;
-        }
         if let Some(task_id) = report.focus {
             let _ = self.focus_task(&task_id);
         }
@@ -5655,7 +5635,7 @@ impl App {
         if self.launch_busy(&task_id) {
             return Ok(());
         }
-        let should_close_detail = self.screen == Screen::Detail;
+        let from_detail = self.leave_detail_for_launch(&task_id)?;
         self.request_full_redraw();
         self.status = format!("Queued {task_id} — dispatching…");
         // The pump below replaces the tick's next one.
@@ -5679,7 +5659,7 @@ impl App {
             };
             LaunchReport {
                 status: Some(status),
-                close_detail_for: (started && should_close_detail).then_some(task_id),
+                focus: from_detail.then_some(task_id),
                 refresh: true,
                 redraw: true,
                 ..LaunchReport::default()
@@ -5705,7 +5685,7 @@ impl App {
         if self.launch_busy(&task_id) {
             return Ok(());
         }
-        let should_close_detail = self.screen == Screen::Detail;
+        let from_detail = self.leave_detail_for_launch(&task_id)?;
         self.request_full_redraw();
         self.status = format!("Starting {task_id}…");
         let suffix = suffix.to_string();
@@ -5720,13 +5700,33 @@ impl App {
             };
             LaunchReport {
                 status: Some(status),
-                close_detail_for: (started && should_close_detail).then_some(task_id),
+                focus: (started && from_detail).then_some(task_id),
                 refresh: true,
                 redraw: true,
                 ..LaunchReport::default()
             }
         });
         Ok(())
+    }
+
+    /// Close the detail screen showing `task_id` before its launch goes to a
+    /// worker, landing on the board with the card focused: the launch can
+    /// take seconds, and its queued/running progress belongs on the board,
+    /// not on a detail window that looks frozen meanwhile. Returns whether
+    /// the detail was open, so the report can refocus the moved card.
+    fn leave_detail_for_launch(&mut self, task_id: &str) -> Result<bool> {
+        let open = self.screen == Screen::Detail
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.task_id == task_id);
+        if !open {
+            return Ok(false);
+        }
+        self.return_screen = Screen::Board;
+        self.close_detail()?;
+        let _ = self.focus_task(task_id);
+        Ok(true)
     }
 
     fn run_on_runner(
@@ -5739,11 +5739,13 @@ impl App {
             return Ok(());
         }
         let task_id = task_id.to_owned();
+        let from_detail = self.leave_detail_for_launch(&task_id)?;
         self.status = format!("Starting {task_id}…");
         self.spawn_launch(Some(task_id.clone()), move |ops| {
             let result =
                 crate::cli::serve::launch_on_board(ops.data_root(), &task_id, runner, queue);
             let mut report = LaunchReport {
+                focus: from_detail.then(|| task_id.clone()),
                 refresh: true,
                 redraw: true,
                 ..Default::default()
@@ -5883,13 +5885,6 @@ impl App {
             return Ok(());
         }
         let from_review = task.status == TaskStatus::Review;
-        // Same request-time capture as `r`: the report may land after the
-        // user opened another task's detail, and that window must survive.
-        let should_close_detail = self.screen == Screen::Detail
-            && self
-                .detail
-                .as_ref()
-                .is_some_and(|detail| detail.task_id == task.id);
         let remote =
             self.board.remote_runs.contains_key(&task.id) || !self.ops.owns_queued_run(&task)?;
         // Same hard fallback as `r`: never park a re-run in a queue nothing
@@ -5906,6 +5901,12 @@ impl App {
                 self.status = format!("{} can be re-run only from Review or In Progress", task.id);
                 return Ok(());
             }
+        }
+        // Leave the Review window before the slow re-run so its progress
+        // (queued, running) shows on the board, not on a stale detail.
+        // In-Progress re-runs keep the window open.
+        if from_review {
+            self.leave_detail_for_launch(&task.id)?;
         }
         self.request_full_redraw();
         if mode == RunMode::Queued {
@@ -5930,15 +5931,7 @@ impl App {
                     };
                 }
             };
-            rerun_launch_report(
-                ops,
-                &task_id,
-                reran,
-                from_review,
-                should_close_detail,
-                remote,
-                mode,
-            )
+            rerun_launch_report(ops, &task_id, reran, from_review, remote, mode)
         });
         Ok(())
     }
