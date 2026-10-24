@@ -81,7 +81,7 @@ use crate::core::models::{
     Session, SessionStatus, Task, TaskStatus,
 };
 use crate::core::notifier::{DesktopNotifier, NotificationConfig};
-use crate::core::project::{Project, Roots};
+use crate::core::project::{Project, ProjectStore, Roots};
 use crate::core::provenance::{
     self, ClaudeHarvester, CodexHarvester, InputManifest, KimiHarvester, OpencodeHarvester,
     PiFamilyHarvester, TranscriptHarvester,
@@ -445,9 +445,21 @@ impl Operations {
 
     pub(crate) fn notifier(&self) -> Result<DesktopNotifier> {
         let mapping = self.config.get_notifications()?;
-        Ok(DesktopNotifier::new(NotificationConfig::from_mapping(
-            &mapping,
-        )))
+        Ok(DesktopNotifier::new(
+            NotificationConfig::from_mapping(&mapping),
+            self.notifier_project_name(),
+        ))
+    }
+
+    /// Display name of this board's registered project, for failure alerts;
+    /// `None` when unregistered or the registry cannot be read.
+    fn notifier_project_name(&self) -> Option<String> {
+        let id = self.project_id.as_deref()?;
+        ProjectStore::open()
+            .ok()?
+            .get(id)
+            .ok()?
+            .map(|project| project.name)
     }
 
     fn notify_question(&self, task: &Task, question: &str) {
