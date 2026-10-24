@@ -375,6 +375,14 @@ impl Journal {
         Ok(ops)
     }
 
+    /// Whether any conflict row, active or archived, names `project`. Cheap:
+    /// it reads only the conflict logs, never the store projection.
+    pub(crate) fn has_stored_conflicts(&self, project: &str) -> Result<bool> {
+        Ok(prune::stored_conflicts(&self.root)?
+            .iter()
+            .any(|c| c.project == project))
+    }
+
     /// Active field conflicts. Archived rows stay visible while they still win the field.
     pub fn conflicts(&self) -> Result<Vec<Conflict>> {
         let state = self.state()?;
