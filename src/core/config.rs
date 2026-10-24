@@ -260,6 +260,8 @@ agents:
     - kimi-code/kimi-for-coding-highspeed
     - kimi-code/k3
     - kimi-code/k3-256k
+    - kimi-code/k3.1-pro
+    - kimi-code/k3.1-pro-highspeed
     effort: null
     efforts:
     - thinking
