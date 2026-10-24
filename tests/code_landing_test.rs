@@ -626,6 +626,12 @@ fn unchanged_wip_tree_does_not_push_again() {
         .complete_task(&task.id, "ses-stable-wip", true)
         .unwrap();
     operations.mark_review_tasks_done().unwrap();
+    // The move only queues the remote cleanup; serve's sync timer runs it.
+    let wip = format!("refs/kanban/wip/{}", task.id);
+    assert!(!git(&p.remote, &["for-each-ref", "--format=%(refname)", &wip]).is_empty());
+    assert_eq!(kanban4ai::core::wip::pending_cleanups(&p.a), 1);
+    kanban4ai::core::wip::flush_cleanups(&p.pa).unwrap();
+    assert_eq!(kanban4ai::core::wip::pending_cleanups(&p.a), 0);
     assert!(
         git(
             &p.remote,
@@ -639,6 +645,27 @@ fn unchanged_wip_tree_does_not_push_again() {
         .is_empty()
     );
     assert_eq!(git(&p.remote, &["rev-parse", &neighbor]), second);
+}
+
+#[test]
+fn queued_cleanup_spares_a_task_restored_before_the_flush() {
+    let p = pair(false);
+    let task = ops(&p.pa)
+        .create_task(NewTask::titled("restored WIP"))
+        .unwrap();
+    take(&p.pa, &task.id, "ses-restored-wip", "restored");
+    let current = ops(&p.pa).get_task(&task.id).unwrap().unwrap();
+    kanban4ai::core::wip::checkpoint(&p.pa, &current).unwrap();
+    let operations = ops(&p.pa);
+    operations
+        .complete_task(&task.id, "ses-restored-wip", true)
+        .unwrap();
+    operations.move_task(&task.id, "archive", false).unwrap();
+    operations.unarchive_task(&task.id).unwrap();
+    kanban4ai::core::wip::flush_cleanups(&p.pa).unwrap();
+    assert_eq!(kanban4ai::core::wip::pending_cleanups(&p.a), 0);
+    let wip = format!("refs/kanban/wip/{}", task.id);
+    assert!(!git(&p.remote, &["for-each-ref", "--format=%(refname)", &wip]).is_empty());
 }
 
 #[test]

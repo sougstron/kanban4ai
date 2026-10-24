@@ -1708,7 +1708,7 @@ impl App {
         {
             self.ctrl_c_exit_deadline = None;
             let _ = self.persist_detail_drafts();
-            self.should_quit = true;
+            self.request_quit();
         } else {
             self.ctrl_c_exit_deadline = Some(now + CTRL_C_EXIT_WINDOW);
             self.status = CTRL_C_EXIT_PROMPT.to_string();
@@ -2078,7 +2078,7 @@ impl App {
             // The title bar advertises `q quit`: `q` leaves the whole TUI
             // instead of bouncing back into the board this list was opened
             // from. `Esc` stays the back key.
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => self.request_quit(),
             KeyCode::Esc => self.leave_projects(),
             KeyCode::Char('/') => self.dispatch(UiAction::Search)?,
             KeyCode::Char('?') => self.dispatch(UiAction::Help)?,
@@ -5013,7 +5013,20 @@ impl App {
         if let Some(project) = self.return_project.clone() {
             self.pending_switch = Some(LoopOutcome::OpenProject(project));
         } else {
-            self.should_quit = true;
+            self.request_quit();
+        }
+    }
+
+    /// Quit, unless a sync is still in flight: then ask first and say how
+    /// much is left. The check reads local sync files only.
+    fn request_quit(&mut self) {
+        let root = self.store.as_ref().map(|store| store.root().to_path_buf());
+        match self.sync_board.backlog_now(root.as_deref()) {
+            Some((remaining, total)) => {
+                self.status = format!("Sync in progress: {remaining} of {total} left");
+                self.modal = Some(ModalState::new(Modal::QuitConfirm { remaining, total }));
+            }
+            None => self.should_quit = true,
         }
     }
 
@@ -7361,6 +7374,7 @@ impl App {
                 self.status = format!("Stop requested for {task_id} on its runner");
                 self.refresh_after_action()?;
             }
+            Modal::QuitConfirm { .. } => self.should_quit = true,
             Modal::RestoreConfirm { task_id } => {
                 let restored = self.ops.unarchive_task(&task_id)?;
                 self.refresh_after_action()?;
@@ -8424,6 +8438,7 @@ fn is_confirmation_modal(modal: &Modal) -> bool {
             | Modal::KillSessionConfirm { .. }
             | Modal::StopTaskConfirm { .. }
             | Modal::RestoreConfirm { .. }
+            | Modal::QuitConfirm { .. }
             | Modal::DeleteProject { .. }
     )
 }

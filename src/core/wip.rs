@@ -1,7 +1,7 @@
 //! WIP checkpoints never move a task branch, HEAD, or the agent's index.
 use super::{
     error::{KanbanError, Result},
-    models::Task,
+    models::{Task, TaskStatus},
     project::{Project, ProjectStore},
     session::SessionManager,
     storage::{BoardGuard, Storage, atomic_write_text, lock_file_reentrant},
@@ -240,17 +240,86 @@ pub fn cleanup(project: &Project, task_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Queue a terminal task's service-ref cleanup. Deleting the refs pushes to
+/// the code remote, which took seconds per task and froze bulk Archive/Done
+/// moves; the move only drops a marker and [`flush_cleanups`] runs from
+/// serve's sync timer. A store with sync off has no such timer and cleans
+/// inline.
 pub fn cleanup_board(board: &Path, task_id: &str) -> Result<()> {
     let Some(root) = super::sync::store_for_board(board) else {
         return Ok(());
     };
-    let Some(id) = board.file_name().and_then(|name| name.to_str()) else {
-        return Ok(());
+    if !super::sync::enabled(root) {
+        let Some(id) = board.file_name().and_then(|name| name.to_str()) else {
+            return Ok(());
+        };
+        return match ProjectStore::at(root).get(id)? {
+            Some(project) => cleanup(&project, task_id),
+            None => Ok(()),
+        };
+    }
+    let directory = board.join(".kanban/wip");
+    fs::create_dir_all(&directory)?;
+    atomic_write_text(&directory.join(format!("{task_id}.cleanup")), "")?;
+    Ok(())
+}
+
+fn cleanup_markers(project: &Project) -> Vec<String> {
+    let Ok(entries) = fs::read_dir(project.data_root.join(".kanban/wip")) else {
+        return Vec::new();
     };
-    let Some(project) = ProjectStore::at(root).get(id)? else {
-        return Ok(());
-    };
-    cleanup(&project, task_id)
+    let mut ids: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()?
+                .strip_suffix(".cleanup")
+                .map(str::to_owned)
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Service-ref cleanups queued by terminal moves and not yet run.
+pub fn pending_cleanups(root: &Path) -> usize {
+    ProjectStore::at(root)
+        .list()
+        .map(|projects| projects.iter().map(|p| cleanup_markers(p).len()).sum())
+        .unwrap_or(0)
+}
+
+/// Run the queued cleanups. A task restored from Archive before its turn
+/// may already own fresh WIP refs, so only a still-terminal (or deleted)
+/// task is cleaned; either way its marker is consumed. A failed cleanup
+/// keeps its marker for the next timer round.
+pub fn flush_cleanups(project: &Project) -> Result<()> {
+    let storage = Storage::new(&project.data_root);
+    let mut failure = None;
+    for task_id in cleanup_markers(project) {
+        let marker = project
+            .data_root
+            .join(".kanban/wip")
+            .join(format!("{task_id}.cleanup"));
+        let result = (|| {
+            let _push = push_lock(project, &task_id)?;
+            let terminal = storage
+                .load_task(&task_id)?
+                .is_none_or(|task| matches!(task.status, TaskStatus::Done | TaskStatus::Archive));
+            if terminal {
+                cleanup(project, &task_id)?;
+            }
+            match fs::remove_file(&marker) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+                _ => Ok(()),
+            }
+        })();
+        if let Err(error) = result {
+            failure = Some(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 /// Serializes one task's WIP pushes, so a slow periodic push that started
@@ -299,6 +368,9 @@ pub fn publish(root: &Path, interval: u64, force: bool) -> Result<()> {
     }
     let mut failure = None;
     for project in ProjectStore::at(root).list()? {
+        if let Err(error) = flush_cleanups(&project) {
+            failure = Some(error);
+        }
         let storage = Storage::new(&project.data_root);
         let sessions = SessionManager::new(&project.data_root);
         for task in storage.list_unarchived_tasks()? {

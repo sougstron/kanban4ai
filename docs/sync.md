@@ -953,7 +953,11 @@ kanban serve --purge-origin-code-refs
 
 При переходе задачи в Done или Archive удаляются её локальные и remote
 `wip`/`wip-runs` refs. Завершённые `runs` по умолчанию сохраняются для
-восстановления; `sync.cleanup_runs: true` удаляет и их.
+восстановления; `sync.cleanup_runs: true` удаляет и их. Сам переход только
+ставит маркер `.kanban/wip/<TASK>.cleanup`, поэтому массовый Archive/Done
+мгновенный; удаление (с `git push` на remote) выполняет фоновый sync-таймер
+serve. Задача, восстановленная до этого, свои refs сохраняет. При sync off
+очистка идёт сразу.
   Устаревшее поколение даёт `RUN_ALREADY_RUNNING`, несколько активных
   источников — `RUN_DUPLICATE`. Онлайн-источник публикует WIP, закрывает session,
   останавливает tmux либо проверенную по PID/start-time background process group,

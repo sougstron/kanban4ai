@@ -13595,6 +13595,50 @@ fn sync_board_status_and_conflicts_snapshots() {
 }
 
 #[test]
+fn quit_during_sync_asks_first_with_the_remaining_count() {
+    use crate::cli::serve::settings::BoardPeer;
+    use crate::core::sync::NodeRole;
+    let (_dir, mut app) = populated_app();
+    let ctrl_c = || KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+    app.sync_board.peers = vec![BoardPeer {
+        role: NodeRole::Server,
+        code: "ONLINE".into(),
+        pending: 7,
+    }];
+    app.handle_key(ctrl_c()).unwrap();
+    app.handle_key(ctrl_c()).unwrap();
+    assert!(!app.should_quit);
+    app.sync_board.peers[0].pending = 3;
+    app.modal = None;
+    app.handle_key(ctrl_c()).unwrap();
+    app.handle_key(ctrl_c()).unwrap();
+    assert!(matches!(
+        app.modal.as_ref().expect("quit confirm").modal,
+        Modal::QuitConfirm {
+            remaining: 3,
+            total: 7
+        }
+    ));
+    insta::assert_snapshot!("quit_confirm_sync_in_progress", render_snapshot(&mut app));
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert!(!app.should_quit && app.modal.is_none());
+    app.handle_key(ctrl_c()).unwrap();
+    app.handle_key(ctrl_c()).unwrap();
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+    assert!(app.should_quit);
+    // Offline: the backlog just waits, so quitting does not ask.
+    let (_dir, mut app) = populated_app();
+    app.sync_board.peers = vec![BoardPeer {
+        role: NodeRole::Server,
+        code: "OFFLINE".into(),
+        pending: 7,
+    }];
+    app.handle_key(ctrl_c()).unwrap();
+    app.handle_key(ctrl_c()).unwrap();
+    assert!(app.should_quit);
+}
+
+#[test]
 fn sync_status_light_states_and_colors() {
     use super::sync_board::SyncLevel;
     use crate::cli::serve::settings::BoardPeer;
