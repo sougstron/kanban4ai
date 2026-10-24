@@ -814,6 +814,50 @@ fn opening_review_detail_clears_the_unseen_notifier() {
     );
 }
 
+/// TASK-560: on a synced store the read-marker write waits for the journal
+/// lock and fsyncs, so it must not hold up the open itself.
+#[test]
+fn opening_unread_review_detail_does_not_wait_for_the_board_lock() {
+    let (_dir, mut app) = app_with_board();
+    let task_id = agent_review_task(&app, "Open me fast");
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload board");
+    app.focused_column = 2;
+    app.focused_card = 0;
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    app.enable_background_launches(wake_tx);
+
+    // Another process-like holder keeps the board lock while the human opens.
+    let root = app.ops.data_root().to_path_buf();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let storage = crate::core::storage::Storage::new(&root);
+        let _guard = storage.lock().expect("hold board lock");
+        locked_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    locked_rx.recv().unwrap();
+
+    app.handle_key(key(KeyCode::Enter)).expect("open detail");
+    assert_eq!(app.screen, Screen::Detail, "the open must not block");
+    assert!(
+        app.board.columns[2]
+            .tasks
+            .iter()
+            .all(|task| !task.review_unseen),
+        "the card drops its notifier at once"
+    );
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.ops.get_task(&task_id).unwrap().unwrap().review_unseen {
+        assert!(Instant::now() < deadline, "the worker persists the read");
+        let _ = wake_rx.recv_timeout(Duration::from_millis(50));
+        app.poll_launches();
+    }
+}
+
 /// The badge answers "which board am I looking at", and the guessing happens
 /// while reading tasks, so it has to hold on every screen a task can be read
 /// from — not just the board.
