@@ -160,6 +160,9 @@ pub struct GlobalConfig {
     /// under sync, like `node` and `tui`.
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
     pub backup: Mapping,
+    /// Project trash (`trash.retention_days`). Machine-local like `backup`.
+    #[serde(default, skip_serializing_if = "Mapping::is_empty")]
+    pub trash: Mapping,
     /// Fresh-input-equivalent weights for the store-wide stats report.
     /// See [`crate::core::token_costs`].
     #[serde(default, skip_serializing_if = "Mapping::is_empty")]
@@ -396,6 +399,15 @@ impl GlobalConfig {
     /// `backup:` with missing or unusable keys replaced by [`BackupPolicy::default`].
     pub fn backup_policy(&self) -> BackupPolicy {
         BackupPolicy::from_mapping(&self.backup)
+    }
+
+    /// `trash.retention_days`; a missing or non-positive value is the default.
+    pub fn trash_retention_days(&self) -> i64 {
+        self.trash
+            .get(Value::String("retention_days".to_string()))
+            .and_then(positive_u64)
+            .and_then(|days| i64::try_from(days).ok())
+            .unwrap_or(super::config::TRASH_RETENTION_DAYS)
     }
 
     /// The auto-mode section; missing or malformed keys read as defaults

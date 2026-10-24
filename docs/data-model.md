@@ -221,7 +221,12 @@ scan of `projects/*/project.yaml`. The `id` is stable (`rename` changes only
 rename first, verified copy on `EXDEV`, source removed last. `--copy` leaves
 the source. Active sessions refuse unless `--force`. Unregister without
 `--purge` renames `project.yaml` to `project.yaml.removed`; re-adding the same
-folder restores that board and id.
+folder restores that board and id. With `--purge` the whole project directory
+is renamed to `<store>/trash/<id>~<YYYYMMDD-HHMMSS>/` with a `trash.yaml`
+(original `id`, `deleted_at`) and deleted for good once `trash.retention_days`
+pass. The trash is outside `projects/`, so sync sees the removal as a delete;
+restoring renames it back and reconciles sync, so the board wins over its
+tombstones.
 
 Agent-facing paths in the prompt are **absolute** under the data root (cwd is
 the work folder, so a relative `.kanban/…` would land in the repo). The

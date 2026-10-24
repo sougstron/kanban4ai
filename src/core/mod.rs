@@ -33,6 +33,7 @@ pub mod telemetry;
 pub mod thread;
 pub mod timefmt;
 pub mod token_costs;
+pub mod trash;
 pub mod update;
 pub mod vcs;
 pub mod wip;

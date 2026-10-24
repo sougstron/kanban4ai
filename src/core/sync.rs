@@ -773,6 +773,7 @@ fn local_fields(entity: &str, global: bool) -> &'static [&'static str] {
             "auto_mode",
             "recent_models",
             "backup",
+            "trash",
         ],
         _ => &[],
     }

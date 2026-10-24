@@ -1239,6 +1239,9 @@ pub const BACKUP_KEEP_MANUAL: usize = 10;
 pub const BACKUP_MAX_TOTAL_MB: u64 = 2048;
 pub const BACKUP_PRE_RESTORE_DAYS: i64 = 7;
 pub const BACKUP_ARTIFACT_WEEKLY_DAYS: i64 = 7;
+/// Default for `trash.retention_days` in `<store>/config.yaml`: how long a
+/// removed project stays restorable from the trash.
+pub const TRASH_RETENTION_DAYS: i64 = 7;
 
 /// Machine-local backup policy. `dir: None` means [`default_backup_dir`].
 #[derive(Debug, Clone, PartialEq, Eq)]

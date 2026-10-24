@@ -18,6 +18,7 @@ mod sync_tab;
 mod theme;
 mod thread_view;
 mod tick_worker;
+mod trash;
 
 #[cfg(test)]
 mod tests;

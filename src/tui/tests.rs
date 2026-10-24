@@ -10623,8 +10623,67 @@ fn projects_delete_dialog_unregisters_by_default() {
     assert!(!modal.purge_data);
     let rendered = render_snapshot(&mut app);
     assert!(rendered.contains("Unregister"), "{rendered}");
-    assert!(rendered.contains("also delete board data"), "{rendered}");
+    assert!(
+        rendered.contains("also move board data to the trash"),
+        "{rendered}"
+    );
     insta::assert_snapshot!("projects_delete", rendered);
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn projects_trash_restores_and_purges_a_removed_project() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-snap-work-trash");
+    let _ = std::fs::remove_dir_all(&work);
+    let (store_dir, mut app) = projects_app(&work, None);
+    let store = ProjectStore::at(store_dir.path());
+    app.project_selected = 0;
+    app.handle_key(key(KeyCode::Char('d'))).expect("delete");
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("toggle purge");
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("Move to trash"), "{rendered}");
+    app.handle_key(key(KeyCode::Char('y'))).expect("confirm");
+    assert!(store.list().expect("list").is_empty());
+    assert!(app.status.contains("trash"), "{}", app.status);
+
+    app.handle_key(key(KeyCode::Char('t'))).expect("open trash");
+    assert_eq!(app.screen, Screen::Trash);
+    assert_eq!(app.trash_items.len(), 1);
+    // Pin the stamps so the snapshot does not depend on the clock.
+    let stamp = crate::core::timefmt::parse("2026-10-24T12:00:00").expect("stamp");
+    app.trash_items[0].deleted_at = stamp;
+    app.trash_items[0].expires_at = stamp;
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("Demo Board"), "{rendered}");
+    assert!(rendered.contains("deleted 2026-10-24 12:00"), "{rendered}");
+    insta::assert_snapshot!("projects_trash", rendered);
+
+    app.handle_key(key(KeyCode::Enter)).expect("restore");
+    assert!(app.trash_items.is_empty());
+    let restored = store.list().expect("list");
+    assert_eq!(restored.len(), 1);
+    assert!(
+        restored[0]
+            .kanban_dir()
+            .join("tasks/todo/TASK-001.md")
+            .is_file()
+    );
+
+    store.remove(&restored[0].id, true).expect("trash again");
+    app.handle_key(key(KeyCode::Esc)).expect("back");
+    assert_eq!(app.screen, Screen::Projects);
+    app.handle_key(key(KeyCode::Char('t')))
+        .expect("reopen trash");
+    app.handle_key(key(KeyCode::Char('d'))).expect("purge");
+    assert!(matches!(
+        app.modal.as_ref().map(|modal| &modal.modal),
+        Some(Modal::PurgeTrashedConfirm { .. })
+    ));
+    app.handle_key(key(KeyCode::Char('y')))
+        .expect("confirm purge");
+    assert!(app.trash_items.is_empty());
+    assert!(store.trash_list().expect("trash").is_empty());
     let _ = std::fs::remove_dir_all(&work);
 }
 

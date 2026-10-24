@@ -49,6 +49,7 @@ use crate::core::storage::{BoardStamps, NewTask, Storage, TaskCache};
 use crate::core::telemetry::{self, SessionProgress, TokenBreakdown};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
+use crate::core::trash::TrashedProject;
 use crate::core::update;
 
 use super::card::{
@@ -97,6 +98,8 @@ pub enum Screen {
     TextView,
     Help,
     Projects,
+    /// Projects removed with their board data, opened with `t` from Projects.
+    Trash,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +213,9 @@ pub enum HitAction {
     FocusProject {
         index: usize,
     },
+    FocusTrash {
+        index: usize,
+    },
 }
 
 /// A user-level action, triggered equally by a hotkey, a button click, or a
@@ -268,6 +274,10 @@ pub enum UiAction {
     RenameProject,
     SetProjectPath,
     DeleteProject,
+    OpenTrash,
+    RestoreTrashed,
+    PurgeTrashed,
+    EmptyTrash,
     CreateCwdProject,
     RefreshLimits(&'static str),
     /// Global Settings "Check now": one deliberate blocking check, refreshing
@@ -526,6 +536,10 @@ pub struct App {
     /// First project row drawn on the projects screen. Owned by the renderer,
     /// which is the only place that knows how many rows a frame holds.
     pub project_scroll: usize,
+    /// Trash screen rows, reloaded whenever the screen opens or changes.
+    pub trash_items: Vec<TrashedProject>,
+    pub trash_selected: usize,
+    pub trash_scroll: usize,
     pub create_cwd: Option<PathBuf>,
     store: Option<ProjectStore>,
     return_project: Option<Project>,
@@ -1077,6 +1091,9 @@ impl App {
             analytics_cache: None,
             project_selected: 0,
             project_scroll: 0,
+            trash_items: Vec::new(),
+            trash_selected: 0,
+            trash_scroll: 0,
             create_cwd: None,
             store: None,
             return_project: None,
@@ -1206,6 +1223,9 @@ impl App {
             analytics_cache: None,
             project_selected: 0,
             project_scroll: 0,
+            trash_items: Vec::new(),
+            trash_selected: 0,
+            trash_scroll: 0,
             create_cwd,
             store: Some(store),
             return_project,
@@ -1523,6 +1543,9 @@ impl App {
         }
         if self.screen == Screen::Projects {
             return self.handle_projects_key(key);
+        }
+        if self.screen == Screen::Trash {
+            return self.handle_trash_key(key);
         }
         let action_screen = matches!(self.screen, Screen::Board | Screen::Detail);
         match (key.code, key.modifiers) {
@@ -2081,6 +2104,7 @@ impl App {
             KeyCode::Char('p') => self.dispatch(UiAction::SetProjectPath)?,
             KeyCode::Char('o') => self.dispatch(UiAction::OpenProjectFolder)?,
             KeyCode::Char('d') => self.dispatch(UiAction::DeleteProject)?,
+            KeyCode::Char('t') => self.dispatch(UiAction::OpenTrash)?,
             KeyCode::Char('s') => self.dispatch(UiAction::OpenGlobalSettings)?,
             KeyCode::Char('S') => self.open_stats_view()?,
             KeyCode::Enter if self.selected_is_create_cwd() => {
@@ -2096,6 +2120,98 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_trash_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                self.screen = Screen::Projects;
+                self.status = self.idle_status().to_string();
+            }
+            KeyCode::Enter | KeyCode::Char('u') => self.dispatch(UiAction::RestoreTrashed)?,
+            KeyCode::Char('d') | KeyCode::Delete => self.dispatch(UiAction::PurgeTrashed)?,
+            KeyCode::Char('D') => self.dispatch(UiAction::EmptyTrash)?,
+            KeyCode::Up => self.focus_up(),
+            KeyCode::Down => self.focus_down(),
+            KeyCode::PageUp => self.page_up(),
+            KeyCode::PageDown => self.page_down(),
+            KeyCode::Home => self.home(),
+            KeyCode::End => self.end(),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Prune expired entries, then show what is left.
+    fn open_trash(&mut self) -> Result<()> {
+        self.screen = Screen::Trash;
+        self.status = self.idle_status().to_string();
+        self.trash_selected = 0;
+        self.trash_scroll = 0;
+        self.reload_trash()
+    }
+
+    fn reload_trash(&mut self) -> Result<()> {
+        let Some(store) = self.store.as_ref() else {
+            self.trash_items.clear();
+            self.status = "Project store is not available".to_string();
+            return Ok(());
+        };
+        store.prune_trash(timefmt::now())?;
+        self.trash_items = store.trash_list()?;
+        self.trash_selected = self
+            .trash_selected
+            .min(self.trash_items.len().saturating_sub(1));
+        Ok(())
+    }
+
+    /// Days a trashed project stays restorable, for the screen's hints.
+    pub fn trash_retention_days(&self) -> i64 {
+        self.store
+            .as_ref()
+            .map_or(crate::core::config::TRASH_RETENTION_DAYS, |store| {
+                store.trash_retention_days()
+            })
+    }
+
+    fn restore_trashed(&mut self) -> Result<()> {
+        let Some(item) = self.trash_items.get(self.trash_selected).cloned() else {
+            self.status = "Trash is empty".to_string();
+            return Ok(());
+        };
+        let Some(store) = self.store.clone() else {
+            self.status = "Project store is not available".to_string();
+            return Ok(());
+        };
+        self.status = match store.restore_from_trash(&item.entry) {
+            Ok(project) => {
+                self.refresh_projects()?;
+                format!("Restored project {} ({})", project.name, project.id)
+            }
+            Err(err) => format!("Restore failed: {err}"),
+        };
+        self.reload_trash()
+    }
+
+    fn open_purge_trashed_dialog(&mut self) {
+        let Some(item) = self.trash_items.get(self.trash_selected) else {
+            self.status = "Trash is empty".to_string();
+            return;
+        };
+        self.modal = Some(ModalState::new(Modal::PurgeTrashedConfirm {
+            entry: item.entry.clone(),
+            name: item.name.clone(),
+        }));
+    }
+
+    fn open_empty_trash_dialog(&mut self) {
+        if self.trash_items.is_empty() {
+            self.status = "Trash is empty".to_string();
+            return;
+        }
+        self.modal = Some(ModalState::new(Modal::EmptyTrashConfirm {
+            count: self.trash_items.len(),
+        }));
     }
 
     /// Log-view pager keys: scroll around the cached tail, `q`/`Esc` back to
@@ -2201,6 +2317,10 @@ impl App {
             UiAction::RenameProject => self.open_rename_project_dialog(),
             UiAction::SetProjectPath => self.open_set_path_dialog(),
             UiAction::DeleteProject => self.open_delete_project_dialog(),
+            UiAction::OpenTrash => self.open_trash()?,
+            UiAction::RestoreTrashed => self.restore_trashed()?,
+            UiAction::PurgeTrashed => self.open_purge_trashed_dialog(),
+            UiAction::EmptyTrash => self.open_empty_trash_dialog(),
             UiAction::CreateCwdProject => self.create_cwd_project()?,
             UiAction::RefreshLimits(provider) => self.refresh_provider_limits(provider),
             UiAction::CheckUpdates => self.check_updates_now(),
@@ -2550,7 +2670,8 @@ impl App {
             Some(
                 HitAction::ColumnFocus(_)
                 | HitAction::DetailThread
-                | HitAction::FocusProject { .. },
+                | HitAction::FocusProject { .. }
+                | HitAction::FocusTrash { .. },
             )
             | None => true,
         }
@@ -2876,7 +2997,8 @@ impl App {
                 | HitAction::DetailNextQuestion
                 | HitAction::DetailEdits
                 | HitAction::DetailThread
-                | HitAction::FocusProject { .. },
+                | HitAction::FocusProject { .. }
+                | HitAction::FocusTrash { .. },
             )
             | None => None,
         }
@@ -2996,6 +3118,10 @@ impl App {
             Some(HitAction::FocusProject { index }) => {
                 self.project_selected = index;
                 self.dispatch(UiAction::OpenProject)
+            }
+            Some(HitAction::FocusTrash { index }) => {
+                self.trash_selected = index;
+                Ok(())
             }
             None => Ok(()),
         }
@@ -3139,7 +3265,8 @@ impl App {
                 | HitAction::DetailNextQuestion
                 | HitAction::DetailEdits
                 | HitAction::DetailThread
-                | HitAction::FocusProject { .. },
+                | HitAction::FocusProject { .. }
+                | HitAction::FocusTrash { .. },
             )
             | None => self.focused_column,
         };
@@ -3592,10 +3719,10 @@ impl App {
     }
 
     fn idle_status(&self) -> &'static str {
-        if self.screen == Screen::Projects {
-            "Projects"
-        } else {
-            DEFAULT_STATUS
+        match self.screen {
+            Screen::Projects => "Projects",
+            Screen::Trash => "Trash",
+            _ => DEFAULT_STATUS,
         }
     }
 
@@ -3920,6 +4047,7 @@ impl App {
             Screen::Projects => {
                 self.project_selected = self.project_selected.saturating_sub(1);
             }
+            Screen::Trash => self.trash_selected = self.trash_selected.saturating_sub(1),
         }
     }
 
@@ -3945,6 +4073,9 @@ impl App {
             Screen::Projects => {
                 self.project_selected =
                     next_index(self.project_selected, self.visible_project_items().len());
+            }
+            Screen::Trash => {
+                self.trash_selected = next_index(self.trash_selected, self.trash_items.len());
             }
         }
     }
@@ -4005,6 +4136,7 @@ impl App {
             }
             Screen::Help => self.help_scroll = 0,
             Screen::Projects => self.project_selected = 0,
+            Screen::Trash => self.trash_selected = 0,
         }
     }
 
@@ -4037,6 +4169,7 @@ impl App {
             Screen::Projects => {
                 self.project_selected = self.visible_project_items().len().saturating_sub(1);
             }
+            Screen::Trash => self.trash_selected = self.trash_items.len().saturating_sub(1),
         }
     }
 
@@ -6477,7 +6610,7 @@ impl App {
             }
             Screen::Sessions => self.session_selected = 0,
             Screen::Archive => self.archive_selected = 0,
-            Screen::Detail | Screen::LogView | Screen::TextView | Screen::Help => {}
+            Screen::Detail | Screen::LogView | Screen::TextView | Screen::Help | Screen::Trash => {}
             Screen::Projects => self.project_selected = 0,
         }
     }
@@ -7368,6 +7501,20 @@ impl App {
                 self.refresh_after_action()?;
             }
             Modal::QuitConfirm { .. } => self.should_quit = true,
+            Modal::PurgeTrashedConfirm { entry, name } => {
+                if let Some(store) = self.store.as_ref() {
+                    store.purge_from_trash(&entry)?;
+                    self.status = format!("Deleted project {name} for good");
+                }
+                self.reload_trash()?;
+            }
+            Modal::EmptyTrashConfirm { .. } => {
+                if let Some(store) = self.store.as_ref() {
+                    let removed = store.empty_trash()?;
+                    self.status = format!("Deleted {removed} trashed project(s) for good");
+                }
+                self.reload_trash()?;
+            }
             Modal::RestoreConfirm { task_id } => {
                 let restored = self.ops.unarchive_task(&task_id)?;
                 self.refresh_after_action()?;
@@ -7547,7 +7694,7 @@ impl App {
                         }
                         self.refresh_projects()?;
                         self.status = if purge {
-                            format!("Deleted project {name} and its board data")
+                            format!("Moved project {name} to the trash · t restores it")
                         } else {
                             format!("Unregistered project {name}")
                         };
@@ -8433,6 +8580,8 @@ fn is_confirmation_modal(modal: &Modal) -> bool {
             | Modal::RestoreConfirm { .. }
             | Modal::QuitConfirm { .. }
             | Modal::DeleteProject { .. }
+            | Modal::PurgeTrashedConfirm { .. }
+            | Modal::EmptyTrashConfirm { .. }
     )
 }
 

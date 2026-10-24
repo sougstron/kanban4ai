@@ -188,6 +188,7 @@ pub fn tick(
     // ignored inside `poke_auto` so a pump cannot write into the user's
     // state directory or take locks on a fixture.
     crate::core::backup::poke_auto(store.root());
+    crate::core::trash::prune_if_due(store);
 
     lines.append(&mut pump_all(projects, state));
     Ok(lines)

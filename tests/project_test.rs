@@ -342,7 +342,7 @@ fn a_different_folder_never_reclaims_a_removed_project() {
 }
 
 #[test]
-fn remove_with_purge_deletes_the_board_data() {
+fn remove_with_purge_moves_the_board_data_to_the_trash() {
     let (dir, store) = temp_store();
     let project = add(&store, &work_dir(dir.path(), "repo"));
     fs::create_dir_all(project.kanban_dir().join("tasks")).unwrap();
@@ -352,6 +352,9 @@ fn remove_with_purge_deletes_the_board_data() {
     assert!(!project.data_root.exists());
     assert!(store.list().unwrap().is_empty());
     assert!(store.remove(&project.id, true).is_err());
+    let trashed = store.trash_list().unwrap();
+    assert_eq!(trashed.len(), 1);
+    assert!(trashed[0].path.join(".kanban/tasks").is_dir());
 }
 
 #[test]

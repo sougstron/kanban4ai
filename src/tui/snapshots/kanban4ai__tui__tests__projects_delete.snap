@@ -1,5 +1,6 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 10627
 expression: rendered
 ---
 ┌ Projects · Enter open · n new · r rename · p path · s settings · S stats · d delete · / filte┐
@@ -8,7 +9,7 @@ expression: rendered
 │    Demo Board                                1      1       0     0       ·             never│
 │    /tmp/k4ai┌ Remove project ──────────────────────────────────────────────────┐             │
 │             │Unregister project Demo Board? Board data stays in the store.     │             │
-│             │Space toggles whether board data is deleted.                      │             │
+│             │Space toggles whether board data goes to the trash.               │             │
 │             │                                                                  │             │
 │             │                                                                  │             │
 │             │                                                                  │             │
@@ -19,7 +20,7 @@ expression: rendered
 │             │                                                                  │             │
 │             │                                                                  │             │
 │             │                                                                  │             │
-│             │☐ also delete board data (2 tasks)                                │             │
+│             │☐ also move board data to the trash (2 tasks)                     │             │
 │             │                                                                  │             │
 │             │                                                                  │             │
 │             │┌────────────────────────────────────────────────────────────────┐│             │
