@@ -12,7 +12,8 @@ auto-loaded into every agent session. Read it when you need the exact flags of a
 - `kanban project rename <id|name> <new-name>` - Change the display name (id stays put) and write `tui.name` so the projects list shows it
 - `kanban project set-path <id|name> <path>` - Repoint the work folder
 - `kanban project path [id|name|path]` - Print the work path (defaults to the current project)
-- `kanban project remove <id|name> [--purge] [--yes]` - Unregister; `--purge` also deletes board data. Interactive confirm unless `--yes`
+- `kanban project remove <id|name> [--purge] [--yes]` - Unregister; `--purge` also moves the board data to the trash (`<store>/trash/`), restorable for `trash.retention_days` (7). Interactive confirm unless `--yes`
+- `kanban project trash list [--format table|json]` / `restore <entry|id|name>` / `purge <entry|id|name> [--yes]` / `empty [--yes]` - Trashed projects: list with expiry, put one back (old id, or `<id>-N` if taken; refused while its folder is registered again), delete one or all for good. Expired entries are pruned by every trash command and hourly by the daemon/TUI tick
 - `kanban project open <id|name|path>` - Open the TUI on that project
 - `kanban backup [create] [--with-artifacts] [--dir D]` - Snapshot the store (core, plus agent artifacts when asked). Prints each archive path, size, file count, and how long the locked copy took. See `docs/backup.md`
 - `kanban backup list [--json] [--dir D]` - Date, kind, core/artifact sizes, retention bucket, verified or not

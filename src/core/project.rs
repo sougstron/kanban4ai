@@ -437,12 +437,13 @@ impl ProjectStore {
 
     /// Unregister a project. Without `purge_data` the board is kept in the
     /// store and re-adding the same folder picks it back up; with it, the
-    /// whole project directory is deleted.
+    /// whole project directory moves to the trash (see [`crate::core::trash`]),
+    /// where it stays restorable until the retention runs out.
     pub fn remove(&self, id: &str, purge_data: bool) -> Result<()> {
         let _guard = self.lock()?;
         let project = self.require(id)?;
         if purge_data {
-            fs::remove_dir_all(&project.data_root)?;
+            self.move_to_trash(&project)?;
             return Ok(());
         }
         fs::rename(
@@ -479,12 +480,12 @@ impl ProjectStore {
         lock_file_reentrant(&self.root.join(LOCK_FILE))
     }
 
-    fn require(&self, id: &str) -> Result<Project> {
+    pub(crate) fn require(&self, id: &str) -> Result<Project> {
         self.get(id)?
             .ok_or_else(|| KanbanError::Invalid(format!("no such project: {id}")))
     }
 
-    fn write_project(&self, project: &Project) -> Result<()> {
+    pub(crate) fn write_project(&self, project: &Project) -> Result<()> {
         fs::create_dir_all(&project.data_root)?;
         let mut value = serde_yaml_ng::to_value(ProjectFile::from(project))?;
         let repo = if !project.work_path.as_os_str().is_empty() && project.work_path.is_dir() {
@@ -540,6 +541,22 @@ impl ProjectStore {
             "cannot allocate a project id for {base}: too many collisions"
         )))
     }
+}
+
+/// The registration inside a project directory that sits outside
+/// `projects/` (the trash). The id comes from the file, not the directory.
+pub(crate) fn read_registration(data_root: &Path) -> Result<Option<Project>> {
+    Ok(
+        read_project_file(&data_root.join(PROJECT_FILE))?.map(|file| Project {
+            id: file.id,
+            name: file.name,
+            work_path: file.work_path,
+            data_root: data_root.to_path_buf(),
+            created_at: file.created_at,
+            last_opened_at: file.last_opened_at,
+            migrated_from: file.migrated_from,
+        }),
+    )
 }
 
 fn read_project_file(path: &Path) -> Result<Option<ProjectFile>> {

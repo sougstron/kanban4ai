@@ -86,6 +86,13 @@ pub enum Modal {
         name: String,
         task_count: u32,
     },
+    PurgeTrashedConfirm {
+        entry: String,
+        name: String,
+    },
+    EmptyTrashConfirm {
+        count: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1086,7 +1093,9 @@ impl ModalState {
             | Modal::StopTaskConfirm { .. }
             | Modal::ContinuePublishedConfirm { .. }
             | Modal::RestoreConfirm { .. }
-            | Modal::QuitConfirm { .. } => &[DialogField::Confirm, DialogField::Cancel],
+            | Modal::QuitConfirm { .. }
+            | Modal::PurgeTrashedConfirm { .. }
+            | Modal::EmptyTrashConfirm { .. } => &[DialogField::Confirm, DialogField::Cancel],
             Modal::AnswerQuestion { .. } => &[
                 DialogField::Question,
                 DialogField::Variant,
@@ -1695,6 +1704,8 @@ impl ModalState {
                 | Modal::RestoreConfirm { .. }
                 | Modal::QuitConfirm { .. }
                 | Modal::DeleteProject { .. }
+                | Modal::PurgeTrashedConfirm { .. }
+                | Modal::EmptyTrashConfirm { .. }
         )
     }
 
@@ -3311,6 +3322,33 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
                 ),
                 Line::from("Старая сессия не будет остановлена. Живая сессия не переносится."),
                 Line::from("При двойном продолжении обе ветки сохранятся для выбора в Review."),
+            ],
+            &mut hitboxes,
+        ),
+        Modal::PurgeTrashedConfirm { name, .. } => render_simple_confirm(
+            frame,
+            app,
+            modal,
+            inner,
+            app.theme.err,
+            vec![
+                Line::from(format!(
+                    "Delete project {} from the trash for good?",
+                    sanitize_terminal_text(name)
+                )),
+                Line::from("Its board, tasks and threads cannot be restored afterwards."),
+            ],
+            &mut hitboxes,
+        ),
+        Modal::EmptyTrashConfirm { count } => render_simple_confirm(
+            frame,
+            app,
+            modal,
+            inner,
+            app.theme.err,
+            vec![
+                Line::from(format!("Delete all {count} trashed project(s) for good?")),
+                Line::from("Nothing in the trash can be restored afterwards."),
             ],
             &mut hitboxes,
         ),
@@ -6196,8 +6234,9 @@ fn render_delete_project(
         .split(area);
     let confirm = if modal.purge_data {
         format!(
-            "Delete project {} and its board data?",
-            sanitize_terminal_text(name)
+            "Move project {} and its board data to the trash? It stays restorable for {} days (t on this screen).",
+            sanitize_terminal_text(name),
+            app.trash_retention_days()
         )
     } else {
         format!(
@@ -6208,7 +6247,7 @@ fn render_delete_project(
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(confirm),
-            Line::from("Space toggles whether board data is deleted."),
+            Line::from("Space toggles whether board data goes to the trash."),
         ])
         .wrap(Wrap { trim: false }),
         rows[0],
@@ -6223,7 +6262,7 @@ fn render_delete_project(
     };
     frame.render_widget(
         Paragraph::new(format!(
-            "{mark} also delete board data ({task_count} tasks)"
+            "{mark} also move board data to the trash ({task_count} tasks)"
         ))
         .style(style),
         rows[1],
@@ -6233,7 +6272,7 @@ fn render_delete_project(
         action: HitAction::ModalField(DialogField::PurgeData),
     });
     let yes = if modal.purge_data {
-        "Delete data"
+        "Move to trash"
     } else {
         "Unregister"
     };
@@ -6297,6 +6336,8 @@ fn modal_title(modal: &Modal) -> &'static str {
         Modal::RenameProject { .. } => " Rename project ",
         Modal::SetProjectPath { .. } => " Change project path ",
         Modal::DeleteProject { .. } => " Remove project ",
+        Modal::PurgeTrashedConfirm { .. } => " Delete permanently ",
+        Modal::EmptyTrashConfirm { .. } => " Empty trash ",
     }
 }
 

@@ -11,7 +11,7 @@ use super::app::{App, HitAction, Hitbox, Screen, UiAction};
 
 use super::card::{sanitize_terminal_text, truncate_display};
 use super::sync_board::SyncLevel;
-use super::{card, detail, dialogs, limits, projects, search, sessions};
+use super::{card, detail, dialogs, limits, projects, search, sessions, trash};
 
 pub(super) const PORTRAIT_WIDTH: u16 = 70;
 
@@ -45,6 +45,7 @@ pub fn ui(frame: &mut Frame<'_>, app: &mut App) {
         Screen::LogView => sessions::render_log_view(frame, app, chunks[0]),
         Screen::TextView => sessions::render_text_view(frame, app, chunks[0]),
         Screen::Projects => projects::render(frame, app, chunks[0]),
+        Screen::Trash => trash::render(frame, app, chunks[0]),
         Screen::Help => {
             if app.help_return == Screen::Projects {
                 projects::render(frame, app, chunks[0]);
@@ -578,9 +579,16 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
             // for the folder button is here.
             seg("o folder", 5),
             seg("d delete", 3),
+            seg("t trash", 5),
             seg("s settings", 5),
             seg("/ filter", 4),
             seg("? help", 1),
+        ],
+        Screen::Trash => vec![
+            seg("Enter restore", 1),
+            seg("d delete for good", 2),
+            seg("D empty", 3),
+            seg("q back", 1),
         ],
     }
 }
@@ -796,7 +804,8 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  o: open the project folder in the desktop file manager"),
         Line::from("  s: global settings, incl. Esc-from-board and project sorting"),
         Line::from("  pinned + row creates a project for the current folder with no dialog"),
-        Line::from("  delete unregisters by default; toggle also deletes board data"),
+        Line::from("  delete unregisters by default; toggle moves board data to the trash"),
+        Line::from("  t: trash · Enter/u restore · d delete for good · D empty"),
         Line::from(
             "  q: quit the TUI · Esc: back to the board, or quit when this is the entry screen",
         ),

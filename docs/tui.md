@@ -198,6 +198,7 @@ the plain-letter hotkeys.
 - `R`: Confirm marking all Review tasks Done
 - `l`: Show running sessions
 - `P`: Open the projects list (from Board, Detail, Archive, Sessions; not while typing). The same physical key works on a Russian layout (`З`).
+- `t` on the Projects screen: open the trash — projects removed with their board data (the delete dialog's toggle), newest first with time left. `Enter`/`u` restores, `d` deletes one for good, `D` empties the trash (both confirm), `q`/`Esc` back
 - `Esc` on the Board: clears an active search filter; if the global
   `tui.escape_to_projects` setting is on and the filter is empty, opens the
   projects list
