@@ -4116,6 +4116,10 @@ impl Operations {
                 let Some(root) = crate::core::sync::store_for_board(self.data_root()) else {
                     return Ok(());
                 };
+                // Serve's sync timer pushes; only a store without one pushes here.
+                if crate::core::sync::enabled(root) {
+                    return crate::core::code::queue_publish(self.data_root());
+                }
                 let Some(project) = self
                     .project_id
                     .as_deref()

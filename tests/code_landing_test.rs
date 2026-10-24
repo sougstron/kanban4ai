@@ -669,6 +669,24 @@ fn queued_cleanup_spares_a_task_restored_before_the_flush() {
 }
 
 #[test]
+fn queued_code_push_runs_on_the_sync_timer() {
+    let p = pair(false);
+    let task = ops(&p.pa)
+        .create_task(NewTask::titled("queued push"))
+        .unwrap();
+    take(&p.pa, &task.id, "ses-queued-push", "queued");
+    let branch = format!("refs/heads/kanban/{}", task.id);
+    assert!(git(&p.remote, &["for-each-ref", "--format=%(refname)", &branch]).is_empty());
+    // A managed-clone launch queues instead of pushing on the caller's thread.
+    kanban4ai::core::code::queue_publish(&p.pa.data_root).unwrap();
+    assert!(kanban4ai::core::code::publish_queued(&p.pa));
+    assert_eq!(kanban4ai::core::wip::pending_cleanups(&p.a), 1);
+    kanban4ai::core::code::flush_publish(&p.a, &p.pa).unwrap();
+    assert!(!kanban4ai::core::code::publish_queued(&p.pa));
+    assert!(!git(&p.remote, &["for-each-ref", "--format=%(refname)", &branch]).is_empty());
+}
+
+#[test]
 fn offline_checkpoint_is_flushed_after_publication_is_enabled() {
     let p = pair(false);
     let config_path = p.a.join("config.yaml");

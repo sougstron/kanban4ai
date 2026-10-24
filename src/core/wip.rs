@@ -282,11 +282,17 @@ fn cleanup_markers(project: &Project) -> Vec<String> {
     ids
 }
 
-/// Service-ref cleanups queued by terminal moves and not yet run.
+/// Remote ref work queued by board actions and not yet run: service-ref
+/// cleanups from terminal moves plus code publications from launches.
 pub fn pending_cleanups(root: &Path) -> usize {
     ProjectStore::at(root)
         .list()
-        .map(|projects| projects.iter().map(|p| cleanup_markers(p).len()).sum())
+        .map(|projects| {
+            projects
+                .iter()
+                .map(|p| cleanup_markers(p).len() + usize::from(super::code::publish_queued(p)))
+                .sum()
+        })
         .unwrap_or(0)
 }
 
@@ -369,6 +375,9 @@ pub fn publish(root: &Path, interval: u64, force: bool) -> Result<()> {
     let mut failure = None;
     for project in ProjectStore::at(root).list()? {
         if let Err(error) = flush_cleanups(&project) {
+            failure = Some(error);
+        }
+        if let Err(error) = super::code::flush_publish(root, &project) {
             failure = Some(error);
         }
         let storage = Storage::new(&project.data_root);
