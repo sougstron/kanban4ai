@@ -244,9 +244,23 @@ fn load_conflicts(
     board: &Path,
 ) -> crate::core::error::Result<(Vec<Conflict>, Vec<String>)> {
     let journal = Journal::open(root)?;
-    let state = journal.state()?;
     let alias = board.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let project = state.project_uids.get(alias);
+    // This reload follows every journal change. The whole-store state is
+    // rebuilt under the sync lock, which stalls a foreground save, so it is
+    // read only when the board has conflicts at all (the rare case).
+    let Some(project) = journal
+        .task_state(alias, &[])?
+        .project_uids
+        .get(alias)
+        .cloned()
+    else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    if !journal.has_stored_conflicts(&project)? {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let state = journal.state()?;
+    let project = Some(&project);
     let mut conflicts = Vec::new();
     let mut tasks = Vec::new();
     for conflict in journal.conflicts()? {

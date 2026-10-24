@@ -117,8 +117,34 @@ pub(crate) fn process(ops: &Operations) -> Result<()> {
         return Ok(());
     }
     let journal = Journal::open(store)?;
+    // Every pump tick lands here, and the whole-store state is rebuilt under
+    // the sync lock after each local write, stalling a foreground save. Only
+    // remote operations carry commands and answers for this node, so the
+    // scan is skipped until another node's journal grows; a periodic rescan
+    // retries what an earlier pass deferred (an answer behind open questions).
+    let mut remote = journal.vector()?;
+    remote.remove(&journal.node.node_id);
+    let board = ops.data_root().to_path_buf();
+    if scanned()
+        .get(&board)
+        .is_some_and(|(seen, at)| *seen == remote && at.elapsed() < CONTROL_RESCAN)
+    {
+        return Ok(());
+    }
     let state = journal.state()?;
-    process_with(ops, &journal, &state)
+    process_with(ops, &journal, &state)?;
+    scanned().insert(board, (remote, std::time::Instant::now()));
+    Ok(())
+}
+
+const CONTROL_RESCAN: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Remote heads each board was last fully processed at, in this process.
+fn scanned()
+-> std::sync::MutexGuard<'static, BTreeMap<PathBuf, (VersionVector, std::time::Instant)>> {
+    static SCANNED: std::sync::Mutex<BTreeMap<PathBuf, (VersionVector, std::time::Instant)>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    SCANNED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn process_with(ops: &Operations, journal: &Journal, state: &JournalState) -> Result<()> {

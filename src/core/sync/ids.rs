@@ -277,8 +277,11 @@ pub(crate) fn historical_max(board: &Storage) -> Result<u64> {
     if !enabled(&target.store) {
         return Ok(0);
     }
-    let journal = Journal::open(&target.store)?;
-    let state = journal.state()?;
+    // Every task creation allocates here, so a cold process must not read
+    // every shard of the store: the board's uid tables already hold each
+    // display id, uid and retired claim (`reassign` keeps deleted tasks in
+    // them). A warm whole-store state is reused and adds its lifecycle.
+    let state = Journal::open(&target.store)?.task_state(&target.project, &[])?;
     let Some(project) = state.project_uids.get(&target.project) else {
         return Ok(0);
     };
