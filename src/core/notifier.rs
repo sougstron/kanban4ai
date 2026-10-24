@@ -73,11 +73,23 @@ impl NotificationConfig {
 
 pub struct DesktopNotifier {
     pub config: NotificationConfig,
+    /// Registered project name shown in failure alerts ("task failed",
+    /// "task stranded"); `None` leaves the titles as before.
+    pub project: Option<String>,
 }
 
 impl DesktopNotifier {
-    pub fn new(config: NotificationConfig) -> Self {
-        DesktopNotifier { config }
+    pub fn new(config: NotificationConfig, project: Option<String>) -> Self {
+        DesktopNotifier { config, project }
+    }
+
+    /// Failure alerts may come from any of several boards, so the project
+    /// name joins the task id when the board is registered.
+    fn failure_title(&self, prefix: &str, task_id: &str) -> String {
+        match &self.project {
+            Some(name) => format!("{prefix}: {task_id} ({name})"),
+            None => format!("{prefix}: {task_id}"),
+        }
     }
 
     pub fn question(&self, task_id: &str, title: &str, body: &str) -> bool {
@@ -111,7 +123,7 @@ impl DesktopNotifier {
 
     pub fn stranded(&self, task_id: &str, title: &str, detail: &str) -> bool {
         self.send(
-            &format!("Kanban task stranded: {task_id}"),
+            &self.failure_title("Kanban task stranded", task_id),
             &format!("{title}\n{detail}"),
             "critical",
         )
@@ -125,7 +137,7 @@ impl DesktopNotifier {
             return false;
         }
         self.send(
-            &format!("Kanban task failed: {task_id}"),
+            &self.failure_title("Kanban task failed", task_id),
             &format!("{title}\n{detail}"),
             "critical",
         )
@@ -307,6 +319,27 @@ mod tests {
     }
 
     #[test]
+    fn failure_titles_name_the_project_and_fall_back_to_the_task_id() {
+        let config = NotificationConfig::default();
+
+        let named = DesktopNotifier::new(config.clone(), Some("api-server".to_string()));
+        assert_eq!(
+            named.failure_title("Kanban task failed", "TASK-7"),
+            "Kanban task failed: TASK-7 (api-server)"
+        );
+        assert_eq!(
+            named.failure_title("Kanban task stranded", "TASK-7"),
+            "Kanban task stranded: TASK-7 (api-server)"
+        );
+
+        let unnamed = DesktopNotifier::new(config, None);
+        assert_eq!(
+            unnamed.failure_title("Kanban task failed", "TASK-7"),
+            "Kanban task failed: TASK-7"
+        );
+    }
+
+    #[test]
     fn cargo_test_binaries_live_in_deps_with_a_hash_suffix() {
         assert!(looks_like_cargo_test_exe(Path::new(
             "target/debug/deps/scheduler_test-0123456789abcdef"
@@ -384,10 +417,13 @@ mod tests {
     fn cargo_test_does_not_deliver_notify_send_to_the_desktop() {
         let dir = tempfile::tempdir().unwrap();
         let spy = write_marker_script(dir.path(), "notify-send");
-        let notifier = DesktopNotifier::new(NotificationConfig {
-            command: spy.display().to_string(),
-            ..NotificationConfig::default()
-        });
+        let notifier = DesktopNotifier::new(
+            NotificationConfig {
+                command: spy.display().to_string(),
+                ..NotificationConfig::default()
+            },
+            None,
+        );
 
         assert!(!notifier.send("Kanban task failed: TASK-1", "body", "critical"));
 
@@ -406,10 +442,13 @@ mod tests {
     fn a_custom_notification_command_still_runs_under_cargo_test() {
         let dir = tempfile::tempdir().unwrap();
         let spy = write_marker_script(dir.path(), "notify-spy");
-        let notifier = DesktopNotifier::new(NotificationConfig {
-            command: spy.display().to_string(),
-            ..NotificationConfig::default()
-        });
+        let notifier = DesktopNotifier::new(
+            NotificationConfig {
+                command: spy.display().to_string(),
+                ..NotificationConfig::default()
+            },
+            None,
+        );
 
         assert!(notifier.send("Kanban task failed: TASK-1", "body", "normal"));
 
