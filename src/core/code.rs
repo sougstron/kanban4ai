@@ -160,6 +160,46 @@ pub fn publish_live(root: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+fn publish_marker(board: &Path) -> PathBuf {
+    board.join(".kanban/wip/code.publish")
+}
+
+/// Queue a push of the board's `kanban/*` branches and integration ref.
+/// Launches (chained ones fire from a TUI move into Review) pushed inline,
+/// freezing the UI on the code remote; serve's sync timer runs
+/// [`flush_publish`] instead.
+pub fn queue_publish(board: &Path) -> Result<()> {
+    let marker = publish_marker(board);
+    fs::create_dir_all(marker.parent().expect("marker has a parent"))?;
+    atomic_write_text(&marker, "")
+}
+
+pub fn publish_queued(project: &Project) -> bool {
+    publish_marker(&project.data_root).exists()
+}
+
+/// Run a queued [`queue_publish`]. The marker is consumed before pushing so
+/// a launch queued during the push is not lost; a failed push re-queues.
+pub fn flush_publish(root: &Path, project: &Project) -> Result<()> {
+    let marker = publish_marker(&project.data_root);
+    match fs::remove_file(&marker) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        other => other?,
+    }
+    let result = (|| {
+        let Some(remote) = publication_remote(root, project)? else {
+            return Ok(());
+        };
+        repository(project)
+            .ok_or_else(|| invalid("RUNNER_REPO_MISSING"))?
+            .publish_code(&remote)
+    })();
+    if result.is_err() {
+        queue_publish(&project.data_root)?;
+    }
+    result
+}
+
 pub fn prepare_from_remote(root: &Path, id: &str, remote: &str) -> Result<CloneStatus> {
     let _store = ProjectStore::at(root).lock()?;
     {

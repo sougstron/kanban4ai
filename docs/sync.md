@@ -957,7 +957,9 @@ kanban serve --purge-origin-code-refs
 ставит маркер `.kanban/wip/<TASK>.cleanup`, поэтому массовый Archive/Done
 мгновенный; удаление (с `git push` на remote) выполняет фоновый sync-таймер
 serve. Задача, восстановленная до этого, свои refs сохраняет. При sync off
-очистка идёт сразу.
+очистка идёт сразу. Так же запуск задачи в managed clone (в том числе
+цепочки, стартующие при переносе в Review) не пушит `kanban/*` и integration
+ref сам, а ставит маркер `.kanban/wip/code.publish` для того же таймера.
   Устаревшее поколение даёт `RUN_ALREADY_RUNNING`, несколько активных
   источников — `RUN_DUPLICATE`. Онлайн-источник публикует WIP, закрывает session,
   останавливает tmux либо проверенную по PID/start-time background process group,

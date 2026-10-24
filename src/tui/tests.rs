@@ -10524,7 +10524,7 @@ fn board_app_ignores_stale_per_project_escape_to_projects() {
 
 #[test]
 fn projects_delete_dialog_unregisters_by_default() {
-    let work = std::path::PathBuf::from("/tmp/k4ai-snap-work");
+    let work = std::path::PathBuf::from("/tmp/k4ai-snap-work-delete");
     let _ = std::fs::remove_dir_all(&work);
     let (_store, mut app) = projects_app(&work, None);
     app.project_selected = 0;
