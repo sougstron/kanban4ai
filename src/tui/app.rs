@@ -4420,11 +4420,41 @@ impl App {
         }
         if let Some(task_id) = self.focused_task_id() {
             self.load_detail(&task_id)?;
-            let _ = self.ops.mark_review_seen(&task_id)?;
+            self.mark_review_seen(&task_id);
             self.return_screen = Screen::Board;
             self.screen = Screen::Detail;
         }
         Ok(())
+    }
+
+    /// Opening a task is the "I've seen it" signal. The card drops its
+    /// notifier at once; the write runs on a launch worker because on a
+    /// synced store it waits for the journal lock and fsyncs, which stalled
+    /// the open by a noticeable beat.
+    fn mark_review_seen(&mut self, task_id: &str) {
+        let mut unseen = false;
+        for task in self
+            .board
+            .columns
+            .iter_mut()
+            .flat_map(|column| column.tasks.iter_mut())
+            .filter(|task| task.id == task_id)
+        {
+            unseen |= task.review_unseen;
+            task.review_unseen = false;
+        }
+        if !unseen {
+            return;
+        }
+        let id = task_id.to_string();
+        self.spawn_launch(None, move |ops| LaunchReport {
+            status: ops
+                .mark_review_seen(&id)
+                .err()
+                .map(|err| format!("Could not mark {id} as read: {err}")),
+            refresh: true,
+            ..LaunchReport::default()
+        });
     }
 
     /// Leave the detail screen for wherever it was opened from, refreshing
