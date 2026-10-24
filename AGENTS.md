@@ -133,6 +133,7 @@ Run phases, the queue dispatcher and the daemon that drive these rules are in
 - Atomic file writes (temp file + rename) via `storage::atomic_write_text`
 - Any task read-modify-write cycle holds the board lock (`Storage::lock`)
 - Context compaction is rule-based (no LLM)
+- Speed is a headline feature: the TUI must answer every key instantly, local or synced. Never run network I/O (sync, `git push`/`fetch`, peer probes) or other slow work on the UI thread or inside a user action; record the change locally and queue the remote part for serve's background sync (e.g. `wip::cleanup_board` markers). Quitting while a sync is in flight asks for confirmation with the remaining count
 - Tests required: `cargo test --locked` must stay green; golden fixtures in `tests/fixtures/` guard legacy board-format compatibility — never regenerate them from Rust output
 - `cargo clippy --all-targets -- -D warnings` clean, `cargo fmt` applied
 - Release builds use the single `kanban4ai` binary; installers create relative `kanban` and `kb` symlinks

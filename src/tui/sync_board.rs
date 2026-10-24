@@ -26,6 +26,11 @@ pub(crate) struct SyncBoard {
     pub tasks: Vec<String>,
     pub error: Option<String>,
     pub selected: usize,
+    /// Queued service-ref cleanups the sync timer has not run yet.
+    pub cleanups: u64,
+    /// Largest backlog seen since the store was last fully synced: the "of
+    /// M" in the quit warning.
+    backlog_total: u64,
     board: PathBuf,
     last_probe: Option<Instant>,
     journal_stamp: Option<u64>,
@@ -36,6 +41,7 @@ pub(crate) struct SyncBoard {
 struct Snapshot {
     board: PathBuf,
     peers: Option<Vec<BoardPeer>>,
+    cleanups: Option<u64>,
     conflicts: Option<(Vec<Conflict>, Vec<String>)>,
 }
 
@@ -69,6 +75,8 @@ impl SyncBoard {
             self.conflicts.clear();
             self.tasks.clear();
             self.error = None;
+            self.cleanups = 0;
+            self.backlog_total = 0;
             self.last_probe = None;
             self.journal_stamp = None;
         }
@@ -78,6 +86,10 @@ impl SyncBoard {
                     if let Some(peers) = snapshot.peers {
                         self.peers = peers;
                     }
+                    if let Some(cleanups) = snapshot.cleanups {
+                        self.cleanups = cleanups;
+                    }
+                    self.note_backlog();
                     if let Some((conflicts, tasks)) = snapshot.conflicts {
                         self.conflicts = conflicts;
                         self.tasks = tasks;
@@ -130,6 +142,41 @@ impl SyncBoard {
     /// Status-bar indicator. A configured server is the authority when
     /// present; otherwise any reachable peer counts. Resolved conflicts stay
     /// in the journal indefinitely, so they mark their cards, not this light.
+    /// Work still on its way to a reachable peer: outbox operations plus
+    /// queued cleanups. `None` while no relevant peer is online, since
+    /// nothing is syncing then and the backlog simply waits.
+    fn outstanding(&self) -> Option<u64> {
+        let server = self.peers.iter().any(|p| p.role == NodeRole::Server);
+        let online: Vec<_> = self
+            .peers
+            .iter()
+            .filter(|p| (!server || p.role == NodeRole::Server) && p.code == "ONLINE")
+            .collect();
+        (!online.is_empty()).then(|| online.iter().map(|p| p.pending).sum::<u64>() + self.cleanups)
+    }
+
+    fn note_backlog(&mut self) {
+        match self.outstanding() {
+            Some(0) | None => self.backlog_total = 0,
+            Some(n) => self.backlog_total = self.backlog_total.max(n),
+        }
+    }
+
+    /// Re-read the local outbox state now (files only, no network) and
+    /// return `(remaining, total)` when a sync is still in flight. Without a
+    /// store root the last polled state stands.
+    pub fn backlog_now(&mut self, root: Option<&Path>) -> Option<(u64, u64)> {
+        if let Some(root) = root.filter(|root| crate::core::sync::enabled(root)) {
+            if let Ok(peers) = settings::board_peers(root) {
+                self.peers = peers;
+            }
+            self.cleanups = crate::core::wip::pending_cleanups(root) as u64;
+        }
+        self.note_backlog();
+        let remaining = self.outstanding().filter(|n| *n > 0)?;
+        Some((remaining, self.backlog_total.max(remaining)))
+    }
+
     pub fn indicator(&self) -> (SyncLevel, String) {
         if self.error.is_some() {
             return (SyncLevel::Error, "Sync error".into());
@@ -155,7 +202,7 @@ impl SyncBoard {
                 None => (SyncLevel::Offline, "Offline".into()),
             };
         }
-        let pending: u64 = online.iter().map(|p| p.pending).sum();
+        let pending: u64 = online.iter().map(|p| p.pending).sum::<u64>() + self.cleanups;
         if pending > 0 {
             (SyncLevel::Syncing, format!("Syncing {pending}"))
         } else {
@@ -185,6 +232,7 @@ fn load(
     Ok(Snapshot {
         board: board.into(),
         peers: probe.then(|| settings::board_peers(root)).transpose()?,
+        cleanups: probe.then(|| crate::core::wip::pending_cleanups(root) as u64),
         conflicts: reload_conflicts
             .then(|| load_conflicts(root, board))
             .transpose()?,

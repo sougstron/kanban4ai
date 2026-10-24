@@ -59,6 +59,10 @@ pub enum Modal {
     RestoreConfirm {
         task_id: String,
     },
+    QuitConfirm {
+        remaining: u64,
+        total: u64,
+    },
     AddMessage {
         task_id: String,
     },
@@ -1081,7 +1085,8 @@ impl ModalState {
             | Modal::KillSessionConfirm { .. }
             | Modal::StopTaskConfirm { .. }
             | Modal::ContinuePublishedConfirm { .. }
-            | Modal::RestoreConfirm { .. } => &[DialogField::Confirm, DialogField::Cancel],
+            | Modal::RestoreConfirm { .. }
+            | Modal::QuitConfirm { .. } => &[DialogField::Confirm, DialogField::Cancel],
             Modal::AnswerQuestion { .. } => &[
                 DialogField::Question,
                 DialogField::Variant,
@@ -1688,6 +1693,7 @@ impl ModalState {
                 | Modal::KillSessionConfirm { .. }
                 | Modal::StopTaskConfirm { .. }
                 | Modal::RestoreConfirm { .. }
+                | Modal::QuitConfirm { .. }
                 | Modal::DeleteProject { .. }
         )
     }
@@ -3320,6 +3326,19 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
                     sanitize_terminal_text(task_id)
                 )),
                 Line::from("The task returns to To Do and keeps its last session record."),
+            ],
+            &mut hitboxes,
+        ),
+        Modal::QuitConfirm { remaining, total } => render_simple_confirm(
+            frame,
+            app,
+            modal,
+            inner,
+            app.theme.warn,
+            vec![
+                Line::from("Sync is not finished yet."),
+                Line::from(format!("{remaining} of {total} change(s) still to sync.")),
+                Line::from("Quit anyway? Unsent changes go out on the next sync."),
             ],
             &mut hitboxes,
         ),
@@ -6269,6 +6288,7 @@ fn modal_title(modal: &Modal) -> &'static str {
         Modal::KillSessionConfirm { .. } => " Kill session ",
         Modal::StopTaskConfirm { .. } => " Stop remote task ",
         Modal::RestoreConfirm { .. } => " Restore task ",
+        Modal::QuitConfirm { .. } => " Sync in progress ",
         Modal::AddMessage { .. } => " Add to thread ",
         Modal::AnswerQuestion { .. } => " Answer question ",
         Modal::Settings => " Project settings ",
