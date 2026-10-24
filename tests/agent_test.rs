@@ -907,6 +907,11 @@ capabilities = ["thinking", "image_in"]
 [models."kimi-code/always"]
 capabilities = ["always_thinking"]
 
+[models."kimi-code/k3.1-pro"]
+provider = "managed:kimi-code"
+model = "k3.1-pro"
+capabilities = ["thinking", "video_in", "image_in"]
+
 [providers."managed:kimi-code"]
 type = "kimi"
 
@@ -919,8 +924,13 @@ base_url = "https://api.kimi.com/coding/v1/search"
         [
             "kimi-code/kimi-for-coding",
             "kimi-code/k3",
-            "kimi-code/always"
+            "kimi-code/always",
+            "kimi-code/k3.1-pro"
         ]
+    );
+    assert_eq!(
+        catalog.variants_for("kimi-code/k3.1-pro"),
+        ["thinking", "no-thinking"]
     );
     assert_eq!(
         catalog.variants_for("kimi-code/k3"),
