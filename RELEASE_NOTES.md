@@ -1,3 +1,48 @@
+# kanban4ai 0.8.11
+
+Notes are from the reviewed diff since 0.8.10. There were no `.changes/` logs.
+
+- **Removed projects land in a 7-day trash.** `kanban project remove
+  --purge` renames the whole project directory to
+  `<store>/trash/<id>~<YYYYMMDD-HHMMSS>/` with a `trash.yaml` (original
+  `id`, `deleted_at`) instead of deleting it outright; the trash sits
+  outside `projects/`, so sync sees the removal as a plain delete.
+  `kanban project trash list [--format table|json]`,
+  `restore <entry|id|name>`, `purge <entry|id|name> [--yes]`, and
+  `empty [--yes]` manage it: restore puts the board back under its old id
+  (`<id>-N` when that is taken; refused while its folder is registered
+  again) and reconciles sync so the board wins over its tombstones,
+  purge/empty delete for good, and every trash command prunes expired
+  entries — the daemon and TUI tick prune hourly.
+  `trash.retention_days` (store config, default 7, machine-local under
+  sync) sets the clock. The TUI Projects screen gains `t`: the trash
+  table, newest first with the time left; `Enter`/`u` restores, `d`
+  deletes one for good, `D` empties the trash (both confirm).
+- **Pin a task's result path and open it from the detail.** An agent whose
+  result is a folder worth looking at (a report, generated images) pins it
+  with `kanban result TASK-N <path>`; pinning again replaces it, and
+  `--clear` unpins. The task detail shows a `Result:` line and `o` hands
+  the path to the file manager — the one plain letter that works on a
+  Review detail's thread instead of starting to type (`Alt+o` from a text
+  panel). A path inside the task's worktree or the work folder is stored
+  checkout-relative, so it still resolves in the work folder after landing
+  removes the worktree; `kanban show` prints the resolved
+  `Result path:`, and the agent prompt mentions the command.
+- **Opening an unread task no longer waits on the read-marker write.**
+  Clearing `review_unseen` went through the synced atomic writer (journal
+  lock, drift reconcile, fsyncs) on the UI thread, so opening an unread
+  task lagged behind a noticeable beat. The card now drops its notifier in
+  memory at once and the write runs on a launch worker.
+- **`o` on the board opens the board's own work folder** in the desktop
+  file manager, matching the projects-list behavior.
+
+Board files, `config.yaml`, journal records, and the sync protocol (3)
+stay readable by 0.8.10. The changes are additive: the new `result_path`
+task field is optional and omitted while unset, `trash.retention_days` is
+a new machine-local store-config key, and the trash directory itself is
+node-local — an older peer ignores the unknown keys and never reads
+`<store>/trash/`.
+
 # kanban4ai 0.8.10
 
 Notes are from the reviewed diff since 0.8.9. There were no `.changes/` logs.
