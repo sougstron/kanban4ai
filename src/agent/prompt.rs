@@ -163,8 +163,11 @@ Ending a reply without one of those strands the task and forces an automatic res
     );
     prompt.push_str(&format!(
         "- Proactively record non-blocking ideas, risks, or better alternatives you notice \
-(don't block on them, keep working) with: \"$KANBAN_CMD\" suggest {} <idea>\n",
-        task.id
+(don't block on them, keep working) with: \"$KANBAN_CMD\" suggest {} <idea>\n\
+- If the outcome is files for the human to look at (a report, generated images), keep them in one \
+folder that is not gitignored (or outside the project) and pin it with: \"$KANBAN_CMD\" result {} <path> \
+— the human opens it from Review with o. One path per task; pinning again replaces it.\n",
+        task.id, task.id
     ));
     append_question_guidance(&mut prompt, task, session_id, &form_file, true);
     append_context_economy(&mut prompt);

@@ -270,6 +270,8 @@ pub enum UiAction {
     /// Hand the selected (or open) project's work folder to the desktop file
     /// manager.
     OpenProjectFolder,
+    /// Hand the open task's pinned result path to the desktop file manager.
+    OpenResultFolder,
     NewProject,
     OpenGlobalSettings,
     RenameProject,
@@ -1658,6 +1660,9 @@ impl App {
             (KeyCode::Char('p'), _) if self.screen == Screen::Detail => {
                 self.dispatch(UiAction::ViewPrompt)?
             }
+            (KeyCode::Char('o'), _) if self.screen == Screen::Detail => {
+                self.dispatch(UiAction::OpenResultFolder)?
+            }
             (KeyCode::Char('v'), _) if self.screen == Screen::Detail => {
                 self.dispatch(UiAction::ViewContext)?
             }
@@ -1738,7 +1743,9 @@ impl App {
     /// hotkey match unless a printable key has a text panel to land in — then
     /// it focuses that panel and types there, so a stray letter can never
     /// approve, run or stop anything. Receives the raw (non-normalized) key so
-    /// Cyrillic input reaches the textareas untouched.
+    /// Cyrillic input reaches the textareas untouched. The one exception is
+    /// `o` on a task with a pinned result: opening a folder changes nothing,
+    /// and Review opens on the thread, so `o` there opens the result.
     fn handle_detail_key(&mut self, key: KeyEvent) -> Result<bool> {
         let Some(detail) = self.detail.as_ref() else {
             return Ok(false);
@@ -1768,6 +1775,15 @@ impl App {
             return Ok(true);
         }
         match detail.focus {
+            DetailFocus::Thread
+                if normalize_command_key(key)
+                    == KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)
+                    && self
+                        .current_task()
+                        .is_some_and(|task| task.result_path.is_some()) =>
+            {
+                Ok(false)
+            }
             DetailFocus::Thread => {
                 let Some(target) = detail.type_target().filter(|_| is_type_to_edit_key(key)) else {
                     return Ok(false);
@@ -2316,6 +2332,7 @@ impl App {
             UiAction::OpenProjects => self.open_projects_list(),
             UiAction::OpenProject => self.open_selected_project(),
             UiAction::OpenProjectFolder => self.open_selected_project_folder(),
+            UiAction::OpenResultFolder => self.open_result_folder(),
             UiAction::NewProject => self.open_new_project_dialog(),
             UiAction::OpenGlobalSettings => self.open_global_settings_dialog(),
             UiAction::RenameProject => self.open_rename_project_dialog(),
@@ -5222,6 +5239,41 @@ impl App {
                 )
             }
             Err(err) => self.status = format!("Could not open the folder: {err}"),
+        }
+    }
+
+    /// Show the open task's pinned result in the desktop file manager. A pinned
+    /// file opens its folder: the file manager is the one opener configured.
+    fn open_result_folder(&mut self) {
+        let Some(task) = self.current_task() else {
+            self.status = "No task selected".to_string();
+            return;
+        };
+        let Some(path) = self.ops.result_path(&task) else {
+            self.status = format!(
+                "{} has no pinned result (agents pin one with kanban result)",
+                task.id
+            );
+            return;
+        };
+        let folder = if path.is_file() {
+            path.parent().map(Path::to_path_buf).unwrap_or(path)
+        } else {
+            path
+        };
+        let configured = self
+            .store
+            .as_ref()
+            .and_then(|store| store.load_global_config().ok())
+            .and_then(|config| config.file_manager());
+        match crate::core::opener::open_folder(&folder, configured.as_deref()) {
+            Ok(()) => {
+                self.status = format!(
+                    "Opened {} in the file manager",
+                    projects::shorten_path(&folder)
+                )
+            }
+            Err(err) => self.status = format!("Could not open the result: {err}"),
         }
     }
 

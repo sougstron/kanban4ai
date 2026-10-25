@@ -232,6 +232,20 @@ enum Command {
     Questions { task_id: String },
     /// Add a suggestion to a task.
     Suggest { task_id: String, suggestion: String },
+    /// Pin the folder (or file) holding this task's result — a report, generated
+    /// images — so the human can open it from the task detail with `o`. One
+    /// path per task: pinning again replaces the earlier pin.
+    #[command(name = "result")]
+    ResultPath {
+        task_id: String,
+        /// Existing folder or file; a relative path resolves against the
+        /// current directory.
+        #[arg(required_unless_present = "clear")]
+        path: Option<String>,
+        /// Remove the pinned path instead.
+        #[arg(long, conflicts_with = "path")]
+        clear: bool,
+    },
     /// Reject (quarantine) a thread message so it is excluded from future
     /// prompts and gathered context, while staying visible for audit.
     Reject { task_id: String, msg_id: String },
@@ -611,6 +625,7 @@ impl Command {
             | Command::Show { task_id, .. }
             | Command::Stop { task_id, .. }
             | Command::Suggest { task_id, .. }
+            | Command::ResultPath { task_id, .. }
             | Command::Take { task_id, .. }
             | Command::Unreject { task_id, .. }
             | Command::Verdict { task_id, .. }
@@ -1243,6 +1258,20 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Some(_) => println!("Suggestion added to {task_id}"),
             None => eprintln!("Failed to add suggestion to {task_id}"),
         },
+        Command::ResultPath {
+            task_id,
+            path,
+            clear,
+        } => {
+            let path = if clear { None } else { path };
+            match ops.set_result_path(&task_id, path.as_deref().map(Path::new))? {
+                Some(task) => match task.result_path {
+                    Some(pinned) => println!("Result path pinned on {task_id}: {pinned}"),
+                    None => println!("Result path cleared on {task_id}"),
+                },
+                None => eprintln!("Task {task_id} not found"),
+            }
+        }
         Command::Reject { task_id, msg_id } => match ops.reject_message(&task_id, &msg_id)? {
             Some(_) => println!("Message {msg_id} rejected on {task_id}"),
             None => eprintln!("Message {msg_id} not found on {task_id}"),
@@ -1402,6 +1431,9 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             }
             if let Some(chained_to) = &task.chained_to {
                 println!("Chained to: {chained_to}");
+            }
+            if let Some(result_path) = ops.result_path(&task) {
+                println!("Result path: {}", result_path.display());
             }
             if let Some(launch_at) = &task.launch_at {
                 println!("Planned launch: {}", timefmt::format(launch_at));

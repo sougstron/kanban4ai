@@ -68,6 +68,14 @@ textarea's own Alt bindings (`Alt+b/f/d/v`) are unavailable there — use
 `Ctrl/Alt+Delete` to delete a word. A detail with no text panel keeps
 the plain-letter hotkeys.
 
+Pinned result: when an agent pinned the folder (or file) holding its result
+with `kanban result`, the detail meta shows a `Result:` line and the status
+bar `o result`. `o` hands that path to the file manager (a pinned file opens
+its folder), using the same `tui.file_manager` opener as the projects list.
+It is the one plain letter that works on the thread of a Review detail
+instead of starting to type; from a text panel use `Alt+o`. Without a pin,
+`o` types as usual.
+
 - `↑/↓/←/→`: Move focus between tasks/columns
 - `Shift+↑/↓`: Move 3 tasks within the focused board column, or scroll 3
   rendered rows while the detail thread is focused
