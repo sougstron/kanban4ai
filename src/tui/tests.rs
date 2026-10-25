@@ -9544,6 +9544,46 @@ fn the_open_folder_button_hands_the_work_folder_to_the_file_manager() {
     assert_eq!(recorded.as_deref(), Some(work.to_string_lossy().as_ref()));
 }
 
+/// `o` on the board does what it does on the projects list, for the board
+/// that is open: its work folder goes to the desktop file manager.
+#[test]
+fn o_on_the_board_opens_the_open_projects_folder() {
+    let (dir, mut app) = app_with_board();
+    let store_dir = tempfile::tempdir().expect("store");
+    let marker = store_dir.path().join("marker");
+    let store = ProjectStore::at(store_dir.path());
+    let mut config = store.load_global_config().expect("global config");
+    config.tui.insert(
+        serde_yaml_ng::Value::String("file_manager".to_string()),
+        serde_yaml_ng::Value::String(format!("sh -c 'printf %s \"$0\" > {}'", marker.display())),
+    );
+    store.save_global_config(&config).expect("save config");
+    app.set_project_store(store);
+
+    let rendered = render_at(&mut app, 200, 16);
+    assert!(rendered.contains("o folder"), "{rendered}");
+
+    app.handle_key(key(KeyCode::Char('o')))
+        .expect("press open-folder");
+    assert!(
+        app.status.starts_with("Opened "),
+        "unexpected status: {}",
+        app.status
+    );
+    let mut recorded = None;
+    for _ in 0..200 {
+        if let Ok(content) = std::fs::read_to_string(&marker) {
+            recorded = Some(content);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        recorded.as_deref(),
+        Some(dir.path().to_string_lossy().as_ref())
+    );
+}
+
 #[test]
 fn opening_a_missing_project_folder_reports_it_instead_of_launching() {
     let store_dir = tempfile::tempdir().expect("store");

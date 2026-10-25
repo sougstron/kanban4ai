@@ -499,6 +499,7 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
                 seg("b review done", 6),
                 seg("/ filter", 3),
                 seg("s settings", 7),
+                seg("o folder", 7),
                 seg("? help", 1),
             ];
             if app
@@ -772,6 +773,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  /: search · Esc clears an active filter"),
         Line::from("  s: project settings · Ctrl+T: cycle and persist theme"),
         Line::from("  P: projects list (also З on a Russian layout)"),
+        Line::from("  o: open this project's folder in the desktop file manager"),
         Line::from("  Esc: projects list when enabled in global settings"),
         Line::from(""),
         Line::from("Detail"),

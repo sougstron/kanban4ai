@@ -225,7 +225,7 @@ task and `u` restores it to To Do. The projects list is a table of the
 settings name, work folder, per-column counts, live agents, and last
 opened; `Enter` opens one, `n` adds, `d` unregisters (Space
 toggles deleting board data), `o` opens the selected board's work folder in
-your desktop's file manager, and `s` opens Global Settings (Esc-from-board,
+your desktop's file manager (`o` on a board opens that board's own folder), and `s` opens Global Settings (Esc-from-board,
 project-list sorting, update checks, plus the global default agent, limits,
 task sorting, and designer/reviewer/executor settings), which apply to every
 board. Project Settings has an "Inherit from global" checkbox per group —
