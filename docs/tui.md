@@ -318,7 +318,9 @@ normal row opens a path+name dialog. `r` renames, `p` changes the work path,
 `o` (status-bar `o folder`) opens the selected row's work folder in the
 desktop's own file manager — outside the TUI, in a real window, using
 `tui.file_manager` or the platform default chain (see "Global Settings"); on
-the pinned create row it opens the folder that row offers to register. The
+the pinned create row it opens the folder that row offers to register. `o` on
+the board itself (status-bar `o folder`) does the same for the open board's
+work folder. The
 opener is spawned detached with its streams closed so it cannot write over the
 frame, and a folder that no longer exists is reported in the status bar instead
 of being launched. `s` opens the Global Settings dialog, `S` (`Ы` in a Russian

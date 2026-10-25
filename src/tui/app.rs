@@ -267,7 +267,8 @@ pub enum UiAction {
     ViewContext,
     OpenProjects,
     OpenProject,
-    /// Hand the selected project's work folder to the desktop file manager.
+    /// Hand the selected (or open) project's work folder to the desktop file
+    /// manager.
     OpenProjectFolder,
     NewProject,
     OpenGlobalSettings,
@@ -1672,6 +1673,9 @@ impl App {
             }
             (KeyCode::Char('b'), _) | (KeyCode::Char('R'), _) if self.screen == Screen::Board => {
                 self.dispatch(UiAction::MarkReviewDone)?
+            }
+            (KeyCode::Char('o'), _) if self.screen == Screen::Board => {
+                self.dispatch(UiAction::OpenProjectFolder)?
             }
             (KeyCode::Char('a'), _) => self.dispatch(UiAction::OpenArchive)?,
             (KeyCode::Char('l'), _) => self.dispatch(UiAction::OpenSessions)?,
@@ -4774,6 +4778,11 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_project_store(&mut self, store: ProjectStore) {
+        self.store = Some(store);
+    }
+
+    #[cfg(test)]
     pub(crate) fn focus_first_question(&mut self) {
         let first = (0..self.board.columns.len()).find_map(|column_index| {
             self.visible_tasks_for_column(column_index)
@@ -5181,16 +5190,21 @@ impl App {
         self.pending_switch = Some(LoopOutcome::OpenProject(row.project.clone()));
     }
 
-    /// Show the selected project's work folder in the desktop file manager,
-    /// outside the TUI. The pinned create-row has no project behind it yet, so
-    /// it opens the folder it offers to register.
+    /// Show a project's work folder in the desktop file manager, outside the
+    /// TUI: the selected row on the projects list, the open board's own work
+    /// folder anywhere else. The pinned create-row has no project behind it
+    /// yet, so it opens the folder it offers to register.
     fn open_selected_project_folder(&mut self) {
-        let path = match self.visible_project_items().get(self.project_selected) {
-            Some(ProjectListItem::CreateCwd { path }) => path.clone(),
-            Some(ProjectListItem::Project(row)) => row.project.work_path.clone(),
-            None => {
-                self.status = "No project selected".to_string();
-                return;
+        let path = if self.screen != Screen::Projects {
+            self.ops.work_path().to_path_buf()
+        } else {
+            match self.visible_project_items().get(self.project_selected) {
+                Some(ProjectListItem::CreateCwd { path }) => path.clone(),
+                Some(ProjectListItem::Project(row)) => row.project.work_path.clone(),
+                None => {
+                    self.status = "No project selected".to_string();
+                    return;
+                }
             }
         };
         // Read the override per press rather than caching it: the file is
