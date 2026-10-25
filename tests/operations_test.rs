@@ -5069,3 +5069,58 @@ fn executor_pool_deadline_wins_and_withdraws_the_question() {
         .collect();
     assert_eq!(questions.len(), 1);
 }
+
+#[test]
+fn a_pinned_result_path_is_one_per_task_and_kept_relative_to_the_work_folder() {
+    let (dir, ops, _recorder) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Report")).unwrap();
+    let work = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(work.join("reports/run1")).unwrap();
+    fs::create_dir_all(work.join("reports/run2")).unwrap();
+
+    // A path inside the work folder is kept relative to it.
+    let pinned = ops
+        .set_result_path(&task.id, Some(&work.join("reports/run1")))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pinned.result_path.as_deref(), Some("reports/run1"));
+    assert_eq!(
+        ops.result_path(&pinned),
+        Some(ops.work_path().join("reports/run1"))
+    );
+
+    // Pinning again (say after a rerun from review) replaces the old path.
+    let pinned = ops
+        .set_result_path(&task.id, Some(&work.join("reports/run2")))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pinned.result_path.as_deref(), Some("reports/run2"));
+
+    // Outside the checkout the canonical absolute path is stored.
+    let outside = tempfile::tempdir().unwrap();
+    let outside_path = outside.path().canonicalize().unwrap();
+    let pinned = ops
+        .set_result_path(&task.id, Some(&outside_path))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pinned.result_path.as_deref(),
+        Some(outside_path.to_str().unwrap())
+    );
+    assert_eq!(ops.result_path(&pinned), Some(outside_path.clone()));
+
+    // A missing path is refused and the previous pin survives.
+    assert!(matches!(
+        ops.set_result_path(&task.id, Some(&work.join("missing"))),
+        Err(KanbanError::Invalid(_))
+    ));
+    let stored = ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(
+        stored.result_path.as_deref(),
+        Some(outside_path.to_str().unwrap())
+    );
+
+    let cleared = ops.set_result_path(&task.id, None).unwrap().unwrap();
+    assert_eq!(cleared.result_path, None);
+    assert_eq!(ops.result_path(&cleared), None);
+}

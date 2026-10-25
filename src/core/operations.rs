@@ -3717,6 +3717,68 @@ impl Operations {
         Ok(Some(task))
     }
 
+    /// Pin the folder (or file) holding the task's result so the human can
+    /// open it from Review, or clear the pin with `None`. One path per task:
+    /// a later pin, say from a rerun after review, replaces the earlier one.
+    /// The path must exist. One inside the task's worktree or the work folder
+    /// is stored relative to that checkout, so it keeps resolving in the work
+    /// folder after landing removes the worktree.
+    pub fn set_result_path(&self, task_id: &str, path: Option<&Path>) -> Result<Option<Task>> {
+        let _guard = self.storage.lock()?;
+        let Some(mut task) = self.storage.load_task(task_id)? else {
+            return Ok(None);
+        };
+        task.result_path = match path {
+            Some(path) => Some(self.pinnable_result_path(&task, path)?),
+            None => None,
+        };
+        task.updated_at = timefmt::now();
+        self.storage.save_task(&task)?;
+        Ok(Some(task))
+    }
+
+    fn pinnable_result_path(&self, task: &Task, path: &Path) -> Result<String> {
+        let resolved = fs::canonicalize(path).map_err(|err| {
+            KanbanError::Invalid(format!("Result path {}: {err}", path.display()))
+        })?;
+        let checkouts = [
+            self.task_worktree_path(task),
+            Some(self.work_path().to_path_buf()),
+        ];
+        for root in checkouts.into_iter().flatten() {
+            let Ok(root) = fs::canonicalize(&root) else {
+                continue;
+            };
+            if let Ok(relative) = resolved.strip_prefix(&root) {
+                let relative = relative.to_string_lossy();
+                return Ok(if relative.is_empty() {
+                    ".".to_string()
+                } else {
+                    relative.into_owned()
+                });
+            }
+        }
+        Ok(resolved.to_string_lossy().into_owned())
+    }
+
+    /// Where the task's pinned result is on disk now. A checkout-relative pin
+    /// resolves in the task's worktree while it still holds the result (the
+    /// agent's latest state before landing), else in the work folder.
+    pub fn result_path(&self, task: &Task) -> Option<PathBuf> {
+        let pinned = Path::new(task.result_path.as_deref()?);
+        if pinned.is_absolute() {
+            return Some(pinned.to_path_buf());
+        }
+        if let Some(candidate) = self
+            .task_worktree_path(task)
+            .map(|worktree| worktree.join(pinned))
+            .filter(|candidate| candidate.exists())
+        {
+            return Some(candidate);
+        }
+        Some(self.work_path().join(pinned))
+    }
+
     /// Fold the pending review-edits buffer into the thread as a permanent
     /// `review_edit` message, clear it, and relaunch the agent. With
     /// [`RunMode::Queued`] (the default everywhere) no agent launches: the

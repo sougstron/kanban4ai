@@ -110,6 +110,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         + u16::from(task.restart_at.is_some() || session_state == Some(SessionState::Crashed))
         + u16::from(task.launch_at.is_some())
         + u16::from(isolated)
+        + u16::from(task.result_path.is_some())
         + u16::from(conflicted)
         + description_lines;
     let meta_height = 6 + meta_extra_lines;
@@ -154,6 +155,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .worktree
             .as_deref()
             .map(|rel| shorten_path(&app.ops.storage.worktrees_dir.join(rel))),
+        result_path: app.ops.result_path(&task).map(|path| shorten_path(&path)),
     };
     render_meta(frame, &theme, &task, &meta_state, chunks[0]);
     if let Some(hitbox) = board::render_project_badge(frame, app, chunks[0], META_TITLE_WIDTH) {
@@ -331,6 +333,7 @@ struct MetaState<'a> {
     wait_note: Option<&'a str>,
     session_state: Option<SessionState>,
     worktree_path: Option<String>,
+    result_path: Option<String>,
     remote_label: Option<&'a str>,
 }
 
@@ -456,6 +459,18 @@ fn render_meta(
             line.push_str(&format!(" │ Integration: {}", task.integration));
         }
         meta.push(Line::from(line));
+    }
+    if let Some(result) = &meta_state.result_path {
+        meta.push(Line::from(vec![
+            Span::styled(
+                "Result: ",
+                Style::default()
+                    .fg(theme.review)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(sanitize_terminal_text(result)),
+            Span::styled(" · o opens it", Style::default().fg(theme.muted)),
+        ]));
     }
     if !task.description.trim().is_empty() {
         meta.push(Line::from(Span::styled(

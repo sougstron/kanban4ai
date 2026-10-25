@@ -135,7 +135,9 @@ kanban4ai ask-form TASK-002 --file .kanban/forms/TASK-002.ask.yaml --agent
 ```
 
 Agents are also prompted to file non-blocking ideas with
-`kanban4ai suggest TASK-002 "<idea>"`.
+`kanban4ai suggest TASK-002 "<idea>"`. An agent whose result is a folder to
+look at (a report, generated images) pins it with
+`kanban4ai result TASK-002 <path>`; `o` in the task detail opens it.
 
 For an interactive task, the agent can use `kanban4ai ask ... --agent --wait
 --session ses-login` to wait for the human answer. Questions and context are

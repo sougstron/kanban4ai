@@ -1056,3 +1056,34 @@ fn a_conflict_worktree_survives_every_cleanup_path() {
     ops.abandon_task(&task.id).unwrap();
     assert!(wt.exists() && git_ref_exists(&work_path, "refs/heads/kanban/TASK-001"));
 }
+
+/// A result pinned inside the task's worktree is stored relative to it, so
+/// once landing has moved the files into the work folder (and cleanup has
+/// removed the worktree) the same pin opens them there.
+#[test]
+fn a_result_pinned_in_the_worktree_resolves_in_the_work_folder_after_landing() {
+    let (_store, _work, work_path, ops, _recorder) =
+        git_project_ops("  isolation:\n    mode: auto\n");
+    let task = ops.create_task(NewTask::titled("Report")).unwrap();
+    take_and_context(&ops, &task.id, "ses-result");
+
+    let wt = worktree_dir(ops.data_root(), &task.id);
+    fs::create_dir_all(wt.join("reports")).unwrap();
+    fs::write(wt.join("reports/summary.md"), "# Summary\n").unwrap();
+    let pinned = ops
+        .set_result_path(&task.id, Some(&wt.join("reports")))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pinned.result_path.as_deref(), Some("reports"));
+    assert_eq!(ops.result_path(&pinned), Some(wt.join("reports")));
+
+    let reviewed = ops
+        .complete_task(&task.id, "ses-result", true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(reviewed.integration, IntegrationState::Landed);
+    assert!(!wt.exists(), "cleanup removed the worktree");
+    let resolved = ops.result_path(&reviewed).unwrap();
+    assert_eq!(resolved, work_path.join("reports"));
+    assert!(resolved.join("summary.md").is_file());
+}

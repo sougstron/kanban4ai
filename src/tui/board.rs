@@ -7,7 +7,7 @@ use ratatui::widgets::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use super::app::{App, HitAction, Hitbox, Screen, UiAction};
+use super::app::{App, DetailFocus, HitAction, Hitbox, Screen, UiAction};
 
 use super::card::{sanitize_terminal_text, truncate_display};
 use super::sync_board::SyncLevel;
@@ -524,6 +524,7 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
                 seg("y approve", 3),
                 seg("x reject", 5),
             ];
+
             if app
                 .current_task()
                 .is_some_and(|task| app.task_can_stop(&task))
@@ -543,6 +544,19 @@ fn status_segments(app: &App) -> Vec<StatusSegment> {
                 for segment in &mut segments {
                     segment.label = format!("M-{}", segment.label);
                 }
+            }
+            // `o` stays a plain letter on the thread even when a text panel
+            // is present; it is the one hotkey that never types there.
+            if app
+                .current_task()
+                .is_some_and(|task| task.result_path.is_some())
+            {
+                let on_thread = app
+                    .detail
+                    .as_ref()
+                    .is_none_or(|detail| detail.focus == DetailFocus::Thread);
+                let label = if on_thread { "o result" } else { "M-o result" };
+                segments.insert(1, seg(label, 1));
             }
             if show_tab {
                 segments.push(seg("Tab editor", 4));
@@ -788,6 +802,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  Home/End: start/end of thread · q/Esc: back · Esc leaves text panels first"),
         Line::from("  [/]: select a thread message · x: toggle reject (quarantine) on it"),
         Line::from("  p: view assembled prompt · v: view inputs/provenance (when present)"),
+        Line::from("  o: open the result folder an agent pinned (kanban result)"),
         Line::from(""),
         Line::from("Dialogs"),
         Line::from("  Tab/Shift+Tab: next/previous field · ↑/↓: fields, lists, text"),

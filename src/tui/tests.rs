@@ -9584,6 +9584,82 @@ fn o_on_the_board_opens_the_open_projects_folder() {
     );
 }
 
+/// Review opens on the thread, and `o` there hands the agent's pinned result
+/// to the file manager instead of starting to type review edits. Without a
+/// pin `o` keeps typing into the editor.
+#[test]
+fn o_in_review_detail_opens_the_pinned_result() {
+    let (dir, mut app) = app_with_board();
+    let store_dir = tempfile::tempdir().expect("store");
+    let marker = store_dir.path().join("marker");
+    let store = ProjectStore::at(store_dir.path());
+    let mut config = store.load_global_config().expect("global config");
+    config.tui.insert(
+        serde_yaml_ng::Value::String("file_manager".to_string()),
+        serde_yaml_ng::Value::String(format!("sh -c 'printf %s \"$0\" > {}'", marker.display())),
+    );
+    store.save_global_config(&config).expect("save config");
+    app.set_project_store(store);
+
+    let plain = app.ops.create_task(NewTask::titled("No result")).unwrap();
+    app.ops.move_task(&plain.id, "review", false).unwrap();
+    let task = app.ops.create_task(NewTask::titled("Report")).unwrap();
+    let reports = dir.path().join("reports");
+    std::fs::create_dir_all(&reports).unwrap();
+    std::fs::write(reports.join("summary.md"), "# Summary\n").unwrap();
+    app.ops
+        .set_result_path(&task.id, Some(&reports.join("summary.md")))
+        .unwrap();
+    app.ops.move_task(&task.id, "review", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.focused_column = review_column(&app);
+
+    let card_of = |app: &App, id: &str| {
+        app.visible_tasks_for_column(app.focused_column)
+            .iter()
+            .position(|task| task.id == id)
+            .unwrap()
+    };
+    app.focused_card = card_of(&app, &plain.id);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    app.handle_key(key(KeyCode::Char('o'))).unwrap();
+    assert_eq!(
+        app.detail.as_ref().unwrap().review_edits.lines().join("\n"),
+        "o"
+    );
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert_eq!(app.screen, Screen::Board);
+
+    app.focused_card = card_of(&app, &task.id);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
+    let rendered = render_at(&mut app, 200, 30);
+    assert!(rendered.contains("Result: "), "{rendered}");
+    assert!(rendered.contains("o result"), "{rendered}");
+
+    app.handle_key(key(KeyCode::Char('o'))).unwrap();
+    assert!(
+        app.status.starts_with("Opened "),
+        "unexpected status: {}",
+        app.status
+    );
+    assert!(app.detail.as_ref().unwrap().review_edits.is_empty());
+    let mut recorded = None;
+    for _ in 0..200 {
+        if let Ok(content) = std::fs::read_to_string(&marker) {
+            recorded = Some(content);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // A pinned file opens the folder that holds it.
+    assert_eq!(
+        recorded.map(std::path::PathBuf::from),
+        Some(app.ops.work_path().join("reports"))
+    );
+}
+
 #[test]
 fn opening_a_missing_project_folder_reports_it_instead_of_launching() {
     let store_dir = tempfile::tempdir().expect("store");

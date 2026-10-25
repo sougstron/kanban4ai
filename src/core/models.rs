@@ -503,6 +503,13 @@ pub struct Task {
     /// at `auto_mode.max_resolver_runs`. Omitted while zero.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub resolver_runs: u32,
+    /// Where the agent left the result a human should look at (a report
+    /// folder, generated images), pinned with `kanban result`. One path per
+    /// task: pinning again replaces it. Relative to the checkout when it was
+    /// pinned inside the task's worktree, so it still resolves in the work
+    /// folder after landing removes the worktree. Omitted while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_path: Option<String>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -573,6 +580,7 @@ impl Task {
             queued_at: None,
             conflict_held: false,
             resolver_runs: 0,
+            result_path: None,
         }
     }
 
