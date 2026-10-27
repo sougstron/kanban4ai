@@ -131,6 +131,9 @@ pub enum DialogField {
     Effort,
     Agent,
     ChainTo,
+    /// Task form: read-only view of what the task runs after (`chained_to`
+    /// plus the orchestrator's `depends_on`) with a button clearing both.
+    Links,
     PlannedLaunch,
     LaunchTime,
     Readonly,
@@ -207,7 +210,7 @@ pub enum DialogField {
     PurgeData,
 }
 
-const TASK_FORM_FIELDS: [DialogField; 7] = [
+const TASK_FORM_FIELDS: [DialogField; 8] = [
     DialogField::Title,
     DialogField::Description,
     DialogField::AgentSettings,
@@ -215,6 +218,7 @@ const TASK_FORM_FIELDS: [DialogField; 7] = [
     DialogField::ChainTo,
     DialogField::TaskOptions,
     DialogField::Runner,
+    DialogField::Links,
 ];
 
 /// The `Options` subpopup of the task form: per-task orchestration opt-ins
@@ -800,6 +804,10 @@ pub struct ModalState {
     pub effort: TextArea<'static>,
     pub agent: TextArea<'static>,
     pub chain_to: TextArea<'static>,
+    /// The orchestrator's `depends_on` edges as loaded; only the Links
+    /// button changes them, and `depends_on_cleared` tells Save to write.
+    pub depends_on: Vec<String>,
+    pub depends_on_cleared: bool,
     pub planned_launch: bool,
     pub launch_time: TextArea<'static>,
     pub target_status: TextArea<'static>,
@@ -934,6 +942,8 @@ impl ModalState {
             effort: one_line(""),
             agent: one_line(""),
             chain_to: one_line(""),
+            depends_on: Vec::new(),
+            depends_on_cleared: false,
             planned_launch: false,
             launch_time: one_line(""),
             target_status: one_line("todo"),
@@ -1033,6 +1043,7 @@ impl ModalState {
         state.effort = one_line(task.ai_effort.as_deref().unwrap_or(""));
         state.agent = one_line(task.agent_name.as_deref().unwrap_or(""));
         state.chain_to = one_line(task.chained_to.as_deref().unwrap_or(""));
+        state.depends_on = task.depends_on.clone();
         state.planned_launch = task.launch_at.is_some();
         state.launch_time = one_line(
             task.launch_at
@@ -1067,6 +1078,7 @@ impl ModalState {
                 DialogField::ChainTo,
                 DialogField::TaskOptions,
                 DialogField::Runner,
+                DialogField::Links,
                 DialogField::Confirm,
                 DialogField::Cancel,
             ],
@@ -2041,6 +2053,11 @@ impl ModalState {
             | DialogField::ReviewerAgentSettings
             | DialogField::ArbiterAgentSettings
             | DialogField::TaskOptions => {}
+            DialogField::Links => {
+                if key.code == ratatui::crossterm::event::KeyCode::Char(' ') {
+                    self.clear_links();
+                }
+            }
             DialogField::Runner => {
                 use ratatui::crossterm::event::KeyCode;
                 if matches!(
@@ -2307,6 +2324,7 @@ impl ModalState {
             | DialogField::ReviewerAgentSettings
             | DialogField::ArbiterAgentSettings
             | DialogField::TaskOptions
+            | DialogField::Links
             | DialogField::Readonly
             | DialogField::Silence
             | DialogField::Runner
@@ -2615,6 +2633,18 @@ impl ModalState {
 
     pub fn chain_text(&self) -> Option<String> {
         non_empty(textarea_text(&self.chain_to))
+    }
+
+    /// The Links button: drop the chain and the orchestrator's dependency
+    /// edges together. Nothing is written until Save.
+    pub fn clear_links(&mut self) {
+        self.chain_selected = select_matching(&self.chain_options, None);
+        self.chain_to = one_line("");
+        self.chain_filter.clear();
+        if !self.depends_on.is_empty() {
+            self.depends_on.clear();
+            self.depends_on_cleared = true;
+        }
     }
 
     pub fn launch_time_text(&self) -> String {
@@ -2945,6 +2975,7 @@ impl ModalState {
             raw_textarea_text(&self.effort),
             raw_textarea_text(&self.agent),
             raw_textarea_text(&self.chain_to),
+            self.depends_on.join(","),
             self.planned_launch.to_string(),
             raw_textarea_text(&self.launch_time),
             raw_textarea_text(&self.target_status),
@@ -4191,6 +4222,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::ReviewerAgentSettings
         | DialogField::ArbiterAgentSettings
         | DialogField::TaskOptions
+        | DialogField::Links
         | DialogField::Silence
         | DialogField::Runner
         | DialogField::UseOrchestrator
@@ -4590,6 +4622,7 @@ fn render_selector_field(
             "Arbiter agent settings",
         ),
         DialogField::TaskOptions => render_options_launcher(frame, app, modal, area),
+        DialogField::Links => render_links_row(frame, app, modal, area),
         DialogField::Backend => render_select_filtered(
             frame,
             app,
@@ -5276,6 +5309,67 @@ fn render_options_launcher(frame: &mut Frame<'_>, app: &App, modal: &ModalState,
         "Options",
         &summary,
     );
+}
+
+/// Links row of the task form: the nearest tasks this one starts after — the
+/// chain target (auto-runs when it reaches Review) and every orchestrator
+/// dependency, ✓ marking the ones already finished — plus the Clear button.
+fn render_links_row(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
+    let field = DialogField::Links;
+    let active = modal.active_field() == field || app.is_hovered(HitAction::ModalField(field));
+    let border = if active {
+        app.theme.focus
+    } else {
+        app.theme.border
+    };
+    let summary = links_summary(app, modal);
+    let (summary, suffix) = if summary.is_empty() {
+        ("none".to_string(), "")
+    } else {
+        (summary, "  › Enter clears")
+    };
+    let summary_width =
+        usize::from(area.width.saturating_sub(2)).saturating_sub(suffix.chars().count());
+    let label = format!("{}{}", truncate_display(&summary, summary_width), suffix);
+    frame.render_widget(
+        Paragraph::new(label).block(
+            Block::default()
+                .title(" Runs after ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border)),
+        ),
+        area,
+    );
+}
+
+fn links_summary(app: &App, modal: &ModalState) -> String {
+    let mut parts = Vec::new();
+    if let Some(chain) = modal.chain_text() {
+        parts.push(format!("chain: {}", sanitize_terminal_text(&chain)));
+    }
+    if !modal.depends_on.is_empty() {
+        let tasks: Vec<Task> = app
+            .board
+            .columns
+            .iter()
+            .flat_map(|column| column.tasks.iter().cloned())
+            .collect();
+        let index = crate::core::graph::index_by_id(&tasks);
+        let deps = modal
+            .depends_on
+            .iter()
+            .map(|id| {
+                let id_text = sanitize_terminal_text(id);
+                match index.get(id.as_str()) {
+                    Some(task) if crate::core::graph::is_satisfied(task) => format!("{id_text} ✓"),
+                    Some(_) => id_text,
+                    None => format!("{id_text} (gone)"),
+                }
+            })
+            .collect::<Vec<_>>();
+        parts.push(format!("plan: {}", deps.join(", ")));
+    }
+    parts.join(" · ")
 }
 
 /// Read-only row: whether worktree isolation can run in this project. The
@@ -6365,6 +6459,7 @@ pub(crate) fn block_has_inside(field: DialogField) -> bool {
             | DialogField::ReviewerAgentSettings
             | DialogField::ArbiterAgentSettings
             | DialogField::TaskOptions
+            | DialogField::Links
             | DialogField::IsolationStatus
     )
 }
@@ -6381,6 +6476,7 @@ pub(crate) fn is_flag_field(field: DialogField) -> bool {
             | DialogField::UseDesigner
             | DialogField::UseReviewer
             | DialogField::Runner
+            | DialogField::Links
             | DialogField::EscapeToProjects
             | DialogField::UpdateCheckOnOpen
             | DialogField::HideKanbanMessages

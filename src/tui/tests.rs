@@ -14006,3 +14006,62 @@ fn sync_status_light_states_and_colors() {
         assert_eq!(cell.fg, color);
     }
 }
+
+/// The task form's "Runs after" row shows both link kinds — the human chain
+/// and the orchestrator's `depends_on` — and its button clears them together.
+#[test]
+fn task_form_links_row_shows_and_clears_chain_and_dependencies() {
+    let (_dir, mut app) = plain_tasks_app(3);
+    let ids: Vec<String> = app
+        .ops
+        .list_tasks(None, None, "created", "asc")
+        .unwrap()
+        .into_iter()
+        .map(|task| task.id)
+        .collect();
+    let (task_id, chain, dep) = (&ids[0], &ids[1], &ids[2]);
+    app.ops
+        .update_task(
+            task_id,
+            crate::core::operations::TaskPatch {
+                chained_to: Some(Some(chain.clone())),
+                depends_on: Some(vec![dep.clone()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    app.ops.move_task(dep, "review", false).unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    let task = app.ops.get_task(task_id).unwrap().unwrap();
+    app.modal = Some(ModalState::for_task(
+        Modal::EditTask {
+            task_id: task_id.clone(),
+        },
+        &task,
+    ));
+    let screen = render_at(&mut app, 96, 60);
+    assert!(
+        screen.contains(&format!("chain: {chain} · plan: {dep} ✓")),
+        "{screen}"
+    );
+    insta::assert_snapshot!(
+        "task_form_links_row",
+        screen.split("\n\n--- style").next().unwrap()
+    );
+
+    app.modal.as_mut().unwrap().focus_field(DialogField::Links);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    let modal = app.modal.as_ref().unwrap();
+    assert_eq!(modal.chain_text(), None);
+    assert!(modal.depends_on.is_empty());
+    assert!(render_at(&mut app, 96, 60).contains("│none"));
+
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    let saved = app.ops.get_task(task_id).unwrap().unwrap();
+    assert_eq!(saved.chained_to, None);
+    assert!(saved.depends_on.is_empty());
+}
