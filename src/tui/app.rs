@@ -3159,6 +3159,8 @@ impl App {
                         modal.open_agent_settings(slot);
                     } else if field == DialogField::TaskOptions {
                         modal.open_options();
+                    } else if field == DialogField::Links {
+                        modal.clear_links();
                     }
                 }
             }
@@ -7085,6 +7087,7 @@ impl App {
                     DialogField::Confirm => return self.submit_modal(modal).map(|_| true),
                     DialogField::Cancel => return self.request_modal_close(modal),
                     DialogField::TaskOptions => modal.open_options(),
+                    DialogField::Links => modal.clear_links(),
                     _ => {
                         if let Some(slot) = ModalState::launcher_slot(field) {
                             modal.open_agent_settings(slot);
@@ -7180,6 +7183,9 @@ impl App {
                 }
                 KeyCode::Enter if modal.active_field() == DialogField::TaskOptions => {
                     modal.open_options();
+                }
+                KeyCode::Enter if modal.active_field() == DialogField::Links => {
+                    modal.clear_links();
                 }
                 // Plain Enter commits the focused field and walks to the next
                 // one, exactly like Tab. A filtered selector with no match
@@ -7535,6 +7541,7 @@ impl App {
                         use_orchestrator: Some(modal.use_orchestrator),
                         chained_to: Some(modal.chain_text()),
                         launch_at,
+                        depends_on: modal.depends_on_cleared.then(Vec::new),
                         runner: Some(modal.runner.clone()),
                         ..Default::default()
                     },
@@ -8828,6 +8835,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::ReviewerAgentSettings
         | DialogField::ArbiterAgentSettings
         | DialogField::TaskOptions
+        | DialogField::Links
         | DialogField::Readonly
         | DialogField::Silence
         | DialogField::UseOrchestrator

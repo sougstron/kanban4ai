@@ -522,7 +522,12 @@ task: the agent decides ambiguous points itself and records each dispute as a
 suggestion. Orchestrator, Designer, and Reviewer are per-task opt-ins; models
 and agents come from project settings. The Options summary names the toggles
 that are on (`silence`, `orchestrator`, `designer`, `reviewer`, `launch at
-HH:MM`), and a silence task shows a `🔇 silence` badge. The Description box sizes itself from its own text the way
+HH:MM`), and a silence task shows a `🔇 silence` badge. Below Runner, a
+read-only `Runs after` row lists the nearest tasks this one starts after: the
+chain target (`chain: TASK-…`, live with the selector) and the orchestrator's
+`depends_on` edges (`plan: TASK-…`, `✓` once finished, `(gone)` when deleted),
+or `none`. Enter, Space or a click on it clears the chain and every dependency
+at once; nothing is written until Save. The Description box sizes itself from its own text the way
 the option selectors size from their option count: at least 5 visible text rows,
 growing one row at a time with the soft-wrapped text up to 15 visible rows and
 shrinking again on delete. The borders add two rows outside these limits.
