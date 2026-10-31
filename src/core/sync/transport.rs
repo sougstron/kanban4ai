@@ -790,7 +790,20 @@ pub(super) fn recover_bootstrap(store: &Path) -> Result<()> {
     let _sync = lock_file_reentrant(&store.join("sync/.lock"))?;
     finish_bootstrap(store, &redo, &boards)
 }
+/// Installing a snapshot is acknowledged to the server, so it runs durably,
+/// after a barrier for the relaxed local writes before it.
 fn finish_bootstrap(store: &Path, redo: &Bootstrap, boards: &BTreeSet<PathBuf>) -> Result<()> {
+    crate::core::storage::durable(|| {
+        crate::core::storage::flush_store(store)?;
+        finish_bootstrap_durably(store, redo, boards)
+    })
+}
+
+fn finish_bootstrap_durably(
+    store: &Path,
+    redo: &Bootstrap,
+    boards: &BTreeSet<PathBuf>,
+) -> Result<()> {
     let root = store.join("sync");
     let stage = root.join(".bootstrap").join(&redo.stage);
     let data = stage.join("data");

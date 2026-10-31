@@ -230,6 +230,37 @@ pub(crate) fn remote_runs_for_tasks<'a>(
     Ok(result)
 }
 
+/// [`remote_runs_for_tasks`] for display: `None` instead of waiting while
+/// another thread or process holds the sync lock, so a board refresh never
+/// freezes behind a journal write or a remote apply. The caller keeps the
+/// runs it showed before and the next refresh retries.
+pub(crate) fn remote_runs_for_tasks_nowait<'a>(
+    board: &Path,
+    task_ids: impl IntoIterator<Item = &'a str>,
+) -> Result<Option<BTreeMap<String, Vec<RunDescriptor>>>> {
+    let Some(store) = store_for_board(board) else {
+        return Ok(Some(BTreeMap::new()));
+    };
+    if !enabled(store) {
+        return Ok(Some(BTreeMap::new()));
+    }
+    let sync = store.join("sync");
+    // Crash recovery and migrations take the store lock before the sync lock;
+    // holding the sync lock while they run would invert that order, so they
+    // are left to a blocking reader.
+    if !sync.is_dir()
+        || sync.join("bootstrap.json").exists()
+        || sync.join("remote-pending.json").exists()
+        || super::format::read_format(store)? != Some(super::format::STORE_FORMAT)
+    {
+        return Ok(None);
+    }
+    let Some(_sync) = crate::core::storage::try_lock_file_reentrant(&sync.join(".lock"))? else {
+        return Ok(None);
+    };
+    remote_runs_for_tasks(board, task_ids).map(Some)
+}
+
 fn decode_fields(fields: Option<&FieldState>) -> Result<BTreeMap<String, RunDescriptor>> {
     fields
         .into_iter()
@@ -553,4 +584,45 @@ pub(super) fn capture(
     apply_meta(state, &op);
     operations.push(op);
     Ok(())
+}
+
+#[cfg(test)]
+mod nowait_tests {
+    use super::*;
+    use crate::core::storage::{atomic_write_text, lock_file_reentrant};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// TASK-572: a board refresh never waits on a sync lock another thread holds.
+    #[test]
+    fn remote_runs_nowait_skips_a_held_sync_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::core::sync::enable_sync(dir.path()).unwrap();
+        let board = Storage::new(dir.path().join("projects/demo"));
+        board.init_board().unwrap();
+        atomic_write_text(
+            &dir.path().join("projects/demo/project.yaml"),
+            "id: demo\nname: Demo\ncreated_at: '2026-01-01T00:00:00'\n",
+        )
+        .unwrap();
+        Journal::open(dir.path()).unwrap();
+        let read = || remote_runs_for_tasks_nowait(&board.project_path, ["TASK-001"]).unwrap();
+        assert!(read().is_some());
+
+        let lock = dir.path().join("sync/.lock");
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _sync = lock_file_reentrant(&lock).unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        held_rx.recv().unwrap();
+        let start = Instant::now();
+        assert!(read().is_none(), "a held lock is skipped, not waited on");
+        assert!(start.elapsed() < Duration::from_secs(1));
+        drop(release_tx);
+        holder.join().unwrap();
+        assert!(read().is_some());
+    }
 }

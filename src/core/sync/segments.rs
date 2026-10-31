@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use super::format::JournalLimits;
 use super::*;
+use crate::core::storage::{sync_dir, sync_file_data};
 
 const MARK_EVERY: u64 = 128;
 
@@ -217,7 +218,7 @@ fn write_ahead(dir: &Path, ops: &BTreeMap<u64, Operation>) -> Result<()> {
     if ops.is_empty() {
         match fs::remove_file(&path) {
             Ok(()) => {
-                fs::File::open(dir)?.sync_all()?;
+                sync_dir(dir)?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
@@ -240,7 +241,7 @@ fn active_file(dir: &Path, head: u64) -> Result<PathBuf> {
     let path = dir.join(segment_name(head + 1));
     fs::create_dir_all(dir)?;
     OpenOptions::new().create(true).append(true).open(&path)?;
-    fs::File::open(dir)?.sync_all()?;
+    sync_dir(dir)?;
     Ok(path)
 }
 
@@ -283,7 +284,7 @@ fn roll_if_needed(
     remember_segment(sync, node, path)?;
     let next = dir.join(segment_name(head + 1));
     OpenOptions::new().create(true).append(true).open(&next)?;
-    fs::File::open(dir)?.sync_all()?;
+    sync_dir(dir)?;
     Ok(())
 }
 
@@ -394,7 +395,7 @@ pub(super) fn append(
         }
         file.write_all(text.as_bytes())?;
     }
-    file.sync_data()?;
+    sync_file_data(&file)?;
     let end = file.metadata()?.len();
     drop(file);
     write_ahead(&dir, &ahead)?;
@@ -545,7 +546,7 @@ pub(super) fn drop_sealed(sync: &Path, node: &str, through: u64) -> Result<()> {
         }
     }
     store_index(sync, &index)?;
-    fs::File::open(&dir)?.sync_all()?;
+    sync_dir(&dir)?;
     Ok(())
 }
 

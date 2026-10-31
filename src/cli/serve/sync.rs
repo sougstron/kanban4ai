@@ -354,6 +354,7 @@ impl ServerLink {
         let own = journal.node.node_id.clone();
         let mut after = journal.vector()?;
         after.insert(own.clone(), cursor.pushed);
+        let mut flushed = false;
         loop {
             let root = self.root.clone();
             let offset = after.clone();
@@ -368,6 +369,14 @@ impl ServerLink {
                 })?;
             if page.operations.is_empty() {
                 return Ok(());
+            }
+            // Local writes skip fsync. Everything read above is made durable
+            // before it leaves this node, so a crash can never reuse a
+            // sequence the server already holds.
+            if !flushed {
+                let root = self.root.clone();
+                blocking(move || crate::core::storage::flush_store(&root)).await?;
+                flushed = true;
             }
             let max = page
                 .operations

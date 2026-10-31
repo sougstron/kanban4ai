@@ -253,3 +253,89 @@ fn tick_worker_heartbeat_does_not_reload_open_detail() {
         "heartbeat must not re-read the detail on the UI thread"
     );
 }
+
+fn column_of(app: &App, id: &str) -> Option<String> {
+    app.board
+        .columns
+        .iter()
+        .find(|column| column.tasks.iter().any(|task| task.id == id))
+        .map(|column| column.id.clone())
+}
+
+/// Apply worker events until every launch job reported and no card move is
+/// pending.
+fn settle(app: &mut App, rx: &Receiver<AppEvent>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !app.launches.is_empty() || !app.pending_moves.is_empty() {
+        assert!(Instant::now() < deadline, "the worker settles");
+        if let Ok(AppEvent::TickReady(result)) = rx.recv_timeout(Duration::from_millis(50)) {
+            app.apply_tick_result(*result).unwrap();
+        }
+        app.poll_launches();
+    }
+}
+
+/// TASK-572: Approve shows the card in Done at once while the Done write
+/// (worktree cleanup, sync capture) waits for the board lock on a worker,
+/// and a board reload meanwhile keeps the card where the user put it.
+#[test]
+fn approve_shows_done_before_the_worker_gets_the_board_lock() {
+    let (_dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Reviewed")).unwrap();
+    app.ops.move_task(&task.id, "review", false).unwrap();
+    app.reload_board().unwrap();
+    assert!(app.focus_task(&task.id));
+    let rx = background(&mut app);
+
+    let board_lock = app.ops.storage.lock().unwrap();
+    app.dispatch(UiAction::Approve).unwrap();
+    assert_eq!(column_of(&app, &task.id).as_deref(), Some("done"));
+    let stored = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Review, "not written yet");
+
+    app.ops.create_task(NewTask::titled("Unrelated")).unwrap();
+    app.reload_board().unwrap();
+    assert_eq!(column_of(&app, &task.id).as_deref(), Some("done"));
+
+    drop(board_lock);
+    settle(&mut app, &rx);
+    let stored = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert_eq!(stored.status, TaskStatus::Done);
+    assert_eq!(column_of(&app, &task.id).as_deref(), Some("done"));
+    assert!(app.status.contains("Approved"), "status: {}", app.status);
+}
+
+/// TASK-572: Run shows the card In Progress (queued) before the launch
+/// worker can take the board lock; its report then brings the real state.
+#[test]
+fn run_shows_in_progress_before_the_worker_gets_the_board_lock() {
+    let (_dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Start me")).unwrap();
+    app.reload_board().unwrap();
+    assert!(app.focus_task(&task.id));
+    let rx = background(&mut app);
+
+    let board_lock = app.ops.storage.lock().unwrap();
+    app.dispatch(UiAction::Run).unwrap();
+    assert_eq!(column_of(&app, &task.id).as_deref(), Some("in_progress"));
+    let shown = app.current_task().expect("focus follows the card");
+    assert_eq!(shown.id, task.id);
+    assert_eq!(shown.run_phase, Some(RunPhase::Queued));
+    // The task disappears before the worker reads it, so nothing launches.
+    std::fs::remove_file(
+        app.ops
+            .storage
+            .tasks_dir
+            .join("todo")
+            .join(format!("{}.md", task.id)),
+    )
+    .unwrap();
+    drop(board_lock);
+    settle(&mut app, &rx);
+    assert_eq!(
+        column_of(&app, &task.id),
+        None,
+        "the reload shows the truth"
+    );
+    assert!(app.status.contains("not found"), "status: {}", app.status);
+}

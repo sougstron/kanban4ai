@@ -181,10 +181,22 @@ impl Hub {
             self.save(&heads)?;
         }
         let limits = format::JournalLimits::load(&self.store)?;
+        let mut flushed = false;
         loop {
             let page = journal.operations_after(&heads.heads, 500)?;
             if page.operations.is_empty() {
                 break;
+            }
+            // This node's own operations were written without fsync; make
+            // them durable before the hub serves them to anyone.
+            if !flushed
+                && page
+                    .operations
+                    .iter()
+                    .any(|op| op.hlc.2 == journal.node.node_id)
+            {
+                crate::core::storage::flush_store(&self.store)?;
+                flushed = true;
             }
             let mut ops = page.operations;
             ops.sort_by(|a, b| (&a.hlc, &a.op).cmp(&(&b.hlc, &b.op)));

@@ -1,7 +1,7 @@
 //! Remote redo transactions and deterministic projection of replicated fields.
 use super::*;
 use crate::core::models::{Message, Thread};
-use crate::core::storage::{BoardGuard, Storage};
+use crate::core::storage::{BoardGuard, Storage, durable, flush_store};
 use crate::core::thread::merge_threads;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,6 +95,10 @@ fn finish(root: &Path, pending: &RemotePending) -> Result<()> {
     Ok(())
 }
 
+fn drift_len(root: &Path) -> u64 {
+    fs::metadata(root.join("drift.jsonl")).map_or(0, |m| m.len())
+}
+
 pub(super) fn recover_remote(root: &Path) -> Result<()> {
     let path = root.join("remote-pending.json");
     if !path.exists() {
@@ -113,10 +117,13 @@ pub(super) fn recover_remote(root: &Path) -> Result<()> {
         .map(|board| Storage::new(board).lock())
         .collect::<Result<_>>()?;
     let _sync = lock_file_reentrant(&root.join(".lock"))?;
-    finish(root, &pending)?;
-    fs::remove_file(path)?;
-    fs::File::open(root)?.sync_all()?;
-    Ok(())
+    durable(|| {
+        flush_store(store)?;
+        finish(root, &pending)?;
+        fs::remove_file(path)?;
+        fs::File::open(root)?.sync_all()?;
+        Ok(())
+    })
 }
 
 impl Journal {
@@ -129,7 +136,13 @@ impl Journal {
     ) -> Result<Vec<Conflict>> {
         recover_remote(&self.root)?;
         self.reconcile()?;
-        let conflicts = self.apply_remote_transaction(operations, max_skew_ms)?;
+        // Local writes skip fsync, and on btrfs a per-file fsync in the
+        // transaction could make a relaxed drift entry durable without its
+        // journal operation. The barrier runs here, outside the board locks.
+        let captured = drift_len(&self.root);
+        flush_store(self.root.parent().expect("sync parent"))?;
+        let conflicts =
+            durable(|| self.apply_remote_transaction(operations, max_skew_ms, Some(captured)))?;
         super::control::process_store(self.root.parent().expect("sync parent"))?;
         Ok(conflicts)
     }
@@ -187,14 +200,16 @@ impl Journal {
             prev: BTreeMap::from([(conflict.field.clone(), conflict.winner.clone())]),
             actor: "human".into(),
         };
-        self.apply_remote_transaction(&[operation], u64::MAX)?;
+        self.apply_remote_transaction(&[operation], u64::MAX, None)?;
         Ok(())
     }
 
+    /// `flushed` is the drift index length at the caller's durability barrier.
     fn apply_remote_transaction(
         &self,
         operations: &[Operation],
         max_skew_ms: u64,
+        flushed: Option<u64>,
     ) -> Result<Vec<Conflict>> {
         let store = self.root.parent().expect("sync parent");
         let _store = lock_file_reentrant(&store.join(".lock"))?;
@@ -226,6 +241,11 @@ impl Journal {
             .map(|p| Storage::new(p).lock())
             .collect::<Result<_>>()?;
         let sync = lock_file_reentrant(&self.root.join(".lock"))?;
+        // Every local capture appends to the drift index: one that slipped in
+        // after the caller's barrier gets a second barrier, under the locks.
+        if flushed.is_some_and(|len| drift_len(&self.root) != len) {
+            flush_store(store)?;
+        }
         self.recover()?;
         let (mut state, prune_meta) = projection::load_state(&self.root)?;
         let cached = prune::take_groups(&self.root);

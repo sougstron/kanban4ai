@@ -45,7 +45,7 @@ use crate::core::project::{Project, ProjectStore};
 use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
 use crate::core::stats::{self, TaskAnalytics};
-use crate::core::storage::{BoardStamps, NewTask, Storage, TaskCache};
+use crate::core::storage::{BoardStamps, Fingerprint, NewTask, Storage, TaskCache};
 use crate::core::telemetry::{self, SessionProgress, TokenBreakdown};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
@@ -557,6 +557,10 @@ pub struct App {
     /// Wakes the event loop when a worker finishes. `None` until the event
     /// loop opts in (and always in tests), which runs every job inline.
     launch_wake: Option<Sender<AppEvent>>,
+    /// Cards shown in their target status while a worker writes the move,
+    /// as `(task id, status)`. Re-applied over every board reload until the
+    /// worker's report settles them.
+    pending_moves: Vec<(String, String)>,
 }
 
 struct ProjectScanReport {
@@ -594,6 +598,11 @@ pub(super) struct LaunchReport {
     background_refresh: bool,
     /// Switch to this project once the report is applied.
     open_project: Option<Project>,
+    /// Pending card moves this job wrote (or failed to): dropped from the
+    /// overlay before the board reloads.
+    settle: Vec<String>,
+    /// The bulk move found a changed source set: confirm again.
+    reconfirm: Option<BulkAction>,
 }
 
 /// One queue pump's outcome: the tasks it started and any failure line.
@@ -1107,6 +1116,7 @@ impl App {
             launch_tx,
             launch_rx,
             launch_wake: None,
+            pending_moves: Vec::new(),
         })
     }
 
@@ -1239,6 +1249,7 @@ impl App {
             launch_tx,
             launch_rx,
             launch_wake: None,
+            pending_moves: Vec::new(),
         };
         if let Some(store) = app.store.as_ref()
             && let Ok(config) = store.load_global_config()
@@ -2890,47 +2901,44 @@ impl App {
         };
         let queues = target_status == TaskStatus::InProgress.as_str();
         let starts_chain = target_status == TaskStatus::Review.as_str();
-        let stopped = if queues {
-            false
-        } else {
-            self.stop_task_if_running(task_id)?
-        };
-        self.ops.move_task(task_id, &target_status, false)?;
-        // The move itself succeeded; a queue or chain-start that fails after it
-        // is reported in the status bar rather than thrown at the event loop.
-        let mut warning = None;
-        let mut queued = queues;
-        if queues && let Err(err) = self.ops.queue_run(task_id) {
-            warning = Some(err.to_string());
-            queued = false;
+        if self.launch_busy(task_id) {
+            return Ok(());
         }
-        let mut chained = 0;
-        if starts_chain {
-            match self.ops.start_chained_tasks(task_id) {
-                Ok(started) => chained = started.len(),
-                Err(err) => warning = Some(err.to_string()),
-            }
-        }
-        self.refresh_after_action()?;
+        let task_id = task_id.to_string();
+        self.status = drop_status(&task_id, &target_status, queues, false, 0);
+        self.show_moved(std::slice::from_ref(&task_id), &target_status);
         self.focused_column = target;
         self.focused_card = 0;
         self.clamp_focus();
-        let status = drop_status(task_id, &target_status, queued, stopped, chained);
-        self.status = match warning {
-            Some(warning) => format!("{status} · {warning}"),
-            None => status,
-        };
+        self.spawn_board_write(vec![task_id.clone()], move |ops| {
+            let stopped = if queues {
+                false
+            } else {
+                stop_task_if_running(ops, &task_id)?
+            };
+            ops.move_task(&task_id, &target_status, false)?;
+            // The move itself succeeded; a queue or chain-start that fails
+            // after it is reported in the status bar, not as an error.
+            let mut warning = None;
+            let mut queued = queues;
+            if queues && let Err(err) = ops.queue_run(&task_id) {
+                warning = Some(err.to_string());
+                queued = false;
+            }
+            let mut chained = 0;
+            if starts_chain {
+                match ops.start_chained_tasks(&task_id) {
+                    Ok(started) => chained = started.len(),
+                    Err(err) => warning = Some(err.to_string()),
+                }
+            }
+            let status = drop_status(&task_id, &target_status, queued, stopped, chained);
+            Ok(Some(match warning {
+                Some(warning) => format!("{status} · {warning}"),
+                None => status,
+            }))
+        });
         Ok(())
-    }
-
-    /// Best effort stop for a hand-parked task: a task without a live agent is
-    /// the normal case here, not an error worth showing.
-    fn stop_task_if_running(&self, task_id: &str) -> Result<bool> {
-        match self.ops.stop_task(task_id) {
-            Ok(stopped) => Ok(stopped.is_some()),
-            Err(KanbanError::Invalid(_)) => Ok(false),
-            Err(err) => Err(err),
-        }
     }
 
     /// Contextual status-bar text shown while a card is being dragged, naming
@@ -3414,6 +3422,7 @@ impl App {
                 let session_before = self.detail_session_state();
                 self.board = board;
                 self.archived_tasks = std::mem::take(&mut self.board.archived);
+                self.overlay_pending_moves();
                 self.clamp_archive_selection();
                 self.finish_board_refresh(result.tasks_changed, sessions_changed, session_before)?;
                 self.expire_session_states_at(timefmt::now());
@@ -3994,6 +4003,10 @@ impl App {
         if report.redraw {
             self.request_full_redraw();
         }
+        if !report.settle.is_empty() {
+            self.pending_moves
+                .retain(|(task_id, _)| !report.settle.contains(task_id));
+        }
         if report.refresh
             && !(report.background_refresh && self.request_tick_refresh(false))
             && let Err(err) = self.refresh_after_action()
@@ -4013,6 +4026,103 @@ impl App {
         if let Some(project) = report.open_project {
             self.pending_switch = Some(LoopOutcome::OpenProject(project));
         }
+        if let Some(action) = report.reconfirm {
+            self.open_bulk_confirm(action);
+            if self.modal.is_some() {
+                self.status = "Tasks changed while confirmation was open; confirm the updated set"
+                    .to_string();
+            }
+        }
+    }
+
+    /// Show `task_ids` in `status` at once, before a worker writes the move:
+    /// a card never waits on the board lock, the sync journal or git cleanup
+    /// to change columns. The worker's report settles them and reloads.
+    fn show_moved(&mut self, task_ids: &[String], status: &str) {
+        for task_id in task_ids {
+            self.pending_moves.retain(|(pending, _)| pending != task_id);
+            self.pending_moves
+                .push((task_id.clone(), status.to_string()));
+        }
+        self.overlay_pending_moves();
+        // A tick read before the move must not replace the moved board.
+        self.board_generation = self.board_generation.wrapping_add(1);
+        self.clamp_focus();
+    }
+
+    /// Re-apply the in-flight moves over a freshly read board.
+    fn overlay_pending_moves(&mut self) {
+        if self.pending_moves.is_empty() {
+            return;
+        }
+        let (sort_by, order) = task_sort_order(&self.settings.task_sort);
+        let now = timefmt::now();
+        for (task_id, status) in &self.pending_moves {
+            let Ok(target) = status.parse::<TaskStatus>() else {
+                continue;
+            };
+            let has_column = self.board.columns.iter().any(|column| column.id == *status);
+            if !has_column && target != TaskStatus::Archive {
+                continue;
+            }
+            let found = self
+                .board
+                .columns
+                .iter_mut()
+                .find_map(|column| {
+                    let index = column.tasks.iter().position(|task| task.id == *task_id)?;
+                    Some(column.tasks.remove(index))
+                })
+                .or_else(|| {
+                    let index = self
+                        .archived_tasks
+                        .iter()
+                        .position(|task| task.id == *task_id)?;
+                    Some(self.archived_tasks.remove(index))
+                });
+            let Some(mut task) = found else {
+                continue;
+            };
+            if task.status != target {
+                task.status = target;
+                task.updated_at = now;
+                // Starting shows as queued until the launch reports.
+                if target == TaskStatus::InProgress && task.session.is_none() {
+                    task.run_phase = Some(RunPhase::Queued);
+                }
+            }
+            match self
+                .board
+                .columns
+                .iter_mut()
+                .find(|column| column.id == *status)
+            {
+                Some(column) => {
+                    column.tasks.push(task);
+                    sort_tasks(&mut column.tasks, sort_by, order);
+                }
+                None => self.archived_tasks.insert(0, task),
+            }
+        }
+    }
+
+    /// Run a board write on a launch worker, with `task_ids` already shown
+    /// moved by [`Self::show_moved`]. The write returns the status line; an
+    /// error goes to the status bar and the reload puts the cards back.
+    fn spawn_board_write<F>(&mut self, task_ids: Vec<String>, write: F)
+    where
+        F: FnOnce(&Operations) -> Result<Option<String>> + Send + 'static,
+    {
+        let key = task_ids.first().cloned().unwrap_or_default();
+        self.spawn_launch(Some(key), move |ops| {
+            let status = write(ops).unwrap_or_else(|err| Some(err.to_string()));
+            LaunchReport {
+                status,
+                refresh: true,
+                settle: task_ids,
+                ..LaunchReport::default()
+            }
+        });
     }
 
     fn pump_in_flight(&self) -> bool {
@@ -5857,9 +5967,6 @@ impl App {
             self.status = "No task selected".to_string();
             return Ok(());
         };
-        if crate::cli::serve::remote_runner_on_board(self.ops.data_root(), &task_id)?.is_some() {
-            return self.run_on_runner(&task_id, None, false);
-        }
         if !self.ops.queue_can_dispatch()? {
             return self.run_current_task_now_with_suffix(" (queue is off — started directly)");
         }
@@ -5871,30 +5978,24 @@ impl App {
         self.status = format!("Queued {task_id} — dispatching…");
         // The pump below replaces the tick's next one.
         self.last_queue_dispatch = Some(Instant::now());
-        // Queueing takes the board lock, which sync and WIP publication can
-        // hold for seconds; on the worker that wait never freezes the UI.
+        self.show_starting(&task_id);
+        // The runner check opens the sync journal and queueing takes the
+        // board lock, which sync and WIP publication can hold for seconds;
+        // on the worker that wait never freezes the UI.
         self.spawn_launch(Some(task_id.clone()), move |ops| {
-            if let Err(err) = ops.queue_run(&task_id) {
-                return LaunchReport {
-                    status: Some(err.to_string()),
-                    refresh: true,
-                    redraw: true,
-                    ..LaunchReport::default()
+            let mut report =
+                match crate::cli::serve::remote_runner_on_board(ops.data_root(), &task_id) {
+                    Ok(Some(_)) => runner_launch(ops, &task_id, None, false, from_detail),
+                    Ok(None) => queued_launch(ops, &task_id, from_detail),
+                    Err(err) => LaunchReport {
+                        status: Some(err.to_string()),
+                        refresh: true,
+                        redraw: true,
+                        ..LaunchReport::default()
+                    },
                 };
-            }
-            let pump = pump_queue(ops);
-            let started = task_started_after_queue_run(ops, &task_id);
-            let status = match pump.error {
-                Some(error) if !started => error,
-                _ => post_queue_run_status(ops, &task_id),
-            };
-            LaunchReport {
-                status: Some(status),
-                focus: from_detail.then_some(task_id),
-                refresh: true,
-                redraw: true,
-                ..LaunchReport::default()
-            }
+            report.settle = vec![task_id];
+            report
         });
         Ok(())
     }
@@ -5910,34 +6011,45 @@ impl App {
             self.status = "No task selected".to_string();
             return Ok(());
         };
-        if crate::cli::serve::remote_runner_on_board(self.ops.data_root(), &task_id)?.is_some() {
-            return self.run_on_runner(&task_id, None, false);
-        }
         if self.launch_busy(&task_id) {
             return Ok(());
         }
         let from_detail = self.leave_detail_for_launch(&task_id)?;
         self.request_full_redraw();
         self.status = format!("Starting {task_id}…");
+        self.show_starting(&task_id);
         let suffix = suffix.to_string();
         self.spawn_launch(Some(task_id.clone()), move |ops| {
-            let (status, started) = match ops.start_task(&task_id) {
-                Ok(Some(session_id)) => (format!("Started {task_id} → {session_id}{suffix}"), true),
-                Ok(None) => match ops.get_task(&task_id) {
-                    Ok(Some(_)) => (format!("Queued {task_id} on its runner"), true),
-                    _ => (format!("Task {task_id} not found"), false),
-                },
-                Err(err) => (err.to_string(), false),
-            };
-            LaunchReport {
-                status: Some(status),
-                focus: (started && from_detail).then_some(task_id),
-                refresh: true,
-                redraw: true,
-                ..LaunchReport::default()
-            }
+            let mut report =
+                match crate::cli::serve::remote_runner_on_board(ops.data_root(), &task_id) {
+                    Ok(Some(_)) => runner_launch(ops, &task_id, None, false, from_detail),
+                    Ok(None) => direct_launch(ops, &task_id, &suffix, from_detail),
+                    Err(err) => LaunchReport {
+                        status: Some(err.to_string()),
+                        refresh: true,
+                        redraw: true,
+                        ..LaunchReport::default()
+                    },
+                };
+            report.settle = vec![task_id];
+            report
         });
         Ok(())
+    }
+
+    /// A launch moves the card to In Progress at once, shown queued until
+    /// the worker's report brings the real run state.
+    fn show_starting(&mut self, task_id: &str) {
+        let elsewhere = self
+            .board
+            .columns
+            .iter()
+            .flat_map(|column| &column.tasks)
+            .any(|task| task.id == task_id && task.status != TaskStatus::InProgress);
+        if elsewhere {
+            self.show_moved(&[task_id.to_string()], TaskStatus::InProgress.as_str());
+            let _ = self.focus_task(task_id);
+        }
     }
 
     /// Close the detail screen showing `task_id` before its launch goes to a
@@ -5973,59 +6085,7 @@ impl App {
         let from_detail = self.leave_detail_for_launch(&task_id)?;
         self.status = format!("Starting {task_id}…");
         self.spawn_launch(Some(task_id.clone()), move |ops| {
-            let result =
-                crate::cli::serve::launch_on_board(ops.data_root(), &task_id, runner, queue);
-            let mut report = LaunchReport {
-                focus: from_detail.then(|| task_id.clone()),
-                refresh: true,
-                redraw: true,
-                ..Default::default()
-            };
-            match result {
-                Ok(Some(value)) if value.get("alternatives").is_some() => {
-                    let roles = (
-                        serde_json::from_value(value["error"]["node"].clone()),
-                        serde_json::from_value(value["alternatives"][0]["node"].clone()),
-                    );
-                    if let (Ok(runner), Ok(other)) = roles {
-                        report.modal = Some(Modal::RunnerUnavailable {
-                            task_id,
-                            code: value["error"]["code"].as_str().unwrap_or("").into(),
-                            message: value["error"]["message"].as_str().unwrap_or("").into(),
-                            runner,
-                            other,
-                        });
-                    }
-                }
-                Ok(Some(value)) => {
-                    report.status = Some(if let Some(error) = value.get("error") {
-                        format!(
-                            "{}: {}",
-                            error["code"].as_str().unwrap_or(""),
-                            error["message"].as_str().unwrap_or("")
-                        )
-                    } else if value["queued"] == true {
-                        format!(
-                            "Queued {task_id} — ждёт {}",
-                            value["node"].as_str().unwrap_or("runner")
-                        )
-                    } else {
-                        format!(
-                            "Started {task_id} → {}",
-                            value["session"].as_str().unwrap_or("")
-                        )
-                    })
-                }
-                Ok(None) => {
-                    report.status = Some(match ops.start_task(&task_id) {
-                        Ok(Some(session)) => format!("Started {task_id} → {session}"),
-                        Ok(None) => format!("Task {task_id} not found"),
-                        Err(e) => e.to_string(),
-                    })
-                }
-                Err(e) => report.status = Some(e.to_string()),
-            }
-            report
+            runner_launch(ops, &task_id, runner, queue, from_detail)
         });
         Ok(())
     }
@@ -6100,10 +6160,18 @@ impl App {
             self.status = format!("{} is not in Review", task.id);
             return Ok(());
         }
-        self.ops
-            .move_task(&task.id, TaskStatus::Done.as_str(), false)?;
-        self.refresh_after_action()?;
-        self.status = format!("Approved {} → Done", task.id);
+        let task_id = task.id.clone();
+        if self.launch_busy(&task_id) {
+            return Ok(());
+        }
+        // Done cleanup removes the worktree and branch: seconds of git on a
+        // big repository, so the card moves now and the worker catches up.
+        self.status = format!("Approved {task_id} → Done");
+        self.show_moved(std::slice::from_ref(&task_id), TaskStatus::Done.as_str());
+        self.spawn_board_write(vec![task_id.clone()], move |ops| {
+            ops.move_task(&task_id, TaskStatus::Done.as_str(), false)?;
+            Ok(None)
+        });
         Ok(())
     }
 
@@ -6661,6 +6729,7 @@ impl App {
         self.board = BoardSnapshot::load_reusing(&self.ops, Some(&self.board))?;
         self.board_generation = self.board_generation.wrapping_add(1);
         self.archived_tasks = std::mem::take(&mut self.board.archived);
+        self.overlay_pending_moves();
         self.clamp_archive_selection();
         Ok(())
     }
@@ -7560,9 +7629,15 @@ impl App {
                     self.modal = Some(modal);
                     return Ok(());
                 }
-                self.ops.move_task(&task_id, &target, false)?;
-                self.refresh_after_action()?;
+                if self.launch_busy(&task_id) {
+                    return Ok(());
+                }
                 self.status = format!("Moved {task_id} to {target}");
+                self.show_moved(std::slice::from_ref(&task_id), &target);
+                self.spawn_board_write(vec![task_id.clone()], move |ops| {
+                    ops.move_task(&task_id, &target, false)?;
+                    Ok(None)
+                });
             }
             Modal::ContinueTask { task_id } => {
                 let node = modal.target_text();
@@ -7619,12 +7694,17 @@ impl App {
                 self.reload_trash()?;
             }
             Modal::RestoreConfirm { task_id } => {
-                let restored = self.ops.unarchive_task(&task_id)?;
-                self.refresh_after_action()?;
-                self.status = match restored {
-                    Some(_) => format!("Restored {task_id} to To Do"),
-                    None => format!("{task_id} is not archived"),
-                };
+                if self.launch_busy(&task_id) {
+                    return Ok(());
+                }
+                self.status = format!("Restored {task_id} to To Do");
+                self.show_moved(std::slice::from_ref(&task_id), TaskStatus::Todo.as_str());
+                self.spawn_board_write(vec![task_id.clone()], move |ops| {
+                    Ok(match ops.unarchive_task(&task_id)? {
+                        Some(_) => None,
+                        None => Some(format!("{task_id} is not archived")),
+                    })
+                });
             }
             Modal::RevertConfirm { task_id } => {
                 let session_id = format!("ses-revert-{}", timefmt::now().format("%Y%m%d-%H%M%S"));
@@ -7641,23 +7721,30 @@ impl App {
                     BulkAction::ArchiveAllDone => (TaskStatus::Done, TaskStatus::Archive),
                     BulkAction::MarkReviewDone => (TaskStatus::Review, TaskStatus::Done),
                 };
-                let Some(moved) = self.ops.bulk_move_exact(from, to, &task_ids)? else {
-                    self.refresh_after_action()?;
-                    self.open_bulk_confirm(action);
-                    if self.modal.is_some() {
-                        self.status =
-                            "Tasks changed while confirmation was open; confirm the updated set"
-                                .to_string();
-                    }
+                if task_ids.iter().any(|task_id| self.launch_busy(task_id)) {
                     return Ok(());
+                }
+                let summary = move |count: usize| match action {
+                    BulkAction::ArchiveAllDone => format!("Archived {count} task(s)"),
+                    BulkAction::MarkReviewDone => format!("Marked {count} Review task(s) Done"),
                 };
-                self.refresh_after_action()?;
-                self.status = match action {
-                    BulkAction::ArchiveAllDone => format!("Archived {} task(s)", moved.len()),
-                    BulkAction::MarkReviewDone => {
-                        format!("Marked {} Review task(s) Done", moved.len())
+                self.status = summary(task_ids.len());
+                self.show_moved(&task_ids, to.as_str());
+                let ids = task_ids.clone();
+                let key = task_ids.first().cloned().unwrap_or_default();
+                self.spawn_launch(Some(key), move |ops| {
+                    let mut report = LaunchReport {
+                        refresh: true,
+                        settle: task_ids,
+                        ..LaunchReport::default()
+                    };
+                    match ops.bulk_move_exact(from, to, &ids) {
+                        Ok(Some(moved)) => report.status = Some(summary(moved.len())),
+                        Ok(None) => report.reconfirm = Some(action),
+                        Err(err) => report.status = Some(err.to_string()),
                     }
-                };
+                    report
+                });
             }
             Modal::AddMessage { task_id } => {
                 let body = modal.description_text();
@@ -7886,15 +7973,8 @@ impl BoardSnapshot {
             .iter()
             .map(|id| (id.clone(), Vec::new()))
             .collect::<BTreeMap<_, _>>();
-        let task_sort =
-            normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER));
-        let (sort_by, order) = match task_sort {
-            TASK_SORT_UPDATED_ASC => ("updated", "asc"),
-            TASK_SORT_UPDATED_DESC => ("updated", "desc"),
-            TASK_SORT_UPDATED_CHAINS => ("updated_chains", "desc"),
-            TASK_SORT_NUMBER_DESC => ("id", "desc"),
-            _ => ("id", "asc"),
-        };
+        let (sort_by, order) =
+            task_sort_order(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER));
         let mut task_cache = previous
             .map(|board| board.task_cache.clone())
             .unwrap_or_default();
@@ -7914,7 +7994,8 @@ impl BoardSnapshot {
         let threads = ops.thread_manager()?;
         let (sessions, suggestions) = thread::scope(|scope| {
             let suggestions = scope.spawn(|| suggestion_counts(&threads, &tasks, previous));
-            let sessions = SessionView::load(ops, &task_refs).and_then(|sessions| {
+            let previous_runs = previous.map(|board| &board.remote_runs);
+            let sessions = SessionView::load(ops, &task_refs, previous_runs).and_then(|sessions| {
                 let extras = Self::load_extras(ops, &task_refs, &sessions.states)?;
                 Ok((sessions, extras))
             });
@@ -7924,6 +8005,10 @@ impl BoardSnapshot {
             (sessions, suggestions)
         });
         let (sessions, extras) = sessions?;
+        let mut stamps = stamps;
+        if sessions.runs_stale {
+            stamps.sessions = STALE_SESSIONS;
+        }
         for task in tasks {
             grouped
                 .entry(task.status.as_str().to_string())
@@ -7969,8 +8054,10 @@ impl BoardSnapshot {
             .collect();
         // The stranded-session check consults open questions, so a thread
         // change can flip a card's state as well.
+        let mut runs_stale = false;
         if sessions_changed || threads_changed {
-            let sessions = SessionView::load(ops, &tasks)?;
+            let sessions = SessionView::load(ops, &tasks, Some(&self.remote_runs))?;
+            runs_stale = sessions.runs_stale;
             self.extras = Self::load_extras(ops, &tasks, &sessions.states)?;
             self.session_states = sessions.states;
             self.session_deadlines = sessions.deadlines;
@@ -7987,6 +8074,9 @@ impl BoardSnapshot {
             self.suggestions = suggestions;
         }
         self.stamps = stamps;
+        if runs_stale {
+            self.stamps.sessions = STALE_SESSIONS;
+        }
         Ok(())
     }
 
@@ -8056,10 +8146,22 @@ struct SessionView {
     wait_deadlines: HashMap<String, chrono::NaiveDateTime>,
     wait_notes: HashMap<String, String>,
     remote_runs: HashMap<String, Vec<crate::core::sync::RunDescriptor>>,
+    /// The sync lock was busy and `remote_runs` are the previous ones.
+    runs_stale: bool,
 }
 
+/// Sessions stamp of a snapshot whose remote runs could not be read: never
+/// equal to a real fingerprint, so the next tick re-reads the sidecars.
+const STALE_SESSIONS: Fingerprint = (u64::MAX, 0, 0);
+
 impl SessionView {
-    fn load(ops: &Operations, tasks: &[&Task]) -> Result<Self> {
+    /// `previous_runs` stands in for the remote runs while the sync lock is
+    /// busy: a refresh never waits on it.
+    fn load(
+        ops: &Operations,
+        tasks: &[&Task],
+        previous_runs: Option<&HashMap<String, Vec<crate::core::sync::RunDescriptor>>>,
+    ) -> Result<Self> {
         let heartbeat_timeout = ops.config.get_threshold("session_heartbeat_timeout")?;
         let session_mgr = SessionManager::new(&ops.storage.project_path);
         let sessions_by_id = session_mgr
@@ -8090,13 +8192,19 @@ impl SessionView {
             deadlines: HashMap::new(),
             wait_deadlines: HashMap::new(),
             wait_notes: HashMap::new(),
-            remote_runs: crate::core::sync::remote_runs_for_tasks(
-                &ops.storage.project_path,
-                tasks.iter().map(|task| task.id.as_str()),
-            )?
-            .into_iter()
-            .collect(),
+            remote_runs: HashMap::new(),
+            runs_stale: false,
         };
+        match crate::core::sync::remote_runs_for_tasks_nowait(
+            &ops.storage.project_path,
+            tasks.iter().map(|task| task.id.as_str()),
+        )? {
+            Some(runs) => view.remote_runs = runs.into_iter().collect(),
+            None => {
+                view.remote_runs = previous_runs.cloned().unwrap_or_default();
+                view.runs_stale = true;
+            }
+        }
         for task in tasks {
             let Some((_, state, deadline, note)) = own_session(task) else {
                 continue;
@@ -9084,6 +9192,17 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
     })
 }
 
+/// `sort_tasks` arguments for a `tui.task_sort` setting.
+fn task_sort_order(task_sort: &str) -> (&'static str, &'static str) {
+    match normalize_task_sort(task_sort) {
+        TASK_SORT_UPDATED_ASC => ("updated", "asc"),
+        TASK_SORT_UPDATED_DESC => ("updated", "desc"),
+        TASK_SORT_UPDATED_CHAINS => ("updated_chains", "desc"),
+        TASK_SORT_NUMBER_DESC => ("id", "desc"),
+        _ => ("id", "asc"),
+    }
+}
+
 pub(super) fn normalize_task_sort(value: &str) -> &'static str {
     match value {
         TASK_SORT_NUMBER_DESC => TASK_SORT_NUMBER_DESC,
@@ -9858,6 +9977,125 @@ fn drop_verb(column_id: &str) -> &'static str {
 }
 
 /// Status line for a completed drop, naming only what actually happened.
+/// The queued `r` launch on a worker: queue, then pump once.
+fn queued_launch(ops: &Operations, task_id: &str, from_detail: bool) -> LaunchReport {
+    let task_id = task_id.to_string();
+    if let Err(err) = ops.queue_run(&task_id) {
+        return LaunchReport {
+            status: Some(err.to_string()),
+            refresh: true,
+            redraw: true,
+            ..LaunchReport::default()
+        };
+    }
+    let pump = pump_queue(ops);
+    let started = task_started_after_queue_run(ops, &task_id);
+    let status = match pump.error {
+        Some(error) if !started => error,
+        _ => post_queue_run_status(ops, &task_id),
+    };
+    LaunchReport {
+        status: Some(status),
+        focus: from_detail.then_some(task_id),
+        refresh: true,
+        redraw: true,
+        ..LaunchReport::default()
+    }
+}
+
+/// The direct `F` launch on a worker.
+fn direct_launch(ops: &Operations, task_id: &str, suffix: &str, from_detail: bool) -> LaunchReport {
+    let task_id = task_id.to_string();
+    let (status, started) = match ops.start_task(&task_id) {
+        Ok(Some(session_id)) => (format!("Started {task_id} → {session_id}{suffix}"), true),
+        Ok(None) => match ops.get_task(&task_id) {
+            Ok(Some(_)) => (format!("Queued {task_id} on its runner"), true),
+            _ => (format!("Task {task_id} not found"), false),
+        },
+        Err(err) => (err.to_string(), false),
+    };
+    LaunchReport {
+        status: Some(status),
+        focus: (started && from_detail).then_some(task_id),
+        refresh: true,
+        redraw: true,
+        ..LaunchReport::default()
+    }
+}
+
+/// A launch on another node's runner, on a worker.
+fn runner_launch(
+    ops: &Operations,
+    task_id: &str,
+    runner: Option<crate::core::sync::NodeRole>,
+    queue: bool,
+    from_detail: bool,
+) -> LaunchReport {
+    let task_id = task_id.to_string();
+    let result = crate::cli::serve::launch_on_board(ops.data_root(), &task_id, runner, queue);
+    let mut report = LaunchReport {
+        focus: from_detail.then(|| task_id.clone()),
+        refresh: true,
+        redraw: true,
+        ..Default::default()
+    };
+    match result {
+        Ok(Some(value)) if value.get("alternatives").is_some() => {
+            let roles = (
+                serde_json::from_value(value["error"]["node"].clone()),
+                serde_json::from_value(value["alternatives"][0]["node"].clone()),
+            );
+            if let (Ok(runner), Ok(other)) = roles {
+                report.modal = Some(Modal::RunnerUnavailable {
+                    task_id,
+                    code: value["error"]["code"].as_str().unwrap_or("").into(),
+                    message: value["error"]["message"].as_str().unwrap_or("").into(),
+                    runner,
+                    other,
+                });
+            }
+        }
+        Ok(Some(value)) => {
+            report.status = Some(if let Some(error) = value.get("error") {
+                format!(
+                    "{}: {}",
+                    error["code"].as_str().unwrap_or(""),
+                    error["message"].as_str().unwrap_or("")
+                )
+            } else if value["queued"] == true {
+                format!(
+                    "Queued {task_id} — ждёт {}",
+                    value["node"].as_str().unwrap_or("runner")
+                )
+            } else {
+                format!(
+                    "Started {task_id} → {}",
+                    value["session"].as_str().unwrap_or("")
+                )
+            })
+        }
+        Ok(None) => {
+            report.status = Some(match ops.start_task(&task_id) {
+                Ok(Some(session)) => format!("Started {task_id} → {session}"),
+                Ok(None) => format!("Task {task_id} not found"),
+                Err(e) => e.to_string(),
+            })
+        }
+        Err(e) => report.status = Some(e.to_string()),
+    }
+    report
+}
+
+/// Best effort stop for a hand-parked task: a task without a live agent is
+/// the normal case here, not an error worth showing.
+fn stop_task_if_running(ops: &Operations, task_id: &str) -> Result<bool> {
+    match ops.stop_task(task_id) {
+        Ok(stopped) => Ok(stopped.is_some()),
+        Err(KanbanError::Invalid(_)) => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 fn drop_status(
     task_id: &str,
     target_status: &str,

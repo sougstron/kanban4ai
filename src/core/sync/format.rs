@@ -160,6 +160,11 @@ pub(super) fn is_stub(text: &str) -> bool {
 /// Called from `Journal::open` after bootstrap recovery and before remote redo.
 /// A format newer than this binary is refused with no writes.
 pub(super) fn ensure(store: &Path) -> Result<()> {
+    // A format migration rewrites the whole replica: keep it fsynced.
+    crate::core::storage::durable(|| ensure_durably(store))
+}
+
+fn ensure_durably(store: &Path) -> Result<()> {
     let root = store.join("sync");
     if !root.exists() {
         return Ok(());
