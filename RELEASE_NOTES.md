@@ -1,3 +1,39 @@
+# kanban4ai 0.8.12
+
+Notes are from the reviewed diff since 0.8.11. There were no `.changes/` logs.
+
+- **Board writes no longer stall the TUI.** Approve (`y`), the move dialog,
+  archive/restore, bulk Archive Done / Review Done, a card drop, and Run
+  (`r`/`F`) move the card on screen at once and write on a launch worker.
+  Until that worker reports, reloads keep the pending move; a failed write
+  puts the card back and shows the error. A launch shows the card In Progress
+  as `⏸ queued` until its report lands. The remote-runner check of a launch
+  moved onto the worker too.
+- **Local writes skip fsync again**, as 0.7.6 did. Temp file + rename and
+  ordered appends keep crash consistency; a power loss can drop the last
+  moments of local work. fsync is paid where data is acknowledged to another
+  node: remote apply and its redo, snapshot install, and format migrations
+  run durably after one `syncfs` barrier taken outside the board and sync
+  locks (repeated under the locks only if a capture slipped in). A client
+  flushes before `push`, and the hub flushes before it serves this node's
+  own operations, so a sent sequence is not reused after a crash. Crash
+  recovery (segment and drift-tail trim) still fsyncs. A board refresh reads
+  remote runs only when the sync lock is free; otherwise it keeps the runs
+  it already showed and retries on the next tick.
+- **The task form shows what a task runs after.** Below Runner, a read-only
+  `Runs after` row lists the chain target (`chain: TASK-…`) and the
+  orchestrator's `depends_on` edges (`plan: TASK-…`, `✓` once finished,
+  `(gone)` when deleted), or `none`. Enter, Space, or a click clears the
+  chain and every dependency; Save writes the clear.
+- **Test-VM disk hygiene.** `scripts/vm-workspace-gc.sh` removes idle debug
+  `target/` directories, idle workspace copies, and old `/tmp/kanban-*`
+  leftovers. `docs/sync.md` documents the hourly timer on the shared test VM.
+
+Board files, `config.yaml`, journal records, and the sync protocol (3) stay
+readable by 0.8.11. Store format is still 5. Nothing new is written that an
+older peer has to understand: durability is when bytes hit disk, not a new
+record field.
+
 # kanban4ai 0.8.11
 
 Notes are from the reviewed diff since 0.8.10. There were no `.changes/` logs.
