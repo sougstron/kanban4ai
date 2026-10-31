@@ -1,5 +1,6 @@
 //! Stat-first drift detection. Capture appends one index record; scans compact it.
 use super::*;
+use crate::core::storage::sync_file;
 use sha2::{Digest, Sha256};
 use std::time::UNIX_EPOCH;
 
@@ -366,11 +367,11 @@ pub(super) fn record_observed(journal: &Journal, path: &Path, entry: Option<&Ent
     repair_tail(&index)?;
     let mut file = OpenOptions::new().create(true).append(true).open(index)?;
     writeln!(file, "{}", json(&(relative, entry))?)?;
-    file.sync_all()?;
+    sync_file(&file)?;
     Ok(())
 }
 
-/// `record_observed` for a whole batch: one append and one fsync.
+/// `record_observed` for a whole batch: one append.
 pub(super) fn record_observed_many(
     journal: &Journal,
     entries: &[(PathBuf, Option<Entry>)],
@@ -393,7 +394,7 @@ pub(super) fn record_observed_many(
     repair_tail(&index)?;
     let mut file = OpenOptions::new().create(true).append(true).open(index)?;
     file.write_all(text.as_bytes())?;
-    file.sync_all()?;
+    sync_file(&file)?;
     Ok(())
 }
 

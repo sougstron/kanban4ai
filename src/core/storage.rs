@@ -8,7 +8,7 @@
 //!   (`.kanban/.lock`, flock) so concurrent `kanban` processes cannot
 //!   resurrect a moved task as a phantom duplicate.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
@@ -42,9 +42,80 @@ pub(crate) fn atomic_write_text_raw(path: &Path, content: &str) -> Result<()> {
         .prefix(".tmp_")
         .tempfile_in(parent)?;
     tmp.write_all(content.as_bytes())?;
-    tmp.as_file().sync_all()?;
+    sync_file(tmp.as_file())?;
     tmp.persist(path).map_err(|e| KanbanError::Io(e.error))?;
-    File::open(parent)?.sync_all()?;
+    sync_dir(parent)?;
+    Ok(())
+}
+
+thread_local! {
+    /// Depth of [`durable`] scopes on this thread.
+    static DURABLE: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Run `action` with fsync enforced on every local write it makes.
+///
+/// Local writes skip fsync by default, as 0.7.6 did: temp file + rename is
+/// already atomic, and the mainstream Linux filesystems persist these
+/// rename/append sequences in order, so a crash loses the last moments of
+/// work, never consistency. An fsync on a busy btrfs can wait seconds for a
+/// whole transaction commit, and it used to run under the board and sync
+/// locks on the UI thread. Durability is paid only where data is
+/// acknowledged to another node: remote apply runs in this scope, and the
+/// sync worker calls [`flush_store`] before it pushes.
+pub(crate) fn durable<T>(action: impl FnOnce() -> T) -> T {
+    struct Scope;
+    impl Drop for Scope {
+        fn drop(&mut self) {
+            DURABLE.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+    DURABLE.with(|depth| depth.set(depth.get() + 1));
+    let _scope = Scope;
+    action()
+}
+
+pub(crate) fn durable_now() -> bool {
+    DURABLE.with(Cell::get) > 0
+}
+
+/// `File::sync_all` inside a [`durable`] scope, a no-op outside it.
+pub(crate) fn sync_file(file: &File) -> std::io::Result<()> {
+    if durable_now() {
+        file.sync_all()
+    } else {
+        Ok(())
+    }
+}
+
+/// `File::sync_data` inside a [`durable`] scope, a no-op outside it.
+pub(crate) fn sync_file_data(file: &File) -> std::io::Result<()> {
+    if durable_now() {
+        file.sync_data()
+    } else {
+        Ok(())
+    }
+}
+
+/// Persist a directory's entries inside a [`durable`] scope.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    if durable_now() {
+        File::open(dir)?.sync_all()
+    } else {
+        Ok(())
+    }
+}
+
+/// Durability barrier for everything written so far under `root`: one
+/// `syncfs` of its filesystem. Called off the UI thread, without board or
+/// sync locks, before local operations leave this node.
+pub fn flush_store(root: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let dir = File::open(root)?;
+    // SAFETY: `dir` owns a valid open descriptor for the whole call.
+    if unsafe { libc::syncfs(dir.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
     Ok(())
 }
 
@@ -109,6 +180,39 @@ pub fn lock_file_reentrant(lock_path: &Path) -> Result<BoardGuard> {
         })
         .map(|_: ()| BoardGuard { key })
         .map_err(KanbanError::Io)
+}
+
+/// [`lock_file_reentrant`] without waiting: `None` while another thread or
+/// process holds the lock. Lets UI-thread readers skip a lock that a
+/// background writer holds instead of freezing behind it.
+pub fn try_lock_file_reentrant(lock_path: &Path) -> Result<Option<BoardGuard>> {
+    let key = match (lock_path.parent(), lock_path.file_name()) {
+        (Some(parent), Some(name)) => parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(name),
+        _ => lock_path.to_path_buf(),
+    };
+    let taken = BOARD_LOCKS.with(|locks| {
+        let mut locks = locks.borrow_mut();
+        if let Some(entry) = locks.get_mut(&key) {
+            entry.depth += 1;
+            return Ok(true);
+        }
+        let file = File::create(lock_path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(e) if e.kind() == fs2::lock_contended_error().kind() => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        locks.insert(key.clone(), LockEntry { file, depth: 1 });
+        Ok(true)
+    });
+    match taken {
+        Ok(true) => Ok(Some(BoardGuard { key })),
+        Ok(false) => Ok(None),
+        Err(e) => Err(KanbanError::Io(e)),
+    }
 }
 
 /// Change-detection signature: `(file_count, max_mtime_ns, total_bytes)`.
@@ -694,4 +798,25 @@ pub(crate) fn stat_ns(path: &Path) -> Option<(u128, u64)> {
         .ok()?
         .as_nanos();
     Some((mtime, metadata.len()))
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    #[test]
+    fn local_writes_are_relaxed_outside_a_durable_scope() {
+        assert!(!durable_now());
+        durable(|| {
+            assert!(durable_now());
+            durable(|| assert!(durable_now()));
+            assert!(durable_now(), "a nested scope keeps the outer one");
+        });
+        assert!(!durable_now());
+        let dir = tempfile::tempdir().unwrap();
+        flush_store(dir.path()).unwrap();
+        atomic_write_text_raw(&dir.path().join("a.txt"), "one").unwrap();
+        durable(|| atomic_write_text_raw(&dir.path().join("a.txt"), "two")).unwrap();
+        assert_eq!(fs::read_to_string(dir.path().join("a.txt")).unwrap(), "two");
+    }
 }

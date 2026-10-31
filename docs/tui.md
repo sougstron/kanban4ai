@@ -243,6 +243,17 @@ with its phase timings; set `KANBAN_TUI_PROFILE=1` before starting the TUI to
 log every pass. Board stamps, snapshot reloads and live-session progress run
 on that tick worker, so a slow store delays card updates, never key handling.
 
+Board writes that can wait on the board lock, the sync journal or git follow
+the same rule (TASK-572). Approve (`y`), the move dialog, archive/restore,
+the bulk Archive Done / Review Done confirmations, a card drop, and Run
+(`r`/`F`) move the card on screen at once and run the write on a launch
+worker. A launch shows the card In Progress as `⏸ queued` until its report
+lands. Until the worker reports, every board reload keeps the pending move.
+The report then reloads the board from disk, so a failed write puts the card
+back and shows the error in the status bar. A board refresh reads remote runs
+only if it can take the sync lock without waiting. Otherwise it keeps the runs
+it showed before and retries on the next tick.
+
 Clipboard pastes use bracketed paste: the whole block is inserted into the
 focused text field in one edit (flattened to a single line for one-line fields
 such as Title, search, and the answer box). Without it the terminal replays a

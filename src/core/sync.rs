@@ -36,7 +36,7 @@ pub use ids::{task_display, task_uid};
 pub(crate) use projection::apply_meta;
 pub use projection::{Claim, Lifecycle};
 pub use run::{LandingDescriptor, RunDescriptor, RunState, remote_runs};
-pub(crate) use run::{remote_runs_for_tasks, store_for_board, task_landings, task_runs};
+pub(crate) use run::{remote_runs_for_tasks_nowait, store_for_board, task_landings, task_runs};
 pub use segments::change_token;
 pub use transport::Page;
 

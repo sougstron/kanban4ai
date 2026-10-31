@@ -2,13 +2,14 @@
 //! sharded by task under `meta/projection/`. Deleting the directory rebuilds
 //! both by replaying the segments.
 use std::collections::{BTreeSet, HashMap};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use super::format::{JournalLimits, STORE_FORMAT};
 use super::*;
+use crate::core::storage::{durable_now, sync_dir, sync_file};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
@@ -672,9 +673,9 @@ fn write_all_uids(sync: &Path, uids: UidsRef) -> Result<()> {
         }
     }
     write_if_changed(&uid_index_path(sync), uids.project_uids)?;
-    File::open(&dir)?.sync_all()?;
+    sync_dir(&dir)?;
     match fs::remove_file(legacy_uids_path(sync)) {
-        Ok(()) => File::open(sync.join("meta"))?.sync_all()?,
+        Ok(()) => sync_dir(&sync.join("meta"))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
@@ -738,7 +739,7 @@ pub(super) fn save_uids_delta(sync: &Path, delta: &UidsDelta) -> Result<()> {
         delta.project.apply(&mut index);
         write_json_synced(&uid_index_path(sync), &index)?;
     }
-    File::open(&dir)?.sync_all()?;
+    sync_dir(&dir)?;
     Ok(())
 }
 
@@ -759,7 +760,7 @@ fn project_part<'a>(
 pub(super) fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     write_json_synced(path, value)?;
     let parent = path.parent().ok_or_else(|| invalid("path has no parent"))?;
-    File::open(parent)?.sync_all()?;
+    sync_dir(parent)?;
     Ok(())
 }
 
@@ -775,7 +776,7 @@ fn write_json_synced<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         let mut writer = BufWriter::new(tmp.as_file_mut());
         serde_json::to_writer(&mut writer, value).map_err(|e| invalid(&e.to_string()))?;
         writer.flush()?;
-        writer.get_ref().sync_all()?;
+        sync_file(writer.get_ref())?;
     }
     tmp.persist(path).map_err(|e| KanbanError::Io(e.error))?;
     Ok(())
@@ -1205,17 +1206,26 @@ pub(super) fn write_checkpoint(sync: &Path, state: &JournalState, prune: &PruneM
     fs::create_dir_all(shards_dir(sync).join("tasks"))?;
     // A first checkpoint writes every task. Concurrent fsyncs share journal
     // commits, so a few writers turn thousands of barriers into a few seconds.
+    // Writers inherit the caller's durability scope.
     let shards: Vec<_> = shards.into_iter().collect();
     let chunk = shards.len().div_ceil(8).max(1);
+    let durable = durable_now();
     std::thread::scope(|scope| {
         let workers: Vec<_> = shards
             .chunks(chunk)
             .map(|part| {
                 scope.spawn(move || -> Result<()> {
-                    for (shard, content) in part {
-                        write_json_synced(&shard_path(sync, shard), content)?;
+                    let write = || {
+                        for (shard, content) in part {
+                            write_json_synced(&shard_path(sync, shard), content)?;
+                        }
+                        Ok(())
+                    };
+                    if durable {
+                        crate::core::storage::durable(write)
+                    } else {
+                        write()
                     }
-                    Ok(())
                 })
             })
             .collect();
@@ -1223,7 +1233,7 @@ pub(super) fn write_checkpoint(sync: &Path, state: &JournalState, prune: &PruneM
             .into_iter()
             .try_for_each(|worker| worker.join().expect("shard writer"))
     })?;
-    File::open(shards_dir(sync).join("tasks"))?.sync_all()?;
+    sync_dir(&shards_dir(sync).join("tasks"))?;
     let heads = segments::heads(sync, &state.compacted)?;
     let mut through = BTreeMap::new();
     for (node, seq) in &heads {
