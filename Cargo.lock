@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "kanban4ai"
-version = "0.8.11"
+version = "0.8.12"
 dependencies = [
  "assert_cmd",
  "axum",
