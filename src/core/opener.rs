@@ -14,6 +14,8 @@ use super::notifier::which;
 /// Openers tried in order, first one on PATH wins. `xdg-open` and `gio` cover
 /// any desktop that registers a handler; the rest are the file managers that
 /// ship with the common desktops, for the minimal setups that have neither.
+/// The generic openers are skipped when the registered folder handler is a
+/// terminal (see [`GENERIC_OPENERS`]).
 #[cfg(target_os = "macos")]
 const CANDIDATES: &[&[&str]] = &[&["open"]];
 #[cfg(not(target_os = "macos"))]
@@ -25,8 +27,15 @@ const CANDIDATES: &[&[&str]] = &[
     &["thunar"],
     &["nemo"],
     &["pcmanfm"],
+    &["pcmanfm-qt"],
     &["caja"],
 ];
+
+/// Openers that only forward to whatever handles `inode/directory`. Terminals
+/// such as kitty register themselves for folders, which on window managers
+/// without a desktop (Hyprland, Sway) leaves `xdg-open` launching a terminal.
+#[cfg(not(target_os = "macos"))]
+const GENERIC_OPENERS: &[&str] = &["xdg-open", "gio"];
 
 /// The command that will be run for a folder: the configured override when it
 /// resolves, otherwise the first available platform default. The folder itself
@@ -44,15 +53,110 @@ pub fn folder_command(configured: Option<&str>) -> Result<Vec<String>> {
         }
         return Ok(parts);
     }
-    CANDIDATES
-        .iter()
-        .find(|candidate| which(candidate[0]).is_some())
+    let available = || {
+        CANDIDATES
+            .iter()
+            .filter(|candidate| which(candidate[0]).is_some())
+    };
+    let skip_generic = folder_handler_is_terminal();
+    available()
+        .find(|candidate| !(skip_generic && is_generic_opener(candidate[0])))
+        .or_else(|| available().next())
         .map(|candidate| candidate.iter().map(|part| (*part).to_string()).collect())
         .ok_or_else(|| {
             KanbanError::Invalid(
                 "No file manager found; set tui.file_manager in global settings".to_string(),
             )
         })
+}
+
+#[cfg(target_os = "macos")]
+fn is_generic_opener(_program: &str) -> bool {
+    false
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_generic_opener(program: &str) -> bool {
+    GENERIC_OPENERS.contains(&program)
+}
+
+#[cfg(target_os = "macos")]
+fn folder_handler_is_terminal() -> bool {
+    false
+}
+
+/// Whether the desktop entry registered for `inode/directory` is a terminal.
+/// Unknown handlers count as fine, so `xdg-open` stays the default.
+#[cfg(not(target_os = "macos"))]
+fn folder_handler_is_terminal() -> bool {
+    if which("xdg-mime").is_none() {
+        return false;
+    }
+    let Ok(output) = Command::new("xdg-mime")
+        .args(["query", "default", "inode/directory"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    let desktop_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if desktop_id.is_empty() {
+        return false;
+    }
+    application_dirs()
+        .into_iter()
+        .map(|dir| dir.join(&desktop_id))
+        .find_map(|path| std::fs::read_to_string(path).ok())
+        .is_some_and(|entry| desktop_entry_is_terminal(&entry))
+}
+
+/// `applications/` folders in XDG lookup order, user data first.
+#[cfg(not(target_os = "macos"))]
+fn application_dirs() -> Vec<std::path::PathBuf> {
+    let non_empty = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    let mut dirs = Vec::new();
+    match non_empty("XDG_DATA_HOME") {
+        Some(home) => dirs.push(std::path::PathBuf::from(home)),
+        None => {
+            if let Some(home) = non_empty("HOME") {
+                dirs.push(std::path::PathBuf::from(home).join(".local/share"));
+            }
+        }
+    }
+    let system = non_empty("XDG_DATA_DIRS")
+        .unwrap_or_else(|| std::ffi::OsString::from("/usr/local/share:/usr/share"));
+    dirs.extend(std::env::split_paths(&system));
+    dirs.into_iter()
+        .map(|dir| dir.join("applications"))
+        .collect()
+}
+
+/// A desktop entry is a terminal when it says `Terminal=true` or lists the
+/// `TerminalEmulator` category in its `[Desktop Entry]` group.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn desktop_entry_is_terminal(entry: &str) -> bool {
+    let mut in_main_group = false;
+    for line in entry.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_main_group = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_main_group {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "Terminal" if value.trim() == "true" => return true,
+            "Categories" if value.split(';').any(|c| c.trim() == "TerminalEmulator") => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Open `path` in the native file manager. Returns once the opener has been
@@ -106,6 +210,24 @@ mod tests {
             err.to_string().contains("not found on PATH"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn a_terminal_desktop_entry_is_recognised() {
+        let kitty = "[Desktop Entry]\nName=kitty URL Launcher\nExec=kitty +open %U\n\
+                     Categories=System;TerminalEmulator;\nMimeType=inode/directory;\n";
+        assert!(desktop_entry_is_terminal(kitty));
+        assert!(desktop_entry_is_terminal(
+            "[Desktop Entry]\nExec=ranger %F\nTerminal=true\n"
+        ));
+    }
+
+    #[test]
+    fn a_file_manager_desktop_entry_is_not_a_terminal() {
+        let dolphin = "[Desktop Entry]\nExec=dolphin %u\nTerminal=false\n\
+                       Categories=Qt;KDE;System;FileTools;FileManager;\n\
+                       [Desktop Action new]\nCategories=TerminalEmulator;\n";
+        assert!(!desktop_entry_is_terminal(dolphin));
     }
 
     #[test]
