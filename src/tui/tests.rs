@@ -2274,6 +2274,40 @@ fn settings_instructions_tab_round_trips_through_config() {
     assert!(!raw.contains("instructions"), "{raw}");
 }
 
+#[test]
+fn settings_follow_hyprland_theme_checkbox_persists_and_locks_quick_toggle() {
+    let (dir, mut app) = settings_app();
+    assert!(!app.settings.follow_hyprland_theme);
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Tab))
+            .expect("theme, hyprland box");
+    }
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::FollowHyprlandTheme
+    );
+    app.handle_key(key(KeyCode::Char(' '))).expect("tick it");
+    assert!(app.modal.as_ref().unwrap().follow_hyprland_theme);
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.modal.is_none(), "{:?}", app.status);
+    assert!(app.settings.follow_hyprland_theme);
+    let raw = std::fs::read_to_string(dir.path().join(".kanban/config.yaml")).unwrap();
+    assert!(raw.contains("follow_hyprland_theme: true"), "{raw}");
+    assert!(raw.contains("theme: light"), "fallback theme kept: {raw}");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+        .expect("quick toggle");
+    assert_eq!(app.settings.theme_name, "light");
+    assert!(app.status.contains("follows Hyprland"), "{}", app.status);
+
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("reopen settings");
+    assert!(app.modal.as_ref().unwrap().follow_hyprland_theme);
+}
+
 /// Slot options carry the live provider numbers from the cached limits
 /// snapshot, with an `(out of quota)` mark where the gate rejects a pair.
 #[test]
@@ -2618,9 +2652,9 @@ fn settings_hotkey_navigates_fields_and_reloads_backend_defaults() {
     assert_eq!(modal.title_text(), "Existing project");
     assert_eq!(modal.backend_text().as_deref(), Some("opencode"));
 
-    for _ in 0..3 {
+    for _ in 0..4 {
         app.handle_key(key(KeyCode::Tab))
-            .expect("theme, inherit box, agent settings");
+            .expect("theme, hyprland box, inherit box, agent settings");
     }
     assert_eq!(
         app.modal.as_ref().unwrap().active_field(),

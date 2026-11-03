@@ -109,6 +109,8 @@ pub struct TuiSettings {
     pub max_tasks_per_column: usize,
     pub refresh_interval: Duration,
     pub theme_name: String,
+    /// Take colors from the active Hyprland theme instead of `theme_name`.
+    pub follow_hyprland_theme: bool,
     pub task_sort: String,
     pub escape_to_projects: bool,
     /// Projects-list ordering (name/newest/smart), a machine-wide setting.
@@ -561,6 +563,8 @@ pub struct App {
     /// as `(task id, status)`. Re-applied over every board reload until the
     /// worker's report settles them.
     pending_moves: Vec<(String, String)>,
+    /// Hyprland theme files' mtime when the board last read them.
+    hyprland_stamp: Option<std::time::SystemTime>,
 }
 
 struct ProjectScanReport {
@@ -998,7 +1002,11 @@ impl App {
     pub fn new(project_path: &Path) -> Result<Self> {
         let ops = Operations::new(project_path);
         let settings = load_settings(&ops)?;
-        let theme = Theme::named(&settings.theme_name);
+        let theme = Theme::resolve(&settings.theme_name, settings.follow_hyprland_theme);
+        let hyprland_stamp = settings
+            .follow_hyprland_theme
+            .then(super::theme::hyprland_stamp)
+            .flatten();
         let mut board = BoardSnapshot::load(&ops)?;
         let archived_tasks = std::mem::take(&mut board.archived);
         let recent_models = recent_models(project_path);
@@ -1117,6 +1125,7 @@ impl App {
             launch_rx,
             launch_wake: None,
             pending_moves: Vec::new(),
+            hyprland_stamp,
         })
     }
 
@@ -1250,6 +1259,7 @@ impl App {
             launch_rx,
             launch_wake: None,
             pending_moves: Vec::new(),
+            hyprland_stamp: None,
         };
         if let Some(store) = app.store.as_ref()
             && let Ok(config) = store.load_global_config()
@@ -1263,7 +1273,7 @@ impl App {
         // The projects list is an entry screen too (bare `kanban4ai` with no
         // resolvable project), so its open runs the same on-open check.
         update::warm_check();
-        app.theme = Theme::named(&app.settings.theme_name);
+        app.apply_theme();
         Ok(app)
     }
 
@@ -3556,6 +3566,7 @@ impl App {
         self.expire_limits_status_at(now);
         self.expire_transient_status_at(now);
         self.expire_session_states_at(timefmt::now());
+        self.follow_hyprland_theme();
         if let Some(mut modal) = self.modal.take() {
             self.service_sync_tab(&mut modal);
             self.modal = Some(modal);
@@ -4976,6 +4987,7 @@ impl App {
         modal.theme = TextArea::new(vec![
             Theme::normalize_name(&tui_string(&config.tui, "theme", "dark")).to_string(),
         ]);
+        modal.follow_hyprland_theme = tui_bool(&config.tui, "follow_hyprland_theme", false);
         modal.description = super::dialogs::wrapped_description(super::dialogs::lines_or_empty(
             &config.instructions,
         ));
@@ -7474,6 +7486,10 @@ impl App {
                         Value::String("theme".to_string()),
                         Value::String(theme_name.clone()),
                     );
+                    config.tui.insert(
+                        Value::String("follow_hyprland_theme".to_string()),
+                        Value::Bool(modal.follow_hyprland_theme),
+                    );
                     config.inherit = modal.inherit.to_mapping();
                     config.instructions = modal.description_text();
                     retain_source_legacy_auto_launch_keys(
@@ -7500,14 +7516,15 @@ impl App {
                     self.project = Some(renamed);
                 }
                 self.settings.project_name = project_name;
-                self.settings.theme_name = theme_name.clone();
+                self.settings.theme_name = theme_name;
+                self.settings.follow_hyprland_theme = modal.follow_hyprland_theme;
                 // Inherited groups resolve against the global config, so the
                 // effective values are read back rather than taken from the form.
                 if let Ok(effective) = load_settings(&self.ops) {
                     self.settings.task_sort = effective.task_sort;
                     self.settings.hide_kanban_messages = effective.hide_kanban_messages;
                 }
-                self.theme = Theme::named(&theme_name);
+                self.apply_theme();
                 self.refresh_after_action()?;
                 self.status = "Project settings saved".to_string();
             }
@@ -7900,7 +7917,30 @@ impl App {
         Ok(())
     }
 
+    /// Resolve the board colors from the settings, remembering the
+    /// Hyprland files' stamp so [`Self::follow_hyprland_theme`] can tell
+    /// when the picker switched themes.
+    fn apply_theme(&mut self) {
+        let follow = self.settings.follow_hyprland_theme;
+        self.hyprland_stamp = follow.then(super::theme::hyprland_stamp).flatten();
+        self.theme = Theme::resolve(&self.settings.theme_name, follow);
+    }
+
+    /// Pick up a Hyprland theme switch while the board is open.
+    fn follow_hyprland_theme(&mut self) {
+        if self.settings.follow_hyprland_theme
+            && super::theme::hyprland_stamp() != self.hyprland_stamp
+        {
+            self.apply_theme();
+        }
+    }
+
     fn cycle_theme(&mut self) -> Result<()> {
+        if self.settings.follow_hyprland_theme {
+            self.status =
+                "Theme follows Hyprland; untick it in project settings to pick one".to_string();
+            return Ok(());
+        }
         let next = Theme::next_name(&self.settings.theme_name).to_string();
         let save_result = (|| -> Result<()> {
             ensure_config_write_target_is_safe(&self.ops.config)?;
@@ -7919,7 +7959,7 @@ impl App {
             return Ok(());
         }
         self.settings.theme_name = next.clone();
-        self.theme = Theme::named(&next);
+        self.apply_theme();
         self.status = format!("Theme switched to {next}");
         Ok(())
     }
@@ -8896,7 +8936,8 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::Agent => Some(modal.agent_selected),
         DialogField::Theme => Some(modal.theme_selected),
         DialogField::TaskSort => Some(modal.task_sort_selected),
-        DialogField::HideKanbanMessages
+        DialogField::FollowHyprlandTheme
+        | DialogField::HideKanbanMessages
         | DialogField::InheritAgent
         | DialogField::InheritLimits
         | DialogField::InheritCommon
@@ -9053,6 +9094,7 @@ fn default_project_settings() -> TuiSettings {
         max_tasks_per_column: 100,
         refresh_interval: Duration::from_secs(1),
         theme_name: "dark".to_string(),
+        follow_hyprland_theme: false,
         task_sort: TASK_SORT_NUMBER.to_string(),
         escape_to_projects: false,
         project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
@@ -9176,6 +9218,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
             ops.config.get_threshold("tui_refresh_interval")?.max(1) as u64,
         ),
         theme_name: Theme::normalize_name(&tui_string(&config.tui, "theme", "dark")).to_string(),
+        follow_hyprland_theme: tui_bool(&config.tui, "follow_hyprland_theme", false),
         task_sort: normalize_task_sort(&tui_string(&config.tui, "task_sort", TASK_SORT_NUMBER))
             .to_string(),
         escape_to_projects: false,

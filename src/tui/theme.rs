@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::time::SystemTime;
+
 use ratatui::style::Color;
 
 /// Built-in themes shown in Project Settings, in quick-toggle order.
@@ -55,6 +58,48 @@ impl Theme {
             "github-dark" => Self::github_dark(),
             _ => Self::dark(),
         }
+    }
+
+    /// The board theme: the Hyprland palette when the project follows it
+    /// and one is readable, else the named built-in theme.
+    pub fn resolve(name: &str, follow_hyprland: bool) -> Self {
+        follow_hyprland
+            .then(Self::hyprland)
+            .flatten()
+            .unwrap_or_else(|| Self::named(name))
+    }
+
+    /// The active Hyprland theme from the theme picker's files: the name in
+    /// `hypr/themes/current` looked up in `hypr/themes/themes.json` — the same
+    /// palette the picker turns into Konsole's `Hypr` color scheme.
+    pub fn hyprland() -> Option<Self> {
+        let dir = hyprland_theme_dir()?;
+        let current = std::fs::read_to_string(dir.join("current")).ok()?;
+        let themes = std::fs::read_to_string(dir.join("themes.json")).ok()?;
+        Self::from_hyprland_palette(&themes, &current)
+    }
+
+    /// Map a theme-picker palette (`base`, `surface`, `text`, `overlay`,
+    /// `accent`, `accent2`, `green`, `yellow`, `red`) onto the board roles.
+    pub fn from_hyprland_palette(themes_json: &str, current: &str) -> Option<Self> {
+        let themes: serde_json::Value = serde_json::from_str(themes_json).ok()?;
+        let palette = themes.get(current.trim())?;
+        let color = |key: &str| parse_hex(palette.get(key)?.as_str()?);
+        let base = color("base")?;
+        let surface = color("surface")?;
+        let overlay = color("overlay")?;
+        Some(Self {
+            bg: base,
+            fg: color("text")?,
+            muted: overlay,
+            border: mix(surface, overlay),
+            hover: mix(base, surface),
+            focus: color("accent")?,
+            warn: color("yellow")?,
+            ok: color("green")?,
+            err: color("red")?,
+            review: color("accent2")?,
+        })
     }
 
     pub fn normalize_name(name: &str) -> &'static str {
@@ -297,6 +342,45 @@ impl Theme {
     }
 }
 
+/// `$XDG_CONFIG_HOME/hypr/themes`, falling back to `~/.config/hypr/themes`.
+fn hyprland_theme_dir() -> Option<PathBuf> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    Some(config.join("hypr").join("themes"))
+}
+
+/// Latest change to the Hyprland theme files, so a running board can
+/// re-read the palette only when the picker switched themes.
+pub fn hyprland_stamp() -> Option<SystemTime> {
+    let dir = hyprland_theme_dir()?;
+    ["current", "themes.json"]
+        .iter()
+        .filter_map(|name| std::fs::metadata(dir.join(name)).ok()?.modified().ok())
+        .max()
+}
+
+fn parse_hex(value: &str) -> Option<Color> {
+    let hex = value.trim().trim_start_matches('#');
+    if hex.len() != 6 {
+        return None;
+    }
+    let channel = |at: usize| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok();
+    Some(Color::Rgb(channel(0)?, channel(2)?, channel(4)?))
+}
+
+/// The midpoint of two RGB colors.
+fn mix(a: Color, b: Color) -> Color {
+    match (a, b) {
+        (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
+            let avg = |x: u8, y: u8| ((u16::from(x) + u16::from(y)) / 2) as u8;
+            Color::Rgb(avg(r1, r2), avg(g1, g2), avg(b1, b2))
+        }
+        _ => a,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +416,37 @@ mod tests {
             assert_eq!(name, *expected);
         }
         assert_eq!(Theme::next_name("github-dark"), "dark");
+    }
+
+    const PALETTES: &str = r#"{
+      "Tokyo Night": {"base": "1a1b26", "shadow": "0f0f14", "surface": "292e42", "text": "c0caf5", "subtext": "a9b1d6", "overlay": "565f89", "accent": "7aa2f7", "accent2": "bb9af7", "green": "9ece6a", "yellow": "e0af68", "red": "f7768e"},
+      "Broken": {"base": "1a1b26"}
+    }"#;
+
+    #[test]
+    fn hyprland_palette_maps_onto_board_roles() {
+        let theme = Theme::from_hyprland_palette(PALETTES, "Tokyo Night\n").expect("palette");
+        assert_eq!(theme.bg, Color::Rgb(0x1a, 0x1b, 0x26));
+        assert_eq!(theme.fg, Color::Rgb(0xc0, 0xca, 0xf5));
+        assert_eq!(theme.muted, Color::Rgb(0x56, 0x5f, 0x89));
+        assert_eq!(theme.focus, Color::Rgb(0x7a, 0xa2, 0xf7));
+        assert_eq!(theme.review, Color::Rgb(0xbb, 0x9a, 0xf7));
+        // Derived shades sit between their two palette neighbours.
+        assert_eq!(theme.hover, Color::Rgb(33, 36, 52));
+        assert_eq!(theme.border, Color::Rgb(63, 70, 101));
+    }
+
+    #[test]
+    fn unusable_hyprland_palette_is_rejected() {
+        assert!(Theme::from_hyprland_palette(PALETTES, "Missing").is_none());
+        assert!(Theme::from_hyprland_palette(PALETTES, "Broken").is_none());
+        assert!(Theme::from_hyprland_palette("not json", "Tokyo Night").is_none());
+        assert!(parse_hex("12345").is_none());
+        assert_eq!(parse_hex("#0a0B0c"), Some(Color::Rgb(10, 11, 12)));
+    }
+
+    #[test]
+    fn resolve_falls_back_to_named_theme_without_following() {
+        assert_eq!(Theme::resolve("nord", false).bg, Theme::named("nord").bg);
     }
 }
