@@ -1,3 +1,21 @@
+# kanban4ai 0.8.13
+
+Notes are from the reviewed diff since 0.8.12. There were no `.changes/` logs.
+
+- **Opening a folder no longer launches a terminal.** On a window manager
+  without a desktop, `xdg-open` and `gio` follow whatever is registered for
+  `inode/directory`. When that desktop entry is a terminal (`Terminal=true`
+  or category `TerminalEmulator`, such as kitty), the TUI folder opener
+  (`o` on the board, the projects list, and a pinned result) skips those
+  generic openers and uses the first file manager on PATH: `nautilus`,
+  `dolphin`, `thunar`, `nemo`, `pcmanfm`, `pcmanfm-qt`, or `caja`. If none
+  of those is installed, it still falls back to `xdg-open` or `gio`. A
+  configured `tui.file_manager` is used as written. macOS still uses `open`.
+
+Board files, `config.yaml`, journal records, and the sync protocol (3) stay
+readable by 0.8.12. Store format is still 5. Nothing new is written that an
+older peer has to understand.
+
 # kanban4ai 0.8.12
 
 Notes are from the reviewed diff since 0.8.11. There were no `.changes/` logs.
