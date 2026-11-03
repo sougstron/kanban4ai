@@ -1,3 +1,21 @@
+# kanban4ai 0.8.14
+
+Notes are from the reviewed diff since 0.8.13. There were no `.changes/` logs.
+
+- **Project settings can follow the Hyprland theme.** A Common-tab checkbox,
+  `tui.follow_hyprland_theme` (default false), takes board colors from the
+  Hyprland theme picker palette (`$XDG_CONFIG_HOME/hypr/themes/current` looked
+  up in `themes.json`, the same palette Konsole's `Hypr` scheme uses) and
+  re-applies them while the board is open when that palette changes. The named
+  `theme` stays the fallback when those files are missing or unusable.
+  `Ctrl+T` does nothing while following and says to untick the checkbox.
+
+Board files, `config.yaml`, journal records, and the sync protocol (3) stay
+readable by 0.8.13. Store format is still 5. `tui` is a free-form map, so an
+older peer ignores `follow_hyprland_theme` if 0.8.14 writes it when project
+settings are saved. Nothing new is written that an older peer has to
+understand.
+
 # kanban4ai 0.8.13
 
 Notes are from the reviewed diff since 0.8.12. There were no `.changes/` logs.
