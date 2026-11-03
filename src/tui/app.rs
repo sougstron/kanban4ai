@@ -1269,6 +1269,10 @@ impl App {
             app.settings.hidden_projects = config.hidden_projects();
             app.settings.backend_order = config.backend_order();
             app.token_costs = config.token_costs();
+            // The projects list has no board, so its colors come from the
+            // global settings rather than any project's `tui.theme`.
+            app.settings.theme_name = Theme::normalize_name(config.projects_theme()).to_string();
+            app.settings.follow_hyprland_theme = config.projects_follow_hyprland_theme();
         }
         // The projects list is an entry screen too (bare `kanban4ai` with no
         // resolvable project), so its open runs the same on-open check.
@@ -1542,7 +1546,7 @@ impl App {
                 ..
             }
         ) {
-            if self.has_board {
+            if self.has_board || self.store.is_some() {
                 return self.dispatch(UiAction::CycleTheme);
             }
             return Ok(());
@@ -5112,6 +5116,10 @@ impl App {
         modal.escape_to_projects = config.escape_to_projects();
         modal.project_sort = super::dialogs::one_line(config.project_sort());
         modal.update_check_on_open = config.update_check_on_open();
+        modal.theme = TextArea::new(vec![
+            Theme::normalize_name(config.projects_theme()).to_string(),
+        ]);
+        modal.follow_hyprland_theme = config.projects_follow_hyprland_theme();
         let hidden = config.hidden_projects();
         let mut rows: Vec<&ProjectRow> = self.projects.iter().collect();
         rows.sort_by_key(|row| row.display_name.to_lowercase());
@@ -7392,6 +7400,8 @@ impl App {
                         return Ok(());
                     }
                 };
+                let projects_theme =
+                    Theme::normalize_name(&modal.theme_text().unwrap_or_default()).to_string();
                 let save_result = (|| -> Result<()> {
                     let Some(store) = &self.store else {
                         return Err(KanbanError::Invalid(
@@ -7405,6 +7415,8 @@ impl App {
                     config.store_board_sections(&edited);
                     config.set_escape_to_projects(modal.escape_to_projects);
                     config.set_update_check_on_open(modal.update_check_on_open);
+                    config.set_projects_theme(&projects_theme);
+                    config.set_projects_follow_hyprland_theme(modal.follow_hyprland_theme);
                     config.set_hidden_projects(&modal.hidden_project_ids());
                     config.set_backend_order(&modal.backend_order);
                     config.set_auto_mode(&auto);
@@ -7432,6 +7444,9 @@ impl App {
                 self.settings.hidden_projects = modal.hidden_project_ids();
                 self.settings.backend_order = modal.backend_order.clone();
                 self.clamp_project_selection();
+                self.settings.theme_name = projects_theme;
+                self.settings.follow_hyprland_theme = modal.follow_hyprland_theme;
+                self.apply_theme();
                 self.status = "Global settings saved".to_string();
             }
             Modal::Settings => {
@@ -7937,23 +7952,26 @@ impl App {
 
     fn cycle_theme(&mut self) -> Result<()> {
         if self.settings.follow_hyprland_theme {
-            self.status =
-                "Theme follows Hyprland; untick it in project settings to pick one".to_string();
+            let place = if self.has_board {
+                "project settings"
+            } else {
+                "global settings"
+            };
+            self.status = format!("Theme follows Hyprland; untick it in {place} to pick one");
             return Ok(());
         }
         let next = Theme::next_name(&self.settings.theme_name).to_string();
-        let save_result = (|| -> Result<()> {
-            ensure_config_write_target_is_safe(&self.ops.config)?;
-            let _lock = self.ops.storage.lock()?;
-            ensure_config_write_target_is_safe(&self.ops.config)?;
-            let mut config = self.ops.config.load_raw_fresh()?;
-            config.tui.insert(
-                Value::String("theme".to_string()),
-                Value::String(next.clone()),
-            );
-            retain_source_legacy_auto_launch_keys(&self.ops.config.config_file, &mut config)?;
-            self.ops.config.save(&config)
-        })();
+        let save_result = if let (false, Some(store)) = (self.has_board, &self.store) {
+            // The projects list keeps its own theme in the global settings.
+            (|| -> Result<()> {
+                let _lock = store.lock()?;
+                let mut config = store.load_global_config()?;
+                config.set_projects_theme(&next);
+                store.save_global_config(&config)
+            })()
+        } else {
+            self.save_board_theme(&next)
+        };
         if let Err(err) = save_result {
             self.status = format!("Could not save theme: {err}");
             return Ok(());
@@ -7962,6 +7980,19 @@ impl App {
         self.apply_theme();
         self.status = format!("Theme switched to {next}");
         Ok(())
+    }
+
+    fn save_board_theme(&self, next: &str) -> Result<()> {
+        ensure_config_write_target_is_safe(&self.ops.config)?;
+        let _lock = self.ops.storage.lock()?;
+        ensure_config_write_target_is_safe(&self.ops.config)?;
+        let mut config = self.ops.config.load_raw_fresh()?;
+        config.tui.insert(
+            Value::String("theme".to_string()),
+            Value::String(next.to_string()),
+        );
+        retain_source_legacy_auto_launch_keys(&self.ops.config.config_file, &mut config)?;
+        self.ops.config.save(&config)
     }
 }
 
