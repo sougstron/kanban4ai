@@ -147,6 +147,7 @@ pub enum DialogField {
     Variant,
     Answer,
     Theme,
+    FollowHyprlandTheme,
     TaskSort,
     Runner,
     HideKanbanMessages,
@@ -323,9 +324,10 @@ impl SettingsTab {
 /// One settings tab's field page, Save/Cancel inclusive: the buttons render
 /// under every tab and save the whole dialog, not just the visible one. Each
 /// inheritable group leads with its "Inherit from global" checkbox.
-const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 23] = [
+const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 24] = [
     DialogField::Title,
     DialogField::Theme,
+    DialogField::FollowHyprlandTheme,
     DialogField::InheritAgent,
     DialogField::AgentSettings,
     DialogField::InheritTaskSort,
@@ -486,6 +488,7 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         DialogField::Title
         | DialogField::AgentSettings
         | DialogField::Theme
+        | DialogField::FollowHyprlandTheme
         | DialogField::TaskSort
         | DialogField::Runner
         | DialogField::InheritPlacement
@@ -863,6 +866,7 @@ pub struct ModalState {
     pub theme_selected: usize,
     pub task_sort_options: Vec<SelectOption>,
     pub task_sort_selected: usize,
+    pub follow_hyprland_theme: bool,
     pub hide_kanban_messages: bool,
     pub project_sort_options: Vec<SelectOption>,
     pub project_sort_selected: usize,
@@ -990,6 +994,7 @@ impl ModalState {
             theme_selected: 0,
             task_sort_options: Vec::new(),
             task_sort_selected: 0,
+            follow_hyprland_theme: false,
             hide_kanban_messages: false,
             project_sort_options: Vec::new(),
             project_sort_selected: 0,
@@ -2122,6 +2127,9 @@ impl ModalState {
             }
             DialogField::Theme => self.input_select(key, SelectorKind::Theme),
             DialogField::TaskSort => self.input_select(key, SelectorKind::TaskSort),
+            DialogField::FollowHyprlandTheme => {
+                toggle_on_space(&mut self.follow_hyprland_theme, key)
+            }
             DialogField::HideKanbanMessages => toggle_on_space(&mut self.hide_kanban_messages, key),
             DialogField::QueueEnabled => toggle_on_space(&mut self.queue_enabled, key),
             DialogField::MaxRunningTotal => input_single_line(&mut self.max_running_total, key),
@@ -2344,7 +2352,7 @@ impl ModalState {
             DialogField::Answer => &mut self.answer,
             DialogField::Theme => &mut self.theme,
             DialogField::TaskSort => &mut self.task_sort,
-            DialogField::HideKanbanMessages => &mut self.answer,
+            DialogField::FollowHyprlandTheme | DialogField::HideKanbanMessages => &mut self.answer,
             DialogField::MaxRunningTotal => &mut self.max_running_total,
             DialogField::MaxRunningDesigner => &mut self.max_running_designer,
             DialogField::MaxRunningReviewer => &mut self.max_running_reviewer,
@@ -2998,6 +3006,7 @@ impl ModalState {
             raw_textarea_text(&self.answer),
             raw_textarea_text(&self.theme),
             self.theme_selected.to_string(),
+            self.follow_hyprland_theme.to_string(),
             raw_textarea_text(&self.task_sort),
             self.task_sort_selected.to_string(),
             self.hide_kanban_messages.to_string(),
@@ -4233,6 +4242,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::EscapeToProjects
         | DialogField::UpdateCheckOnOpen
         | DialogField::QueueEnabled
+        | DialogField::FollowHyprlandTheme
         | DialogField::HideKanbanMessages
         | DialogField::AutoRestartEnabled
         | DialogField::DesignerEnabled
@@ -4803,6 +4813,15 @@ fn render_selector_field(
             &modal.task_sort_options,
             modal.task_sort_selected,
             area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::FollowHyprlandTheme => render_checkbox(
+            frame,
+            app,
+            area,
+            "Hyprland",
+            "follow the Hyprland theme",
+            modal.follow_hyprland_theme,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
         DialogField::HideKanbanMessages => render_checkbox(
@@ -6479,6 +6498,7 @@ pub(crate) fn is_flag_field(field: DialogField) -> bool {
             | DialogField::Links
             | DialogField::EscapeToProjects
             | DialogField::UpdateCheckOnOpen
+            | DialogField::FollowHyprlandTheme
             | DialogField::HideKanbanMessages
             | DialogField::QueueEnabled
             | DialogField::AutoRestartEnabled

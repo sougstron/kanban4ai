@@ -47,6 +47,12 @@ auto-loaded into every agent session. Read it when you are reading or adding a s
   or `github-dark`. Quick-toggle/persist via `Ctrl+T`, or edit in Project
   Settings. Legacy aliases `textual-dark`, `textual-light`, `nordic`, and
   `solarized-light` are accepted.
+- `follow_hyprland_theme`: false - Project Settings **Hyprland** checkbox.
+  When on, colors come from the active Hyprland theme picker palette
+  (`$XDG_CONFIG_HOME/hypr/themes/current` looked up in `themes.json`, the
+  source of Konsole's `Hypr` scheme) and update live when it switches;
+  `theme` stays the fallback when those files are missing, and `Ctrl+T` is
+  disabled while following.
 - `task_sort`: `task_number` (default, ascending TASK id), `task_number_desc`
   (descending TASK id — highest task number first; doubles as the
   queue-priority control for the dispatcher), `updated_at_asc` (least recently
