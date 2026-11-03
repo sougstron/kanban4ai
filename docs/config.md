@@ -103,9 +103,13 @@ they are edited: press `s` on the Projects screen. Saved under the store
   hands the work folder to (the folder is appended as the last argument;
   the value is split like a shell word list, e.g. `nautilus --new-window`).
   Unset means the first of `xdg-open`, `gio open`, `nautilus`, `dolphin`,
-  `thunar`, `nemo`, `pcmanfm`, `caja` found on PATH (`open` on macOS). Set it
-  when that chain picks the wrong application. There is no dialog field for
-  this key; it is edited in the file.
+  `thunar`, `nemo`, `pcmanfm`, `pcmanfm-qt`, `caja` found on PATH (`open` on
+  macOS). When `xdg-mime` says the `inode/directory` handler is a terminal
+  (`Terminal=true` or category `TerminalEmulator`), `xdg-open` and `gio` are
+  skipped so a window manager does not open a terminal instead of a file
+  manager; if no file manager is on PATH, those generic openers are used
+  anyway. Set the key when that chain picks the wrong application. There is
+  no dialog field for this key; it is edited in the file.
 - `updates.check_on_open`: true - whether the TUI kicks off a background
   update check when it opens (`core::update::warm_check`; no-ops inside the
   `check_interval_hours` TTL). When a newer release is seen, the status line
