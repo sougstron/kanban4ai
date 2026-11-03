@@ -88,6 +88,13 @@ they are edited: press `s` on the Projects screen. Saved under the store
   active search filter) opens the projects list. Moved out of the per-project
   `tui.escape_to_projects` (TASK-178): the stale per-project key is now
   ignored, so boards that had it enabled need the toggle re-enabled globally.
+- `tui.projects_theme`: `dark` - theme of the Projects screen and everything
+  opened from it (Global Settings, trash, stats, dialogs); same names as the
+  per-project `theme`. Picked in Global Settings or cycled with `Ctrl+T` on
+  the Projects screen. Boards keep their own per-project theme.
+- `tui.projects_follow_hyprland_theme`: false - Global Settings **Hyprland**
+  checkbox: the Projects screen follows the active Hyprland theme like the
+  per-project `follow_hyprland_theme`, with `projects_theme` as fallback.
 - `tui.project_sort`: `name` (default, alphabetical by the name the list
   displays), `newest` (most recently created first), `smart` (unread work
   first — unseen Review or open questions — then rows with running agents,

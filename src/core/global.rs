@@ -255,6 +255,40 @@ impl GlobalConfig {
         );
     }
 
+    /// Built-in theme of the Projects screen and its dialogs
+    /// (`tui.projects_theme`). Stored as written; the TUI normalizes it.
+    pub fn projects_theme(&self) -> &str {
+        self.tui
+            .get(Value::String("projects_theme".to_string()))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or("dark")
+    }
+
+    pub fn set_projects_theme(&mut self, name: &str) {
+        self.tui.insert(
+            Value::String("projects_theme".to_string()),
+            Value::String(name.to_string()),
+        );
+    }
+
+    /// Whether the Projects screen takes its colors from the active
+    /// Hyprland theme (`tui.projects_follow_hyprland_theme`, default off).
+    pub fn projects_follow_hyprland_theme(&self) -> bool {
+        self.tui
+            .get(Value::String("projects_follow_hyprland_theme".to_string()))
+            .and_then(as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn set_projects_follow_hyprland_theme(&mut self, enabled: bool) {
+        self.tui.insert(
+            Value::String("projects_follow_hyprland_theme".to_string()),
+            Value::Bool(enabled),
+        );
+    }
+
     /// How the Projects screen orders its rows. Whatever its storage shape,
     /// the effective default is `name`.
     pub fn project_sort(&self) -> &'static str {

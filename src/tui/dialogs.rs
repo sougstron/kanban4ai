@@ -394,7 +394,9 @@ const SETTINGS_PAGE_INSTRUCTIONS_FIELDS: [DialogField; 3] = [
 /// The Global Settings Common page: the machine-only settings first, then
 /// the global half of every inheritable group on that tab. The other tabs
 /// are the project pages minus their inherit checkbox.
-const GLOBAL_SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 18] = [
+const GLOBAL_SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 20] = [
+    DialogField::Theme,
+    DialogField::FollowHyprlandTheme,
     DialogField::EscapeToProjects,
     DialogField::ProjectSort,
     DialogField::UpdateCheckOnOpen,

@@ -10239,8 +10239,14 @@ fn projects_screen_global_settings_toggle_persists_to_the_store() {
         .expect("open global settings");
     let modal = app.modal.as_ref().expect("global settings modal");
     assert_eq!(modal.modal, Modal::GlobalSettings);
-    assert_eq!(modal.active_field(), DialogField::EscapeToProjects);
+    assert_eq!(modal.active_field(), DialogField::Theme);
     assert!(!modal.escape_to_projects);
+    app.handle_key(key(KeyCode::Tab)).expect("hyprland box");
+    app.handle_key(key(KeyCode::Tab)).expect("escape box");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::EscapeToProjects
+    );
 
     app.handle_key(key(KeyCode::Char(' '))).expect("toggle");
     assert!(
@@ -10271,6 +10277,82 @@ fn projects_screen_global_settings_toggle_persists_to_the_store() {
     let store = ProjectStore::at(store_dir.path());
     let config = store.load_global_config().expect("saved global config");
     assert!(config.escape_to_projects());
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
+fn projects_screen_theme_is_picked_in_global_settings() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-glob-theme");
+    let _ = std::fs::remove_dir_all(&work);
+    let (store_dir, mut app) = projects_app(&work, None);
+    assert_eq!(app.settings.theme_name, "dark");
+
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open global settings");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::Theme
+    );
+    let rendered = render_snapshot(&mut app);
+    assert!(rendered.contains("Theme"), "{rendered}");
+    assert!(rendered.contains("follow the Hyprland theme"), "{rendered}");
+    app.handle_key(key(KeyCode::Enter)).expect("step inside");
+    app.handle_key(key(KeyCode::Down)).expect("light");
+    assert_eq!(
+        app.modal.as_ref().unwrap().theme_text(),
+        Some("light".to_string())
+    );
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+    assert!(app.modal.is_none(), "{}", app.status);
+    assert_eq!(app.settings.theme_name, "light");
+    assert_eq!(app.theme.bg, Theme::named("light").bg);
+    let store = ProjectStore::at(store_dir.path());
+    let config = store.load_global_config().unwrap();
+    assert_eq!(config.projects_theme(), "light");
+    assert!(!config.projects_follow_hyprland_theme());
+
+    // Ctrl+T cycles the projects theme and saves it globally.
+    app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+        .expect("quick toggle");
+    let next = Theme::next_name("light");
+    assert_eq!(app.settings.theme_name, next);
+    assert_eq!(store.load_global_config().unwrap().projects_theme(), next);
+
+    // The Hyprland box persists and locks the quick toggle.
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("reopen global settings");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::FollowHyprlandTheme);
+    app.handle_key(key(KeyCode::Char(' '))).expect("tick it");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+    assert!(app.settings.follow_hyprland_theme);
+    assert!(
+        store
+            .load_global_config()
+            .unwrap()
+            .projects_follow_hyprland_theme()
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL))
+        .expect("locked toggle");
+    assert_eq!(app.settings.theme_name, next);
+    assert!(app.status.contains("global settings"), "{}", app.status);
+
+    // A fresh projects list starts with the saved choice.
+    let reopened =
+        loaded_projects_at(ProjectStore::at(store_dir.path()), None, None).expect("projects app");
+    assert_eq!(reopened.settings.theme_name, next);
+    assert!(reopened.settings.follow_hyprland_theme);
 
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -10756,14 +10838,17 @@ fn projects_screen_global_settings_project_sort_persists_to_the_store() {
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open global settings");
     let modal = app.modal.as_ref().expect("global settings modal");
-    assert_eq!(modal.active_field(), DialogField::EscapeToProjects);
+    assert_eq!(modal.active_field(), DialogField::Theme);
     assert!(modal.fields().contains(&DialogField::ProjectSort));
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::ProjectSort);
     let rendered = render_snapshot(&mut app);
     assert!(rendered.contains("Project sorting"), "{rendered}");
     assert!(rendered.contains("By name"), "{rendered}");
 
-    // Tab onto the selector, then pick the third option (Smart).
-    app.handle_key(key(KeyCode::Tab)).expect("focus sort");
+    // On the selector, pick the third option (Smart).
     app.handle_key(key(KeyCode::Enter)).expect("step inside");
     app.handle_key(key(KeyCode::Down)).expect("newest");
     app.handle_key(key(KeyCode::Down)).expect("smart");
@@ -12317,6 +12402,10 @@ fn global_settings_updates_rows_snapshot() {
     force_update_cache(Some("9.9.9"));
     let (_dir, mut app) = global_settings_app();
     open_global_settings(&mut app);
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::UpdateCheckOnOpen);
     let rendered = render_at(&mut app, 96, 36);
     assert!(
         rendered.contains("kanban4ai 9.9.9 available (released 20d ago)"),
