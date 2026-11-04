@@ -1,3 +1,20 @@
+# kanban4ai 0.8.15
+
+Notes are from the reviewed diff since 0.8.14. There were no `.changes/` logs.
+
+- **The Projects screen has its own theme.** Global Settings gains Theme and
+  Hyprland fields (`tui.projects_theme`, default `dark`, and
+  `tui.projects_follow_hyprland_theme`, default false). They color the
+  projects list and everything opened from it (Global Settings, trash, stats,
+  dialogs). `Ctrl+T` on the Projects screen cycles and saves that theme; while
+  Hyprland follow is on it does nothing and says to untick the checkbox in
+  global settings. Boards keep their own per-project theme and Hyprland follow.
+
+Board files, `config.yaml`, journal records, and the sync protocol (3) stay
+readable by 0.8.14. Store format is still 5. Global `tui` is machine-local
+and a free-form map, so these keys are not replicated and an older install
+ignores them. Nothing new is written that an older peer has to understand.
+
 # kanban4ai 0.8.14
 
 Notes are from the reviewed diff since 0.8.13. There were no `.changes/` logs.
