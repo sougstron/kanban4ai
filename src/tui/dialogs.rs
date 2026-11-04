@@ -155,6 +155,8 @@ pub enum DialogField {
     ProjectSort,
     UpdateCheckOnOpen,
     ProjectVisibility,
+    /// Global Settings Limits page: which providers the limits row shows.
+    LimitsVisibility,
     BackendOrder,
     /// Global Settings Sync page: one panel of live buttons and switches.
     SyncPanel,
@@ -251,6 +253,8 @@ pub enum SettingsTab {
     Backends,
     /// Global Settings only: which registered projects the list shows.
     Projects,
+    /// Global Settings only: which providers the limits row shows.
+    Limits,
     /// Global Settings only: this node, its peers and replication state.
     Sync,
     /// Global Settings only: machine-wide auto mode.
@@ -266,9 +270,9 @@ impl SettingsTab {
         SettingsTab::Instructions,
     ];
 
-    /// The Global Settings strip: every project tab plus Backends, Projects
-    /// and Sync.
-    pub const GLOBAL: [SettingsTab; 8] = [
+    /// The Global Settings strip: every project tab plus Backends, Projects,
+    /// Limits and Sync.
+    pub const GLOBAL: [SettingsTab; 9] = [
         SettingsTab::Common,
         SettingsTab::Designer,
         SettingsTab::Reviewer,
@@ -276,6 +280,7 @@ impl SettingsTab {
         SettingsTab::Auto,
         SettingsTab::Backends,
         SettingsTab::Projects,
+        SettingsTab::Limits,
         SettingsTab::Sync,
     ];
 
@@ -288,6 +293,7 @@ impl SettingsTab {
             SettingsTab::Instructions => "Prompt",
             SettingsTab::Backends => "Backends",
             SettingsTab::Projects => "Projects",
+            SettingsTab::Limits => "Limits",
             SettingsTab::Sync => "Sync",
             SettingsTab::Auto => "Auto",
         }
@@ -303,6 +309,7 @@ impl SettingsTab {
             SettingsTab::Instructions => "Prm",
             SettingsTab::Backends => "Bck",
             SettingsTab::Projects => "Prj",
+            SettingsTab::Limits => "Lim",
             SettingsTab::Sync => "Syn",
             SettingsTab::Auto => "Aut",
         }
@@ -432,6 +439,14 @@ const GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS: [DialogField; 3] = [
     DialogField::Cancel,
 ];
 
+/// The Global Settings Limits page: one checklist of every provider, ticked
+/// when the limits row above the status bar shows it.
+const GLOBAL_SETTINGS_PAGE_LIMITS_FIELDS: [DialogField; 3] = [
+    DialogField::LimitsVisibility,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
 /// The Global Settings Auto page: machine-wide auto mode.
 const GLOBAL_SETTINGS_PAGE_AUTO_FIELDS: [DialogField; 7] = [
     DialogField::AutoModeEnabled,
@@ -459,6 +474,7 @@ pub(crate) fn settings_page_fields(tab: SettingsTab) -> &'static [DialogField] {
         SettingsTab::Common
         | SettingsTab::Backends
         | SettingsTab::Projects
+        | SettingsTab::Limits
         | SettingsTab::Sync
         | SettingsTab::Auto => &SETTINGS_PAGE_COMMON_FIELDS,
         SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS,
@@ -477,6 +493,7 @@ pub(crate) fn global_settings_page_fields(tab: SettingsTab) -> &'static [DialogF
         SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS[1..],
         SettingsTab::Backends => &GLOBAL_SETTINGS_PAGE_BACKENDS_FIELDS,
         SettingsTab::Projects => &GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS,
+        SettingsTab::Limits => &GLOBAL_SETTINGS_PAGE_LIMITS_FIELDS,
         SettingsTab::Sync => &GLOBAL_SETTINGS_PAGE_SYNC_FIELDS,
         SettingsTab::Auto => &GLOBAL_SETTINGS_PAGE_AUTO_FIELDS,
     }
@@ -532,6 +549,7 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         DialogField::Description => Some(SettingsTab::Instructions),
         DialogField::BackendOrder => Some(SettingsTab::Backends),
         DialogField::ProjectVisibility => Some(SettingsTab::Projects),
+        DialogField::LimitsVisibility => Some(SettingsTab::Limits),
         DialogField::SyncPanel => Some(SettingsTab::Sync),
         DialogField::AutoModeEnabled
         | DialogField::AutoModeArbiter
@@ -785,7 +803,8 @@ impl AgentPicker {
     }
 }
 
-/// One row of the Global Settings Projects checklist.
+/// One row of a Global Settings checklist: a project on the Projects tab,
+/// a provider on the Limits tab.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectVisibility {
     pub id: String,
@@ -876,6 +895,10 @@ pub struct ModalState {
     /// the projects list shows it, and the row the cursor sits on.
     pub project_visibility: Vec<ProjectVisibility>,
     pub project_visibility_selected: usize,
+    /// Global Settings Limits tab: every provider with whether the limits
+    /// row shows it, and the row the cursor sits on.
+    pub limits_visibility: Vec<ProjectVisibility>,
+    pub limits_visibility_selected: usize,
     /// Global Settings Backends tab: every backend in picker order.
     pub backend_order: Vec<String>,
     pub backend_order_selected: usize,
@@ -1002,6 +1025,8 @@ impl ModalState {
             project_sort_selected: 0,
             project_visibility: Vec::new(),
             project_visibility_selected: 0,
+            limits_visibility: Vec::new(),
+            limits_visibility_selected: 0,
             backend_order: Vec::new(),
             backend_order_selected: 0,
             sync: Default::default(),
@@ -1358,7 +1383,12 @@ impl ModalState {
             self.input(key(KeyCode::Enter));
         } else if selector_kind(field).is_some() {
             self.enter_field();
-        } else if is_flag_field(field) || field == DialogField::ProjectVisibility {
+        } else if is_flag_field(field)
+            || matches!(
+                field,
+                DialogField::ProjectVisibility | DialogField::LimitsVisibility
+            )
+        {
             self.input(key(KeyCode::Char(' ')));
         }
     }
@@ -1779,21 +1809,25 @@ impl ModalState {
         }
     }
 
-    /// Up/Down walk the project checklist, Space flips the focused row.
-    fn input_project_visibility(&mut self, key: ratatui::crossterm::event::KeyEvent) {
+    /// Up/Down walk a visibility checklist, Space flips the focused row.
+    fn input_visibility(
+        rows: &mut [ProjectVisibility],
+        cursor: &mut usize,
+        key: ratatui::crossterm::event::KeyEvent,
+    ) {
         use ratatui::crossterm::event::KeyCode;
-        let len = self.project_visibility.len();
+        let len = rows.len();
         if len == 0 {
             return;
         }
-        let selected = self.project_visibility_selected.min(len - 1);
+        let selected = (*cursor).min(len - 1);
         match key.code {
-            KeyCode::Up => self.project_visibility_selected = selected.saturating_sub(1),
-            KeyCode::Down => self.project_visibility_selected = (selected + 1).min(len - 1),
-            KeyCode::Home => self.project_visibility_selected = 0,
-            KeyCode::End => self.project_visibility_selected = len - 1,
+            KeyCode::Up => *cursor = selected.saturating_sub(1),
+            KeyCode::Down => *cursor = (selected + 1).min(len - 1),
+            KeyCode::Home => *cursor = 0,
+            KeyCode::End => *cursor = len - 1,
             KeyCode::Char(' ') => {
-                let row = &mut self.project_visibility[selected];
+                let row = &mut rows[selected];
                 row.visible = !row.visible;
             }
             _ => {}
@@ -1841,6 +1875,15 @@ impl ModalState {
         }
     }
 
+    /// Providers the Limits checklist leaves unticked.
+    pub fn hidden_limit_providers(&self) -> Vec<String> {
+        self.limits_visibility
+            .iter()
+            .filter(|row| !row.visible)
+            .map(|row| row.id.clone())
+            .collect()
+    }
+
     /// Ids of the projects the checklist leaves unticked.
     pub fn hidden_project_ids(&self) -> Vec<String> {
         self.project_visibility
@@ -1865,6 +1908,13 @@ impl ModalState {
             if let Some(row) = self.project_visibility.get_mut(index) {
                 row.visible = !row.visible;
                 self.project_visibility_selected = index;
+            }
+            return;
+        }
+        if field == DialogField::LimitsVisibility {
+            if let Some(row) = self.limits_visibility.get_mut(index) {
+                row.visible = !row.visible;
+                self.limits_visibility_selected = index;
             }
             return;
         }
@@ -2110,7 +2160,16 @@ impl ModalState {
                 }
             }
             DialogField::ProjectSort => self.input_select(key, SelectorKind::ProjectSort),
-            DialogField::ProjectVisibility => self.input_project_visibility(key),
+            DialogField::ProjectVisibility => Self::input_visibility(
+                &mut self.project_visibility,
+                &mut self.project_visibility_selected,
+                key,
+            ),
+            DialogField::LimitsVisibility => Self::input_visibility(
+                &mut self.limits_visibility,
+                &mut self.limits_visibility_selected,
+                key,
+            ),
             DialogField::BackendOrder => self.input_backend_order(key),
             DialogField::SyncPanel => self.sync.input(key),
             DialogField::PurgeData => {
@@ -2345,6 +2404,7 @@ impl ModalState {
             | DialogField::EscapeToProjects
             | DialogField::UpdateCheckOnOpen
             | DialogField::ProjectVisibility
+            | DialogField::LimitsVisibility
             | DialogField::BackendOrder
             | DialogField::SyncPanel => &mut self.answer,
             DialogField::ProjectSort => &mut self.project_sort,
@@ -3017,6 +3077,10 @@ impl ModalState {
             raw_textarea_text(&self.project_sort),
             self.project_sort_selected.to_string(),
             self.project_visibility
+                .iter()
+                .map(|row| if row.visible { '1' } else { '0' })
+                .collect(),
+            self.limits_visibility
                 .iter()
                 .map(|row| if row.visible { '1' } else { '0' })
                 .collect(),
@@ -4271,7 +4335,9 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor => 1,
         DialogField::Description => DESCRIPTION_MIN_ROWS + 2,
-        DialogField::ProjectVisibility | DialogField::BackendOrder => 4,
+        DialogField::ProjectVisibility
+        | DialogField::LimitsVisibility
+        | DialogField::BackendOrder => 4,
         DialogField::MaxRunningPerBackend | DialogField::MaxRunningPerBackendModel => 5,
         // The chain selector always shows its filter and the "No chain"
         // entry, so two content rows already cover an empty board.
@@ -4326,6 +4392,7 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         DialogField::TaskSort => modal.task_sort_options.len(),
         DialogField::ProjectSort => modal.project_sort_options.len(),
         DialogField::ProjectVisibility => modal.project_visibility.len(),
+        DialogField::LimitsVisibility => modal.limits_visibility.len(),
         DialogField::BackendOrder => modal.backend_order.len(),
         DialogField::ChainTo => modal.chain_options.len(),
         DialogField::DesignerBackend => modal.designer.backend_options.len(),
@@ -4789,6 +4856,7 @@ fn render_selector_field(
         ),
         DialogField::EscapeToProjects => render_escape_to_projects(frame, app, modal, area),
         DialogField::ProjectVisibility => render_project_visibility(frame, app, modal, area),
+        DialogField::LimitsVisibility => render_limits_visibility(frame, app, modal, area),
         DialogField::BackendOrder => render_backend_order(frame, app, modal, area),
         DialogField::UpdateCheckOnOpen => render_checkbox(
             frame,
@@ -5440,6 +5508,10 @@ fn register_task_options(
         DialogField::ProjectVisibility => (
             modal.project_visibility.len(),
             modal.project_visibility_selected,
+        ),
+        DialogField::LimitsVisibility => (
+            modal.limits_visibility.len(),
+            modal.limits_visibility_selected,
         ),
         DialogField::BackendOrder => (modal.backend_order.len(), modal.backend_order_selected),
         DialogField::ChainTo => (modal.chain_options.len(), modal.chain_selected),
@@ -6118,6 +6190,41 @@ fn render_project_visibility(frame: &mut Frame<'_>, app: &App, modal: &ModalStat
     );
 }
 
+/// The Limits tab checklist: a ticked provider is shown in the limits row.
+fn render_limits_visibility(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
+    let field = DialogField::LimitsVisibility;
+    let active = modal.active_field() == field || app.is_hovered(HitAction::ModalField(field));
+    let items = modal
+        .limits_visibility
+        .iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let mark = if row.visible { "☑" } else { "☐" };
+            ListItem::new(format!("{mark} {}", sanitize_terminal_text(&row.label))).style(
+                option_hover_style(app, HitAction::ModalOption { field, index }),
+            )
+        })
+        .collect();
+    let focused = modal.active_field() == field;
+    let block = inside_border(
+        Block::default()
+            .title(" Show in limits row (Space toggles) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(select_border(app, active, false))),
+        focused,
+    );
+    render_list_in(
+        frame,
+        app,
+        items,
+        modal.limits_visibility_selected,
+        area,
+        Some(block),
+        true,
+        highlight_coloured(focused),
+    );
+}
+
 /// The Backends tab list: backend pickers in every project follow this order.
 fn render_backend_order(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
     let field = DialogField::BackendOrder;
@@ -6532,6 +6639,7 @@ fn field_owns_vertical_arrows(field: DialogField) -> bool {
             | DialogField::ChainTo
             | DialogField::ProjectSort
             | DialogField::ProjectVisibility
+            | DialogField::LimitsVisibility
             | DialogField::BackendOrder
             | DialogField::SyncPanel
             | DialogField::TargetStatus

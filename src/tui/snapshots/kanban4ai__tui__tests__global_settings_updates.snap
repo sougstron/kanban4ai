@@ -1,5 +1,6 @@
 ---
 source: src/tui/tests.rs
+assertion_line: 12420
 expression: rendered
 ---
 ┌ Projects · Enter open · n new · r rename · p path · s settings · S stats · d delete · / filte┐
@@ -8,7 +9,7 @@ expression: rendered
 │                                                                                              │
 │                                                                                              │
 │             ┌ Global settings ─────────────────────────────────────────────────┐             │
-│             │ Com │ Des │ Rev │ Exe │ Aut │ Bck │ Prj │ Syn                    │             │
+│             │ Com │ Des │ Rev │ Exe │ Aut │ Bck │ Prj │ Lim │ Syn              │             │
 │             │──────────────────────────────────────────────────────────────────│             │
 │             │┌ Updates ───────────────────────────────────────────────────────┐│             │
 │             ││kanban4ai 9.9.9 available (released 20d ago)                    ││             │
@@ -76,7 +77,9 @@ expression: rendered
 6:51-56 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:56-57 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:57-62 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-6:62-81 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+6:62-63 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+6:63-68 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+6:68-81 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:81-82 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 6:82-95 Style::new().fg(Color::Reset).bg(Color::Reset).underline_color(Color::Reset)
 6:95-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Reset).underline_color(Color::Reset)

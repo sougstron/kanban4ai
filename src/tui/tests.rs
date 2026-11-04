@@ -10370,11 +10370,12 @@ fn global_settings_projects_tab_hides_and_restores_a_project() {
     };
     assert_eq!(project_rows(&app), 1);
 
-    // Left from Common wraps onto Sync, then the Projects tab, Global
-    // Settings only.
+    // Left from Common wraps onto Sync, then Limits, then the Projects tab,
+    // Global Settings only.
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open global settings");
     app.handle_key(key(KeyCode::Left)).expect("sync tab");
+    app.handle_key(key(KeyCode::Left)).expect("limits tab");
     app.handle_key(key(KeyCode::Left)).expect("projects tab");
     let modal = app.modal.as_ref().expect("global settings modal");
     assert_eq!(modal.settings_tab, SettingsTab::Projects);
@@ -10406,6 +10407,7 @@ fn global_settings_projects_tab_hides_and_restores_a_project() {
     // Ticking it again brings the row back.
     app.handle_key(key(KeyCode::Char('s'))).expect("reopen");
     app.handle_key(key(KeyCode::Left)).expect("sync tab");
+    app.handle_key(key(KeyCode::Left)).expect("limits tab");
     app.handle_key(key(KeyCode::Left)).expect("projects tab");
     assert!(!app.modal.as_ref().unwrap().project_visibility[0].visible);
     app.handle_key(key(KeyCode::Enter))
@@ -10429,15 +10431,82 @@ fn global_settings_projects_tab_hides_and_restores_a_project() {
 }
 
 #[test]
+fn global_settings_limits_tab_hides_and_restores_a_provider() {
+    let work = std::path::PathBuf::from("/tmp/k4ai-glob-limits");
+    let _ = std::fs::remove_dir_all(&work);
+    let (store_dir, mut app) = projects_app(&work, None);
+
+    // Left from Common wraps onto Sync, then Limits.
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open global settings");
+    app.handle_key(key(KeyCode::Left)).expect("sync tab");
+    app.handle_key(key(KeyCode::Left)).expect("limits tab");
+    let modal = app.modal.as_ref().expect("global settings modal");
+    assert_eq!(modal.settings_tab, SettingsTab::Limits);
+    assert_eq!(modal.active_field(), DialogField::LimitsVisibility);
+    let providers: Vec<&str> = modal
+        .limits_visibility
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect();
+    assert_eq!(providers, crate::core::limits::PROVIDERS);
+    assert!(modal.limits_visibility.iter().all(|row| row.visible));
+    // Step into the list, walk to codex and untick it.
+    app.handle_key(key(KeyCode::Enter))
+        .expect("step into the list");
+    app.handle_key(key(KeyCode::Down)).expect("codex");
+    app.handle_key(key(KeyCode::Char(' '))).expect("untick");
+    insta::assert_snapshot!("global_settings_limits_tab", render_at(&mut app, 80, 24));
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+
+    assert!(app.modal.is_none());
+    assert_eq!(app.settings.hidden_limits, vec!["codex".to_string()]);
+    let store = ProjectStore::at(store_dir.path());
+    assert_eq!(
+        store.load_global_config().unwrap().hidden_limits(),
+        vec!["codex".to_string()]
+    );
+
+    // Reopening shows it unticked; ticking it again clears the key.
+    app.handle_key(key(KeyCode::Char('s'))).expect("reopen");
+    app.handle_key(key(KeyCode::Left)).expect("sync tab");
+    app.handle_key(key(KeyCode::Left)).expect("limits tab");
+    assert!(!app.modal.as_ref().unwrap().limits_visibility[1].visible);
+    app.modal
+        .as_mut()
+        .unwrap()
+        .select_option(DialogField::LimitsVisibility, 1);
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save settings");
+    assert!(app.settings.hidden_limits.is_empty());
+    assert!(
+        store
+            .load_global_config()
+            .unwrap()
+            .hidden_limits()
+            .is_empty()
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+#[test]
 fn global_settings_backends_tab_reorders_backend_pickers() {
     let work = std::path::PathBuf::from("/tmp/k4ai-glob-backends");
     let _ = std::fs::remove_dir_all(&work);
     let (store_dir, mut app) = projects_app(&work, None);
 
-    // Left from Common wraps onto Sync, then Projects, then Backends.
+    // Left from Common wraps onto Sync, then Limits, Projects, then Backends.
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open global settings");
     app.handle_key(key(KeyCode::Left)).expect("sync tab");
+    app.handle_key(key(KeyCode::Left)).expect("limits tab");
     app.handle_key(key(KeyCode::Left)).expect("projects tab");
     app.handle_key(key(KeyCode::Left)).expect("backends tab");
     let modal = app.modal.as_ref().expect("global settings modal");
@@ -10483,10 +10552,10 @@ fn global_settings_auto_tab_saves_auto_mode() {
     let _ = std::fs::remove_dir_all(&work);
     let (store_dir, mut app) = projects_app(&work, None);
 
-    // Left from Common wraps onto Sync, Projects, Backends, then Auto.
+    // Left from Common wraps onto Sync, Limits, Projects, Backends, then Auto.
     app.handle_key(key(KeyCode::Char('s')))
         .expect("open global settings");
-    for _ in 0..4 {
+    for _ in 0..5 {
         app.handle_key(key(KeyCode::Left)).expect("previous tab");
     }
     let modal = app.modal.as_ref().expect("global settings modal");
@@ -11135,6 +11204,26 @@ fn limits_row_drops_windows_that_have_already_reset() {
     // showing a percentage for a period that is finished.
     assert!(row.contains("✺ codex stale"), "{row}");
     assert!(!row.contains("40%"), "{row}");
+}
+
+#[test]
+fn limits_row_leaves_out_hidden_providers() {
+    let (_dir, mut app) = populated_app();
+    app.limits = Some(limits_fixture());
+    app.settings.hidden_limits = vec!["codex".to_string(), "grok".to_string()];
+
+    let lines = rendered_lines(&mut app, 120, 28);
+    let upper = &lines[lines.len() - 3];
+    assert!(upper.contains("✳ claude 5h 66%"), "{upper}");
+    assert!(!upper.contains("codex"), "{upper}");
+    assert!(!upper.contains("grok"), "{upper}");
+
+    // Hiding every provider with an entry drops the row entirely.
+    app.settings.hidden_limits.push("claude".to_string());
+    let lines = rendered_lines(&mut app, 120, 28);
+    assert!(!lines[lines.len() - 2].contains("claude"), "{lines:?}");
+    assert!(!lines[lines.len() - 3].contains("claude"), "{lines:?}");
+    assert!(lines[lines.len() - 1].contains("n new"), "{lines:?}");
 }
 
 #[test]

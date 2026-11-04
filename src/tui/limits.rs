@@ -8,7 +8,8 @@
 //! background thread; this module only draws whatever snapshot is cached, so a
 //! slow or unreachable provider never touches the event loop. Providers with no
 //! credentials on the machine are omitted entirely — the row lists what the
-//! user actually has.
+//! user actually has — and so are providers unticked in Global Settings →
+//! Limits (`tui.hidden_limits`).
 //!
 //! The row degrades with width: reset times drop first, then window labels and
 //! provider names, then whole providers from the right.
@@ -80,7 +81,7 @@ pub fn is_visible(app: &App) -> bool {
         && app
             .limits
             .as_ref()
-            .is_some_and(|snapshot| has_any_provider(snapshot))
+            .is_some_and(|snapshot| has_any_provider(app, snapshot))
 }
 
 /// Two lines when any provider has both a short window and a long one to
@@ -100,10 +101,11 @@ pub fn row_height(app: &App) -> u16 {
 
 /// Whether the row draws at all. Only the displayed providers count: the
 /// snapshot may still carry an entry for a parked one (codex), which must not
-/// reserve an empty line.
-fn has_any_provider(snapshot: &LimitsSnapshot) -> bool {
+/// reserve an empty line, and neither may a provider the user hid.
+fn has_any_provider(app: &App, snapshot: &LimitsSnapshot) -> bool {
     limits::PROVIDERS
         .iter()
+        .filter(|provider| !is_hidden(app, provider))
         .filter_map(|provider| snapshot.get(provider))
         .any(|entry| entry.state != ProviderState::NotConfigured)
 }
@@ -187,9 +189,18 @@ fn build_lines(
     (Vec::new(), Vec::new())
 }
 
+/// Unticked in Global Settings → Limits.
+fn is_hidden(app: &App, provider: &str) -> bool {
+    app.settings
+        .hidden_limits
+        .iter()
+        .any(|name| name == provider)
+}
+
 fn provider_blocks(app: &App, snapshot: &LimitsSnapshot, now: i64, detail: Detail) -> Vec<Block> {
     limits::PROVIDERS
         .into_iter()
+        .filter(|provider| !is_hidden(app, provider))
         .filter_map(|provider| {
             let entry = snapshot.get(provider)?;
             provider_block(app, provider, entry, now, detail)

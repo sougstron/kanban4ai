@@ -121,6 +121,8 @@ pub struct TuiSettings {
     pub backend_order: Vec<String>,
     /// Draw the provider subscription-limits row above the status bar.
     pub show_limits: bool,
+    /// Providers the limits row leaves out (Global Settings → Limits).
+    pub hidden_limits: Vec<String>,
     /// Hide thread messages authored by kanban (audit notes). Display filter only.
     pub hide_kanban_messages: bool,
     /// Seconds a limits snapshot stays fresh before a background refresh.
@@ -1267,6 +1269,7 @@ impl App {
             app.settings.escape_to_projects = config.escape_to_projects();
             app.settings.project_sort = config.project_sort().to_string();
             app.settings.hidden_projects = config.hidden_projects();
+            app.settings.hidden_limits = config.hidden_limits();
             app.settings.backend_order = config.backend_order();
             app.token_costs = config.token_costs();
             // The projects list has no board, so its colors come from the
@@ -5131,6 +5134,15 @@ impl App {
                 visible: !hidden.contains(&row.project.id),
             })
             .collect();
+        let hidden_limits = config.hidden_limits();
+        modal.limits_visibility = crate::core::limits::PROVIDERS
+            .into_iter()
+            .map(|provider| super::dialogs::ProjectVisibility {
+                id: provider.to_string(),
+                label: format!("{} {provider}", super::limits::provider_icon(provider)),
+                visible: !hidden_limits.iter().any(|name| name == provider),
+            })
+            .collect();
         // Saved order first (kept even for a backend only some project
         // defines), then every other backend the global view knows.
         let mut backends = config.backend_order();
@@ -5205,6 +5217,7 @@ impl App {
             self.settings.escape_to_projects = config.escape_to_projects();
             self.settings.project_sort = config.project_sort().to_string();
             self.settings.hidden_projects = config.hidden_projects();
+            self.settings.hidden_limits = config.hidden_limits();
             self.settings.backend_order = config.backend_order();
             self.token_costs = config.token_costs();
         }
@@ -7418,6 +7431,7 @@ impl App {
                     config.set_projects_theme(&projects_theme);
                     config.set_projects_follow_hyprland_theme(modal.follow_hyprland_theme);
                     config.set_hidden_projects(&modal.hidden_project_ids());
+                    config.set_hidden_limits(&modal.hidden_limit_providers());
                     config.set_backend_order(&modal.backend_order);
                     config.set_auto_mode(&auto);
                     config.set_project_sort(
@@ -7442,6 +7456,7 @@ impl App {
                 )
                 .to_string();
                 self.settings.hidden_projects = modal.hidden_project_ids();
+                self.settings.hidden_limits = modal.hidden_limit_providers();
                 self.settings.backend_order = modal.backend_order.clone();
                 self.clamp_project_selection();
                 self.settings.theme_name = projects_theme;
@@ -8979,6 +8994,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::InheritReviewer
         | DialogField::InheritExecutor
         | DialogField::ProjectVisibility
+        | DialogField::LimitsVisibility
         | DialogField::BackendOrder
         | DialogField::SyncPanel => None,
         DialogField::ProjectSort => Some(modal.project_sort_selected),
@@ -9132,6 +9148,7 @@ fn default_project_settings() -> TuiSettings {
         hidden_projects: Vec::new(),
         backend_order: Vec::new(),
         show_limits: true,
+        hidden_limits: Vec::new(),
         hide_kanban_messages: false,
         limits_refresh_interval: crate::core::limits::DEFAULT_REFRESH_INTERVAL,
     }
@@ -9257,6 +9274,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
         hidden_projects: Vec::new(),
         backend_order: Vec::new(),
         show_limits: tui_bool(&config.tui, "show_limits", true),
+        hidden_limits: Vec::new(),
         hide_kanban_messages: tui_bool(&config.tui, "hide_kanban_messages", false),
         limits_refresh_interval: ops
             .config

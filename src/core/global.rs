@@ -337,6 +337,38 @@ impl GlobalConfig {
         }
     }
 
+    /// Providers the limits row above the status bar leaves out
+    /// (`tui.hidden_limits`). A display filter only: limits are still fetched
+    /// for `kanban limits` and the executor's threshold routing.
+    pub fn hidden_limits(&self) -> Vec<String> {
+        self.tui
+            .get(Value::String("hidden_limits".to_string()))
+            .and_then(Value::as_sequence)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// An empty list drops the key so an untouched file stays untouched.
+    pub fn set_hidden_limits(&mut self, providers: &[String]) {
+        let key = Value::String("hidden_limits".to_string());
+        if providers.is_empty() {
+            self.tui.remove(&key);
+        } else {
+            self.tui.insert(
+                key,
+                Value::Sequence(providers.iter().cloned().map(Value::String).collect()),
+            );
+        }
+    }
+
     /// Preferred backend order for every backend picker in the TUI
     /// (`tui.backend_order`). Display only: launch resolution never reads it.
     pub fn backend_order(&self) -> Vec<String> {
@@ -748,6 +780,33 @@ mod tests {
         store.save_global_config(&config).expect("save");
         let raw = std::fs::read_to_string(store.global_config_path()).expect("raw");
         assert!(!raw.contains("hidden_projects"), "{raw}");
+    }
+
+    #[test]
+    fn hidden_limits_round_trip_and_empty_drops_key() {
+        let dir = tempfile::tempdir().expect("store");
+        let store = ProjectStore::at(dir.path());
+        assert!(
+            store
+                .load_global_config()
+                .unwrap()
+                .hidden_limits()
+                .is_empty()
+        );
+
+        let mut config = store.load_global_config().unwrap();
+        config.set_hidden_limits(&["codex".to_string(), "kimi".to_string()]);
+        store.save_global_config(&config).expect("save");
+        assert_eq!(
+            store.load_global_config().unwrap().hidden_limits(),
+            vec!["codex".to_string(), "kimi".to_string()]
+        );
+
+        let mut config = store.load_global_config().unwrap();
+        config.set_hidden_limits(&[]);
+        store.save_global_config(&config).expect("save");
+        let raw = std::fs::read_to_string(store.global_config_path()).expect("raw");
+        assert!(!raw.contains("hidden_limits"), "{raw}");
     }
 
     #[test]
