@@ -106,6 +106,13 @@ they are edited: press `s` on the Projects screen. Saved under the store
   `kanban` commands are untouched. Edited on the Global Settings Projects tab
   (one checkbox per registered project, ticked = shown); ticking every row
   and saving drops the key. The list footer counts hidden projects.
+- `tui.hidden_limits`: unset - provider names (`claude`, `codex`, `grok`,
+  `zai`, `synthetic`, `kimi`) the limits row above the status bar leaves out.
+  A display filter only: limits are still fetched, `kanban limits` prints
+  every provider and executor threshold routing is unaffected. Edited on the
+  Global Settings Limits tab (one checkbox per provider, ticked = shown);
+  ticking every row and saving drops the key. Hiding every configured
+  provider removes the row entirely.
 - `tui.backend_order`: unset - backend names in the order every project's
   backend pickers list them (task form, settings, executor-pool slots).
   Backends it does not name follow in config order. Display only: launch

@@ -250,7 +250,8 @@ renews its login token, and z.ai / synthetic / kimi re-fetch over HTTPS. A windo
 whose reset time has passed is dropped rather than shown frozen (synthetic's
 tick-regenerating quotas keep their seat until the next poll), and a provider
 with nothing current left reads `stale`. `kanban4ai limits` prints the same
-data, and `tui.show_limits: false` hides the row.
+data, and `tui.show_limits: false` hides the row. Single providers can be
+hidden on the Global Settings Limits tab (`tui.hidden_limits`).
 
 ### 5. Sessions, archives, projects, and data
 

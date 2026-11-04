@@ -855,7 +855,7 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  ✳ claude · ✕ grok · ◆ zai · ✦ synthetic · ☾ kimi"),
         Line::from("  click a provider to refresh now · % left and ↻ reset"),
         Line::from("  5h windows on the upper line, weekly/monthly on the lower"),
-        Line::from("  hide the row with tui.show_limits: false · kanban limits prints it"),
+        Line::from("  hide providers in Global Settings → Limits · kanban limits prints all"),
         Line::from(""),
         Line::from("?: toggle help · q/Esc: back · Ctrl+C twice: quit"),
         Line::from("Ctrl+C on the task thread: copy task to To Do"),
