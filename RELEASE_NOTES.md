@@ -1,3 +1,22 @@
+# kanban4ai 0.8.16
+
+Notes are from the reviewed diff since 0.8.15. There were no `.changes/` logs.
+
+- **Providers can be hidden from the limits row.** Global Settings gains a
+  Limits tab: one checkbox per provider (`claude`, `codex`, `grok`, `zai`,
+  `synthetic`, `kimi`), ticked means shown. Unticked names are stored in
+  `tui.hidden_limits`. The limits row above the status bar leaves them out,
+  and hiding every configured provider removes the row. Ticking every row
+  and saving drops the key. This is display only: limits are still fetched,
+  `kanban limits` prints every provider, and executor threshold routing is
+  unchanged.
+
+Board files, project `config.yaml`, journal records, and the sync protocol
+(3) stay readable by 0.8.15. Store format is still 5. Global `tui` is
+machine-local and a free-form map, so `hidden_limits` is not replicated and
+an older install ignores it. Nothing new is written that an older peer has
+to understand.
+
 # kanban4ai 0.8.15
 
 Notes are from the reviewed diff since 0.8.14. There were no `.changes/` logs.
