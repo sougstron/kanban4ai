@@ -902,6 +902,11 @@ pub struct ModalState {
     /// Global Settings Backends tab: every backend in picker order.
     pub backend_order: Vec<String>,
     pub backend_order_selected: usize,
+    /// Global Settings Backends tab: backends the pickers leave out.
+    pub hidden_backends: Vec<String>,
+    /// Settings form: every configured backend, hidden ones included, so
+    /// cap-map validation still accepts a backend its picker leaves out.
+    pub configured_backends: Vec<String>,
     /// Global Settings Sync tab; loaded the first time the tab shows.
     pub sync: super::sync_tab::SyncTab,
     pub purge_data: bool,
@@ -1029,6 +1034,8 @@ impl ModalState {
             limits_visibility_selected: 0,
             backend_order: Vec::new(),
             backend_order_selected: 0,
+            hidden_backends: Vec::new(),
+            configured_backends: Vec::new(),
             sync: Default::default(),
             purge_data: false,
             queue_enabled: true,
@@ -1835,7 +1842,7 @@ impl ModalState {
     }
 
     /// Up/Down walk the backend list; Shift/Ctrl+Up/Down (or K/J) carry the
-    /// focused backend one place up or down.
+    /// focused backend one place up or down; Space hides or shows it.
     fn input_backend_order(&mut self, key: ratatui::crossterm::event::KeyEvent) {
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         let len = self.backend_order.len();
@@ -1865,6 +1872,15 @@ impl ModalState {
             }
             KeyCode::End => {
                 self.backend_order_selected = len - 1;
+                return;
+            }
+            KeyCode::Char(' ') => {
+                let name = &self.backend_order[selected];
+                if let Some(index) = self.hidden_backends.iter().position(|n| n == name) {
+                    self.hidden_backends.remove(index);
+                } else {
+                    self.hidden_backends.push(name.clone());
+                }
                 return;
             }
             _ => None,
@@ -3085,6 +3101,7 @@ impl ModalState {
                 .map(|row| if row.visible { '1' } else { '0' })
                 .collect(),
             self.backend_order.join(","),
+            self.hidden_backends.join(","),
             self.purge_data.to_string(),
             self.queue_enabled.to_string(),
             raw_textarea_text(&self.max_running_total),
@@ -6225,7 +6242,8 @@ fn render_limits_visibility(frame: &mut Frame<'_>, app: &App, modal: &ModalState
     );
 }
 
-/// The Backends tab list: backend pickers in every project follow this order.
+/// The Backends tab list: backend pickers in every project follow this order
+/// and leave out unticked backends (unless a picker already selected one).
 fn render_backend_order(frame: &mut Frame<'_>, app: &App, modal: &ModalState, area: Rect) {
     let field = DialogField::BackendOrder;
     let active = modal.active_field() == field || app.is_hovered(HitAction::ModalField(field));
@@ -6237,16 +6255,27 @@ fn render_backend_order(frame: &mut Frame<'_>, app: &App, modal: &ModalState, ar
             .iter()
             .enumerate()
             .map(|(index, name)| {
-                ListItem::new(format!("{}. {}", index + 1, sanitize_terminal_text(name))).style(
-                    option_hover_style(app, HitAction::ModalOption { field, index }),
-                )
+                let mark = if modal.hidden_backends.contains(name) {
+                    "☐"
+                } else {
+                    "☑"
+                };
+                ListItem::new(format!(
+                    "{mark} {}. {}",
+                    index + 1,
+                    sanitize_terminal_text(name)
+                ))
+                .style(option_hover_style(
+                    app,
+                    HitAction::ModalOption { field, index },
+                ))
             })
             .collect()
     };
     let focused = modal.active_field() == field;
     let block = inside_border(
         Block::default()
-            .title(" Backend order (Shift+↑/↓ or K/J moves) ")
+            .title(" Space shows/hides · Shift+↑/↓ or K/J moves ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(select_border(app, active, false))),
         focused,

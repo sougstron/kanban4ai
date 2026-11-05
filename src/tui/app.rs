@@ -119,6 +119,9 @@ pub struct TuiSettings {
     pub hidden_projects: Vec<String>,
     /// Machine-wide backend picker order (Global Settings → Backends).
     pub backend_order: Vec<String>,
+    /// Backends the pickers leave out unless already selected (Global
+    /// Settings → Backends).
+    pub hidden_backends: Vec<String>,
     /// Draw the provider subscription-limits row above the status bar.
     pub show_limits: bool,
     /// Providers the limits row leaves out (Global Settings → Limits).
@@ -1271,6 +1274,7 @@ impl App {
             app.settings.hidden_projects = config.hidden_projects();
             app.settings.hidden_limits = config.hidden_limits();
             app.settings.backend_order = config.backend_order();
+            app.settings.hidden_backends = config.hidden_backends();
             app.token_costs = config.token_costs();
             // The projects list has no board, so its colors come from the
             // global settings rather than any project's `tui.theme`.
@@ -3479,6 +3483,7 @@ impl App {
             self.settings.hide_kanban_messages = effective.hide_kanban_messages;
             let global = self.ops.config.load_global().0;
             self.settings.backend_order = global.backend_order();
+            self.settings.hidden_backends = global.hidden_backends();
             self.token_costs = global.token_costs();
         }
         if self.request_tick_refresh(global_changed) {
@@ -5152,6 +5157,7 @@ impl App {
             }
         }
         modal.backend_order = backends;
+        modal.hidden_backends = config.hidden_backends();
         // One probe per dialog open, never per frame: the probe shells out to
         // pacman. `Some` means the package manager owns the binary and the
         // dialog shows its upgrade command instead of an "Update now" button.
@@ -5219,6 +5225,7 @@ impl App {
             self.settings.hidden_projects = config.hidden_projects();
             self.settings.hidden_limits = config.hidden_limits();
             self.settings.backend_order = config.backend_order();
+            self.settings.hidden_backends = config.hidden_backends();
             self.token_costs = config.token_costs();
         }
     }
@@ -5727,7 +5734,7 @@ impl App {
             value: None,
         })
         .chain(
-            self.ordered_backends(&config)
+            self.picker_backends(&config, &[modal.backend_text()])
                 .into_iter()
                 .map(|backend| SelectOption {
                     label: backend.clone(),
@@ -5777,6 +5784,19 @@ impl App {
         names
     }
 
+    /// [`Self::ordered_backends`] minus the backends Global Settings hides
+    /// (`tui.hidden_backends`). A hidden backend named in `keep` (the
+    /// picker's current value) stays listed so hiding it never rewrites an
+    /// existing selection.
+    fn picker_backends(&self, config: &BoardConfig, keep: &[Option<String>]) -> Vec<String> {
+        let mut names = self.ordered_backends(config);
+        names.retain(|name| {
+            !self.settings.hidden_backends.contains(name)
+                || keep.iter().flatten().any(|kept| kept == name)
+        });
+        names
+    }
+
     /// The `— none —` + `backend/model` option list shared by the six
     /// executor-pool slot selectors. Every configured backend × its models,
     /// annotated with the live provider numbers from the cached limits
@@ -5791,7 +5811,15 @@ impl App {
             label: "— none —".to_string(),
             value: None,
         }];
-        for backend in self.ordered_backends(config) {
+        // Backends a pool already uses stay listed even when hidden.
+        let pooled = orch
+            .executors
+            .middle
+            .iter()
+            .chain(&orch.executors.cheap)
+            .map(|candidate| candidate.backend.clone())
+            .collect::<Vec<_>>();
+        for backend in self.picker_backends(config, &pooled) {
             let backend = backend.as_str();
             let backend_settings = config
                 .agents
@@ -5900,29 +5928,35 @@ impl App {
         let Some(config) = self.modal_config(modal) else {
             return;
         };
-        let backends = self.ordered_backends(&config);
-        let backend_options = backends
-            .iter()
+        // Cap-map validation accepts every configured backend, hidden or not.
+        modal.configured_backends = self.ordered_backends(&config);
+        let backend_options = self
+            .picker_backends(&config, &[modal.backend_text()])
+            .into_iter()
             .map(|backend| SelectOption {
                 label: backend.clone(),
-                value: Some(backend.clone()),
+                value: Some(backend),
             })
             .collect::<Vec<_>>();
         modal.set_backend_options(backend_options);
         let default_agent = mapping_str(Some(&config.auto_launch), "default_agent")
             .unwrap_or_else(|| "opencode".to_string());
-        let role_backends = std::iter::once(SelectOption {
-            label: format!("Default backend ({default_agent})"),
-            value: None,
-        })
-        .chain(backends.iter().map(|backend| SelectOption {
-            label: backend.clone(),
-            value: Some(backend.clone()),
-        }))
-        .collect::<Vec<_>>();
-        modal.set_backend_options_for(AgentSlot::Designer, role_backends.clone());
-        modal.set_backend_options_for(AgentSlot::Reviewer, role_backends.clone());
-        modal.set_backend_options_for(AgentSlot::Arbiter, role_backends);
+        for slot in [AgentSlot::Designer, AgentSlot::Reviewer, AgentSlot::Arbiter] {
+            let role_backends = std::iter::once(SelectOption {
+                label: format!("Default backend ({default_agent})"),
+                value: None,
+            })
+            .chain(
+                self.picker_backends(&config, &[modal.backend_text_for(slot)])
+                    .into_iter()
+                    .map(|backend| SelectOption {
+                        label: backend.clone(),
+                        value: Some(backend),
+                    }),
+            )
+            .collect::<Vec<_>>();
+            modal.set_backend_options_for(slot, role_backends);
+        }
         modal.set_reviewer_on_changes_options(vec![
             SelectOption {
                 label: "Stay in Progress (re-queue)".to_string(),
@@ -7433,6 +7467,7 @@ impl App {
                     config.set_hidden_projects(&modal.hidden_project_ids());
                     config.set_hidden_limits(&modal.hidden_limit_providers());
                     config.set_backend_order(&modal.backend_order);
+                    config.set_hidden_backends(&modal.hidden_backends);
                     config.set_auto_mode(&auto);
                     config.set_project_sort(
                         &modal
@@ -7458,6 +7493,7 @@ impl App {
                 self.settings.hidden_projects = modal.hidden_project_ids();
                 self.settings.hidden_limits = modal.hidden_limit_providers();
                 self.settings.backend_order = modal.backend_order.clone();
+                self.settings.hidden_backends = modal.hidden_backends.clone();
                 self.clamp_project_selection();
                 self.settings.theme_name = projects_theme;
                 self.settings.follow_hyprland_theme = modal.follow_hyprland_theme;
@@ -9147,6 +9183,7 @@ fn default_project_settings() -> TuiSettings {
         project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
         hidden_projects: Vec::new(),
         backend_order: Vec::new(),
+        hidden_backends: Vec::new(),
         show_limits: true,
         hidden_limits: Vec::new(),
         hide_kanban_messages: false,
@@ -9273,6 +9310,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
         project_sort: crate::core::global::PROJECT_SORT_NAME.to_string(),
         hidden_projects: Vec::new(),
         backend_order: Vec::new(),
+        hidden_backends: Vec::new(),
         show_limits: tui_bool(&config.tui, "show_limits", true),
         hidden_limits: Vec::new(),
         hide_kanban_messages: tui_bool(&config.tui, "hide_kanban_messages", false),
@@ -9700,6 +9738,7 @@ fn is_known_settings_backend(modal: &ModalState, backend: &str) -> bool {
         .backend_options
         .iter()
         .any(|option| option.value.as_deref() == Some(backend))
+        || modal.configured_backends.iter().any(|name| name == backend)
 }
 
 fn canonicalize_backend_model_key(

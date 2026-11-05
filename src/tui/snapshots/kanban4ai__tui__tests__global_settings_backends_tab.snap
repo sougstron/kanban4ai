@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 10531
 expression: "render_at(&mut app, 80, 24)"
 ---
 ┌ Projects · Enter open · n new · r rename · p path · s settings · S stats · d ┐
@@ -10,13 +9,13 @@ expression: "render_at(&mut app, 80, 24)"
 │    /tmp/k4┌ Global settings ─────────────────────────────────────┐           │
 │           │ Com │ Des │ Rev │ Exe │ Aut │ Bck │ Prj │ Lim │ Syn  │           │
 │           │──────────────────────────────────────────────────────│           │
-│           │┏ Backend order (Shift+↑/↓ or K/J moves) ━━━━━━━━━━━━┓│           │
-│           │┃  1. claude                                         ┃│           │
-│           │┃  2. opencode                                       ┃│           │
-│           │┃  3. codex                                          ┃│           │
-│           │┃  4. omp                                            ┃│           │
-│           │┃  5. pi                                             ┃│           │
-│           │┃› 6. kimi                                           ┃│           │
+│           │┏ Space shows/hides · Shift+↑/↓ or K/J moves ━━━━━━━━┓│           │
+│           │┃  ☑ 1. claude                                       ┃│           │
+│           │┃  ☑ 2. opencode                                     ┃│           │
+│           │┃  ☑ 3. codex                                        ┃│           │
+│           │┃  ☑ 4. omp                                          ┃│           │
+│           │┃  ☑ 5. pi                                           ┃│           │
+│           │┃› ☐ 6. kimi                                         ┃│           │
 │           │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛│           │
 │           │┌────────────────────────────────────────────────────┐│           │
 │           ││[ Save ]  [ Cancel ]                                ││           │
