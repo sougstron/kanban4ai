@@ -1,13 +1,11 @@
 # Updater internals
 
 Reference detail for the updater implementation. Read it when touching
-`core/update.rs` or `core/http.rs`. Maintainer releases use two project-local
-skills instead: [`update-app`](../.agents/skills/update-app/SKILL.md)
-("Update app X.Y.Z") bumps the version, runs the gates, and stages a local
-candidate binary for manual testing without publishing or installing it;
-[`release-app`](../.agents/skills/release-app/SKILL.md) ("Release X.Y.Z")
-publishes that tested candidate to Git/GitHub, AUR, this laptop, and the sync
-server.
+`core/update.rs` or `core/http.rs`. Maintainer releases use the project-local
+[`update-app`](../.agents/skills/update-app/SKILL.md) skill: "Update app" (or
+"Update app and release") picks the next patch version unless a higher minor or
+major is requested, runs the gates, and releases to Git/GitHub, AUR, this
+laptop, and the sync server in one pass.
 
 ## Updater (`core/update.rs`, `core/http.rs`, `kanban update`)
 
