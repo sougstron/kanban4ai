@@ -118,6 +118,13 @@ they are edited: press `s` on the Projects screen. Saved under the store
   Backends it does not name follow in config order. Display only: launch
   resolution and defaults ignore it. Edited on the Global Settings Backends
   tab (Shift+↑/↓ or K/J moves the focused backend).
+- `tui.hidden_backends`: unset - backend names every project's backend
+  pickers (task form, settings, executor-pool slots) leave out. A display
+  filter only: a picker still lists a hidden backend its current value
+  already names (a task, role, default agent or pool picked it before it was
+  hidden), and launch resolution ignores the list. Edited on the Global
+  Settings Backends tab (Space unticks/ticks the focused backend); ticking
+  every row and saving drops the key.
 - `daemon.interval`: 60 - seconds between `kanban daemon` ticks. `--interval` on the command line overrides. This is the only orchestration cadence that lives in the store config, because the daemon spans projects.
 - `tui.file_manager`: unset - command the Projects screen's `o folder` button
   hands the work folder to (the folder is appended as the last argument;

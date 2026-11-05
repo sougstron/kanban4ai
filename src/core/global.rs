@@ -403,6 +403,41 @@ impl GlobalConfig {
         }
     }
 
+    /// Backends the TUI's backend pickers leave out (`tui.hidden_backends`).
+    /// A display filter only: a picker still lists a hidden backend that its
+    /// current value already names, and launch resolution ignores the list.
+    pub fn hidden_backends(&self) -> Vec<String> {
+        let mut hidden: Vec<String> = Vec::new();
+        for name in self
+            .tui
+            .get(Value::String("hidden_backends".to_string()))
+            .and_then(Value::as_sequence)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            if !hidden.iter().any(|known| known == name) {
+                hidden.push(name.to_string());
+            }
+        }
+        hidden
+    }
+
+    /// An empty list drops the key so an untouched file stays untouched.
+    pub fn set_hidden_backends(&mut self, names: &[String]) {
+        let key = Value::String("hidden_backends".to_string());
+        if names.is_empty() {
+            self.tui.remove(&key);
+        } else {
+            self.tui.insert(
+                key,
+                Value::Sequence(names.iter().cloned().map(Value::String).collect()),
+            );
+        }
+    }
+
     /// Seconds between daemon ticks. Missing, zero, or unparseable values
     /// read as 60 so a hand-edited file still yields a usable cadence.
     pub fn daemon_interval(&self) -> u64 {
@@ -753,6 +788,24 @@ mod tests {
         store.save_global_config(&config).expect("save");
         let raw = std::fs::read_to_string(store.global_config_path()).unwrap();
         assert!(!raw.contains("backend_order"), "{raw}");
+    }
+
+    #[test]
+    fn hidden_backends_round_trip_dedup_and_empty_drops_key() {
+        let dir = tempfile::tempdir().expect("store");
+        let store = ProjectStore::at(dir.path());
+        let mut config = store.load_global_config().unwrap();
+        assert!(config.hidden_backends().is_empty());
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        config.set_hidden_backends(&names(&["grok", " ", "kimi", "grok"]));
+        store.save_global_config(&config).expect("save");
+        let hidden = store.load_global_config().unwrap().hidden_backends();
+        assert_eq!(hidden, names(&["grok", "kimi"]));
+
+        config.set_hidden_backends(&[]);
+        store.save_global_config(&config).expect("save");
+        let raw = std::fs::read_to_string(store.global_config_path()).unwrap();
+        assert!(!raw.contains("hidden_backends"), "{raw}");
     }
 
     #[test]

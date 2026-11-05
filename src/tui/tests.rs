@@ -10528,6 +10528,11 @@ fn global_settings_backends_tab_reorders_backend_pickers() {
     app.handle_key(key(KeyCode::Char('K'))).expect("move up");
     let expected = app.modal.as_ref().unwrap().backend_order.clone();
     assert_eq!(expected[expected.len() - 2], before[before.len() - 1]);
+    // Space unticks the focused backend; a second press would tick it again.
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("hide backend");
+    let hidden = vec![expected[expected.len() - 2].clone()];
+    assert_eq!(app.modal.as_ref().unwrap().hidden_backends, hidden);
     insta::assert_snapshot!("global_settings_backends_tab", render_at(&mut app, 80, 24));
 
     app.modal
@@ -10537,11 +10542,11 @@ fn global_settings_backends_tab_reorders_backend_pickers() {
     app.handle_key(key(KeyCode::Enter)).expect("save settings");
     assert!(app.modal.is_none());
     assert_eq!(app.settings.backend_order, expected);
+    assert_eq!(app.settings.hidden_backends, hidden);
     let store = ProjectStore::at(store_dir.path());
-    assert_eq!(
-        store.load_global_config().unwrap().backend_order(),
-        expected
-    );
+    let saved = store.load_global_config().unwrap();
+    assert_eq!(saved.backend_order(), expected);
+    assert_eq!(saved.hidden_backends(), hidden);
 
     let _ = std::fs::remove_dir_all(&work);
 }
@@ -10625,6 +10630,46 @@ fn task_form_backend_picker_follows_the_global_backend_order() {
             .iter()
             .any(|value| value.as_deref() == Some("opencode"))
     );
+}
+
+#[test]
+fn hidden_backends_leave_pickers_but_keep_an_existing_selection() {
+    let (_dir, mut app) = populated_app();
+    app.settings.hidden_backends = vec!["claude".to_string(), "codex".to_string()];
+    let backend_values = |app: &App| {
+        app.modal
+            .as_ref()
+            .expect("modal")
+            .backend_options
+            .iter()
+            .filter_map(|option| option.value.clone())
+            .collect::<Vec<_>>()
+    };
+
+    // A new task never offers a hidden backend.
+    app.handle_key(key(KeyCode::Char('n'))).expect("new");
+    let values = backend_values(&app);
+    assert!(values.iter().any(|value| value == "opencode"), "{values:?}");
+    assert!(!values.iter().any(|value| value == "claude"), "{values:?}");
+    assert!(!values.iter().any(|value| value == "codex"), "{values:?}");
+    app.handle_key(key(KeyCode::Esc)).expect("close");
+
+    // A task that already runs on a hidden backend keeps it selectable.
+    for _ in 0..8 {
+        if app
+            .current_task()
+            .is_some_and(|task| task.agent_backend.as_deref() == Some("claude"))
+        {
+            break;
+        }
+        app.handle_key(key(KeyCode::Right)).expect("next column");
+    }
+    app.handle_key(key(KeyCode::Char('e'))).expect("edit");
+    let modal = app.modal.as_ref().expect("modal");
+    assert_eq!(modal.backend_text().as_deref(), Some("claude"));
+    let values = backend_values(&app);
+    assert!(values.iter().any(|value| value == "claude"), "{values:?}");
+    assert!(!values.iter().any(|value| value == "codex"), "{values:?}");
 }
 
 #[test]
