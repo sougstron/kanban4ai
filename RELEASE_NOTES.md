@@ -1,3 +1,29 @@
+# kanban4ai 0.8.17
+
+Notes are from the reviewed diff since 0.8.16. There were no `.changes/` logs.
+
+- **Backends can be hidden from every picker.** Global Settings gains a
+  checkbox per backend on its Backends tab (`Space` toggles the focused
+  row). Unticked names are stored in `tui.hidden_backends`; ticking every
+  row and saving drops the key. Backend pickers in the task form, settings,
+  and executor-pool slots leave hidden names out, but a picker still lists a
+  hidden backend its current value already names (a task, role, default
+  agent, or pool picked it before it was hidden), and launch resolution
+  ignores the list. This is display only.
+- **The maintainer update and release skills are one.**
+  `.agents/skills/update-app` now covers the whole release-everywhere
+  pipeline — canonical Git/GitHub, both stable AUR packages, this laptop,
+  and the kanban-server sync node — and picks the next version itself
+  (patch bump by default, correcting same-or-skipped patch requests).
+  `.agents/skills/release-app` and its `.claude/skills` link are removed;
+  `docs/releasing.md` describes the merged flow.
+
+Board files, project `config.yaml`, journal records, and the sync protocol
+(3) stay readable by 0.8.16. Store format is still 5. Global `tui` is
+machine-local and a free-form map, so `hidden_backends` is not replicated
+and an older install ignores it. Nothing new is written that an older peer
+has to understand.
+
 # kanban4ai 0.8.16
 
 Notes are from the reviewed diff since 0.8.15. There were no `.changes/` logs.
