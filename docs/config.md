@@ -581,7 +581,11 @@ default_permission: readonly
 backends:
   claude:
     permissions:
-      audit: ["--permission-mode", "plan"]
+      # Custom presets replace the built-in flags: keep the bypass so headless
+      # runs never stop on an approval prompt.
+      audit:
+        - "--dangerously-skip-permissions"
+        - "--disallowedTools=Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch"
   codex:
     permissions:
       local-edits:
@@ -603,16 +607,22 @@ must be lists of strings. `{kanban_dir}` expands to the board directory and
 | Claude | Edit/Write/MultiEdit/NotebookEdit disabled; shell still writable | Unsupported | Skip permissions |
 | Codex | Prompt only; callbacks retain full access | workspace-write sandbox, board directory writable, approvals never | Bypass approvals and sandbox |
 | Pi | edit/write tools disabled; shell still writable | Unsupported | Existing headless defaults |
-| Grok | Prompt only | Unsupported | bypassPermissions |
+| Grok | search_replace/write_file/apply_patch/edit_notebook disabled; shell still writable | Unsupported | bypassPermissions |
 | OMP, Kimi, OpenCode | Prompt only | Unsupported | Existing headless defaults |
 
 Readonly always includes the investigation-only prompt. Partial and prompt-only
-modes emit an explicit warning on the task thread before launch; they are **not
-security boundaries**. Shell access lets agents run heartbeat/context/done and
-other board callbacks. Unsupported presets fail before spawning an agent, with
-an error naming the backend and preset. Custom presets override built-ins and
-are the administrator's responsibility: keep board callbacks writable and
-avoid interactive approval prompts in headless runs.
+modes emit an explicit warning on the task thread before launch — once, and
+again only when the warning text changes — they are **not security boundaries**.
+Shell access lets agents run heartbeat/context/done and other board callbacks.
+Unsupported presets fail before spawning an agent, with an error naming the
+backend and preset. Backends outside the table above (custom agent names) have
+no built-ins at all: once a task or project default selects any preset, even
+`full`, they fail until `backends.<name>.permissions.<preset>` is defined. Avoid
+`--permission-mode plan` or `default` in custom Claude/Grok presets: headless
+runs cannot answer their approval prompts, so board callbacks (heartbeat,
+context, done) can be refused. Custom presets override built-ins and are the
+administrator's responsibility: keep board callbacks writable and avoid
+interactive approval prompts in headless runs.
 
 In preset mode, backend permission flags in `extra_args` are removed before
 preset arguments are appended (including Codex sandbox/approval config

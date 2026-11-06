@@ -217,13 +217,43 @@ impl ThreadManager {
     /// come from every process that pumps the store, so an in-process dedupe
     /// is not enough to keep a stuck condition from flooding the thread.
     pub fn post_board_note(&self, task_id: &str, body: &str) -> Result<Option<Message>> {
+        self.post_board_note_if(task_id, body, |thread| {
+            thread
+                .messages
+                .last()
+                .is_some_and(|last| is_board_note(last) && strip_repeat(&last.body) == body)
+        })
+    }
+
+    /// Post a board note unless the latest board note starting with `topic`
+    /// already says `body`, however many messages came after it. Keeps a
+    /// condition restated on every launch (a permission warning) to one note
+    /// until it changes.
+    pub fn post_board_note_on_change(
+        &self,
+        task_id: &str,
+        topic: &str,
+        body: &str,
+    ) -> Result<Option<Message>> {
+        self.post_board_note_if(task_id, body, |thread| {
+            thread
+                .messages
+                .iter()
+                .rev()
+                .find(|m| is_board_note(m) && m.body.starts_with(topic))
+                .is_some_and(|last| strip_repeat(&last.body) == body)
+        })
+    }
+
+    fn post_board_note_if(
+        &self,
+        task_id: &str,
+        body: &str,
+        is_repeat: impl FnOnce(&Thread) -> bool,
+    ) -> Result<Option<Message>> {
         let _guard = self.lock()?;
         let mut thread = self.load(task_id)?;
-        if thread
-            .messages
-            .last()
-            .is_some_and(|last| is_board_note(last) && strip_repeat(&last.body) == body)
-        {
+        if is_repeat(&thread) {
             return Ok(None);
         }
         let mut message = Message::new(
@@ -600,5 +630,36 @@ mod tests {
         let thread = parse_thread(raw, "TASK-415").unwrap();
         let resolved = thread.messages[0].resolved_at.unwrap();
         assert_eq!(timefmt::format(&resolved), "2026-10-12T14:23:28.372600");
+    }
+
+    #[test]
+    fn on_change_note_skips_restated_topic_until_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let tm = ThreadManager::new(dir.path()).unwrap();
+        let warn = "Permission readonly on codex: prompt-only";
+        assert!(
+            tm.post_board_note_on_change("T-1", "Permission ", warn)
+                .unwrap()
+                .is_some()
+        );
+        tm.post_board_note("T-1", "▶ launch session=ses-a").unwrap();
+        tm.post_board_note("T-1", "■ exit session=ses-a").unwrap();
+        assert!(
+            tm.post_board_note_on_change("T-1", "Permission ", warn)
+                .unwrap()
+                .is_none()
+        );
+        let changed = "Permission readonly on grok: file-edit tools disabled";
+        assert!(
+            tm.post_board_note_on_change("T-1", "Permission ", changed)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            tm.post_board_note_on_change("T-1", "Permission ", warn)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(tm.load("T-1").unwrap().messages.len(), 5);
     }
 }
