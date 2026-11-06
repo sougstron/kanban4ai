@@ -44,6 +44,10 @@ pub struct ResolvedPermission {
     pub warning: Option<String>,
 }
 
+/// Every permission warning starts with this, so the thread can tell a
+/// restated warning from a changed one.
+pub const PERMISSION_WARNING_TOPIC: &str = "Permission ";
+
 pub fn resolve_permission(
     config: &BoardConfig,
     backend: &AgentBackendConfig,
@@ -97,10 +101,17 @@ pub fn resolve_permission(
                         args.extend(["--exclude-tools".into(), "edit,write".into()]);
                         "file-edit tools disabled; shell and extension tools can still write"
                     }
+                    "grok" => {
+                        args.extend([
+                            "--disallowed-tools".into(),
+                            "search_replace,write_file,apply_patch,edit_notebook".into(),
+                        ]);
+                        "file-edit tools disabled; shell and extension tools can still write"
+                    }
                     _ => "prompt-only restriction; backend tools can still write",
                 };
                 warning = Some(format!(
-                    "Permission readonly on {}: {enforcement}. Shell access is retained for kanban callbacks.",
+                    "{PERMISSION_WARNING_TOPIC}readonly on {}: {enforcement}. Shell access is retained for kanban callbacks.",
                     backend.name
                 ));
                 args
@@ -151,7 +162,17 @@ fn strip_permission_flags(backend: &str, args: &[String]) -> Vec<String> {
             ],
             &["--sandbox", "-s", "--ask-for-approval", "-a", "--add-dir"],
         ),
-        "grok" => (&["--always-approve"], &["--permission-mode"]),
+        "grok" => (
+            &["--always-approve"],
+            &[
+                "--permission-mode",
+                "--disallowed-tools",
+                "--disallowedTools",
+                "--allowed-tools",
+                "--allowedTools",
+                "--tools",
+            ],
+        ),
         "kimi" => (&["--yolo", "--yes", "-y"], &[]),
         "omp" => (&["--auto-approve"], &["--approval-mode"]),
         "pi" => (&[], &["--exclude-tools", "-xt"]),
@@ -1723,6 +1744,21 @@ mod permission_tests {
                     .to_string()
                     .contains(name)
             );
+            if matches!(name, "claude" | "grok" | "pi") {
+                assert!(
+                    readonly.warning.as_deref().unwrap().contains("file-edit"),
+                    "{name}"
+                );
+            }
+            if name == "grok" {
+                let at = readonly
+                    .extra_args
+                    .iter()
+                    .position(|a| a == "--disallowed-tools")
+                    .unwrap();
+                assert!(readonly.extra_args[at + 1].contains("search_replace"));
+                assert!(readonly.extra_args[at + 1].contains("write_file"));
+            }
             let edits = resolve(&config, name, Some("edits"));
             assert_eq!(edits.is_ok(), name == "codex", "{name}");
         }

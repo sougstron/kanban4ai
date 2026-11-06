@@ -47,8 +47,11 @@ fn launch(
             .and_then(|tm| tm.post_board_note(&task.id, &format!("Agent launch failed: {err}")));
     })?;
     if let Some(warning) = &plan.permission_warning {
-        crate::core::thread::ThreadManager::new(roots.data_root)?
-            .post_board_note(&task.id, warning)?;
+        crate::core::thread::ThreadManager::new(roots.data_root)?.post_board_note_on_change(
+            &task.id,
+            crate::agent::backends::PERMISSION_WARNING_TOPIC,
+            warning,
+        )?;
     }
     let started = spawn_plan(roots, &plan, &auto_launch)?;
     if started

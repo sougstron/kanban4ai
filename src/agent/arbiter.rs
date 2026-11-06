@@ -134,7 +134,13 @@ fn arbiter_pass(ops: &Operations, task_id: &str) -> Result<()> {
     )?;
     backend.extra_args = permission.extra_args;
     if let Some(warning) = permission.warning {
-        ops.post_queue_note(task_id, &warning);
+        let _ = ops.thread_manager().and_then(|tm| {
+            tm.post_board_note_on_change(
+                task_id,
+                crate::agent::backends::PERMISSION_WARNING_TOPIC,
+                &warning,
+            )
+        });
     }
     let prompt = arbiter_prompt(&task, &ops.task_context(task_id)?, &questions);
 
