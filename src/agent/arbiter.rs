@@ -124,7 +124,18 @@ fn arbiter_pass(ops: &Operations, task_id: &str) -> Result<()> {
         .ok_or_else(|| KanbanError::Invalid(format!("no such task: {task_id}")))?;
     let config = ops.config.load()?;
     let settings = resolve_bot_launch_settings(&config, &mode.arbiter_bot())?;
-    let backend = backend_config(&config, &settings.backend)?;
+    let mut backend = backend_config(&config, &settings.backend)?;
+    let permission = crate::agent::backends::resolve_permission(
+        &config,
+        &backend,
+        None,
+        &ops.roots().kanban_dir(),
+        ops.roots().work_path,
+    )?;
+    backend.extra_args = permission.extra_args;
+    if let Some(warning) = permission.warning {
+        ops.post_queue_note(task_id, &warning);
+    }
     let prompt = arbiter_prompt(&task, &ops.task_context(task_id)?, &questions);
 
     let logs = ops.storage.kanban_dir.join("logs");

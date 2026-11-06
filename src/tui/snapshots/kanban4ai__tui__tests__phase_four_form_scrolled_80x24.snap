@@ -7,8 +7,8 @@ expression: output
 ││TASK-001 Questio│││                  │││TASK-002 Impleme│││                  │
 ││? Choose a rout…│││                  │││Dropdown work   │││                  │
 ││☑ interact┌ New task ────────────────────────────────────────────┐           │
-│└──────────│┌ Readonly ──────────────────────────────────────────┐│           │
-│           ││☐ investigate without changing project files (Space ││           │
+│└──────────│┌ Permission · Space cycles, ←/→ inside ─────────────┐│           │
+│           ││Project default                                     ││           │
 │           ││                                                    ││           │
 │           │└────────────────────────────────────────────────────┘│           │
 │           │┌ Chain to ──────────────────────────────────────────┐│           │

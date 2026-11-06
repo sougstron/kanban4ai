@@ -105,7 +105,8 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let description_lines = task_description_lines(&task);
     let isolated = task.worktree.is_some();
     let conflicted = task.integration == IntegrationState::Conflict;
-    let meta_extra_lines = u16::from(waiting)
+    let meta_extra_lines = u16::from(task.permission().is_some_and(|p| p != "full"))
+        + u16::from(waiting)
         + u16::from(wait_deadline.is_some())
         + u16::from(task.restart_at.is_some() || session_state == Some(SessionState::Crashed))
         + u16::from(task.launch_at.is_some())
@@ -382,8 +383,11 @@ fn render_meta(
             timefmt::format(&task.updated_at)
         )),
     ];
-    if task.readonly {
-        meta.push(Line::from("🔒 Readonly: project-file writes disabled"));
+    if let Some(permission) = task.permission().filter(|p| *p != "full") {
+        meta.push(Line::from(format!(
+            "🔒 Permission: {}",
+            sanitize_terminal_text(permission)
+        )));
     }
     if task.silence {
         meta.push(Line::from(

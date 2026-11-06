@@ -42,7 +42,14 @@ fn launch(
     if !auto_launch.enabled {
         return Ok(false);
     }
-    let plan = build_launch_plan(roots, task, session_id, revert)?;
+    let plan = build_launch_plan(roots, task, session_id, revert).inspect_err(|err| {
+        let _ = crate::core::thread::ThreadManager::new(roots.data_root)
+            .and_then(|tm| tm.post_board_note(&task.id, &format!("Agent launch failed: {err}")));
+    })?;
+    if let Some(warning) = &plan.permission_warning {
+        crate::core::thread::ThreadManager::new(roots.data_root)?
+            .post_board_note(&task.id, warning)?;
+    }
     let started = spawn_plan(roots, &plan, &auto_launch)?;
     if started
         && backend_has_catalog(&plan.backend)

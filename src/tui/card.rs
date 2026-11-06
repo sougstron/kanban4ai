@@ -405,8 +405,11 @@ pub fn badges(
     {
         badges.push((format!("🕐 {}", launch_at.format("%H:%M")), app.theme.focus));
     }
-    if task.readonly {
-        badges.push(("🔒 readonly".to_string(), app.theme.muted));
+    if let Some(permission) = task.permission().filter(|p| *p != "full") {
+        badges.push((
+            format!("🔒 {}", sanitize_terminal_text(permission)),
+            app.theme.muted,
+        ));
     }
     if task.silence {
         badges.push(("🔇 silence".to_string(), app.theme.warn));

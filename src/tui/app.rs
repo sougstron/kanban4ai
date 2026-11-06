@@ -5724,6 +5724,13 @@ impl App {
         let Ok(config) = self.ops.config.load() else {
             return;
         };
+        modal.permission_choices = std::iter::once(None)
+            .chain(config.permission_names().into_iter().map(Some))
+            .collect();
+        if !modal.permission_choices.contains(&modal.permission) {
+            modal.permission_choices.push(modal.permission.clone());
+        }
+        modal.permission_default = config.default_permission();
         // Task forms lead with a "Default backend" entry (value None) so a
         // task can follow the project's `auto_launch.default_agent` instead
         // of pinning a concrete backend at creation time.
@@ -7631,7 +7638,7 @@ impl App {
                     agent_backend: modal.backend_text(),
                     agent_name: modal.agent_text(),
                     interactive: false,
-                    readonly: modal.readonly,
+                    permission: modal.permission.clone(),
                     silence: modal.silence,
                     use_designer: modal.use_designer,
                     use_reviewer: modal.use_reviewer,
@@ -7686,7 +7693,7 @@ impl App {
                         agent_backend: Some(modal.backend_text()),
                         agent_name: Some(modal.agent_text()),
                         interactive: None,
-                        readonly: Some(modal.readonly),
+                        permission: Some(modal.permission.clone()),
                         silence: Some(modal.silence),
                         use_designer: Some(modal.use_designer),
                         use_reviewer: Some(modal.use_reviewer),
@@ -9068,7 +9075,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::ArbiterAgentSettings
         | DialogField::TaskOptions
         | DialogField::Links
-        | DialogField::Readonly
+        | DialogField::Permission
         | DialogField::Silence
         | DialogField::UseOrchestrator
         | DialogField::UseDesigner

@@ -467,6 +467,97 @@ impl Default for BoardConfig {
 }
 
 impl BoardConfig {
+    /// Project override; the auto_launch spelling also participates in Agent inheritance.
+    pub fn default_permission(&self) -> Option<String> {
+        self.extras
+            .get("default_permission")
+            .or_else(|| self.auto_launch.get("default_permission"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+    }
+
+    fn permission_map(&self, backend: &str) -> Option<&Mapping> {
+        self.extras
+            .get("backends")
+            .and_then(Value::as_mapping)
+            .and_then(|m| m.get(backend))
+            .and_then(Value::as_mapping)
+            .and_then(|m| m.get("permissions"))
+            .and_then(Value::as_mapping)
+    }
+
+    pub fn configured_permission_args(
+        &self,
+        backend: &str,
+        preset: &str,
+    ) -> crate::core::error::Result<Option<Vec<String>>> {
+        let value = self
+            .permission_map(backend)
+            .and_then(|m| m.get(preset))
+            .or_else(|| {
+                self.agents
+                    .get(backend)
+                    .and_then(Value::as_mapping)
+                    .and_then(|m| m.get("permissions"))
+                    .and_then(Value::as_mapping)
+                    .and_then(|m| m.get(preset))
+            });
+        value
+            .map(|v| {
+                v.as_sequence()
+                    .and_then(|args| args.iter().map(|a| a.as_str().map(str::to_owned)).collect())
+                    .ok_or_else(|| {
+                        crate::core::error::KanbanError::Invalid(format!(
+                            "permissions.{preset} for {backend} must be a list of strings"
+                        ))
+                    })
+            })
+            .transpose()
+    }
+
+    pub fn permission_names(&self) -> Vec<String> {
+        let mut custom = std::collections::BTreeSet::new();
+        for backends in [
+            Some(&self.agents),
+            self.extras.get("backends").and_then(Value::as_mapping),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for backend in backends.values() {
+                if let Some(permissions) = backend.get("permissions").and_then(Value::as_mapping) {
+                    custom.extend(
+                        permissions
+                            .keys()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned),
+                    );
+                }
+            }
+        }
+        let mut names: Vec<String> = ["readonly", "edits", "full"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        custom.retain(|p| !names.contains(p));
+        names.extend(custom);
+        names
+    }
+
+    pub fn validate_permission(&self, permission: Option<&str>) -> crate::core::error::Result<()> {
+        if let Some(preset) = permission.filter(|p| !p.trim().is_empty())
+            && !self.permission_names().iter().any(|p| p == preset)
+        {
+            return Err(crate::core::error::KanbanError::Invalid(format!(
+                "unknown permission preset '{preset}'; known: {}",
+                self.permission_names().join(", ")
+            )));
+        }
+        Ok(())
+    }
+
     /// Task override > effective project placement (already inherited from global).
     pub fn runner_for(&self, task: Option<Runner>) -> Runner {
         task.unwrap_or_else(|| {
