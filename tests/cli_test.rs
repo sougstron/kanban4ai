@@ -414,12 +414,12 @@ fn create_can_mark_a_task_readonly() {
         .get_task("TASK-001")
         .unwrap()
         .unwrap();
-    assert!(task.readonly);
+    assert_eq!(task.permission(), Some("readonly"));
     kanban(&dir)
         .args(["show", "TASK-001"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Readonly: on"));
+        .stdout(predicate::str::contains("Permission: readonly"));
 }
 
 #[test]
@@ -2019,4 +2019,48 @@ fn arbiter_answers_open_questions_through_its_backend() {
         .assert()
         .success()
         .stdout(predicate::str::contains("a or b?").not());
+}
+
+#[test]
+fn named_permissions_create_edit_clear_and_validate() {
+    let dir = board();
+    kanban(&dir)
+        .args(["create", "Restricted", "--permission", "edits"])
+        .assert()
+        .success();
+    let ops = Operations::new(dir.data_root());
+    assert_eq!(
+        ops.get_task("TASK-001").unwrap().unwrap().permission(),
+        Some("edits")
+    );
+    kanban(&dir)
+        .args(["edit", "TASK-001", "--permission", "readonly"])
+        .assert()
+        .success();
+    assert_eq!(
+        ops.get_task("TASK-001").unwrap().unwrap().permission(),
+        Some("readonly")
+    );
+    kanban(&dir)
+        .args(["list", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"permission\": \"readonly\""))
+        .stdout(predicate::str::contains("\"readonly\": true"));
+    kanban(&dir)
+        .args(["edit", "TASK-001", "--permission", ""])
+        .assert()
+        .success();
+    assert_eq!(
+        ops.get_task("TASK-001").unwrap().unwrap().permission(),
+        None
+    );
+    kanban(&dir)
+        .args(["create", "Bad", "--permission", "missing"])
+        .assert()
+        .failure();
+    kanban(&dir)
+        .args(["create", "Conflict", "--readonly", "--permission", "full"])
+        .assert()
+        .failure();
 }

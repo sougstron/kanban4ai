@@ -29,7 +29,7 @@ fn parses_python_written_task_with_agent_fields() {
     assert_eq!(task.ai_model.as_deref(), Some("opus"));
     assert_eq!(task.agent_backend.as_deref(), Some("claude"));
     assert!(task.interactive);
-    assert!(!task.readonly);
+    assert_eq!(task.permission(), None);
     assert!(!task.silence);
     assert_eq!(task.context_size, 2840);
     assert_eq!(task.review_edits, "");
@@ -327,7 +327,7 @@ fn rust_written_task_is_parseable_and_stable() {
             agent_backend: Some("claude".into()),
             agent_name: None,
             interactive: true,
-            readonly: true,
+            permission: Some("readonly".into()),
             silence: false,
             use_designer: false,
             use_reviewer: false,
@@ -348,4 +348,22 @@ fn rust_written_task_is_parseable_and_stable() {
     let reloaded = storage2.load_task(&task.id).unwrap().unwrap();
     assert_eq!(task, reloaded);
     assert_eq!(reloaded.description, "line one\n\nline two with --- dashes");
+}
+
+#[test]
+fn legacy_readonly_and_named_permission_round_trip() {
+    let mut task = kanban4ai::core::models::Task::new("TASK-001", "Permissions");
+    task.set_permission(Some("readonly".into()));
+    let legacy = serde_yaml_ng::to_string(&task).unwrap();
+    assert!(legacy.contains("readonly: true"));
+    assert!(!legacy.contains("permission:"));
+    let loaded: kanban4ai::core::models::Task = serde_yaml_ng::from_str(&legacy).unwrap();
+    assert_eq!(loaded.permission(), Some("readonly"));
+    assert_eq!(serde_yaml_ng::to_string(&loaded).unwrap(), legacy);
+    task.set_permission(Some("edits".into()));
+    let named = serde_yaml_ng::to_string(&task).unwrap();
+    assert!(!named.contains("readonly:"));
+    let loaded: kanban4ai::core::models::Task = serde_yaml_ng::from_str(&named).unwrap();
+    assert_eq!(loaded.permission(), Some("edits"));
+    assert_eq!(serde_yaml_ng::to_string(&loaded).unwrap(), named);
 }

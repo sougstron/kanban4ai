@@ -563,8 +563,61 @@ Per-task persona: `task.agent_name` is passed to opencode as `--agent`, overridi
 
 Built-in backends:
 - **opencode**: `opencode run --title "<id>: <title>" [extra_args] [--model M] [--variant E] [--agent A]` plus the prompt file as the last argument. A task's `ai_effort` (or the backend `effort` default) is passed as `--variant`, opencode's per-model reasoning-effort selector.
-- **claude** (Claude Code): `claude --print [extra_args] [--model M] [--effort E]` plus the prompt file as the last argument. Default `extra_args` is `["--dangerously-skip-permissions"]` — tighten in config for stricter permissions. Default models are the `fable`/`opus`/`sonnet`/`haiku` aliases; `ai_effort` is passed as `--effort` (`low`/`medium`/`high`/`xhigh`/`max`).
+- **claude** (Claude Code): `claude --print [extra_args] [--model M] [--effort E]` plus the prompt file as the last argument. Default `extra_args` is `["--dangerously-skip-permissions"]` — select a named permission preset for stricter permissions (see below). Default models are the `fable`/`opus`/`sonnet`/`haiku` aliases; `ai_effort` is passed as `--effort` (`low`/`medium`/`high`/`xhigh`/`max`).
 - **codex**: `<command> exec --json [extra_args] [--model M] [-c model_reasoning_effort=E]` plus the prompt file as the last argument. `--json` emits Codex's JSONL event stream, which is captured for telemetry, replies, and input provenance. `ai_effort` is passed through Codex's `model_reasoning_effort` config override (`low`/`medium`/`high`/`xhigh`/`max`, plus `ultra` where the model supports it). The default extra args also include `--dangerously-bypass-approvals-and-sandbox` and `--skip-git-repo-check`, matching autonomous launches and kanban's support for non-git folders. Codex has no launch-time persona flag, so `agent_name` is ignored. Codex stdin is closed by the wrapper because `exec` may read additional prompt input from a pane TTY.
 - **omp** / **pi** (the "pi" agent family): `<command> -p --mode json [extra_args] [--model M] [--thinking E]` plus the prompt file as the last argument. Run non-interactively with `-p`; `ai_effort` is passed as `--thinking` (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`). Model uses fuzzy `provider/id` selectors from the live catalog. Neither has a launch-time persona flag, so `agent_name` is ignored. `--mode json` makes them emit the same NDJSON event stream on stdout as their session files, so their runs are harvested for telemetry and input provenance exactly like claude/opencode. Both probe stdin even under `-p` and hang forever on an inherited pane TTY, so the wrapper closes their stdin (`< /dev/null`).
-- **grok** (Grok Build): `<command> --output-format streaming-messages-json --verbatim [extra_args] [--model M] [--reasoning-effort E] --prompt-file <file>`. Headless mode is selected by `--prompt-file` (the prompt body is not also passed as a positional). Default `extra_args` is `["--permission-mode", "bypassPermissions"]` so a tmux-hosted run does not block on tool approvals — tighten in config for stricter permissions. `ai_effort` is `--reasoning-effort` (`low`/`medium`/`high`/`xhigh`, or whatever that model's menu advertises). `agent_name` is ignored. `streaming-messages-json` is the Messages API stream claude already emits, so replies, telemetry, the log formatter, and provenance harvest share that path; grok tool ids (`read_file`, `search_replace`, `run_terminal_cmd`, …) are recorded alongside claude's names. The wrapper closes stdin. Automatic relaunches resume the harvested `session_id` with `--resume`.
+- **grok** (Grok Build): `<command> --output-format streaming-messages-json --verbatim [extra_args] [--model M] [--reasoning-effort E] --prompt-file <file>`. Headless mode is selected by `--prompt-file` (the prompt body is not also passed as a positional). Default `extra_args` is `["--permission-mode", "bypassPermissions"]` so a tmux-hosted run does not block on tool approvals — select a named permission preset for stricter permissions (see below). `ai_effort` is `--reasoning-effort` (`low`/`medium`/`high`/`xhigh`, or whatever that model's menu advertises). `agent_name` is ignored. `streaming-messages-json` is the Messages API stream claude already emits, so replies, telemetry, the log formatter, and provenance harvest share that path; grok tool ids (`read_file`, `search_replace`, `run_terminal_cmd`, …) are recorded alongside claude's names. The wrapper closes stdin. Automatic relaunches resume the harvested `session_id` with `--resume`.
 - **kimi** (Kimi Code CLI): `<command> --print --output-format stream-json [--session ID] [extra_args] [--model M] [--thinking|--no-thinking] --prompt <prompt>`. `--print` is headless and auto-approves tool calls. `ai_effort` is `thinking` or `no-thinking` (other values are ignored); `agent_name` is ignored. The stream is one OpenAI-style message per line (`role`, `content`, `tool_calls`), rendered to the log and harvested for replies and provenance (`ReadFile`, `WriteFile`, `StrReplaceFile`, `Shell`, `FetchURL`, …; other tool names count as MCP). The stream carries no session id, so the harvester reads it from kimi's stderr hint `To resume this session: kimi -r <id>`; automatic relaunches resume it with `--session`. The wrapper closes stdin. Quota is tracked under the `kimi` limits provider.
+
+### Named permission presets
+
+Tasks may select `readonly`, `edits`, `full`, or a custom preset. An empty task
+permission follows the project default. With no task override and no project
+default, existing `extra_args` are passed unchanged (including legacy bypass
+flags). Presets do not migrate or rewrite existing configurations.
+
+```yaml
+default_permission: readonly
+backends:
+  claude:
+    permissions:
+      audit: ["--permission-mode", "plan"]
+  codex:
+    permissions:
+      local-edits:
+        - "--sandbox"
+        - "workspace-write"
+        - "--add-dir"
+        - "{kanban_dir}"
+```
+
+`agents.<name>.permissions` is also accepted alongside the existing backend
+settings. `backends` wins for the same preset. `auto_launch.default_permission`
+is an alternative default that participates in the Agent inheritance group;
+top-level `default_permission` wins and stays project-local. Custom preset values
+must be lists of strings. `{kanban_dir}` expands to the board directory and
+`{work_dir}` to the agent working directory, each within a single argument.
+
+| Backend | readonly | edits | full |
+|---|---|---|---|
+| Claude | Edit/Write/MultiEdit/NotebookEdit disabled; shell still writable | Unsupported | Skip permissions |
+| Codex | Prompt only; callbacks retain full access | workspace-write sandbox, board directory writable, approvals never | Bypass approvals and sandbox |
+| Pi | edit/write tools disabled; shell still writable | Unsupported | Existing headless defaults |
+| Grok | Prompt only | Unsupported | bypassPermissions |
+| OMP, Kimi, OpenCode | Prompt only | Unsupported | Existing headless defaults |
+
+Readonly always includes the investigation-only prompt. Partial and prompt-only
+modes emit an explicit warning on the task thread before launch; they are **not
+security boundaries**. Shell access lets agents run heartbeat/context/done and
+other board callbacks. Unsupported presets fail before spawning an agent, with
+an error naming the backend and preset. Custom presets override built-ins and
+are the administrator's responsibility: keep board callbacks writable and
+avoid interactive approval prompts in headless runs.
+
+In preset mode, backend permission flags in `extra_args` are removed before
+preset arguments are appended (including Codex sandbox/approval config
+assignments). Unrelated arguments remain. Explicit `full` chooses the built-in
+full-access behavior, even if legacy bypass flags were previously removed.
+Designer/reviewer launches use the task permission with their selected backend;
+the arbiter uses the project default. Orchestrator children inherit an explicit
+preset, except readonly, which falls back to the project default.

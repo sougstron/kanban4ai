@@ -316,7 +316,10 @@ pub struct Task {
     /// Restrict delegated agents to investigation and board-side output.
     /// Omitted while false so legacy task files round-trip unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub readonly: bool,
+    #[serde(rename = "readonly")]
+    pub legacy_readonly: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission: Option<String>,
     /// Questions are refused. The agent decides ambiguous points itself and
     /// records each dispute with `kanban suggest`. Omitted while false so
     /// legacy boards round-trip byte-identically. Wins over `interactive`.
@@ -525,6 +528,24 @@ fn default_task_status() -> TaskStatus {
 }
 
 impl Task {
+    /// Effective task override, including the spelling used by older boards.
+    pub fn permission(&self) -> Option<&str> {
+        self.permission
+            .as_deref()
+            .or(self.legacy_readonly.then_some("readonly"))
+    }
+
+    /// Keep readonly compatible with older clients and byte-stable fixtures.
+    pub fn set_permission(&mut self, permission: Option<String>) {
+        let permission = permission.filter(|p| !p.trim().is_empty());
+        self.legacy_readonly = permission.as_deref() == Some("readonly");
+        self.permission = if self.legacy_readonly {
+            None
+        } else {
+            permission
+        };
+    }
+
     pub fn new(id: impl Into<String>, title: impl Into<String>) -> Self {
         let now = timefmt::now();
         Task {
@@ -545,7 +566,8 @@ impl Task {
             agent_backend: None,
             agent_name: None,
             interactive: false,
-            readonly: false,
+            legacy_readonly: false,
+            permission: None,
             silence: false,
             use_designer: false,
             use_reviewer: false,

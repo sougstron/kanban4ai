@@ -171,7 +171,7 @@ folder that is not gitignored (or outside the project) and pin it with: \"$KANBA
     ));
     append_question_guidance(&mut prompt, task, session_id, &form_file, true);
     append_context_economy(&mut prompt);
-    if task.readonly {
+    if task.permission() == Some("readonly") {
         prompt.push_str(
             "\nReadonly mode (mandatory): investigate and report, but do not create, edit, \
 delete, rename, or move any project file, including plans, notes, generated files, and build \
@@ -259,7 +259,7 @@ Heartbeat: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
 {finish}. Continue from the latest state; do not repeat work already completed.",
         task.id, task.id
     );
-    if task.readonly {
+    if task.permission() == Some("readonly") {
         prompt.push_str(
             "\nReadonly mode remains mandatory: do not modify project files or run commands that \
 write into the project. Board operations remain fully available through kanban4ai, including \

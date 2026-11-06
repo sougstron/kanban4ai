@@ -148,7 +148,9 @@ pub struct TaskPatch {
     pub agent_backend: Option<Option<String>>,
     pub agent_name: Option<Option<String>>,
     pub interactive: Option<bool>,
-    pub readonly: Option<bool>,
+    pub permission: Option<Option<String>>,
+    /// Compatibility API: readonly=false clears readonly only, never another preset.
+    pub clear_legacy_readonly: bool,
     pub silence: Option<bool>,
     pub use_designer: Option<bool>,
     pub use_reviewer: Option<bool>,
@@ -608,8 +610,16 @@ impl Operations {
         if let Some(interactive) = patch.interactive {
             task.interactive = interactive;
         }
-        if let Some(readonly) = patch.readonly {
-            task.readonly = readonly;
+        if patch.clear_legacy_readonly && task.permission() == Some("readonly") {
+            task.set_permission(None);
+        }
+        if let Some(permission) = patch.permission {
+            if permission.as_deref() != task.permission() {
+                self.config
+                    .load()?
+                    .validate_permission(permission.as_deref())?;
+            }
+            task.set_permission(permission);
         }
         if let Some(silence) = patch.silence {
             task.silence = silence;
@@ -673,6 +683,9 @@ impl Operations {
     }
 
     fn materialize_new_task(&self, new_task: NewTask) -> Result<NewTask> {
+        self.config
+            .load()?
+            .validate_permission(new_task.permission.as_deref())?;
         let mut task = Task::new(String::new(), String::new());
         task.ai_model = new_task.ai_model;
         task.ai_effort = new_task.ai_effort;
@@ -692,7 +705,7 @@ impl Operations {
             agent_backend: task.agent_backend,
             agent_name: task.agent_name,
             interactive: new_task.interactive,
-            readonly: new_task.readonly,
+            permission: new_task.permission,
             silence: new_task.silence,
             use_designer: new_task.use_designer,
             use_reviewer: new_task.use_reviewer,
@@ -2371,7 +2384,10 @@ impl Operations {
                 },
                 explicit_assignment: candidate.is_some() || inherit_explicit,
                 interactive: false,
-                readonly: false,
+                permission: parent
+                    .permission()
+                    .filter(|p| *p != "readonly")
+                    .map(str::to_owned),
                 // A silent planner must not spawn children that stop to ask.
                 silence: parent.silence,
                 use_designer: node.designer,

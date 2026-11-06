@@ -136,7 +136,7 @@ pub enum DialogField {
     Links,
     PlannedLaunch,
     LaunchTime,
-    Readonly,
+    Permission,
     Silence,
     UseOrchestrator,
     UseDesigner,
@@ -217,7 +217,7 @@ const TASK_FORM_FIELDS: [DialogField; 8] = [
     DialogField::Title,
     DialogField::Description,
     DialogField::AgentSettings,
-    DialogField::Readonly,
+    DialogField::Permission,
     DialogField::ChainTo,
     DialogField::TaskOptions,
     DialogField::Runner,
@@ -840,7 +840,9 @@ pub struct ModalState {
     pub task_sort: TextArea<'static>,
     pub runner: Option<Runner>,
     pub interactive: bool,
-    pub readonly: bool,
+    pub permission: Option<String>,
+    pub permission_choices: Vec<Option<String>>,
+    pub permission_default: Option<String>,
     pub silence: bool,
     pub use_orchestrator: bool,
     pub use_designer: bool,
@@ -986,7 +988,15 @@ impl ModalState {
             task_sort: one_line("task_number"),
             runner: None,
             interactive: false,
-            readonly: false,
+            permission: None,
+            permission_choices: std::iter::once(None)
+                .chain(
+                    ["readonly", "edits", "full"]
+                        .into_iter()
+                        .map(|p| Some(p.into())),
+                )
+                .collect(),
+            permission_default: None,
             silence: false,
             use_orchestrator: false,
             use_designer: false,
@@ -1091,7 +1101,7 @@ impl ModalState {
                 .unwrap_or(""),
         );
         state.interactive = task.interactive;
-        state.readonly = task.readonly;
+        state.permission = task.permission().map(str::to_owned);
         state.silence = task.silence;
         state.runner = task.runner.clone();
         state.use_orchestrator = task.use_orchestrator;
@@ -1113,7 +1123,7 @@ impl ModalState {
                 DialogField::Title,
                 DialogField::Description,
                 DialogField::AgentSettings,
-                DialogField::Readonly,
+                DialogField::Permission,
                 DialogField::ChainTo,
                 DialogField::TaskOptions,
                 DialogField::Runner,
@@ -2119,7 +2129,22 @@ impl ModalState {
             DialogField::ChainTo => self.input_select(key, SelectorKind::ChainTo),
             DialogField::PlannedLaunch => toggle_on_space(&mut self.planned_launch, key),
             DialogField::LaunchTime => input_single_line(&mut self.launch_time, key),
-            DialogField::Readonly => toggle_on_space(&mut self.readonly, key),
+            DialogField::Permission => {
+                use ratatui::crossterm::event::KeyCode;
+                if matches!(
+                    key.code,
+                    KeyCode::Char(' ') | KeyCode::Left | KeyCode::Right
+                ) {
+                    let n = self.permission_choices.len();
+                    let i = self
+                        .permission_choices
+                        .iter()
+                        .position(|p| p == &self.permission)
+                        .unwrap_or(0);
+                    let delta = if key.code == KeyCode::Left { n - 1 } else { 1 };
+                    self.permission = self.permission_choices[(i + delta) % n].clone();
+                }
+            }
             DialogField::Silence => toggle_on_space(&mut self.silence, key),
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
@@ -2410,7 +2435,7 @@ impl ModalState {
             | DialogField::ArbiterAgentSettings
             | DialogField::TaskOptions
             | DialogField::Links
-            | DialogField::Readonly
+            | DialogField::Permission
             | DialogField::Silence
             | DialogField::Runner
             | DialogField::UseOrchestrator
@@ -3066,7 +3091,7 @@ impl ModalState {
             raw_textarea_text(&self.launch_time),
             raw_textarea_text(&self.target_status),
             self.interactive.to_string(),
-            self.readonly.to_string(),
+            self.permission.clone().unwrap_or_default(),
             self.silence.to_string(),
             format!("{:?}", self.runner),
             self.use_orchestrator.to_string(),
@@ -4770,15 +4795,24 @@ fn render_selector_field(
             Some(&modal.chain_filter),
             modal.filter_error == Some(field),
         ),
-        DialogField::Readonly => render_checkbox(
-            frame,
-            app,
-            area,
-            "Readonly",
-            "investigate without changing project files",
-            modal.readonly,
-            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
-        ),
+        DialogField::Permission => {
+            let value = modal.permission.clone().unwrap_or_else(|| {
+                modal
+                    .permission_default
+                    .as_ref()
+                    .map(|p| format!("Project default ({p})"))
+                    .unwrap_or_else(|| "Project default".into())
+            });
+            render_textarea(
+                frame,
+                app,
+                &one_line(&value),
+                area,
+                "Permission · Space cycles, ←/→ inside",
+                modal.active_field() == field,
+                app.is_hovered(HitAction::ModalField(field)),
+            );
+        }
         DialogField::Silence => render_checkbox(
             frame,
             app,
@@ -6626,7 +6660,7 @@ pub(crate) fn block_has_inside(field: DialogField) -> bool {
 pub(crate) fn is_flag_field(field: DialogField) -> bool {
     matches!(
         field,
-        DialogField::Readonly
+        DialogField::Permission
             | DialogField::Silence
             | DialogField::PlannedLaunch
             | DialogField::UseOrchestrator

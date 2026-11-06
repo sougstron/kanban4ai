@@ -25,8 +25,8 @@ expression: "screen.split(\"\\n\\n--- style\").next().unwrap()"
 │             │┌ Agent settings ────────────────────────────────────────────────┐│             │
 │             ││opencode · openai/gpt-5.5  › Enter to configure                 ││             │
 │             │└────────────────────────────────────────────────────────────────┘│             │
-│             │┌ Readonly ──────────────────────────────────────────────────────┐│             │
-│             ││☐ investigate without changing project files (Space toggles)    ││             │
+│             │┌ Permission · Space cycles, ←/→ inside ─────────────────────────┐│             │
+│             ││Project default                                                 ││             │
 │             ││                                                                ││             │
 │             │└────────────────────────────────────────────────────────────────┘│             │
 │             │┌ Chain to ──────────────────────────────────────────────────────┐│             │

@@ -36,6 +36,159 @@ pub struct AgentBackendConfig {
     pub extra_args: Vec<String>,
 }
 
+/// Resolved before any process starts; None preserves legacy argv exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPermission {
+    pub preset: Option<String>,
+    pub extra_args: Vec<String>,
+    pub warning: Option<String>,
+}
+
+pub fn resolve_permission(
+    config: &BoardConfig,
+    backend: &AgentBackendConfig,
+    permission: Option<&str>,
+    kanban_dir: &Path,
+    work_dir: &Path,
+) -> Result<ResolvedPermission> {
+    let preset = permission
+        .map(str::to_owned)
+        .or_else(|| config.default_permission());
+    let Some(name) = preset.as_deref() else {
+        return Ok(ResolvedPermission {
+            preset,
+            extra_args: backend.extra_args.clone(),
+            warning: None,
+        });
+    };
+    let mut warning = None;
+    let args = if let Some(args) = config.configured_permission_args(&backend.name, name)? {
+        args
+    } else {
+        let full: Vec<&str> = match backend.name.as_str() {
+            "claude" => vec!["--dangerously-skip-permissions"],
+            "codex" => vec!["--dangerously-bypass-approvals-and-sandbox"],
+            "grok" => vec!["--permission-mode", "bypassPermissions"],
+            "opencode" | "kimi" | "pi" | "omp" => vec![],
+            _ => return Err(unsupported_permission(&backend.name, name)),
+        };
+        match (backend.name.as_str(), name) {
+            (_, "full") => full.into_iter().map(str::to_owned).collect(),
+            ("codex", "edits") => vec![
+                "-c".into(),
+                "sandbox_mode=\"workspace-write\"".into(),
+                "-c".into(),
+                "approval_policy=\"never\"".into(),
+                "-c".into(),
+                format!(
+                    "sandbox_workspace_write.writable_roots={}",
+                    serde_json::to_string(&[kanban_dir.to_string_lossy()])
+                        .expect("strings serialize")
+                ),
+            ],
+            (_, "readonly") => {
+                let mut args: Vec<String> = full.into_iter().map(str::to_owned).collect();
+                let enforcement = match backend.name.as_str() {
+                    "claude" => {
+                        args.push("--disallowedTools=Edit,Write,MultiEdit,NotebookEdit".into());
+                        "file-edit tools disabled; shell and extension tools can still write"
+                    }
+                    "pi" => {
+                        args.extend(["--exclude-tools".into(), "edit,write".into()]);
+                        "file-edit tools disabled; shell and extension tools can still write"
+                    }
+                    _ => "prompt-only restriction; backend tools can still write",
+                };
+                warning = Some(format!(
+                    "Permission readonly on {}: {enforcement}. Shell access is retained for kanban callbacks.",
+                    backend.name
+                ));
+                args
+            }
+            _ => return Err(unsupported_permission(&backend.name, name)),
+        }
+    };
+    // Presets own permission flags. Old default bypass flags must not override
+    // a selected restriction. Unrelated extra_args remain in their original order.
+    let mut extra_args = strip_permission_flags(&backend.name, &backend.extra_args);
+    extra_args.extend(args.into_iter().map(|arg| {
+        arg.replace("{kanban_dir}", &kanban_dir.to_string_lossy())
+            .replace("{work_dir}", &work_dir.to_string_lossy())
+    }));
+    Ok(ResolvedPermission {
+        preset,
+        extra_args,
+        warning,
+    })
+}
+
+fn unsupported_permission(backend: &str, preset: &str) -> KanbanError {
+    KanbanError::Invalid(format!(
+        "permission preset '{preset}' is not supported by backend '{backend}'; define backends.{backend}.permissions.{preset} in config.yaml"
+    ))
+}
+
+fn strip_permission_flags(backend: &str, args: &[String]) -> Vec<String> {
+    let (switches, values): (&[&str], &[&str]) = match backend {
+        "claude" => (
+            &[
+                "--dangerously-skip-permissions",
+                "--allow-dangerously-skip-permissions",
+            ],
+            &[
+                "--permission-mode",
+                "--allowedTools",
+                "--allowed-tools",
+                "--disallowedTools",
+                "--disallowed-tools",
+            ],
+        ),
+        "codex" => (
+            &[
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--full-auto",
+                "--approve-for-me",
+            ],
+            &["--sandbox", "-s", "--ask-for-approval", "-a", "--add-dir"],
+        ),
+        "grok" => (&["--always-approve"], &["--permission-mode"]),
+        "kimi" => (&["--yolo", "--yes", "-y"], &[]),
+        "omp" => (&["--auto-approve"], &["--approval-mode"]),
+        "pi" => (&[], &["--exclude-tools", "-xt"]),
+        _ => (&[], &[]),
+    };
+    let mut result = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let flag = arg.split('=').next().unwrap_or(arg);
+        if switches.contains(&flag) {
+            i += 1;
+        } else if values.contains(&flag) {
+            i += if arg.contains('=') { 1 } else { 2 };
+        } else if backend == "codex" && matches!(flag, "-c" | "--config") {
+            let value = arg
+                .split_once('=')
+                .map(|(_, v)| v)
+                .or_else(|| args.get(i + 1).map(String::as_str));
+            let owns = value.is_some_and(|v| {
+                v.starts_with("sandbox_")
+                    || v.starts_with("approval_policy=")
+                    || v.starts_with("permissions.")
+            });
+            let count = if arg.contains('=') { 1 } else { 2 };
+            if !owns {
+                result.extend(args[i..(i + count).min(args.len())].iter().cloned());
+            }
+            i += count;
+        } else {
+            result.push(arg.clone());
+            i += 1;
+        }
+    }
+    result
+}
+
 /// The backend, model, effort, and agent persona a launch actually uses:
 /// the task's own fields where set, the backend's configured defaults
 /// otherwise. [`Operations`](crate::core::operations::Operations) writes these
@@ -185,6 +338,7 @@ pub fn materialize_task_launch_settings(config: &BoardConfig, task: &mut Task) -
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchPlan {
+    pub permission_warning: Option<String>,
     pub backend: String,
     pub task_id: String,
     pub command: String,
@@ -245,7 +399,18 @@ pub fn build_launch_plan<'a>(
         effort,
         agent,
     } = resolve_launch_settings(&config, task)?;
-    let backend_config = backend_config(&config, &backend)?;
+    let mut backend_config = backend_config(&config, &backend)?;
+    let permission = resolve_permission(
+        &config,
+        &backend_config,
+        task.permission(),
+        &roots.kanban_dir(),
+        roots.work_path,
+    )?;
+    backend_config.extra_args = permission.extra_args;
+    let mut effective_task = task.clone();
+    effective_task.set_permission(permission.preset);
+    let task = &effective_task;
     let resolve_agent = if backend == "opencode" {
         agent.clone()
     } else {
@@ -313,6 +478,7 @@ pub fn build_launch_plan<'a>(
     };
 
     Ok(LaunchPlan {
+        permission_warning: permission.warning,
         backend,
         task_id: task.id.clone(),
         command: backend_config.command,
@@ -1515,4 +1681,148 @@ fn strip_agent_mode_suffix(line: &str) -> Option<&str> {
     let rest = line.strip_suffix(')')?;
     let (name, mode) = rest.rsplit_once('(')?;
     matches!(mode.trim(), "primary" | "subagent" | "all").then(|| name.trim_end())
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    fn resolve(
+        config: &BoardConfig,
+        backend: &str,
+        preset: Option<&str>,
+    ) -> Result<ResolvedPermission> {
+        resolve_permission(
+            config,
+            &backend_config(config, backend)?,
+            preset,
+            Path::new("/board/.kanban"),
+            Path::new("/work"),
+        )
+    }
+
+    #[test]
+    fn all_backends_preserve_legacy_and_report_readonly_enforcement() {
+        let config = BoardConfig::default();
+        for name in ["claude", "codex", "grok", "omp", "pi", "kimi", "opencode"] {
+            let original = backend_config(&config, name).unwrap();
+            let legacy = resolve(&config, name, None).unwrap();
+            assert_eq!(legacy.extra_args, original.extra_args, "{name}");
+            assert!(legacy.warning.is_none());
+            let full = resolve(&config, name, Some("full")).unwrap();
+            // Flag order is irrelevant; all original arguments must remain.
+            assert_eq!(full.extra_args.len(), original.extra_args.len(), "{name}");
+            for arg in &original.extra_args {
+                assert!(full.extra_args.contains(arg), "{name}: {arg}");
+            }
+            let readonly = resolve(&config, name, Some("readonly")).unwrap();
+            assert!(readonly.warning.as_deref().unwrap().contains(name));
+            assert!(
+                resolve(&config, name, Some("missing"))
+                    .unwrap_err()
+                    .to_string()
+                    .contains(name)
+            );
+            let edits = resolve(&config, name, Some("edits"));
+            assert_eq!(edits.is_ok(), name == "codex", "{name}");
+        }
+    }
+
+    #[test]
+    fn custom_presets_defaults_and_placeholders() {
+        let mut config = BoardConfig {
+            extras: serde_yaml_ng::from_str(
+                r#"
+default_permission: audit
+backends:
+  claude:
+    permissions:
+      audit: ["--permission-mode", "plan", "--add-dir", "{kanban_dir}", "{work_dir}"]
+      broken: [1]
+      readonly: ["--permission-mode=plan"]
+"#,
+            )
+            .unwrap(),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.permission_names(),
+            ["readonly", "edits", "full", "audit", "broken"]
+        );
+        let resolved = resolve(&config, "claude", None).unwrap();
+        assert_eq!(resolved.preset.as_deref(), Some("audit"));
+        assert_eq!(
+            resolved.extra_args,
+            [
+                "--permission-mode",
+                "plan",
+                "--add-dir",
+                "/board/.kanban",
+                "/work"
+            ]
+        );
+        assert!(resolved.warning.is_none());
+        let overridden = resolve(&config, "claude", Some("readonly")).unwrap();
+        assert_eq!(overridden.extra_args, ["--permission-mode=plan"]);
+        assert!(overridden.warning.is_none());
+        assert!(resolve(&config, "claude", Some("broken")).is_err());
+        config
+            .auto_launch
+            .insert("default_permission".into(), "readonly".into());
+        config.extras.remove("default_permission");
+        assert_eq!(
+            resolve(&config, "pi", None).unwrap().preset.as_deref(),
+            Some("readonly")
+        );
+    }
+
+    #[test]
+    fn permission_flags_cannot_override_codex_edits_or_custom_presets() {
+        let config = BoardConfig::default();
+        let mut backend = backend_config(&config, "codex").unwrap();
+        backend.extra_args.extend(
+            [
+                "--sandbox=danger-full-access",
+                "-c",
+                "sandbox_mode=\"danger-full-access\"",
+                "--config=approval_policy=\"on-request\"",
+                "--skip-git-repo-check",
+            ]
+            .map(str::to_owned),
+        );
+        let resolved = resolve_permission(
+            &config,
+            &backend,
+            Some("edits"),
+            Path::new("/board with spaces/.kanban"),
+            Path::new("/work"),
+        )
+        .unwrap();
+        assert!(
+            !resolved
+                .extra_args
+                .iter()
+                .any(|a| a.contains("danger") || a.contains("on-request"))
+        );
+        assert!(
+            resolved
+                .extra_args
+                .iter()
+                .any(|a| a == "--skip-git-repo-check")
+        );
+        assert!(resolved.extra_args.iter().any(
+            |a| a == "sandbox_workspace_write.writable_roots=[\"/board with spaces/.kanban\"]"
+        ));
+        assert_eq!(
+            strip_permission_flags(
+                "grok",
+                &[
+                    "--permission-mode".into(),
+                    "bypassPermissions".into(),
+                    "--verbatim".into()
+                ]
+            ),
+            ["--verbatim"]
+        );
+    }
 }

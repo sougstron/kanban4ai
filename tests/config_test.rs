@@ -1187,3 +1187,22 @@ fn global_group_sections_round_trip_and_unknown_keys_survive() {
     );
     assert_eq!(reloaded.tui["task_sort"].as_str(), Some("updated_at_desc"));
 }
+
+#[test]
+fn permission_defaults_and_custom_presets_follow_agent_inheritance() {
+    let global = "auto_launch:\n  default_permission: audit\nagents:\n  claude:\n    permissions:\n      audit: [--permission-mode, plan]\n";
+    let (_store, config) = store_board(&all_inherit(true), Some(global));
+    let effective = config.load().unwrap();
+    assert_eq!(effective.default_permission().as_deref(), Some("audit"));
+    assert_eq!(
+        effective.permission_names(),
+        ["readonly", "edits", "full", "audit"]
+    );
+    assert_eq!(
+        effective
+            .configured_permission_args("claude", "audit")
+            .unwrap()
+            .unwrap(),
+        ["--permission-mode", "plan"]
+    );
+}

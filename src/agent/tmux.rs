@@ -503,6 +503,7 @@ mod tests {
         auto_complete: bool,
     ) -> LaunchPlan {
         LaunchPlan {
+            permission_warning: None,
             backend: "test".to_string(),
             task_id: task_id.to_string(),
             command: command.to_string(),

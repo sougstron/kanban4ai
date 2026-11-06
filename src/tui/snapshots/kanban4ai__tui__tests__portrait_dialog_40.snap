@@ -16,8 +16,8 @@ expression: "render_at(&mut app, width, 24)"
 │┌ Agent settings ────────────────────┐│
 ││defaults  › Enter to configure      ││
 │└────────────────────────────────────┘│
-│┌ Readonly ──────────────────────────┐│
-││☐ investigate without changing proje││
+│┌ Permission · Space cycles, ←/→ insi┐│
+││Project default                     ││
 ││                                    ││
 │└────────────────────────────────────┘│
 │┌────────────────────────────────────┐│

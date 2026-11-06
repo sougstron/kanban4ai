@@ -370,7 +370,7 @@ fn readonly_task_prompt_forbids_project_writes_but_allows_board_output() {
     let task = storage
         .create_task(NewTask {
             title: "Investigate only".into(),
-            readonly: true,
+            permission: Some("readonly".into()),
             ..Default::default()
         })
         .unwrap();
@@ -1876,4 +1876,35 @@ fn post_with_test_origin(
 fn has_arg_pair(args: &[String], key: &str, value: &str) -> bool {
     args.windows(2)
         .any(|pair| pair[0] == key && pair[1] == value)
+}
+
+#[test]
+fn project_default_readonly_reaches_launch_prompt_and_unsupported_presets_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    std::fs::write(
+        dir.path().join(".kanban/config.yaml"),
+        "default_permission: readonly\nauto_launch:\n  default_agent: claude\n",
+    )
+    .unwrap();
+    let task = storage
+        .create_task(NewTask::titled("Default restriction"))
+        .unwrap();
+    let plan =
+        kanban4ai::agent::build_launch_plan(dir.path(), &task, "ses-permission", false).unwrap();
+    assert!(plan.prompt.contains("Readonly mode (mandatory)"));
+    assert!(plan.permission_warning.is_some());
+    assert!(
+        plan.args
+            .iter()
+            .any(|a| a.starts_with("--disallowedTools="))
+    );
+    let mut task = task;
+    task.agent_backend = Some("kimi".into());
+    task.set_permission(Some("edits".into()));
+    let error = kanban4ai::agent::build_launch_plan(dir.path(), &task, "ses-unsupported", false)
+        .unwrap_err();
+    assert!(error.to_string().contains("edits"));
+    assert!(error.to_string().contains("kimi"));
 }

@@ -10,7 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 
 use crate::core::models::{IntegrationState, RunPhase, TaskStatus};
-use crate::core::operations::Operations;
+use crate::core::operations::{Operations, TaskPatch};
 use crate::core::project::ProjectStore;
 use crate::core::session::SessionManager;
 use crate::core::storage::{NewTask, Storage};
@@ -1886,7 +1886,7 @@ fn arrows_pick_blocks_outside_and_stay_inside_a_selector() {
     app.handle_key(key(KeyCode::Up)).expect("up");
     assert_eq!(
         app.modal.as_ref().unwrap().active_field(),
-        DialogField::Readonly
+        DialogField::Permission
     );
     app.handle_key(key(KeyCode::Down)).expect("down");
     app.handle_key(key(KeyCode::Down)).expect("down");
@@ -2001,18 +2001,21 @@ fn flags_flip_on_space_outside_and_enter_inside() {
     app.modal
         .as_mut()
         .unwrap()
-        .focus_field(DialogField::Readonly);
+        .focus_field(DialogField::Permission);
     app.handle_key(key(KeyCode::Char(' '))).unwrap();
     let modal = app.modal.as_ref().unwrap();
-    assert!(modal.readonly);
+    assert_eq!(modal.permission.as_deref(), Some("readonly"));
     assert!(!modal.is_editing());
     app.handle_key(key(KeyCode::Enter)).expect("inside");
     assert!(app.modal.as_ref().unwrap().is_editing());
     app.handle_key(key(KeyCode::Enter)).expect("flip");
-    assert!(!app.modal.as_ref().unwrap().readonly);
+    assert_eq!(
+        app.modal.as_ref().unwrap().permission.as_deref(),
+        Some("edits")
+    );
     app.handle_key(key(KeyCode::Down)).unwrap();
     let modal = app.modal.as_ref().unwrap();
-    assert_eq!(modal.active_field(), DialogField::Readonly);
+    assert_eq!(modal.active_field(), DialogField::Permission);
     app.handle_key(key(KeyCode::Tab)).unwrap();
     let modal = app.modal.as_ref().unwrap();
     assert_eq!(modal.active_field(), DialogField::ChainTo);
@@ -5740,9 +5743,16 @@ fn review_detail_rerun_closes_the_detail_before_the_launch_finishes() {
         .expect("rerun");
     assert_eq!(app.screen, Screen::Board, "detail must close on the press");
     assert!(app.detail.is_none());
-    assert_eq!(
-        app.ops.get_task(&task.id).unwrap().unwrap().review_edits,
-        "Rework this",
+    // The worker can fold the saved edits into context before it reaches
+    // GatedLauncher. Both durable states prove the visible text was saved.
+    let saved = app.ops.get_task(&task.id).unwrap().unwrap();
+    assert!(
+        saved.review_edits == "Rework this"
+            || app
+                .ops
+                .task_context(&task.id)
+                .unwrap()
+                .contains("Rework this"),
         "visible edits are saved before the detail closes"
     );
 
@@ -11827,7 +11837,7 @@ fn new_task_mode_toggles_save_on_the_task() {
     }
     assert_eq!(
         app.modal.as_ref().expect("modal").active_field(),
-        DialogField::Readonly
+        DialogField::Permission
     );
     app.handle_key(key(KeyCode::Char(' '))).expect("space");
     app.handle_key(key(KeyCode::Down)).expect("down");
@@ -11883,7 +11893,7 @@ fn new_task_mode_toggles_save_on_the_task() {
         .into_iter()
         .find(|task| task.title == "Per-task bots")
         .expect("created task");
-    assert!(created.readonly);
+    assert_eq!(created.permission(), Some("readonly"));
     assert!(created.silence);
     assert!(created.use_orchestrator);
     assert!(created.use_designer);
@@ -14321,4 +14331,89 @@ fn task_form_links_row_shows_and_clears_chain_and_dependencies() {
     let saved = app.ops.get_task(task_id).unwrap().unwrap();
     assert_eq!(saved.chained_to, None);
     assert!(saved.depends_on.is_empty());
+}
+
+#[test]
+fn permission_selector_custom_and_badges_snapshots() {
+    let (_dir, mut app) = app_with_board();
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    let modal = app.modal.as_mut().unwrap();
+    modal.permission_choices.push(Some("audit".into()));
+    modal.permission = Some("audit".into());
+    modal.focus_field(DialogField::Permission);
+    insta::assert_snapshot!("permission_selector_custom", render_snapshot(&mut app));
+    app.modal = None;
+    let task = app
+        .ops
+        .create_task(NewTask {
+            title: "Restricted edits".into(),
+            permission: Some("edits".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    app.reload_if_changed().unwrap();
+    let card = render_snapshot(&mut app);
+    assert!(
+        card.lines()
+            .any(|line| line.contains("🔒") && line.contains("edits"))
+    );
+    insta::assert_snapshot!("permission_card_edits", card);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    let detail = render_snapshot(&mut app);
+    assert!(detail.contains("Permission: edits"));
+    insta::assert_snapshot!("permission_detail_edits", detail);
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    app.ops
+        .update_task(
+            &task.id,
+            TaskPatch {
+                permission: Some(Some("full".into())),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    app.reload_if_changed().unwrap();
+    let full = render_snapshot(&mut app);
+    assert!(!full.contains("🔒"));
+    insta::assert_snapshot!("permission_card_full", full);
+}
+
+#[test]
+fn permission_selector_loads_legacy_cycles_and_clears_on_save() {
+    let (_dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask {
+            title: "Legacy readonly".into(),
+            permission: Some("readonly".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(task.legacy_readonly);
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.handle_key(key(KeyCode::Char('e'))).unwrap();
+    let modal = app.modal.as_mut().unwrap();
+    assert_eq!(modal.permission.as_deref(), Some("readonly"));
+    modal.focus_field(DialogField::Permission);
+    app.handle_key(key(KeyCode::Char(' '))).unwrap();
+    assert_eq!(
+        app.modal.as_ref().unwrap().permission.as_deref(),
+        Some("edits")
+    );
+    app.handle_key(key(KeyCode::Char(' '))).unwrap();
+    assert_eq!(
+        app.modal.as_ref().unwrap().permission.as_deref(),
+        Some("full")
+    );
+    app.handle_key(key(KeyCode::Char(' '))).unwrap();
+    assert_eq!(app.modal.as_ref().unwrap().permission, None);
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(
+        app.ops.get_task(&task.id).unwrap().unwrap().permission(),
+        None
+    );
 }

@@ -524,8 +524,8 @@ saving (`Ctrl+S`) no longer re-runs the agent — re-running is the separate
 `review_edits` buffer automatically when the detail closes, so reopening the
 task restores it without an explicit save. Create/edit dialogs group the form
 as: Title, Description, an `Agent settings` row that opens a nested popup for
-backend, model, effort, and persona, a Readonly checkbox (investigation and
-board-side reporting without project-file writes), a "Chain to task" selector,
+backend, model, effort, and persona, a Permission selector (project default, readonly,
+edits, full, or a custom preset), a "Chain to task" selector,
 and an `Options` row that opens a second nested popup holding the
 Silence, Orchestrator, Designer, and Reviewer checkboxes plus the "Planned
 launch" checkbox with an HH:MM time field. Silence forbids questions on this
@@ -623,3 +623,11 @@ Tab, Shift+Tab, Esc out of the block, or a click on another field — clears the
 field being left along with any error it was showing, so returning to a
 selector always starts from the full list rather than a stale narrowing. The
 option that was picked while filtered stays selected.
+
+The task form's **Permission** selector replaces the Readonly checkbox. Space
+cycles Project default → readonly → edits → full → configured custom presets;
+Left/Right cycle while inside the field. A task's removed custom preset remains
+visible when editing. Project default follows `default_permission`. Cards and
+detail show `🔒 <preset>` for explicit restrictions; full and project default
+have no badge. Backend enforcement and unsupported-preset errors are described
+in [configuration](config.md#named-permission-presets).

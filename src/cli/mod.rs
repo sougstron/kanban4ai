@@ -78,8 +78,11 @@ enum Command {
         #[arg(long)]
         interactive: bool,
         /// Prevent delegated agents from modifying project files
-        #[arg(long)]
+        #[arg(long, conflicts_with = "permission")]
         readonly: bool,
+        /// Named permission preset (empty means project default)
+        #[arg(long)]
+        permission: Option<String>,
         /// Forbid questions: the agent decides and records disputes as suggestions
         #[arg(long)]
         silence: bool,
@@ -102,6 +105,12 @@ enum Command {
         /// Wait for these tasks to reach Review/Done, and read their results (repeatable)
         #[arg(long = "depends-on")]
         depends_on: Vec<String>,
+    },
+    /// Change a task's permission preset (empty clears to project default).
+    Edit {
+        task_id: String,
+        #[arg(long, required = true)]
+        permission: String,
     },
     /// Register a project in the store (migrating a local .kanban if present).
     Init {
@@ -614,6 +623,7 @@ impl Command {
             | Command::Detach { task_id, .. }
             | Command::Done { task_id, .. }
             | Command::Edits { task_id, .. }
+            | Command::Edit { task_id, .. }
             | Command::Integrate { task_id, .. }
             | Command::Move { task_id, .. }
             | Command::Plan { task_id, .. }
@@ -995,6 +1005,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             agent_name,
             interactive,
             readonly,
+            permission,
             silence,
             designer,
             reviewer,
@@ -1023,7 +1034,11 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 agent_backend,
                 agent_name,
                 interactive,
-                readonly,
+                permission: if readonly {
+                    Some("readonly".into())
+                } else {
+                    permission.filter(|p| !p.trim().is_empty())
+                },
                 silence,
                 use_designer: designer,
                 use_reviewer: reviewer,
@@ -1317,6 +1332,22 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 None => eprintln!("Failed to record verdict on {task_id}"),
             }
         }
+        Command::Edit {
+            task_id,
+            permission,
+        } => {
+            let updated = ops.update_task(
+                &task_id,
+                TaskPatch {
+                    permission: Some((!permission.trim().is_empty()).then_some(permission)),
+                    ..Default::default()
+                },
+            )?;
+            if updated.is_none() {
+                return Err(KanbanError::Invalid(format!("Task {task_id} not found")));
+            }
+            println!("Updated task {task_id}");
+        }
         Command::Edits { task_id, text } => match ops.set_review_edits(&task_id, &text)? {
             Some(_) => println!("Review edits saved on {task_id}"),
             None => eprintln!("Task {task_id} not found"),
@@ -1472,8 +1503,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     }
                 );
             }
-            if task.readonly {
-                println!("Readonly: on");
+            if let Some(permission) = task.permission() {
+                println!("Permission: {permission}");
             }
             if task.silence {
                 println!("Silence: on");
@@ -2074,7 +2105,8 @@ fn task_to_json(task: &Task) -> serde_json::Value {
         "agent_backend": task.agent_backend,
         "agent_name": task.agent_name,
         "interactive": task.interactive,
-        "readonly": task.readonly,
+        "readonly": task.permission() == Some("readonly"),
+        "permission": task.permission(),
         "silence": task.silence,
         "use_designer": task.use_designer,
         "use_reviewer": task.use_reviewer,

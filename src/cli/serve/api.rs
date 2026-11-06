@@ -110,6 +110,8 @@ fn encode<T: Serialize>(value: T) -> Result<Value> {
 }
 fn task_wire(task: crate::core::models::Task) -> Result<Value> {
     let mut value = encode(&task)?;
+    value["permission"] = encode(task.permission())?;
+    value["readonly"] = Value::Bool(task.permission() == Some("readonly"));
     value["description"] = Value::String(task.description);
     let map = value.as_object_mut().expect("Task serializes as an object");
     for field in [
@@ -505,7 +507,17 @@ fn fields(value: Value) -> Result<serde_json::Map<String, Value>> {
 }
 fn patch(value: Value) -> Result<TaskPatch> {
     let mut patch = TaskPatch::default();
-    for (key, value) in fields(value)? {
+    let mut fields = fields(value)?;
+    // The explicit permission key wins regardless of JSON key ordering.
+    if let Some(readonly) = fields.remove("readonly") {
+        let readonly: bool = decode(readonly)?;
+        if readonly {
+            patch.permission = Some(Some("readonly".into()));
+        } else {
+            patch.clear_legacy_readonly = true;
+        }
+    }
+    for (key, value) in fields {
         match key.as_str() {
             "title" => patch.title = Some(decode(value)?),
             "description" => patch.description = Some(decode(value)?),
@@ -514,7 +526,7 @@ fn patch(value: Value) -> Result<TaskPatch> {
             "agent_backend" => patch.agent_backend = Some(decode(value)?),
             "agent_name" => patch.agent_name = Some(decode(value)?),
             "interactive" => patch.interactive = Some(decode(value)?),
-            "readonly" => patch.readonly = Some(decode(value)?),
+            "permission" => patch.permission = Some(decode(value)?),
             "silence" => patch.silence = Some(decode(value)?),
             "use_designer" => patch.use_designer = Some(decode(value)?),
             "use_reviewer" => patch.use_reviewer = Some(decode(value)?),
@@ -559,7 +571,7 @@ async fn create(
                     agent_backend: patch.agent_backend.flatten(),
                     agent_name: patch.agent_name.flatten(),
                     interactive: patch.interactive.unwrap_or(false),
-                    readonly: patch.readonly.unwrap_or(false),
+                    permission: patch.permission.flatten(),
                     silence: patch.silence.unwrap_or(false),
                     use_designer: patch.use_designer.unwrap_or(false),
                     use_reviewer: patch.use_reviewer.unwrap_or(false),
@@ -1808,6 +1820,45 @@ async fn events(State(root): State<PathBuf>, uri: axum::http::Uri) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_api_preserves_named_presets_for_legacy_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let ops = Operations::new(dir.path());
+        ops.storage.init_board().unwrap();
+        let task = ops
+            .create_task(NewTask {
+                permission: Some("edits".into()),
+                ..NewTask::titled("Permissions")
+            })
+            .unwrap();
+        let task = ops
+            .update_task(
+                &task.id,
+                patch(serde_json::json!({"readonly": false})).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.permission(), Some("edits"));
+        let task = ops
+            .update_task(
+                &task.id,
+                patch(serde_json::json!({"readonly": true})).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        let wire = task_wire(task.clone()).unwrap();
+        assert_eq!(wire["permission"], "readonly");
+        assert_eq!(wire["readonly"], true);
+        let task = ops
+            .update_task(
+                &task.id,
+                patch(serde_json::json!({"readonly": true, "permission": null})).unwrap(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.permission(), None);
+    }
 
     #[tokio::test]
     async fn explicit_offline_runner_offers_alternative_without_mutation_and_waits() {
