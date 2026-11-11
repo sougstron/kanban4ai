@@ -2469,20 +2469,32 @@ impl Operations {
                 .iter()
                 .any(|t| &t.id == id && matches!(t.status, TaskStatus::Review | TaskStatus::Done))
         }) {
-            // Always enqueue. Dispatcher caps apply even when a human disables auto-launch.
-            self.queue_local_run(&task.id)?;
+            // Route through queue_run so a remote runner is placed the same
+            // way dispatch_ready_dependents places dependents. When the queue
+            // cannot dispatch (queue or auto-launch off) nothing would ever
+            // drain the entry, so start directly — the same fallback `rerun`
+            // and the TUI use.
+            if self.queue_can_dispatch()? {
+                self.queue_run(&task.id)?;
+            } else {
+                self.start_task(&task.id)?;
+            }
         }
-        self.thread_manager()?.post(
+        // Board notes, not agent context: a Context entry authored by the
+        // agent would leak into the parent's result digest, flip
+        // has_agent_context, and drop the parent's own reply from downstream
+        // digests.
+        let threads = self.thread_manager()?;
+        threads.post_board_note(
             &parent.id,
-            MessageRole::Agent,
-            MessageKind::Context,
             &format!(
                 "Spawned helper {}: {}. Read its result with kanban output {}.",
                 task.id, task.title, task.id
             ),
-            None,
-            vec![],
-            Some("agent".into()),
+        )?;
+        threads.post_board_note(
+            &task.id,
+            &format!("Spawned by parent {} as a helper.", parent.id),
         )?;
         Ok(self.storage.load_task(&task.id)?.unwrap_or(task))
     }

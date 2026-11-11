@@ -2846,11 +2846,15 @@ impl Config {
             result.policy = SpawnPolicy::Allowed;
             result.source = "spawned child";
         }
-        result.requires_helper = result.policy == SpawnPolicy::Forced;
         if depth >= settings.max_depth {
             result.policy = SpawnPolicy::Forbidden;
             result.source = "depth limit";
         }
+        // A helper is only required when spawning is actually possible: the
+        // depth limit still allows children and max_children is not zero.
+        // Requiring the impossible would make `spawn` and `done` refuse each
+        // other forever.
+        result.requires_helper = result.policy == SpawnPolicy::Forced && settings.max_children > 0;
         Ok(result)
     }
 
