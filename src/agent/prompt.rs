@@ -1,7 +1,7 @@
-use crate::core::compaction::compact_text;
 use crate::core::config::Config;
+use crate::core::context::result_digest;
 use crate::core::error::Result;
-use crate::core::models::{Message, MessageKind, MessageStatus, Role, Task};
+use crate::core::models::{Message, MessageKind, MessageStatus, Role, Task, TaskStatus};
 use crate::core::project::Roots;
 use crate::core::storage::Storage;
 use crate::core::thread::ThreadManager;
@@ -23,9 +23,9 @@ fn clarification_line(task: &Task) -> String {
 /// surrounding sentence names what an unfinished reply strands.
 fn long_wait_finish_clause(silence: bool) -> &'static str {
     if silence {
-        "the done command above, or the waiting/detach command if you are waiting on a declared long-running result. Do not ask; a question is refused"
+        "the done command above, or kanban wait that declared waiting, or the waiting/detach command if you are waiting on a declared long-running result. Do not ask; a question is refused"
     } else {
-        "the done command above, the ask command if you are blocked, or the waiting/detach command if you are waiting on a declared long-running result"
+        "the done command above, the ask command if you are blocked, or kanban wait that declared waiting, or the waiting/detach command if you are waiting on a declared long-running result"
     }
 }
 
@@ -218,6 +218,7 @@ not touch the project folder's own checkout.\n"
         prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
     }
     append_upstream_results(roots, task, &mut prompt)?;
+    append_spawn_helpers(roots, task, &mut prompt)?;
     append_thread_context(roots, task, &mut prompt)?;
     Ok(prompt)
 }
@@ -356,6 +357,7 @@ Ending a reply without one of those strands the design phase and forces an autom
         prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
     }
     append_upstream_results(roots, task, &mut prompt)?;
+    append_spawn_helpers(roots, task, &mut prompt)?;
     append_thread_context(roots, task, &mut prompt)?;
     Ok(prompt)
 }
@@ -736,7 +738,7 @@ fn append_upstream_results(roots: Roots<'_>, task: &Task, prompt: &mut String) -
             upstream.status.as_str(),
             upstream.title.trim()
         ));
-        let digest = upstream_digest(&threads, &upstream.id, per_dependency)?;
+        let digest = result_digest(&threads, &upstream.id, per_dependency)?;
         if digest.is_empty() {
             prompt.push_str("  (finished without recording a result)\n");
             continue;
@@ -748,55 +750,6 @@ fn append_upstream_results(roots: Roots<'_>, task: &Task, prompt: &mut String) -
         }
     }
     Ok(())
-}
-
-/// One dependency's result, newest first and truncated to `budget` characters.
-/// Newest first because the last thing a task recorded is its conclusion; the
-/// earlier entries are the road to it and are the right thing to lose.
-///
-/// The harvested whole-session reply (`author: agent-reply`) is skipped when
-/// the run also posted explicit `kanban context` entries — the same rule
-/// [`append_thread_context`] applies to a task's own thread. A reply is chat
-/// prose addressed to the human: several kilobytes of tables and pleasantries
-/// that, being the newest message, would spend the entire budget and evict
-/// the deliberately compact progress notes the digest exists to carry.
-fn upstream_digest(threads: &ThreadManager, task_id: &str, budget: usize) -> Result<String> {
-    let thread = threads.load(task_id)?;
-    let has_agent_context = thread.messages.iter().any(|message| {
-        message.kind == MessageKind::Context
-            && message.status != MessageStatus::Rejected
-            && message.author.as_deref() == Some("agent")
-    });
-    let mut kept: Vec<String> = Vec::new();
-    let mut used = 0usize;
-    for message in thread
-        .messages
-        .iter()
-        .rev()
-        .filter(|message| message.kind == MessageKind::Context)
-        .filter(|message| message.status != MessageStatus::Rejected)
-        .filter(|message| !(has_agent_context && message.author.as_deref() == Some("agent-reply")))
-    {
-        let body = compact_text(message.body.trim());
-        if body.is_empty() {
-            continue;
-        }
-        let remaining = budget.saturating_sub(used);
-        if remaining == 0 {
-            kept.push("…(earlier upstream context omitted)".to_string());
-            break;
-        }
-        let body = if body.chars().count() > remaining {
-            let truncated: String = body.chars().take(remaining).collect();
-            format!("{truncated}…")
-        } else {
-            body
-        };
-        used += body.chars().count();
-        kept.push(body);
-    }
-    kept.reverse();
-    Ok(kept.join("\n"))
 }
 
 fn append_thread_context(roots: Roots<'_>, task: &Task, prompt: &mut String) -> Result<()> {
@@ -933,4 +886,47 @@ KANBAN_SESSION={session_id}\nKANBAN_TASK_ID={}\nKANBAN_CMD=$KANBAN_CMD\n",
         task.id,
         task.id
     )
+}
+
+fn append_spawn_helpers(roots: Roots<'_>, task: &Task, prompt: &mut String) -> Result<()> {
+    use crate::core::config::SpawnPolicy;
+    if Role::from_phase(task.run_phase) != Role::Executor {
+        return Ok(());
+    }
+    let ops = crate::core::operations::Operations::new(roots.data_root);
+    let effective = ops.effective_spawn(task)?;
+    if effective.policy != SpawnPolicy::Forbidden {
+        prompt.push_str(&format!("\nAgent helpers: use \"$KANBAN_CMD\" spawn --parent {} <title> --description <instructions> for independent parallel work or cheaper-model research. Static up-front DAGs belong to the orchestrator's kanban plan. Helpers use separate worktrees seeded from the project; they cannot see your uncommitted edits. Read results with \"$KANBAN_CMD\" output <id>; join with \"$KANBAN_CMD\" wait <id>... . If wait exits 3, waiting is already declared: end your reply so helpers can use the released slot.\n", task.id));
+        if effective.policy == SpawnPolicy::Forced {
+            prompt.push_str("Spawn policy (mandatory): create at least one helper with kanban spawn before done; done is refused otherwise.\n");
+        }
+    }
+    let children: Vec<_> = ops
+        .storage
+        .get_all_tasks()?
+        .into_iter()
+        .filter(|child| child.spawned && child.parent_task.as_deref() == Some(&task.id))
+        .collect();
+    if !children.is_empty() {
+        prompt.push_str("\nSpawned helpers:\n");
+        let budget = ops
+            .config
+            .get_orchestration()?
+            .orchestrator
+            .upstream_budget_chars
+            .max(0) as usize
+            / children.len();
+        let threads = ThreadManager::new(roots.data_root)?;
+        for child in children {
+            prompt.push_str(&format!(
+                "- {} [{}]: {}\n",
+                child.id, child.status, child.title
+            ));
+            if matches!(child.status, TaskStatus::Review | TaskStatus::Done) {
+                prompt.push_str(&result_digest(&threads, &child.id, budget)?);
+                prompt.push('\n');
+            }
+        }
+    }
+    Ok(())
 }

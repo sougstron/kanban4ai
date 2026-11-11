@@ -1744,7 +1744,13 @@ fn settings_tab_arrows_wrap_and_tab_stays_in_page() {
     let modal = app.modal.as_mut().unwrap();
     modal.set_settings_tab(SettingsTab::Executor);
     assert_eq!(modal.active_field(), DialogField::InheritExecutor);
-    for _ in 0..(modal.fields().len() - 1) {
+    for _ in 0..(modal
+        .fields()
+        .iter()
+        .filter(|field| modal.field_enabled(**field))
+        .count()
+        - 1)
+    {
         app.handle_key(key(KeyCode::Tab)).expect("next field");
     }
     assert_eq!(
@@ -5743,16 +5749,17 @@ fn review_detail_rerun_closes_the_detail_before_the_launch_finishes() {
         .expect("rerun");
     assert_eq!(app.screen, Screen::Board, "detail must close on the press");
     assert!(app.detail.is_none());
-    // The worker can fold the saved edits into context before it reaches
+    // The worker can fold the saved edits into the thread before it reaches
     // GatedLauncher. Both durable states prove the visible text was saved.
     let saved = app.ops.get_task(&task.id).unwrap().unwrap();
     assert!(
         saved.review_edits == "Rework this"
-            || app
-                .ops
-                .task_context(&task.id)
+            || crate::core::thread::ThreadManager::new(app.ops.data_root())
                 .unwrap()
-                .contains("Rework this"),
+                .messages_of_kind(&task.id, crate::core::models::MessageKind::ReviewEdit)
+                .unwrap()
+                .iter()
+                .any(|message| message.body == "Rework this"),
         "visible edits are saved before the detail closes"
     );
 
@@ -11896,6 +11903,8 @@ fn new_task_mode_toggles_save_on_the_task() {
         (DialogField::UseOrchestrator, true),
         (DialogField::UseDesigner, true),
         (DialogField::UseReviewer, true),
+        (DialogField::SpawnPolicy, false),
+        (DialogField::SpawnHelperModel, false),
         (DialogField::PlannedLaunch, false),
         (DialogField::LaunchTime, false),
     ] {
@@ -14453,4 +14462,75 @@ fn permission_selector_loads_legacy_cycles_and_clears_on_save() {
         app.ops.get_task(&task.id).unwrap().unwrap().permission(),
         None
     );
+}
+
+#[test]
+fn fanout_task_options_snapshot() {
+    let (_dir, mut app) = populated_app();
+    app.handle_key(key(KeyCode::Char('n'))).unwrap();
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::TaskOptions);
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    insta::assert_snapshot!("fanout_task_options", render_at(&mut app, 100, 40));
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::SpawnPolicy);
+    app.handle_key(key(KeyCode::Char(' '))).unwrap();
+    assert_eq!(
+        app.modal.as_ref().unwrap().spawn_policy,
+        Some(crate::core::config::SpawnPolicy::Allowed)
+    );
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert_eq!(app.modal.as_ref().unwrap().spawn_policy, None);
+}
+
+#[test]
+fn fanout_project_settings_snapshots() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s'))).unwrap();
+    app.modal
+        .as_mut()
+        .unwrap()
+        .set_settings_tab(SettingsTab::Executor);
+    app.modal
+        .as_mut()
+        .unwrap()
+        .inherit
+        .set(crate::core::config::InheritGroup::FanOut, false);
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::SpawnMaxChildren);
+    insta::assert_snapshot!("fanout_project_settings", render_at(&mut app, 100, 40));
+    app.modal
+        .as_mut()
+        .unwrap()
+        .inherit
+        .set(crate::core::config::InheritGroup::FanOut, true);
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::InheritFanOut);
+    insta::assert_snapshot!(
+        "fanout_project_settings_inherited",
+        render_at(&mut app, 100, 40)
+    );
+}
+
+#[test]
+fn fanout_global_settings_snapshot() {
+    let (_dir, mut app) = global_settings_app();
+    open_global_settings(&mut app);
+    app.modal
+        .as_mut()
+        .unwrap()
+        .set_settings_tab(SettingsTab::Executor);
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::SpawnMaxChildren);
+    insta::assert_snapshot!("fanout_global_settings", render_at(&mut app, 100, 40));
 }

@@ -777,6 +777,7 @@ mod tests {
         role: &[(&str, i64)],
     ) -> OrchestrationSettings {
         OrchestrationSettings {
+            spawn: Default::default(),
             queue_enabled: true,
             max_running_total: total,
             max_running_per_backend: backend.iter().map(|(k, v)| (k.to_string(), *v)).collect(),

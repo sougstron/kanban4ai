@@ -305,6 +305,14 @@ orchestration:
     agent: null
     on_changes_requested: in_progress
     max_rounds: 3
+  spawn:
+    policy: allowed
+    helper_model: same
+    max_depth: 2
+    max_children: 5
+    wait_poll_secs: 5
+    wait_timeout_secs: 600
+    wait_eta_secs: 900
   orchestrator:
     max_subtasks: 12
     upstream_budget_chars: 4000
@@ -335,6 +343,7 @@ inherit:
   reviewer: true
   executor: true
   placement: true
+  fan_out: true
 "#;
 
 /// Placement preference only; availability and launch routing belong to the runner.
@@ -624,10 +633,11 @@ pub enum InheritGroup {
     Reviewer,
     Executor,
     Placement,
+    FanOut,
 }
 
 impl InheritGroup {
-    pub const ALL: [InheritGroup; 8] = [
+    pub const ALL: [InheritGroup; 9] = [
         InheritGroup::Agent,
         InheritGroup::Limits,
         InheritGroup::Common,
@@ -636,6 +646,7 @@ impl InheritGroup {
         InheritGroup::Reviewer,
         InheritGroup::Executor,
         InheritGroup::Placement,
+        InheritGroup::FanOut,
     ];
 
     /// The key under the project's `inherit:` section.
@@ -649,6 +660,7 @@ impl InheritGroup {
             InheritGroup::Reviewer => "reviewer",
             InheritGroup::Executor => "executor",
             InheritGroup::Placement => "placement",
+            InheritGroup::FanOut => "fan_out",
         }
     }
 
@@ -665,6 +677,7 @@ impl InheritGroup {
             InheritGroup::Designer => Some("designer"),
             InheritGroup::Reviewer => Some("reviewer"),
             InheritGroup::Executor => Some("executors"),
+            InheritGroup::FanOut => Some("spawn"),
             _ => None,
         }
     }
@@ -680,20 +693,21 @@ impl InheritGroup {
             }
             InheritGroup::TaskSort => config.tui.contains_key("task_sort"),
             InheritGroup::Placement => !config.runner.is_empty(),
-            InheritGroup::Designer | InheritGroup::Reviewer | InheritGroup::Executor => {
-                self.orchestration_section().is_some_and(orch_has)
-            }
+            InheritGroup::Designer
+            | InheritGroup::Reviewer
+            | InheritGroup::Executor
+            | InheritGroup::FanOut => self.orchestration_section().is_some_and(orch_has),
         }
     }
 }
 
 /// Per-group "take this from the global config" switches (`inherit:`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InheritFlags([bool; 8]);
+pub struct InheritFlags([bool; 9]);
 
 impl InheritFlags {
     pub fn all(inherit: bool) -> Self {
-        Self([inherit; 8])
+        Self([inherit; 9])
     }
 
     pub fn get(&self, group: InheritGroup) -> bool {
@@ -772,7 +786,10 @@ pub fn copy_group(dst: &mut BoardConfig, src: &BoardConfig, group: InheritGroup)
         }
         InheritGroup::TaskSort => copy_key(&mut dst.tui, &src.tui, "task_sort"),
         InheritGroup::Placement => dst.runner = src.runner.clone(),
-        InheritGroup::Designer | InheritGroup::Reviewer | InheritGroup::Executor => {
+        InheritGroup::Designer
+        | InheritGroup::Reviewer
+        | InheritGroup::Executor
+        | InheritGroup::FanOut => {
             if let Some(section) = group.orchestration_section() {
                 copy_key(&mut dst.orchestration, &src.orchestration, section);
             }
@@ -852,6 +869,7 @@ pub enum OnChangesRequested {
 /// this — never the raw `Mapping`, and no threshold is hardcoded elsewhere.
 #[derive(Debug, Clone)]
 pub struct OrchestrationSettings {
+    pub spawn: SpawnSettings,
     pub queue_enabled: bool,
     /// Total concurrently running agents. `0` means unlimited.
     pub max_running_total: i64,
@@ -880,6 +898,91 @@ pub struct OrchestrationSettings {
     pub isolation: IsolationSettings,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnPolicy {
+    #[default]
+    Allowed,
+    Forbidden,
+    Forced,
+}
+impl SpawnPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allowed => "allowed",
+            Self::Forbidden => "forbidden",
+            Self::Forced => "forced",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "allowed" => Some(Self::Allowed),
+            "forbidden" => Some(Self::Forbidden),
+            "forced" => Some(Self::Forced),
+            _ => None,
+        }
+    }
+}
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnHelperModel {
+    #[default]
+    Same,
+    ExecutorMiddle,
+    ExecutorCheap,
+}
+impl SpawnHelperModel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Same => "same",
+            Self::ExecutorMiddle => "executor_middle",
+            Self::ExecutorCheap => "executor_cheap",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "same" => Some(Self::Same),
+            "executor_middle" => Some(Self::ExecutorMiddle),
+            "executor_cheap" => Some(Self::ExecutorCheap),
+            _ => None,
+        }
+    }
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpawnSettings {
+    pub policy: SpawnPolicy,
+    pub helper_model: SpawnHelperModel,
+    pub max_depth: u32,
+    pub max_children: usize,
+    pub wait_poll_secs: u64,
+    pub wait_timeout_secs: u64,
+    pub wait_eta_secs: i64,
+}
+impl Default for SpawnSettings {
+    fn default() -> Self {
+        Self {
+            policy: SpawnPolicy::Allowed,
+            helper_model: SpawnHelperModel::Same,
+            max_depth: 2,
+            max_children: 5,
+            wait_poll_secs: 5,
+            wait_timeout_secs: 600,
+            wait_eta_secs: 900,
+        }
+    }
+}
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EffectiveSpawn {
+    pub requires_helper: bool,
+    pub policy: SpawnPolicy,
+    pub source: &'static str,
+    pub helper_model: SpawnHelperModel,
+    pub helper_source: &'static str,
+    pub depth: u32,
+    pub max_depth: u32,
+    pub max_children: usize,
+}
 /// `orchestration.orchestrator`: bounds on a planning pass. There is no
 /// `enabled` key — the orchestrator is a per-task opt-in
 /// ([`Task::use_orchestrator`]) and runs on the task's own backend/model, so
@@ -2095,6 +2198,10 @@ impl OrchestrationSettings {
                 on_changes_requested,
                 max_rounds,
             },
+            spawn: mapping
+                .get("spawn")
+                .and_then(|v| serde_yaml_ng::from_value(v.clone()).ok())
+                .unwrap_or_default(),
             orchestrator: OrchestratorSettings {
                 max_subtasks: orchestrator_int("max_subtasks", 12),
                 upstream_budget_chars: orchestrator_int("upstream_budget_chars", 4000),
@@ -2509,6 +2616,18 @@ impl Config {
                 )
                 .collect();
         let orch = &mut config.orchestration;
+        if let Some(value) = orch.get("spawn") {
+            let settings: SpawnSettings = serde_yaml_ng::from_value(value.clone())
+                .map_err(|e| KanbanError::Invalid(format!("orchestration.spawn: {e}")))?;
+            if settings.wait_poll_secs == 0
+                || settings.wait_timeout_secs == 0
+                || settings.wait_eta_secs < 1
+            {
+                return Err(KanbanError::Invalid(
+                    "orchestration.spawn wait durations must be positive".into(),
+                ));
+            }
+        }
 
         coerce_bool_field(orch, "queue_enabled", "orchestration")?;
         coerce_int_cap(orch, "max_running_total")?;
@@ -2695,6 +2814,44 @@ impl Config {
         let text = self.load()?.instructions;
         let text = text.trim();
         Ok((!text.is_empty()).then(|| text.to_string()))
+    }
+
+    pub fn effective_spawn(&self, task: &Task, depth: u32) -> Result<EffectiveSpawn> {
+        let settings = self.get_orchestration()?.spawn;
+        let source =
+            if self.global_file.is_some() && self.inherit_flags()?.get(InheritGroup::FanOut) {
+                "global"
+            } else {
+                "project"
+            };
+        let mut result = EffectiveSpawn {
+            requires_helper: false,
+            policy: task.spawn_policy.unwrap_or(settings.policy),
+            source: if task.spawn_policy.is_some() {
+                "task"
+            } else {
+                source
+            },
+            helper_model: task.spawn_helper_model.unwrap_or(settings.helper_model),
+            helper_source: if task.spawn_helper_model.is_some() {
+                "task"
+            } else {
+                source
+            },
+            depth,
+            max_depth: settings.max_depth,
+            max_children: settings.max_children,
+        };
+        if task.spawned && task.spawn_policy.is_none() && result.policy == SpawnPolicy::Forced {
+            result.policy = SpawnPolicy::Allowed;
+            result.source = "spawned child";
+        }
+        result.requires_helper = result.policy == SpawnPolicy::Forced;
+        if depth >= settings.max_depth {
+            result.policy = SpawnPolicy::Forbidden;
+            result.source = "depth limit";
+        }
+        Ok(result)
     }
 
     pub fn get_orchestration(&self) -> Result<OrchestrationSettings> {

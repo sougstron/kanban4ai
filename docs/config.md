@@ -632,3 +632,34 @@ full-access behavior, even if legacy bypass flags were previously removed.
 Designer/reviewer launches use the task permission with their selected backend;
 the arbiter uses the project default. Orchestrator children inherit an explicit
 preset, except readonly, which falls back to the project default.
+
+## Agent fan-out
+
+`orchestration.spawn` defaults:
+
+```yaml
+spawn:
+  policy: allowed              # allowed | forbidden | forced
+  helper_model: same           # same | executor_middle | executor_cheap
+  max_depth: 2
+  max_children: 5
+  wait_poll_secs: 5
+  wait_timeout_secs: 600
+  wait_eta_secs: 900
+```
+
+These values live under `orchestration` in global/project config. The
+`inherit.fan_out` switch defaults to true for existing boards without fan-out
+settings. Effective policy/model resolve task override → project → global.
+The shared `Config::effective_spawn` resolver also enforces depth. Zero depth or
+zero children disables further spawning. Wait durations must be positive.
+
+`forbidden` rejects spawn and omits helper instructions from the prompt.
+`forced` requires at least one spawned helper before an agent can finish its
+executor phase. Helpers default explicitly to `allowed`, so forced policy does
+not cause an endless chain. Depth remains a hard limit. Explicit task policy
+changes can still force a helper within that depth limit.
+
+`same` copies backend/model/effort. Middle/cheap use existing executor pools and
+quota selection; explicit spawn flags take precedence. Children use the ordinary
+queue and its total, backend, model and role concurrency caps.

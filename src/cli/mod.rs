@@ -391,6 +391,48 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Create and enqueue a helper owned by the current parent executor session.
+    Spawn {
+        title: String,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        #[arg(long)]
+        readonly: bool,
+        #[arg(long, value_delimiter = ',')]
+        depends_on: Vec<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Wait for results. Exit: 0 success, 2 timeout, 3 declared waiting (end
+    /// the agent reply), 4 failed/blocked/missing child. Uses waiting to free slots.
+    Wait {
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<String>,
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        no_waiting: bool,
+    },
+    /// Read a helper's result digest, branch and diff statistics.
+    Output {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Update session heartbeat.
     Heartbeat {
         /// Session ID
@@ -1448,6 +1490,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             println!("ID: {}", task.id);
             println!("Title: {}", task.title);
             println!("Status: {}", task.status);
+            let spawn = ops.effective_spawn(&task)?;
+            println!("Spawn policy: {} ({})", spawn.policy.as_str(), spawn.source);
+            println!(
+                "Spawn helper model: {} ({})",
+                spawn.helper_model.as_str(),
+                spawn.helper_source
+            );
+
             if let Some(agent_backend) = &task.agent_backend {
                 println!("Agent: {agent_backend}");
             }
@@ -1491,7 +1541,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 );
             }
             if let Some(parent_task) = &task.parent_task {
-                println!("Planned by: {parent_task}");
+                println!(
+                    "{}: {parent_task}",
+                    if task.spawned {
+                        "Spawned by"
+                    } else {
+                        "Planned by"
+                    }
+                );
             }
             if task.use_orchestrator {
                 println!(
@@ -1569,6 +1626,131 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     result.before
                 ),
                 CompactionStatus::NoContext => println!("No context found for this task."),
+            }
+        }
+        Command::Spawn {
+            title,
+            parent,
+            description,
+            backend,
+            model,
+            effort,
+            readonly,
+            depends_on,
+            session,
+            json,
+        } => {
+            let parent = parent
+                .or_else(|| std::env::var("KANBAN_TASK_ID").ok())
+                .ok_or_else(|| {
+                    KanbanError::Permission(
+                        "spawn requires the parent session and --parent or KANBAN_TASK_ID".into(),
+                    )
+                })?;
+            let session_id = env_session(session);
+            if std::env::var("KANBAN_TASK_ID").is_ok_and(|id| id != parent)
+                || std::env::var("KANBAN_SESSION").is_ok_and(|id| id != session_id)
+            {
+                return Err(KanbanError::Permission(
+                    "spawn must use the current parent session".into(),
+                ));
+            }
+            let child = ops.spawn_task(
+                crate::core::operations::SpawnRequest {
+                    parent_id: parent,
+                    title,
+                    description,
+                    backend,
+                    model,
+                    effort,
+                    readonly,
+                    depends_on,
+                },
+                &session_id,
+            )?;
+            if json {
+                println!("{}", serde_json::json!(child));
+            } else {
+                println!("{}", child.id);
+            }
+        }
+        Command::Output { id, json } => {
+            let output = ops.task_output(&id)?;
+            if json {
+                println!("{}", serde_json::json!(output));
+            } else {
+                println!(
+                    "{}: {} [{}]",
+                    output.task.id, output.task.title, output.state.state
+                );
+                println!(
+                    "Branch: {}\nIntegration: {:?}",
+                    output.task.branch.as_deref().unwrap_or("(none)"),
+                    output.task.integration
+                );
+                if let Some(stat) = output.diff_stat {
+                    println!("Diff: {stat}");
+                }
+                if let Some(path) = output.task.result_path {
+                    println!("Result: {path}");
+                }
+                println!("{}", output.digest);
+            }
+        }
+        Command::Wait {
+            ids,
+            timeout,
+            session,
+            json,
+            no_waiting,
+        } => {
+            let settings = ops.config.get_orchestration()?.spawn;
+            let timeout =
+                std::time::Duration::from_secs(timeout.unwrap_or(settings.wait_timeout_secs));
+            let started = std::time::Instant::now();
+            let session_id = env_session(session);
+            let parent = std::env::var("KANBAN_TASK_ID").ok();
+            loop {
+                let states = ops.wait_poll(&ids)?;
+                let terminal = states.iter().all(|s| s.terminal);
+                let timed_out = started.elapsed() >= timeout;
+                let release = !no_waiting && parent.is_some() && ops.spawn_wait_needs_slot(&ids)?;
+                if terminal || timed_out || release {
+                    let waiting = !terminal && !no_waiting && parent.is_some();
+                    if waiting {
+                        ops.declare_waiting_for(parent.as_deref().unwrap(), &session_id, &ids)?;
+                    }
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({"statuses": states, "waiting": waiting})
+                        );
+                    } else {
+                        for state in &states {
+                            println!("{}  {}  {}", state.id, state.state, state.title);
+                        }
+                        if waiting {
+                            println!(
+                                "Waiting declared. End your reply now; the board relaunches you when helpers finish or the deadline passes."
+                            );
+                        }
+                    }
+                    return Ok(ExitCode::from(if terminal {
+                        if states.iter().all(|s| s.success) {
+                            0
+                        } else {
+                            4
+                        }
+                    } else if waiting {
+                        3
+                    } else {
+                        2
+                    }));
+                }
+                std::thread::sleep(
+                    std::time::Duration::from_secs(settings.wait_poll_secs)
+                        .min(timeout.saturating_sub(started.elapsed())),
+                );
             }
         }
         Command::Heartbeat { session } => {
@@ -2119,6 +2301,9 @@ fn task_to_json(task: &Task) -> serde_json::Value {
         "depends_on": task.depends_on,
         "needs": task.needs,
         "parent_task": task.parent_task,
+        "spawned": task.spawned,
+        "spawn_policy": task.spawn_policy,
+        "spawn_helper_model": task.spawn_helper_model,
         "role_profile": task.role_profile,
         "review_edits": task.review_edits,
     })

@@ -140,6 +140,8 @@ impl AgentLauncher for NoopLauncher {
 /// Option-valued task fields use `Some(None)` to clear.
 #[derive(Debug, Default, Clone)]
 pub struct TaskPatch {
+    pub spawn_policy: Option<Option<crate::core::config::SpawnPolicy>>,
+    pub spawn_helper_model: Option<Option<crate::core::config::SpawnHelperModel>>,
     pub title: Option<String>,
     pub description: Option<String>,
     pub status: Option<String>,
@@ -165,6 +167,33 @@ pub struct TaskPatch {
     pub role_profile: Option<Option<String>>,
     pub session: Option<Option<String>>,
     pub runner: Option<Option<crate::core::config::Runner>>,
+}
+
+#[derive(Debug, Default)]
+pub struct SpawnRequest {
+    pub parent_id: String,
+    pub title: String,
+    pub description: String,
+    pub backend: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub readonly: bool,
+    pub depends_on: Vec<String>,
+}
+#[derive(Debug, serde::Serialize)]
+pub struct ChildState {
+    pub id: String,
+    pub title: String,
+    pub state: String,
+    pub terminal: bool,
+    pub success: bool,
+}
+#[derive(Debug, serde::Serialize)]
+pub struct TaskOutput {
+    pub task: Task,
+    pub state: ChildState,
+    pub digest: String,
+    pub diff_stat: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -535,6 +564,7 @@ impl Operations {
         copied.run_failure = None;
         copied.crash_restarts = 0;
         copied.restart_at = None;
+        copied.spawned = false;
         copied.review_rounds = 0;
         copied.designed = false;
         // A copy is a fresh root, not a second node of the same graph: it
@@ -571,6 +601,12 @@ impl Operations {
             return Ok(None);
         };
         let assignment_before = launch_assignment(&task);
+        if let Some(value) = patch.spawn_policy {
+            task.spawn_policy = value;
+        }
+        if let Some(value) = patch.spawn_helper_model {
+            task.spawn_helper_model = value;
+        }
         if let Some(runner) = patch.runner {
             task.runner = runner;
         }
@@ -1611,6 +1647,20 @@ impl Operations {
                 ));
             }
 
+            if is_agent
+                && self.effective_spawn(&task)?.requires_helper
+                && !self
+                    .storage
+                    .get_all_tasks()?
+                    .iter()
+                    .any(|child| child.spawned && child.parent_task.as_deref() == Some(&task.id))
+            {
+                return Err(KanbanError::Permission(format!(
+                    "spawn_policy is forced for {}; create a helper with kanban spawn --parent {} before done",
+                    task.id, task.id
+                )));
+            }
+
             if is_agent && self.config.get_rule("user_only_review_to_done")? {
                 // A peer can enter Review while this node's concurrent
                 // executor is still running; its result must still be sealed.
@@ -2275,6 +2325,290 @@ impl Operations {
             }
         }
         Ok(started)
+    }
+
+    /// Resolve fan-out once for every caller, including its hard ancestry bound.
+    pub fn effective_spawn(&self, task: &Task) -> Result<crate::core::config::EffectiveSpawn> {
+        let mut depth = 0;
+        let mut current = task.clone();
+        let mut visited = std::collections::HashSet::new();
+        while current.spawned {
+            if !visited.insert(current.id.clone()) {
+                return Err(KanbanError::Invalid("cycle in spawn ancestry".into()));
+            }
+            depth += 1;
+            let Some(parent) = current.parent_task.as_deref() else {
+                break;
+            };
+            let Some(parent) = self.storage.load_task(parent)? else {
+                break;
+            };
+            current = parent;
+        }
+        self.config.effective_spawn(task, depth)
+    }
+
+    pub fn spawn_task(&self, request: SpawnRequest, session_id: &str) -> Result<Task> {
+        use crate::core::config::{SpawnHelperModel, SpawnPolicy};
+        let _guard = self.storage.lock()?;
+        let parent = self
+            .storage
+            .load_task(&request.parent_id)?
+            .ok_or_else(|| KanbanError::Invalid("parent task not found".into()))?;
+        self.require_current_agent_session(&parent, session_id)?;
+        if !matches!(parent.run_phase, None | Some(RunPhase::Execute)) {
+            return Err(KanbanError::Permission(
+                "only the parent's executor session may spawn helpers".into(),
+            ));
+        }
+        let effective = self.effective_spawn(&parent)?;
+        if effective.policy == SpawnPolicy::Forbidden {
+            return Err(KanbanError::Permission(format!(
+                "spawn is forbidden for {} (from {})",
+                parent.id, effective.source
+            )));
+        }
+        let tasks = self.storage.get_all_tasks()?;
+        if tasks
+            .iter()
+            .filter(|t| t.spawned && t.parent_task.as_deref() == Some(&parent.id))
+            .count()
+            >= effective.max_children
+        {
+            return Err(KanbanError::Permission(format!(
+                "{} reached orchestration.spawn.max_children ({})",
+                parent.id, effective.max_children
+            )));
+        }
+        // A helper cannot wait on its own running parent (nor a descendant
+        // that depends on that parent): that would create a dynamic join deadlock.
+        let mut pending = request.depends_on.clone();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            if id == parent.id {
+                return Err(KanbanError::Invalid(
+                    "helper dependencies cannot depend on its parent".into(),
+                ));
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let dep = tasks
+                .iter()
+                .find(|t| t.id == id)
+                .ok_or_else(|| KanbanError::Invalid(format!("dependency {id} not found")))?;
+            pending.extend(dep.depends_on.iter().cloned());
+        }
+        let explicit =
+            request.backend.is_some() || request.model.is_some() || request.effort.is_some();
+        let orch = self.config.get_orchestration()?;
+        let profile = if explicit {
+            None
+        } else {
+            match effective.helper_model {
+                SpawnHelperModel::Same => None,
+                SpawnHelperModel::ExecutorMiddle => Some("middle"),
+                SpawnHelperModel::ExecutorCheap => Some("cheap"),
+            }
+        }
+        .filter(|profile| {
+            if *profile == "middle" {
+                !orch.executors.middle.is_empty()
+            } else {
+                !orch.executors.cheap.is_empty()
+            }
+        });
+        let same_backend = request.backend.is_none() || request.backend == parent.agent_backend;
+        let mut task = self.create_task(NewTask {
+            title: request.title,
+            description: request.description,
+            agent_backend: if profile.is_some() {
+                None
+            } else {
+                request.backend.or(parent.agent_backend.clone())
+            },
+            ai_model: if profile.is_some() {
+                None
+            } else {
+                request
+                    .model
+                    .or_else(|| same_backend.then(|| parent.ai_model.clone()).flatten())
+            },
+            ai_effort: if profile.is_some() {
+                None
+            } else {
+                request
+                    .effort
+                    .or_else(|| same_backend.then(|| parent.ai_effort.clone()).flatten())
+            },
+            agent_name: if profile.is_none() && same_backend {
+                parent.agent_name.clone()
+            } else {
+                None
+            },
+            explicit_assignment: profile.is_none(),
+            permission: if request.readonly {
+                Some("readonly".into())
+            } else {
+                parent.permission().map(str::to_owned)
+            },
+            silence: parent.silence,
+            runner: parent.runner.clone(),
+            parent_task: Some(parent.id.clone()),
+            role_profile: profile.map(str::to_owned),
+            depends_on: request.depends_on,
+            ..NewTask::default()
+        })?;
+        task.spawned = true;
+        task.spawn_policy = Some(SpawnPolicy::Allowed);
+        // materialize_new_task pins default fields; a pool selection must remain unpinned.
+        task.explicit_assignment = profile.is_none();
+        self.storage.save_task(&task)?;
+        if task.depends_on.iter().all(|id| {
+            tasks
+                .iter()
+                .any(|t| &t.id == id && matches!(t.status, TaskStatus::Review | TaskStatus::Done))
+        }) {
+            // Always enqueue. Dispatcher caps apply even when a human disables auto-launch.
+            self.queue_local_run(&task.id)?;
+        }
+        self.thread_manager()?.post(
+            &parent.id,
+            MessageRole::Agent,
+            MessageKind::Context,
+            &format!(
+                "Spawned helper {}: {}. Read its result with kanban output {}.",
+                task.id, task.title, task.id
+            ),
+            None,
+            vec![],
+            Some("agent".into()),
+        )?;
+        Ok(self.storage.load_task(&task.id)?.unwrap_or(task))
+    }
+
+    pub fn wait_poll(&self, ids: &[String]) -> Result<Vec<ChildState>> {
+        let _guard = self.storage.lock()?;
+        let heartbeat_timeout = self.config.get_threshold("session_heartbeat_timeout")?;
+        ids.iter()
+            .map(|id| {
+                let Some(task) = self.storage.load_task(id)? else {
+                    return Ok(ChildState {
+                        id: id.clone(),
+                        title: String::new(),
+                        state: "missing".into(),
+                        terminal: true,
+                        success: false,
+                    });
+                };
+                let session = task
+                    .session
+                    .as_deref()
+                    .and_then(|s| self.session_manager().load_session(s));
+                let session_state = task
+                    .session
+                    .as_deref()
+                    .and_then(|id| self.session_manager().session_state(id, heartbeat_timeout));
+                let state = if matches!(task.status, TaskStatus::Review | TaskStatus::Done) {
+                    task.status.as_str().to_string()
+                } else if task.has_questions {
+                    "blocked".into()
+                } else if task.run_phase == Some(RunPhase::Queued) {
+                    "queued".into()
+                } else if session
+                    .as_ref()
+                    .is_some_and(|s| s.status == SessionStatus::Active && s.wait_until.is_some())
+                {
+                    "waiting".into()
+                } else if session_state == Some(crate::core::session::SessionState::Live) {
+                    "running".into()
+                } else if task.status == TaskStatus::InProgress && task.restart_at.is_none() {
+                    "failed".into()
+                } else {
+                    "todo".into()
+                };
+                let success = matches!(task.status, TaskStatus::Review | TaskStatus::Done);
+                let terminal = success || matches!(state.as_str(), "failed" | "blocked");
+                Ok(ChildState {
+                    id: task.id,
+                    title: task.title,
+                    state,
+                    terminal,
+                    success,
+                })
+            })
+            .collect()
+    }
+
+    pub fn spawn_wait_needs_slot(&self, ids: &[String]) -> Result<bool> {
+        for id in ids {
+            if let Some(task) = self.storage.load_task(id)?
+                && task.run_phase == Some(RunPhase::Queued)
+                && self.queue_is_full(&task)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn declare_waiting_for(
+        &self,
+        task_id: &str,
+        session: &str,
+        ids: &[String],
+    ) -> Result<chrono::NaiveDateTime> {
+        let _guard = self.storage.lock()?;
+        let deadline = self.declare_waiting(
+            task_id,
+            session,
+            Some(self.config.get_orchestration()?.spawn.wait_eta_secs),
+            Some(&format!(
+                "helpers {}; read results with kanban output",
+                ids.join(", ")
+            )),
+        )?;
+        let mgr = self.session_manager();
+        let mut stored = mgr
+            .load_session(session)
+            .ok_or_else(|| KanbanError::Invalid("session disappeared".into()))?;
+        stored.wait_for = ids.to_vec();
+        mgr.save_session(&stored)?;
+        Ok(deadline)
+    }
+
+    pub fn task_output(&self, id: &str) -> Result<TaskOutput> {
+        let task = self
+            .storage
+            .load_task(id)?
+            .ok_or_else(|| KanbanError::Invalid(format!("task {id} not found")))?;
+        let budget = self
+            .config
+            .get_orchestration()?
+            .orchestrator
+            .upstream_budget_chars
+            .max(0) as usize;
+        let digest = crate::core::context::result_digest(&self.thread_manager()?, id, budget)?;
+        let diff_stat = match (&task.base_commit, &task.branch) {
+            (Some(base), Some(branch)) => {
+                let output = std::process::Command::new("git")
+                    .current_dir(self.work_path())
+                    .args(["diff", "--shortstat", base, branch, "--"])
+                    .output()?;
+                output
+                    .status
+                    .success()
+                    .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            }
+            _ => None,
+        };
+        let state = self.wait_poll(&[id.to_owned()])?.remove(0);
+        Ok(TaskOutput {
+            task,
+            state,
+            digest,
+            diff_stat,
+        })
     }
 
     /// Ingest an orchestrator plan: validate the whole graph, then create the
@@ -5756,7 +6090,12 @@ impl Operations {
             let Some(wait_until) = session.wait_until else {
                 continue;
             };
-            if now <= wait_until {
+            let helpers_finished = !session.wait_for.is_empty()
+                && self
+                    .wait_poll(&session.wait_for)?
+                    .iter()
+                    .all(|state| state.terminal);
+            if now <= wait_until && !helpers_finished {
                 continue;
             }
             // A live process past its deadline is still working (its wrapper
@@ -5792,6 +6131,14 @@ impl Operations {
                 timefmt::format(&wait_until),
                 session.wait_note.as_deref().unwrap_or("(no note)")
             );
+            let note = if helpers_finished {
+                format!(
+                    "Awaited helpers finished: {}. Read each with kanban output <id>, record the results with context, and continue.",
+                    session.wait_for.join(", ")
+                )
+            } else {
+                note
+            };
             if self.queue_can_dispatch()? {
                 // The pause held no slot, so waking re-acquires one through
                 // the dispatcher instead of launching past the caps.

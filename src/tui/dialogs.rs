@@ -208,6 +208,11 @@ pub enum DialogField {
     InheritDesigner,
     InheritReviewer,
     InheritExecutor,
+    InheritFanOut,
+    SpawnPolicy,
+    SpawnHelperModel,
+    SpawnMaxDepth,
+    SpawnMaxChildren,
     Confirm,
     Cancel,
     PurgeData,
@@ -227,11 +232,13 @@ const TASK_FORM_FIELDS: [DialogField; 8] = [
 /// The `Options` subpopup of the task form: per-task orchestration opt-ins
 /// and the planned launch, grouped off the parent form like the agent
 /// settings popup.
-const TASK_OPTIONS_FIELDS: [DialogField; 8] = [
+const TASK_OPTIONS_FIELDS: [DialogField; 10] = [
     DialogField::Silence,
     DialogField::UseOrchestrator,
     DialogField::UseDesigner,
     DialogField::UseReviewer,
+    DialogField::SpawnPolicy,
+    DialogField::SpawnHelperModel,
     DialogField::PlannedLaunch,
     DialogField::LaunchTime,
     DialogField::Confirm,
@@ -376,7 +383,7 @@ const SETTINGS_PAGE_REVIEWER_FIELDS: [DialogField; 7] = [
     DialogField::Cancel,
 ];
 
-const SETTINGS_PAGE_EXECUTOR_FIELDS: [DialogField; 11] = [
+const SETTINGS_PAGE_EXECUTOR_FIELDS: [DialogField; 16] = [
     DialogField::InheritExecutor,
     DialogField::ExecutorMiddle1,
     DialogField::ExecutorMiddle2,
@@ -386,6 +393,11 @@ const SETTINGS_PAGE_EXECUTOR_FIELDS: [DialogField; 11] = [
     DialogField::ExecutorCheap3,
     DialogField::ExecutorWeekThreshold,
     DialogField::ExecutorFiveHourThreshold,
+    DialogField::InheritFanOut,
+    DialogField::SpawnPolicy,
+    DialogField::SpawnHelperModel,
+    DialogField::SpawnMaxDepth,
+    DialogField::SpawnMaxChildren,
     DialogField::Confirm,
     DialogField::Cancel,
 ];
@@ -490,7 +502,22 @@ pub(crate) fn global_settings_page_fields(tab: SettingsTab) -> &'static [DialogF
         SettingsTab::Common | SettingsTab::Instructions => &GLOBAL_SETTINGS_PAGE_COMMON_FIELDS,
         SettingsTab::Designer => &SETTINGS_PAGE_DESIGNER_FIELDS[1..],
         SettingsTab::Reviewer => &SETTINGS_PAGE_REVIEWER_FIELDS[1..],
-        SettingsTab::Executor => &SETTINGS_PAGE_EXECUTOR_FIELDS[1..],
+        SettingsTab::Executor => &[
+            DialogField::ExecutorMiddle1,
+            DialogField::ExecutorMiddle2,
+            DialogField::ExecutorMiddle3,
+            DialogField::ExecutorCheap1,
+            DialogField::ExecutorCheap2,
+            DialogField::ExecutorCheap3,
+            DialogField::ExecutorWeekThreshold,
+            DialogField::ExecutorFiveHourThreshold,
+            DialogField::SpawnPolicy,
+            DialogField::SpawnHelperModel,
+            DialogField::SpawnMaxDepth,
+            DialogField::SpawnMaxChildren,
+            DialogField::Confirm,
+            DialogField::Cancel,
+        ],
         SettingsTab::Backends => &GLOBAL_SETTINGS_PAGE_BACKENDS_FIELDS,
         SettingsTab::Projects => &GLOBAL_SETTINGS_PAGE_PROJECTS_FIELDS,
         SettingsTab::Limits => &GLOBAL_SETTINGS_PAGE_LIMITS_FIELDS,
@@ -537,7 +564,12 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::ReviewerAgentSettings
         | DialogField::ReviewerOnChanges
         | DialogField::ReviewerMaxRounds => Some(SettingsTab::Reviewer),
-        DialogField::InheritExecutor
+        DialogField::InheritFanOut
+        | DialogField::SpawnPolicy
+        | DialogField::SpawnHelperModel
+        | DialogField::SpawnMaxDepth
+        | DialogField::SpawnMaxChildren
+        | DialogField::InheritExecutor
         | DialogField::ExecutorMiddle1
         | DialogField::ExecutorMiddle2
         | DialogField::ExecutorMiddle3
@@ -571,6 +603,7 @@ pub(crate) fn inherit_checkbox_group(field: DialogField) -> Option<InheritGroup>
         DialogField::InheritDesigner => Some(InheritGroup::Designer),
         DialogField::InheritReviewer => Some(InheritGroup::Reviewer),
         DialogField::InheritExecutor => Some(InheritGroup::Executor),
+        DialogField::InheritFanOut => Some(InheritGroup::FanOut),
         _ => None,
     }
 }
@@ -579,6 +612,10 @@ pub(crate) fn inherit_checkbox_group(field: DialogField) -> Option<InheritGroup>
 /// fields (name, theme, isolation) and the checkboxes themselves.
 pub(crate) fn field_group(field: DialogField) -> Option<InheritGroup> {
     match field {
+        DialogField::SpawnPolicy
+        | DialogField::SpawnHelperModel
+        | DialogField::SpawnMaxDepth
+        | DialogField::SpawnMaxChildren => Some(InheritGroup::FanOut),
         DialogField::AgentSettings
         | DialogField::Backend
         | DialogField::Model
@@ -714,6 +751,8 @@ struct AgentPopupState {
 /// Opening snapshot of the `Options` subpopup; Cancel restores exactly this.
 struct OptionsSnapshot {
     silence: bool,
+    spawn_policy: Option<crate::core::config::SpawnPolicy>,
+    spawn_helper_model: Option<crate::core::config::SpawnHelperModel>,
     use_orchestrator: bool,
     use_designer: bool,
     use_reviewer: bool,
@@ -844,6 +883,11 @@ pub struct ModalState {
     pub permission_choices: Vec<Option<String>>,
     pub permission_default: Option<String>,
     pub silence: bool,
+    pub spawn_policy: Option<crate::core::config::SpawnPolicy>,
+    pub spawn_helper_model: Option<crate::core::config::SpawnHelperModel>,
+    pub spawn_inherited_label: String,
+    pub spawn_max_depth: TextArea<'static>,
+    pub spawn_max_children: TextArea<'static>,
     pub use_orchestrator: bool,
     pub use_designer: bool,
     pub use_reviewer: bool,
@@ -998,6 +1042,11 @@ impl ModalState {
                 .collect(),
             permission_default: None,
             silence: false,
+            spawn_policy: None,
+            spawn_helper_model: None,
+            spawn_inherited_label: "project defaults".into(),
+            spawn_max_depth: one_line("2"),
+            spawn_max_children: one_line("5"),
             use_orchestrator: false,
             use_designer: false,
             use_reviewer: false,
@@ -1105,6 +1154,8 @@ impl ModalState {
         state.silence = task.silence;
         state.runner = task.runner.clone();
         state.use_orchestrator = task.use_orchestrator;
+        state.spawn_policy = task.spawn_policy;
+        state.spawn_helper_model = task.spawn_helper_model;
         state.use_designer = task.use_designer;
         state.use_reviewer = task.use_reviewer;
         state
@@ -1336,6 +1387,9 @@ impl ModalState {
             DialogField::Title => &mut self.title,
             DialogField::Description => &mut self.description,
             DialogField::Answer => &mut self.answer,
+            DialogField::SpawnMaxDepth => &mut self.spawn_max_depth,
+            DialogField::SpawnMaxChildren => &mut self.spawn_max_children,
+            DialogField::SpawnPolicy | DialogField::SpawnHelperModel => &mut self.answer,
             DialogField::LaunchTime => &mut self.launch_time,
             DialogField::MaxRunningTotal => &mut self.max_running_total,
             DialogField::MaxRunningDesigner => &mut self.max_running_designer,
@@ -1546,6 +1600,8 @@ impl ModalState {
             form_scroll: 0,
             original: OptionsSnapshot {
                 silence: self.silence,
+                spawn_policy: self.spawn_policy,
+                spawn_helper_model: self.spawn_helper_model,
                 use_orchestrator: self.use_orchestrator,
                 use_designer: self.use_designer,
                 use_reviewer: self.use_reviewer,
@@ -1580,6 +1636,8 @@ impl ModalState {
                 SubPopup::Options(options) => {
                     self.silence = options.original.silence;
                     self.use_orchestrator = options.original.use_orchestrator;
+                    self.spawn_policy = options.original.spawn_policy;
+                    self.spawn_helper_model = options.original.spawn_helper_model;
                     self.use_designer = options.original.use_designer;
                     self.use_reviewer = options.original.use_reviewer;
                     self.planned_launch = options.original.planned_launch;
@@ -2187,6 +2245,59 @@ impl ModalState {
                     self.runner = choices[(current + delta) % choices.len()].clone();
                 }
             }
+            DialogField::SpawnPolicy | DialogField::SpawnHelperModel => {
+                use crate::core::config::{SpawnHelperModel, SpawnPolicy};
+                use ratatui::crossterm::event::KeyCode;
+                if matches!(
+                    key.code,
+                    KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Left | KeyCode::Right
+                ) {
+                    let settings = matches!(self.modal, Modal::Settings | Modal::GlobalSettings);
+                    if self.active_field() == DialogField::SpawnPolicy {
+                        let values = [
+                            None,
+                            Some(SpawnPolicy::Allowed),
+                            Some(SpawnPolicy::Forbidden),
+                            Some(SpawnPolicy::Forced),
+                        ];
+                        let start = usize::from(settings);
+                        let current = values
+                            .iter()
+                            .position(|v| *v == self.spawn_policy)
+                            .unwrap_or(start)
+                            .max(start);
+                        let count = values.len() - start;
+                        let delta = if key.code == KeyCode::Left {
+                            count - 1
+                        } else {
+                            1
+                        };
+                        self.spawn_policy = values[start + (current - start + delta) % count];
+                    } else {
+                        let values = [
+                            None,
+                            Some(SpawnHelperModel::Same),
+                            Some(SpawnHelperModel::ExecutorMiddle),
+                            Some(SpawnHelperModel::ExecutorCheap),
+                        ];
+                        let start = usize::from(settings);
+                        let current = values
+                            .iter()
+                            .position(|v| *v == self.spawn_helper_model)
+                            .unwrap_or(start)
+                            .max(start);
+                        let count = values.len() - start;
+                        let delta = if key.code == KeyCode::Left {
+                            count - 1
+                        } else {
+                            1
+                        };
+                        self.spawn_helper_model = values[start + (current - start + delta) % count];
+                    }
+                }
+            }
+            DialogField::SpawnMaxDepth => input_single_line(&mut self.spawn_max_depth, key),
+            DialogField::SpawnMaxChildren => input_single_line(&mut self.spawn_max_children, key),
             DialogField::UseOrchestrator => toggle_on_space(&mut self.use_orchestrator, key),
             DialogField::UseDesigner => toggle_on_space(&mut self.use_designer, key),
             DialogField::UseReviewer => toggle_on_space(&mut self.use_reviewer, key),
@@ -2301,6 +2412,7 @@ impl ModalState {
             | DialogField::InheritPlacement
             | DialogField::InheritDesigner
             | DialogField::InheritReviewer
+            | DialogField::InheritFanOut
             | DialogField::InheritExecutor => {
                 if key.code == ratatui::crossterm::event::KeyCode::Char(' ')
                     && let Some(group) = inherit_checkbox_group(field)
@@ -2428,6 +2540,9 @@ impl ModalState {
             DialogField::Effort => &mut self.effort,
             DialogField::Agent => &mut self.agent,
             DialogField::ChainTo => &mut self.chain_to,
+            DialogField::SpawnMaxDepth => &mut self.spawn_max_depth,
+            DialogField::SpawnMaxChildren => &mut self.spawn_max_children,
+            DialogField::SpawnPolicy | DialogField::SpawnHelperModel => &mut self.answer,
             DialogField::LaunchTime => &mut self.launch_time,
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
@@ -2504,6 +2619,7 @@ impl ModalState {
             | DialogField::InheritPlacement
             | DialogField::InheritDesigner
             | DialogField::InheritReviewer
+            | DialogField::InheritFanOut
             | DialogField::InheritExecutor => &mut self.answer,
         }
     }
@@ -3094,6 +3210,9 @@ impl ModalState {
             self.permission.clone().unwrap_or_default(),
             self.silence.to_string(),
             format!("{:?}", self.runner),
+            format!("{:?}/{:?}", self.spawn_policy, self.spawn_helper_model),
+            raw_textarea_text(&self.spawn_max_depth),
+            raw_textarea_text(&self.spawn_max_children),
             self.use_orchestrator.to_string(),
             self.use_designer.to_string(),
             self.use_reviewer.to_string(),
@@ -4367,6 +4486,10 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::ReviewerMaxRounds
         | DialogField::ExecutorWeekThreshold
         | DialogField::ExecutorFiveHourThreshold
+        | DialogField::SpawnPolicy
+        | DialogField::SpawnHelperModel
+        | DialogField::SpawnMaxDepth
+        | DialogField::SpawnMaxChildren
         | DialogField::IsolationStatus => 3,
         DialogField::InheritAgent
         | DialogField::InheritLimits
@@ -4375,6 +4498,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::InheritPlacement
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
+        | DialogField::InheritFanOut
         | DialogField::InheritExecutor => 1,
         DialogField::Description => DESCRIPTION_MIN_ROWS + 2,
         DialogField::ProjectVisibility
@@ -4843,6 +4967,62 @@ fn render_selector_field(
                 app.is_hovered(HitAction::ModalField(field)),
             );
         }
+        DialogField::SpawnPolicy
+        | DialogField::SpawnHelperModel
+        | DialogField::SpawnMaxDepth
+        | DialogField::SpawnMaxChildren => {
+            let (title, value) = match field {
+                DialogField::SpawnPolicy => (
+                    "Fan-out policy · Space cycles",
+                    modal
+                        .spawn_policy
+                        .map(|v| v.as_str().to_string())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Inherit ({})",
+                                modal
+                                    .spawn_inherited_label
+                                    .split(", ")
+                                    .next()
+                                    .unwrap_or("project")
+                            )
+                        }),
+                ),
+                DialogField::SpawnHelperModel => (
+                    "Helper model · Space cycles",
+                    modal
+                        .spawn_helper_model
+                        .map(|v| v.as_str().to_string())
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Inherit ({})",
+                                modal
+                                    .spawn_inherited_label
+                                    .split(", ")
+                                    .last()
+                                    .unwrap_or("project")
+                            )
+                        }),
+                ),
+                DialogField::SpawnMaxDepth => (
+                    "Fan-out maximum depth",
+                    textarea_text(&modal.spawn_max_depth),
+                ),
+                _ => (
+                    "Fan-out maximum children",
+                    textarea_text(&modal.spawn_max_children),
+                ),
+            };
+            render_textarea(
+                frame,
+                app,
+                &one_line(&value),
+                area,
+                title,
+                modal.active_field() == field,
+                app.is_hovered(HitAction::ModalField(field)),
+            );
+        }
         DialogField::UseOrchestrator => render_checkbox(
             frame,
             app,
@@ -5295,6 +5475,7 @@ fn render_selector_field(
         | DialogField::InheritPlacement
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
+        | DialogField::InheritFanOut
         | DialogField::InheritExecutor => {
             let Some(group) = inherit_checkbox_group(field) else {
                 return;
@@ -5332,6 +5513,7 @@ fn render_inherit_checkbox(
         InheritGroup::Reviewer => "reviewer",
         InheritGroup::Executor => "executors",
         InheritGroup::Placement => "runner",
+        InheritGroup::FanOut => "fan-out",
     };
     let mark = if checked { "☑" } else { "☐" };
     let style = if active {
@@ -6660,7 +6842,9 @@ pub(crate) fn block_has_inside(field: DialogField) -> bool {
 pub(crate) fn is_flag_field(field: DialogField) -> bool {
     matches!(
         field,
-        DialogField::Permission
+        DialogField::SpawnPolicy
+            | DialogField::SpawnHelperModel
+            | DialogField::Permission
             | DialogField::Silence
             | DialogField::PlannedLaunch
             | DialogField::UseOrchestrator
@@ -6686,6 +6870,7 @@ pub(crate) fn is_flag_field(field: DialogField) -> bool {
             | DialogField::InheritPlacement
             | DialogField::InheritDesigner
             | DialogField::InheritReviewer
+            | DialogField::InheritFanOut
             | DialogField::InheritExecutor
     )
 }

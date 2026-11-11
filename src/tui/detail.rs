@@ -425,7 +425,12 @@ fn render_meta(
         }
         if let Some(parent) = &task.parent_task {
             line.push_str(&format!(
-                " │ Planned by: {}",
+                " │ {}: {}",
+                if task.spawned {
+                    "Spawned by"
+                } else {
+                    "Planned by"
+                },
                 sanitize_terminal_text(parent)
             ));
         }

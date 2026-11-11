@@ -2064,3 +2064,71 @@ fn named_permissions_create_edit_clear_and_validate() {
         .assert()
         .failure();
 }
+
+#[test]
+fn fanout_cli_spawn_output_wait_and_forbidden() {
+    use kanban4ai::core::config::SpawnPolicy;
+    use kanban4ai::core::operations::TaskPatch;
+    use kanban4ai::core::storage::NewTask;
+    let env = board();
+    let ops = Operations::new(env.data_root());
+    let parent = ops.create_task(NewTask::titled("Parent")).unwrap();
+    ops.take_task(&parent.id, "ses-parent", true).unwrap();
+    let output = kanban(&env)
+        .env("KANBAN_SESSION", "ses-parent")
+        .env("KANBAN_TASK_ID", &parent.id)
+        .args(["spawn", "--parent", &parent.id, "Helper", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let child: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let id = child["id"].as_str().unwrap();
+    assert_eq!(child["parent_task"], parent.id);
+    kanban(&env)
+        .args(["output", id, "--json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("digest"));
+    kanban(&env)
+        .env_remove("KANBAN_TASK_ID")
+        .args(["wait", id, "--timeout", "0"])
+        .assert()
+        .code(2);
+    kanban(&env)
+        .env("KANBAN_SESSION", "ses-parent")
+        .env("KANBAN_TASK_ID", &parent.id)
+        .args(["wait", id, "--timeout", "0"])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("Waiting declared"));
+    let mut task = ops.get_task(id).unwrap().unwrap();
+    task.status = kanban4ai::core::models::TaskStatus::Review;
+    ops.storage.save_task(&task).unwrap();
+    kanban(&env)
+        .args(["wait", id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("review"));
+    ops.update_task(
+        &parent.id,
+        TaskPatch {
+            spawn_policy: Some(Some(SpawnPolicy::Forbidden)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    kanban(&env)
+        .env("KANBAN_SESSION", "ses-parent")
+        .env("KANBAN_TASK_ID", &parent.id)
+        .args(["spawn", "Denied"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("forbidden"));
+    kanban(&env)
+        .args(["show", &parent.id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Spawn policy: forbidden (task)"));
+}
