@@ -587,3 +587,29 @@ appended to every role's fresh prompt, just ahead of the role file, whenever it
 is not blank. Native resumes also reread this string, including when returning
 to a previously used backend, so current settings supersede the instructions
 from that backend's earlier run (see `docs/config.md`).
+
+## Agent fan-out (spawn)
+
+Use `spawn` for independent work discovered during execution: research, isolated
+modules, or tests against an already agreed API. Use `plan` for a static DAG
+chosen up front by the orchestrator. Spawn is available only to the current
+parent executor session. Each helper has `parent_task` plus `spawned: true`;
+helpers do not become dependencies of their running parent. Spawned helper
+results appear in the parent's initial/resume prompt and through `output`.
+
+Helpers receive the parent's readonly/silence permissions and runner. They use
+separate worktrees seeded from the project, **not the parent's uncommitted
+worktree**. Give each helper self-contained instructions and integrate its
+result deliberately. `output` includes branch and diff statistics for review.
+
+The project's/global fan-out settings and task overrides control policy and
+helper model. Forced policy blocks executor completion until a helper exists;
+forbidden policy rejects spawn. Depth and per-parent child limits bound growth.
+
+`wait` normally blocks and prints terminal states. At timeout, or when queued
+helpers need the parent's occupied slot, an agent declares waiting automatically
+(exit 3). End the reply then: no background poller is needed. The existing
+waiting lifecycle releases the slot and resumes after every `session.wait_for`
+target becomes terminal, once the old process has exited, or at the deadline.
+Missing, failed and question-blocked tasks are terminal so parents can handle
+failure instead of waiting indefinitely. Read results with `output` on resume.

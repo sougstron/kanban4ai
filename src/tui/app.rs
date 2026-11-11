@@ -5721,6 +5721,21 @@ impl App {
     }
 
     fn populate_task_form_options(&self, modal: &mut ModalState, edited_task_id: Option<&str>) {
+        let mut inherited = edited_task_id
+            .and_then(|id| self.ops.get_task(id).ok().flatten())
+            .unwrap_or_else(|| Task::new("", ""));
+        inherited.spawn_policy = None;
+        inherited.spawn_helper_model = None;
+        if let Ok(value) = self.ops.effective_spawn(&inherited) {
+            modal.spawn_inherited_label = format!(
+                "{}: {}, {}: {}",
+                value.source,
+                value.policy.as_str(),
+                value.helper_source,
+                value.helper_model.as_str()
+            );
+        }
+
         let Ok(config) = self.ops.config.load() else {
             return;
         };
@@ -7657,6 +7672,14 @@ impl App {
                     .unwrap_or(TaskStatus::Todo.as_str())
                     .parse::<TaskStatus>()?;
                 let task = self.ops.create_task_in_status(new_task, target)?;
+                self.ops.update_task(
+                    &task.id,
+                    TaskPatch {
+                        spawn_policy: Some(modal.spawn_policy),
+                        spawn_helper_model: Some(modal.spawn_helper_model),
+                        ..Default::default()
+                    },
+                )?;
                 if target == TaskStatus::Todo {
                     self.status = format!("Created {}", task.id);
                 } else {
@@ -7697,6 +7720,8 @@ impl App {
                         silence: Some(modal.silence),
                         use_designer: Some(modal.use_designer),
                         use_reviewer: Some(modal.use_reviewer),
+                        spawn_policy: Some(modal.spawn_policy),
+                        spawn_helper_model: Some(modal.spawn_helper_model),
                         use_orchestrator: Some(modal.use_orchestrator),
                         chained_to: Some(modal.chain_text()),
                         launch_at,
@@ -9035,6 +9060,11 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::Runner
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
+        | DialogField::InheritFanOut
+        | DialogField::SpawnPolicy
+        | DialogField::SpawnHelperModel
+        | DialogField::SpawnMaxDepth
+        | DialogField::SpawnMaxChildren
         | DialogField::InheritExecutor
         | DialogField::ProjectVisibility
         | DialogField::LimitsVisibility
@@ -9272,6 +9302,12 @@ fn fill_settings_group(modal: &mut ModalState, config: &BoardConfig, group: Inhe
                 OnChangesRequested::Todo => "todo".to_string(),
             }]);
             modal.reviewer_max_rounds = TextArea::new(vec![bot.max_rounds.to_string()]);
+        }
+        InheritGroup::FanOut => {
+            modal.spawn_policy = Some(orch.spawn.policy);
+            modal.spawn_helper_model = Some(orch.spawn.helper_model);
+            modal.spawn_max_depth = TextArea::new(vec![orch.spawn.max_depth.to_string()]);
+            modal.spawn_max_children = TextArea::new(vec![orch.spawn.max_children.to_string()]);
         }
         InheritGroup::Executor => {
             let thresholds = orch.executors.thresholds;
@@ -9910,6 +9946,34 @@ fn apply_settings_groups(
     draft: &SettingsDraft,
 ) -> Result<()> {
     let edits = |group: InheritGroup| !modal.inherit.get(group);
+    if edits(InheritGroup::FanOut) {
+        let mut settings = OrchestrationSettings::from_mapping(&config.orchestration).spawn;
+        settings.policy = modal.spawn_policy.unwrap_or_default();
+        settings.helper_model = modal.spawn_helper_model.unwrap_or_default();
+        settings.max_depth = modal
+            .spawn_max_depth
+            .lines()
+            .join("")
+            .trim()
+            .parse()
+            .map_err(|_| {
+                KanbanError::Invalid("Fan-out depth must be a non-negative integer".into())
+            })?;
+        settings.max_children = modal
+            .spawn_max_children
+            .lines()
+            .join("")
+            .trim()
+            .parse()
+            .map_err(|_| {
+                KanbanError::Invalid("Fan-out children must be a non-negative integer".into())
+            })?;
+        config.orchestration.insert(
+            Value::String("spawn".into()),
+            serde_yaml_ng::to_value(settings)?,
+        );
+    }
+
     if edits(InheritGroup::Placement) {
         config.runner.insert(
             Value::String("default".to_string()),

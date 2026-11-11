@@ -364,6 +364,13 @@ pub struct Task {
     /// `kanban plan` creates; omitted for hand-written tasks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_task: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub spawned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_policy: Option<crate::core::config::SpawnPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_helper_model: Option<crate::core::config::SpawnHelperModel>,
+
     /// Name of the `orchestration.roles` profile the orchestrator assigned to
     /// this node. The profile is an ordered roster of backend/model
     /// candidates; [`Task::roster_index`] says which one is in use. Omitted
@@ -576,6 +583,9 @@ impl Task {
             depends_on: Vec::new(),
             needs: None,
             parent_task: None,
+            spawned: false,
+            spawn_policy: None,
+            spawn_helper_model: None,
             role_profile: None,
             roster_index: 0,
             orchestrated: false,
@@ -657,6 +667,8 @@ pub struct Session {
         skip_serializing_if = "Option::is_none"
     )]
     pub wait_until: Option<NaiveDateTime>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wait_for: Vec<String>,
     /// What the agent said it is waiting for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_note: Option<String>,
@@ -693,6 +705,7 @@ impl Session {
             last_seen: now,
             ended_at: None,
             wait_until: None,
+            wait_for: Vec::new(),
             wait_note: None,
             wait_exited: false,
             pending_usage: None,

@@ -241,3 +241,16 @@ unchanged. Legacy `readonly: true` is read as the `readonly` preset and remains
 the serialized spelling when readonly is selected, preserving older clients and
 byte-stable task round trips. An explicit `permission` takes precedence if both
 keys exist. Other presets serialize as `permission`, omitting `readonly`.
+
+### Dynamic helpers
+
+Optional task frontmatter `spawn_policy` (`allowed`, `forbidden`, `forced`) and
+`spawn_helper_model` (`same`, `executor_middle`, `executor_cheap`) override the
+project/global fan-out settings. Absent fields preserve inheritance. `spawned:
+true` marks a dynamic helper whose `parent_task` identifies its parent; plan
+children omit this flag. These fields are omitted when unset/false, preserving
+legacy task serialization. Copying a task clears its helper identity.
+
+Sessions may carry `wait_for: [TASK-N, ...]` alongside the existing waiting
+deadline. The board can wake a departed session early when every target has a
+terminal result. Ordinary `waiting` renewals clear this target list.

@@ -369,6 +369,7 @@ impl SessionManager {
         let was_waiting = session.wait_until.is_some();
         session.wait_until = Some(wait_until);
         session.wait_note = note;
+        session.wait_for.clear();
         session.wait_exited = false;
         session.last_seen = timefmt::now();
         self.save_session(&session)?;

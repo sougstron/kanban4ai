@@ -631,3 +631,13 @@ visible when editing. Project default follows `default_permission`. Cards and
 detail show `🔒 <preset>` for explicit restrictions; full and project default
 have no badge. Backend enforcement and unsupported-preset errors are described
 in [configuration](config.md#named-permission-presets).
+
+### Fan-out controls
+
+Task options includes **Fan-out policy** and **Helper model**. Space or arrow
+keys cycle values, including inheritance from the project. Project Settings →
+Executor includes **Inherit fan-out from global**, policy, helper model, maximum
+depth and maximum children. Inherited fields show global values and are read
+only until inheritance is disabled. Global Settings → Executor edits the same
+defaults without an inheritance checkbox. Cancelling Task options restores the
+previous policy/model along with its other staged changes.

@@ -528,6 +528,8 @@ fn patch(value: Value) -> Result<TaskPatch> {
             "interactive" => patch.interactive = Some(decode(value)?),
             "permission" => patch.permission = Some(decode(value)?),
             "silence" => patch.silence = Some(decode(value)?),
+            "spawn_policy" => patch.spawn_policy = Some(decode(value)?),
+            "spawn_helper_model" => patch.spawn_helper_model = Some(decode(value)?),
             "use_designer" => patch.use_designer = Some(decode(value)?),
             "use_reviewer" => patch.use_reviewer = Some(decode(value)?),
             "use_orchestrator" => patch.use_orchestrator = Some(decode(value)?),

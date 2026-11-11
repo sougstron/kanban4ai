@@ -78,3 +78,32 @@ permission preset. `--readonly` remains an alias and conflicts with
 Unknown names are rejected; backend support is checked at launch. JSON reports
 both `permission` and the compatibility boolean `readonly`. See
 [configuration](config.md#named-permission-presets) for enforcement limits.
+
+## Agent helpers: spawn, wait, output
+
+`kanban spawn --parent TASK-N <title> [--description TEXT] [--backend NAME]
+[--model MODEL] [--effort EFFORT] [--readonly] [--depends-on TASK-A,TASK-B]
+[--session SESSION] [--json]` creates a helper and queues it. The parent and
+session default to `KANBAN_TASK_ID` and `KANBAN_SESSION`. Only the parent's
+active executor session can spawn. Text output is the new id; JSON is the task.
+Dependencies must finish before launch. Readonly and silence are inherited;
+`--readonly` can tighten permissions. Explicit model flags override the helper
+model preference. Empty executor pools fall back to the parent's assignment.
+
+`kanban wait <id>... [--timeout SECONDS] [--session SESSION] [--json]
+[--no-waiting]` polls until all results are available. Exit codes:
+
+- `0`: every task reached Review or Done.
+- `2`: timeout, without declaring a wait.
+- `3`: the agent's parent session declared waiting. **End the reply now.**
+- `4`: at least one task failed, is blocked by a question, or is missing.
+
+For an agent, timeout or a full queue cap automatically declares waiting for the
+parent, releasing its slot. The board resumes the parent when all targets are
+terminal (after its process exits), or at the waiting deadline. `--no-waiting`
+opts out. Defaults come from `orchestration.spawn`; `--timeout 0` checks once.
+
+`kanban output <id> [--json]` returns the same bounded context digest supplied
+in dependency prompts, plus task metadata, result path, branch and diff stat.
+A missing/deleted Git branch has no diff stat; integration state remains visible.
+`kanban show` displays effective fan-out policy and helper model with sources.

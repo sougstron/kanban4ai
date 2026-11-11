@@ -496,6 +496,7 @@ fn write_live_session(data_root: &Path) {
             last_seen: timefmt::now(),
             ended_at: None,
             wait_until: None,
+            wait_for: Vec::new(),
             wait_note: None,
             wait_exited: false,
             pending_usage: None,

@@ -203,3 +203,52 @@ impl ContextManager {
         Ok(())
     }
 }
+
+/// One dependency's result, newest first and truncated to `budget` characters.
+/// Newest first because the last thing a task recorded is its conclusion; the
+/// earlier entries are the road to it and are the right thing to lose.
+///
+/// The harvested whole-session reply (`author: agent-reply`) is skipped when
+/// the run also posted explicit `kanban context` entries — the same rule
+/// the prompt builder applies to a task's own thread. A reply is chat
+/// prose addressed to the human: several kilobytes of tables and pleasantries
+/// that, being the newest message, would spend the entire budget and evict
+/// the deliberately compact progress notes the digest exists to carry.
+pub fn result_digest(threads: &ThreadManager, task_id: &str, budget: usize) -> Result<String> {
+    let thread = threads.load(task_id)?;
+    let has_agent_context = thread.messages.iter().any(|message| {
+        message.kind == MessageKind::Context
+            && message.status != MessageStatus::Rejected
+            && message.author.as_deref() == Some("agent")
+    });
+    let mut kept: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    for message in thread
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| message.kind == MessageKind::Context)
+        .filter(|message| message.status != MessageStatus::Rejected)
+        .filter(|message| !(has_agent_context && message.author.as_deref() == Some("agent-reply")))
+    {
+        let body = crate::core::compaction::compact_text(message.body.trim());
+        if body.is_empty() {
+            continue;
+        }
+        let remaining = budget.saturating_sub(used);
+        if remaining == 0 {
+            kept.push("…(earlier upstream context omitted)".to_string());
+            break;
+        }
+        let body = if body.chars().count() > remaining {
+            let truncated: String = body.chars().take(remaining).collect();
+            format!("{truncated}…")
+        } else {
+            body
+        };
+        used += body.chars().count();
+        kept.push(body);
+    }
+    kept.reverse();
+    Ok(kept.join("\n"))
+}
