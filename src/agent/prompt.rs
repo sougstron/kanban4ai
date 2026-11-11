@@ -895,9 +895,11 @@ fn append_spawn_helpers(roots: Roots<'_>, task: &Task, prompt: &mut String) -> R
     }
     let ops = crate::core::operations::Operations::new(roots.data_root);
     let effective = ops.effective_spawn(task)?;
-    if effective.policy != SpawnPolicy::Forbidden {
+    // Only advertise helpers when spawning is actually possible: a Forbidden
+    // policy or a zero max_children would make `spawn` refuse every attempt.
+    if effective.policy != SpawnPolicy::Forbidden && effective.max_children > 0 {
         prompt.push_str(&format!("\nAgent helpers: use \"$KANBAN_CMD\" spawn --parent {} <title> --description <instructions> for independent parallel work or cheaper-model research. Static up-front DAGs belong to the orchestrator's kanban plan. Helpers use separate worktrees seeded from the project; they cannot see your uncommitted edits. Read results with \"$KANBAN_CMD\" output <id>; join with \"$KANBAN_CMD\" wait <id>... . If wait exits 3, waiting is already declared: end your reply so helpers can use the released slot.\n", task.id));
-        if effective.policy == SpawnPolicy::Forced {
+        if effective.requires_helper {
             prompt.push_str("Spawn policy (mandatory): create at least one helper with kanban spawn before done; done is refused otherwise.\n");
         }
     }

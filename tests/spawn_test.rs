@@ -1,7 +1,7 @@
 mod common;
 
 use kanban4ai::core::config::{Config, InheritGroup, SpawnHelperModel, SpawnPolicy};
-use kanban4ai::core::models::{RunPhase, Task, TaskStatus};
+use kanban4ai::core::models::{MessageKind, MessageRole, RunPhase, Task, TaskStatus};
 use kanban4ai::core::operations::{Operations, SpawnRequest, TaskPatch};
 use kanban4ai::core::session::SessionManager;
 use kanban4ai::core::storage::NewTask;
@@ -45,7 +45,6 @@ fn spawn_links_queues_inherits_permissions_and_assignment() {
     assert_eq!(child.agent_backend, parent.agent_backend);
     assert_eq!(child.ai_model, parent.ai_model);
     assert_eq!(child.ai_effort, parent.ai_effort);
-    assert_eq!(child.run_phase, Some(RunPhase::Queued));
     assert_eq!(child.spawn_policy, Some(SpawnPolicy::Allowed));
     assert!(!child.use_orchestrator && !child.use_designer && !child.use_reviewer);
     assert!(
@@ -54,6 +53,60 @@ fn spawn_links_queues_inherits_permissions_and_assignment() {
             .unwrap()
             .depends_on
             .is_empty()
+    );
+}
+
+#[test]
+fn spawn_starts_helper_directly_when_queue_cannot_dispatch() {
+    let (_dir, ops, _) = common::ops_with_recorder(false);
+    let parent = parent(&ops);
+    let child = ops.spawn_task(request(&parent), "ses-parent").unwrap();
+    // With the queue unable to dispatch (auto-launch off here) a queue entry
+    // would never drain: the helper starts instead of being stranded Queued.
+    assert_eq!(child.status, TaskStatus::InProgress);
+    assert_ne!(child.run_phase, Some(RunPhase::Queued));
+    assert!(child.session.is_some());
+    assert!(ops.dispatch_queue().unwrap().is_empty());
+}
+
+#[test]
+fn spawn_queues_helper_when_queue_can_dispatch() {
+    let (_dir, ops, _) = common::ops_with_recorder(false);
+    let mut cfg = ops.config.load_raw().unwrap();
+    cfg.rules
+        .insert("auto_launch_on_delegate".into(), false.into());
+    cfg.auto_launch.insert("enabled".into(), true.into());
+    ops.config.save(&cfg).unwrap();
+    let parent = parent(&ops);
+    let child = ops.spawn_task(request(&parent), "ses-parent").unwrap();
+    assert_eq!(child.run_phase, Some(RunPhase::Queued));
+}
+
+#[test]
+fn spawn_posts_board_notes_instead_of_agent_context() {
+    let (dir, ops, _) = common::ops_with_recorder(false);
+    let parent = parent(&ops);
+    let child = ops.spawn_task(request(&parent), "ses-parent").unwrap();
+    let threads = kanban4ai::core::thread::ThreadManager::new(dir.path()).unwrap();
+    let parent_thread = threads.load(&parent.id).unwrap();
+    assert!(
+        parent_thread
+            .messages
+            .iter()
+            .all(|m| !(m.kind == MessageKind::Context && m.role == MessageRole::Agent))
+    );
+    assert!(
+        parent_thread
+            .messages
+            .iter()
+            .any(|m| m.body.contains("Spawned helper") && m.body.contains(&child.id))
+    );
+    let child_thread = threads.load(&child.id).unwrap();
+    assert!(
+        child_thread
+            .messages
+            .iter()
+            .any(|m| m.body.contains(&format!("Spawned by parent {}", parent.id)))
     );
 }
 
@@ -117,6 +170,11 @@ fn forced_done_requires_spawn_child_and_does_not_force_children() {
         ops.effective_spawn(&child).unwrap().policy,
         SpawnPolicy::Allowed
     );
+    // The spawn note is a board note now; it no longer satisfies the
+    // recorded-context gate on the parent's behalf.
+    kanban4ai::core::context::ContextManager::new(ops.data_root())
+        .append_context(&parent.id, "Result recorded.", "agent", &ops.storage)
+        .unwrap();
     assert_eq!(
         ops.complete_task(&parent.id, "ses-parent", true)
             .unwrap()
@@ -286,14 +344,27 @@ fn concurrent_spawns_cannot_exceed_child_cap() {
 }
 
 #[test]
-fn forced_completion_cannot_be_bypassed_by_zero_depth() {
-    let (_dir, ops, _) = common::ops_with_recorder(false);
-    config(&ops, "policy: forced\nmax_depth: 0");
-    let parent = parent(&ops);
-    assert!(
-        ops.complete_task(&parent.id, "ses-parent", true)
-            .unwrap_err()
-            .to_string()
-            .contains("spawn_policy is forced")
-    );
+fn forced_with_impossible_spawn_never_deadlocks() {
+    for yaml in [
+        "policy: forced\nmax_depth: 0",
+        "policy: forced\nmax_children: 0",
+    ] {
+        let (_dir, ops, _) = common::ops_with_recorder(false);
+        config(&ops, yaml);
+        let parent = parent(&ops);
+        // Spawning stays impossible (depth limit / child cap) ...
+        assert!(!ops.effective_spawn(&parent).unwrap().requires_helper);
+        assert!(ops.spawn_task(request(&parent), "ses-parent").is_err());
+        // ... so done must not demand the impossible helper.
+        kanban4ai::core::context::ContextManager::new(ops.data_root())
+            .append_context(&parent.id, "Result recorded.", "agent", &ops.storage)
+            .unwrap();
+        assert_eq!(
+            ops.complete_task(&parent.id, "ses-parent", true)
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Review
+        );
+    }
 }
