@@ -1198,7 +1198,7 @@ pub fn parse_kimi_config_models(text: &str) -> BackendCatalog {
 }
 
 /// pi's agent config directory (`PI_CODING_AGENT_DIR`, default `~/.pi/agent`).
-fn pi_agent_dir() -> PathBuf {
+pub(crate) fn pi_agent_dir() -> PathBuf {
     std::env::var_os("PI_CODING_AGENT_DIR")
         .map(PathBuf::from)
         .or_else(|| {

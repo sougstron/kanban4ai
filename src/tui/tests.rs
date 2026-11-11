@@ -11282,6 +11282,43 @@ fn limits_row_leaves_out_hidden_providers() {
 }
 
 #[test]
+fn limits_row_puts_yolo_hour_and_day_windows_on_one_line() {
+    use crate::core::limits::{LimitWindow, LimitsSnapshot, ProviderLimits, ProviderState};
+
+    let (_dir, mut app) = populated_app();
+    let now = chrono::Utc::now().timestamp();
+    let window = |label: &str, remaining: f64, resets_in: i64| LimitWindow {
+        label: label.to_string(),
+        remaining_percent: remaining,
+        resets_at: Some(now + resets_in),
+        rolling: false,
+    };
+    app.limits = Some(std::sync::Arc::new(LimitsSnapshot {
+        fetched_at: now,
+        providers: vec![ProviderLimits {
+            provider: "yolo".to_string(),
+            state: ProviderState::Ready,
+            windows: vec![
+                window("1h", 70.0, 40 * 60 + 30),
+                window("24h", 99.0, 14 * 3600 + 40 * 60 + 30),
+            ],
+            observed_at: None,
+        }],
+    }));
+
+    let lines = rendered_lines(&mut app, 120, 28);
+    let row = &lines[lines.len() - 2];
+    assert!(
+        row.contains("↯ yolo 1h 70% ↻40m · 24h 99% ↻14h40m"),
+        "{lines:?}"
+    );
+
+    app.settings.hidden_limits = vec!["yolo".to_string()];
+    let lines = rendered_lines(&mut app, 120, 28);
+    assert!(!lines.iter().any(|line| line.contains("yolo")), "{lines:?}");
+}
+
+#[test]
 fn limits_row_is_absent_without_a_snapshot_when_disabled_and_off_screen() {
     let (_dir, mut app) = populated_app();
 

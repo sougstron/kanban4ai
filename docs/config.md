@@ -107,9 +107,10 @@ they are edited: press `s` on the Projects screen. Saved under the store
   (one checkbox per registered project, ticked = shown); ticking every row
   and saving drops the key. The list footer counts hidden projects.
 - `tui.hidden_limits`: unset - provider names (`claude`, `codex`, `grok`,
-  `zai`, `synthetic`, `kimi`) the limits row above the status bar leaves out.
-  A display filter only: limits are still fetched, `kanban limits` prints
-  every provider and executor threshold routing is unaffected. Edited on the
+  `zai`, `synthetic`, `kimi`, `yolo`) the limits row above the status bar
+  leaves out. A display filter only: limits are still fetched, `kanban limits`
+  prints every provider and executor threshold routing is unaffected — except
+  `yolo`, whose read spends a request, so hiding it also stops that probe. Edited on the
   Global Settings Limits tab (one checkbox per provider, ticked = shown);
   ticking every row and saving drops the key. Hiding every configured
   provider removes the row entirely.

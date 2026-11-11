@@ -87,6 +87,81 @@ pub(crate) fn http_request_json(
     serde_json::from_str(payload).map_err(|err| HttpError::Transport(format!("bad JSON: {err}")))
 }
 
+/// One HTTP request through curl, like [`http_request_json`], returning the
+/// response headers instead of the body (which is discarded). Header names
+/// are lowercased; with redirects followed only the final response's headers
+/// are kept. Used where a provider reports quota in headers only.
+pub(crate) fn http_request_headers(
+    url: &str,
+    headers: &[(&str, String)],
+    body: Option<&str>,
+) -> Result<Vec<(String, String)>, HttpError> {
+    let mut config = String::new();
+    config.push_str(&format!("url = {}\n", quote_curl(url)));
+    for (name, value) in headers {
+        config.push_str(&format!(
+            "header = {}\n",
+            quote_curl(&format!("{name}: {value}"))
+        ));
+    }
+    if let Some(body) = body {
+        config.push_str(&format!("data = {}\n", quote_curl(body)));
+    }
+    config.push_str("silent\nshow-error\nlocation\n");
+    config.push_str("dump-header = \"-\"\noutput = \"/dev/null\"\n");
+    config.push_str(&format!("max-time = {HTTP_TIMEOUT_SECS}\n"));
+    config.push_str("write-out = \"\\n%{http_code}\"\n");
+
+    let mut child = Command::new("curl")
+        .arg("-K")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| HttpError::Transport(format!("curl unavailable: {err}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(config.as_bytes())
+            .map_err(|err| HttpError::Transport(format!("curl input failed: {err}")))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| HttpError::Transport(format!("curl failed: {err}")))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr);
+        return Err(HttpError::Transport(
+            message
+                .lines()
+                .next_back()
+                .unwrap_or("request failed")
+                .trim()
+                .to_string(),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_string();
+    let (dump, status) = split_status(&text);
+    if !(200..300).contains(&status) {
+        return Err(HttpError::Status(status));
+    }
+    Ok(parse_header_dump(dump))
+}
+
+/// Header lines of the last response in a curl `dump-header` block (each
+/// redirect hop starts a new `HTTP/` status line).
+fn parse_header_dump(dump: &str) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    for line in dump.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with("HTTP/") {
+            headers.clear();
+        } else if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
+        }
+    }
+    headers
+}
+
 /// Timeout for release-archive downloads, in seconds. [`HTTP_TIMEOUT_SECS`]
 /// covers small API payloads; an archive is a few megabytes.
 pub(crate) const DOWNLOAD_TIMEOUT_SECS: u64 = 300;
@@ -188,6 +263,19 @@ mod tests {
         assert_eq!(split_status("{\"a\":1}\n200"), ("{\"a\":1}", 200));
         assert_eq!(split_status("no status"), ("no status", 0));
         assert_eq!(quote_curl("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn header_dump_keeps_only_the_final_response_lowercased() {
+        let dump = "HTTP/1.1 301 Moved\r\nLocation: /x\r\n\r\nHTTP/2 200\r\n\
+                    X-Yolo-Pressure-Used-Pct-1h: 12\r\ncontent-type: a:b\r\n\r\n";
+        assert_eq!(
+            parse_header_dump(dump),
+            vec![
+                ("x-yolo-pressure-used-pct-1h".to_string(), "12".to_string()),
+                ("content-type".to_string(), "a:b".to_string()),
+            ]
+        );
     }
 
     #[test]
