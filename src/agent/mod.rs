@@ -8,6 +8,7 @@ mod prompt;
 mod tmux;
 
 pub use backends::parse_opencode_agent_list;
+pub(crate) use backends::pi_agent_dir;
 pub use backends::{
     AgentBackendConfig, AutoLaunchConfig, BackendCatalog, LaunchPlan, LaunchSettings,
     backend_catalog, backend_config, backend_has_catalog, build_launch_plan,

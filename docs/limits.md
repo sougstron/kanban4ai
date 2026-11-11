@@ -116,11 +116,29 @@ Sources, all read-only and best effort:
   polled itself (`usage_history`), with their age. `kimi-code/*` models
   resolve to this provider; `opencode-go/kimi-*` do not (that is opencode's
   plan).
+- **yolo**: the Yolo-Auto flat-rate plan, normally set up as pi's `yolo-auto`
+  custom provider. The key is `$YOLO_AUTO_API_KEY` or
+  `providers.yolo-auto.apiKey` in pi's `models.json`
+  (`$PI_CODING_AGENT_DIR`, default `~/.pi/agent`); like pi, an `apiKey` that
+  names a set environment variable is read through it, and a `!command` key
+  is not run. `GET /v1/usage` only counts requests and tokens (its limits are
+  `null` on the flat plans), so the quota comes from the
+  `x-yolo-pressure-used-pct-{1h,24h}` / `x-yolo-pressure-reset-{1h,24h}`
+  headers (integer percent used, seconds to reset) of a one-token
+  `POST /v1/chat/completions` to `qwen3.8-flash`. Because that probe is a real
+  request, the background refresh sends it at most every 15 minutes
+  (`YOLO_PROBE_MIN_INTERVAL_SECS`, stamped in `<store>/yolo-usage-poll`), or
+  sooner (60 s floor) once a cached window has rolled over; a click or
+  `kanban limits --refresh` probes at once. Between probes the cached entry
+  stands. Unticking yolo on the Global Settings Limits tab
+  (`tui.hidden_limits`) stops the probe too, not only the row: the provider
+  then reads `not_configured`. `yolo-auto/*` models resolve to this provider.
 
 HTTPS goes through `curl -K -`, with the request config (URL and headers) piped
 on stdin: no TLS dependency is linked into the crate, and bearer tokens never
 appear in a command line where `ps` would expose them. `curl` is an optional
-dependency — without it claude, grok, zai, synthetic, and kimi degrade to `n/a`.
+dependency — without it claude, grok, zai, synthetic, kimi, and yolo degrade to
+`n/a`.
 
 A provider with no credentials on the machine reports `not_configured` and is
 omitted from the row entirely; `401`/`403` becomes `signed out`. Fetches run on
@@ -181,12 +199,12 @@ Build CLI spends that subscription directly); the catalog backends
 (`opencode`/`omp`/`pi`) resolve by model-id prefix — `openai/*` → `codex`
 (the OpenAI subscription backs those runs), `anthropic/*` → `claude`,
 `zai*`/`glm*` → `zai`, `synthetic/*` → `synthetic`, `kimi-code/*` → `kimi`,
-`xai/*`/`grok*` → `grok`. Anything else returns `None` — a pair no
+`xai/*`/`grok*` → `grok`, `yolo-auto/*` → `yolo`. Anything else returns `None` — a pair no
 subscription covers, such as a purely local model.
 
 `has_headroom` checks every **live** window of the resolved provider against
-the `orchestration.executors.thresholds` floors: a `5h` label needs
-`five_hour_percent` remaining, a `7d`/weekly label needs `week_percent`, any
+the `orchestration.executors.thresholds` floors (`window_floor`): a `5h` or
+`1h` label needs `five_hour_percent` remaining, a `7d`/weekly label needs `week_percent`, any
 other label uses `week_percent`. The boundary is inclusive (exactly 5%
 passes). `None` (no provider), `not_configured`, `signed out`, `unavailable`,
 or a provider with no live window all **pass** the gate: unknown is not

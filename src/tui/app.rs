@@ -7498,7 +7498,15 @@ impl App {
                 )
                 .to_string();
                 self.settings.hidden_projects = modal.hidden_project_ids();
-                self.settings.hidden_limits = modal.hidden_limit_providers();
+                let hidden_limits = modal.hidden_limit_providers();
+                // A hidden yolo is not probed at all (each read spends a
+                // request), so re-ticking it fetches now instead of leaving
+                // the row empty until the cache ages out.
+                let yolo_hidden = |names: &[String]| names.iter().any(|name| name == "yolo");
+                if yolo_hidden(&self.settings.hidden_limits) && !yolo_hidden(&hidden_limits) {
+                    crate::core::limits::refresh_provider_async("yolo");
+                }
+                self.settings.hidden_limits = hidden_limits;
                 self.settings.backend_order = modal.backend_order.clone();
                 self.settings.hidden_backends = modal.hidden_backends.clone();
                 self.clamp_project_selection();

@@ -66,6 +66,13 @@
 //!   store (omp only renews while it runs); when no live read succeeds, the
 //!   windows omp itself last polled (`usage_history`) are shown with their
 //!   age.
+//! - **yolo**: the Yolo-Auto plan, set up as pi's `yolo-auto` custom provider
+//!   (key from `$YOLO_AUTO_API_KEY` or `~/.pi/agent/models.json`). The quota
+//!   is only reported in the `x-yolo-pressure-*` headers of a completion, so
+//!   a one-token completion probes it — at most every
+//!   [`YOLO_PROBE_MIN_INTERVAL_SECS`] in the background. Reports a 1-hour and
+//!   a 24-hour window. Unticking yolo in Global Settings → Limits stops the
+//!   probe as well as hiding the row.
 //!
 //! HTTPS is done by piping a config file into `curl -K -` rather than by
 //! linking a TLS stack: it keeps the dependency set unchanged, and it keeps
@@ -110,7 +117,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::core::http::{HttpError, http_get_json, http_request_json};
+use crate::core::http::{HttpError, http_get_json, http_request_headers, http_request_json};
 use crate::core::limit_share;
 use crate::core::project::store_root;
 use crate::core::storage::atomic_write_text;
@@ -118,7 +125,15 @@ use crate::core::storage::atomic_write_text;
 /// Providers rendered on the board and listed by `kanban limits`, in display
 /// order. `codex` is the OpenAI subscription: it covers the codex CLI and
 /// opencode's `openai/*` models alike, since both spend the same quota.
-pub const PROVIDERS: [&str; 6] = ["claude", "codex", "grok", "zai", "synthetic", "kimi"];
+pub const PROVIDERS: [&str; 7] = [
+    "claude",
+    "codex",
+    "grok",
+    "zai",
+    "synthetic",
+    "kimi",
+    "yolo",
+];
 
 /// Fallback refresh interval when no board config is available (the projects
 /// screen has no project, so no `.kanban/config.yaml` to read).
@@ -151,6 +166,8 @@ pub fn provider_for(backend: &str, model: Option<&str>) -> Option<&'static str> 
                 Some("kimi")
             } else if model.starts_with("xai") || model.starts_with("grok") {
                 Some("grok")
+            } else if model.starts_with("yolo-auto") {
+                Some("yolo")
             } else {
                 None
             }
@@ -169,15 +186,20 @@ pub fn has_headroom(
     thresholds: &crate::core::config::PoolThresholds,
     now: i64,
 ) -> bool {
-    provider_limits.live_windows(now).iter().all(|window| {
-        let floor = match window.label.as_str() {
-            "5h" => thresholds.five_hour_percent,
-            // Weekly windows and any other label (24h, mon, …) floor at
-            // the weekly threshold.
-            _ => thresholds.week_percent,
-        };
-        window.remaining_percent >= floor
-    })
+    provider_limits
+        .live_windows(now)
+        .iter()
+        .all(|window| window.remaining_percent >= window_floor(&window.label, thresholds))
+}
+
+/// The configured floor for one window: the burst windows (`5h`, yolo's `1h`)
+/// floor at `five_hour_percent`; weekly windows and any other label (24h,
+/// mon, …) at the weekly threshold.
+pub fn window_floor(label: &str, thresholds: &crate::core::config::PoolThresholds) -> f64 {
+    match label {
+        "5h" | "1h" => thresholds.five_hour_percent,
+        _ => thresholds.week_percent,
+    }
 }
 
 /// Convenience over [`has_headroom`]: look the provider up in `snapshot`.
@@ -2088,6 +2110,183 @@ pub fn parse_kimi_usage(value: &Value) -> Vec<LimitWindow> {
     windows
 }
 
+// ---------------------------------------------------------------------------
+// yolo — the Yolo-Auto flat-rate plan, configured as a pi custom provider.
+// ---------------------------------------------------------------------------
+
+/// Answers every completion with the `x-yolo-pressure-*` quota headers.
+/// `GET /v1/usage` only counts requests and tokens, so it cannot say how
+/// much of the plan is left.
+const YOLO_CHAT_URL: &str = "https://yolo-auto.com/v1/chat/completions";
+
+/// The cheapest model on every paid plan; the probe asks it for one token.
+const YOLO_PROBE_MODEL: &str = "qwen3.8-flash";
+
+/// The pi `models.json` provider entry that holds the key.
+const YOLO_PI_PROVIDER: &str = "yolo-auto";
+
+/// Minimum spacing of background probes. Each one is a real (if one-token)
+/// completion, so the board reads the quota at most this often; a window that
+/// has rolled over is re-read sooner (see [`yolo_probe_due`]), and a click or
+/// `kanban limits --refresh` probes at once.
+pub const YOLO_PROBE_MIN_INTERVAL_SECS: i64 = 900;
+
+/// Even a rolled-over window waits this long between probes, so a server that
+/// answers a zero reset cannot turn the board into a request loop.
+const YOLO_PROBE_FLOOR_SECS: i64 = 60;
+
+static YOLO_PROBED_AT: AtomicI64 = AtomicI64::new(0);
+
+fn yolo_probe_path() -> Option<PathBuf> {
+    store_root().ok().map(|root| root.join("yolo-usage-poll"))
+}
+
+fn yolo_probed_at() -> i64 {
+    let cached = YOLO_PROBED_AT.load(Ordering::SeqCst);
+    if cached > 0 {
+        return cached;
+    }
+    let stored = yolo_probe_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    YOLO_PROBED_AT.store(stored, Ordering::SeqCst);
+    stored
+}
+
+fn record_yolo_probe(now: i64) {
+    YOLO_PROBED_AT.store(now, Ordering::SeqCst);
+    if let Some(path) = yolo_probe_path() {
+        let _ = fs::create_dir_all(path.parent().unwrap_or(Path::new("/")));
+        let _ = atomic_write_text(&path, &now.to_string());
+    }
+}
+
+/// Whether a background refresh may probe now: the interval has passed, or a
+/// cached window has rolled over (its number describes a period that is gone)
+/// and the floor has passed.
+fn yolo_probe_due(cached: Option<&ProviderLimits>, probed_at: i64, now: i64) -> bool {
+    let elapsed = now.saturating_sub(probed_at);
+    let rolled_over = cached.is_some_and(|entry| entry.windows.iter().any(|w| w.is_expired(now)));
+    elapsed >= YOLO_PROBE_MIN_INTERVAL_SECS || (rolled_over && elapsed >= YOLO_PROBE_FLOOR_SECS)
+}
+
+/// Unticking yolo in Global Settings → Limits (`tui.hidden_limits`) also stops
+/// the probe: unlike the other providers' reads, it spends a request.
+fn yolo_disabled() -> bool {
+    store_root()
+        .ok()
+        .and_then(|root| {
+            crate::core::project::ProjectStore::at(root)
+                .load_global_config()
+                .ok()
+        })
+        .is_some_and(|config| config.hidden_limits().iter().any(|name| name == "yolo"))
+}
+
+/// The key: `$YOLO_AUTO_API_KEY`, else the `yolo-auto` provider of pi's
+/// `models.json`. pi reads `apiKey` as an environment variable name when one
+/// is set under it, and as the literal key otherwise; a `!command` key is not
+/// run here.
+fn yolo_api_key() -> Option<String> {
+    if let Some(key) = std::env::var_os("YOLO_AUTO_API_KEY").filter(|key| !key.is_empty()) {
+        return Some(key.to_string_lossy().to_string());
+    }
+    let text = fs::read_to_string(crate::agent::pi_agent_dir().join("models.json")).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    yolo_key_from_pi_models(&value, |name| std::env::var(name).ok())
+}
+
+pub fn yolo_key_from_pi_models(
+    value: &Value,
+    env: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    let raw = value
+        .get("providers")?
+        .get(YOLO_PI_PROVIDER)?
+        .get("apiKey")?
+        .as_str()?
+        .trim();
+    if raw.is_empty() || raw.starts_with('!') {
+        return None;
+    }
+    env(raw)
+        .filter(|key| !key.is_empty())
+        .or_else(|| Some(raw.to_string()))
+}
+
+/// Yolo's windows, probing only when due (see [`YOLO_PROBE_MIN_INTERVAL_SECS`]);
+/// between probes the cached entry stands. `force` is a click or
+/// `kanban limits --refresh`.
+fn resolve_yolo(previous: Option<&LimitsSnapshot>, force: bool) -> ProviderLimits {
+    if yolo_disabled() {
+        return ProviderLimits::new("yolo", ProviderState::NotConfigured);
+    }
+    let Some(key) = yolo_api_key() else {
+        return ProviderLimits::new("yolo", ProviderState::NotConfigured);
+    };
+    let now = now_secs();
+    let cached = previous
+        .and_then(|snapshot| snapshot.get("yolo"))
+        .filter(|entry| entry.state != ProviderState::NotConfigured);
+    if !force
+        && let Some(cached) = cached
+        && !yolo_probe_due(Some(cached), yolo_probed_at(), now)
+    {
+        return cached.clone();
+    }
+    record_yolo_probe(now);
+    fetch_yolo(&key, now)
+}
+
+fn fetch_yolo(key: &str, now: i64) -> ProviderLimits {
+    let headers = [
+        ("Authorization", format!("Bearer {key}")),
+        ("Content-Type", "application/json".to_string()),
+    ];
+    let body = json!({
+        "model": YOLO_PROBE_MODEL,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+    })
+    .to_string();
+    match http_request_headers(YOLO_CHAT_URL, &headers, Some(&body)) {
+        Ok(response) => {
+            let windows = parse_yolo_pressure(&response, now);
+            if windows.is_empty() {
+                ProviderLimits::new("yolo", ProviderState::Unavailable("no quota".to_string()))
+            } else {
+                ProviderLimits {
+                    windows,
+                    ..ProviderLimits::new("yolo", ProviderState::Ready)
+                }
+            }
+        }
+        Err(err) => ProviderLimits::new("yolo", err.into_state()),
+    }
+}
+
+/// The `x-yolo-pressure-used-pct-{1h,24h}` headers (integer percent used) and
+/// their `x-yolo-pressure-reset-*` partners (seconds until the window resets).
+pub fn parse_yolo_pressure(headers: &[(String, String)], now: i64) -> Vec<LimitWindow> {
+    let header = |name: String| {
+        headers
+            .iter()
+            .find(|(key, _)| *key == name)
+            .and_then(|(_, value)| value.trim().parse::<f64>().ok())
+    };
+    ["1h", "24h"]
+        .into_iter()
+        .filter_map(|label| {
+            let used = header(format!("x-yolo-pressure-used-pct-{label}"))?;
+            let resets_at = header(format!("x-yolo-pressure-reset-{label}"))
+                .filter(|seconds| *seconds >= 0.0)
+                .map(|seconds| now + seconds as i64);
+            Some(LimitWindow::new(label, used, resets_at))
+        })
+        .collect()
+}
+
 /// `application/x-www-form-urlencoded` for one value.
 fn form_encode(text: &str) -> String {
     text.bytes()
@@ -2320,6 +2519,7 @@ pub fn refresh_provider_now(provider: &str) {
         "zai" => fetch_zai(),
         "synthetic" => fetch_synthetic(),
         "kimi" => fetch_kimi(),
+        "yolo" => resolve_yolo(cached().as_deref(), true),
         _ => return,
     };
     store_provider(provider, |_| fresh);
@@ -2375,6 +2575,7 @@ pub fn fetch_all(force: bool) -> LimitsSnapshot {
                 fetch_zai(),
                 fetch_synthetic(),
                 fetch_kimi(),
+                resolve_yolo(previous.as_deref(), force),
             ],
             now,
         ),
@@ -2933,6 +3134,97 @@ mod tests {
         fs::write(&path, r#"{"openai":{"type":"oauth"}}"#).unwrap();
         assert_eq!(synthetic_key_from_store(&path), None);
         assert!(synthetic_key_from_store(&dir.path().join("nope.json")).is_none());
+    }
+
+    #[test]
+    fn yolo_pressure_headers_become_hour_and_day_windows() {
+        let headers: Vec<(String, String)> = [
+            ("x-yolo-pressure-used-pct-1h", "30"),
+            ("x-yolo-pressure-reset-1h", "3523"),
+            ("x-yolo-pressure-used-pct-24h", "1"),
+            ("x-yolo-pressure-reset-24h", "53923"),
+            ("x-yolo-auto-model", "qwen3.8-flash"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+        let windows = parse_yolo_pressure(&headers, 1_000);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "1h");
+        assert_eq!(windows[0].remaining_percent, 70.0);
+        assert_eq!(windows[0].resets_at, Some(4_523));
+        assert_eq!(windows[1].label, "24h");
+        assert_eq!(windows[1].remaining_percent, 99.0);
+        assert_eq!(windows[1].resets_at, Some(54_923));
+        assert!(!windows[0].rolling);
+
+        // A used percent without its reset still counts; no headers, no windows.
+        let partial = vec![(
+            "x-yolo-pressure-used-pct-24h".to_string(),
+            "120".to_string(),
+        )];
+        let windows = parse_yolo_pressure(&partial, 0);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].remaining_percent, 0.0);
+        assert_eq!(windows[0].resets_at, None);
+        assert!(parse_yolo_pressure(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn yolo_key_resolves_like_pi_models_json() {
+        let models = |key: &str| json!({"providers": {"yolo-auto": {"apiKey": key}}});
+        let no_env = |_: &str| None;
+        assert_eq!(
+            yolo_key_from_pi_models(&models("yolo_abc"), no_env),
+            Some("yolo_abc".to_string())
+        );
+        // An apiKey naming a set environment variable is read through it.
+        let env = |name: &str| (name == "YOLO_KEY").then(|| "yolo_env".to_string());
+        assert_eq!(
+            yolo_key_from_pi_models(&models("YOLO_KEY"), env),
+            Some("yolo_env".to_string())
+        );
+        // Shell-command keys are not run; empty or missing entries mean none.
+        assert_eq!(yolo_key_from_pi_models(&models("!pass yolo"), no_env), None);
+        assert_eq!(yolo_key_from_pi_models(&models(" "), no_env), None);
+        assert_eq!(
+            yolo_key_from_pi_models(&json!({"providers": {"zai": {"apiKey": "k"}}}), no_env),
+            None
+        );
+    }
+
+    #[test]
+    fn yolo_probe_waits_out_its_interval_unless_a_window_rolled_over() {
+        let now = 10_000;
+        let entry = |resets_at| ProviderLimits {
+            windows: vec![LimitWindow::new("1h", 10.0, Some(resets_at))],
+            ..ProviderLimits::new("yolo", ProviderState::Ready)
+        };
+        let live = entry(now + 600);
+        let rolled = entry(now - 1);
+        // Fresh numbers inside the interval: no probe.
+        assert!(!yolo_probe_due(Some(&live), now - 300, now));
+        assert!(yolo_probe_due(
+            Some(&live),
+            now - YOLO_PROBE_MIN_INTERVAL_SECS,
+            now
+        ));
+        // A rolled-over window re-probes early, but never inside the floor.
+        assert!(yolo_probe_due(Some(&rolled), now - 300, now));
+        assert!(!yolo_probe_due(Some(&rolled), now - 10, now));
+        assert!(yolo_probe_due(None, 0, now));
+    }
+
+    #[test]
+    fn hour_windows_floor_at_the_five_hour_threshold() {
+        let thresholds = crate::core::config::PoolThresholds {
+            five_hour_percent: 20.0,
+            week_percent: 5.0,
+        };
+        assert_eq!(window_floor("1h", &thresholds), 20.0);
+        assert_eq!(window_floor("5h", &thresholds), 20.0);
+        assert_eq!(window_floor("24h", &thresholds), 5.0);
+        assert_eq!(window_floor("7d", &thresholds), 5.0);
     }
 
     #[test]
@@ -3867,6 +4159,10 @@ mod tests {
             Some("grok")
         );
         assert_eq!(provider_for("pi", Some("google/gemini-3.7-flash")), None);
+        assert_eq!(
+            provider_for("pi", Some("yolo-auto/qwen3.8-27b")),
+            Some("yolo")
+        );
         // Unknown model ids and unknown backends map to nothing.
         assert_eq!(provider_for("opencode", Some("yolo/bar")), None);
         assert_eq!(provider_for("opencode", Some("some/local")), None);

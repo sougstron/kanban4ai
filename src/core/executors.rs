@@ -12,7 +12,7 @@
 //! `Operations::advance_role_roster`.
 
 use crate::core::config::{ExecutorPools, PoolThresholds, RoleCandidate};
-use crate::core::limits::{LimitWindow, LimitsSnapshot, provider_for};
+use crate::core::limits::{LimitWindow, LimitsSnapshot, provider_for, window_floor};
 
 /// Which executor pool to walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,10 +114,7 @@ fn blocking_window<'a>(
         return None;
     }
     limits.live_windows(now).into_iter().find_map(|window| {
-        let floor = match window.label.as_str() {
-            "5h" => thresholds.five_hour_percent,
-            _ => thresholds.week_percent,
-        };
+        let floor = window_floor(&window.label, thresholds);
         (window.remaining_percent < floor).then_some((provider, window))
     })
 }
