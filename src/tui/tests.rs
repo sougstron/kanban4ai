@@ -11289,7 +11289,7 @@ fn limits_row_leaves_out_hidden_providers() {
 }
 
 #[test]
-fn limits_row_puts_yolo_hour_and_day_windows_on_one_line() {
+fn limits_row_stacks_yolo_day_window_under_its_hour_window() {
     use crate::core::limits::{LimitWindow, LimitsSnapshot, ProviderLimits, ProviderState};
 
     let (_dir, mut app) = populated_app();
@@ -11314,11 +11314,13 @@ fn limits_row_puts_yolo_hour_and_day_windows_on_one_line() {
     }));
 
     let lines = rendered_lines(&mut app, 120, 28);
-    let row = &lines[lines.len() - 2];
-    assert!(
-        row.contains("↯ yolo 1h 70% ↻40m · 24h 99% ↻14h40m"),
-        "{lines:?}"
-    );
+    let upper = &lines[lines.len() - 3];
+    let lower = &lines[lines.len() - 2];
+    assert!(upper.contains("↯ yolo 1h 70% ↻40m"), "{lines:?}");
+    assert!(!upper.contains("24h"), "{lines:?}");
+    assert!(lower.contains("24h 99% ↻14h40m"), "{lines:?}");
+    let column = |line: &str, needle: &str| line[..line.find(needle).unwrap()].chars().count();
+    assert_eq!(column(upper, "1h"), column(lower, "24h"), "{lines:?}");
 
     app.settings.hidden_limits = vec!["yolo".to_string()];
     let lines = rendered_lines(&mut app, 120, 28);

@@ -1,8 +1,9 @@
 //! The provider limits row, directly above the status bar, showing how much of
 //! each AI subscription window is still available and when it resets. It is
-//! two lines tall when any provider has both kinds of window: short ones (5h)
-//! on the upper line, weekly/monthly ones on the lower. A provider with only
-//! one kind keeps it on the upper line, level with its name.
+//! two lines tall when any provider has windows of different lengths: each
+//! provider's shortest window (5h, yolo's 1h) on the upper line, its longer
+//! ones (7d, 24h, monthly) stacked below. A provider whose windows are all one
+//! length keeps them on the upper line, level with its name.
 //!
 //! Numbers come from [`crate::core::limits`], which refreshes them on a
 //! background thread; this module only draws whatever snapshot is cached, so a
@@ -253,10 +254,15 @@ fn provider_block(
             "stale"
         }));
     }
+    let shortest = windows
+        .iter()
+        .map(|window| window_minutes(&window.label))
+        .min()
+        .unwrap_or(i64::MAX);
     let mut upper = Vec::new();
     let mut lower = Vec::new();
     for window in windows {
-        let line = if is_short_window(&window.label) {
+        let line = if window_minutes(&window.label) == shortest {
             &mut upper
         } else {
             &mut lower
@@ -286,9 +292,6 @@ fn provider_block(
             ));
         }
     }
-    if upper.is_empty() {
-        std::mem::swap(&mut upper, &mut lower);
-    }
     // codex reports whatever the last local session was told, so its numbers
     // carry their own age; a fetched-live provider has none.
     if detail == Detail::Full
@@ -312,12 +315,24 @@ fn provider_block(
     })
 }
 
-/// Hour/minute windows go on the upper line. Weekly, monthly, and anything
-/// else go below.
-fn is_short_window(label: &str) -> bool {
-    label
-        .strip_suffix(['m', 'h'])
-        .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+/// A window label's length in minutes, so a provider's windows can be ranked:
+/// `30m`, `5h`, `24h`, `7d`, `mon`. Anything unrecognised sorts last.
+fn window_minutes(label: &str) -> i64 {
+    if label == "mon" {
+        return 30 * 1440;
+    }
+    let Some(unit) = label.chars().last() else {
+        return i64::MAX;
+    };
+    let scale = match unit {
+        'm' => 1,
+        'h' => 60,
+        'd' => 1440,
+        _ => return i64::MAX,
+    };
+    label[..label.len() - 1]
+        .parse::<i64>()
+        .map_or(i64::MAX, |count| count * scale)
 }
 
 fn state_label(state: &ProviderState, detail: Detail) -> &'static str {
