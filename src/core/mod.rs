@@ -28,6 +28,7 @@ pub mod scheduler;
 pub mod session;
 pub mod stats;
 pub mod storage;
+pub mod subagents;
 pub mod sync;
 pub mod telemetry;
 pub mod thread;

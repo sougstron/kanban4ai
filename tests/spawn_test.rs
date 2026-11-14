@@ -1,7 +1,7 @@
 mod common;
 
 use kanban4ai::core::config::{Config, InheritGroup, SpawnHelperModel, SpawnPolicy};
-use kanban4ai::core::models::{MessageKind, MessageRole, RunPhase, Task, TaskStatus};
+use kanban4ai::core::models::{MessageKind, MessageRole, RunPhase, SubState, Task, TaskStatus};
 use kanban4ai::core::operations::{Operations, SpawnRequest, TaskPatch};
 use kanban4ai::core::session::SessionManager;
 use kanban4ai::core::storage::NewTask;
@@ -33,6 +33,12 @@ fn config(ops: &Operations, yaml: &str) {
         .insert("spawn".into(), serde_yaml_ng::from_str(yaml).unwrap());
     ops.config.save(&cfg).unwrap();
 }
+fn sub_config(ops: &Operations, yaml: &str) {
+    let mut cfg = ops.config.load_raw().unwrap();
+    cfg.orchestration
+        .insert("subagents".into(), serde_yaml_ng::from_str(yaml).unwrap());
+    ops.config.save(&cfg).unwrap();
+}
 
 #[test]
 fn spawn_links_queues_inherits_permissions_and_assignment() {
@@ -41,6 +47,7 @@ fn spawn_links_queues_inherits_permissions_and_assignment() {
     let child = ops.spawn_task(request(&parent), "ses-parent").unwrap();
     assert_eq!(child.parent_task.as_deref(), Some(parent.id.as_str()));
     assert!(child.spawned && child.silence && child.explicit_assignment);
+    assert!(child.is_subagent());
     assert_eq!(child.permission(), Some("readonly"));
     assert_eq!(child.agent_backend, parent.agent_backend);
     assert_eq!(child.ai_model, parent.ai_model);
@@ -70,7 +77,7 @@ fn spawn_starts_helper_directly_when_queue_cannot_dispatch() {
 }
 
 #[test]
-fn spawn_queues_helper_when_queue_can_dispatch() {
+fn spawn_starts_subagent_outside_the_queue_even_when_it_can_dispatch() {
     let (_dir, ops, _) = common::ops_with_recorder(false);
     let mut cfg = ops.config.load_raw().unwrap();
     cfg.rules
@@ -79,7 +86,8 @@ fn spawn_queues_helper_when_queue_can_dispatch() {
     ops.config.save(&cfg).unwrap();
     let parent = parent(&ops);
     let child = ops.spawn_task(request(&parent), "ses-parent").unwrap();
-    assert_eq!(child.run_phase, Some(RunPhase::Queued));
+    assert_ne!(child.run_phase, Some(RunPhase::Queued));
+    assert_eq!(child.sub_state, Some(SubState::Running));
 }
 
 #[test]
@@ -99,14 +107,14 @@ fn spawn_posts_board_notes_instead_of_agent_context() {
         parent_thread
             .messages
             .iter()
-            .any(|m| m.body.contains("Spawned helper") && m.body.contains(&child.id))
+            .any(|m| m.body.contains("Subagent") && m.body.contains(&child.id))
     );
     let child_thread = threads.load(&child.id).unwrap();
     assert!(
         child_thread
             .messages
             .iter()
-            .any(|m| m.body.contains(&format!("Spawned by parent {}", parent.id)))
+            .any(|m| m.body.contains(&format!("Subagent of {}", parent.id)))
     );
 }
 
@@ -134,7 +142,7 @@ fn spawn_requires_live_executor_session_and_respects_forbidden() {
 #[test]
 fn spawn_depth_children_and_dependency_deadlocks_are_bounded() {
     let (_dir, ops, _) = common::ops_with_recorder(false);
-    config(&ops, "max_depth: 1\nmax_children: 1");
+    sub_config(&ops, "max_depth: 1\nmax_children: 1");
     let parent = parent(&ops);
     let mut invalid = request(&parent);
     invalid.depends_on = vec![parent.id.clone()];
@@ -147,7 +155,7 @@ fn spawn_depth_children_and_dependency_deadlocks_are_bounded() {
             .contains("max_children")
     );
     assert_eq!(ops.effective_spawn(&child).unwrap().source, "depth limit");
-    config(&ops, "max_depth: 0");
+    sub_config(&ops, "max_depth: 0");
     assert_eq!(
         ops.effective_spawn(&parent).unwrap().policy,
         SpawnPolicy::Forbidden
@@ -168,8 +176,17 @@ fn forced_done_requires_spawn_child_and_does_not_force_children() {
     let child = ops.spawn_task(request(&parent), "ses-parent").unwrap();
     assert_eq!(
         ops.effective_spawn(&child).unwrap().policy,
-        SpawnPolicy::Allowed
+        SpawnPolicy::Forbidden
     );
+    // A live subagent blocks the parent's done until it finishes.
+    assert!(
+        ops.complete_task(&parent.id, "ses-parent", true)
+            .unwrap_err()
+            .to_string()
+            .contains("live subagents")
+    );
+    ops.sub_done(&child.id, child.session.as_deref(), Some("Found it."))
+        .unwrap();
     // The spawn note is a board note now; it no longer satisfies the
     // recorded-context gate on the parent's behalf.
     kanban4ai::core::context::ContextManager::new(ops.data_root())
@@ -251,10 +268,21 @@ fn three_level_resolution_and_legacy_defaults() {
 }
 
 #[test]
-fn wait_records_targets_and_wakes_early_only_after_children_finish() {
+fn legacy_wait_records_targets_and_wakes_early_only_after_children_finish() {
     let (dir, ops, _) = common::ops_with_recorder(true);
     let parent = parent(&ops);
-    let mut child = ops.spawn_task(request(&parent), "ses-parent").unwrap();
+    // A legacy helper: an ordinary board task with `spawned: true`.
+    let mut child = ops
+        .create_task(NewTask {
+            title: "Legacy helper".into(),
+            parent_task: Some(parent.id.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    child.spawned = true;
+    child.status = TaskStatus::InProgress;
+    child.run_phase = Some(RunPhase::Queued);
+    ops.storage.save_task(&child).unwrap();
     ops.declare_waiting_for(&parent.id, "ses-parent", &[child.id.clone()])
         .unwrap();
     let mgr = SessionManager::new(dir.path());
@@ -291,41 +319,24 @@ fn output_shares_upstream_digest_and_wait_classifies_terminal_states() {
 }
 
 #[test]
-fn spawn_helpers_share_parent_concurrency_caps() {
-    let (_dir, ops, recorder) = common::ops_with_recorder(true);
-    let mut cfg = ops.config.load_raw().unwrap();
-    cfg.orchestration
-        .insert("max_running_total".into(), 1.into());
-    ops.config.save(&cfg).unwrap();
-    let parent = parent(&ops);
-    let child = ops.spawn_task(request(&parent), "ses-parent").unwrap();
-    assert!(ops.spawn_wait_needs_slot(&[child.id.clone()]).unwrap());
-    assert!(ops.dispatch_queue().unwrap().is_empty());
-    let before = recorder.calls().len();
-    ops.declare_waiting_for(&parent.id, "ses-parent", &[child.id.clone()])
-        .unwrap();
-    assert_eq!(ops.dispatch_queue().unwrap().len(), 1);
-    assert_eq!(recorder.calls().len(), before + 1);
-}
-
-#[test]
-fn dependency_spawn_stays_todo_until_upstream_is_ready() {
+fn spawn_alias_rejects_dependencies() {
     let (_dir, ops, _) = common::ops_with_recorder(true);
     let parent = parent(&ops);
-    let mut dependency = ops.create_task(NewTask::titled("Upstream")).unwrap();
+    let dependency = ops.create_task(NewTask::titled("Upstream")).unwrap();
     let mut req = request(&parent);
     req.depends_on.push(dependency.id.clone());
-    let child = ops.spawn_task(req, "ses-parent").unwrap();
-    assert_eq!(child.status, TaskStatus::Todo);
-    dependency.status = TaskStatus::Review;
-    ops.storage.save_task(&dependency).unwrap();
-    assert_eq!(ops.dispatch_ready_dependents().unwrap(), vec![child.id]);
+    assert!(
+        ops.spawn_task(req, "ses-parent")
+            .unwrap_err()
+            .to_string()
+            .contains("kanban plan")
+    );
 }
 
 #[test]
 fn concurrent_spawns_cannot_exceed_child_cap() {
     let (dir, ops, _) = common::ops_with_recorder(false);
-    config(&ops, "max_children: 1");
+    sub_config(&ops, "max_children: 1");
     let parent = parent(&ops);
     let handles: Vec<_> = (0..2)
         .map(|_| {
@@ -345,12 +356,10 @@ fn concurrent_spawns_cannot_exceed_child_cap() {
 
 #[test]
 fn forced_with_impossible_spawn_never_deadlocks() {
-    for yaml in [
-        "policy: forced\nmax_depth: 0",
-        "policy: forced\nmax_children: 0",
-    ] {
+    for yaml in ["max_depth: 0", "max_children: 0"] {
         let (_dir, ops, _) = common::ops_with_recorder(false);
-        config(&ops, yaml);
+        config(&ops, "policy: forced");
+        sub_config(&ops, yaml);
         let parent = parent(&ops);
         // Spawning stays impossible (depth limit / child cap) ...
         assert!(!ops.effective_spawn(&parent).unwrap().requires_helper);

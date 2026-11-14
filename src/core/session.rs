@@ -39,7 +39,7 @@ fn state_of(
     if session.status != SessionStatus::Active {
         return SessionState::Crashed;
     }
-    if session.wait_until.is_some_and(|deadline| *now <= deadline) {
+    if session.wait_pending(now) {
         return SessionState::Waiting;
     }
     if (*now - session.last_seen).num_seconds() <= heartbeat_timeout {
@@ -158,7 +158,7 @@ impl SessionManager {
         let Some(session) = self.load_session(session_id) else {
             return;
         };
-        if session.status != SessionStatus::Active || session.wait_until.is_some() {
+        if session.status != SessionStatus::Active || session.is_waiting() {
             return;
         }
         let logs = self.project_path.join(".kanban").join("logs");
@@ -198,7 +198,7 @@ impl SessionManager {
         if session.status != SessionStatus::Active {
             return None; // already ended — never double-record a re-close.
         }
-        let phase = if session.wait_until.is_some() {
+        let phase = if session.is_waiting() {
             stats::Phase::Waiting
         } else {
             stats::Phase::Running
@@ -366,10 +366,50 @@ impl SessionManager {
         // Only a *fresh* wait is a Running→Waiting transition; renewing an
         // already-declared wait (a new ETA before the old one expires) must
         // not re-close a Running span that already ended at the first call.
-        let was_waiting = session.wait_until.is_some();
+        let was_waiting = session.is_waiting();
         session.wait_until = Some(wait_until);
+        session.wait_trigger = None;
         session.wait_note = note;
         session.wait_for.clear();
+        session.wait_exited = false;
+        session.last_seen = timefmt::now();
+        self.save_session(&session)?;
+        if !was_waiting {
+            stats::record_exit(&self.project_path, &session.task_id, stats::Phase::Running);
+            stats::record_enter(
+                &self.project_path,
+                &session.task_id,
+                stats::Phase::Waiting,
+                &stats::Tags::default(),
+            );
+        }
+        Ok(true)
+    }
+
+    /// Record a wait with no deadline that ends on `trigger` instead (TASK-594:
+    /// `kanban sub wait`). The session stays alive without heartbeats until
+    /// the trigger fires; nothing relaunches it on a timer. Returns `false`
+    /// when the session is missing or not active.
+    pub fn set_trigger_wait(
+        &self,
+        session_id: &str,
+        trigger: crate::core::models::WaitTrigger,
+        wait_for: Vec<String>,
+        note: Option<String>,
+    ) -> Result<bool> {
+        Self::validate_session_id(session_id)?;
+        let _guard = Storage::new(&self.project_path).lock()?;
+        let Some(mut session) = self.load_session(session_id) else {
+            return Ok(false);
+        };
+        if session.status != SessionStatus::Active {
+            return Ok(false);
+        }
+        let was_waiting = session.is_waiting();
+        session.wait_until = None;
+        session.wait_trigger = Some(trigger);
+        session.wait_for = wait_for;
+        session.wait_note = note;
         session.wait_exited = false;
         session.last_seen = timefmt::now();
         self.save_session(&session)?;
@@ -457,7 +497,7 @@ impl SessionManager {
         let now = timefmt::now();
         let mut crashed = Vec::new();
         for session in self.list_active_sessions() {
-            if session.wait_until.is_some_and(|deadline| now <= deadline) {
+            if session.wait_pending(&now) {
                 continue;
             }
             let elapsed = (now - session.last_seen).num_seconds();

@@ -81,8 +81,9 @@ impl Slots {
         let config = ops.config.load()?;
         let mut slots = Slots::default();
         for task in ops.storage.list_tasks(Some("in_progress"))? {
-            // A queued task has no live session by design; it occupies nothing.
-            if task.run_phase == Some(RunPhase::Queued) {
+            // A queued task has no live session by design; it occupies
+            // nothing. Subagents count only against their own caps.
+            if task.run_phase == Some(RunPhase::Queued) || task.is_subagent() {
                 continue;
             }
             let Some(session_id) = task.session.as_deref() else {
@@ -289,6 +290,9 @@ impl Operations {
         for session in self.session_manager().check_sessions(heartbeat_timeout)? {
             let _ = self.schedule_crash_restart(&session.task_id, "heartbeat timeout");
         }
+        // Subagents run outside the board queue on their own caps; pump
+        // them whether or not the queue itself is on.
+        let _ = self.pump_subagents();
         let _ = self.due_restarts()?;
         let _ = self.due_launches()?;
         // Auto mode answers open questions and re-dispatches conflicted
@@ -545,7 +549,8 @@ impl Operations {
             let Some(restart_at) = task.restart_at else {
                 continue;
             };
-            if restart_at > now {
+            // The subagent pump restarts subagents inside their parent.
+            if restart_at > now || task.is_subagent() {
                 continue;
             }
             // A task parked by the executor-pool gate carries an open
@@ -637,6 +642,13 @@ impl Operations {
         deadline: Option<NaiveDateTime>,
         cause: &str,
     ) -> Result<bool> {
+        if self
+            .storage
+            .load_task(task_id)?
+            .is_some_and(|task| task.is_subagent())
+        {
+            return self.schedule_subagent_restart(task_id, deadline, cause);
+        }
         let orch = self.config.get_orchestration()?;
         // Crash restart runs *through* the queue, so promising a retry the
         // dispatcher can never honour would strand the task with a "↻ retry"
@@ -778,6 +790,7 @@ mod tests {
     ) -> OrchestrationSettings {
         OrchestrationSettings {
             spawn: Default::default(),
+            subagents: Default::default(),
             queue_enabled: true,
             max_running_total: total,
             max_running_per_backend: backend.iter().map(|(k, v)| (k.to_string(), *v)).collect(),

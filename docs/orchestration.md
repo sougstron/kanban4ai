@@ -588,28 +588,66 @@ is not blank. Native resumes also reread this string, including when returning
 to a previously used backend, so current settings supersede the instructions
 from that backend's earlier run (see `docs/config.md`).
 
-## Agent fan-out (spawn)
+## Subagents (`core/subagents.rs`)
 
-Use `spawn` for independent work discovered during execution: research, isolated
-modules, or tests against an already agreed API. Use `plan` for a static DAG
-chosen up front by the orchestrator. Spawn is available only to the current
-parent executor session. Each helper has `parent_task` plus `spawned: true`;
-helpers do not become dependencies of their running parent. Spawned helper
-results appear in the parent's initial/resume prompt and through `output`.
+A subagent is a child run of the current executor, not a board task. Use it
+for dynamic side work discovered during one execution (research, an isolated
+module, tests against an agreed API); a static up-front DAG of visible tasks
+stays with the orchestrator's `kanban plan`. `kanban spawn` is a deprecated
+alias of `kanban sub spawn`.
 
-Helpers receive the parent's readonly/silence permissions and runner. They use
-separate worktrees seeded from the project, **not the parent's uncommitted
-worktree**. Give each helper self-contained instructions and integrate its
-result deliberately. `output` includes branch and diff statistics for review.
+- **Storage.** A subagent is a task file with `kind: subagent`, `parent_task`
+  and its own `sub_state` (`queued | running | done | failed | cancelled`).
+  It never appears in a board column, `kanban list`, bulk moves or the board
+  queue; `status` stays `in_progress`/`done` only for older readers. Legacy
+  `spawned: true` helpers stay ordinary board tasks.
+- **Launch, outside the queue.** `sub spawn` starts it at once and it never
+  counts against `max_running_total` / `max_running_per_role` /
+  `max_running_per_backend*`. Its caps are `orchestration.subagents`
+  (`max_parallel_per_parent`, `max_running_total`, `max_children`,
+  `max_depth`); beyond them it waits FIFO in the parent's own queue and starts
+  as soon as a sibling ends. Executor pools still apply: an exhausted pool
+  fails the subagent with the reason. Subagents run locally; auto-launch must
+  be on (otherwise the launch fails and the parent is told).
+- **Worktree.** By default (not `--readonly`, or with `--from-parent`) the
+  checkout is cut from a snapshot of the parent's worktree, uncommitted edits
+  included (`seed_commit`), so the subagent sees exactly what the parent has.
+- **Finish.** `sub done --summary` (or `done` from the subagent's session)
+  records the summary as its result, commits its worktree onto its branch and
+  makes it terminal: no Review, no bot reviewer, no landing. The parent reads
+  `sub output`, then `sub merge` (merge into the parent's worktree; the
+  project changes only when the parent lands) or `sub discard`. `sub send`
+  reruns a finished subagent with a follow-up; `sub cancel` kills it.
+- **Prompt.** A subagent gets a short prompt: the task, heartbeat, `sub done`
+  with the summary, and "never ask" (silence is forced; unclear points go into
+  the summary). No columns, backups, result pin, reviewer or fan-out rules;
+  `max_depth: 1` (default) forbids nested subagents.
+- **Failure.** A crash uses the ordinary backoff ladder
+  (`orchestration.auto_restart`), restarting inside the parent's queue; a
+  spent ladder, a non-retryable error or a spent auto-resume budget marks it
+  `failed`. A watchdog replaces the wait ETA: a running subagent with no
+  transcript/log progress for `subagents.stall_timeout` is failed and killed.
+- **Parent lifecycle.** Back to To Do, stop, recover, re-run or any move out
+  of In Progress cancels and kills live subagents. The parent's `done` is
+  refused while subagents are live unless `--cancel-subagents`. Archive and
+  delete cascade to the subagents; the parent reaching Done drops their
+  branches. Forced spawn policy counts created subagents.
 
-The project's/global fan-out settings and task overrides control policy and
-helper model. Forced policy blocks executor completion until a helper exists;
-forbidden policy rejects spawn. Depth and per-parent child limits bound growth.
+### Waking the parent (`sub wait`)
 
-`wait` normally blocks and prints terminal states. At timeout, or when queued
-helpers need the parent's occupied slot, an agent declares waiting automatically
-(exit 3). End the reply then: no background poller is needed. The existing
-waiting lifecycle releases the slot and resumes after every `session.wait_for`
-target becomes terminal, once the old process has exited, or at the deadline.
-Missing, failed and question-blocked tasks are terminal so parents can handle
-failure instead of waiting indefinitely. Read results with `output` on resume.
+`kanban sub wait [<id>...]` (no ids: every live subagent) declares a wait with
+**no deadline**: `wait_until` unset, `wait_trigger: subagents`,
+`wait_for: [ids]`, and exits 3 — the agent ends its reply. Exit 0 (all done)
+or 4 (some failed/cancelled) means nothing was declared. The parent wakes
+exactly once, when every target is terminal and its process has exited:
+`sub done`/`cancel`/failure check it immediately, the parent's own exit
+checks it (in case everything finished first), and the dispatcher tick
+(`dispatch_queue` → subagent pump, `wake_expired_waits`) is the fallback. The
+wake relaunches the parent directly — its family already held the slot — with
+a note listing every subagent state, and does not spend `auto_resumes`.
+Trigger waits are never reaped by heartbeat and have no daemon deadline.
+`waiting --eta` for external processes is unchanged; the legacy `kanban wait`
+on old `spawned: true` helpers keeps its ETA-based wait.
+
+Subagent tokens and time fold into the parent in `stats` and the detail
+panel's analytics line (`subagents N: time · tokens`).

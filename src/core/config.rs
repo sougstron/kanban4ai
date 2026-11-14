@@ -313,6 +313,12 @@ orchestration:
     wait_poll_secs: 5
     wait_timeout_secs: 600
     wait_eta_secs: 900
+  subagents:
+    max_parallel_per_parent: 3
+    max_running_total: 6
+    max_children: 5
+    max_depth: 1
+    stall_timeout: 7200
   orchestrator:
     max_subtasks: 12
     upstream_budget_chars: 4000
@@ -869,7 +875,10 @@ pub enum OnChangesRequested {
 /// this — never the raw `Mapping`, and no threshold is hardcoded elsewhere.
 #[derive(Debug, Clone)]
 pub struct OrchestrationSettings {
+    /// Deprecated (`orchestration.spawn`); still read for the helper policy
+    /// and model, and as the fallback for `subagents.max_children`.
     pub spawn: SpawnSettings,
+    pub subagents: SubagentSettings,
     pub queue_enabled: bool,
     /// Total concurrently running agents. `0` means unlimited.
     pub max_running_total: i64,
@@ -969,6 +978,39 @@ impl Default for SpawnSettings {
             wait_poll_secs: 5,
             wait_timeout_secs: 600,
             wait_eta_secs: 900,
+        }
+    }
+}
+/// `orchestration.subagents` (TASK-594): caps of the child runs a parent
+/// executor starts with `kanban sub spawn`. Subagents never pass through the
+/// board queue, so these are their only caps. Absent keys fall back to the
+/// defaults; `max_children` falls back to the deprecated
+/// `spawn.max_children`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SubagentSettings {
+    /// Subagents of one parent running at once; the rest wait FIFO in the
+    /// parent's own queue.
+    pub max_parallel_per_parent: usize,
+    /// Subagents running at once on the whole board (machine guard).
+    pub max_running_total: usize,
+    /// Subagents one parent may create in total.
+    pub max_children: Option<usize>,
+    /// Nesting bound: a task at this subagent depth may not spawn. `1`
+    /// means a subagent cannot create subagents.
+    pub max_depth: u32,
+    /// Seconds a running subagent may go without transcript/log progress
+    /// before the watchdog marks it failed and wakes its parent.
+    pub stall_timeout: i64,
+}
+impl Default for SubagentSettings {
+    fn default() -> Self {
+        Self {
+            max_parallel_per_parent: 3,
+            max_running_total: 6,
+            max_children: None,
+            max_depth: 1,
+            stall_timeout: 7200,
         }
     }
 }
@@ -2202,6 +2244,10 @@ impl OrchestrationSettings {
                 .get("spawn")
                 .and_then(|v| serde_yaml_ng::from_value(v.clone()).ok())
                 .unwrap_or_default(),
+            subagents: mapping
+                .get("subagents")
+                .and_then(|v| serde_yaml_ng::from_value(v.clone()).ok())
+                .unwrap_or_default(),
             orchestrator: OrchestratorSettings {
                 max_subtasks: orchestrator_int("max_subtasks", 12),
                 upstream_budget_chars: orchestrator_int("upstream_budget_chars", 4000),
@@ -2629,6 +2675,19 @@ impl Config {
             }
         }
 
+        if let Some(value) = orch.get("subagents") {
+            let settings: SubagentSettings = serde_yaml_ng::from_value(value.clone())
+                .map_err(|e| KanbanError::Invalid(format!("orchestration.subagents: {e}")))?;
+            if settings.max_parallel_per_parent == 0
+                || settings.max_running_total == 0
+                || settings.stall_timeout < 1
+            {
+                return Err(KanbanError::Invalid(
+                    "orchestration.subagents caps and stall_timeout must be positive".into(),
+                ));
+            }
+        }
+
         coerce_bool_field(orch, "queue_enabled", "orchestration")?;
         coerce_int_cap(orch, "max_running_total")?;
 
@@ -2817,7 +2876,10 @@ impl Config {
     }
 
     pub fn effective_spawn(&self, task: &Task, depth: u32) -> Result<EffectiveSpawn> {
-        let settings = self.get_orchestration()?.spawn;
+        let orch = self.get_orchestration()?;
+        let settings = orch.spawn;
+        let max_children = orch.subagents.max_children.unwrap_or(settings.max_children);
+        let max_depth = orch.subagents.max_depth;
         let source =
             if self.global_file.is_some() && self.inherit_flags()?.get(InheritGroup::FanOut) {
                 "global"
@@ -2839,14 +2901,14 @@ impl Config {
                 source
             },
             depth,
-            max_depth: settings.max_depth,
-            max_children: settings.max_children,
+            max_depth,
+            max_children,
         };
         if task.spawned && task.spawn_policy.is_none() && result.policy == SpawnPolicy::Forced {
             result.policy = SpawnPolicy::Allowed;
             result.source = "spawned child";
         }
-        if depth >= settings.max_depth {
+        if depth >= max_depth {
             result.policy = SpawnPolicy::Forbidden;
             result.source = "depth limit";
         }
@@ -2854,7 +2916,7 @@ impl Config {
         // depth limit still allows children and max_children is not zero.
         // Requiring the impossible would make `spawn` and `done` refuse each
         // other forever.
-        result.requires_helper = result.policy == SpawnPolicy::Forced && settings.max_children > 0;
+        result.requires_helper = result.policy == SpawnPolicy::Forced && max_children > 0;
         Ok(result)
     }
 

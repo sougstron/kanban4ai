@@ -475,7 +475,7 @@ pub(super) fn capture(
             Some(SessionStatus::Closed) => RunState::Finished,
             Some(SessionStatus::Crashed) => RunState::Failed,
             None => RunState::Finished,
-            _ if session.as_ref().is_some_and(|s| s.wait_until.is_some()) => RunState::Waiting,
+            _ if session.as_ref().is_some_and(|s| s.is_waiting()) => RunState::Waiting,
             _ => RunState::Running,
         }
     };

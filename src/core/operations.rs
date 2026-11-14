@@ -78,7 +78,7 @@ use crate::core::graph;
 use crate::core::limits;
 use crate::core::models::{
     IntegrationState, Message, MessageKind, MessageRole, MessageStatus, Role, RunMode, RunPhase,
-    Session, SessionStatus, Task, TaskStatus,
+    Session, SessionStatus, SubState, Task, TaskStatus,
 };
 use crate::core::notifier::{DesktopNotifier, NotificationConfig};
 use crate::core::project::{Project, ProjectStore, Roots};
@@ -326,7 +326,7 @@ enum CrashRestart {
     After(NaiveDateTime),
 }
 
-enum RespawnOutcome {
+pub(crate) enum RespawnOutcome {
     Spawned(String),
     Noop,
     LaunchFailed(String),
@@ -470,7 +470,7 @@ impl Operations {
         SessionManager::new(self.data_root())
     }
 
-    fn context_manager(&self) -> ContextManager {
+    pub(crate) fn context_manager(&self) -> ContextManager {
         ContextManager::new(self.data_root())
     }
 
@@ -757,6 +757,7 @@ impl Operations {
     }
 
     pub fn delete_task(&self, task_id: &str) -> Result<bool> {
+        self.cascade_subagents(task_id, None)?;
         self.storage.delete_task(task_id)
     }
 
@@ -766,6 +767,8 @@ impl Operations {
         let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(false);
         };
+        // A parent's subagents are deleted with it.
+        self.cascade_subagents(task_id, None)?;
         // Dropping a task drops its isolated worktree and branch with it.
         // The branch is typically unmerged here — an abandon is an explicit
         // human discard, so it goes too (a Conflict worktree never does).
@@ -799,7 +802,8 @@ impl Operations {
                 .session
                 .as_deref()
                 .is_some_and(|s| session_mgr.is_session_active(s));
-            if task.session.is_none() || session_alive {
+            // A subagent's dead session is the subagent pump's to fail.
+            if task.session.is_none() || session_alive || task.is_subagent() {
                 continue;
             }
             // A task with open questions is waiting for an answer, not stalled.
@@ -922,6 +926,8 @@ impl Operations {
         order: &str,
     ) -> Result<Vec<Task>> {
         let mut tasks = self.storage.list_tasks(status)?;
+        // Subagents live inside their parent, never in a board column.
+        tasks.retain(|task| !task.is_subagent());
 
         if let Some(search) = search {
             let query = search.to_lowercase();
@@ -949,6 +955,7 @@ impl Operations {
     /// of its last session; liveness is decided by the session record, not by
     /// this field being set.
     pub fn recover_task(&self, task_id: &str) -> Result<Option<Task>> {
+        self.cancel_live_subagents(task_id, &format!("parent {task_id} recovered"))?;
         let _guard = self.storage.lock()?;
         let Some(mut task) = self.storage.load_task(task_id)? else {
             return Ok(None);
@@ -996,6 +1003,11 @@ impl Operations {
             let Some(task) = self.storage.load_task(task_id)? else {
                 return Ok(None);
             };
+            if task.is_subagent() {
+                return Err(KanbanError::Invalid(format!(
+                    "{task_id} is a subagent; manage it with kanban sub"
+                )));
+            }
 
             let config = self.config.load()?;
             let mut valid: Vec<String> = config.column_ids();
@@ -1069,6 +1081,20 @@ impl Operations {
             }
         };
 
+        if let Some(moved) = &moved
+            && moved.status != TaskStatus::InProgress
+        {
+            // The parent's run is over: its live subagents go with it, and
+            // an archived parent takes all of them into the archive.
+            if moved.status == TaskStatus::Archive {
+                self.cascade_subagents(&moved.id, Some(TaskStatus::Archive))?;
+            } else {
+                self.cancel_live_subagents(
+                    &moved.id,
+                    &format!("parent {} moved to {}", moved.id, moved.status),
+                )?;
+            }
+        }
         if entered_review && let Some(moved) = &moved {
             self.trigger_chained_tasks(&moved.id)?;
         }
@@ -1107,7 +1133,8 @@ impl Operations {
         }
         let moved = {
             let _guard = self.storage.lock()?;
-            let tasks = self.storage.list_tasks(Some(from.as_str()))?;
+            let mut tasks = self.storage.list_tasks(Some(from.as_str()))?;
+            tasks.retain(|task| !task.is_subagent());
             self.move_tasks_locked(tasks, to)?
         };
         self.trigger_bulk_review_chains(to, &moved)?;
@@ -1127,7 +1154,8 @@ impl Operations {
         }
         let moved = {
             let _guard = self.storage.lock()?;
-            let tasks = self.storage.list_tasks(Some(from.as_str()))?;
+            let mut tasks = self.storage.list_tasks(Some(from.as_str()))?;
+            tasks.retain(|task| !task.is_subagent());
             let mut current_ids = tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>();
             let mut confirmed_ids = expected_ids.to_vec();
             current_ids.sort();
@@ -1159,6 +1187,9 @@ impl Operations {
                 }
                 self.storage.move_task(&task.id, to.as_str(), false)?
             };
+            if to == TaskStatus::Archive && result.is_some() {
+                self.cascade_subagents(&task.id, Some(TaskStatus::Archive))?;
+            }
             moved.extend(result);
         }
         Ok(moved)
@@ -1187,6 +1218,9 @@ impl Operations {
     /// record of which session last worked the task.
     fn move_task_to_done(&self, task: &Task) -> Result<Option<Task>> {
         let _guard = self.storage.lock()?;
+        // Done is terminal for the parent, so nothing can merge its
+        // subagents' branches any more.
+        self.clear_subagent_worktrees(&task.id)?;
         if let Err(error) = crate::core::wip::cleanup_board(self.data_root(), &task.id) {
             self.post_queue_note(&task.id, &format!("Service ref cleanup pending: {error}"));
         }
@@ -1390,6 +1424,15 @@ impl Operations {
         if let Some(session) = crate::cli::serve::runner_action(self.data_root(), task_id, false)? {
             return Ok(session);
         }
+        if self
+            .storage
+            .load_task(task_id)?
+            .is_some_and(|task| task.is_subagent())
+        {
+            return Err(KanbanError::Invalid(format!(
+                "{task_id} is a subagent; run it again with kanban sub send"
+            )));
+        }
         let session_mgr = self.session_manager();
         let session_id = {
             let _guard = self.storage.lock()?;
@@ -1573,6 +1616,12 @@ impl Operations {
         }) else {
             return Ok(None);
         };
+        // Stopping a subagent cancels it; stopping a parent stops its family.
+        if task.is_subagent() {
+            self.sub_cancel(&task.id, &format!("session {session_id} stopped"))?;
+        } else {
+            self.cancel_live_subagents(&task.id, &format!("parent {} stopped", task.id))?;
+        }
         if was_active {
             self.thread_manager()?.post(
                 &task.id,
@@ -1633,6 +1682,18 @@ impl Operations {
                 return Ok(Some(task));
             }
 
+            // A subagent's `done` ends it inside its parent: no Review, no
+            // bot reviewer, no landing.
+            if task.is_subagent() {
+                drop(_guard);
+                return self
+                    .sub_done(task_id, is_agent.then_some(session_id), None)
+                    .map(Some);
+            }
+            if is_agent {
+                self.require_no_live_subagents(task_id)?;
+            }
+
             if is_agent && task.run_phase == Some(RunPhase::Orchestrate) {
                 drop(_guard);
                 return self.complete_orchestrate_phase(task_id, session_id);
@@ -1656,7 +1717,7 @@ impl Operations {
                     .any(|child| child.spawned && child.parent_task.as_deref() == Some(&task.id))
             {
                 return Err(KanbanError::Permission(format!(
-                    "spawn_policy is forced for {}; create a helper with kanban spawn --parent {} before done",
+                    "spawn_policy is forced for {}; create a subagent with kanban sub spawn --parent {} before done",
                     task.id, task.id
                 )));
             }
@@ -2348,155 +2409,29 @@ impl Operations {
         self.config.effective_spawn(task, depth)
     }
 
+    /// The legacy `kanban spawn`: now an alias of `kanban sub spawn`
+    /// (TASK-594). Dependency edges belong to `kanban plan`.
     pub fn spawn_task(&self, request: SpawnRequest, session_id: &str) -> Result<Task> {
-        use crate::core::config::{SpawnHelperModel, SpawnPolicy};
-        let _guard = self.storage.lock()?;
-        let parent = self
-            .storage
-            .load_task(&request.parent_id)?
-            .ok_or_else(|| KanbanError::Invalid("parent task not found".into()))?;
-        self.require_current_agent_session(&parent, session_id)?;
-        if !matches!(parent.run_phase, None | Some(RunPhase::Execute)) {
-            return Err(KanbanError::Permission(
-                "only the parent's executor session may spawn helpers".into(),
+        if !request.depends_on.is_empty() {
+            return Err(KanbanError::Invalid(
+                "subagents start at once and cannot depend on tasks; plan a dependency graph \
+                 with kanban plan"
+                    .into(),
             ));
         }
-        let effective = self.effective_spawn(&parent)?;
-        if effective.policy == SpawnPolicy::Forbidden {
-            return Err(KanbanError::Permission(format!(
-                "spawn is forbidden for {} (from {})",
-                parent.id, effective.source
-            )));
-        }
-        let tasks = self.storage.get_all_tasks()?;
-        if tasks
-            .iter()
-            .filter(|t| t.spawned && t.parent_task.as_deref() == Some(&parent.id))
-            .count()
-            >= effective.max_children
-        {
-            return Err(KanbanError::Permission(format!(
-                "{} reached orchestration.spawn.max_children ({})",
-                parent.id, effective.max_children
-            )));
-        }
-        // A helper cannot wait on its own running parent (nor a descendant
-        // that depends on that parent): that would create a dynamic join deadlock.
-        let mut pending = request.depends_on.clone();
-        let mut seen = std::collections::HashSet::new();
-        while let Some(id) = pending.pop() {
-            if id == parent.id {
-                return Err(KanbanError::Invalid(
-                    "helper dependencies cannot depend on its parent".into(),
-                ));
-            }
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            let dep = tasks
-                .iter()
-                .find(|t| t.id == id)
-                .ok_or_else(|| KanbanError::Invalid(format!("dependency {id} not found")))?;
-            pending.extend(dep.depends_on.iter().cloned());
-        }
-        let explicit =
-            request.backend.is_some() || request.model.is_some() || request.effort.is_some();
-        let orch = self.config.get_orchestration()?;
-        let profile = if explicit {
-            None
-        } else {
-            match effective.helper_model {
-                SpawnHelperModel::Same => None,
-                SpawnHelperModel::ExecutorMiddle => Some("middle"),
-                SpawnHelperModel::ExecutorCheap => Some("cheap"),
-            }
-        }
-        .filter(|profile| {
-            if *profile == "middle" {
-                !orch.executors.middle.is_empty()
-            } else {
-                !orch.executors.cheap.is_empty()
-            }
-        });
-        let same_backend = request.backend.is_none() || request.backend == parent.agent_backend;
-        let mut task = self.create_task(NewTask {
-            title: request.title,
-            description: request.description,
-            agent_backend: if profile.is_some() {
-                None
-            } else {
-                request.backend.or(parent.agent_backend.clone())
+        self.sub_spawn(
+            crate::core::subagents::SubSpawnRequest {
+                parent_id: request.parent_id,
+                title: request.title,
+                description: request.description,
+                backend: request.backend,
+                model: request.model,
+                effort: request.effort,
+                readonly: request.readonly,
+                from_parent: None,
             },
-            ai_model: if profile.is_some() {
-                None
-            } else {
-                request
-                    .model
-                    .or_else(|| same_backend.then(|| parent.ai_model.clone()).flatten())
-            },
-            ai_effort: if profile.is_some() {
-                None
-            } else {
-                request
-                    .effort
-                    .or_else(|| same_backend.then(|| parent.ai_effort.clone()).flatten())
-            },
-            agent_name: if profile.is_none() && same_backend {
-                parent.agent_name.clone()
-            } else {
-                None
-            },
-            explicit_assignment: profile.is_none(),
-            permission: if request.readonly {
-                Some("readonly".into())
-            } else {
-                parent.permission().map(str::to_owned)
-            },
-            silence: parent.silence,
-            runner: parent.runner.clone(),
-            parent_task: Some(parent.id.clone()),
-            role_profile: profile.map(str::to_owned),
-            depends_on: request.depends_on,
-            ..NewTask::default()
-        })?;
-        task.spawned = true;
-        task.spawn_policy = Some(SpawnPolicy::Allowed);
-        // materialize_new_task pins default fields; a pool selection must remain unpinned.
-        task.explicit_assignment = profile.is_none();
-        self.storage.save_task(&task)?;
-        if task.depends_on.iter().all(|id| {
-            tasks
-                .iter()
-                .any(|t| &t.id == id && matches!(t.status, TaskStatus::Review | TaskStatus::Done))
-        }) {
-            // Route through queue_run so a remote runner is placed the same
-            // way dispatch_ready_dependents places dependents. When the queue
-            // cannot dispatch (queue or auto-launch off) nothing would ever
-            // drain the entry, so start directly — the same fallback `rerun`
-            // and the TUI use.
-            if self.queue_can_dispatch()? {
-                self.queue_run(&task.id)?;
-            } else {
-                self.start_task(&task.id)?;
-            }
-        }
-        // Board notes, not agent context: a Context entry authored by the
-        // agent would leak into the parent's result digest, flip
-        // has_agent_context, and drop the parent's own reply from downstream
-        // digests.
-        let threads = self.thread_manager()?;
-        threads.post_board_note(
-            &parent.id,
-            &format!(
-                "Spawned helper {}: {}. Read its result with kanban output {}.",
-                task.id, task.title, task.id
-            ),
-        )?;
-        threads.post_board_note(
-            &task.id,
-            &format!("Spawned by parent {} as a helper.", parent.id),
-        )?;
-        Ok(self.storage.load_task(&task.id)?.unwrap_or(task))
+            session_id,
+        )
     }
 
     pub fn wait_poll(&self, ids: &[String]) -> Result<Vec<ChildState>> {
@@ -2513,6 +2448,16 @@ impl Operations {
                         success: false,
                     });
                 };
+                if task.is_subagent() {
+                    let state = task.sub_state.unwrap_or(SubState::Queued);
+                    return Ok(ChildState {
+                        id: task.id,
+                        title: task.title,
+                        state: state.as_str().to_string(),
+                        terminal: state.is_terminal(),
+                        success: state == SubState::Done,
+                    });
+                }
                 let session = task
                     .session
                     .as_deref()
@@ -2529,7 +2474,7 @@ impl Operations {
                     "queued".into()
                 } else if session
                     .as_ref()
-                    .is_some_and(|s| s.status == SessionStatus::Active && s.wait_until.is_some())
+                    .is_some_and(|s| s.status == SessionStatus::Active && s.is_waiting())
                 {
                     "waiting".into()
                 } else if session_state == Some(crate::core::session::SessionState::Live) {
@@ -3533,7 +3478,7 @@ impl Operations {
                     // A live session with no declared wait is the `ask --wait`
                     // poller: it heartbeats every poll iteration and wakes
                     // itself on the answer.
-                    Some(SessionState::Live) if record.wait_until.is_none() => {
+                    Some(SessionState::Live) if !record.is_waiting() => {
                         return Ok(None);
                     }
                     // A stale heartbeat leaves the record Active long after
@@ -3588,9 +3533,7 @@ impl Operations {
         // the caps.
         let was_paused = expected_session
             .and_then(|session| session_mgr.load_session(session))
-            .is_some_and(|record| {
-                record.status == SessionStatus::Active && record.wait_until.is_some()
-            });
+            .is_some_and(|record| record.status == SessionStatus::Active && record.is_waiting());
 
         if let Some(old_session) = expected_session {
             let mut record = session_mgr.load_session(old_session);
@@ -3609,7 +3552,7 @@ impl Operations {
                 Err(_) if process_already_gone => {}
                 Ok(false) | Err(_)
                     if record.as_ref().is_some_and(|session| {
-                        session.status == SessionStatus::Active && session.wait_until.is_some()
+                        session.status == SessionStatus::Active && session.is_waiting()
                     }) =>
                 {
                     // A background fallback cannot be signalled safely. Make
@@ -3622,6 +3565,7 @@ impl Operations {
                         )));
                     };
                     session.wait_until = Some(timefmt::now() - chrono::Duration::seconds(1));
+                    session.wait_trigger = None;
                     session_mgr.save_session(session)?;
                     self.thread_manager()?.post_with_origin(
                         &task.id,
@@ -3780,7 +3724,11 @@ impl Operations {
                 })
     }
 
-    fn require_current_agent_session(&self, task: &Task, session_id: &str) -> Result<()> {
+    pub(crate) fn require_current_agent_session(
+        &self,
+        task: &Task,
+        session_id: &str,
+    ) -> Result<()> {
         self.require_agent_session_in_status(task, session_id, TaskStatus::InProgress)
     }
 
@@ -4154,6 +4102,7 @@ impl Operations {
         if crate::core::sync::control::request(self.data_root(), task_id, "rerun")? {
             return self.get_task(task_id);
         }
+        self.cancel_live_subagents(task_id, &format!("parent {task_id} re-run"))?;
         if mode == RunMode::Queued {
             return self.queue_run(task_id);
         }
@@ -4221,6 +4170,7 @@ impl Operations {
         if let Some(session_id) = session_id {
             SessionManager::validate_session_id(session_id)?;
         }
+        self.cancel_live_subagents(task_id, &format!("parent {task_id} re-run"))?;
         let session_mgr = self.session_manager();
         let queued = mode == RunMode::Queued;
         let (task, session_id) = {
@@ -4406,7 +4356,7 @@ impl Operations {
     }
 
     /// The task's isolated checkout, when it exists on disk.
-    fn task_worktree_path(&self, task: &Task) -> Option<PathBuf> {
+    pub(crate) fn task_worktree_path(&self, task: &Task) -> Option<PathBuf> {
         let rel = task.worktree.as_deref()?;
         let path = self.storage.worktrees_dir.join(rel);
         path.is_dir().then_some(path)
@@ -4614,6 +4564,13 @@ impl Operations {
             return repo
                 .read_ref(&commit)?
                 .ok_or_else(|| KanbanError::Invalid("Published WIP object missing".into()));
+        }
+        // A subagent started `--from-parent` branches from the snapshot of
+        // its parent's worktree taken at spawn time.
+        if let Some(seed) = task.seed_commit.as_deref() {
+            return repo
+                .read_ref(&format!("{seed}^{{commit}}"))?
+                .ok_or_else(|| KanbanError::Invalid(format!("seed commit {seed} is missing")));
         }
         match iso.seed {
             IsolationSeed::Head => repo.head_oid(),
@@ -5585,6 +5542,11 @@ impl Operations {
             self.record_agent_reply(task_id, session_id);
         }
         let outcome = self.reconcile_agent_exit_inner(task_id, session_id, exit_status)?;
+        if matches!(outcome, AgentExitOutcome::Waiting) {
+            // Every subagent may have finished while this parent was still
+            // exiting after `sub wait`; nothing else would wake it then.
+            let _ = self.wake_subagent_waits();
+        }
         if session_matched_task {
             // A run that closed itself (`kanban done`) before its transcript
             // carried usage — Codex reports tokens only at turn end — is
@@ -5968,7 +5930,15 @@ impl Operations {
             session_mgr.crash_session(session_id)?;
             let cause = format!("agent exited with code {exit_status}");
             match self.crash_restart_plan(task_id, session_id) {
-                CrashRestart::Skip => {}
+                CrashRestart::Skip => {
+                    if self
+                        .storage
+                        .load_task(task_id)?
+                        .is_some_and(|t| t.is_subagent())
+                    {
+                        let _ = self.fail_subagent(task_id, &format!("{cause}; not retryable"));
+                    }
+                }
                 CrashRestart::Backoff => {
                     let _ = self.schedule_crash_restart(task_id, &cause);
                 }
@@ -5980,8 +5950,8 @@ impl Operations {
         }
 
         let now = timefmt::now();
-        let in_declared_wait = session.status == SessionStatus::Active
-            && session.wait_until.is_some_and(|deadline| now <= deadline);
+        let in_declared_wait =
+            session.status == SessionStatus::Active && session.wait_pending(&now);
         if in_declared_wait {
             session_mgr.mark_wait_exited(session_id)?;
             return Ok(AgentExitOutcome::Waiting);
@@ -6010,6 +5980,13 @@ impl Operations {
         let max_resumes = self.config.get_threshold("max_auto_resumes")?;
         if i64::from(task.auto_resumes) >= max_resumes {
             session_mgr.crash_session(session_id)?;
+            if task.is_subagent() {
+                self.fail_subagent(
+                    &task.id,
+                    &format!("exited without sub done {max_resumes} times in a row"),
+                )?;
+                return Ok(AgentExitOutcome::ResumeExhausted);
+            }
             if let Ok(notifier) = self.notifier() {
                 notifier.stranded(
                     &task.id,
@@ -6095,6 +6072,9 @@ impl Operations {
     /// the wait-resume monitor.
     pub fn wake_expired_waits(&self) -> Result<Vec<WaitWake>> {
         let session_mgr = self.session_manager();
+        // Trigger waits (`kanban sub wait`) have no deadline; they end here
+        // too, so every caller of this method also wakes subagent parents.
+        let subagent_wakes = self.wake_subagent_waits().unwrap_or_default();
         let heartbeat_timeout = self.config.get_threshold("session_heartbeat_timeout")?;
         let now = timefmt::now();
         let mut resumed = Vec::new();
@@ -6151,9 +6131,10 @@ impl Operations {
             } else {
                 note
             };
-            if self.queue_can_dispatch()? {
+            if self.queue_can_dispatch()? && !task.is_subagent() {
                 // The pause held no slot, so waking re-acquires one through
                 // the dispatcher instead of launching past the caps.
+                // Subagents never enter the board queue.
                 if self.queue_expired_wait(&session, &note, attempt)? {
                     resumed.push(WaitWake::Queued {
                         task_id: session.task_id.clone(),
@@ -6217,6 +6198,7 @@ impl Operations {
             // never calls back into this method, so there is no recursion.
             let _ = self.dispatch_queue();
         }
+        resumed.extend(subagent_wakes);
         Ok(resumed)
     }
 
@@ -6270,7 +6252,7 @@ impl Operations {
     /// ended. No-op (returns `None`) when the task is gone, no longer In
     /// Progress, or already handed to a different session — the guard that
     /// makes concurrent resume paths (TUI tick vs `check-sessions`) safe.
-    fn respawn_session(
+    pub(crate) fn respawn_session(
         &self,
         task_id: &str,
         expected_session: &str,
@@ -6399,7 +6381,7 @@ impl Operations {
     /// here: its worktree is the one place unmerged agent work lives.
     /// Returns the git problems hit along the way; the task fields are
     /// cleared only when everything actually went away.
-    fn clear_task_worktree(&self, task: &mut Task, allow_unmerged: bool) -> Vec<String> {
+    pub(crate) fn clear_task_worktree(&self, task: &mut Task, allow_unmerged: bool) -> Vec<String> {
         if task.integration == IntegrationState::Conflict {
             return Vec::new();
         }

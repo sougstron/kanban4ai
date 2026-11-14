@@ -635,7 +635,25 @@ preset, except readonly, which falls back to the project default.
 
 ## Agent fan-out
 
-`orchestration.spawn` defaults:
+`orchestration.subagents` (TASK-594) caps the child runs of `kanban sub`:
+
+```yaml
+subagents:
+  max_parallel_per_parent: 3   # beyond: FIFO in the parent's own queue
+  max_running_total: 6         # every subagent on the board (machine guard)
+  max_children: 5              # per parent; absent → spawn.max_children
+  max_depth: 1                 # 1: a subagent cannot spawn subagents
+  stall_timeout: 7200          # seconds without transcript/log progress → failed
+```
+
+Subagents ignore the board queue caps (`max_running_total`,
+`max_running_per_*`) entirely; these are their only limits. Caps and
+`stall_timeout` must be positive.
+
+`orchestration.spawn` is **deprecated** but still read: `policy` and
+`helper_model` decide whether and on which model subagents run,
+`max_children` is the fallback above, and `max_depth` is ignored (`wait_*`
+only drive the legacy `kanban wait`). Defaults:
 
 ```yaml
 spawn:
@@ -661,5 +679,5 @@ not cause an endless chain. Depth remains a hard limit. Explicit task policy
 changes can still force a helper within that depth limit.
 
 `same` copies backend/model/effort. Middle/cheap use existing executor pools and
-quota selection; explicit spawn flags take precedence. Children use the ordinary
-queue and its total, backend, model and role concurrency caps.
+quota selection; explicit spawn flags take precedence. Subagents bypass the
+board queue and its caps; see `orchestration.subagents` above.

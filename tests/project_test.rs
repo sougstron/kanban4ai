@@ -499,6 +499,7 @@ fn write_live_session(data_root: &Path) {
             wait_for: Vec::new(),
             wait_note: None,
             wait_exited: false,
+            wait_trigger: None,
             pending_usage: None,
         })
         .unwrap();

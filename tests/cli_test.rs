@@ -2065,15 +2065,65 @@ fn named_permissions_create_edit_clear_and_validate() {
         .failure();
 }
 
+/// A fake opencode backend for subagent CLI tests: a subagent finishes
+/// itself through the real `sub done` callback after a second; TASK-001
+/// (the parent) and `slow` runs just sleep.
+fn fake_subagent_backend(env: &Env, auto_launch: bool) -> PathBuf {
+    let slow = env.work().join("slow.flag");
+    let script = env.work().join("fake-agent.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$KANBAN_TASK_ID\" in TASK-001) exit 0;; esac\n\
+[ -f {} ] && exec sleep 30\nsleep 1\n\
+\"$KANBAN_CMD\" sub done \"$KANBAN_TASK_ID\" --session \"$KANBAN_SESSION\" --summary \"fake result\"\n",
+            slow.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    write_board_config(
+        env,
+        &format!(
+            "notifications:\n  enabled: false\n\
+auto_launch:\n  enabled: {auto_launch}\n  use_tmux: true\n  terminal_fallback: true\n  default_agent: opencode\n\
+agents:\n  opencode:\n    command: {}\n    extra_args: []\n",
+            script.display()
+        ),
+    );
+    slow
+}
+
+fn opencode_parent(env: &Env) -> kanban4ai::core::models::Task {
+    use kanban4ai::core::storage::NewTask;
+    let ops = Operations::new(env.data_root());
+    let parent = ops
+        .create_task(NewTask {
+            title: "Parent".into(),
+            agent_backend: Some("opencode".into()),
+            ..Default::default()
+        })
+        .unwrap();
+    // Taken without a launch: auto-launch is still off here.
+    ops.take_task(&parent.id, "ses-parent", true).unwrap();
+    parent
+}
+
 #[test]
 fn fanout_cli_spawn_output_wait_and_forbidden() {
     use kanban4ai::core::config::SpawnPolicy;
     use kanban4ai::core::operations::TaskPatch;
-    use kanban4ai::core::storage::NewTask;
     let env = board();
     let ops = Operations::new(env.data_root());
-    let parent = ops.create_task(NewTask::titled("Parent")).unwrap();
-    ops.take_task(&parent.id, "ses-parent", true).unwrap();
+    let parent = opencode_parent(&env);
+    let slow = fake_subagent_backend(&env, true);
+    std::fs::write(&slow, "").unwrap();
     let output = kanban(&env)
         .env("KANBAN_SESSION", "ses-parent")
         .env("KANBAN_TASK_ID", &parent.id)
@@ -2086,6 +2136,7 @@ fn fanout_cli_spawn_output_wait_and_forbidden() {
     let child: serde_json::Value = serde_json::from_slice(&output).unwrap();
     let id = child["id"].as_str().unwrap();
     assert_eq!(child["parent_task"], parent.id);
+    assert_eq!(child["kind"], "subagent");
     kanban(&env)
         .args(["output", id, "--json"])
         .assert()
@@ -2099,18 +2150,28 @@ fn fanout_cli_spawn_output_wait_and_forbidden() {
     kanban(&env)
         .env("KANBAN_SESSION", "ses-parent")
         .env("KANBAN_TASK_ID", &parent.id)
-        .args(["wait", id, "--timeout", "0"])
+        .args(["wait", id])
         .assert()
         .code(3)
         .stdout(predicate::str::contains("Waiting declared"));
-    let mut task = ops.get_task(id).unwrap().unwrap();
-    task.status = kanban4ai::core::models::TaskStatus::Review;
-    ops.storage.save_task(&task).unwrap();
+    // Only the parent controls its subagents.
     kanban(&env)
+        .env("KANBAN_TASK_ID", "TASK-999")
+        .args(["sub", "cancel", id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("only its parent"));
+    kanban(&env)
+        .env("KANBAN_TASK_ID", &parent.id)
+        .args(["sub", "cancel", id])
+        .assert()
+        .success();
+    kanban(&env)
+        .env_remove("KANBAN_TASK_ID")
         .args(["wait", id])
         .assert()
-        .success()
-        .stdout(predicate::str::contains("review"));
+        .code(4)
+        .stdout(predicate::str::contains("cancelled"));
     ops.update_task(
         &parent.id,
         TaskPatch {
@@ -2131,4 +2192,124 @@ fn fanout_cli_spawn_output_wait_and_forbidden() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Spawn policy: forbidden (task)"));
+}
+
+#[test]
+fn sub_done_from_a_fake_backend_wakes_the_parent_without_review() {
+    use kanban4ai::core::models::{SubState, TaskStatus};
+    let env = board();
+    let ops = Operations::new(env.data_root());
+    let parent = opencode_parent(&env);
+    fake_subagent_backend(&env, true);
+    let id = String::from_utf8(
+        kanban(&env)
+            .env("KANBAN_SESSION", "ses-parent")
+            .env("KANBAN_TASK_ID", &parent.id)
+            .args(["sub", "spawn", "Research", "--description", "Find it"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    kanban(&env)
+        .env("KANBAN_SESSION", "ses-parent")
+        .env("KANBAN_TASK_ID", &parent.id)
+        .args(["sub", "wait"])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("no deadline"));
+    kanban(&env)
+        .args([
+            "agent-exit",
+            &parent.id,
+            "--session",
+            "ses-parent",
+            "--status",
+            "0",
+        ])
+        .assert()
+        .success();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let child = ops.get_task(&id).unwrap().unwrap();
+        let woken = ops
+            .get_task(&parent.id)
+            .unwrap()
+            .unwrap()
+            .session
+            .as_deref()
+            != Some("ses-parent");
+        if child.sub_state == Some(SubState::Done) && woken {
+            assert_eq!(child.status, TaskStatus::Done);
+            assert!(!child.review_unseen);
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "subagent {:?}, parent woken {woken}",
+            child.sub_state
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    let thread = kanban4ai::core::thread::ThreadManager::new(env.data_root())
+        .unwrap()
+        .load(&parent.id)
+        .unwrap();
+    assert!(
+        thread
+            .messages
+            .iter()
+            .any(|m| m.body.contains(&format!("Subagents finished: {id} done")))
+    );
+    kanban(&env)
+        .env("KANBAN_TASK_ID", &parent.id)
+        .args(["sub", "output", &id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fake result"));
+    kanban(&env)
+        .args(["list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&id).not());
+    // Stop the parent's fake relaunch loop.
+    fake_subagent_backend(&env, false);
+}
+
+#[test]
+fn parent_done_refuses_live_subagents_unless_cancelled() {
+    let env = board();
+    let ops = Operations::new(env.data_root());
+    let parent = opencode_parent(&env);
+    let slow = fake_subagent_backend(&env, true);
+    std::fs::write(&slow, "").unwrap();
+    kanban(&env)
+        .env("KANBAN_SESSION", "ses-parent")
+        .env("KANBAN_TASK_ID", &parent.id)
+        .args(["sub", "spawn", "Slow"])
+        .assert()
+        .success();
+    kanban(&env)
+        .args(["context", &parent.id, "Parent result."])
+        .assert()
+        .success();
+    kanban(&env)
+        .env("KANBAN_SESSION", "ses-parent")
+        .args(["done", &parent.id, "--agent"])
+        .assert()
+        .stderr(predicate::str::contains("live subagents"));
+    kanban(&env)
+        .env("KANBAN_SESSION", "ses-parent")
+        .args(["done", &parent.id, "--agent", "--cancel-subagents"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cancelled subagent TASK-002"));
+    assert_eq!(
+        ops.get_task(&parent.id).unwrap().unwrap().status,
+        kanban4ai::core::models::TaskStatus::Review
+    );
 }

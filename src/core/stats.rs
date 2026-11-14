@@ -470,13 +470,53 @@ pub struct ProjectStats {
     pub source: SourceDiagnostics,
 }
 
-/// Load and reconstruct one project's stats from its events file.
+/// Load and reconstruct one project's stats from its events file. A
+/// subagent's records are counted under its parent task (TASK-594): it is
+/// part of the parent's run, not a task of its own.
 pub fn load(project_path: &Path) -> ProjectStats {
     let (records, source) = read_records(&events_path(project_path));
-    ProjectStats {
+    let mut stats = ProjectStats {
         source,
         ..pair_records(records)
+    };
+    let parents: HashMap<String, String> = subagents_by_parent(project_path)
+        .into_iter()
+        .flat_map(|(parent, subs)| subs.into_iter().map(move |(id, _)| (id, parent.clone())))
+        .collect();
+    if !parents.is_empty() {
+        for span in &mut stats.spans {
+            if let Some(parent) = parents.get(&span.task_id) {
+                span.task_id = parent.clone();
+            }
+        }
+        for usage in &mut stats.usage {
+            if let Some(parent) = parents.get(&usage.task_id) {
+                usage.task_id = parent.clone();
+            }
+        }
     }
+    stats
+}
+
+/// Subagents per parent task id, as `(id, created_at)`.
+fn subagents_by_parent(project_path: &Path) -> HashMap<String, Vec<(String, NaiveDateTime)>> {
+    let mut map: HashMap<String, Vec<(String, NaiveDateTime)>> = HashMap::new();
+    if !project_path.join(".kanban").join("tasks").is_dir() {
+        return map;
+    }
+    for task in crate::core::storage::Storage::new(project_path)
+        .list_tasks(None)
+        .unwrap_or_default()
+    {
+        if task.is_subagent()
+            && let Some(parent) = task.parent_task
+        {
+            map.entry(parent)
+                .or_default()
+                .push((task.id, task.created_at));
+        }
+    }
+    map
 }
 
 /// Pair `Enter`/`Exit` phase edges per `(task_id, phase)` in timestamp order
@@ -602,6 +642,32 @@ pub struct TaskAnalytics {
     /// Share of each provider limit window the task consumed, per role
     /// (`core::limit_share`). Left empty here; the caller fills it in.
     pub limit_shares: Vec<LimitShare>,
+    /// The task's subagents. Their tokens are already in `breakdown` /
+    /// `unsplit_tokens`; their (parallel) running time is only here.
+    pub subagents: SubagentTotals,
+}
+
+/// The subagent line of a parent's analytics (TASK-594).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SubagentTotals {
+    pub count: usize,
+    pub runs: usize,
+    pub running_seconds: i64,
+    /// Every token of every subagent run (split and unsplit).
+    pub tokens: i64,
+}
+
+impl TaskAnalytics {
+    /// Fold one subagent's analytics into its parent's.
+    fn fold_subagent(&mut self, sub: TaskAnalytics) {
+        self.subagents.count += 1;
+        self.subagents.runs += sub.runs;
+        self.subagents.running_seconds += sub.running_seconds;
+        self.subagents.tokens +=
+            sub.breakdown.prompt_total() + sub.breakdown.output + sub.unsplit_tokens;
+        self.breakdown.add(&sub.breakdown);
+        self.unsplit_tokens += sub.unsplit_tokens;
+    }
 }
 
 impl TaskAnalytics {
@@ -635,14 +701,9 @@ pub fn events_stamp(project_path: &Path) -> EventsStamp {
 /// task's `created_at`) count, so a recycled task id does not inherit the
 /// history of the abandoned task that held it before.
 pub fn task_analytics(project_path: &Path, task_id: &str, since: NaiveDateTime) -> TaskAnalytics {
-    let mut pending = TaskAnalyticsBuilder::default();
-    for record in load_records(project_path) {
-        let (id, ts) = record_task_time(&record);
-        if id == task_id && ts >= since {
-            pending.record(project_path, record);
-        }
-    }
-    pending.finish()
+    tasks_analytics(project_path, &[(task_id.to_string(), since)])
+        .remove(task_id)
+        .unwrap_or_default()
 }
 
 /// Aggregate all requested tasks with one read of the project's event log.
@@ -657,20 +718,39 @@ pub fn tasks_analytics(
         .iter()
         .map(|(id, since)| (id.as_str(), (*since, TaskAnalyticsBuilder::default())))
         .collect();
+    // Subagents of the requested tasks, folded into their parent below.
+    let mut subs: HashMap<String, (String, NaiveDateTime, TaskAnalyticsBuilder)> = HashMap::new();
     if !pending.is_empty() {
+        for (parent, children) in subagents_by_parent(project_path) {
+            if pending.contains_key(parent.as_str()) {
+                for (id, since) in children {
+                    subs.insert(id, (parent.clone(), since, TaskAnalyticsBuilder::default()));
+                }
+            }
+        }
         for record in load_records(project_path) {
             let (id, ts) = record_task_time(&record);
             if let Some((since, builder)) = pending.get_mut(id)
                 && ts >= *since
             {
                 builder.record(project_path, record);
+            } else if let Some((_, since, builder)) = subs.get_mut(id)
+                && ts >= *since
+            {
+                builder.record(project_path, record);
             }
         }
     }
-    pending
+    let mut result: HashMap<String, TaskAnalytics> = pending
         .into_iter()
         .map(|(id, (_, builder))| (id.to_owned(), builder.finish()))
-        .collect()
+        .collect();
+    for (_, (parent, _, builder)) in subs {
+        if let Some(analytics) = result.get_mut(&parent) {
+            analytics.fold_subagent(builder.finish());
+        }
+    }
+    result
 }
 
 fn record_task_time(record: &Record) -> (&str, NaiveDateTime) {
