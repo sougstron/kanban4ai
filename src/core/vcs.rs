@@ -1085,6 +1085,44 @@ impl GitRepo {
         }
     }
 
+    /// Merge `branch` into `worktree`'s checked-out branch with a commit
+    /// (subagent results into their parent's worktree, TASK-594). Returns
+    /// the conflicted paths, left with markers in the worktree; empty means
+    /// a clean merge. Any other refusal is an error.
+    pub fn merge_branch_into_worktree(
+        &self,
+        worktree: &Path,
+        branch: &str,
+        message: &str,
+    ) -> Result<Vec<String>> {
+        populate_worktree(worktree)?;
+        let out = run(
+            worktree,
+            &["merge", "--no-edit", "-m", message, branch],
+            None,
+        )?;
+        if out.status.success() {
+            return Ok(Vec::new());
+        }
+        let unmerged = require(
+            run(worktree, &["diff", "--name-only", "--diff-filter=U"], None)?,
+            "diff --diff-filter=U",
+        )?;
+        let paths: Vec<String> = String::from_utf8_lossy(&unmerged.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if paths.is_empty() {
+            return Err(KanbanError::Invalid(format!(
+                "git merge failed (exit {}): {}",
+                out.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(paths)
+    }
+
     /// True when `branch` is fully merged into [`INTEGRATION_REF`]. This —
     /// never `HEAD` — is the gate that makes a task branch deletable.
     pub fn is_landed(&self, branch: &str) -> Result<bool> {

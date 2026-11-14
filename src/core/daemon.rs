@@ -418,6 +418,11 @@ fn settle(project: &Project, ops: &Operations, queue_on: bool) -> Result<Option<
         let dispatching = ops.queue_can_dispatch()?;
         let mut deadlines = Vec::new();
         for session in ops.session_manager().list_active_sessions() {
+            // A trigger wait (`kanban sub wait`) has no deadline: the
+            // subagent that finishes last wakes it.
+            if session.wait_trigger.is_some() {
+                continue;
+            }
             // Reaped once silent past the timeout, unless inside a declared
             // wait; an expired wait is woken on the same timeout.
             deadlines.push(match session.wait_until {

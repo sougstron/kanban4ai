@@ -107,6 +107,9 @@ pub fn build_agent_prompt<'a>(
         Role::Orchestrator => return build_orchestrator_prompt(roots, task, session_id),
         Role::Designer => return build_designer_prompt(roots, task, session_id),
         Role::Reviewer => return build_reviewer_prompt(roots, task, session_id),
+        Role::Executor if task.is_subagent() => {
+            return build_subagent_prompt(roots, task, session_id);
+        }
         Role::Executor => {}
     }
     let backups_dir = roots.data_path("backups").join(&task.id);
@@ -223,6 +226,54 @@ not touch the project folder's own checkout.\n"
     Ok(prompt)
 }
 
+/// Prompt of a subagent (TASK-594): a child run inside its parent's
+/// execution. No board, column, backup, result-pin, reviewer, or spawn
+/// rules apply — only the work, the finish command, and the summary the
+/// parent reads.
+fn build_subagent_prompt(roots: Roots<'_>, task: &Task, session_id: &str) -> Result<String> {
+    let parent = task.parent_task.as_deref().unwrap_or("-");
+    let mut prompt = format!(
+        "Subagent task: {}: {}\n\n\
+You are a subagent of kanban4ai task {parent}, working in: {}\n\
+- KANBAN_SESSION={session_id}; KANBAN_TASK_ID={}; use \"$KANBAN_CMD\" for callbacks.\n\
+- Keep the session alive with: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
+- Record progress with: \"$KANBAN_CMD\" context {} <text> --source agent\n\
+- The session ends with your reply; background jobs die with it. Run long commands in the foreground.\n\
+- Never ask: questions are refused. Decide unclear points yourself and state them in the summary.\n\
+- Finish with: \"$KANBAN_CMD\" sub done {} --session {session_id} --summary <result>\n\
+  The summary is everything the parent reads: what you found or changed, where, and what is unclear. \
+It must be the final command of your reply.\n",
+        task.id,
+        task.title,
+        roots.work_path.display(),
+        task.id,
+        task.id,
+        task.id,
+    );
+    if task.branch.is_some() {
+        prompt.push_str(
+            "- Your checkout is your own branch; commit freely. The parent decides whether to \
+merge it into its own work; nothing reaches the project directly.\n",
+        );
+    }
+    if task.permission() == Some("readonly") {
+        prompt.push_str(
+            "- Readonly (mandatory): investigate and report; do not modify project files or run \
+commands that write into the project.\n",
+        );
+    }
+    append_context_economy(&mut prompt);
+    append_role_instructions(roots, Role::Executor, &mut prompt);
+    prompt.push_str("\nTask:\n");
+    if task.description.trim().is_empty() {
+        prompt.push_str(&task.title);
+    } else {
+        prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
+    }
+    append_thread_context(roots, task, &mut prompt)?;
+    Ok(prompt)
+}
+
 /// Small follow-up sent when Codex/pi/omp reopen their native conversation. The
 /// backend already has the original task, rules, tool history, and its own
 /// replies. Refresh the board session identity and current project instructions,
@@ -236,6 +287,10 @@ pub fn build_resume_prompt<'a>(
 ) -> Result<String> {
     let roots = roots.into();
     let finish = match role {
+        Role::Executor if task.is_subagent() => format!(
+            "Finish with: \"$KANBAN_CMD\" sub done {} --session {session_id} --summary <result>",
+            task.id
+        ),
         Role::Executor => format!(
             "Finish with: \"$KANBAN_CMD\" done {} --session {session_id} --agent",
             task.id
@@ -895,12 +950,12 @@ fn append_spawn_helpers(roots: Roots<'_>, task: &Task, prompt: &mut String) -> R
     }
     let ops = crate::core::operations::Operations::new(roots.data_root);
     let effective = ops.effective_spawn(task)?;
-    // Only advertise helpers when spawning is actually possible: a Forbidden
-    // policy or a zero max_children would make `spawn` refuse every attempt.
+    // Only advertise subagents when spawning is actually possible: a
+    // Forbidden policy or a zero max_children would refuse every attempt.
     if effective.policy != SpawnPolicy::Forbidden && effective.max_children > 0 {
-        prompt.push_str(&format!("\nAgent helpers: use \"$KANBAN_CMD\" spawn --parent {} <title> --description <instructions> for independent parallel work or cheaper-model research. Static up-front DAGs belong to the orchestrator's kanban plan. Helpers use separate worktrees seeded from the project; they cannot see your uncommitted edits. Read results with \"$KANBAN_CMD\" output <id>; join with \"$KANBAN_CMD\" wait <id>... . If wait exits 3, waiting is already declared: end your reply so helpers can use the released slot.\n", task.id));
+        prompt.push_str(&format!("\nSubagents: for independent parallel side work or cheaper-model research, run \"$KANBAN_CMD\" sub spawn --parent {} <title> --description <instructions> [--readonly]. A subagent starts at once outside the board queue, never appears on the board, and works on its own branch seeded from your worktree (uncommitted edits included). It finishes with its own sub done — you do not finish it. Join with \"$KANBAN_CMD\" sub wait (exit 3: end your reply; you are relaunched, with no deadline, when all of them finish). Then read \"$KANBAN_CMD\" sub output <id> and either \"$KANBAN_CMD\" sub merge <id> into your worktree or \"$KANBAN_CMD\" sub discard <id>. Also: sub send <id> <message>, sub cancel <id>, sub list. Your done is refused while subagents are live. Static up-front DAGs belong to the orchestrator's kanban plan.\n", task.id));
         if effective.requires_helper {
-            prompt.push_str("Spawn policy (mandatory): create at least one helper with kanban spawn before done; done is refused otherwise.\n");
+            prompt.push_str("Spawn policy (mandatory): create at least one subagent with kanban sub spawn before done; done is refused otherwise.\n");
         }
     }
     let children: Vec<_> = ops
@@ -910,7 +965,7 @@ fn append_spawn_helpers(roots: Roots<'_>, task: &Task, prompt: &mut String) -> R
         .filter(|child| child.spawned && child.parent_task.as_deref() == Some(&task.id))
         .collect();
     if !children.is_empty() {
-        prompt.push_str("\nSpawned helpers:\n");
+        prompt.push_str("\nSubagents and helpers:\n");
         let budget = ops
             .config
             .get_orchestration()?
@@ -920,11 +975,16 @@ fn append_spawn_helpers(roots: Roots<'_>, task: &Task, prompt: &mut String) -> R
             / children.len();
         let threads = ThreadManager::new(roots.data_root)?;
         for child in children {
-            prompt.push_str(&format!(
-                "- {} [{}]: {}\n",
-                child.id, child.status, child.title
-            ));
-            if matches!(child.status, TaskStatus::Review | TaskStatus::Done) {
+            let state = match child.sub_state {
+                Some(state) => state.to_string(),
+                None => child.status.to_string(),
+            };
+            prompt.push_str(&format!("- {} [{state}]: {}\n", child.id, child.title));
+            let finished = match child.sub_state {
+                Some(state) => state.is_terminal(),
+                None => matches!(child.status, TaskStatus::Review | TaskStatus::Done),
+            };
+            if finished {
                 prompt.push_str(&result_digest(&threads, &child.id, budget)?);
                 prompt.push('\n');
             }

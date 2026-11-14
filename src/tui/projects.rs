@@ -271,7 +271,7 @@ fn with_session_counts(
 ) -> ProjectCounts {
     let waiting = sessions
         .iter()
-        .filter(|session| session.wait_until.is_some_and(|deadline| now <= deadline))
+        .filter(|session| session.wait_pending(&now))
         .count() as u32;
     counts.sessions = sessions.len() as u32 - waiting;
     counts.paused += waiting;

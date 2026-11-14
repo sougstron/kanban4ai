@@ -176,6 +176,9 @@ enum Command {
         /// Agent mode
         #[arg(long)]
         agent: bool,
+        /// Cancel (and kill) live subagents instead of refusing
+        #[arg(long)]
+        cancel_subagents: bool,
     },
     /// Append context to a task.
     Context {
@@ -391,7 +394,12 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Create and enqueue a helper owned by the current parent executor session.
+    /// Subagents: child runs of the current executor, managed only from it.
+    Sub {
+        #[command(subcommand)]
+        command: SubCommand,
+    },
+    /// Deprecated alias of `sub spawn`.
     Spawn {
         title: String,
         #[arg(long)]
@@ -648,6 +656,83 @@ enum Command {
     StatuslineBridge,
 }
 
+#[derive(Subcommand)]
+enum SubCommand {
+    /// Create and start a subagent of the parent executor session. It runs
+    /// outside the board queue and never appears on the board.
+    Spawn {
+        title: String,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        /// Investigate and report only
+        #[arg(long)]
+        readonly: bool,
+        /// Seed the worktree from the parent's worktree, uncommitted edits
+        /// included (default unless --readonly)
+        #[arg(long, conflicts_with = "from_project")]
+        from_parent: bool,
+        /// Seed the worktree from the project instead of the parent
+        #[arg(long)]
+        from_project: bool,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Finish a subagent: no Review, no landing; its branch stays for the parent.
+    Done {
+        id: String,
+        #[arg(long)]
+        session: Option<String>,
+        /// The result the parent reads (also note anything unclear here)
+        #[arg(long)]
+        summary: Option<String>,
+    },
+    /// Wait without a deadline until subagents finish (default: every live
+    /// one). Exit: 0 all done, 3 waiting declared (end your reply now),
+    /// 4 some failed or were cancelled.
+    Wait {
+        ids: Vec<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read a subagent's result digest, branch and diff statistics.
+    Output {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Merge a finished subagent's branch into the parent's worktree.
+    Merge { id: String },
+    /// Drop a finished subagent's worktree and branch.
+    Discard { id: String },
+    /// Run a finished subagent again with a follow-up message.
+    Send { id: String, message: String },
+    /// Cancel and kill a subagent.
+    Cancel {
+        id: String,
+        #[arg(long, default_value = "cancelled by the parent")]
+        reason: String,
+    },
+    /// List subagents (default: of KANBAN_TASK_ID, else all).
+    List {
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 impl Command {
     /// The task a board command addresses, so a renumbered id can be resolved.
     fn task_id_mut(&mut self) -> Option<&mut String> {
@@ -710,6 +795,220 @@ fn read_agent_file(ops: &Operations, path: &str) -> Result<String> {
         }
         Err(err) => Err(err.into()),
     }
+}
+
+fn print_output(ops: &Operations, id: &str, json: bool) -> Result<()> {
+    let output = ops.task_output(id)?;
+    if json {
+        println!("{}", serde_json::json!(output));
+        return Ok(());
+    }
+    println!(
+        "{}: {} [{}]",
+        output.task.id, output.task.title, output.state.state
+    );
+    if let Some(reason) = &output.task.sub_reason {
+        println!("Reason: {reason}");
+    }
+    println!(
+        "Branch: {}\nIntegration: {:?}",
+        output.task.branch.as_deref().unwrap_or("(none)"),
+        output.task.integration
+    );
+    if let Some(stat) = output.diff_stat {
+        println!("Diff: {stat}");
+    }
+    if let Some(path) = output.task.result_path {
+        println!("Result: {path}");
+    }
+    println!("{}", output.digest);
+    Ok(())
+}
+
+/// Subagents are controlled only from their parent: inside an agent
+/// session (`KANBAN_TASK_ID` set) the caller must be the parent, or the
+/// subagent itself where `allow_self`.
+fn require_sub_caller(ops: &Operations, id: &str, allow_self: bool) -> Result<Task> {
+    let task = ops
+        .get_task(id)?
+        .filter(Task::is_subagent)
+        .ok_or_else(|| KanbanError::Invalid(format!("{id} is not a subagent")))?;
+    if let Ok(caller) = std::env::var("KANBAN_TASK_ID")
+        && task.parent_task.as_deref() != Some(caller.as_str())
+        && !(allow_self && caller == task.id)
+    {
+        return Err(KanbanError::Permission(format!(
+            "{id} is a subagent of {}; only its parent controls it",
+            task.parent_task.as_deref().unwrap_or("-")
+        )));
+    }
+    Ok(task)
+}
+
+fn sub_wait(
+    ops: &Operations,
+    ids: Vec<String>,
+    session: Option<String>,
+    json: bool,
+) -> Result<ExitCode> {
+    let parent = std::env::var("KANBAN_TASK_ID").ok().or_else(|| {
+        ids.first()
+            .and_then(|id| ops.storage.load_task(id).ok().flatten())
+            .and_then(|task| task.parent_task)
+    });
+    let parent = parent.ok_or_else(|| {
+        KanbanError::Permission("sub wait runs in the parent session (KANBAN_TASK_ID)".into())
+    })?;
+    let session_id = env_session(session);
+    let (states, waiting) = match ops.sub_wait(&parent, &session_id, &ids)? {
+        crate::core::subagents::SubWait::Finished(states) => (states, false),
+        crate::core::subagents::SubWait::Waiting(states) => (states, true),
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({"statuses": states, "waiting": waiting})
+        );
+    } else {
+        for state in &states {
+            println!("{}  {}  {}", state.id, state.state, state.title);
+        }
+        if waiting {
+            println!(
+                "Waiting declared (no deadline). End your reply now; the board relaunches you \
+                 when every awaited subagent is done, failed, or cancelled."
+            );
+        }
+    }
+    Ok(ExitCode::from(if waiting {
+        3
+    } else if states.iter().all(|s| s.success) {
+        0
+    } else {
+        4
+    }))
+}
+
+fn run_sub(ops: &Operations, command: SubCommand) -> Result<ExitCode> {
+    match command {
+        SubCommand::Spawn {
+            title,
+            parent,
+            description,
+            backend,
+            model,
+            effort,
+            readonly,
+            from_parent,
+            from_project,
+            session,
+            json,
+        } => {
+            let parent = parent
+                .or_else(|| std::env::var("KANBAN_TASK_ID").ok())
+                .ok_or_else(|| {
+                    KanbanError::Permission(
+                        "sub spawn requires the parent session and --parent or KANBAN_TASK_ID"
+                            .into(),
+                    )
+                })?;
+            let session_id = env_session(session);
+            if std::env::var("KANBAN_TASK_ID").is_ok_and(|id| id != parent)
+                || std::env::var("KANBAN_SESSION").is_ok_and(|id| id != session_id)
+            {
+                return Err(KanbanError::Permission(
+                    "sub spawn must use the current parent session".into(),
+                ));
+            }
+            let child = ops.sub_spawn(
+                crate::core::subagents::SubSpawnRequest {
+                    parent_id: parent,
+                    title,
+                    description,
+                    backend,
+                    model,
+                    effort,
+                    readonly,
+                    from_parent: if from_parent {
+                        Some(true)
+                    } else if from_project {
+                        Some(false)
+                    } else {
+                        None
+                    },
+                },
+                &session_id,
+            )?;
+            if json {
+                println!("{}", serde_json::json!(child));
+            } else {
+                println!("{}", child.id);
+            }
+        }
+        SubCommand::Done {
+            id,
+            session,
+            summary,
+        } => {
+            require_sub_caller(ops, &id, true)?;
+            let session_id = session.or_else(|| std::env::var("KANBAN_SESSION").ok());
+            let task = ops.sub_done(&id, session_id.as_deref(), summary.as_deref())?;
+            println!(
+                "Subagent {id} {}",
+                task.sub_state.map(|s| s.as_str()).unwrap_or("done")
+            );
+        }
+        SubCommand::Wait { ids, session, json } => return sub_wait(ops, ids, session, json),
+        SubCommand::Output { id, json } => {
+            require_sub_caller(ops, &id, false)?;
+            print_output(ops, &id, json)?;
+        }
+        SubCommand::Merge { id } => {
+            require_sub_caller(ops, &id, false)?;
+            println!("{}", ops.sub_merge(&id)?);
+        }
+        SubCommand::Discard { id } => {
+            require_sub_caller(ops, &id, false)?;
+            ops.sub_discard(&id)?;
+            println!("Discarded {id}");
+        }
+        SubCommand::Send { id, message } => {
+            require_sub_caller(ops, &id, false)?;
+            let task = ops.sub_send(&id, &message)?;
+            println!(
+                "{id} {}",
+                task.sub_state.map(|s| s.as_str()).unwrap_or("queued")
+            );
+        }
+        SubCommand::Cancel { id, reason } => {
+            require_sub_caller(ops, &id, false)?;
+            let task = ops.sub_cancel(&id, &reason)?;
+            println!(
+                "{id} {}",
+                task.sub_state.map(|s| s.as_str()).unwrap_or("cancelled")
+            );
+        }
+        SubCommand::List { parent, json } => {
+            let parent = parent.or_else(|| std::env::var("KANBAN_TASK_ID").ok());
+            let subs = ops.list_subagents(parent.as_deref())?;
+            if json {
+                println!("{}", serde_json::json!(subs));
+            } else if subs.is_empty() {
+                println!("No subagents.");
+            } else {
+                for task in subs {
+                    println!(
+                        "{:<10} {:<10} {:<10} {}",
+                        task.id,
+                        task.parent_task.as_deref().unwrap_or("-"),
+                        task.sub_state.map(|s| s.as_str()).unwrap_or("-"),
+                        task.title
+                    );
+                }
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn env_session(explicit: Option<String>) -> String {
@@ -1157,8 +1456,20 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             task_id,
             session,
             agent,
+            cancel_subagents,
         } => {
             let session_id = env_session(session);
+            if cancel_subagents
+                && let Some(task) = ops.get_task(&task_id)?
+                && !task.is_subagent()
+            {
+                if agent {
+                    ops.require_current_agent_session(&task, &session_id)?;
+                }
+                for id in ops.cancel_live_subagents(&task_id, "parent finished with done")? {
+                    println!("Cancelled subagent {id}");
+                }
+            }
             let repeat = agent
                 && ops
                     .get_task(&task_id)?
@@ -1674,29 +1985,8 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 println!("{}", child.id);
             }
         }
-        Command::Output { id, json } => {
-            let output = ops.task_output(&id)?;
-            if json {
-                println!("{}", serde_json::json!(output));
-            } else {
-                println!(
-                    "{}: {} [{}]",
-                    output.task.id, output.task.title, output.state.state
-                );
-                println!(
-                    "Branch: {}\nIntegration: {:?}",
-                    output.task.branch.as_deref().unwrap_or("(none)"),
-                    output.task.integration
-                );
-                if let Some(stat) = output.diff_stat {
-                    println!("Diff: {stat}");
-                }
-                if let Some(path) = output.task.result_path {
-                    println!("Result: {path}");
-                }
-                println!("{}", output.digest);
-            }
-        }
+        Command::Output { id, json } => print_output(&ops, &id, json)?,
+        Command::Sub { command } => return run_sub(&ops, command),
         Command::Wait {
             ids,
             timeout,
@@ -1710,6 +2000,17 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             let started = std::time::Instant::now();
             let session_id = env_session(session);
             let parent = std::env::var("KANBAN_TASK_ID").ok();
+            if parent.is_some()
+                && ids.iter().any(|id| {
+                    ops.storage
+                        .load_task(id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|t| t.is_subagent())
+                })
+            {
+                return sub_wait(&ops, ids, Some(session_id), json);
+            }
             loop {
                 let states = ops.wait_poll(&ids)?;
                 let terminal = states.iter().all(|s| s.terminal);

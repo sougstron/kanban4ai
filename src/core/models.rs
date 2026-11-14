@@ -67,6 +67,40 @@ string_enum!(RunPhase {
     Review => "review",
 });
 
+// What a task file describes. Absent (`None`, omitted) is an ordinary board
+// task. `Subagent` is a child run of a parent executor: stored as a task so
+// storage, sessions, provenance and stats are shared, but never shown in a
+// board column (TASK-594).
+string_enum!(TaskKind {
+    Subagent => "subagent",
+});
+
+// Lifecycle of a subagent (`kind: subagent`), independent of the board
+// columns. `done`, `failed` and `cancelled` are terminal and wake a parent
+// waiting with `kanban sub wait`.
+string_enum!(SubState {
+    Queued => "queued",
+    Running => "running",
+    Done => "done",
+    Failed => "failed",
+    Cancelled => "cancelled",
+});
+
+impl SubState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            SubState::Done | SubState::Failed | SubState::Cancelled
+        )
+    }
+}
+
+// What ends a declared wait without a deadline. `Subagents`: every
+// `wait_for` subagent reached a terminal sub-state.
+string_enum!(WaitTrigger {
+    Subagents => "subagents",
+});
+
 // How a worktree-isolated task's branch stands relative to the project's
 // integration ref. `None` (the default, omitted from frontmatter) means the
 // task never ran isolated. There is deliberately no Blocked state — the
@@ -520,6 +554,22 @@ pub struct Task {
     /// folder after landing removes the worktree. Omitted while unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_path: Option<String>,
+    /// `subagent` for a child run of a parent executor (TASK-594). Omitted
+    /// while unset so ordinary tasks round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<TaskKind>,
+    /// Lifecycle of a subagent; the board column stays `in_progress`/`done`
+    /// only for older readers. Omitted while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_state: Option<SubState>,
+    /// Why a subagent failed or was cancelled. Omitted while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_reason: Option<String>,
+    /// Commit the isolated checkout is cut from instead of a live snapshot
+    /// of the project: a subagent started `--from-parent` gets a snapshot of
+    /// the parent's worktree, uncommitted edits included. Omitted while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_commit: Option<String>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -613,7 +663,22 @@ impl Task {
             conflict_held: false,
             resolver_runs: 0,
             result_path: None,
+            kind: None,
+            sub_state: None,
+            sub_reason: None,
+            seed_commit: None,
         }
+    }
+
+    /// A child run of a parent executor (`kind: subagent`). Legacy
+    /// `spawned: true` helpers are ordinary board tasks and stay false here.
+    pub fn is_subagent(&self) -> bool {
+        self.kind == Some(TaskKind::Subagent)
+    }
+
+    /// A subagent that has not reached a terminal sub-state yet.
+    pub fn is_live_subagent(&self) -> bool {
+        self.is_subagent() && !self.sub_state.is_some_and(SubState::is_terminal)
     }
 
     /// Clear the automatic-relaunch bookkeeping: the clean-exit resume budget,
@@ -677,6 +742,10 @@ pub struct Session {
     /// to know the process is gone.
     #[serde(default, skip_serializing_if = "is_false")]
     pub wait_exited: bool,
+    /// A wait with no deadline (`wait_until` unset) that ends on an event
+    /// instead: `subagents` wakes once every `wait_for` subagent is terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_trigger: Option<WaitTrigger>,
     /// Tags of a run that closed before its transcript carried any token
     /// usage. Codex writes its only usage event when the turn ends, after the
     /// agent's own `kanban done` closed the session; the agent-exit reconcile
@@ -708,8 +777,21 @@ impl Session {
             wait_for: Vec::new(),
             wait_note: None,
             wait_exited: false,
+            wait_trigger: None,
             pending_usage: None,
         }
+    }
+
+    /// The agent declared a wait: a deadline (`kanban waiting`) or an event
+    /// trigger (`kanban sub wait`).
+    pub fn is_waiting(&self) -> bool {
+        self.wait_until.is_some() || self.wait_trigger.is_some()
+    }
+
+    /// A declared wait that has not ended yet: a trigger wait never expires,
+    /// a deadline wait until its deadline passes.
+    pub fn wait_pending(&self, now: &NaiveDateTime) -> bool {
+        self.wait_trigger.is_some() || self.wait_until.is_some_and(|deadline| *now <= deadline)
     }
 
     pub fn named(

@@ -79,29 +79,41 @@ Unknown names are rejected; backend support is checked at launch. JSON reports
 both `permission` and the compatibility boolean `readonly`. See
 [configuration](config.md#named-permission-presets) for enforcement limits.
 
-## Agent helpers: spawn, wait, output
+## Subagents: `kanban sub`
 
-`kanban spawn --parent TASK-N <title> [--description TEXT] [--backend NAME]
-[--model MODEL] [--effort EFFORT] [--readonly] [--depends-on TASK-A,TASK-B]
-[--session SESSION] [--json]` creates a helper and queues it. The parent and
-session default to `KANBAN_TASK_ID` and `KANBAN_SESSION`. Only the parent's
-active executor session can spawn. Text output is the new id; JSON is the task.
-Dependencies must finish before launch. Readonly and silence are inherited;
-`--readonly` can tighten permissions. Explicit model flags override the helper
-model preference. Empty executor pools fall back to the parent's assignment.
+Subagents are child runs of the current executor, managed only from it (inside
+an agent session, `KANBAN_TASK_ID` must be the parent; the subagent itself may
+only `sub done`). See [orchestration](orchestration.md#subagents-coresubagentsrs).
 
-`kanban wait <id>... [--timeout SECONDS] [--session SESSION] [--json]
-[--no-waiting]` polls until all results are available. Exit codes:
+- `sub spawn <title> [--parent TASK-N] [--description TEXT] [--backend NAME]
+  [--model MODEL] [--effort EFFORT] [--readonly] [--from-parent |
+  --from-project] [--session SESSION] [--json]` creates and starts a subagent
+  outside the board queue. Parent and session default to `KANBAN_TASK_ID` /
+  `KANBAN_SESSION`; only the parent's active executor session may spawn. The
+  worktree is seeded from the parent's worktree unless `--readonly` or
+  `--from-project`. Prints the id (JSON: the task).
+- `sub done <id> [--session S] --summary TEXT` finishes it: no Review, no
+  landing, branch kept. `done` from the subagent's session does the same.
+- `sub wait [<id>...] [--session S] [--json]` waits without a deadline (no ids:
+  every live subagent). Exit `0` all done, `3` waiting declared — **end the
+  reply now**, the board relaunches you when all are terminal — `4` some
+  failed or were cancelled.
+- `sub output <id> [--json]` prints state, reason, branch, diff stat and the
+  result digest. `sub merge <id>` merges its branch into the parent's
+  worktree; `sub discard <id>` drops worktree and branch.
+- `sub send <id> <message>` reruns a finished subagent with a follow-up;
+  `sub cancel <id> [--reason TEXT]` kills it; `sub list [--parent TASK-N]
+  [--json]`.
 
-- `0`: every task reached Review or Done.
-- `2`: timeout, without declaring a wait.
-- `3`: the agent's parent session declared waiting. **End the reply now.**
-- `4`: at least one task failed, is blocked by a question, or is missing.
+`kanban done --cancel-subagents` cancels live subagents first; without it an
+agent `done` is refused while any are live.
 
-For an agent, timeout or a full queue cap automatically declares waiting for the
-parent, releasing its slot. The board resumes the parent when all targets are
-terminal (after its process exits), or at the waiting deadline. `--no-waiting`
-opts out. Defaults come from `orchestration.spawn`; `--timeout 0` checks once.
+`kanban spawn` is a deprecated alias of `sub spawn` (`--depends-on` is
+refused: plan dependency graphs with `kanban plan`). `kanban wait <id>...
+[--timeout SECONDS] [--no-waiting]` is kept for legacy helpers; called from the
+parent session on subagent ids it behaves like `sub wait`. Its exit codes:
+`0` every task reached Review/Done, `2` timeout, `3` waiting declared, `4`
+failed/blocked/missing.
 
 `kanban output <id> [--json]` returns the same bounded context digest supplied
 in dependency prompts, plus task metadata, result path, branch and diff stat.

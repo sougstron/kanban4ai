@@ -631,6 +631,18 @@ fn render_analytics(
                 muted,
             ));
         }
+        let subagents = analytics.subagents;
+        if subagents.count > 0 {
+            spans.push(Span::styled(
+                format!(
+                    " · subagents {}: {} · {} tok",
+                    subagents.count,
+                    format_span(subagents.running_seconds),
+                    format_tokens(subagents.tokens)
+                ),
+                muted,
+            ));
+        }
         Line::from(spans)
     };
     let mut lines = vec![line];

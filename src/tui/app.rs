@@ -8144,8 +8144,10 @@ impl BoardSnapshot {
         // The archive has no column of its own; it feeds the Archive screen
         // from this same read instead of a second parse.
         let archive_column = ids.iter().any(|id| id == TaskStatus::Archive.as_str());
+        // Subagents live inside their parent's run, never in a column.
         let (mut archived, mut tasks): (Vec<Task>, Vec<Task>) = all_tasks
             .into_iter()
+            .filter(|task| !task.is_subagent())
             .partition(|task| task.status == TaskStatus::Archive && !archive_column);
         sort_tasks(&mut tasks, sort_by, order);
         sort_tasks(&mut archived, "updated", "desc");

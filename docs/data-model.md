@@ -5,7 +5,7 @@ auto-loaded into every agent session. Read it when the task/thread file format, 
 
 ## Data Model
 - **Task**: id (TASK-NNN), title, description, status (todo/in_progress/review/done/archive), session, has_questions, interactive, permission (legacy readonly), silence, use_designer, use_reviewer, use_orchestrator, depends_on, needs, parent_task, role_profile, roster_index, orchestrated, ai_model, ai_effort, explicit_assignment, agent_backend, agent_name, chained_to, launch_at, review_edits, auto_resumes, completed_at, run_phase, crash_restarts, restart_at, review_rounds, designed, worktree, branch, base_commit, integration, queued_at, conflict_held, resolver_runs (the merge-conflict queue hold and auto-mode resolver budget; machine-local under sync, omitted while unset), result_path (the one result folder/file an agent pinned with `kanban result`; checkout-relative when pinned inside the worktree or work folder, absolute otherwise; omitted while unset). `explicit_assignment` is set when a human named a backend, model, effort, or agent, so a later save tells it apart from "Default" even when it equals the board defaults; executor pools only ever reassign orchestrator plan nodes. Omitted while false. `description` is the **user-authored task body**; agent replies and progress belong to the sidecar thread. `permission: readonly` (also read from legacy `readonly: true`) instructs delegated agents to investigate and report through board commands without modifying project files or producing project-local artifacts. `silence` forbids questions on this task: `kanban ask` and `kanban ask-form` are refused, the agent decides ambiguous points itself, and each dispute is recorded with `kanban suggest`. It wins over `interactive`. Omitted while false. Planned subtasks inherit it from the orchestrator task.
-- **Session**: id, task_id, started_at, status (active/closed/crashed), last_seen, wait_until, wait_note, wait_exited. `wait_until`/`wait_note` are set by `kanban waiting`; `wait_exited` means the agent process ended during the declared wait — at the deadline the pause is handed back to the queue (or, with the queue off, the agent is relaunched directly) to check the result.
+- **Session**: id, task_id, started_at, status (active/closed/crashed), last_seen, wait_until, wait_note, wait_exited, wait_trigger. `wait_until`/`wait_note` are set by `kanban waiting`; `wait_trigger: subagents` (with no `wait_until`) is set by `kanban sub wait`; `wait_exited` means the agent process ended during the declared wait — at the deadline the pause is handed back to the queue (or, with the queue off, the agent is relaunched directly) to check the result.
 - **MessageRole** / **MessageKind** / **MessageStatus**: enums for thread message author, type, and lifecycle state. `MessageKind` is one of `system`, `task`, `question`, `suggestion`, `context`, or `review_edit`.
 - New tasks initialize their sidecar thread with `system` and `task` messages: `MSG-001` records creation metadata, `MSG-002` stores the initial user-authored task body so the TUI can render the whole conversation from the thread.
 - **Message**: thread entry with `id` (MSG-NNN), role, kind, status, body, `parent_id`, `variants`, author, timestamps, and resolution metadata. Answered questions also store `answer` and `answered_by_role`; open questions may carry a `draft` (the human's in-progress typed answer, stashed by the TUI when the detail closes — cleared when the question is answered).
@@ -254,3 +254,22 @@ legacy task serialization. Copying a task clears its helper identity.
 Sessions may carry `wait_for: [TASK-N, ...]` alongside the existing waiting
 deadline. The board can wake a departed session early when every target has a
 terminal result. Ordinary `waiting` renewals clear this target list.
+
+### Subagents
+
+A subagent (`kanban sub`, TASK-594) is a task file with these extra keys, each
+written only when set:
+
+- `kind: subagent` — a child run of `parent_task`; never shown in a column.
+  `spawned: true` is still written for older readers; a task with `spawned:
+  true` and no `kind` is a legacy helper and stays an ordinary board task.
+- `sub_state: queued | running | done | failed | cancelled` — its lifecycle;
+  the last three are terminal. `status` is kept `in_progress`/`done` only for
+  compatibility.
+- `sub_reason` — why it failed or was cancelled.
+- `seed_commit` — the snapshot of the parent's worktree its checkout starts
+  from (`--from-parent`).
+
+The parent stores no list; subagents are found by `parent_task`. A session
+waiting on subagents has no `wait_until` and carries `wait_trigger:
+subagents` with the targets in `wait_for`.
