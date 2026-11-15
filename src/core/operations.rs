@@ -194,6 +194,9 @@ pub struct TaskOutput {
     pub state: ChildState,
     pub digest: String,
     pub diff_stat: Option<String>,
+    /// Files the branch changed against its base (subagents only).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2429,6 +2432,7 @@ impl Operations {
                 effort: request.effort,
                 readonly: request.readonly,
                 from_parent: None,
+                context: None,
             },
             session_id,
         )
@@ -2545,19 +2549,39 @@ impl Operations {
             .orchestrator
             .upstream_budget_chars
             .max(0) as usize;
-        let digest = crate::core::context::result_digest(&self.thread_manager()?, id, budget)?;
-        let diff_stat = match (&task.base_commit, &task.branch) {
-            (Some(base), Some(branch)) => {
-                let output = std::process::Command::new("git")
-                    .current_dir(self.work_path())
-                    .args(["diff", "--shortstat", base, branch, "--"])
-                    .output()?;
-                output
-                    .status
-                    .success()
-                    .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        // A subagent's result is the summary it reported, not the tail of
+        // its thread.
+        let digest = if task.is_subagent() {
+            match (&task.sub_summary, &task.sub_reason) {
+                (Some(summary), _) => summary.trim().to_owned(),
+                (None, Some(reason)) => format!("(no summary: {reason})"),
+                (None, None) => "(no summary yet)".to_owned(),
             }
-            _ => None,
+        } else {
+            crate::core::context::result_digest(&self.thread_manager()?, id, budget)?
+        };
+        let git_diff = |args: &[&str]| -> Result<Option<String>> {
+            let (Some(base), Some(branch)) = (&task.base_commit, &task.branch) else {
+                return Ok(None);
+            };
+            let output = std::process::Command::new("git")
+                .current_dir(self.work_path())
+                .arg("diff")
+                .args(args)
+                .args([base.as_str(), branch.as_str(), "--"])
+                .output()?;
+            Ok(output
+                .status
+                .success()
+                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
+        };
+        let diff_stat = git_diff(&["--shortstat"])?;
+        let changed_files = if task.is_subagent() {
+            git_diff(&["--name-only"])?
+                .map(|names| names.lines().map(str::to_owned).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
         };
         let state = self.wait_poll(&[id.to_owned()])?.remove(0);
         Ok(TaskOutput {
@@ -2565,6 +2589,7 @@ impl Operations {
             state,
             digest,
             diff_stat,
+            changed_files,
         })
     }
 

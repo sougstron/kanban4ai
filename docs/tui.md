@@ -162,10 +162,12 @@ instead of starting to type; from a text panel use `Alt+o`. Without a pin,
     `next:` order line, and the two quota floors (`Week %`, `5h %`). See
     `docs/config.md` (`orchestration.executors`) and `docs/orchestration.md`
     (Executor Pools).
-  - **Prompt**: one multi-line `Instructions for every task` box (Enter
+  - **Prompt**: a multi-line `Instructions for every task` box (Enter
     breaks lines, plain-text paste) stored as `instructions:` in
     `.kanban/config.yaml`; when not blank it is injected into every task's
-    agent prompt. See `docs/config.md` ("Project Instructions").
+    agent prompt. See `docs/config.md` ("Project Instructions"). Below it,
+    `Instructions for subagents only` edits `.kanban/instructions/subagent.md`
+    (see `docs/orchestration.md`, "Role-scoped instructions").
   On the Projects screen `s` instead opens Global Settings (see "Global
   Settings"): the same tabs minus Prompt and the inherit checkboxes, project
   name, theme and isolation row — they edit the global values the projects

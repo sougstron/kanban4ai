@@ -156,6 +156,9 @@ enum Command {
         /// Output format
         #[arg(long = "format", value_parser = ["table", "json"], default_value = "table")]
         output_format: String,
+        /// Also list subagents, indented under their parent
+        #[arg(long)]
+        all: bool,
     },
     /// Take a task for work (links to an agent session).
     Take {
@@ -682,6 +685,11 @@ enum SubCommand {
         /// Seed the worktree from the project instead of the parent
         #[arg(long)]
         from_project: bool,
+        /// File of excerpts to hand over (repeatable): the subagent sees only
+        /// these ("Context from parent", capped by
+        /// subagents.context_budget_chars)
+        #[arg(long)]
+        context: Vec<String>,
         #[arg(long)]
         session: Option<String>,
         #[arg(long)]
@@ -692,9 +700,10 @@ enum SubCommand {
         id: String,
         #[arg(long)]
         session: Option<String>,
-        /// The result the parent reads (also note anything unclear here)
+        /// The result the parent reads (also note anything unclear here);
+        /// required and non-empty
         #[arg(long)]
-        summary: Option<String>,
+        summary: String,
     },
     /// Wait without a deadline until subagents finish (default: every live
     /// one). Exit: 0 all done, 3 waiting declared (end your reply now),
@@ -815,11 +824,20 @@ fn print_output(ops: &Operations, id: &str, json: bool) -> Result<()> {
         output.task.branch.as_deref().unwrap_or("(none)"),
         output.task.integration
     );
-    if let Some(stat) = output.diff_stat {
+    if let Some(stat) = output.diff_stat.filter(|stat| !stat.is_empty()) {
         println!("Diff: {stat}");
     }
-    if let Some(path) = output.task.result_path {
+    if !output.changed_files.is_empty() {
+        println!("Changed files:");
+        for file in &output.changed_files {
+            println!("  {file}");
+        }
+    }
+    if let Some(path) = &output.task.result_path {
         println!("Result: {path}");
+    }
+    if output.task.is_subagent() {
+        println!("Summary:");
     }
     println!("{}", output.digest);
     Ok(())
@@ -901,9 +919,20 @@ fn run_sub(ops: &Operations, command: SubCommand) -> Result<ExitCode> {
             readonly,
             from_parent,
             from_project,
+            context,
             session,
             json,
         } => {
+            let context = if context.is_empty() {
+                None
+            } else {
+                let mut text = String::new();
+                for path in &context {
+                    let body = read_agent_file(ops, path)?;
+                    text.push_str(&format!("### {path}\n{}\n\n", body.trim_end()));
+                }
+                Some(text)
+            };
             let parent = parent
                 .or_else(|| std::env::var("KANBAN_TASK_ID").ok())
                 .ok_or_else(|| {
@@ -936,6 +965,7 @@ fn run_sub(ops: &Operations, command: SubCommand) -> Result<ExitCode> {
                     } else {
                         None
                     },
+                    context,
                 },
                 &session_id,
             )?;
@@ -952,7 +982,12 @@ fn run_sub(ops: &Operations, command: SubCommand) -> Result<ExitCode> {
         } => {
             require_sub_caller(ops, &id, true)?;
             let session_id = session.or_else(|| std::env::var("KANBAN_SESSION").ok());
-            let task = ops.sub_done(&id, session_id.as_deref(), summary.as_deref())?;
+            if summary.trim().is_empty() {
+                return Err(KanbanError::Invalid(
+                    "--summary must not be empty: it is everything the parent reads".into(),
+                ));
+            }
+            let task = ops.sub_done(&id, session_id.as_deref(), Some(&summary))?;
             println!(
                 "Subagent {id} {}",
                 task.sub_state.map(|s| s.as_str()).unwrap_or("done")
@@ -1411,9 +1446,30 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             sort,
             order,
             output_format,
+            all,
         } => {
-            let tasks = ops.list_tasks(status.as_deref(), search.as_deref(), &sort, &order)?;
+            let mut tasks = ops.list_tasks(status.as_deref(), search.as_deref(), &sort, &order)?;
+            // Subagents live inside their parent: `--all` lists them right
+            // after it.
+            let mut subagents: std::collections::HashMap<String, Vec<Task>> =
+                std::collections::HashMap::new();
+            if all {
+                for sub in ops.list_subagents(None)? {
+                    if let Some(parent) = sub.parent_task.clone() {
+                        subagents.entry(parent).or_default().push(sub);
+                    }
+                }
+            }
             if output_format == "json" {
+                if all {
+                    tasks = tasks
+                        .into_iter()
+                        .flat_map(|task| {
+                            let subs = subagents.remove(&task.id).unwrap_or_default();
+                            std::iter::once(task).chain(subs)
+                        })
+                        .collect();
+                }
                 println!("{}", tasks_to_json(&tasks)?);
             } else if tasks.is_empty() {
                 println!("No tasks found.");
@@ -1427,6 +1483,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                         task.status.as_str(),
                         task.title
                     );
+                    for sub in subagents.remove(&task.id).unwrap_or_default() {
+                        println!(
+                            "  └ {:<8} {:<15} {}",
+                            sub.id,
+                            crate::core::subagents::state_label(&sub),
+                            sub.title
+                        );
+                    }
                 }
             }
         }
@@ -1851,7 +1915,16 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                     task.roster_index + 1
                 );
             }
-            if let Some(parent_task) = &task.parent_task {
+            if task.is_subagent() {
+                println!(
+                    "Subagent of: {} ({})",
+                    task.parent_task.as_deref().unwrap_or("-"),
+                    crate::core::subagents::state_label(&task)
+                );
+                if let Some(summary) = &task.sub_summary {
+                    println!("Summary: {summary}");
+                }
+            } else if let Some(parent_task) = &task.parent_task {
                 println!(
                     "{}: {parent_task}",
                     if task.spawned {
@@ -1895,6 +1968,10 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             println!("Updated: {}", timefmt::format(&task.updated_at));
             if !task.description.is_empty() {
                 println!("\nDescription:\n{}", task.description);
+            }
+            let subagents = ops.subagent_table(&task.id, false)?;
+            if !subagents.is_empty() {
+                println!("\nSubagents:\n{}", subagents.trim_end());
             }
             if with_context {
                 let context =
@@ -2572,6 +2649,19 @@ fn tasks_to_json(tasks: &[Task]) -> Result<String> {
 
 /// Full task dict (including `description`) in the Python `to_dict` key order.
 fn task_to_json(task: &Task) -> serde_json::Value {
+    let mut value = task_to_json_base(task);
+    // Subagent fields only on subagents, so ordinary tasks keep the
+    // original key set.
+    if task.is_subagent() {
+        value["kind"] = serde_json::json!(task.kind);
+        value["sub_state"] = serde_json::json!(task.sub_state);
+        value["sub_summary"] = serde_json::json!(task.sub_summary);
+        value["sub_collected"] = serde_json::json!(task.sub_collected);
+    }
+    value
+}
+
+fn task_to_json_base(task: &Task) -> serde_json::Value {
     serde_json::json!({
         "id": task.id,
         "title": task.title,

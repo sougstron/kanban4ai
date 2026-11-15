@@ -2276,6 +2276,18 @@ fn sub_done_from_a_fake_backend_wakes_the_parent_without_review() {
         .assert()
         .success()
         .stdout(predicate::str::contains(&id).not());
+    // `--all` nests subagents under their parent; `show` lists them.
+    kanban(&env)
+        .args(["list", "--all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!("  └ {id}")));
+    kanban(&env)
+        .args(["show", &parent.id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Subagents:"))
+        .stdout(predicate::str::contains(format!("| {id} | done")));
     // Stop the parent's fake relaunch loop.
     fake_subagent_backend(&env, false);
 }

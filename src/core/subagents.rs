@@ -19,8 +19,8 @@ use std::fs;
 use crate::core::config::{SpawnHelperModel, SpawnPolicy};
 use crate::core::error::{KanbanError, Result};
 use crate::core::models::{
-    MessageKind, MessageRole, RunPhase, SessionStatus, SubState, Task, TaskKind, TaskStatus,
-    WaitTrigger,
+    MessageKind, MessageRole, RunPhase, SessionStatus, SubCollected, SubState, Task, TaskKind,
+    TaskStatus, WaitTrigger,
 };
 use crate::core::operations::{
     ChildState, Operations, PoolOutcome, RespawnOutcome, WaitWake, safe_session_component,
@@ -42,6 +42,9 @@ pub struct SubSpawnRequest {
     pub effort: Option<String>,
     pub readonly: bool,
     pub from_parent: Option<bool>,
+    /// `sub spawn --context`: excerpts the parent hands over, already read
+    /// from their files. Capped by `subagents.context_budget_chars`.
+    pub context: Option<String>,
 }
 
 /// Result of `kanban sub wait`.
@@ -57,6 +60,65 @@ pub enum SubWait {
 /// and without a scheduled restart is failed: covers the moment between a
 /// crash and its restart being scheduled.
 const ORPHAN_GRACE_SECS: i64 = 60;
+
+/// `text` cut to `budget` characters, saying so when it was cut.
+fn cap_chars(text: &str, budget: usize) -> String {
+    if text.chars().count() <= budget {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().take(budget).collect();
+    format!("{kept}\n…(cut at subagents.context_budget_chars = {budget})")
+}
+
+/// Seconds a subagent has run: from creation to its finish (or `now`).
+pub fn subagent_elapsed(task: &Task, now: chrono::NaiveDateTime) -> i64 {
+    let end = if task.sub_state.is_some_and(SubState::is_terminal) {
+        task.completed_at.unwrap_or(now)
+    } else {
+        now
+    };
+    (end - task.created_at).num_seconds().max(0)
+}
+
+/// `45s`, `12m`, `1h04m`: a duration short enough for one table cell.
+pub fn short_elapsed(seconds: i64) -> String {
+    let (h, m) = (seconds / 3600, (seconds % 3600) / 60);
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// The first line of a subagent's summary (or its failure reason), at most
+/// `max` characters.
+pub fn summary_line(task: &Task, max: usize) -> String {
+    let text = task
+        .sub_summary
+        .as_deref()
+        .or(task.sub_reason.as_deref())
+        .unwrap_or("")
+        .trim();
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.chars().count() > max {
+        let cut: String = line.chars().take(max.saturating_sub(1)).collect();
+        format!("{cut}…")
+    } else {
+        line.to_owned()
+    }
+}
+
+/// A subagent's state label: its sub-state, with what the parent did with
+/// the result once collected.
+pub fn state_label(task: &Task) -> String {
+    let state = task.sub_state.map_or("queued", |s| s.as_str());
+    match task.sub_collected {
+        Some(collected) => format!("{state}/{collected}"),
+        None => state.to_owned(),
+    }
+}
 
 impl Operations {
     /// Subagents of `parent_id`, oldest first (the parent's FIFO order).
@@ -149,6 +211,12 @@ impl Operations {
                 None
             };
             let same_backend = request.backend.is_none() || request.backend == parent.agent_backend;
+            let context = request
+                .context
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(|text| cap_chars(text, orch.subagents.context_budget_chars));
             let mut task = self.create_task(NewTask {
                 title: request.title,
                 description: request.description,
@@ -198,6 +266,7 @@ impl Operations {
             task.spawn_policy = Some(SpawnPolicy::Allowed);
             task.explicit_assignment = profile.is_none();
             task.seed_commit = seed.clone();
+            task.sub_context = context;
             task.updated_at = timefmt::now();
             self.storage.save_task(&task)?;
             let threads = self.thread_manager()?;
@@ -360,7 +429,16 @@ impl Operations {
             if let Some(session_id) = session_id {
                 self.require_current_agent_session(&task, session_id)?;
             }
-            if let Some(summary) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+            let summary = summary.map(str::trim).filter(|s| !s.is_empty());
+            // The summary is the subagent's whole result: an agent may not
+            // finish without one. A human override (no session) may.
+            if session_id.is_some() && summary.is_none() {
+                return Err(KanbanError::Invalid(format!(
+                    "a subagent finishes with: kanban sub done {task_id} --session <session> \
+                     --summary \"<result>\" (the summary is required and must not be empty)"
+                )));
+            }
+            if let Some(summary) = summary {
                 self.context_manager().append_context_with_session(
                     task_id,
                     summary,
@@ -372,6 +450,7 @@ impl Operations {
                     task = current;
                 }
             }
+            task.sub_summary = summary.map(str::to_owned);
             self.commit_subagent_work(&task, "result");
             self.finish_subagent(&mut task, SubState::Done, None)?;
             task
@@ -555,6 +634,9 @@ impl Operations {
             )));
         }
         let Some(branch) = sub.branch.clone() else {
+            sub.sub_collected = Some(SubCollected::Merged);
+            sub.updated_at = timefmt::now();
+            self.storage.save_task(&sub)?;
             return Ok(format!(
                 "{task_id} ran in the shared folder; its edits are already there"
             ));
@@ -593,6 +675,7 @@ impl Operations {
         }
         let problems = self.clear_task_worktree(&mut sub, true);
         sub.integration = crate::core::models::IntegrationState::Landed;
+        sub.sub_collected = Some(SubCollected::Merged);
         sub.updated_at = timefmt::now();
         self.storage.save_task(&sub)?;
         let message = format!("merged {branch} into {parent_id}'s worktree");
@@ -619,6 +702,7 @@ impl Operations {
         if !problems.is_empty() {
             return Err(KanbanError::Invalid(problems.join("; ")));
         }
+        sub.sub_collected = Some(SubCollected::Discarded);
         sub.updated_at = timefmt::now();
         self.storage.save_task(&sub)?;
         self.post_queue_note(task_id, "🧹 discarded — worktree and branch removed");
@@ -650,6 +734,9 @@ impl Operations {
             )?;
             sub.sub_state = Some(SubState::Queued);
             sub.sub_reason = None;
+            sub.sub_summary = None;
+            sub.sub_collected = None;
+            sub.completed_at = None;
             sub.status = TaskStatus::InProgress;
             sub.integration = crate::core::models::IntegrationState::None;
             sub.reset_auto_restart();
@@ -747,10 +834,10 @@ impl Operations {
                 session_mgr.close_session(&session.id)?;
                 continue;
             };
+            let table = self.subagent_table(&session.task_id, false)?;
             let note = format!(
-                "Subagents finished: {}. Read each with kanban sub output <id>, then merge it \
-                 into your worktree with kanban sub merge <id> or drop it with kanban sub \
-                 discard <id>, and continue.",
+                "Subagents finished: {}. Read each with kanban sub output <id>, then kanban \
+                 sub merge <id> into your worktree or kanban sub discard <id>, and continue.\n{table}",
                 states
                     .iter()
                     .map(|s| format!("{} {}", s.id, s.state))
@@ -939,6 +1026,72 @@ impl Operations {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    /// The compact subagent table a parent reads in its wake note and its
+    /// prompt: id, state, time, title and one line of summary. `open_only`
+    /// keeps the subagents still waiting to be collected and failed ones.
+    /// Empty when there is nothing to list.
+    pub fn subagent_table(&self, parent_id: &str, open_only: bool) -> Result<String> {
+        let now = timefmt::now();
+        let rows: Vec<String> = self
+            .subagents_of(parent_id)?
+            .iter()
+            .filter(|task| !open_only || task.is_open_subagent())
+            .map(|task| {
+                format!(
+                    "| {} | {} | {} | {} | {} |",
+                    task.id,
+                    state_label(task),
+                    short_elapsed(subagent_elapsed(task, now)),
+                    task.title.trim().replace('|', "/"),
+                    summary_line(task, 120).replace('|', "/")
+                )
+            })
+            .collect();
+        if rows.is_empty() {
+            return Ok(String::new());
+        }
+        Ok(format!(
+            "| id | state | time | title | summary |\n|---|---|---|---|---|\n{}\n",
+            rows.join("\n")
+        ))
+    }
+
+    /// `.kanban/instructions/subagent.md`: instructions only subagents read.
+    pub fn subagent_instructions_path(&self) -> std::path::PathBuf {
+        self.data_root()
+            .join(".kanban")
+            .join("instructions")
+            .join("subagent.md")
+    }
+
+    /// The subagent instructions, empty when the file is missing.
+    pub fn subagent_instructions(&self) -> String {
+        fs::read_to_string(self.subagent_instructions_path()).unwrap_or_default()
+    }
+
+    /// Replace the subagent instructions. Clearing them empties an existing
+    /// file (an empty file is skipped like a missing one) and never creates
+    /// one.
+    pub fn set_subagent_instructions(&self, text: &str) -> Result<()> {
+        let path = self.subagent_instructions_path();
+        let text = text.trim();
+        if text == self.subagent_instructions().trim() {
+            return Ok(());
+        }
+        if text.is_empty() && !path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = if text.is_empty() {
+            String::new()
+        } else {
+            format!("{text}\n")
+        };
+        crate::core::storage::atomic_write_text(&path, &content)
     }
 
     fn load_subagent(&self, task_id: &str) -> Result<Task> {

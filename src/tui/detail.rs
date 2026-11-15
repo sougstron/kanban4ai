@@ -141,10 +141,33 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if !show_answer {
         constraints[3] = Constraint::Length(0);
     }
-    let chunks = Layout::default()
+    let mut chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(area);
+        .split(area)
+        .to_vec();
+    // The parent's subagents sit between the analytics and the thread; the
+    // thread keeps at least five rows.
+    let subagents = app
+        .board
+        .subagents
+        .get(&task.id)
+        .cloned()
+        .unwrap_or_default();
+    let sub_height = if subagents.is_empty() {
+        0
+    } else {
+        (subagents.len() as u16 + 2)
+            .min(8)
+            .min(chunks[2].height.saturating_sub(5))
+    };
+    let sub_area = Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, sub_height);
+    chunks[2] = Rect::new(
+        chunks[2].x,
+        chunks[2].y.saturating_add(sub_height),
+        chunks[2].width,
+        chunks[2].height.saturating_sub(sub_height),
+    );
 
     let meta_state = MetaState {
         waiting,
@@ -161,6 +184,24 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     render_meta(frame, &theme, &task, &meta_state, chunks[0]);
     if let Some(hitbox) = board::render_project_badge(frame, app, chunks[0], META_TITLE_WIDTH) {
         app.hitboxes.push(hitbox);
+    }
+    if let Some(detail) = app.detail.as_mut() {
+        detail.subagent_count = subagents.len();
+        if detail.subagent_count == 0 && detail.focus == DetailFocus::Subagents {
+            detail.focus = DetailFocus::Thread;
+        }
+    }
+    if sub_height > 0 {
+        let detail = app.detail.as_ref().unwrap();
+        render_subagents(
+            frame,
+            &theme,
+            &subagents,
+            &detail.analytics,
+            detail.subagent_selected,
+            focus == DetailFocus::Subagents,
+            sub_area,
+        );
     }
     let live_progress = app.session_progress.get(&task.id);
     render_analytics(
@@ -552,6 +593,93 @@ fn render_meta(
 /// time and tokens, cumulative over the first run, review passes, reruns and
 /// crash restarts. Purely programmatic: closed sessions come from the stats
 /// events file ([`TaskAnalytics`]), the live one from transcript telemetry.
+/// The parent's "Сабагенты" section: one row per subagent with its state,
+/// backend/model, run time, tokens and one line of summary. The selected row
+/// is highlighted while the section has focus.
+fn render_subagents(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    subagents: &[Task],
+    analytics: &TaskAnalytics,
+    selected: usize,
+    focused: bool,
+    area: Rect,
+) {
+    use crate::core::models::SubState;
+    use crate::core::subagents::{short_elapsed, state_label, subagent_elapsed, summary_line};
+    let now = timefmt::now();
+    let selected = selected.min(subagents.len().saturating_sub(1));
+    let visible = usize::from(area.height.saturating_sub(2)).max(1);
+    let offset = selected.saturating_sub(visible - 1);
+    let width = usize::from(area.width.saturating_sub(2));
+    let lines: Vec<Line> = subagents
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(visible)
+        .map(|(index, sub)| {
+            let (glyph, color) = match sub.sub_state {
+                Some(SubState::Done) => ("✓", theme.ok),
+                Some(SubState::Failed | SubState::Cancelled) => ("✗", theme.err),
+                Some(SubState::Running) => ("▶", theme.focus),
+                _ => ("…", theme.muted),
+            };
+            let agent = match (&sub.agent_backend, &sub.ai_model) {
+                (Some(backend), Some(model)) => format!("{backend}/{model}"),
+                (Some(backend), None) => backend.clone(),
+                (None, _) => sub.role_profile.clone().unwrap_or_else(|| "-".into()),
+            };
+            let tokens = analytics
+                .subagent_tokens
+                .get(&sub.id)
+                .map_or_else(|| "-".to_string(), |t| card::format_tokens(*t));
+            let summary = summary_line(sub, 200);
+            let text = format!(
+                " {} {:<15} {} · {} · {} · {}{}",
+                sub.id,
+                state_label(sub),
+                sanitize_terminal_text(&agent),
+                short_elapsed(subagent_elapsed(sub, now)),
+                tokens,
+                sanitize_terminal_text(sub.title.trim()),
+                if summary.is_empty() {
+                    String::new()
+                } else {
+                    format!(" — {}", sanitize_terminal_text(&summary))
+                }
+            );
+            let mut style = Style::default().fg(theme.fg);
+            if focused && index == selected {
+                style = style.bg(theme.border).add_modifier(Modifier::BOLD);
+            }
+            Line::from(vec![
+                Span::styled(glyph.to_string(), Style::default().fg(color)),
+                Span::styled(truncate_display(&text, width.saturating_sub(1)), style),
+            ])
+        })
+        .collect();
+    let title = if focused {
+        " Сабагенты · Enter thread · x cancel · m merge · d discard "
+    } else {
+        " Сабагенты · Tab "
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.bg).fg(theme.fg))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if focused {
+                        theme.focus
+                    } else {
+                        theme.border
+                    })),
+            ),
+        area,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_analytics(
     frame: &mut Frame<'_>,

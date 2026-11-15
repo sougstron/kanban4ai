@@ -25,7 +25,7 @@ auto-loaded into every agent session. Read it when you need the exact flags of a
 - `kanban chain <id> [<target_id>] [--clear]` - Show, set, or clear chaining
 - `kanban depends <id> [--on TASK-NNN ...] [--clear]` - Show, set, or clear the tasks `<id>` waits for. With no flags it prints the edges, whether they are satisfied, and which tasks wait on this one. `--on` replaces the whole set; every id must exist and the result must stay acyclic (a cycle is refused, naming the path). Unlike a chain, a dependency is an AND-join **and** feeds the upstream results into the task's prompt (see "Task Dependencies" in `docs/orchestration.md`)
 - `kanban plan <id> --file <path> [--session <id>] [--agent]` - Submit an orchestrator plan: validate the YAML graph and create its subtasks. With `--agent` the session must be `<id>`'s current orchestrate-phase session. The whole plan is validated (unknown references, duplicate keys, cycles, unknown role profiles, `max_subtasks`) before anything is created; `kanban plan --help` carries the schema
-- `kanban list` - List tasks
+- `kanban list [--all]` - List tasks (`--all` also lists subagents, indented under their parent)
 - `kanban show <id>` - Show task details
 - `kanban take <id> --session <id> --agent` - Take task for an agent
 - `kanban done <id> --session <id> --agent` - Complete task
@@ -87,19 +87,22 @@ only `sub done`). See [orchestration](orchestration.md#subagents-coresubagentsrs
 
 - `sub spawn <title> [--parent TASK-N] [--description TEXT] [--backend NAME]
   [--model MODEL] [--effort EFFORT] [--readonly] [--from-parent |
-  --from-project] [--session SESSION] [--json]` creates and starts a subagent
+  --from-project] [--context FILE]... [--session SESSION] [--json]` creates and starts a subagent
   outside the board queue. Parent and session default to `KANBAN_TASK_ID` /
   `KANBAN_SESSION`; only the parent's active executor session may spawn. The
   worktree is seeded from the parent's worktree unless `--readonly` or
-  `--from-project`. Prints the id (JSON: the task).
+  `--from-project`. Each `--context` file is handed over under "Context from
+  parent" (capped by `subagents.context_budget_chars`); it is all the
+  subagent sees of the parent's work. Prints the id (JSON: the task).
 - `sub done <id> [--session S] --summary TEXT` finishes it: no Review, no
-  landing, branch kept. `done` from the subagent's session does the same.
+  landing, branch kept. The summary is required and non-empty; an agent's
+  plain `done` from the subagent's session is refused for lack of one.
 - `sub wait [<id>...] [--session S] [--json]` waits without a deadline (no ids:
   every live subagent). Exit `0` all done, `3` waiting declared — **end the
   reply now**, the board relaunches you when all are terminal — `4` some
   failed or were cancelled.
-- `sub output <id> [--json]` prints state, reason, branch, diff stat and the
-  result digest. `sub merge <id>` merges its branch into the parent's
+- `sub output <id> [--json]` prints state, reason, branch, diff stat,
+  changed files and the summary. `sub merge <id>` merges its branch into the parent's
   worktree; `sub discard <id>` drops worktree and branch.
 - `sub send <id> <message>` reruns a finished subagent with a follow-up;
   `sub cancel <id> [--reason TEXT]` kills it; `sub list [--parent TASK-N]

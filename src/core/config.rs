@@ -319,6 +319,7 @@ orchestration:
     max_children: 5
     max_depth: 1
     stall_timeout: 7200
+    context_budget_chars: 4000
   orchestrator:
     max_subtasks: 12
     upstream_budget_chars: 4000
@@ -1002,6 +1003,9 @@ pub struct SubagentSettings {
     /// Seconds a running subagent may go without transcript/log progress
     /// before the watchdog marks it failed and wakes its parent.
     pub stall_timeout: i64,
+    /// Characters of `sub spawn --context` excerpts kept in a subagent's
+    /// prompt ("Context from parent"); the rest is cut.
+    pub context_budget_chars: usize,
 }
 impl Default for SubagentSettings {
     fn default() -> Self {
@@ -1011,6 +1015,7 @@ impl Default for SubagentSettings {
             max_children: None,
             max_depth: 1,
             stall_timeout: 7200,
+            context_budget_chars: 4000,
         }
     }
 }

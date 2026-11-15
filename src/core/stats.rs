@@ -645,6 +645,9 @@ pub struct TaskAnalytics {
     /// The task's subagents. Their tokens are already in `breakdown` /
     /// `unsplit_tokens`; their (parallel) running time is only here.
     pub subagents: SubagentTotals,
+    /// Tokens of each subagent's closed runs, by subagent id (the parent
+    /// detail's subagent rows).
+    pub subagent_tokens: HashMap<String, i64>,
 }
 
 /// The subagent line of a parent's analytics (TASK-594).
@@ -659,12 +662,13 @@ pub struct SubagentTotals {
 
 impl TaskAnalytics {
     /// Fold one subagent's analytics into its parent's.
-    fn fold_subagent(&mut self, sub: TaskAnalytics) {
+    fn fold_subagent(&mut self, id: String, sub: TaskAnalytics) {
+        let tokens = sub.breakdown.prompt_total() + sub.breakdown.output + sub.unsplit_tokens;
         self.subagents.count += 1;
         self.subagents.runs += sub.runs;
         self.subagents.running_seconds += sub.running_seconds;
-        self.subagents.tokens +=
-            sub.breakdown.prompt_total() + sub.breakdown.output + sub.unsplit_tokens;
+        self.subagents.tokens += tokens;
+        self.subagent_tokens.insert(id, tokens);
         self.breakdown.add(&sub.breakdown);
         self.unsplit_tokens += sub.unsplit_tokens;
     }
@@ -745,9 +749,9 @@ pub fn tasks_analytics(
         .into_iter()
         .map(|(id, (_, builder))| (id.to_owned(), builder.finish()))
         .collect();
-    for (_, (parent, _, builder)) in subs {
+    for (id, (parent, _, builder)) in subs {
         if let Some(analytics) = result.get_mut(&parent) {
-            analytics.fold_subagent(builder.finish());
+            analytics.fold_subagent(id, builder.finish());
         }
     }
     result
