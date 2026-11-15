@@ -57,7 +57,7 @@ use super::card::{
 };
 use super::dialogs::{
     AgentSlot, BulkAction, DialogField, Modal, ModalButton, ModalState, QuestionChoice,
-    SelectOption, SettingsTab, executor_slot_index, is_flag_field,
+    SelectOption, SettingsTab, SubagentAction, executor_slot_index, is_flag_field,
 };
 use super::event::{AppEvent, LoopOutcome};
 use super::image;
@@ -156,6 +156,11 @@ pub struct BoardSnapshot {
     pub session_deadlines: HashMap<String, chrono::NaiveDateTime>,
     pub session_wait_deadlines: HashMap<String, chrono::NaiveDateTime>,
     pub session_wait_notes: HashMap<String, String>,
+    /// Subagents a parent's waiting session awaits (`sub wait`), by parent.
+    pub session_wait_subagents: HashMap<String, Vec<String>>,
+    /// Subagents (`kind: subagent`) by parent task, oldest first. They never
+    /// enter a column; their parent's card and detail view show them.
+    pub subagents: HashMap<String, Vec<Task>>,
     pub remote_runs: HashMap<String, Vec<crate::core::sync::RunDescriptor>>,
     /// Suggestion count per task thread (any status), shown in the card's
     /// top-right corner. Carries the thread stamp so the next rebuild only
@@ -305,6 +310,9 @@ pub enum DetailFocus {
     Thread,
     Answer,
     Edits,
+    /// The parent's subagent rows: arrows select, Enter opens one's thread,
+    /// `x`/`m`/`d` cancel/merge/discard it (each confirmed).
+    Subagents,
 }
 
 #[derive(Clone)]
@@ -344,6 +352,13 @@ pub struct DetailState {
     /// Stamp of the thread file `messages` were read from; a board reload
     /// that leaves it unchanged does not re-read the detail.
     pub thread_stamp: Option<(u128, u64)>,
+    /// Selected row of the subagent section.
+    pub subagent_selected: usize,
+    /// Rows the subagent section showed on the last frame.
+    pub subagent_count: usize,
+    /// Parent task whose detail Esc returns to: set while this detail shows
+    /// one of its subagents.
+    pub back_to: Option<String>,
 }
 
 impl DetailState {
@@ -381,6 +396,7 @@ impl DetailState {
             DetailFocus::Thread => true,
             DetailFocus::Answer => !self.open_questions().is_empty(),
             DetailFocus::Edits => self.edits_editable(),
+            DetailFocus::Subagents => self.subagent_count > 0,
         }
     }
 }
@@ -394,6 +410,8 @@ pub struct ActiveSession {
     /// Live telemetry for the Sessions list (todo progress + last activity),
     /// derived from the transcript like the card telemetry.
     pub progress: SessionProgress,
+    /// Parent task of a subagent's session; the list nests it there.
+    pub parent: Option<String>,
 }
 
 /// Pager over the tail of `.kanban/logs/<session>.log`. While `follow` is on
@@ -1406,7 +1424,7 @@ impl App {
                         "Review edits can be changed only while the task is in Review".to_string();
                     return Ok(());
                 }
-                DetailFocus::Thread => {}
+                DetailFocus::Thread | DetailFocus::Subagents => {}
             }
         }
         self.status = "Nothing pasted: focus a text field first".to_string();
@@ -1471,7 +1489,7 @@ impl App {
         }
         match self.detail.as_ref()?.focus {
             DetailFocus::Answer | DetailFocus::Edits => Some(true),
-            DetailFocus::Thread => None,
+            DetailFocus::Thread | DetailFocus::Subagents => None,
         }
     }
 
@@ -1806,6 +1824,21 @@ impl App {
             self.cycle_detail_focus();
             return Ok(true);
         }
+        let viewing_subagent = detail.task.as_ref().is_some_and(Task::is_subagent);
+        if detail.focus == DetailFocus::Subagents && self.handle_subagents_key(key)? {
+            return Ok(true);
+        }
+        // A subagent is controlled only through its parent: its own detail
+        // reads, but board actions (run, move, delete, approve…) stay off.
+        if viewing_subagent
+            && let KeyCode::Char(ch) = normalize_command_key(key).code
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !matches!(ch, 'p' | 'v' | 'L' | '[' | ']' | 'q' | '?' | 'l' | '/')
+        {
+            self.status = "Subagent: control it from its parent (Esc)".to_string();
+            return Ok(true);
+        }
+        let detail = self.detail.as_ref().unwrap();
         match detail.focus {
             DetailFocus::Thread
                 if normalize_command_key(key)
@@ -1816,7 +1849,7 @@ impl App {
             {
                 Ok(false)
             }
-            DetailFocus::Thread => {
+            DetailFocus::Thread | DetailFocus::Subagents => {
                 let Some(target) = detail.type_target().filter(|_| is_type_to_edit_key(key)) else {
                     return Ok(false);
                 };
@@ -1881,11 +1914,106 @@ impl App {
         }
     }
 
+    /// Keys of the focused subagent section. `false` leaves the key to the
+    /// thread handling.
+    fn handle_subagents_key(&mut self, key: KeyEvent) -> Result<bool> {
+        let Some(detail) = self.detail.as_ref() else {
+            return Ok(false);
+        };
+        let subs = self
+            .board
+            .subagents
+            .get(&detail.task_id)
+            .cloned()
+            .unwrap_or_default();
+        let selected = detail.subagent_selected.min(subs.len().saturating_sub(1));
+        let norm = normalize_command_key(key);
+        if norm
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Ok(false);
+        }
+        match norm.code {
+            KeyCode::Esc => self.set_detail_focus(DetailFocus::Thread),
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(detail) = self.detail.as_mut() {
+                    detail.subagent_selected = if norm.code == KeyCode::Up {
+                        selected.saturating_sub(1)
+                    } else {
+                        (selected + 1).min(subs.len().saturating_sub(1))
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(sub) = subs.get(selected) {
+                    self.open_subagent_detail(&sub.id)?;
+                }
+            }
+            KeyCode::Char(ch @ ('x' | 'm' | 'd')) => {
+                let Some(sub) = subs.get(selected) else {
+                    return Ok(true);
+                };
+                let action = match ch {
+                    'x' => SubagentAction::Cancel,
+                    'm' => SubagentAction::Merge,
+                    _ => SubagentAction::Discard,
+                };
+                self.modal = Some(ModalState::new(Modal::SubagentConfirm {
+                    task_id: sub.id.clone(),
+                    action,
+                }));
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Run a confirmed subagent hotkey through operations. Kept out of the
+    /// modal-submit match: a `Task` local there would grow that already
+    /// large frame past the test threads' stack.
+    #[inline(never)]
+    fn apply_subagent_action(&mut self, task_id: &str, action: SubagentAction) -> Result<()> {
+        self.status = match action {
+            SubagentAction::Cancel => {
+                let task = self.ops.sub_cancel(task_id, "cancelled from the TUI")?;
+                format!(
+                    "{task_id} {}",
+                    task.sub_state.map_or("cancelled", |s| s.as_str())
+                )
+            }
+            SubagentAction::Merge => self.ops.sub_merge(task_id)?,
+            SubagentAction::Discard => {
+                self.ops.sub_discard(task_id)?;
+                format!("Discarded {task_id}")
+            }
+        };
+        self.refresh_after_action()
+    }
+
+    /// Show a subagent's thread in the detail view; Esc returns to the
+    /// parent's detail.
+    fn open_subagent_detail(&mut self, sub_id: &str) -> Result<()> {
+        let parent = self.detail.as_ref().map(|detail| detail.task_id.clone());
+        self.persist_detail_drafts()?;
+        self.load_detail(sub_id)?;
+        if let Some(detail) = self.detail.as_mut() {
+            detail.back_to = parent;
+        }
+        self.status = format!("Subagent {sub_id} · Esc back to the parent");
+        Ok(())
+    }
+
     fn cycle_detail_focus(&mut self) {
         let Some(detail) = self.detail.as_ref() else {
             return;
         };
-        let order = [DetailFocus::Thread, DetailFocus::Answer, DetailFocus::Edits];
+        let order = [
+            DetailFocus::Thread,
+            DetailFocus::Answer,
+            DetailFocus::Edits,
+            DetailFocus::Subagents,
+        ];
         let current = order
             .iter()
             .position(|focus| *focus == detail.focus)
@@ -1904,7 +2032,13 @@ impl App {
     /// and stopping at the ends instead of wrapping — `Tab` remains the
     /// wrapping cycle. Works from any caret or variant position.
     fn move_detail_block(&mut self, delta: isize) {
-        let order = [DetailFocus::Thread, DetailFocus::Answer, DetailFocus::Edits];
+        // Top to bottom as drawn: the subagent section sits above the thread.
+        let order = [
+            DetailFocus::Subagents,
+            DetailFocus::Thread,
+            DetailFocus::Answer,
+            DetailFocus::Edits,
+        ];
         let Some(detail) = self.detail.as_ref() else {
             return;
         };
@@ -1936,6 +2070,9 @@ impl App {
             self.status = match self.detail.as_ref().map(|detail| detail.focus) {
                 Some(DetailFocus::Answer) => "Answer panel focused".to_string(),
                 Some(DetailFocus::Edits) => "Review editor focused".to_string(),
+                Some(DetailFocus::Subagents) => {
+                    "Subagents: Enter thread · x cancel · m merge · d discard".to_string()
+                }
                 _ => "Thread focused".to_string(),
             };
         }
@@ -4616,6 +4753,25 @@ impl App {
     /// Leave the detail screen for wherever it was opened from, refreshing
     /// that list so the closed detail's changes are visible immediately.
     fn close_detail(&mut self) -> Result<()> {
+        let back_to = self.detail.as_ref().and_then(|detail| {
+            let sub = detail.task_id.clone();
+            detail.back_to.clone().map(|parent| (parent, sub))
+        });
+        if let Some((parent, sub)) = back_to {
+            self.detail = None;
+            self.load_detail(&parent)?;
+            if let Some(detail) = self.detail.as_mut() {
+                detail.subagent_count = self.board.subagents.get(&parent).map_or(0, Vec::len);
+                detail.subagent_selected = self
+                    .board
+                    .subagents
+                    .get(&parent)
+                    .and_then(|subs| subs.iter().position(|t| t.id == sub))
+                    .unwrap_or(0);
+                detail.focus = DetailFocus::Subagents;
+            }
+            return Ok(());
+        }
         self.persist_detail_drafts()?;
         self.detail = None;
         let target = self.return_screen;
@@ -4709,6 +4865,10 @@ impl App {
             .detail
             .as_ref()
             .and_then(|detail| (detail.task_id == task_id).then_some(detail.focus));
+        let preserved_subagents = self.detail.as_ref().and_then(|detail| {
+            (detail.task_id == task_id).then(|| (detail.subagent_selected, detail.back_to.clone()))
+        });
+        let subagent_count = self.board.subagents.get(task_id).map_or(0, Vec::len);
         let preserved_scroll = self.detail.as_ref().and_then(|detail| {
             (detail.task_id == task_id).then_some((detail.scroll, detail.pin_last_message))
         });
@@ -4763,6 +4923,11 @@ impl App {
             provenance,
             analytics,
             thread_stamp,
+            subagent_selected: preserved_subagents
+                .as_ref()
+                .map_or(0, |(selected, _)| *selected),
+            subagent_count,
+            back_to: preserved_subagents.and_then(|(_, back_to)| back_to),
         };
         // A fresh open stays on the thread so Esc closes the detail at once.
         // Plain letters still jump into the review editor (or the answer box)
@@ -5002,6 +5167,9 @@ impl App {
         modal.follow_hyprland_theme = tui_bool(&config.tui, "follow_hyprland_theme", false);
         modal.description = super::dialogs::wrapped_description(super::dialogs::lines_or_empty(
             &config.instructions,
+        ));
+        modal.subagent_instructions = Box::new(super::dialogs::wrapped_description(
+            super::dialogs::lines_or_empty(self.ops.subagent_instructions().trim_end()),
         ));
         modal.inherit = inherit;
         modal.global_view = Some(Box::new(global_view));
@@ -6773,9 +6941,17 @@ impl App {
             .into_iter()
             .map(|(session, state)| {
                 let task = self.ops.get_task(&session.task_id).ok().flatten();
+                // A subagent's sessions are listed under its parent's.
+                let parent = task
+                    .as_ref()
+                    .filter(|task| task.is_subagent())
+                    .and_then(|task| task.parent_task.clone());
                 let task_label = task
                     .as_ref()
-                    .map(|task| format!("{} {}", task.id, task.title))
+                    .map(|task| match &parent {
+                        Some(_) => format!("└ {} {}", task.id, task.title),
+                        None => format!("{} {}", task.id, task.title),
+                    })
                     .or_else(|| {
                         session
                             .name
@@ -6799,13 +6975,35 @@ impl App {
                     task_label,
                     token_display,
                     progress,
+                    parent,
                 }
             })
             .collect();
         // Directory order is arbitrary; keep the list stable across refreshes
-        // so the selection doesn't jump.
+        // so the selection doesn't jump. A subagent's sessions follow its
+        // parent's latest session — the run that spawned them — or sort by
+        // the parent id when the parent has none listed.
+        let mut first_of_task: HashMap<String, String> = HashMap::new();
+        for active in &self.active_sessions {
+            let entry = first_of_task
+                .entry(active.session.task_id.clone())
+                .or_insert_with(|| active.session.id.clone());
+            if active.session.id > *entry {
+                *entry = active.session.id.clone();
+            }
+        }
+        let group = |active: &ActiveSession| match &active.parent {
+            Some(parent) => (
+                first_of_task
+                    .get(parent)
+                    .cloned()
+                    .unwrap_or_else(|| parent.clone()),
+                1,
+            ),
+            None => (active.session.id.clone(), 0),
+        };
         self.active_sessions
-            .sort_by(|a, b| a.session.id.cmp(&b.session.id));
+            .sort_by(|a, b| (group(a), &a.session.id).cmp(&(group(b), &b.session.id)));
         self.session_selected = self
             .session_selected
             .min(self.active_sessions.len().saturating_sub(1));
@@ -7592,7 +7790,9 @@ impl App {
                         &self.ops.config.config_file,
                         &mut config,
                     )?;
-                    self.ops.config.save(&config)
+                    self.ops.config.save(&config)?;
+                    self.ops
+                        .set_subagent_instructions(&textarea_text(&modal.subagent_instructions))
                 })();
                 if let Err(err) = save_result {
                     let message = format!("Could not save project settings: {err}");
@@ -7795,6 +7995,9 @@ impl App {
                     Some(task) => format!("Stopped {session_id} (task {})", task.id),
                     None => format!("Session {session_id} not found"),
                 };
+            }
+            Modal::SubagentConfirm { task_id, action } => {
+                self.apply_subagent_action(&task_id, action)?;
             }
             Modal::StopTaskConfirm { task_id } => {
                 self.ops.stop_task(&task_id)?;
@@ -8107,6 +8310,8 @@ impl BoardSnapshot {
             session_deadlines: HashMap::new(),
             session_wait_deadlines: HashMap::new(),
             session_wait_notes: HashMap::new(),
+            session_wait_subagents: HashMap::new(),
+            subagents: HashMap::new(),
             remote_runs: HashMap::new(),
             suggestions: HashMap::new(),
             designer_bot: false,
@@ -8145,9 +8350,19 @@ impl BoardSnapshot {
         // from this same read instead of a second parse.
         let archive_column = ids.iter().any(|id| id == TaskStatus::Archive.as_str());
         // Subagents live inside their parent's run, never in a column.
+        let (subagent_tasks, all_tasks): (Vec<Task>, Vec<Task>) =
+            all_tasks.into_iter().partition(Task::is_subagent);
+        let mut subagents: HashMap<String, Vec<Task>> = HashMap::new();
+        for sub in subagent_tasks {
+            if let Some(parent) = sub.parent_task.clone() {
+                subagents.entry(parent).or_default().push(sub);
+            }
+        }
+        for subs in subagents.values_mut() {
+            subs.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        }
         let (mut archived, mut tasks): (Vec<Task>, Vec<Task>) = all_tasks
             .into_iter()
-            .filter(|task| !task.is_subagent())
             .partition(|task| task.status == TaskStatus::Archive && !archive_column);
         sort_tasks(&mut tasks, sort_by, order);
         sort_tasks(&mut archived, "updated", "desc");
@@ -8195,6 +8410,8 @@ impl BoardSnapshot {
             session_deadlines: sessions.deadlines,
             session_wait_deadlines: sessions.wait_deadlines,
             session_wait_notes: sessions.wait_notes,
+            session_wait_subagents: sessions.wait_subagents,
+            subagents,
             remote_runs: sessions.remote_runs,
             suggestions,
             designer_bot: orch.designer.enabled,
@@ -8227,6 +8444,7 @@ impl BoardSnapshot {
             self.session_deadlines = sessions.deadlines;
             self.session_wait_deadlines = sessions.wait_deadlines;
             self.session_wait_notes = sessions.wait_notes;
+            self.session_wait_subagents = sessions.wait_subagents;
             self.remote_runs = sessions.remote_runs;
         }
         if threads_changed {
@@ -8309,6 +8527,7 @@ struct SessionView {
     deadlines: HashMap<String, chrono::NaiveDateTime>,
     wait_deadlines: HashMap<String, chrono::NaiveDateTime>,
     wait_notes: HashMap<String, String>,
+    wait_subagents: HashMap<String, Vec<String>>,
     remote_runs: HashMap<String, Vec<crate::core::sync::RunDescriptor>>,
     /// The sync lock was busy and `remote_runs` are the previous ones.
     runs_stale: bool,
@@ -8340,9 +8559,12 @@ impl SessionView {
                     SessionState::Waiting => session.wait_until,
                     SessionState::Crashed => None,
                 };
+                let awaited = (session.wait_trigger
+                    == Some(crate::core::models::WaitTrigger::Subagents))
+                .then_some(session.wait_for);
                 (
                     session.id,
-                    (session.task_id, state, deadline, session.wait_note),
+                    (session.task_id, state, deadline, session.wait_note, awaited),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -8356,6 +8578,7 @@ impl SessionView {
             deadlines: HashMap::new(),
             wait_deadlines: HashMap::new(),
             wait_notes: HashMap::new(),
+            wait_subagents: HashMap::new(),
             remote_runs: HashMap::new(),
             runs_stale: false,
         };
@@ -8370,7 +8593,7 @@ impl SessionView {
             }
         }
         for task in tasks {
-            let Some((_, state, deadline, note)) = own_session(task) else {
+            let Some((_, state, deadline, note, awaited)) = own_session(task) else {
                 continue;
             };
             view.states.insert(task.id.clone(), *state);
@@ -8383,6 +8606,9 @@ impl SessionView {
                 }
                 if let Some(note) = note {
                     view.wait_notes.insert(task.id.clone(), note.clone());
+                }
+                if let Some(awaited) = awaited {
+                    view.wait_subagents.insert(task.id.clone(), awaited.clone());
                 }
             }
         }
@@ -8952,6 +9178,7 @@ fn is_confirmation_modal(modal: &Modal) -> bool {
             | Modal::BulkConfirm { .. }
             | Modal::KillSessionConfirm { .. }
             | Modal::StopTaskConfirm { .. }
+            | Modal::SubagentConfirm { .. }
             | Modal::RestoreConfirm { .. }
             | Modal::QuitConfirm { .. }
             | Modal::DeleteProject { .. }
@@ -9109,6 +9336,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         }
         DialogField::Title
         | DialogField::Description
+        | DialogField::SubagentInstructions
         | DialogField::AgentSettings
         | DialogField::DesignerAgentSettings
         | DialogField::ReviewerAgentSettings

@@ -95,6 +95,13 @@ impl SubState {
     }
 }
 
+// What the parent did with a finished subagent's branch. Unset while the
+// result is still waiting to be collected.
+string_enum!(SubCollected {
+    Merged => "merged",
+    Discarded => "discarded",
+});
+
 // What ends a declared wait without a deadline. `Subagents`: every
 // `wait_for` subagent reached a terminal sub-state.
 string_enum!(WaitTrigger {
@@ -570,6 +577,19 @@ pub struct Task {
     /// the parent's worktree, uncommitted edits included. Omitted while unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seed_commit: Option<String>,
+    /// The result a subagent reported with `sub done --summary` (TASK-595):
+    /// what the parent reads first. Omitted while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_summary: Option<String>,
+    /// Excerpts the parent handed over with `sub spawn --context`, already
+    /// capped by `orchestration.subagents.context_budget_chars`; the
+    /// subagent's only view of the parent's work. Omitted while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_context: Option<String>,
+    /// Set once the parent merged or discarded the subagent's result.
+    /// Omitted while unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_collected: Option<SubCollected>,
 }
 
 fn is_zero(value: &u32) -> bool {
@@ -667,6 +687,9 @@ impl Task {
             sub_state: None,
             sub_reason: None,
             seed_commit: None,
+            sub_summary: None,
+            sub_context: None,
+            sub_collected: None,
         }
     }
 
@@ -679,6 +702,13 @@ impl Task {
     /// A subagent that has not reached a terminal sub-state yet.
     pub fn is_live_subagent(&self) -> bool {
         self.is_subagent() && !self.sub_state.is_some_and(SubState::is_terminal)
+    }
+
+    /// A subagent its parent still has to deal with: its result was neither
+    /// merged nor discarded yet, or it failed.
+    pub fn is_open_subagent(&self) -> bool {
+        self.is_subagent()
+            && (self.sub_collected.is_none() || self.sub_state == Some(SubState::Failed))
     }
 
     /// Clear the automatic-relaunch bookkeeping: the clean-exit resume budget,

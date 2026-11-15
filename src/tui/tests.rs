@@ -14536,3 +14536,152 @@ fn fanout_global_settings_snapshot() {
         .focus_field(DialogField::SpawnMaxChildren);
     insta::assert_snapshot!("fanout_global_settings", render_at(&mut app, 100, 40));
 }
+
+/// A parent in `sub wait` on three subagents: one running, one done with a
+/// summary, one failed. Times are fixed so snapshots stay stable.
+fn board_with_subagents() -> (tempfile::TempDir, App, String, Vec<String>) {
+    use crate::core::models::{SubState, TaskKind, WaitTrigger};
+    let (dir, mut app) = app_with_board();
+    let mut parent = app
+        .ops
+        .create_task(NewTask::titled("Parent with helpers"))
+        .unwrap();
+    parent.status = TaskStatus::InProgress;
+    parent.session = Some("ses-parent".into());
+    app.ops.storage.save_task(&parent).unwrap();
+    let sessions = SessionManager::new(dir.path());
+    sessions.link_session(&parent.id, "ses-parent").unwrap();
+    let now = crate::core::timefmt::now();
+    let mut ids = Vec::new();
+    for (title, state, summary) in [
+        ("Scan the cache", SubState::Running, None),
+        (
+            "Read the logs",
+            SubState::Done,
+            Some("Leak is in cache.rs:42\nmore"),
+        ),
+        ("Run the fuzzer", SubState::Failed, None),
+    ] {
+        let mut sub = app
+            .ops
+            .create_task(NewTask {
+                title: title.into(),
+                parent_task: Some(parent.id.clone()),
+                ..NewTask::default()
+            })
+            .unwrap();
+        sub.kind = Some(TaskKind::Subagent);
+        sub.spawned = true;
+        sub.sub_state = Some(state);
+        sub.agent_backend = Some("claude".into());
+        sub.ai_model = Some("sonnet".into());
+        sub.created_at = now - chrono::Duration::seconds(125);
+        sub.sub_summary = summary.map(str::to_owned);
+        if state.is_terminal() {
+            sub.status = TaskStatus::Done;
+            sub.completed_at = Some(sub.created_at + chrono::Duration::seconds(65));
+        } else {
+            sub.status = TaskStatus::InProgress;
+        }
+        if state == SubState::Failed {
+            sub.sub_reason = Some("stalled".into());
+        }
+        app.ops.storage.save_task(&sub).unwrap();
+        ids.push(sub.id);
+    }
+    sessions
+        .set_trigger_wait("ses-parent", WaitTrigger::Subagents, ids.clone(), None)
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).expect("reload");
+    // Focus the parent's card in In Progress.
+    app.focused_column = app
+        .board
+        .columns
+        .iter()
+        .position(|column| column.id == "in_progress")
+        .unwrap();
+    app.focused_card = 0;
+    (dir, app, parent.id, ids)
+}
+
+#[test]
+fn subagents_stay_off_the_board_and_badge_their_parent() {
+    let (_dir, mut app, parent, ids) = board_with_subagents();
+    assert!(
+        app.board
+            .columns
+            .iter()
+            .flat_map(|column| column.tasks.iter())
+            .all(|task| !ids.contains(&task.id)),
+        "subagents never sit in a column"
+    );
+    let in_progress = app
+        .board
+        .columns
+        .iter()
+        .find(|column| column.id == "in_progress")
+        .unwrap();
+    assert_eq!(in_progress.tasks.len(), 1);
+    let rendered = render_at(&mut app, 150, 20);
+    assert!(rendered.contains("⑂ 1▶ 1✓ 1✗"), "{rendered}");
+    assert!(rendered.contains("сабагенты 2/3"), "{rendered}");
+    assert!(!rendered.contains("Scan the cache"));
+    insta::assert_snapshot!("subagents_parent_card", render_at(&mut app, 150, 20));
+    // Search in columns never finds a subagent.
+    app.handle_key(key(KeyCode::Char('/'))).unwrap();
+    for character in "Scan the".chars() {
+        app.handle_key(key(KeyCode::Char(character))).unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert!(
+        (0..app.board.columns.len()).all(|column| app.visible_tasks_for_column(column).is_empty())
+    );
+    let _ = parent;
+}
+
+#[test]
+fn parent_detail_lists_subagents_and_controls_them_through_operations() {
+    let (_dir, mut app, parent, ids) = board_with_subagents();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(app.screen, Screen::Detail);
+    assert_eq!(app.detail.as_ref().unwrap().task_id, parent);
+    insta::assert_snapshot!("subagents_detail_section", render_at(&mut app, 120, 30));
+
+    // Tab reaches the section; arrows pick a row; Enter opens its thread.
+    app.handle_key(key(KeyCode::Tab)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Subagents);
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    insta::assert_snapshot!("subagents_detail_focused", render_at(&mut app, 120, 30));
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().task_id, ids[1]);
+    // Board actions on a subagent's own detail are off.
+    app.handle_key(key(KeyCode::Char('d'))).unwrap();
+    assert!(app.modal.is_none());
+    app.handle_key(key(KeyCode::Esc)).unwrap();
+    assert_eq!(app.screen, Screen::Detail);
+    let detail = app.detail.as_ref().unwrap();
+    assert_eq!(detail.task_id, parent);
+    assert_eq!(detail.focus, DetailFocus::Subagents);
+    assert_eq!(detail.subagent_selected, 1);
+
+    // `x` on the running one asks first, then cancels through operations.
+    app.handle_key(key(KeyCode::Up)).unwrap();
+    app.handle_key(key(KeyCode::Char('x'))).unwrap();
+    assert!(matches!(
+        app.modal.as_ref().unwrap().modal,
+        Modal::SubagentConfirm { .. }
+    ));
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+    assert_eq!(
+        app.ops.get_task(&ids[0]).unwrap().unwrap().sub_state,
+        Some(crate::core::models::SubState::Cancelled)
+    );
+    // `d` discards a finished one.
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    app.handle_key(key(KeyCode::Char('d'))).unwrap();
+    app.handle_key(key(KeyCode::Char('y'))).unwrap();
+    assert_eq!(
+        app.ops.get_task(&ids[1]).unwrap().unwrap().sub_collected,
+        Some(crate::core::models::SubCollected::Discarded)
+    );
+}

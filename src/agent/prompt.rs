@@ -226,52 +226,83 @@ not touch the project folder's own checkout.\n"
     Ok(prompt)
 }
 
-/// Prompt of a subagent (TASK-594): a child run inside its parent's
-/// execution. No board, column, backup, result-pin, reviewer, or spawn
-/// rules apply — only the work, the finish command, and the summary the
-/// parent reads.
+/// Prompt of a subagent (TASK-594, TASK-595): a child run inside its
+/// parent's execution. Deliberately short (≤ 2 KB without the task text,
+/// pinned by `tests/subagent_prompt_test.rs`): no
+/// board, column, backup, result-pin, reviewer, wait or spawn rules, no
+/// project-wide instructions, no parent thread or upstream digest. The
+/// subagent sees its task, `instructions/subagent.md`, and only the context
+/// its parent handed over with `sub spawn --context`.
 fn build_subagent_prompt(roots: Roots<'_>, task: &Task, session_id: &str) -> Result<String> {
-    let parent = task.parent_task.as_deref().unwrap_or("-");
-    let mut prompt = format!(
-        "Subagent task: {}: {}\n\n\
-You are a subagent of kanban4ai task {parent}, working in: {}\n\
-- KANBAN_SESSION={session_id}; KANBAN_TASK_ID={}; use \"$KANBAN_CMD\" for callbacks.\n\
-- Keep the session alive with: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
-- Record progress with: \"$KANBAN_CMD\" context {} <text> --source agent\n\
-- The session ends with your reply; background jobs die with it. Run long commands in the foreground.\n\
-- Never ask: questions are refused. Decide unclear points yourself and state them in the summary.\n\
-- Finish with: \"$KANBAN_CMD\" sub done {} --session {session_id} --summary <result>\n\
-  The summary is everything the parent reads: what you found or changed, where, and what is unclear. \
-It must be the final command of your reply.\n",
-        task.id,
-        task.title,
-        roots.work_path.display(),
-        task.id,
-        task.id,
-        task.id,
-    );
-    if task.branch.is_some() {
-        prompt.push_str(
-            "- Your checkout is your own branch; commit freely. The parent decides whether to \
-merge it into its own work; nothing reaches the project directly.\n",
-        );
+    let mut prompt = subagent_contract(roots, task, session_id);
+    append_subagent_instructions(roots, &mut prompt);
+    if let Some(context) = task.sub_context.as_deref() {
+        prompt.push_str("\nContext from parent:\n");
+        prompt.push_str(context.trim());
+        prompt.push('\n');
     }
-    if task.permission() == Some("readonly") {
-        prompt.push_str(
-            "- Readonly (mandatory): investigate and report; do not modify project files or run \
-commands that write into the project.\n",
-        );
-    }
-    append_context_economy(&mut prompt);
-    append_role_instructions(roots, Role::Executor, &mut prompt);
     prompt.push_str("\nTask:\n");
     if task.description.trim().is_empty() {
         prompt.push_str(&task.title);
     } else {
         prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
     }
+    // Its own thread only: follow-ups the parent sent with `sub send` and
+    // what earlier runs of this subagent recorded.
     append_thread_context(roots, task, &mut prompt)?;
     Ok(prompt)
+}
+
+/// The fixed part of a subagent's prompt: who it is, where it works, and the
+/// one way it finishes.
+fn subagent_contract(roots: Roots<'_>, task: &Task, session_id: &str) -> String {
+    let parent = task.parent_task.as_deref().unwrap_or("-");
+    let mut prompt = format!(
+        "Subagent {id}: {title}\n\
+You are subagent {id} of kanban4ai task {parent}. Work in: {work}\n\
+KANBAN_SESSION={session_id}; use \"$KANBAN_CMD\" for kanban commands.\n",
+        id = task.id,
+        title = task.title,
+        work = roots.work_path.display(),
+    );
+    if task.branch.is_some() {
+        prompt.push_str(if task.seed_commit.is_some() {
+            "- Your checkout is your own branch, seeded from the parent's worktree (its uncommitted edits included). Commit freely; the parent decides whether to merge it.\n"
+        } else {
+            "- Your checkout is your own branch, cut from the project. Commit freely; the parent decides whether to merge it.\n"
+        });
+    }
+    if task.permission() == Some("readonly") {
+        prompt.push_str(
+            "- Readonly (mandatory): investigate and report; do not modify project files or run commands that write into the project.\n",
+        );
+    }
+    prompt.push_str(&format!(
+        "- Run every command in the foreground and wait for it, however long: your session ends with your reply and background jobs die with it.\n\
+- Never ask: nobody answers. Decide unclear points yourself and name them in the summary.\n\
+- Finish, as the final command of your reply, with:\n\
+  \"$KANBAN_CMD\" sub done {id} --session {session_id} --summary \"<result>\"\n\
+  The summary is all the parent reads: what you found or changed, where, and what stays unclear.\n",
+        id = task.id,
+    ));
+    prompt
+}
+
+/// `.kanban/instructions/subagent.md`: instructions only subagents read.
+/// The project-wide `instructions:` and the other role files never reach a
+/// subagent.
+fn append_subagent_instructions(roots: Roots<'_>, prompt: &mut String) {
+    let path = roots.data_path("instructions").join("subagent.md");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let text = text.trim();
+    if !text.is_empty() {
+        prompt.push_str(&format!(
+            "\nProject instructions for subagents (from {}):\n{text}\n",
+            path.display()
+        ));
+    }
 }
 
 /// Small follow-up sent when Codex/pi/omp reopen their native conversation. The
@@ -286,11 +317,22 @@ pub fn build_resume_prompt<'a>(
     role: Role,
 ) -> Result<String> {
     let roots = roots.into();
+    if task.is_subagent() {
+        let mut prompt = format!(
+            "Resume subagent {id}. The board session changed; earlier session ids are superseded.\n\
+KANBAN_SESSION={session_id}. Finish, as the final command of your reply, with: \
+\"$KANBAN_CMD\" sub done {id} --session {session_id} --summary \"<result>\". \
+Continue from the latest state; do not repeat completed work.",
+            id = task.id
+        );
+        if task.permission() == Some("readonly") {
+            prompt.push_str("\nReadonly remains mandatory: do not modify project files.");
+        }
+        append_subagent_instructions(roots, &mut prompt);
+        append_thread_delta(roots, task, previous_session_id, &mut prompt)?;
+        return Ok(prompt);
+    }
     let finish = match role {
-        Role::Executor if task.is_subagent() => format!(
-            "Finish with: \"$KANBAN_CMD\" sub done {} --session {session_id} --summary <result>",
-            task.id
-        ),
         Role::Executor => format!(
             "Finish with: \"$KANBAN_CMD\" done {} --session {session_id} --agent",
             task.id
@@ -329,6 +371,9 @@ record each dispute with \"$KANBAN_CMD\" suggest.",
         );
     }
     append_project_instructions(roots, &mut prompt);
+    if role == Role::Executor {
+        append_open_subagents(roots, task, &mut prompt)?;
+    }
     append_thread_delta(roots, task, previous_session_id, &mut prompt)?;
     Ok(prompt)
 }
@@ -953,41 +998,68 @@ fn append_spawn_helpers(roots: Roots<'_>, task: &Task, prompt: &mut String) -> R
     // Only advertise subagents when spawning is actually possible: a
     // Forbidden policy or a zero max_children would refuse every attempt.
     if effective.policy != SpawnPolicy::Forbidden && effective.max_children > 0 {
-        prompt.push_str(&format!("\nSubagents: for independent parallel side work or cheaper-model research, run \"$KANBAN_CMD\" sub spawn --parent {} <title> --description <instructions> [--readonly]. A subagent starts at once outside the board queue, never appears on the board, and works on its own branch seeded from your worktree (uncommitted edits included). It finishes with its own sub done — you do not finish it. Join with \"$KANBAN_CMD\" sub wait (exit 3: end your reply; you are relaunched, with no deadline, when all of them finish). Then read \"$KANBAN_CMD\" sub output <id> and either \"$KANBAN_CMD\" sub merge <id> into your worktree or \"$KANBAN_CMD\" sub discard <id>. Also: sub send <id> <message>, sub cancel <id>, sub list. Your done is refused while subagents are live. Static up-front DAGs belong to the orchestrator's kanban plan.\n", task.id));
+        prompt.push_str(&format!(
+            "\nSubagents (side work inside your own run; a static graph of visible tasks is kanban plan, not this):\n\
+1. \"$KANBAN_CMD\" sub spawn --parent {id} <title> --description <instructions> [--context <file>]... [--readonly]. \
+It starts at once off the board, on its own branch seeded from your worktree, and sees only the description and the --context excerpts you give it.\n\
+2. \"$KANBAN_CMD\" sub wait declares the wait (exit 3): end your reply. You are relaunched when all of them finish; there is no timer.\n\
+3. \"$KANBAN_CMD\" sub output <id> shows its summary, diffstat and changed files.\n\
+4. \"$KANBAN_CMD\" sub merge <id> into your worktree or \"$KANBAN_CMD\" sub discard <id>; \"$KANBAN_CMD\" sub send <id> <message> asks it a follow-up.\n\
+Never put waiting --eta on subagents, never redo their work, never run done for them. Your own done is refused while they are live.\n",
+            id = task.id
+        ));
         if effective.requires_helper {
             prompt.push_str("Spawn policy (mandatory): create at least one subagent with kanban sub spawn before done; done is refused otherwise.\n");
         }
     }
+    append_open_subagents(roots, task, prompt)?;
+    append_legacy_helpers(roots, task, prompt)
+}
+
+/// The parent's subagents it still has to deal with — not merged or
+/// discarded yet, or failed — as the same compact table its wake note shows.
+fn append_open_subagents(roots: Roots<'_>, task: &Task, prompt: &mut String) -> Result<()> {
+    let table =
+        crate::core::operations::Operations::new(roots.data_root).subagent_table(&task.id, true)?;
+    if !table.is_empty() {
+        prompt.push_str("\nYour subagents still to collect:\n");
+        prompt.push_str(&table);
+    }
+    Ok(())
+}
+
+/// Legacy `spawned: true` helpers (visible board tasks) keep their result
+/// digest.
+fn append_legacy_helpers(roots: Roots<'_>, task: &Task, prompt: &mut String) -> Result<()> {
+    let ops = crate::core::operations::Operations::new(roots.data_root);
     let children: Vec<_> = ops
         .storage
         .get_all_tasks()?
         .into_iter()
-        .filter(|child| child.spawned && child.parent_task.as_deref() == Some(&task.id))
+        .filter(|child| {
+            child.spawned && !child.is_subagent() && child.parent_task.as_deref() == Some(&task.id)
+        })
         .collect();
-    if !children.is_empty() {
-        prompt.push_str("\nSubagents and helpers:\n");
-        let budget = ops
-            .config
-            .get_orchestration()?
-            .orchestrator
-            .upstream_budget_chars
-            .max(0) as usize
-            / children.len();
-        let threads = ThreadManager::new(roots.data_root)?;
-        for child in children {
-            let state = match child.sub_state {
-                Some(state) => state.to_string(),
-                None => child.status.to_string(),
-            };
-            prompt.push_str(&format!("- {} [{state}]: {}\n", child.id, child.title));
-            let finished = match child.sub_state {
-                Some(state) => state.is_terminal(),
-                None => matches!(child.status, TaskStatus::Review | TaskStatus::Done),
-            };
-            if finished {
-                prompt.push_str(&result_digest(&threads, &child.id, budget)?);
-                prompt.push('\n');
-            }
+    if children.is_empty() {
+        return Ok(());
+    }
+    prompt.push_str("\nSpawned helpers (board tasks):\n");
+    let budget = ops
+        .config
+        .get_orchestration()?
+        .orchestrator
+        .upstream_budget_chars
+        .max(0) as usize
+        / children.len();
+    let threads = ThreadManager::new(roots.data_root)?;
+    for child in children {
+        prompt.push_str(&format!(
+            "- {} [{}]: {}\n",
+            child.id, child.status, child.title
+        ));
+        if matches!(child.status, TaskStatus::Review | TaskStatus::Done) {
+            prompt.push_str(&result_digest(&threads, &child.id, budget)?);
+            prompt.push('\n');
         }
     }
     Ok(())

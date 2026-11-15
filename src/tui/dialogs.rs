@@ -49,6 +49,11 @@ pub enum Modal {
     StopTaskConfirm {
         task_id: String,
     },
+    /// Cancel, merge or discard one subagent from its parent's detail.
+    SubagentConfirm {
+        task_id: String,
+        action: SubagentAction,
+    },
     ContinueTask {
         task_id: String,
     },
@@ -95,6 +100,14 @@ pub enum Modal {
     },
 }
 
+/// What the parent detail's subagent hotkeys do (`x`/`m`/`d`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentAction {
+    Cancel,
+    Merge,
+    Discard,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BulkAction {
     ArchiveAllDone,
@@ -121,6 +134,8 @@ pub struct QuestionChoice {
 pub enum DialogField {
     Title,
     Description,
+    /// Project Settings → Prompt: `.kanban/instructions/subagent.md`.
+    SubagentInstructions,
     AgentSettings,
     DesignerAgentSettings,
     ReviewerAgentSettings,
@@ -404,8 +419,9 @@ const SETTINGS_PAGE_EXECUTOR_FIELDS: [DialogField; 16] = [
 
 /// The project's free-form agent instructions. The form reuses the
 /// `Description` textarea, which project settings has no other use for.
-const SETTINGS_PAGE_INSTRUCTIONS_FIELDS: [DialogField; 3] = [
+const SETTINGS_PAGE_INSTRUCTIONS_FIELDS: [DialogField; 4] = [
     DialogField::Description,
+    DialogField::SubagentInstructions,
     DialogField::Confirm,
     DialogField::Cancel,
 ];
@@ -578,7 +594,9 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::ExecutorCheap3
         | DialogField::ExecutorWeekThreshold
         | DialogField::ExecutorFiveHourThreshold => Some(SettingsTab::Executor),
-        DialogField::Description => Some(SettingsTab::Instructions),
+        DialogField::Description | DialogField::SubagentInstructions => {
+            Some(SettingsTab::Instructions)
+        }
         DialogField::BackendOrder => Some(SettingsTab::Backends),
         DialogField::ProjectVisibility => Some(SettingsTab::Projects),
         DialogField::LimitsVisibility => Some(SettingsTab::Limits),
@@ -862,6 +880,9 @@ pub struct ModalState {
     pub editing: bool,
     pub title: TextArea<'static>,
     pub description: TextArea<'static>,
+    /// Project Settings only: `.kanban/instructions/subagent.md`. Boxed:
+    /// every dialog carries the form, and its frames are already large.
+    pub subagent_instructions: Box<TextArea<'static>>,
     pub backend: TextArea<'static>,
     pub model: TextArea<'static>,
     pub effort: TextArea<'static>,
@@ -1017,6 +1038,7 @@ impl ModalState {
             } else {
                 TextArea::default()
             },
+            subagent_instructions: Box::default(),
             backend: one_line(""),
             model: one_line(""),
             effort: one_line(""),
@@ -1203,6 +1225,7 @@ impl ModalState {
             | Modal::BulkConfirm { .. }
             | Modal::KillSessionConfirm { .. }
             | Modal::StopTaskConfirm { .. }
+            | Modal::SubagentConfirm { .. }
             | Modal::ContinuePublishedConfirm { .. }
             | Modal::RestoreConfirm { .. }
             | Modal::QuitConfirm { .. }
@@ -1386,6 +1409,7 @@ impl ModalState {
         Some(match field {
             DialogField::Title => &mut self.title,
             DialogField::Description => &mut self.description,
+            DialogField::SubagentInstructions => &mut self.subagent_instructions,
             DialogField::Answer => &mut self.answer,
             DialogField::SpawnMaxDepth => &mut self.spawn_max_depth,
             DialogField::SpawnMaxChildren => &mut self.spawn_max_children,
@@ -1825,6 +1849,7 @@ impl ModalState {
                 | Modal::BulkConfirm { .. }
                 | Modal::KillSessionConfirm { .. }
                 | Modal::StopTaskConfirm { .. }
+                | Modal::SubagentConfirm { .. }
                 | Modal::RestoreConfirm { .. }
                 | Modal::QuitConfirm { .. }
                 | Modal::DeleteProject { .. }
@@ -2180,6 +2205,11 @@ impl ModalState {
                     super::app::input_multiline(&mut self.description, key);
                 }
             }
+            DialogField::SubagentInstructions => {
+                if !super::app::apply_word_edit(&mut self.subagent_instructions, key) {
+                    super::app::input_multiline(&mut self.subagent_instructions, key);
+                }
+            }
             DialogField::Backend => self.input_select(key, SelectorKind::Backend),
             DialogField::Model => self.input_select(key, SelectorKind::Model),
             DialogField::Effort => self.input_select(key, SelectorKind::Effort),
@@ -2441,6 +2471,7 @@ impl ModalState {
             self.active_field(),
             DialogField::Title
                 | DialogField::Description
+                | DialogField::SubagentInstructions
                 | DialogField::Answer
                 | DialogField::MaxRunningTotal
                 | DialogField::MaxRunningDesigner
@@ -2475,6 +2506,9 @@ impl ModalState {
             }
             DialogField::Description => {
                 self.description.insert_str(&text);
+            }
+            DialogField::SubagentInstructions => {
+                self.subagent_instructions.insert_str(&text);
             }
             DialogField::Answer => {
                 self.answer.insert_str(&text);
@@ -2535,6 +2569,7 @@ impl ModalState {
         match self.active_field() {
             DialogField::Title => &mut self.title,
             DialogField::Description => &mut self.description,
+            DialogField::SubagentInstructions => &mut self.subagent_instructions,
             DialogField::Backend => &mut self.backend,
             DialogField::Model => &mut self.model,
             DialogField::Effort => &mut self.effort,
@@ -3197,6 +3232,7 @@ impl ModalState {
         [
             raw_textarea_text(&self.title),
             raw_textarea_text(&self.description),
+            raw_textarea_text(&self.subagent_instructions),
             raw_textarea_text(&self.backend),
             raw_textarea_text(&self.model),
             raw_textarea_text(&self.effort),
@@ -3556,6 +3592,35 @@ pub fn render(frame: &mut Frame<'_>, app: &App, modal: &mut ModalState, area: Re
                 Line::from(
                     "Stops the agent process and closes the session. The task keeps its status.",
                 ),
+            ],
+            &mut hitboxes,
+        ),
+        Modal::SubagentConfirm { task_id, action } => render_simple_confirm(
+            frame,
+            app,
+            modal,
+            inner,
+            match action {
+                SubagentAction::Merge => app.theme.ok,
+                _ => app.theme.err,
+            },
+            vec![
+                Line::from(format!(
+                    "{} subagent {}?",
+                    match action {
+                        SubagentAction::Cancel => "Cancel",
+                        SubagentAction::Merge => "Merge",
+                        SubagentAction::Discard => "Discard",
+                    },
+                    sanitize_terminal_text(task_id)
+                )),
+                Line::from(match action {
+                    SubagentAction::Cancel => "Kills its run; the parent is woken if it waits.",
+                    SubagentAction::Merge => {
+                        "Merges its branch into the parent's worktree, not the project."
+                    }
+                    SubagentAction::Discard => "Removes its worktree and branch.",
+                }),
             ],
             &mut hitboxes,
         ),
@@ -4338,10 +4403,11 @@ fn description_content_height(modal: &ModalState, row_width: u16) -> u16 {
     (&probe).render(area, &mut scratch);
     let rows =
         u16::try_from(probe.screen_cursor().row.saturating_add(1)).unwrap_or(DESCRIPTION_MAX_ROWS);
-    // The project instructions are alone on their tab, so they take the
-    // whole page (callers clamp to the space left) instead of a small box.
+    // The project instructions share their tab only with the subagent
+    // box, so they take most of the page (callers clamp to the space left)
+    // instead of a small box.
     let min_rows = if matches!(modal.modal, Modal::Settings) {
-        DESCRIPTION_MAX_ROWS
+        DESCRIPTION_MAX_ROWS - SUBAGENT_INSTRUCTIONS_HEIGHT
     } else {
         DESCRIPTION_MIN_ROWS
     };
@@ -4449,6 +4515,8 @@ fn selector_form_rows_from_scroll(
 const DESCRIPTION_MIN_ROWS: u16 = 5;
 /// Maximum visible text rows; additional content scrolls within the field.
 const DESCRIPTION_MAX_ROWS: u16 = 15;
+/// Rows (with borders) of the Prompt tab's subagent-instructions box.
+const SUBAGENT_INSTRUCTIONS_HEIGHT: u16 = 7;
 
 fn task_field_min_height(field: DialogField) -> u16 {
     match field {
@@ -4501,6 +4569,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::InheritFanOut
         | DialogField::InheritExecutor => 1,
         DialogField::Description => DESCRIPTION_MIN_ROWS + 2,
+        DialogField::SubagentInstructions => SUBAGENT_INSTRUCTIONS_HEIGHT,
         DialogField::ProjectVisibility
         | DialogField::LimitsVisibility
         | DialogField::BackendOrder => 4,
@@ -4831,6 +4900,15 @@ fn render_selector_field(
             app,
             modal,
             area,
+            modal.active_field() == field,
+            app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::SubagentInstructions => render_textarea(
+            frame,
+            app,
+            &modal.subagent_instructions,
+            area,
+            "Instructions for subagents only (instructions/subagent.md)",
             modal.active_field() == field,
             app.is_hovered(HitAction::ModalField(field)),
         ),
@@ -6793,6 +6871,7 @@ fn modal_title(modal: &Modal) -> &'static str {
         Modal::BulkConfirm { .. } => " Confirm bulk action ",
         Modal::KillSessionConfirm { .. } => " Kill session ",
         Modal::StopTaskConfirm { .. } => " Stop remote task ",
+        Modal::SubagentConfirm { .. } => " Subagent ",
         Modal::RestoreConfirm { .. } => " Restore task ",
         Modal::QuitConfirm { .. } => " Sync in progress ",
         Modal::AddMessage { .. } => " Add to thread ",

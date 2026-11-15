@@ -148,10 +148,27 @@ async fn board(State(root): State<PathBuf>, Params(id): Params<String>) -> Respo
         blocking(move || {
             let p = project(&root, &id)?;
             let config = crate::core::config::Config::new(&p.data_root).load()?;
-            let tasks = Operations::for_project(&p)
+            let ops = Operations::for_project(&p);
+            // Subagents never enter a column: they ride inside their parent
+            // (`subagents`, each with `kind` and `parent_task`).
+            let mut subagents: std::collections::HashMap<String, Vec<Value>> =
+                std::collections::HashMap::new();
+            for sub in ops.list_subagents(None)? {
+                if let Some(parent) = sub.parent_task.clone() {
+                    subagents.entry(parent).or_default().push(task_wire(sub)?);
+                }
+            }
+            let tasks = ops
                 .list_tasks(None, None, "id", "asc")?
                 .into_iter()
-                .map(task_wire)
+                .map(|task| {
+                    let subs = subagents.remove(&task.id);
+                    let mut value = task_wire(task)?;
+                    if let (Some(subs), Some(map)) = (subs, value.as_object_mut()) {
+                        map.insert("subagents".into(), Value::Array(subs));
+                    }
+                    Ok(value)
+                })
                 .collect::<Result<Vec<_>>>()?;
             Ok(json!({"columns": config.columns, "tasks": tasks}))
         })
@@ -166,7 +183,13 @@ async fn task(
         blocking(move || {
             valid_task(&task)?;
             let p = project(&root, &id)?;
-            let value = found(Operations::for_project(&p).get_task(&task)?)?;
+            let ops = Operations::for_project(&p);
+            let value = found(ops.get_task(&task)?)?;
+            let subagents = ops
+                .subagents_of(&task)?
+                .into_iter()
+                .map(task_wire)
+                .collect::<Result<Vec<_>>>()?;
             let journal = Journal::open(&root)?;
             let runs = journal.runs(&id, &task)?;
             let state = journal.state()?;
@@ -191,7 +214,12 @@ async fn task(
                     })
                 })
                 .collect();
-            Ok(json!({"task": task_wire(value)?, "runs": runs, "conflicts": conflicts}))
+            Ok(json!({
+                "task": task_wire(value)?,
+                "runs": runs,
+                "conflicts": conflicts,
+                "subagents": subagents,
+            }))
         })
         .await,
     )
@@ -2001,6 +2029,69 @@ mod tests {
             server.abort();
             let _ = server.await;
         }
+    }
+
+    #[tokio::test]
+    async fn board_and_task_nest_subagents_in_their_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = temp.path().join("store");
+        let work = temp.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        let p = ProjectStore::at(&store).add(&work, None).unwrap().project;
+        Storage::new(&p.data_root).init_board().unwrap();
+        crate::core::sync::enable_sync(&store).unwrap();
+        let token = issue_token(&store, TokenKind::Node).unwrap();
+        let ops = Operations::for_project(&p);
+        let parent = ops
+            .create_task(crate::core::storage::NewTask::titled("Parent"))
+            .unwrap();
+        let mut sub = ops
+            .create_task(crate::core::storage::NewTask {
+                title: "Child".into(),
+                parent_task: Some(parent.id.clone()),
+                ..Default::default()
+            })
+            .unwrap();
+        sub.kind = Some(crate::core::models::TaskKind::Subagent);
+        sub.sub_state = Some(crate::core::models::SubState::Running);
+        ops.storage.save_task(&sub).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let router = super::super::router(store.join("sync/tokens.yaml"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let http = reqwest::Client::new();
+        let board: Value = http
+            .get(format!("{base}/api/v1/projects/{}/board", p.id))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let tasks = board["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1, "{board}");
+        assert_eq!(tasks[0]["id"], parent.id.as_str());
+        let nested = &tasks[0]["subagents"][0];
+        assert_eq!(nested["id"], sub.id.as_str());
+        assert_eq!(nested["kind"], "subagent");
+        assert_eq!(nested["parent_task"], parent.id.as_str());
+        let detail: Value = http
+            .get(format!(
+                "{base}/api/v1/projects/{}/tasks/{}",
+                p.id, parent.id
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(detail["subagents"][0]["sub_state"], "running");
+        server.abort();
     }
 
     #[tokio::test]

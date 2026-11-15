@@ -588,6 +588,10 @@ is not blank. Native resumes also reread this string, including when returning
 to a previously used backend, so current settings supersede the instructions
 from that backend's earlier run (see `docs/config.md`).
 
+Subagents are the exception: they get neither the project-wide string nor
+`executor.md`, only `<board>/.kanban/instructions/subagent.md` (edited in the
+Prompt tab's second box). No other role ever sees that file.
+
 ## Subagents (`core/subagents.rs`)
 
 A subagent is a child run of the current executor, not a board task. Use it
@@ -598,9 +602,13 @@ alias of `kanban sub spawn`.
 
 - **Storage.** A subagent is a task file with `kind: subagent`, `parent_task`
   and its own `sub_state` (`queued | running | done | failed | cancelled`).
-  It never appears in a board column, `kanban list`, bulk moves or the board
+  It never appears in a board column, column search or counts, `kanban list`
+  (`list --all` nests them under their parent), bulk moves or the board
   queue; `status` stays `in_progress`/`done` only for older readers. Legacy
-  `spawned: true` helpers stay ordinary board tasks.
+  `spawned: true` helpers stay ordinary board tasks. `sub_summary`,
+  `sub_context` and `sub_collected` (`merged | discarded`) are optional
+  fields older readers ignore; the serve API nests subagents in their parent
+  (`subagents`, each with `kind` and `parent_task`).
 - **Launch, outside the queue.** `sub spawn` starts it at once and it never
   counts against `max_running_total` / `max_running_per_role` /
   `max_running_per_backend*`. Its caps are `orchestration.subagents`
@@ -612,16 +620,31 @@ alias of `kanban sub spawn`.
 - **Worktree.** By default (not `--readonly`, or with `--from-parent`) the
   checkout is cut from a snapshot of the parent's worktree, uncommitted edits
   included (`seed_commit`), so the subagent sees exactly what the parent has.
-- **Finish.** `sub done --summary` (or `done` from the subagent's session)
-  records the summary as its result, commits its worktree onto its branch and
-  makes it terminal: no Review, no bot reviewer, no landing. The parent reads
-  `sub output`, then `sub merge` (merge into the parent's worktree; the
-  project changes only when the parent lands) or `sub discard`. `sub send`
-  reruns a finished subagent with a follow-up; `sub cancel` kills it.
-- **Prompt.** A subagent gets a short prompt: the task, heartbeat, `sub done`
-  with the summary, and "never ask" (silence is forced; unclear points go into
-  the summary). No columns, backups, result pin, reviewer or fan-out rules;
-  `max_depth: 1` (default) forbids nested subagents.
+- **Finish.** `sub done --summary` records the summary (required, non-empty;
+  an agent's plain `done` without one is refused) as its result, commits its
+  worktree onto its branch and makes it terminal: no Review, no bot reviewer,
+  no landing. The parent reads `sub output` — the summary, diffstat and
+  changed files, not the thread tail — then `sub merge` (merge into the
+  parent's worktree; the project changes only when the parent lands) or
+  `sub discard`. `sub send` reruns a finished subagent with a follow-up;
+  `sub cancel` kills it.
+- **Prompt (limited context).** A subagent's prompt stays under 2 KB without
+  its task text (pinned by `tests/subagent_prompt_test.rs`): its id and
+  parent, work folder (and whether it was seeded from the parent), readonly,
+  foreground-only commands, "never ask" (unclear points go into the summary)
+  and the one finish command. No columns, Review, backups, result pin,
+  suggest/ask, detach/waiting, heartbeat or fan-out rules (`max_depth: 1`
+  forbids nesting). It never sees the parent's thread, upstream digests or
+  project instructions — only `instructions/subagent.md` and what the parent
+  hands over with `sub spawn --context <file>` (repeatable; under "Context
+  from parent", cut at `subagents.context_budget_chars`, default 4000).
+- **Parent prompt.** The executor's Subagents block is the loop `sub spawn` →
+  `sub wait` (end the reply; woken when all finish, no timer) → `sub output`
+  → `sub merge|discard` / `sub send`, and forbids `waiting --eta` on
+  subagents, redoing their work, or running done for them. Its fresh and
+  resume prompts carry a table (id, state, time, title, one summary line) of
+  the subagents still to collect — not merged/discarded, or failed. The wake
+  note carries the same table for all of them.
 - **Failure.** A crash uses the ordinary backoff ladder
   (`orchestration.auto_restart`), restarting inside the parent's queue; a
   spent ladder, a non-retryable error or a spent auto-resume budget marks it
@@ -651,3 +674,15 @@ on old `spawned: true` helpers keeps its ETA-based wait.
 
 Subagent tokens and time fold into the parent in `stats` and the detail
 panel's analytics line (`subagents N: time · tokens`).
+
+### In the TUI
+
+The parent's card carries `⑂ R▶ D✓ F✗` (running or queued / done / failed or
+cancelled); while it waits in `sub wait` its phase reads `⏳ сабагенты N/M`
+(finished of awaited) instead of a deadline. Its detail view has a
+"Сабагенты" section between analytics and thread: one row per subagent with
+state, backend/model, time, tokens and a summary line. Tab focuses it;
+arrows select, Enter opens the subagent's thread in the same view (Esc
+returns to the parent), and `x` cancel / `m` merge / `d` discard each ask
+first and go through operations. A subagent's own detail is read-only. In
+the Sessions tab a subagent's sessions follow its parent's (`└`).

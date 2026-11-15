@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::core::models::{IntegrationState, RunPhase, Task, TaskStatus};
+use crate::core::models::{IntegrationState, RunPhase, SubState, Task, TaskStatus};
 use crate::core::session::SessionState;
 use crate::core::telemetry::{SessionProgress, TokenBreakdown};
 
@@ -369,12 +369,16 @@ pub fn badges(
             badges.push((label.to_string(), phase_color(&app.theme, task.run_phase)));
         }
         Some(SessionState::Waiting) => {
-            let label = app
-                .board
-                .session_wait_deadlines
-                .get(&task.id)
-                .map(|deadline| format!("⏳ until {}", deadline.format("%H:%M")))
-                .unwrap_or_else(|| "⏳ wait mode".to_string());
+            // A `sub wait` has no deadline: it ends when the subagents do.
+            let label = match app.board.session_wait_subagents.get(&task.id) {
+                Some(awaited) => subagent_wait_label(app, &task.id, awaited),
+                None => app
+                    .board
+                    .session_wait_deadlines
+                    .get(&task.id)
+                    .map(|deadline| format!("⏳ until {}", deadline.format("%H:%M")))
+                    .unwrap_or_else(|| "⏳ wait mode".to_string()),
+            };
             badges.push((label, app.theme.warn));
         }
         Some(SessionState::Crashed) => match task.restart_at {
@@ -388,6 +392,9 @@ pub fn badges(
                 badges.push((label.to_string(), color));
             }
         }
+    }
+    if let Some(label) = subagent_badge(app, &task.id) {
+        badges.push((label, app.theme.focus));
     }
     // Chaining only matters before the task runs: at In Progress the chain
     // already fired (or is moot) and past it the badge is noise, so the badge
@@ -468,6 +475,32 @@ pub fn badges(
         badges.push(("⑂ worktree".to_string(), app.theme.muted));
     }
     badges
+}
+
+/// `⑂ 2▶ 1✓ 0✗`: a parent's subagents running (or queued), done, and
+/// failed or cancelled. `None` without subagents.
+pub fn subagent_badge(app: &App, task_id: &str) -> Option<String> {
+    let subs = app.board.subagents.get(task_id).filter(|s| !s.is_empty())?;
+    let (mut running, mut done, mut failed) = (0, 0, 0);
+    for sub in subs {
+        match sub.sub_state {
+            Some(SubState::Done) => done += 1,
+            Some(SubState::Failed | SubState::Cancelled) => failed += 1,
+            _ => running += 1,
+        }
+    }
+    Some(format!("⑂ {running}▶ {done}✓ {failed}✗"))
+}
+
+/// `⏳ сабагенты 2/5`: how many of the awaited subagents already finished.
+fn subagent_wait_label(app: &App, task_id: &str, awaited: &[String]) -> String {
+    let finished = app.board.subagents.get(task_id).map_or(0, |subs| {
+        subs.iter()
+            .filter(|sub| awaited.contains(&sub.id))
+            .filter(|sub| sub.sub_state.is_some_and(SubState::is_terminal))
+            .count()
+    });
+    format!("⏳ сабагенты {finished}/{}", awaited.len())
 }
 
 /// Role color for a delegated run: blue for design/planning, purple for

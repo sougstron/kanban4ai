@@ -22,5 +22,5 @@ pub use backends::{
     upcoming_run_plan, warm_backend_catalog, warm_opencode_catalog,
 };
 pub use launcher::KanbanLauncher;
-pub use prompt::build_agent_prompt;
+pub use prompt::{build_agent_prompt, build_resume_prompt};
 pub use tmux::{kill_session, session_exists, stop_for_handoff};

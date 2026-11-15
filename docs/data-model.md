@@ -269,6 +269,10 @@ written only when set:
 - `sub_reason` — why it failed or was cancelled.
 - `seed_commit` — the snapshot of the parent's worktree its checkout starts
   from (`--from-parent`).
+- `sub_summary` — the result reported with `sub done --summary`.
+- `sub_context` — the excerpts the parent handed over (`sub spawn --context`),
+  already capped.
+- `sub_collected: merged | discarded` — what the parent did with the result.
 
 The parent stores no list; subagents are found by `parent_task`. A session
 waiting on subagents has no `wait_until` and carries `wait_trigger:
