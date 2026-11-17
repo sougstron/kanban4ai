@@ -164,6 +164,8 @@ pub enum DialogField {
     Theme,
     FollowHyprlandTheme,
     TaskSort,
+    /// Open a task's detail on its Diff tab when it has changes.
+    DetailTabDiff,
     Runner,
     HideKanbanMessages,
     EscapeToProjects,
@@ -219,6 +221,7 @@ pub enum DialogField {
     InheritLimits,
     InheritCommon,
     InheritTaskSort,
+    InheritDetailTab,
     InheritPlacement,
     InheritDesigner,
     InheritReviewer,
@@ -353,7 +356,7 @@ impl SettingsTab {
 /// One settings tab's field page, Save/Cancel inclusive: the buttons render
 /// under every tab and save the whole dialog, not just the visible one. Each
 /// inheritable group leads with its "Inherit from global" checkbox.
-const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 24] = [
+const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 26] = [
     DialogField::Title,
     DialogField::Theme,
     DialogField::FollowHyprlandTheme,
@@ -361,6 +364,8 @@ const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 24] = [
     DialogField::AgentSettings,
     DialogField::InheritTaskSort,
     DialogField::TaskSort,
+    DialogField::InheritDetailTab,
+    DialogField::DetailTabDiff,
     DialogField::InheritPlacement,
     DialogField::Runner,
     DialogField::InheritCommon,
@@ -429,7 +434,7 @@ const SETTINGS_PAGE_INSTRUCTIONS_FIELDS: [DialogField; 4] = [
 /// The Global Settings Common page: the machine-only settings first, then
 /// the global half of every inheritable group on that tab. The other tabs
 /// are the project pages minus their inherit checkbox.
-const GLOBAL_SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 20] = [
+const GLOBAL_SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 21] = [
     DialogField::Theme,
     DialogField::FollowHyprlandTheme,
     DialogField::EscapeToProjects,
@@ -437,6 +442,7 @@ const GLOBAL_SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 20] = [
     DialogField::UpdateCheckOnOpen,
     DialogField::AgentSettings,
     DialogField::TaskSort,
+    DialogField::DetailTabDiff,
     DialogField::Runner,
     DialogField::HideKanbanMessages,
     DialogField::AutoRestartEnabled,
@@ -555,6 +561,7 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::Runner
         | DialogField::InheritPlacement
         | DialogField::HideKanbanMessages
+        | DialogField::DetailTabDiff
         | DialogField::QueueEnabled
         | DialogField::MaxRunningTotal
         | DialogField::MaxRunningDesigner
@@ -569,6 +576,7 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::InheritLimits
         | DialogField::InheritCommon
         | DialogField::InheritTaskSort
+        | DialogField::InheritDetailTab
         | DialogField::EscapeToProjects
         | DialogField::ProjectSort
         | DialogField::UpdateCheckOnOpen => Some(SettingsTab::Common),
@@ -617,6 +625,7 @@ pub(crate) fn inherit_checkbox_group(field: DialogField) -> Option<InheritGroup>
         DialogField::InheritLimits => Some(InheritGroup::Limits),
         DialogField::InheritCommon => Some(InheritGroup::Common),
         DialogField::InheritTaskSort => Some(InheritGroup::TaskSort),
+        DialogField::InheritDetailTab => Some(InheritGroup::DetailTab),
         DialogField::InheritPlacement => Some(InheritGroup::Placement),
         DialogField::InheritDesigner => Some(InheritGroup::Designer),
         DialogField::InheritReviewer => Some(InheritGroup::Reviewer),
@@ -650,6 +659,7 @@ pub(crate) fn field_group(field: DialogField) -> Option<InheritGroup> {
         | DialogField::AutoRestartEnabled
         | DialogField::AutoRestartDelays => Some(InheritGroup::Common),
         DialogField::TaskSort => Some(InheritGroup::TaskSort),
+        DialogField::DetailTabDiff => Some(InheritGroup::DetailTab),
         DialogField::Runner => Some(InheritGroup::Placement),
         DialogField::DesignerEnabled
         | DialogField::DesignerAgentSettings
@@ -956,6 +966,7 @@ pub struct ModalState {
     pub task_sort_selected: usize,
     pub follow_hyprland_theme: bool,
     pub hide_kanban_messages: bool,
+    pub detail_tab_diff: bool,
     pub project_sort_options: Vec<SelectOption>,
     pub project_sort_selected: usize,
     /// Global Settings Projects tab: every registered project with whether
@@ -1107,6 +1118,7 @@ impl ModalState {
             task_sort_selected: 0,
             follow_hyprland_theme: false,
             hide_kanban_messages: false,
+            detail_tab_diff: false,
             project_sort_options: Vec::new(),
             project_sort_selected: 0,
             project_visibility: Vec::new(),
@@ -2374,6 +2386,7 @@ impl ModalState {
                 toggle_on_space(&mut self.follow_hyprland_theme, key)
             }
             DialogField::HideKanbanMessages => toggle_on_space(&mut self.hide_kanban_messages, key),
+            DialogField::DetailTabDiff => toggle_on_space(&mut self.detail_tab_diff, key),
             DialogField::QueueEnabled => toggle_on_space(&mut self.queue_enabled, key),
             DialogField::MaxRunningTotal => input_single_line(&mut self.max_running_total, key),
             DialogField::MaxRunningDesigner => {
@@ -2439,6 +2452,7 @@ impl ModalState {
             | DialogField::InheritLimits
             | DialogField::InheritCommon
             | DialogField::InheritTaskSort
+            | DialogField::InheritDetailTab
             | DialogField::InheritPlacement
             | DialogField::InheritDesigner
             | DialogField::InheritReviewer
@@ -2605,7 +2619,9 @@ impl ModalState {
             DialogField::Answer => &mut self.answer,
             DialogField::Theme => &mut self.theme,
             DialogField::TaskSort => &mut self.task_sort,
-            DialogField::FollowHyprlandTheme | DialogField::HideKanbanMessages => &mut self.answer,
+            DialogField::FollowHyprlandTheme
+            | DialogField::HideKanbanMessages
+            | DialogField::DetailTabDiff => &mut self.answer,
             DialogField::MaxRunningTotal => &mut self.max_running_total,
             DialogField::MaxRunningDesigner => &mut self.max_running_designer,
             DialogField::MaxRunningReviewer => &mut self.max_running_reviewer,
@@ -2651,6 +2667,7 @@ impl ModalState {
             | DialogField::InheritLimits
             | DialogField::InheritCommon
             | DialogField::InheritTaskSort
+            | DialogField::InheritDetailTab
             | DialogField::InheritPlacement
             | DialogField::InheritDesigner
             | DialogField::InheritReviewer
@@ -3268,6 +3285,7 @@ impl ModalState {
             raw_textarea_text(&self.task_sort),
             self.task_sort_selected.to_string(),
             self.hide_kanban_messages.to_string(),
+            self.detail_tab_diff.to_string(),
             self.escape_to_projects.to_string(),
             self.update_check_on_open.to_string(),
             raw_textarea_text(&self.project_sort),
@@ -4539,6 +4557,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::QueueEnabled
         | DialogField::FollowHyprlandTheme
         | DialogField::HideKanbanMessages
+        | DialogField::DetailTabDiff
         | DialogField::AutoRestartEnabled
         | DialogField::DesignerEnabled
         | DialogField::ReviewerEnabled
@@ -4563,6 +4582,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::InheritLimits
         | DialogField::InheritCommon
         | DialogField::InheritTaskSort
+        | DialogField::InheritDetailTab
         | DialogField::InheritPlacement
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
@@ -5212,6 +5232,15 @@ fn render_selector_field(
             modal.hide_kanban_messages,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
+        DialogField::DetailTabDiff => render_checkbox(
+            frame,
+            app,
+            area,
+            "Task screen",
+            "open on Diff when the task has changes",
+            modal.detail_tab_diff,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
         DialogField::ProjectSort => render_select(
             frame,
             app,
@@ -5550,6 +5579,7 @@ fn render_selector_field(
         | DialogField::InheritLimits
         | DialogField::InheritCommon
         | DialogField::InheritTaskSort
+        | DialogField::InheritDetailTab
         | DialogField::InheritPlacement
         | DialogField::InheritDesigner
         | DialogField::InheritReviewer
@@ -5587,6 +5617,7 @@ fn render_inherit_checkbox(
         InheritGroup::Limits => "limits",
         InheritGroup::Common => "thread & restarts",
         InheritGroup::TaskSort => "task sorting",
+        InheritGroup::DetailTab => "task screen",
         InheritGroup::Designer => "designer",
         InheritGroup::Reviewer => "reviewer",
         InheritGroup::Executor => "executors",
@@ -6935,6 +6966,7 @@ pub(crate) fn is_flag_field(field: DialogField) -> bool {
             | DialogField::UpdateCheckOnOpen
             | DialogField::FollowHyprlandTheme
             | DialogField::HideKanbanMessages
+            | DialogField::DetailTabDiff
             | DialogField::QueueEnabled
             | DialogField::AutoRestartEnabled
             | DialogField::DesignerEnabled
@@ -6946,6 +6978,7 @@ pub(crate) fn is_flag_field(field: DialogField) -> bool {
             | DialogField::InheritLimits
             | DialogField::InheritCommon
             | DialogField::InheritTaskSort
+            | DialogField::InheritDetailTab
             | DialogField::InheritPlacement
             | DialogField::InheritDesigner
             | DialogField::InheritReviewer

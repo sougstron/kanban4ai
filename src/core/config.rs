@@ -118,6 +118,7 @@ tui:
   max_tasks_per_column: 100
   theme: textual-dark
   task_sort: task_number
+  detail_tab: thread
   show_limits: true
   hide_kanban_messages: false
 auto_launch:
@@ -346,6 +347,7 @@ inherit:
   limits: true
   common: true
   task_sort: true
+  detail_tab: true
   designer: true
   reviewer: true
   executor: true
@@ -636,6 +638,8 @@ pub enum InheritGroup {
     Common,
     /// `tui.task_sort`.
     TaskSort,
+    /// `tui.detail_tab`: the tab a task's detail opens on (`thread` | `diff`).
+    DetailTab,
     Designer,
     Reviewer,
     Executor,
@@ -644,11 +648,12 @@ pub enum InheritGroup {
 }
 
 impl InheritGroup {
-    pub const ALL: [InheritGroup; 9] = [
+    pub const ALL: [InheritGroup; 10] = [
         InheritGroup::Agent,
         InheritGroup::Limits,
         InheritGroup::Common,
         InheritGroup::TaskSort,
+        InheritGroup::DetailTab,
         InheritGroup::Designer,
         InheritGroup::Reviewer,
         InheritGroup::Executor,
@@ -663,6 +668,7 @@ impl InheritGroup {
             InheritGroup::Limits => "limits",
             InheritGroup::Common => "common",
             InheritGroup::TaskSort => "task_sort",
+            InheritGroup::DetailTab => "detail_tab",
             InheritGroup::Designer => "designer",
             InheritGroup::Reviewer => "reviewer",
             InheritGroup::Executor => "executor",
@@ -699,6 +705,7 @@ impl InheritGroup {
                 orch_has("auto_restart") || config.tui.contains_key("hide_kanban_messages")
             }
             InheritGroup::TaskSort => config.tui.contains_key("task_sort"),
+            InheritGroup::DetailTab => config.tui.contains_key("detail_tab"),
             InheritGroup::Placement => !config.runner.is_empty(),
             InheritGroup::Designer
             | InheritGroup::Reviewer
@@ -710,11 +717,11 @@ impl InheritGroup {
 
 /// Per-group "take this from the global config" switches (`inherit:`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InheritFlags([bool; 9]);
+pub struct InheritFlags([bool; 10]);
 
 impl InheritFlags {
     pub fn all(inherit: bool) -> Self {
-        Self([inherit; 9])
+        Self([inherit; 10])
     }
 
     pub fn get(&self, group: InheritGroup) -> bool {
@@ -792,6 +799,7 @@ pub fn copy_group(dst: &mut BoardConfig, src: &BoardConfig, group: InheritGroup)
             copy_key(&mut dst.tui, &src.tui, "hide_kanban_messages");
         }
         InheritGroup::TaskSort => copy_key(&mut dst.tui, &src.tui, "task_sort"),
+        InheritGroup::DetailTab => copy_key(&mut dst.tui, &src.tui, "detail_tab"),
         InheritGroup::Placement => dst.runner = src.runner.clone(),
         InheritGroup::Designer
         | InheritGroup::Reviewer

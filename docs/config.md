@@ -55,6 +55,10 @@ auto-loaded into every agent session. Read it when you are reading or adding a s
   source of Konsole's `Hypr` scheme) and update live when it switches;
   `theme` stays the fallback when those files are missing, and `Ctrl+T` is
   disabled while following.
+- `detail_tab`: `thread` (default) or `diff` — the tab a task's detail opens
+  on. `diff` switches to the Diff tab once the task's diff arrives with
+  changes (worktree, branch, landed commit or backups, e.g. in Review); a task
+  without changes stays on the thread. **Task screen** in Settings → Common.
 - `task_sort`: `task_number` (default, ascending TASK id), `task_number_desc`
   (descending TASK id — highest task number first; doubles as the
   queue-priority control for the dispatcher), `updated_at_asc` (least recently
@@ -156,7 +160,7 @@ they are edited: press `s` on the Projects screen. Saved under the store
 - `updates.notify`: false - reserved for firing a desktop notification on a
   newly seen version; the status-line banner is the only surface for now.
 - `auto_launch:`, `agents:`, the group keys of `orchestration:`, and
-  `tui.task_sort` / `tui.hide_kanban_messages`: the global half of the
+  `tui.task_sort` / `tui.detail_tab` / `tui.hide_kanban_messages`: the global half of the
   inheritable groups below, same shapes as in the project file. Absent keys
   read as the built-in defaults. Edited on the Global Settings tabs.
 - `net.tailscale.mode`: `off` (default), `system` (read-only status of the installed systemd/kernel-tun Tailscale service), or `managed` (private userspace sidecar supervised by TUI/daemon/serve). System login/logout and service lifecycle belong to the administrator; `net up/down/logout` refuse to change that service.
@@ -227,6 +231,7 @@ choice in a top-level `inherit:` section:
 | `limits` | `orchestration.queue_enabled`, `max_running_total`, `max_running_per_backend`, `max_running_per_backend_model`, `max_running_per_role` |
 | `common` | `orchestration.auto_restart`, `tui.hide_kanban_messages` |
 | `task_sort` | `tui.task_sort` |
+| `detail_tab` | `tui.detail_tab` |
 | `designer` | `orchestration.designer` |
 | `reviewer` | `orchestration.reviewer` |
 | `executor` | `orchestration.executors` |

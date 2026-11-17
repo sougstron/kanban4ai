@@ -129,6 +129,9 @@ pub struct TuiSettings {
     pub hidden_limits: Vec<String>,
     /// Hide thread messages authored by kanban (audit notes). Display filter only.
     pub hide_kanban_messages: bool,
+    /// A task's detail opens on the Diff tab when the task has changes
+    /// (`tui.detail_tab: diff`); otherwise on the Thread tab.
+    pub detail_tab_diff: bool,
     /// Task detail shows the full Task block and the Analytics panel instead
     /// of the two-row summary header (`z` / click toggles, saved per board).
     pub detail_header_expanded: bool,
@@ -400,6 +403,10 @@ pub struct DiffView {
     pub max_scroll: u16,
     /// On the next paint, scroll the file list so the selected row is visible.
     pub follow_selected: bool,
+    /// Switch to the Diff tab once the first diff arrives with changes — the
+    /// `tui.detail_tab: diff` default. Cleared by that first diff or by the
+    /// user picking a tab first.
+    pub open_when_loaded: bool,
 }
 
 impl DiffView {
@@ -3595,6 +3602,7 @@ impl App {
             return;
         }
         detail.diff.open = open;
+        detail.diff.open_when_loaded = false;
         detail.diff.follow_selected = detail.diff.open;
         detail.focus = DetailFocus::Thread;
         self.status = if detail.diff.open {
@@ -3666,8 +3674,16 @@ impl App {
         let Some(detail) = self.detail.as_mut().filter(|d| d.task_id == task_id) else {
             return;
         };
+        let on_thread = detail.focus == DetailFocus::Thread;
         let view = &mut detail.diff;
         view.loaded = true;
+        if std::mem::take(&mut view.open_when_loaded)
+            && on_thread
+            && diff.as_ref().is_some_and(|diff| !diff.files.is_empty())
+        {
+            view.open = true;
+            view.follow_selected = true;
+        }
         if view.diff != diff {
             view.diff = diff;
             let selected = view.selected.min(view.file_count().saturating_sub(1));
@@ -3846,6 +3862,7 @@ impl App {
         if global_changed && let Ok(effective) = load_settings(&self.ops) {
             self.settings.task_sort = effective.task_sort;
             self.settings.hide_kanban_messages = effective.hide_kanban_messages;
+            self.settings.detail_tab_diff = effective.detail_tab_diff;
             let global = self.ops.config.load_global().0;
             self.settings.backend_order = global.backend_order();
             self.settings.hidden_backends = global.hidden_backends();
@@ -5184,7 +5201,12 @@ impl App {
                 .map_or(0, |(selected, _)| *selected),
             subagent_count,
             back_to: preserved_subagents.and_then(|(_, back_to)| back_to),
-            diff: preserved_diff.unwrap_or_default(),
+            // A fresh open waits for the diff before honoring a Diff default,
+            // so tasks without changes stay on the thread.
+            diff: preserved_diff.unwrap_or_else(|| DiffView {
+                open_when_loaded: self.settings.detail_tab_diff,
+                ..DiffView::default()
+            }),
         };
         // A fresh open stays on the thread so Esc closes the detail at once.
         // Plain letters still jump into the review editor (or the answer box)
@@ -8107,6 +8129,7 @@ impl App {
                 if let Ok(effective) = load_settings(&self.ops) {
                     self.settings.task_sort = effective.task_sort;
                     self.settings.hide_kanban_messages = effective.hide_kanban_messages;
+                    self.settings.detail_tab_diff = effective.detail_tab_diff;
                 }
                 self.apply_theme();
                 self.refresh_after_action()?;
@@ -9589,10 +9612,12 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::TaskSort => Some(modal.task_sort_selected),
         DialogField::FollowHyprlandTheme
         | DialogField::HideKanbanMessages
+        | DialogField::DetailTabDiff
         | DialogField::InheritAgent
         | DialogField::InheritLimits
         | DialogField::InheritCommon
         | DialogField::InheritTaskSort
+        | DialogField::InheritDetailTab
         | DialogField::InheritPlacement
         | DialogField::Runner
         | DialogField::InheritDesigner
@@ -9762,6 +9787,7 @@ fn default_project_settings() -> TuiSettings {
         show_limits: true,
         hidden_limits: Vec::new(),
         hide_kanban_messages: false,
+        detail_tab_diff: false,
         detail_header_expanded: false,
         limits_refresh_interval: crate::core::limits::DEFAULT_REFRESH_INTERVAL,
     }
@@ -9796,6 +9822,7 @@ fn fill_settings_group(modal: &mut ModalState, config: &BoardConfig, group: Inhe
                     .to_string(),
             ]);
         }
+        InheritGroup::DetailTab => modal.detail_tab_diff = detail_tab_is_diff(&config.tui),
         InheritGroup::Placement => {
             modal.runner = Some(config.runner_for(None));
         }
@@ -9896,6 +9923,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
         show_limits: tui_bool(&config.tui, "show_limits", true),
         hidden_limits: Vec::new(),
         hide_kanban_messages: tui_bool(&config.tui, "hide_kanban_messages", false),
+        detail_tab_diff: detail_tab_is_diff(&config.tui),
         detail_header_expanded: tui_bool(&config.tui, "detail_header_expanded", false),
         limits_refresh_interval: ops
             .config
@@ -9903,6 +9931,14 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
             .unwrap_or(crate::core::limits::DEFAULT_REFRESH_INTERVAL)
             .max(30),
     })
+}
+
+/// Whether `tui.detail_tab` asks for the Diff tab; anything else (absent,
+/// `thread`, unknown) opens the Thread tab.
+fn detail_tab_is_diff(tui: &Mapping) -> bool {
+    tui.get("detail_tab")
+        .and_then(Value::as_str)
+        .is_some_and(|tab| tab.trim().eq_ignore_ascii_case("diff"))
 }
 
 /// `sort_tasks` arguments for a `tui.task_sort` setting.
@@ -10552,6 +10588,19 @@ fn apply_settings_groups(
         config.tui.insert(
             Value::String("task_sort".to_string()),
             Value::String(draft.task_sort.clone()),
+        );
+    }
+    if edits(InheritGroup::DetailTab) {
+        config.tui.insert(
+            Value::String("detail_tab".to_string()),
+            Value::String(
+                if modal.detail_tab_diff {
+                    "diff"
+                } else {
+                    "thread"
+                }
+                .to_string(),
+            ),
         );
     }
     if edits(InheritGroup::Common) {

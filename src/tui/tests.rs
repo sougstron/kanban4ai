@@ -12892,7 +12892,12 @@ fn inherited_groups_show_global_values_and_cannot_be_focused() {
     assert!(modal.field_enabled(DialogField::InheritAgent));
     assert!(modal.field_enabled(DialogField::Theme));
 
-    // Disabled rows are not clickable.
+    // Disabled rows are not clickable. The page scrolls: bring the limits
+    // group into view first.
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::InheritLimits);
     let _ = render_at(&mut app, 120, 60);
     assert!(
         !app.hitboxes
@@ -14899,4 +14904,101 @@ fn ctrl_o_on_the_diff_tab_opens_the_selected_files_folder() {
     assert_eq!(opened(&mut app), dir.path().to_string_lossy());
     app.handle_key(key(KeyCode::Down)).unwrap();
     assert_eq!(opened(&mut app), dir.path().join("src").to_string_lossy());
+}
+
+/// `tui.detail_tab: diff` opens a task on its Diff tab once the diff shows
+/// changes; a task without changes stays on the thread.
+#[test]
+fn detail_tab_diff_setting_opens_tasks_with_changes_on_the_diff_tab() {
+    let (dir, mut app) = app_with_board();
+    app.settings.detail_tab_diff = true;
+    let plain = app.ops.create_task(NewTask::titled("Plain card")).unwrap();
+    let changed = app.ops.create_task(NewTask::titled("Diff card")).unwrap();
+    let backups = dir.path().join(".kanban/backups").join(&changed.id);
+    std::fs::create_dir_all(&backups).unwrap();
+    std::fs::write(backups.join("notes.md"), "old\n").unwrap();
+    std::fs::write(dir.path().join("notes.md"), "new\n").unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    // Both cards share a column: Enter opens the focused one, Esc returns.
+    let open = |app: &mut App, second: bool| {
+        if app.detail.is_some() {
+            app.handle_key(key(KeyCode::Esc)).unwrap();
+        }
+        app.clamp_focus();
+        app.handle_key(key(KeyCode::Up)).unwrap();
+        if second {
+            app.handle_key(key(KeyCode::Down)).unwrap();
+        }
+        app.handle_key(key(KeyCode::Enter)).unwrap();
+    };
+
+    open(&mut app, false);
+    assert_eq!(app.detail.as_ref().unwrap().task_id, plain.id);
+    app.tick().unwrap();
+    let detail = app.detail.as_ref().unwrap();
+    assert!(!detail.diff.open, "no changes: the thread stays");
+    assert!(!detail.diff.open_when_loaded);
+
+    open(&mut app, true);
+    assert_eq!(app.detail.as_ref().unwrap().task_id, changed.id);
+    assert!(
+        !app.detail.as_ref().unwrap().diff.open,
+        "waits for the diff"
+    );
+    app.tick().unwrap();
+    assert!(app.detail.as_ref().unwrap().diff.open, "changes: Diff tab");
+
+    // Alt+← back to the thread sticks across later diff refreshes.
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT))
+        .unwrap();
+    app.tick().unwrap();
+    assert!(!app.detail.as_ref().unwrap().diff.open);
+
+    // The default (thread) never switches on its own.
+    app.settings.detail_tab_diff = false;
+    open(&mut app, false);
+    open(&mut app, true);
+    assert_eq!(app.detail.as_ref().unwrap().task_id, changed.id);
+    app.tick().unwrap();
+    assert!(!app.detail.as_ref().unwrap().diff.open);
+}
+
+#[test]
+fn project_settings_save_the_detail_tab_and_inherit_it_by_default() {
+    let (_store, mut app) = inherit_settings_app(true);
+    assert!(
+        !app.settings.detail_tab_diff,
+        "global default is the thread"
+    );
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    {
+        let modal = app.modal.as_mut().unwrap();
+        assert!(
+            modal
+                .inherit
+                .get(crate::core::config::InheritGroup::DetailTab)
+        );
+        assert!(!modal.field_enabled(DialogField::DetailTabDiff));
+        modal.focus_field(DialogField::InheritDetailTab);
+    }
+    app.handle_key(key(KeyCode::Char(' ')))
+        .expect("untick task screen");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::DetailTabDiff);
+    app.handle_key(key(KeyCode::Char(' '))).expect("tick diff");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .focus_field(DialogField::Confirm);
+    app.handle_key(key(KeyCode::Enter)).expect("save");
+    assert!(app.modal.is_none(), "{:?}", app.status);
+
+    let raw = raw_project_config(&app);
+    assert_eq!(raw["inherit"]["detail_tab"].as_bool(), Some(false));
+    assert_eq!(raw["tui"]["detail_tab"].as_str(), Some("diff"));
+    assert!(app.settings.detail_tab_diff);
 }
