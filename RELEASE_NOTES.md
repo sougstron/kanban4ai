@@ -1,3 +1,12 @@
+# kanban4ai 0.8.21
+
+Notes are from the reviewed diff since 0.8.20. There were no `.changes/` logs.
+
+- **Alt+←/→ switch the detail's Thread │ Diff tabs.** From any panel, Alt+→ opens the Diff tab and focuses the lower panel; Alt+← returns to Thread. The same arrow again does not toggle. Clicking a tab label still switches. The `g` binding is gone. The tab-strip hint is `M-←→`, and the compact header's file count ends in `M-→`.
+- **Those chords no longer delete a word in the detail.** The detail always owns Alt+←/→ for the tabs, so word deletion in its text panels stays on Alt+Backspace and Alt+Delete. Dialog text fields still delete a word with Alt+←/→ where no tabs own the chord.
+
+Board files stay loadable by 0.8.20. Project `config.yaml`, the store format (5), the sync protocol (3), and journal records are unchanged.
+
 # kanban4ai 0.8.20
 
 Notes are from the reviewed diff since 0.8.19. There were no `.changes/` logs.
