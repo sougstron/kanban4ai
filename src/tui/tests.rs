@@ -14825,3 +14825,52 @@ fn alt_arrows_switch_the_diff_tab_and_enter_or_a_click_expands_a_file() {
     let back = render_at(&mut app, 96, 28);
     assert!(back.contains("MSG-001"), "{back}");
 }
+
+/// `Ctrl+O` on the Diff tab hands the selected file's folder to the file
+/// manager; a deleted file falls back to its nearest existing folder.
+#[test]
+fn ctrl_o_on_the_diff_tab_opens_the_selected_files_folder() {
+    let (dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Diff card")).unwrap();
+    let backups = dir.path().join(".kanban/backups").join(&task.id);
+    std::fs::create_dir_all(backups.join("gone/deep")).unwrap();
+    std::fs::create_dir_all(backups.join("src")).unwrap();
+    std::fs::write(backups.join("gone/deep/x.txt"), "old\n").unwrap();
+    std::fs::write(backups.join("src/a.txt"), "one\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.txt"), "ONE\n").unwrap();
+    let store_dir = tempfile::tempdir().expect("store");
+    let marker = store_dir.path().join("marker");
+    let store = ProjectStore::at(store_dir.path());
+    let mut config = store.load_global_config().expect("global config");
+    config.tui.insert(
+        serde_yaml_ng::Value::String("file_manager".to_string()),
+        serde_yaml_ng::Value::String(format!("sh -c 'printf %s \"$0\" > {}'", marker.display())),
+    );
+    store.save_global_config(&config).expect("save config");
+    app.set_project_store(store);
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    app.tick().unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT))
+        .unwrap();
+
+    let ctrl_o = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    let opened = |app: &mut App| {
+        let _ = std::fs::remove_file(&marker);
+        app.handle_key(ctrl_o).unwrap();
+        assert!(app.status.starts_with("Opened "), "{}", app.status);
+        for _ in 0..200 {
+            if let Ok(content) = std::fs::read_to_string(&marker) {
+                return content;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("opener never ran");
+    };
+    // Files list sorted: gone/deep/x.txt first, src/a.txt second.
+    assert_eq!(opened(&mut app), dir.path().to_string_lossy());
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    assert_eq!(opened(&mut app), dir.path().join("src").to_string_lossy());
+}

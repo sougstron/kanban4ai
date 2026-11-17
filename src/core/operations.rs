@@ -2641,6 +2641,30 @@ impl Operations {
         })
     }
 
+    /// The folder holding a file of the task's diff, for the file manager: in
+    /// the worktree when the diff came from it, else in the work folder. A
+    /// deleted file (or a branch file not landed yet) falls back to its
+    /// nearest folder that still exists.
+    pub fn diff_file_folder(
+        &self,
+        task: &Task,
+        source: &task_diff::DiffSource,
+        rel: &str,
+    ) -> PathBuf {
+        let root = match source {
+            task_diff::DiffSource::Worktree => self
+                .task_worktree_path(task)
+                .unwrap_or_else(|| self.work_path().to_path_buf()),
+            _ => self.work_path().to_path_buf(),
+        };
+        let mut folder = root.join(rel);
+        folder.pop();
+        while !folder.is_dir() && folder.starts_with(&root) && folder != root {
+            folder.pop();
+        }
+        if folder.is_dir() { folder } else { root }
+    }
+
     /// Ingest an orchestrator plan: validate the whole graph, then create the
     /// subtasks and wire the edges. The orchestrated task itself becomes the
     /// join node — it depends on every node it planned, so it runs again (as
