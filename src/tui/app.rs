@@ -1706,9 +1706,6 @@ impl App {
             (KeyCode::Char('z'), _) if self.screen == Screen::Detail => {
                 self.dispatch(UiAction::ToggleDetailHeader)?
             }
-            (KeyCode::Char('g'), _) if self.screen == Screen::Detail => {
-                self.dispatch(UiAction::ToggleDiffTab)?
-            }
             (KeyCode::Enter, _) if self.diff_tab_open() => {
                 let selected = self.detail.as_ref().map_or(0, |d| d.diff.selected);
                 self.dispatch(UiAction::ToggleDiffFile(selected))?
@@ -1857,8 +1854,8 @@ impl App {
         // Alt+arrows are global block navigation: up/down jump straight to
         // the panel above/below (thread → answer → review editor) from any
         // caret or variant position, without first walking to a panel edge.
-        // Left/right are not navigation (the detail has no tabs), so they
-        // reach the focused panel, where Alt+←/→ delete a word.
+        // Left/right switch the lower panel's Thread │ Diff tabs, from any
+        // panel, so they never reach a text panel's word deletion here.
         if key.modifiers.contains(KeyModifiers::ALT)
             && !key.modifiers.contains(KeyModifiers::CONTROL)
         {
@@ -1869,6 +1866,10 @@ impl App {
                 }
                 KeyCode::Down => {
                     self.move_detail_block(1);
+                    return Ok(true);
+                }
+                KeyCode::Left | KeyCode::Right => {
+                    self.set_diff_tab(key.code == KeyCode::Right);
                     return Ok(true);
                 }
                 _ => {}
@@ -1889,7 +1890,7 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && !matches!(
                 ch,
-                'p' | 'v' | 'L' | '[' | ']' | 'q' | '?' | 'l' | '/' | 'z' | 'g'
+                'p' | 'v' | 'L' | '[' | ']' | 'q' | '?' | 'l' | '/' | 'z'
             )
         {
             self.status = "Subagent: control it from its parent (Esc)".to_string();
@@ -3545,16 +3546,23 @@ impl App {
     }
 
     fn toggle_diff_tab(&mut self) {
+        let open = self.detail.as_ref().is_some_and(|detail| !detail.diff.open);
+        self.set_diff_tab(open);
+    }
+
+    /// Alt+← shows the Thread tab, Alt+→ the Diff tab; either focuses it.
+    fn set_diff_tab(&mut self, open: bool) {
         let Some(detail) = self.detail.as_mut() else {
             return;
         };
-        detail.diff.open = !detail.diff.open;
-        detail.diff.follow_selected = detail.diff.open;
-        if detail.diff.open {
-            detail.focus = DetailFocus::Thread;
+        if detail.diff.open == open && detail.focus == DetailFocus::Thread {
+            return;
         }
+        detail.diff.open = open;
+        detail.diff.follow_selected = detail.diff.open;
+        detail.focus = DetailFocus::Thread;
         self.status = if detail.diff.open {
-            "Diff: ↑/↓ file · Enter expand · g back to thread"
+            "Diff: ↑/↓ file · Enter expand · Alt+← back to thread"
         } else {
             "Thread"
         }

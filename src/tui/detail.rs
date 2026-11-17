@@ -640,7 +640,7 @@ fn render_meta_compact(
         ));
         let count = diff.files.len();
         second.push(Span::styled(
-            format!(" · {count} file{} · g", if count == 1 { "" } else { "s" }),
+            format!(" · {count} file{} · M-→", if count == 1 { "" } else { "s" }),
             muted,
         ));
     }
@@ -675,7 +675,7 @@ fn render_meta_compact(
 }
 
 /// The lower panel's tab strip, drawn as its border title:
-/// ` Thread │ Diff +12 −3 (2) · g `, the active tab bold. `diff_start` and
+/// ` Thread │ Diff +12 −3 (2) · M-←→ `, the active tab bold. `diff_start` and
 /// `diff_end` are the Diff tab's columns within the title, for its hitbox.
 struct TabTitle {
     line: Line<'static>,
@@ -712,9 +712,9 @@ fn panel_tab_title(theme: &Theme, view: &DiffView) -> TabTitle {
         diff_text.push_str(&count);
     }
     let hint = if view.open {
-        " · ↑↓ Enter · g "
+        " · ↑↓ Enter · M-←→ "
     } else {
-        " · g "
+        " · M-←→ "
     };
     spans.push(Span::styled(hint, idle));
     diff_text.push_str(hint);

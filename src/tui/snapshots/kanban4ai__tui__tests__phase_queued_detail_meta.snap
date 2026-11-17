@@ -11,7 +11,7 @@ expression: output
 ┌ Analytics ───────────────────────────────────────────────────────────────────────────────────────┐
 │No agent runs recorded yet                                                                        │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Thread │ Diff · g ───────────────────────────────────────────────────────────────────────────────┐
+┌ Thread │ Diff · M-←→ ────────────────────────────────────────────────────────────────────────────┐
 │MSG-001 · <timestamp> · system · open                                                             │
 │Task created: Detail phase                                                                        │
 │Status: todo                                                                                      │
@@ -71,8 +71,8 @@ expression: output
 9:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 9:1-9 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold().underlined()
 9:9-10 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-9:10-20 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-9:20-100 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+9:10-23 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+9:23-100 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 10:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 10:1-45 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 10:45-99 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

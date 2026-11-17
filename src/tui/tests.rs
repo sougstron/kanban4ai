@@ -2079,7 +2079,7 @@ fn alt_left_right_is_a_noop_without_tabs() {
 /// has no tabs — change neither focus nor text. With an open question the
 /// answer panel joins the ladder, even from a mid-list variant selection.
 #[test]
-fn detail_alt_arrows_jump_blocks_and_ignore_left_right() {
+fn detail_alt_arrows_jump_blocks_and_switch_the_diff_tab() {
     let (_dir, mut app) = open_focused_review_editor("abcdef");
     // Park the caret mid-text: plain Up/Down stay in the editor.
     app.handle_key(key(KeyCode::Home)).unwrap();
@@ -2107,15 +2107,26 @@ fn detail_alt_arrows_jump_blocks_and_ignore_left_right() {
         .expect("editor is the last block");
     assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
 
-    // No tabs in the detail: Alt+Left/Right change neither focus nor text.
-    app.handle_key(alt_key(KeyCode::Left)).unwrap();
+    // Alt+Left/Right own the Thread │ Diff tabs from any panel: they focus
+    // the lower panel and never touch the editor's text.
+    let text = app.detail.as_ref().unwrap().review_edits.lines().to_vec();
     app.handle_key(alt_key(KeyCode::Right)).unwrap();
-    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
-    assert_eq!(
-        app.detail.as_ref().unwrap().review_edits.cursor(),
-        (0, 0),
-        "the caret never moved"
+    let detail = app.detail.as_ref().unwrap();
+    assert_eq!(detail.focus, DetailFocus::Thread);
+    assert!(detail.diff.open, "Alt+→ shows the Diff tab");
+    assert_eq!(detail.review_edits.lines(), text, "the editor text stays");
+    app.handle_key(alt_key(KeyCode::Right)).unwrap();
+    assert!(
+        app.detail.as_ref().unwrap().diff.open,
+        "Alt+→ does not toggle"
     );
+    app.handle_key(alt_key(KeyCode::Left)).unwrap();
+    assert!(
+        !app.detail.as_ref().unwrap().diff.open,
+        "Alt+← shows the Thread"
+    );
+    app.handle_key(alt_key(KeyCode::Down)).expect("alt down");
+    assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Edits);
     app.handle_key(key(KeyCode::Esc)).unwrap();
     assert_eq!(app.detail.as_ref().unwrap().focus, DetailFocus::Thread);
     app.handle_key(key(KeyCode::Esc)).unwrap();
@@ -13416,13 +13427,15 @@ fn detail_answer_word_keys_jump_and_delete_by_word() {
     assert_eq!(detail.answer_input.lines(), ["alpha  gamma"]);
     assert_eq!(detail.answer_input.cursor(), (0, 6));
 
-    app.handle_key(alt_key(KeyCode::Left))
+    // Alt+←/→ switch the Thread │ Diff tabs here; Alt+Backspace/Delete
+    // still delete by word.
+    app.handle_key(alt_key(KeyCode::Backspace))
         .expect("delete word back");
     let detail = app.detail.as_ref().unwrap();
     assert_eq!(detail.answer_input.lines(), [" gamma"]);
     assert_eq!(detail.answer_input.cursor(), (0, 0));
 
-    app.handle_key(alt_key(KeyCode::Right))
+    app.handle_key(alt_key(KeyCode::Delete))
         .expect("delete word forward");
     let detail = app.detail.as_ref().unwrap();
     assert_eq!(detail.answer_input.lines(), [""]);
@@ -14746,7 +14759,7 @@ fn z_and_a_header_click_toggle_the_collapsed_task_header() {
 }
 
 #[test]
-fn g_opens_the_diff_tab_and_enter_or_a_click_expands_a_file() {
+fn alt_arrows_switch_the_diff_tab_and_enter_or_a_click_expands_a_file() {
     let (dir, mut app) = app_with_board();
     let task = app.ops.create_task(NewTask::titled("Diff card")).unwrap();
     // A non-isolated run: originals in the task's backups, edits in place.
@@ -14764,10 +14777,14 @@ fn g_opens_the_diff_tab_and_enter_or_a_click_expands_a_file() {
     app.tick().unwrap();
 
     let thread = render_at(&mut app, 96, 28);
-    assert!(thread.contains("Thread │ Diff +3 −2 (2) · g"), "{thread}");
-    assert!(thread.contains("Δ +3 −2 · 2 files · g"), "{thread}");
+    assert!(
+        thread.contains("Thread │ Diff +3 −2 (2) · M-←→"),
+        "{thread}"
+    );
+    assert!(thread.contains("Δ +3 −2 · 2 files · M-→"), "{thread}");
 
-    app.handle_key(key(KeyCode::Char('g'))).unwrap();
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT))
+        .unwrap();
     let list = render_at(&mut app, 96, 28);
     assert!(
         list.contains("backups vs current files · +3 −2 · 2 files"),
@@ -14802,8 +14819,9 @@ fn g_opens_the_diff_tab_and_enter_or_a_click_expands_a_file() {
     assert!(both.contains("▾ notes.md"), "{both}");
     assert!(both.contains("+new"), "{both}");
 
-    // g returns to the thread.
-    app.handle_key(key(KeyCode::Char('g'))).unwrap();
+    // Alt+← returns to the thread; a plain g no longer touches the tabs.
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT))
+        .unwrap();
     let back = render_at(&mut app, 96, 28);
     assert!(back.contains("MSG-001"), "{back}");
 }

@@ -92,8 +92,9 @@ instead of starting to type; from a text panel use `Alt+o`. Without a pin,
 - Plain `↑/↓` in a flat dialog leave a field from its edge: a text field
   from its top line/end, a selector from its first or last visible option;
   inside, they move the caret or selection
-- `Alt+←/→`: where no tabs own the chord it deletes a
-  word: in the detail's text panels and in every dialog text field `Alt+←`
+- `Alt+←/→`: where no tabs own the chord (the detail's Thread │ Diff tabs
+  and the settings tabs do) it deletes a
+  word: in every dialog text field `Alt+←`
   removes the word before the caret and `Alt+→` the one after it (the board
   keeps its columns plain-arrow only, and Yes/No confirmation prompts ignore
   the chord). As with `Alt+letter`, `Ctrl+Alt` is left
@@ -113,8 +114,9 @@ instead of starting to type; from a text panel use `Alt+o`. Without a pin,
   header expands it to the full Task block plus Analytics; the choice is
   saved per board as `tui.detail_header_expanded`. A detail area under 24
   rows stays collapsed regardless
-- `g` (detail): switch the lower panel between **Thread** and **Diff**
-  (the border title is the tab strip; clicking a tab label also switches).
+- `Alt+←/→` (detail, from any panel): switch the lower panel to
+  **Thread** / **Diff** (the border title is the tab strip; clicking a tab
+  label also switches).
   The Diff tab lists every changed file with its `+/−` counts; `↑/↓` select,
   `Enter` or a click expands/collapses the file's hunks inline, and
   PgUp/PgDn/wheel/Home/End scroll. Source, first that applies: the

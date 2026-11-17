@@ -6,7 +6,7 @@ expression: render_snapshot(&mut app)
 │TASK-001 Question card │ todo                                                                 │
 │No agent runs yet │ opencode/openai/gpt-5.5                                                   │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Thread │ Diff · g ───────────────────────────────────────────────────────────────────────────┐
+┌ Thread │ Diff · M-←→ ────────────────────────────────────────────────────────────────────────┐
 │MSG-001 · <timestamp> · system · open                                                         │
 │Task created: Question card                                                                   │
 │Status: todo                                                                                  │
@@ -53,8 +53,8 @@ expression: render_snapshot(&mut app)
 4:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 4:1-9 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold().underlined()
 4:9-10 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-4:10-20 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-4:20-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+4:10-23 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+4:23-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:1-45 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 5:45-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
