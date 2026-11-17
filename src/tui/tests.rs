@@ -14759,7 +14759,7 @@ fn z_and_a_header_click_toggle_the_collapsed_task_header() {
 }
 
 #[test]
-fn alt_arrows_switch_the_diff_tab_and_enter_or_a_click_expands_a_file() {
+fn alt_arrows_switch_the_diff_tab_and_arrows_move_between_its_panes() {
     let (dir, mut app) = app_with_board();
     let task = app.ops.create_task(NewTask::titled("Diff card")).unwrap();
     // A non-isolated run: originals in the task's backups, edits in place.
@@ -14790,34 +14790,60 @@ fn alt_arrows_switch_the_diff_tab_and_enter_or_a_click_expands_a_file() {
         list.contains("backups vs current files · +3 −2 · 2 files"),
         "{list}"
     );
-    assert!(list.contains("▸ notes.md"), "{list}");
-    assert!(list.contains("▸ src/a.txt"), "{list}");
+    // Files on the left, the first file's hunk on the right.
+    assert!(list.contains("│notes.md  "), "{list}");
+    assert!(list.contains("│src/a.txt  "), "{list}");
+    assert!(list.contains("│+new"), "{list}");
+    assert!(!list.contains("+TWO"), "{list}");
 
-    // ↓ selects the second file, Enter shows its hunk.
+    // ↓ on the list selects the second file and shows its lines.
     app.handle_key(key(KeyCode::Down)).unwrap();
-    app.handle_key(key(KeyCode::Enter)).unwrap();
-    let expanded = render_at(&mut app, 96, 28);
-    assert!(expanded.contains("▾ src/a.txt"), "{expanded}");
-    assert!(expanded.contains("@@ -1,3 +1,4 @@"), "{expanded}");
-    assert!(expanded.contains("+TWO"), "{expanded}");
-    insta::assert_snapshot!("detail_diff_tab_expanded", expanded);
+    let split = render_at(&mut app, 96, 28);
+    assert!(split.contains("│@@ -1,3 +1,4 @@"), "{split}");
+    assert!(split.contains("│+TWO"), "{split}");
+    assert!(!split.contains("+new"), "{split}");
+    insta::assert_snapshot!("detail_diff_tab_split", split);
 
-    // A click on a file row toggles it too.
-    let first = app
+    // → focuses the lines: ↓ scrolls them and keeps the selected file.
+    app.handle_key(key(KeyCode::Right)).unwrap();
+    assert!(app.detail.as_ref().unwrap().diff.lines_focused);
+    render_at(&mut app, 96, 12);
+    let max = app.detail.as_ref().unwrap().diff.max_scroll;
+    assert!(max > 0, "a short panel overflows the hunk");
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    let view = &app.detail.as_ref().unwrap().diff;
+    assert_eq!((view.selected, view.scroll), (1, 1));
+    // Ctrl moves by ten, clamped to the end.
+    app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().diff.scroll, max);
+    // ← returns to the list; ↑ selects the first file again from the top.
+    app.handle_key(key(KeyCode::Left)).unwrap();
+    app.handle_key(key(KeyCode::Up)).unwrap();
+    let view = &app.detail.as_ref().unwrap().diff;
+    assert_eq!(
+        (view.lines_focused, view.selected, view.scroll),
+        (false, 0, 0)
+    );
+
+    // A click on a file row selects it and focuses the list.
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert!(app.detail.as_ref().unwrap().diff.lines_focused);
+    render_at(&mut app, 96, 28);
+    let second = app
         .hitboxes
         .iter()
-        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::ToggleDiffFile(0)))
+        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::SelectDiffFile(1)))
         .copied()
         .expect("file row hitbox");
     app.handle_mouse(mouse(
         MouseEventKind::Down(MouseButton::Left),
-        first.area.x + 1,
-        first.area.y,
+        second.area.x + 1,
+        second.area.y,
     ))
     .unwrap();
-    let both = render_at(&mut app, 96, 28);
-    assert!(both.contains("▾ notes.md"), "{both}");
-    assert!(both.contains("+new"), "{both}");
+    let view = &app.detail.as_ref().unwrap().diff;
+    assert_eq!((view.lines_focused, view.selected), (false, 1));
 
     // Alt+← returns to the thread; a plain g no longer touches the tabs.
     app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT))

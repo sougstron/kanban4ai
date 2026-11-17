@@ -311,8 +311,11 @@ pub enum UiAction {
     ToggleDetailHeader,
     /// Switch the detail's lower panel between Thread and Diff (`g`).
     ToggleDiffTab,
-    /// Expand or collapse one file's hunks in the Diff tab (Enter, click).
-    ToggleDiffFile(usize),
+    /// Select one file in the Diff tab's file list (click on its row).
+    SelectDiffFile(usize),
+    /// Focus the Diff tab's file list (`false`) or the selected file's lines
+    /// (`true`): ←/→, Enter, a click on either pane.
+    FocusDiffPane(bool),
 }
 
 /// Which detail panel receives keyboard input. `Thread` is the neutral state;
@@ -385,13 +388,17 @@ pub struct DiffView {
     /// `None` until the first computation finished.
     pub loaded: bool,
     pub diff: Option<TaskDiff>,
-    /// Selected file (index into `diff.files`).
+    /// Selected file (index into `diff.files`), shown in the right pane.
     pub selected: usize,
-    /// Paths whose hunks are shown inline.
-    pub expanded: HashSet<String>,
+    /// Keys go to the right pane (the selected file's lines) instead of
+    /// the file list on the left.
+    pub lines_focused: bool,
+    /// First visible row of the file list.
+    pub files_scroll: u16,
+    /// First visible row of the selected file's lines.
     pub scroll: u16,
     pub max_scroll: u16,
-    /// On the next paint, scroll so the selected file's row is visible.
+    /// On the next paint, scroll the file list so the selected row is visible.
     pub follow_selected: bool,
 }
 
@@ -1709,12 +1716,21 @@ impl App {
             (KeyCode::Char('z'), _) if self.screen == Screen::Detail => {
                 self.dispatch(UiAction::ToggleDetailHeader)?
             }
-            (KeyCode::Enter, _) if self.diff_tab_open() => {
-                let selected = self.detail.as_ref().map_or(0, |d| d.diff.selected);
-                self.dispatch(UiAction::ToggleDiffFile(selected))?
+            // The Diff tab's two panes: ←/→ (and Enter from the list) move
+            // between the file list and the selected file's lines; ↑/↓
+            // select a file or scroll lines, Shift x3, Ctrl x10.
+            (KeyCode::Left | KeyCode::Right, KeyModifiers::NONE) if self.diff_tab_open() => {
+                self.dispatch(UiAction::FocusDiffPane(key.code == KeyCode::Right))?
             }
-            (KeyCode::Up | KeyCode::Down, KeyModifiers::NONE) if self.diff_tab_open() => {
-                self.move_diff_selection(if key.code == KeyCode::Up { -1 } else { 1 })
+            (KeyCode::Enter, _) if self.diff_tab_open() => {
+                let lines = self.detail.as_ref().is_some_and(|d| d.diff.lines_focused);
+                self.dispatch(UiAction::FocusDiffPane(!lines))?
+            }
+            (KeyCode::Up | KeyCode::Down, m)
+                if self.diff_tab_open() && !m.contains(KeyModifiers::ALT) =>
+            {
+                let step = self.arrow_scroll_step(&key) as isize;
+                self.scroll_detail(if key.code == KeyCode::Up { -step } else { step })
             }
             (KeyCode::Enter, _)
                 if self.screen == Screen::Detail
@@ -2582,7 +2598,8 @@ impl App {
             UiAction::ApplyUpdate => self.apply_update_now()?,
             UiAction::ToggleDetailHeader => self.toggle_detail_header(),
             UiAction::ToggleDiffTab => self.toggle_diff_tab(),
-            UiAction::ToggleDiffFile(index) => self.toggle_diff_file(index),
+            UiAction::SelectDiffFile(index) => self.select_diff_file(index),
+            UiAction::FocusDiffPane(lines) => self.focus_diff_pane(lines),
         }
         Ok(())
     }
@@ -3484,6 +3501,18 @@ impl App {
                         self.scroll_detail(delta);
                         return;
                     }
+                    // Each Diff pane wheels on its own: the list steps the
+                    // selected file, the right pane scrolls its lines.
+                    Some(HitAction::Action(
+                        UiAction::SelectDiffFile(_) | UiAction::FocusDiffPane(false),
+                    )) => {
+                        self.move_diff_selection(delta);
+                        return;
+                    }
+                    Some(HitAction::Action(UiAction::FocusDiffPane(true))) => {
+                        self.scroll_diff_lines(delta);
+                        return;
+                    }
                     // The answer panel's scrollable window is its variant
                     // list: the wheel steps the selection, exactly like the
                     // panel's ↑/↓ keys, and the visible options follow.
@@ -3569,31 +3598,34 @@ impl App {
         detail.diff.follow_selected = detail.diff.open;
         detail.focus = DetailFocus::Thread;
         self.status = if detail.diff.open {
-            "Diff: ↑/↓ file · Enter expand · Ctrl+O folder · Alt+← thread"
+            "Diff: ←/→ files│lines · ↑/↓ select/scroll · Ctrl+O folder · Alt+← thread"
         } else {
             "Thread"
         }
         .to_string();
     }
 
-    fn toggle_diff_file(&mut self, index: usize) {
+    fn select_diff_file(&mut self, index: usize) {
         let Some(detail) = self.detail.as_mut() else {
             return;
         };
+        detail.focus = DetailFocus::Thread;
         let view = &mut detail.diff;
-        let Some(path) = view
-            .diff
-            .as_ref()
-            .and_then(|diff| diff.files.get(index))
-            .map(|file| file.path.clone())
-        else {
+        view.lines_focused = false;
+        if index < view.file_count() && index != view.selected {
+            view.selected = index;
+            view.scroll = 0;
+        }
+        view.follow_selected = true;
+    }
+
+    fn focus_diff_pane(&mut self, lines: bool) {
+        let Some(detail) = self.detail.as_mut() else {
             return;
         };
-        view.selected = index;
-        view.follow_selected = true;
-        if !view.expanded.remove(&path) {
-            view.expanded.insert(path);
-        }
+        detail.focus = DetailFocus::Thread;
+        detail.diff.lines_focused = lines;
+        detail.diff.follow_selected = true;
     }
 
     fn move_diff_selection(&mut self, delta: isize) {
@@ -3605,8 +3637,22 @@ impl App {
         if count == 0 {
             return;
         }
-        view.selected = view.selected.saturating_add_signed(delta).min(count - 1);
+        let selected = view.selected.saturating_add_signed(delta).min(count - 1);
+        if selected != view.selected {
+            view.selected = selected;
+            view.scroll = 0;
+        }
         view.follow_selected = true;
+    }
+
+    fn scroll_diff_lines(&mut self, delta: isize) {
+        if let Some(detail) = self.detail.as_mut() {
+            let view = &mut detail.diff;
+            view.scroll = view
+                .scroll
+                .saturating_add_signed(delta.clamp(-1000, 1000) as i16)
+                .min(view.max_scroll);
+        }
     }
 
     /// The open detail's task, for the tick worker to diff.
@@ -3624,7 +3670,11 @@ impl App {
         view.loaded = true;
         if view.diff != diff {
             view.diff = diff;
-            view.selected = view.selected.min(view.file_count().saturating_sub(1));
+            let selected = view.selected.min(view.file_count().saturating_sub(1));
+            if selected != view.selected {
+                view.selected = selected;
+                view.scroll = 0;
+            }
         }
     }
 
@@ -3633,11 +3683,11 @@ impl App {
             return;
         };
         if detail.diff.open {
-            let view = &mut detail.diff;
-            view.scroll = view
-                .scroll
-                .saturating_add_signed(delta.clamp(-1000, 1000) as i16)
-                .min(view.max_scroll);
+            if detail.diff.lines_focused {
+                self.scroll_diff_lines(delta);
+            } else {
+                self.move_diff_selection(delta);
+            }
             return;
         }
         detail.scroll = if delta < 0 {
@@ -4596,8 +4646,12 @@ impl App {
             }
             Screen::Detail => {
                 if let Some(detail) = self.detail.as_mut() {
-                    if detail.diff.open {
+                    if detail.diff.open && detail.diff.lines_focused {
                         detail.diff.scroll = 0;
+                    } else if detail.diff.open {
+                        detail.diff.selected = 0;
+                        detail.diff.scroll = 0;
+                        detail.diff.follow_selected = true;
                     } else {
                         detail.scroll = 0;
                     }
@@ -4627,8 +4681,12 @@ impl App {
             Screen::Board => self.focus_last_card(),
             Screen::Detail => {
                 if let Some(detail) = self.detail.as_mut() {
-                    if detail.diff.open {
+                    if detail.diff.open && detail.diff.lines_focused {
                         detail.diff.scroll = detail.diff.max_scroll;
+                    } else if detail.diff.open {
+                        detail.diff.selected = detail.diff.file_count().saturating_sub(1);
+                        detail.diff.scroll = 0;
+                        detail.diff.follow_selected = true;
                     } else {
                         detail.scroll = detail.max_scroll;
                     }

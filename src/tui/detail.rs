@@ -712,7 +712,7 @@ fn panel_tab_title(theme: &Theme, view: &DiffView) -> TabTitle {
         diff_text.push_str(&count);
     }
     let hint = if view.open {
-        " · ↑↓ Enter · M-←→ "
+        " · ←→ ↑↓ · M-←→ "
     } else {
         " · M-←→ "
     };
@@ -753,9 +753,43 @@ fn push_tab_hitboxes(app: &mut App, title: &TabTitle, area: Rect) {
     }
 }
 
-/// The Diff tab: one row per changed file, hunks of the expanded ones
-/// inline. Rows never wrap, so a row is a line and the selected file's row
-/// is known for scrolling and clicks.
+/// Narrowest the Diff tab's file list gets while the panel has room.
+const DIFF_LIST_MIN: u16 = 18;
+
+/// The Diff tab's file-list width out of the panel's `inner` columns: wide
+/// enough for the longest `path +a −r` row (`need`), never under a quarter
+/// of the panel (nor [`DIFF_LIST_MIN`]) and never over 55% of it, so the
+/// diff on the right always keeps most of the room.
+fn diff_list_width(inner: u16, need: usize) -> u16 {
+    let ceil = inner.saturating_mul(11) / 20;
+    let floor = (inner / 4).max(DIFF_LIST_MIN).min(ceil);
+    u16::try_from(need).unwrap_or(u16::MAX).clamp(floor, ceil)
+}
+
+/// `text` cut to `max_width` from the left: a long path keeps its file name.
+fn truncate_display_start(text: &str, max_width: usize) -> String {
+    if text.width() <= max_width {
+        return text.to_string();
+    }
+    let limit = max_width.saturating_sub(1);
+    let mut tail = Vec::new();
+    let mut width = 0;
+    for ch in text.chars().rev() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > limit {
+            break;
+        }
+        width += ch_width;
+        tail.push(ch);
+    }
+    let mut out = String::from("…");
+    out.extend(tail.into_iter().rev());
+    out
+}
+
+/// The Diff tab, split like a code review page: the changed files on the
+/// left, the selected file's hunks on the right. ←/→ move the keyboard
+/// between the panes; rows never wrap, so a row is a line.
 fn render_diff_panel(
     frame: &mut Frame<'_>,
     app: &mut App,
@@ -764,153 +798,288 @@ fn render_diff_panel(
     focus: DetailFocus,
     area: Rect,
 ) {
-    let inner_width = usize::from(area.width.saturating_sub(2));
-    let visible_height = area.height.saturating_sub(2);
     let muted = Style::default().fg(theme.muted);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut file_rows: Vec<(usize, usize)> = Vec::new();
+    let focused = focus == DetailFocus::Thread;
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if focused { theme.focus } else { theme.border }));
+    let inner = block.inner(area);
+    frame.render_widget(
+        Paragraph::new("")
+            .style(Style::default().bg(theme.bg).fg(theme.fg))
+            .block(block),
+        area,
+    );
     let view = &app.detail.as_ref().unwrap().diff;
-    match (&view.diff, view.loaded) {
-        (_, false) => lines.push(Line::from(Span::styled("Computing the diff…", muted))),
-        (None, true) => lines.push(Line::from(Span::styled(
-            "No diff: the task has no worktree, branch, landed commit or backups yet",
-            muted,
-        ))),
+    let message = match (&view.diff, view.loaded) {
+        (_, false) => Some("Computing the diff…".to_string()),
+        (None, true) => Some(
+            "No diff: the task has no worktree, branch, landed commit or backups yet".to_string(),
+        ),
         (Some(diff), true) => {
             let mut header = format!("{} · {}", diff.source.label(), diff.summary());
             if diff.truncated {
                 header.push_str(" · long patch truncated");
             }
-            lines.push(Line::from(Span::styled(
-                truncate_display(&header, inner_width),
-                muted,
-            )));
-            if diff.files.is_empty() {
-                lines.push(Line::from(Span::styled("No changes", muted)));
-            }
-            let selected = view.selected.min(diff.files.len().saturating_sub(1));
-            for (index, file) in diff.files.iter().enumerate() {
-                let expanded = view.expanded.contains(&file.path);
-                file_rows.push((index, lines.len()));
-                let counts = if file.binary {
-                    " binary".to_string()
-                } else {
-                    format!(" +{} −{}", file.added, file.removed)
-                };
-                let marker = if expanded { "▾ " } else { "▸ " };
-                let path_width = inner_width.saturating_sub(marker.width() + counts.width());
-                let path = truncate_display(&sanitize_terminal_text(&file.path), path_width);
-                let pad = " ".repeat(path_width.saturating_sub(path.width()));
-                let mut row_style = Style::default().fg(theme.fg);
-                if index == selected && focus == DetailFocus::Thread {
-                    row_style = row_style.bg(theme.border).add_modifier(Modifier::BOLD);
-                }
-                lines.push(
-                    Line::from(vec![
-                        Span::styled(marker, muted),
-                        Span::raw(path),
-                        Span::raw(pad),
-                        Span::styled(
-                            counts,
-                            Style::default().fg(if file.binary {
-                                theme.muted
-                            } else if file.removed > file.added {
-                                theme.err
-                            } else {
-                                theme.ok
-                            }),
-                        ),
-                    ])
-                    .style(row_style),
-                );
-                if expanded {
-                    for text in &file.lines {
-                        let style = if text.starts_with("@@") {
-                            Style::default().fg(theme.focus)
-                        } else if text.starts_with('+') {
-                            Style::default().fg(theme.ok)
-                        } else if text.starts_with('-') {
-                            Style::default().fg(theme.err)
-                        } else {
-                            Style::default().fg(theme.fg)
-                        };
-                        lines.push(Line::from(Span::styled(
-                            truncate_display(
-                                &sanitize_terminal_text(&text.replace('\t', "    ")),
-                                inner_width,
-                            ),
-                            style,
-                        )));
-                    }
-                }
-            }
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    truncate_display(&header, usize::from(inner.width)),
+                    muted,
+                ))),
+                Rect {
+                    height: inner.height.min(1),
+                    ..inner
+                },
+            );
+            diff.files.is_empty().then(|| "No changes".to_string())
         }
-    }
-    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-    let max_scroll = content_height.saturating_sub(visible_height);
-    let scroll = {
-        let view = &mut app.detail.as_mut().unwrap().diff;
-        view.max_scroll = max_scroll;
-        if view.follow_selected {
-            view.follow_selected = false;
-            if let Some(&(_, row)) = file_rows.iter().find(|(index, _)| *index == view.selected) {
-                let row = u16::try_from(row).unwrap_or(u16::MAX);
-                if row < view.scroll {
-                    view.scroll = row;
-                } else if row >= view.scroll.saturating_add(visible_height) {
-                    view.scroll = row.saturating_sub(visible_height.saturating_sub(1));
-                }
-            }
-        }
-        view.scroll = view.scroll.min(max_scroll);
-        view.scroll
     };
-    for (index, row) in file_rows {
-        let Some(offset) = row.checked_sub(usize::from(scroll)) else {
-            continue;
+    if let Some(message) = message {
+        let row = if view.loaded && view.diff.is_some() {
+            1
+        } else {
+            0
         };
-        if offset >= usize::from(visible_height) {
-            continue;
+        if inner.height > row {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(message, muted))),
+                Rect::new(inner.x, inner.y + row, inner.width, 1),
+            );
         }
         app.hitboxes.push(Hitbox {
-            area: Rect::new(
-                area.x + 1,
-                area.y + 1 + offset as u16,
-                inner_width as u16,
-                1,
+            area,
+            action: HitAction::DetailThread,
+        });
+        return;
+    }
+    let diff = view.diff.as_ref().unwrap();
+    let body = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let counts: Vec<String> = diff
+        .files
+        .iter()
+        .map(|file| {
+            if file.binary {
+                "binary".to_string()
+            } else {
+                format!("+{} −{}", file.added, file.removed)
+            }
+        })
+        .collect();
+    let need = diff
+        .files
+        .iter()
+        .zip(&counts)
+        .map(|(file, counts)| sanitize_terminal_text(&file.path).width() + 1 + counts.width())
+        .max()
+        .unwrap_or(0);
+    let list_width = diff_list_width(body.width, need);
+    let list = Rect {
+        width: list_width,
+        ..body
+    };
+    let separator = Rect::new(
+        list.right(),
+        body.y,
+        1.min(body.width - list_width),
+        body.height,
+    );
+    let lines_area = Rect::new(
+        separator.right(),
+        body.y,
+        body.width.saturating_sub(list_width + separator.width),
+        body.height,
+    );
+    let selected = view.selected.min(diff.files.len() - 1);
+    let lines_focused = view.lines_focused;
+
+    // Left: one row per file, path cut from the left, counts on the right.
+    let mut list_lines = Vec::with_capacity(diff.files.len());
+    for (index, (file, counts)) in diff.files.iter().zip(&counts).enumerate() {
+        let width = usize::from(list.width);
+        let counts = truncate_display(counts, width.saturating_sub(2));
+        let path_width = width.saturating_sub(counts.width() + 1);
+        let path = truncate_display_start(&sanitize_terminal_text(&file.path), path_width);
+        let pad = " ".repeat(width.saturating_sub(path.width() + counts.width()));
+        let mut row_style = Style::default().fg(theme.fg);
+        if index == selected {
+            row_style = if focused && !lines_focused {
+                row_style.bg(theme.border).add_modifier(Modifier::BOLD)
+            } else {
+                row_style.fg(theme.focus).add_modifier(Modifier::BOLD)
+            };
+        }
+        list_lines.push(
+            Line::from(vec![
+                Span::raw(path),
+                Span::raw(pad),
+                Span::styled(
+                    counts,
+                    Style::default().fg(if file.binary {
+                        theme.muted
+                    } else if file.removed > file.added {
+                        theme.err
+                    } else {
+                        theme.ok
+                    }),
+                ),
+            ])
+            .style(row_style),
+        );
+    }
+
+    // Right: the selected file's path, then its hunks.
+    let file = &diff.files[selected];
+    let path_style = if focused && lines_focused {
+        Style::default()
+            .fg(theme.focus)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+    };
+    let header = Line::from(Span::styled(
+        truncate_display_start(
+            &sanitize_terminal_text(&file.path),
+            usize::from(lines_area.width),
+        ),
+        path_style,
+    ));
+    let text_width = usize::from(lines_area.width.saturating_sub(1));
+    let file_lines: Vec<Line<'static>> = if file.binary {
+        vec![Line::from(Span::styled("Binary file", muted))]
+    } else {
+        file.lines
+            .iter()
+            .map(|text| {
+                let style = if text.starts_with("@@") {
+                    Style::default().fg(theme.focus)
+                } else if text.starts_with('+') {
+                    Style::default().fg(theme.ok)
+                } else if text.starts_with('-') {
+                    Style::default().fg(theme.err)
+                } else {
+                    Style::default().fg(theme.fg)
+                };
+                Line::from(Span::styled(
+                    truncate_display(
+                        &sanitize_terminal_text(&text.replace('\t', "    ")),
+                        text_width,
+                    ),
+                    style,
+                ))
+            })
+            .collect()
+    };
+
+    let list_height = list.height;
+    let lines_height = lines_area.height.saturating_sub(1);
+    let list_max = u16::try_from(list_lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(list_height);
+    let lines_max = u16::try_from(file_lines.len())
+        .unwrap_or(u16::MAX)
+        .saturating_sub(lines_height);
+    let (list_scroll, lines_scroll) = {
+        let view = &mut app.detail.as_mut().unwrap().diff;
+        if view.follow_selected {
+            view.follow_selected = false;
+            let row = u16::try_from(selected).unwrap_or(u16::MAX);
+            if row < view.files_scroll {
+                view.files_scroll = row;
+            } else if row >= view.files_scroll.saturating_add(list_height) {
+                view.files_scroll = row.saturating_sub(list_height.saturating_sub(1));
+            }
+        }
+        view.files_scroll = view.files_scroll.min(list_max);
+        view.max_scroll = lines_max;
+        view.scroll = view.scroll.min(lines_max);
+        (view.files_scroll, view.scroll)
+    };
+
+    frame.render_widget(Paragraph::new(list_lines).scroll((list_scroll, 0)), list);
+    frame.render_widget(
+        Paragraph::new(
+            (0..separator.height)
+                .map(|_| Line::from("│"))
+                .collect::<Vec<_>>(),
+        )
+        .style(Style::default().fg(theme.border)),
+        separator,
+    );
+    if lines_area.height > 0 {
+        frame.render_widget(
+            Paragraph::new(header),
+            Rect {
+                height: 1,
+                ..lines_area
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(file_lines).scroll((lines_scroll, 0)),
+            Rect::new(
+                lines_area.x,
+                lines_area.y + 1,
+                lines_area.width,
+                lines_height,
             ),
-            action: HitAction::Action(UiAction::ToggleDiffFile(index)),
+        );
+    }
+    if list_max > 0 && separator.width > 0 {
+        let mut state =
+            ScrollbarState::new(usize::from(list_max)).position(usize::from(list_scroll));
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            Rect::new(body.x, body.y, list.width + 1, body.height),
+            &mut state,
+        );
+    }
+    if lines_max > 0 {
+        let mut state =
+            ScrollbarState::new(usize::from(lines_max)).position(usize::from(lines_scroll));
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut state,
+        );
+    }
+
+    for index in 0..diff_file_count(app) {
+        let Some(offset) = index.checked_sub(usize::from(list_scroll)) else {
+            continue;
+        };
+        if offset >= usize::from(list_height) {
+            break;
+        }
+        app.hitboxes.push(Hitbox {
+            area: Rect::new(list.x, list.y + offset as u16, list.width, 1),
+            action: HitAction::Action(UiAction::SelectDiffFile(index)),
         });
     }
+    app.hitboxes.push(Hitbox {
+        area: list,
+        action: HitAction::Action(UiAction::FocusDiffPane(false)),
+    });
+    app.hitboxes.push(Hitbox {
+        area: lines_area,
+        action: HitAction::Action(UiAction::FocusDiffPane(true)),
+    });
     app.hitboxes.push(Hitbox {
         area,
         action: HitAction::DetailThread,
     });
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().bg(theme.bg).fg(theme.fg))
-            .block(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(if focus == DetailFocus::Thread {
-                        theme.focus
-                    } else {
-                        theme.border
-                    })),
-            )
-            .scroll((scroll, 0)),
-        area,
-    );
-    if max_scroll > 0 {
-        let mut scrollbar_state =
-            ScrollbarState::new(max_scroll as usize).position(scroll as usize);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area,
-            &mut scrollbar_state,
-        );
-    }
+}
+
+fn diff_file_count(app: &App) -> usize {
+    app.detail
+        .as_ref()
+        .map_or(0, |detail| detail.diff.file_count())
 }
 
 fn task_description_lines(task: &Task) -> u16 {
@@ -1934,4 +2103,30 @@ fn thread_lines(
         append_text_region(region, wrapped_text_region(&lines[tail_start..], width));
     }
     lines
+}
+
+#[cfg(test)]
+mod diff_split_tests {
+    use super::{diff_list_width, truncate_display_start};
+
+    #[test]
+    fn the_file_list_fits_its_longest_row_between_a_quarter_and_55_percent() {
+        // Short paths keep the 25% floor, long ones grow to the 55% cap.
+        assert_eq!(diff_list_width(100, 10), 25);
+        assert_eq!(diff_list_width(100, 40), 40);
+        assert_eq!(diff_list_width(100, 300), 55);
+        // A narrow panel keeps the absolute minimum while 55% allows it.
+        assert_eq!(diff_list_width(40, 5), 18);
+        assert_eq!(diff_list_width(20, 30), 11);
+        assert_eq!(diff_list_width(0, 30), 0);
+    }
+
+    #[test]
+    fn long_paths_are_cut_from_the_left() {
+        assert_eq!(
+            truncate_display_start("src/tui/detail.rs", 10),
+            "…detail.rs"
+        );
+        assert_eq!(truncate_display_start("a.rs", 10), "a.rs");
+    }
 }

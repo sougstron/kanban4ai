@@ -796,6 +796,9 @@ fn help_lines() -> Vec<Line<'static>> {
         Line::from("  Tab: cycle thread/answer/editor panels when present ·"),
         Line::from("  Alt+↑/↓: jump a panel up/down from anywhere, no wrap"),
         Line::from("  Alt+←/→: Thread │ Diff tabs of the lower panel from any panel"),
+        Line::from(
+            "  Diff tab: ←/→ files │ lines · ↑/↓ select a file or scroll (Shift/Ctrl faster)",
+        ),
         Line::from("  Enter: queue To Do tasks · r/buttons: run now (F) or revoke live/paused"),
         Line::from("  k: stop a live or waiting session without starting a new one"),
         Line::from("  Ctrl+S: save review edits (no re-run) · Ctrl+R: re-queue"),
