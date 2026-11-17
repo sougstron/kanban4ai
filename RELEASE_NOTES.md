@@ -1,3 +1,11 @@
+# kanban4ai 0.8.22
+
+Notes are from the reviewed diff since 0.8.21. There were no `.changes/` logs.
+
+- **Ctrl+O on the Diff tab opens the selected file's folder.** It uses the same file-manager opener as the projects list and a task's pinned result. A worktree diff opens the worktree's copy; any other diff opens the work folder's copy. A deleted file, or a file that is not on disk yet, opens the nearest folder that still exists. The Diff status line includes `Ctrl+O folder`.
+
+Board files stay loadable by 0.8.21. Project `config.yaml`, the store format (5), the sync protocol (3), and journal records are unchanged.
+
 # kanban4ai 0.8.21
 
 Notes are from the reviewed diff since 0.8.20. There were no `.changes/` logs.

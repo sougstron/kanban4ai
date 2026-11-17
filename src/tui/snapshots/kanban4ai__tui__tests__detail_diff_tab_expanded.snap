@@ -29,7 +29,7 @@ expression: expanded
 │                                                                                              │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
 [ ▶ Queue r ] [ ⚡  Now F ] [ Edit e ] [ Move m ] [ +Ctx c ] [ Revert ] [ Del d ]                
- Diff: ↑/↓ file · Enter expand · Alt+← back to thread │ r queue · q/Esc back          ● Offline 
+ Diff: ↑/↓ file · Enter expand · Ctrl+O folder · Alt+← thread │ r queue · q/Esc back  ● Offline 
 
 --- style runs ---
 0:0-85 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

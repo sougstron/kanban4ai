@@ -288,6 +288,9 @@ pub enum UiAction {
     OpenProjectFolder,
     /// Hand the open task's pinned result path to the desktop file manager.
     OpenResultFolder,
+    /// Hand the folder of the Diff tab's selected file to the desktop file
+    /// manager.
+    OpenDiffFileFolder,
     NewProject,
     OpenGlobalSettings,
     RenameProject,
@@ -1761,6 +1764,9 @@ impl App {
             (KeyCode::Char('p'), _) if self.screen == Screen::Detail => {
                 self.dispatch(UiAction::ViewPrompt)?
             }
+            (KeyCode::Char('o'), KeyModifiers::CONTROL) if self.diff_tab_open() => {
+                self.dispatch(UiAction::OpenDiffFileFolder)?
+            }
             (KeyCode::Char('o'), _) if self.screen == Screen::Detail => {
                 self.dispatch(UiAction::OpenResultFolder)?
             }
@@ -2560,6 +2566,7 @@ impl App {
             UiAction::OpenProject => self.open_selected_project(),
             UiAction::OpenProjectFolder => self.open_selected_project_folder(),
             UiAction::OpenResultFolder => self.open_result_folder(),
+            UiAction::OpenDiffFileFolder => self.open_diff_file_folder(),
             UiAction::NewProject => self.open_new_project_dialog(),
             UiAction::OpenGlobalSettings => self.open_global_settings_dialog(),
             UiAction::RenameProject => self.open_rename_project_dialog(),
@@ -3562,7 +3569,7 @@ impl App {
         detail.diff.follow_selected = detail.diff.open;
         detail.focus = DetailFocus::Thread;
         self.status = if detail.diff.open {
-            "Diff: ↑/↓ file · Enter expand · Alt+← back to thread"
+            "Diff: ↑/↓ file · Enter expand · Ctrl+O folder · Alt+← thread"
         } else {
             "Thread"
         }
@@ -5786,6 +5793,37 @@ impl App {
                 )
             }
             Err(err) => self.status = format!("Could not open the result: {err}"),
+        }
+    }
+
+    /// Show the folder of the Diff tab's selected file in the desktop file
+    /// manager (`Ctrl+O`).
+    fn open_diff_file_folder(&mut self) {
+        let Some(detail) = self.detail.as_ref() else {
+            return;
+        };
+        let (Some(task), Some(diff)) = (detail.task.as_ref(), detail.diff.diff.as_ref()) else {
+            self.status = "No diff to open".to_string();
+            return;
+        };
+        let Some(file) = diff.files.get(detail.diff.selected) else {
+            self.status = "No file selected".to_string();
+            return;
+        };
+        let folder = self.ops.diff_file_folder(task, &diff.source, &file.path);
+        let configured = self
+            .store
+            .as_ref()
+            .and_then(|store| store.load_global_config().ok())
+            .and_then(|config| config.file_manager());
+        match crate::core::opener::open_folder(&folder, configured.as_deref()) {
+            Ok(()) => {
+                self.status = format!(
+                    "Opened {} in the file manager",
+                    projects::shorten_path(&folder)
+                )
+            }
+            Err(err) => self.status = format!("Could not open the folder: {err}"),
         }
     }
 
