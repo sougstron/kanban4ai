@@ -177,7 +177,7 @@ impl GlobalConfig {
     /// once validated.
     pub fn board_sections(&self) -> BoardConfig {
         let mut tui = Mapping::new();
-        for key in ["task_sort", "hide_kanban_messages"] {
+        for key in ["task_sort", "detail_tab", "hide_kanban_messages"] {
             if let Some(value) = self.tui.get(key) {
                 tui.insert(Value::String(key.to_owned()), value.clone());
             }
@@ -210,7 +210,7 @@ impl GlobalConfig {
         self.agents = sections.agents;
         self.orchestration = sections.orchestration;
         self.runner = sections.runner;
-        for key in ["task_sort", "hide_kanban_messages"] {
+        for key in ["task_sort", "detail_tab", "hide_kanban_messages"] {
             match sections.tui.get(key) {
                 Some(value) => {
                     self.tui

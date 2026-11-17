@@ -1206,3 +1206,34 @@ fn permission_defaults_and_custom_presets_follow_agent_inheritance() {
         ["--permission-mode", "plan"]
     );
 }
+
+#[test]
+fn detail_tab_defaults_to_thread_and_projects_inherit_or_override_it() {
+    // Built-in default: the thread, for a board that never mentions it.
+    let (_store, config) = store_board("", None);
+    assert_eq!(
+        config.load().unwrap().tui["detail_tab"].as_str(),
+        Some("thread")
+    );
+
+    // A project follows the global value, with or without an inherit section.
+    let global = "tui:\n  detail_tab: diff\n";
+    for project in ["", "inherit:\n  task_sort: false\n"] {
+        let (_store, config) = store_board(project, Some(global));
+        assert_eq!(
+            config.load().unwrap().tui["detail_tab"].as_str(),
+            Some("diff"),
+            "{project:?}"
+        );
+    }
+
+    // Unticked, the project's own value wins.
+    let (_store, config) = store_board(
+        "tui:\n  detail_tab: thread\ninherit:\n  detail_tab: false\n",
+        Some(global),
+    );
+    assert_eq!(
+        config.load().unwrap().tui["detail_tab"].as_str(),
+        Some("thread")
+    );
+}
