@@ -62,6 +62,7 @@ string_enum!(TaskStatus {
 string_enum!(RunPhase {
     Queued => "queued",
     Orchestrate => "orchestrate",
+    Promptmax => "promptmax",
     Design => "design",
     Execute => "execute",
     Review => "review",
@@ -140,12 +141,14 @@ pub enum RunMode {
 }
 
 // Which bot a session is running as. Derived from `RunPhase` (`orchestrate` →
-// orchestrator, `design` → designer, `review` → reviewer, everything else
+// orchestrator, `promptmax` → promptmaxer, `design` → designer, `review` →
+// reviewer, everything else
 // including a missing phase → executor) and handed to the prompt builder and
 // the move gate.
 string_enum!(Role {
     Executor => "executor",
     Orchestrator => "orchestrator",
+    Promptmaxer => "promptmaxer",
     Designer => "designer",
     Reviewer => "reviewer",
 });
@@ -154,6 +157,7 @@ impl Role {
     pub fn from_phase(phase: Option<RunPhase>) -> Self {
         match phase {
             Some(RunPhase::Orchestrate) => Role::Orchestrator,
+            Some(RunPhase::Promptmax) => Role::Promptmaxer,
             Some(RunPhase::Design) => Role::Designer,
             Some(RunPhase::Review) => Role::Reviewer,
             _ => Role::Executor,
@@ -372,6 +376,12 @@ pub struct Task {
     /// legacy boards round-trip byte-identically.
     #[serde(default, skip_serializing_if = "is_false")]
     pub use_designer: bool,
+    /// Opt this task into the promptmaxer bot even when
+    /// `orchestration.designer.promptmax.enabled` is off: a pre-launch pass
+    /// that writes a detailed English brief for the executor. Omitted while
+    /// false so legacy boards round-trip byte-identically.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub use_promptmax: bool,
     /// Opt this task into the reviewer bot even when
     /// `orchestration.reviewer.enabled` is off. Models and agents still
     /// come from the project reviewer settings. Omitted while false.
@@ -492,6 +502,11 @@ pub struct Task {
     /// boards round-trip byte-identically.
     #[serde(default, skip_serializing_if = "is_false")]
     pub designed: bool,
+    /// A promptmaxer pass has already written this task's brief. Gates the
+    /// promptmax phase exactly like [`Task::designed`] gates design. Omitted
+    /// while false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub promptmaxed: bool,
     /// Worktree isolation (TASK-236): relative path of the task's checkout
     /// under `.kanban/worktrees`. Omitted while unset so legacy boards
     /// round-trip byte-identically.
@@ -647,6 +662,7 @@ impl Task {
             permission: None,
             silence: false,
             use_designer: false,
+            use_promptmax: false,
             use_reviewer: false,
             use_orchestrator: false,
             chained_to: None,
@@ -669,6 +685,7 @@ impl Task {
             launch_at: None,
             review_rounds: 0,
             designed: false,
+            promptmaxed: false,
             worktree: None,
             branch: None,
             cleanup_retry_at: None,

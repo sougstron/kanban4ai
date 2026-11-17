@@ -154,6 +154,7 @@ pub enum DialogField {
     Permission,
     Silence,
     UseOrchestrator,
+    UsePromptmax,
     UseDesigner,
     UseReviewer,
     TargetStatus,
@@ -191,6 +192,13 @@ pub enum DialogField {
     DesignerModel,
     DesignerEffort,
     DesignerAgent,
+    PromptmaxEnabled,
+    PromptmaxMega,
+    PromptmaxAgentSettings,
+    PromptmaxBackend,
+    PromptmaxModel,
+    PromptmaxEffort,
+    PromptmaxAgent,
     ReviewerEnabled,
     ReviewerBackend,
     ReviewerModel,
@@ -250,9 +258,10 @@ const TASK_FORM_FIELDS: [DialogField; 8] = [
 /// The `Options` subpopup of the task form: per-task orchestration opt-ins
 /// and the planned launch, grouped off the parent form like the agent
 /// settings popup.
-const TASK_OPTIONS_FIELDS: [DialogField; 10] = [
+const TASK_OPTIONS_FIELDS: [DialogField; 11] = [
     DialogField::Silence,
     DialogField::UseOrchestrator,
+    DialogField::UsePromptmax,
     DialogField::UseDesigner,
     DialogField::UseReviewer,
     DialogField::SpawnPolicy,
@@ -385,10 +394,13 @@ const SETTINGS_PAGE_COMMON_FIELDS: [DialogField; 26] = [
     DialogField::Cancel,
 ];
 
-const SETTINGS_PAGE_DESIGNER_FIELDS: [DialogField; 5] = [
+const SETTINGS_PAGE_DESIGNER_FIELDS: [DialogField; 8] = [
     DialogField::InheritDesigner,
     DialogField::DesignerEnabled,
     DialogField::DesignerAgentSettings,
+    DialogField::PromptmaxEnabled,
+    DialogField::PromptmaxMega,
+    DialogField::PromptmaxAgentSettings,
     DialogField::Confirm,
     DialogField::Cancel,
 ];
@@ -582,7 +594,10 @@ pub(crate) fn tab_for_field(field: DialogField) -> Option<SettingsTab> {
         | DialogField::UpdateCheckOnOpen => Some(SettingsTab::Common),
         DialogField::InheritDesigner
         | DialogField::DesignerEnabled
-        | DialogField::DesignerAgentSettings => Some(SettingsTab::Designer),
+        | DialogField::PromptmaxEnabled
+        | DialogField::PromptmaxMega
+        | DialogField::DesignerAgentSettings
+        | DialogField::PromptmaxAgentSettings => Some(SettingsTab::Designer),
         DialogField::InheritReviewer
         | DialogField::ReviewerEnabled
         | DialogField::ReviewerAgentSettings
@@ -662,11 +677,18 @@ pub(crate) fn field_group(field: DialogField) -> Option<InheritGroup> {
         DialogField::DetailTabDiff => Some(InheritGroup::DetailTab),
         DialogField::Runner => Some(InheritGroup::Placement),
         DialogField::DesignerEnabled
+        | DialogField::PromptmaxEnabled
+        | DialogField::PromptmaxMega
         | DialogField::DesignerAgentSettings
+        | DialogField::PromptmaxAgentSettings
         | DialogField::DesignerBackend
+        | DialogField::PromptmaxBackend
         | DialogField::DesignerModel
+        | DialogField::PromptmaxModel
         | DialogField::DesignerEffort
-        | DialogField::DesignerAgent => Some(InheritGroup::Designer),
+        | DialogField::PromptmaxEffort
+        | DialogField::DesignerAgent
+        | DialogField::PromptmaxAgent => Some(InheritGroup::Designer),
         DialogField::ReviewerEnabled
         | DialogField::ReviewerAgentSettings
         | DialogField::ReviewerBackend
@@ -705,6 +727,15 @@ const DESIGNER_AGENT_FIELDS: [DialogField; 6] = [
     DialogField::Cancel,
 ];
 
+const PROMPTMAX_AGENT_FIELDS: [DialogField; 6] = [
+    DialogField::PromptmaxBackend,
+    DialogField::PromptmaxModel,
+    DialogField::PromptmaxEffort,
+    DialogField::PromptmaxAgent,
+    DialogField::Confirm,
+    DialogField::Cancel,
+];
+
 const REVIEWER_AGENT_FIELDS: [DialogField; 6] = [
     DialogField::ReviewerBackend,
     DialogField::ReviewerModel,
@@ -738,6 +769,8 @@ pub enum ModalButton {
 pub enum AgentSlot {
     Primary,
     Designer,
+    /// The promptmaxer; its model list also offers `same` (the task's own).
+    Promptmax,
     Reviewer,
     /// Global Settings only: the auto-mode arbiter.
     Arbiter,
@@ -782,6 +815,7 @@ struct OptionsSnapshot {
     spawn_policy: Option<crate::core::config::SpawnPolicy>,
     spawn_helper_model: Option<crate::core::config::SpawnHelperModel>,
     use_orchestrator: bool,
+    use_promptmax: bool,
     use_designer: bool,
     use_reviewer: bool,
     planned_launch: bool,
@@ -920,6 +954,7 @@ pub struct ModalState {
     pub spawn_max_depth: TextArea<'static>,
     pub spawn_max_children: TextArea<'static>,
     pub use_orchestrator: bool,
+    pub use_promptmax: bool,
     pub use_designer: bool,
     pub use_reviewer: bool,
     pub escape_to_projects: bool,
@@ -998,7 +1033,13 @@ pub struct ModalState {
     pub auto_restart_enabled: bool,
     pub auto_restart_delays: TextArea<'static>,
     pub designer_enabled: bool,
+    pub promptmax_enabled: bool,
     pub(crate) designer: AgentPicker,
+    pub promptmax_mega: bool,
+    /// Boxed: `ModalState` is moved through deep TUI call chains, and an
+    /// inline fourth picker pushes debug-build stack frames past the 2 MiB
+    /// test-thread stack.
+    pub(crate) promptmax: Box<AgentPicker>,
     pub reviewer_enabled: bool,
     pub(crate) reviewer: AgentPicker,
     pub reviewer_on_changes: TextArea<'static>,
@@ -1081,6 +1122,7 @@ impl ModalState {
             spawn_max_depth: one_line("2"),
             spawn_max_children: one_line("5"),
             use_orchestrator: false,
+            use_promptmax: false,
             use_designer: false,
             use_reviewer: false,
             escape_to_projects: false,
@@ -1146,7 +1188,10 @@ impl ModalState {
             auto_restart_enabled: true,
             auto_restart_delays: one_line("1, 30, 270"),
             designer_enabled: false,
+            promptmax_enabled: false,
             designer: AgentPicker::new(),
+            promptmax_mega: false,
+            promptmax: Box::new(AgentPicker::new()),
             reviewer_enabled: false,
             reviewer: AgentPicker::new(),
             reviewer_on_changes: one_line("in_progress"),
@@ -1191,6 +1236,7 @@ impl ModalState {
         state.spawn_policy = task.spawn_policy;
         state.spawn_helper_model = task.spawn_helper_model;
         state.use_designer = task.use_designer;
+        state.use_promptmax = task.use_promptmax;
         state.use_reviewer = task.use_reviewer;
         state
     }
@@ -1566,6 +1612,10 @@ impl ModalState {
             | DialogField::DesignerModel
             | DialogField::DesignerEffort
             | DialogField::DesignerAgent => Some(AgentSlot::Designer),
+            DialogField::PromptmaxBackend
+            | DialogField::PromptmaxModel
+            | DialogField::PromptmaxEffort
+            | DialogField::PromptmaxAgent => Some(AgentSlot::Promptmax),
             DialogField::ReviewerBackend
             | DialogField::ReviewerModel
             | DialogField::ReviewerEffort
@@ -1582,6 +1632,7 @@ impl ModalState {
         match field {
             DialogField::AgentSettings => Some(AgentSlot::Primary),
             DialogField::DesignerAgentSettings => Some(AgentSlot::Designer),
+            DialogField::PromptmaxAgentSettings => Some(AgentSlot::Promptmax),
             DialogField::ReviewerAgentSettings => Some(AgentSlot::Reviewer),
             DialogField::ArbiterAgentSettings => Some(AgentSlot::Arbiter),
             _ => None,
@@ -1640,6 +1691,7 @@ impl ModalState {
                 spawn_helper_model: self.spawn_helper_model,
                 use_orchestrator: self.use_orchestrator,
                 use_designer: self.use_designer,
+                use_promptmax: self.use_promptmax,
                 use_reviewer: self.use_reviewer,
                 planned_launch: self.planned_launch,
                 launch_time: self.launch_time.clone(),
@@ -1675,6 +1727,7 @@ impl ModalState {
                     self.spawn_policy = options.original.spawn_policy;
                     self.spawn_helper_model = options.original.spawn_helper_model;
                     self.use_designer = options.original.use_designer;
+                    self.use_promptmax = options.original.use_promptmax;
                     self.use_reviewer = options.original.use_reviewer;
                     self.planned_launch = options.original.planned_launch;
                     self.launch_time = options.original.launch_time.clone();
@@ -1707,6 +1760,7 @@ impl ModalState {
                 model_filter: self.model_filter.clone(),
             },
             AgentSlot::Designer => self.designer.clone(),
+            AgentSlot::Promptmax => (*self.promptmax).clone(),
             AgentSlot::Reviewer => self.reviewer.clone(),
             AgentSlot::Arbiter => self.arbiter.clone(),
         }
@@ -1731,6 +1785,7 @@ impl ModalState {
                 self.model_filter = picker.model_filter;
             }
             AgentSlot::Designer => self.designer = picker,
+            AgentSlot::Promptmax => *self.promptmax = picker,
             AgentSlot::Reviewer => self.reviewer = picker,
             AgentSlot::Arbiter => self.arbiter = picker,
         }
@@ -1740,6 +1795,7 @@ impl ModalState {
         match slot {
             AgentSlot::Primary => None,
             AgentSlot::Designer => Some(&self.designer),
+            AgentSlot::Promptmax => Some(&*self.promptmax),
             AgentSlot::Reviewer => Some(&self.reviewer),
             AgentSlot::Arbiter => Some(&self.arbiter),
         }
@@ -1749,6 +1805,7 @@ impl ModalState {
         match slot {
             AgentSlot::Primary => None,
             AgentSlot::Designer => Some(&mut self.designer),
+            AgentSlot::Promptmax => Some(&mut *self.promptmax),
             AgentSlot::Reviewer => Some(&mut self.reviewer),
             AgentSlot::Arbiter => Some(&mut self.arbiter),
         }
@@ -1760,6 +1817,14 @@ impl ModalState {
 
     pub fn designer_model_selected(&self) -> usize {
         self.designer.model_selected
+    }
+
+    pub fn promptmax_backend_selected(&self) -> usize {
+        self.promptmax.backend_selected
+    }
+
+    pub fn promptmax_model_selected(&self) -> usize {
+        self.promptmax.model_selected
     }
 
     pub fn reviewer_backend_selected(&self) -> usize {
@@ -1782,6 +1847,7 @@ impl ModalState {
         match slot {
             AgentSlot::Primary => self.backend_text(),
             AgentSlot::Designer => non_empty(textarea_text(&self.designer.backend)),
+            AgentSlot::Promptmax => non_empty(textarea_text(&self.promptmax.backend)),
             AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.backend)),
             AgentSlot::Arbiter => non_empty(textarea_text(&self.arbiter.backend)),
         }
@@ -1791,6 +1857,7 @@ impl ModalState {
         match slot {
             AgentSlot::Primary => self.model_text(),
             AgentSlot::Designer => non_empty(textarea_text(&self.designer.model)),
+            AgentSlot::Promptmax => non_empty(textarea_text(&self.promptmax.model)),
             AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.model)),
             AgentSlot::Arbiter => non_empty(textarea_text(&self.arbiter.model)),
         }
@@ -1800,6 +1867,7 @@ impl ModalState {
         match slot {
             AgentSlot::Primary => self.effort_text(),
             AgentSlot::Designer => non_empty(textarea_text(&self.designer.effort)),
+            AgentSlot::Promptmax => non_empty(textarea_text(&self.promptmax.effort)),
             AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.effort)),
             AgentSlot::Arbiter => non_empty(textarea_text(&self.arbiter.effort)),
         }
@@ -1809,6 +1877,7 @@ impl ModalState {
         match slot {
             AgentSlot::Primary => self.agent_text(),
             AgentSlot::Designer => non_empty(textarea_text(&self.designer.agent)),
+            AgentSlot::Promptmax => non_empty(textarea_text(&self.promptmax.agent)),
             AgentSlot::Reviewer => non_empty(textarea_text(&self.reviewer.agent)),
             AgentSlot::Arbiter => non_empty(textarea_text(&self.arbiter.agent)),
         }
@@ -1818,6 +1887,7 @@ impl ModalState {
         match slot {
             AgentSlot::Primary => self.backend = one_line(value),
             AgentSlot::Designer => self.designer.backend = one_line(value),
+            AgentSlot::Promptmax => self.promptmax.backend = one_line(value),
             AgentSlot::Reviewer => self.reviewer.backend = one_line(value),
             AgentSlot::Arbiter => self.arbiter.backend = one_line(value),
         }
@@ -1827,6 +1897,7 @@ impl ModalState {
         match slot {
             AgentSlot::Primary => self.model = one_line(value),
             AgentSlot::Designer => self.designer.model = one_line(value),
+            AgentSlot::Promptmax => self.promptmax.model = one_line(value),
             AgentSlot::Reviewer => self.reviewer.model = one_line(value),
             AgentSlot::Arbiter => self.arbiter.model = one_line(value),
         }
@@ -1836,6 +1907,7 @@ impl ModalState {
         match slot {
             AgentSlot::Primary => self.effort = one_line(value),
             AgentSlot::Designer => self.designer.effort = one_line(value),
+            AgentSlot::Promptmax => self.promptmax.effort = one_line(value),
             AgentSlot::Reviewer => self.reviewer.effort = one_line(value),
             AgentSlot::Arbiter => self.arbiter.effort = one_line(value),
         }
@@ -1845,6 +1917,7 @@ impl ModalState {
         match slot {
             AgentSlot::Primary => self.agent = one_line(value),
             AgentSlot::Designer => self.designer.agent = one_line(value),
+            AgentSlot::Promptmax => self.promptmax.agent = one_line(value),
             AgentSlot::Reviewer => self.reviewer.agent = one_line(value),
             AgentSlot::Arbiter => self.arbiter.agent = one_line(value),
         }
@@ -2072,7 +2145,9 @@ impl ModalState {
             DialogField::Model => Some(self.model_filter.as_str()),
             DialogField::ChainTo => Some(self.chain_filter.as_str()),
             DialogField::DesignerBackend => Some(self.designer.backend_filter.as_str()),
+            DialogField::PromptmaxBackend => Some(self.promptmax.backend_filter.as_str()),
             DialogField::DesignerModel => Some(self.designer.model_filter.as_str()),
+            DialogField::PromptmaxModel => Some(self.promptmax.model_filter.as_str()),
             DialogField::ReviewerBackend => Some(self.reviewer.backend_filter.as_str()),
             DialogField::ArbiterBackend => Some(self.arbiter.backend_filter.as_str()),
             DialogField::ReviewerModel => Some(self.reviewer.model_filter.as_str()),
@@ -2095,7 +2170,9 @@ impl ModalState {
             DialogField::Model => Some(&mut self.model_filter),
             DialogField::ChainTo => Some(&mut self.chain_filter),
             DialogField::DesignerBackend => Some(&mut self.designer.backend_filter),
+            DialogField::PromptmaxBackend => Some(&mut self.promptmax.backend_filter),
             DialogField::DesignerModel => Some(&mut self.designer.model_filter),
+            DialogField::PromptmaxModel => Some(&mut self.promptmax.model_filter),
             DialogField::ReviewerBackend => Some(&mut self.reviewer.backend_filter),
             DialogField::ArbiterBackend => Some(&mut self.arbiter.backend_filter),
             DialogField::ReviewerModel => Some(&mut self.reviewer.model_filter),
@@ -2124,9 +2201,13 @@ impl ModalState {
             DialogField::TaskSort => &self.task_sort_options,
             DialogField::ProjectSort => &self.project_sort_options,
             DialogField::DesignerBackend => &self.designer.backend_options,
+            DialogField::PromptmaxBackend => &self.promptmax.backend_options,
             DialogField::DesignerModel => &self.designer.model_options,
+            DialogField::PromptmaxModel => &self.promptmax.model_options,
             DialogField::DesignerEffort => &self.designer.effort_options,
+            DialogField::PromptmaxEffort => &self.promptmax.effort_options,
             DialogField::DesignerAgent => &self.designer.agent_options,
+            DialogField::PromptmaxAgent => &self.promptmax.agent_options,
             DialogField::ReviewerBackend => &self.reviewer.backend_options,
             DialogField::ArbiterBackend => &self.arbiter.backend_options,
             DialogField::ReviewerModel => &self.reviewer.model_options,
@@ -2248,6 +2329,7 @@ impl ModalState {
             DialogField::Silence => toggle_on_space(&mut self.silence, key),
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
+            | DialogField::PromptmaxAgentSettings
             | DialogField::ReviewerAgentSettings
             | DialogField::ArbiterAgentSettings
             | DialogField::TaskOptions => {}
@@ -2341,6 +2423,7 @@ impl ModalState {
             DialogField::SpawnMaxDepth => input_single_line(&mut self.spawn_max_depth, key),
             DialogField::SpawnMaxChildren => input_single_line(&mut self.spawn_max_children, key),
             DialogField::UseOrchestrator => toggle_on_space(&mut self.use_orchestrator, key),
+            DialogField::UsePromptmax => toggle_on_space(&mut self.use_promptmax, key),
             DialogField::UseDesigner => toggle_on_space(&mut self.use_designer, key),
             DialogField::UseReviewer => toggle_on_space(&mut self.use_reviewer, key),
             DialogField::EscapeToProjects => {
@@ -2408,10 +2491,16 @@ impl ModalState {
             DialogField::AutoRestartEnabled => toggle_on_space(&mut self.auto_restart_enabled, key),
             DialogField::AutoRestartDelays => input_single_line(&mut self.auto_restart_delays, key),
             DialogField::DesignerEnabled => toggle_on_space(&mut self.designer_enabled, key),
+            DialogField::PromptmaxEnabled => toggle_on_space(&mut self.promptmax_enabled, key),
+            DialogField::PromptmaxMega => toggle_on_space(&mut self.promptmax_mega, key),
             DialogField::DesignerBackend => self.input_select(key, SelectorKind::Backend),
+            DialogField::PromptmaxBackend => self.input_select(key, SelectorKind::Backend),
             DialogField::DesignerModel => self.input_select(key, SelectorKind::Model),
+            DialogField::PromptmaxModel => self.input_select(key, SelectorKind::Model),
             DialogField::DesignerEffort => self.input_select(key, SelectorKind::Effort),
+            DialogField::PromptmaxEffort => self.input_select(key, SelectorKind::Effort),
             DialogField::DesignerAgent => self.input_select(key, SelectorKind::Agent),
+            DialogField::PromptmaxAgent => self.input_select(key, SelectorKind::Agent),
             DialogField::ReviewerEnabled => toggle_on_space(&mut self.reviewer_enabled, key),
             DialogField::ReviewerBackend => self.input_select(key, SelectorKind::Backend),
             DialogField::ArbiterBackend => self.input_select(key, SelectorKind::Backend),
@@ -2595,6 +2684,7 @@ impl ModalState {
             DialogField::LaunchTime => &mut self.launch_time,
             DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
+            | DialogField::PromptmaxAgentSettings
             | DialogField::ReviewerAgentSettings
             | DialogField::ArbiterAgentSettings
             | DialogField::TaskOptions
@@ -2603,6 +2693,7 @@ impl ModalState {
             | DialogField::Silence
             | DialogField::Runner
             | DialogField::UseOrchestrator
+            | DialogField::UsePromptmax
             | DialogField::UseDesigner
             | DialogField::UseReviewer
             | DialogField::PlannedLaunch
@@ -2630,9 +2721,13 @@ impl ModalState {
             DialogField::MaxRunningPerBackendModel => &mut self.max_running_per_backend_model,
             DialogField::AutoRestartDelays => &mut self.auto_restart_delays,
             DialogField::DesignerBackend => &mut self.designer.backend,
+            DialogField::PromptmaxBackend => &mut self.promptmax.backend,
             DialogField::DesignerModel => &mut self.designer.model,
+            DialogField::PromptmaxModel => &mut self.promptmax.model,
             DialogField::DesignerEffort => &mut self.designer.effort,
+            DialogField::PromptmaxEffort => &mut self.promptmax.effort,
             DialogField::DesignerAgent => &mut self.designer.agent,
+            DialogField::PromptmaxAgent => &mut self.promptmax.agent,
             DialogField::ReviewerBackend => &mut self.reviewer.backend,
             DialogField::ArbiterBackend => &mut self.arbiter.backend,
             DialogField::ReviewerModel => &mut self.reviewer.model,
@@ -2659,6 +2754,8 @@ impl ModalState {
             | DialogField::QueueEnabled
             | DialogField::AutoRestartEnabled
             | DialogField::DesignerEnabled
+            | DialogField::PromptmaxEnabled
+            | DialogField::PromptmaxMega
             | DialogField::ReviewerEnabled
             | DialogField::AutoModeEnabled
             | DialogField::AutoModeArbiter
@@ -2742,7 +2839,10 @@ impl ModalState {
     pub fn set_backend_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
         match slot {
             AgentSlot::Primary => self.set_backend_options(options),
-            AgentSlot::Designer | AgentSlot::Reviewer | AgentSlot::Arbiter => {
+            AgentSlot::Designer
+            | AgentSlot::Promptmax
+            | AgentSlot::Reviewer
+            | AgentSlot::Arbiter => {
                 let current = self.backend_text_for(slot);
                 let picker = self.picker_mut(slot).expect("role picker");
                 picker.backend_options = options;
@@ -2750,6 +2850,7 @@ impl ModalState {
                     select_matching(&picker.backend_options, current.as_deref());
                 let field = match slot {
                     AgentSlot::Designer => DialogField::DesignerBackend,
+                    AgentSlot::Promptmax => DialogField::PromptmaxBackend,
                     AgentSlot::Reviewer => DialogField::ReviewerBackend,
                     AgentSlot::Arbiter => DialogField::ArbiterBackend,
                     AgentSlot::Primary => unreachable!(),
@@ -2763,13 +2864,17 @@ impl ModalState {
     pub fn set_model_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
         match slot {
             AgentSlot::Primary => self.set_model_options(options),
-            AgentSlot::Designer | AgentSlot::Reviewer | AgentSlot::Arbiter => {
+            AgentSlot::Designer
+            | AgentSlot::Promptmax
+            | AgentSlot::Reviewer
+            | AgentSlot::Arbiter => {
                 let current = self.model_text_for(slot);
                 let picker = self.picker_mut(slot).expect("role picker");
                 picker.model_options = options;
                 picker.model_selected = select_matching(&picker.model_options, current.as_deref());
                 let field = match slot {
                     AgentSlot::Designer => DialogField::DesignerModel,
+                    AgentSlot::Promptmax => DialogField::PromptmaxModel,
                     AgentSlot::Reviewer => DialogField::ReviewerModel,
                     AgentSlot::Arbiter => DialogField::ArbiterModel,
                     AgentSlot::Primary => unreachable!(),
@@ -2783,7 +2888,10 @@ impl ModalState {
     pub fn set_effort_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
         match slot {
             AgentSlot::Primary => self.set_effort_options(options),
-            AgentSlot::Designer | AgentSlot::Reviewer | AgentSlot::Arbiter => {
+            AgentSlot::Designer
+            | AgentSlot::Promptmax
+            | AgentSlot::Reviewer
+            | AgentSlot::Arbiter => {
                 let current = self.effort_text_for(slot);
                 let picker = self.picker_mut(slot).expect("role picker");
                 picker.effort_options = options;
@@ -2791,6 +2899,7 @@ impl ModalState {
                     select_matching(&picker.effort_options, current.as_deref());
                 let field = match slot {
                     AgentSlot::Designer => DialogField::DesignerEffort,
+                    AgentSlot::Promptmax => DialogField::PromptmaxEffort,
                     AgentSlot::Reviewer => DialogField::ReviewerEffort,
                     AgentSlot::Arbiter => DialogField::ArbiterEffort,
                     AgentSlot::Primary => unreachable!(),
@@ -2803,13 +2912,17 @@ impl ModalState {
     pub fn set_agent_options_for(&mut self, slot: AgentSlot, options: Vec<SelectOption>) {
         match slot {
             AgentSlot::Primary => self.set_agent_options(options),
-            AgentSlot::Designer | AgentSlot::Reviewer | AgentSlot::Arbiter => {
+            AgentSlot::Designer
+            | AgentSlot::Promptmax
+            | AgentSlot::Reviewer
+            | AgentSlot::Arbiter => {
                 let current = self.agent_text_for(slot);
                 let picker = self.picker_mut(slot).expect("role picker");
                 picker.agent_options = options;
                 picker.agent_selected = select_matching(&picker.agent_options, current.as_deref());
                 let field = match slot {
                     AgentSlot::Designer => DialogField::DesignerAgent,
+                    AgentSlot::Promptmax => DialogField::PromptmaxAgent,
                     AgentSlot::Reviewer => DialogField::ReviewerAgent,
                     AgentSlot::Arbiter => DialogField::ArbiterAgent,
                     AgentSlot::Primary => unreachable!(),
@@ -3267,6 +3380,7 @@ impl ModalState {
             raw_textarea_text(&self.spawn_max_depth),
             raw_textarea_text(&self.spawn_max_children),
             self.use_orchestrator.to_string(),
+            self.use_promptmax.to_string(),
             self.use_designer.to_string(),
             self.use_reviewer.to_string(),
             self.backend_selected.to_string(),
@@ -3311,14 +3425,24 @@ impl ModalState {
             self.auto_restart_enabled.to_string(),
             raw_textarea_text(&self.auto_restart_delays),
             self.designer_enabled.to_string(),
+            self.promptmax_enabled.to_string(),
+            self.promptmax_mega.to_string(),
             raw_textarea_text(&self.designer.backend),
+            raw_textarea_text(&self.promptmax.backend),
             raw_textarea_text(&self.designer.model),
+            raw_textarea_text(&self.promptmax.model),
             raw_textarea_text(&self.designer.effort),
+            raw_textarea_text(&self.promptmax.effort),
             raw_textarea_text(&self.designer.agent),
+            raw_textarea_text(&self.promptmax.agent),
             self.designer.backend_selected.to_string(),
+            self.promptmax.backend_selected.to_string(),
             self.designer.model_selected.to_string(),
+            self.promptmax.model_selected.to_string(),
             self.designer.effort_selected.to_string(),
+            self.promptmax.effort_selected.to_string(),
             self.designer.agent_selected.to_string(),
+            self.promptmax.agent_selected.to_string(),
             self.reviewer_enabled.to_string(),
             raw_textarea_text(&self.reviewer.backend),
             raw_textarea_text(&self.arbiter.backend),
@@ -3375,6 +3499,7 @@ fn agent_fields(slot: AgentSlot) -> &'static [DialogField] {
     match slot {
         AgentSlot::Primary => &PRIMARY_AGENT_FIELDS,
         AgentSlot::Designer => &DESIGNER_AGENT_FIELDS,
+        AgentSlot::Promptmax => &PROMPTMAX_AGENT_FIELDS,
         AgentSlot::Reviewer => &REVIEWER_AGENT_FIELDS,
         AgentSlot::Arbiter => &ARBITER_AGENT_FIELDS,
     }
@@ -3402,18 +3527,22 @@ fn selector_kind(field: DialogField) -> Option<SelectorKind> {
     match field {
         DialogField::Backend
         | DialogField::DesignerBackend
+        | DialogField::PromptmaxBackend
         | DialogField::ReviewerBackend
         | DialogField::ArbiterBackend => Some(SelectorKind::Backend),
         DialogField::Model
         | DialogField::DesignerModel
+        | DialogField::PromptmaxModel
         | DialogField::ReviewerModel
         | DialogField::ArbiterModel => Some(SelectorKind::Model),
         DialogField::Effort
         | DialogField::DesignerEffort
+        | DialogField::PromptmaxEffort
         | DialogField::ReviewerEffort
         | DialogField::ArbiterEffort => Some(SelectorKind::Effort),
         DialogField::Agent
         | DialogField::DesignerAgent
+        | DialogField::PromptmaxAgent
         | DialogField::ReviewerAgent
         | DialogField::ArbiterAgent => Some(SelectorKind::Agent),
         DialogField::ChainTo => Some(SelectorKind::ChainTo),
@@ -3897,6 +4026,7 @@ fn agent_slot_name(slot: AgentSlot) -> &'static str {
     match slot {
         AgentSlot::Primary => "Primary",
         AgentSlot::Designer => "Designer",
+        AgentSlot::Promptmax => "Promptmax",
         AgentSlot::Reviewer => "Reviewer",
         AgentSlot::Arbiter => "Arbiter",
     }
@@ -4541,6 +4671,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         DialogField::Title
         | DialogField::AgentSettings
         | DialogField::DesignerAgentSettings
+        | DialogField::PromptmaxAgentSettings
         | DialogField::ReviewerAgentSettings
         | DialogField::ArbiterAgentSettings
         | DialogField::TaskOptions
@@ -4548,6 +4679,7 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::Silence
         | DialogField::Runner
         | DialogField::UseOrchestrator
+        | DialogField::UsePromptmax
         | DialogField::UseDesigner
         | DialogField::UseReviewer
         | DialogField::PlannedLaunch
@@ -4560,6 +4692,8 @@ fn task_field_min_height(field: DialogField) -> u16 {
         | DialogField::DetailTabDiff
         | DialogField::AutoRestartEnabled
         | DialogField::DesignerEnabled
+        | DialogField::PromptmaxEnabled
+        | DialogField::PromptmaxMega
         | DialogField::ReviewerEnabled
         | DialogField::AutoModeEnabled
         | DialogField::AutoModeArbiter
@@ -4602,7 +4736,9 @@ fn task_field_min_height(field: DialogField) -> u16 {
         DialogField::Backend
         | DialogField::Model
         | DialogField::DesignerBackend
+        | DialogField::PromptmaxBackend
         | DialogField::DesignerModel
+        | DialogField::PromptmaxModel
         | DialogField::ReviewerBackend
         | DialogField::ArbiterBackend
         | DialogField::ReviewerModel
@@ -4651,9 +4787,13 @@ fn task_selector_max_height(modal: &ModalState, field: DialogField) -> u16 {
         DialogField::BackendOrder => modal.backend_order.len(),
         DialogField::ChainTo => modal.chain_options.len(),
         DialogField::DesignerBackend => modal.designer.backend_options.len(),
+        DialogField::PromptmaxBackend => modal.promptmax.backend_options.len(),
         DialogField::DesignerModel => modal.designer.model_options.len(),
+        DialogField::PromptmaxModel => modal.promptmax.model_options.len(),
         DialogField::DesignerEffort => modal.designer.effort_options.len(),
+        DialogField::PromptmaxEffort => modal.promptmax.effort_options.len(),
         DialogField::DesignerAgent => modal.designer.agent_options.len(),
+        DialogField::PromptmaxAgent => modal.promptmax.agent_options.len(),
         DialogField::ExecutorMiddle1
         | DialogField::ExecutorMiddle2
         | DialogField::ExecutorMiddle3
@@ -4948,6 +5088,14 @@ fn render_selector_field(
             area,
             "Designer agent settings",
         ),
+        DialogField::PromptmaxAgentSettings => render_agent_launcher(
+            frame,
+            app,
+            modal,
+            AgentSlot::Promptmax,
+            area,
+            "Promptmax agent settings",
+        ),
         DialogField::ReviewerAgentSettings => render_agent_launcher(
             frame,
             app,
@@ -5165,6 +5313,15 @@ fn render_selector_field(
                 );
             }
         }
+        DialogField::UsePromptmax => render_checkbox(
+            frame,
+            app,
+            area,
+            "Promptmax",
+            "detailed brief before launch",
+            modal.use_promptmax,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
         DialogField::UseDesigner => render_checkbox(
             frame,
             app,
@@ -5387,6 +5544,64 @@ fn render_selector_field(
             "Designer · Agent",
             &modal.designer.agent_options,
             modal.designer.agent_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::PromptmaxEnabled => render_checkbox(
+            frame,
+            app,
+            area,
+            "Promptmax",
+            "brief the executor before it runs",
+            modal.promptmax_enabled,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::PromptmaxMega => render_checkbox(
+            frame,
+            app,
+            area,
+            "Promptmax · Mega",
+            "mega prompt (off: expanded)",
+            modal.promptmax_mega,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::PromptmaxBackend => render_select_filtered(
+            frame,
+            app,
+            "Promptmax · Backend",
+            &modal.promptmax.backend_options,
+            modal.promptmax.backend_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.promptmax.backend_filter),
+            modal.filter_error == Some(field),
+        ),
+        DialogField::PromptmaxModel => render_select_filtered(
+            frame,
+            app,
+            "Promptmax · Model",
+            &modal.promptmax.model_options,
+            modal.promptmax.model_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+            Some(&modal.promptmax.model_filter),
+            modal.filter_error == Some(field),
+        ),
+        DialogField::PromptmaxEffort => render_select(
+            frame,
+            app,
+            "Promptmax · Effort",
+            &modal.promptmax.effort_options,
+            modal.promptmax.effort_selected,
+            area,
+            modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
+        ),
+        DialogField::PromptmaxAgent => render_select(
+            frame,
+            app,
+            "Promptmax · Agent",
+            &modal.promptmax.agent_options,
+            modal.promptmax.agent_selected,
             area,
             modal.active_field() == field || app.is_hovered(HitAction::ModalField(field)),
         ),
@@ -5681,6 +5896,7 @@ fn render_agent_launcher(
     let field = match slot {
         AgentSlot::Primary => DialogField::AgentSettings,
         AgentSlot::Designer => DialogField::DesignerAgentSettings,
+        AgentSlot::Promptmax => DialogField::PromptmaxAgentSettings,
         AgentSlot::Reviewer => DialogField::ReviewerAgentSettings,
         AgentSlot::Arbiter => DialogField::ArbiterAgentSettings,
     };
@@ -5711,6 +5927,9 @@ fn render_options_launcher(frame: &mut Frame<'_>, app: &App, modal: &ModalState,
     }
     if modal.use_orchestrator {
         parts.push("orchestrator".to_string());
+    }
+    if modal.use_promptmax {
+        parts.push("promptmax".to_string());
     }
     if modal.use_designer {
         parts.push("designer".to_string());
@@ -5872,6 +6091,22 @@ fn register_task_options(
         DialogField::DesignerAgent => (
             modal.designer.agent_options.len(),
             modal.designer.agent_selected,
+        ),
+        DialogField::PromptmaxBackend => (
+            modal.promptmax.backend_options.len(),
+            modal.promptmax.backend_selected,
+        ),
+        DialogField::PromptmaxModel => (
+            modal.promptmax.model_options.len(),
+            modal.promptmax.model_selected,
+        ),
+        DialogField::PromptmaxEffort => (
+            modal.promptmax.effort_options.len(),
+            modal.promptmax.effort_selected,
+        ),
+        DialogField::PromptmaxAgent => (
+            modal.promptmax.agent_options.len(),
+            modal.promptmax.agent_selected,
         ),
         DialogField::ReviewerBackend => (
             modal.reviewer.backend_options.len(),
@@ -6142,6 +6377,10 @@ fn select_field_from_title(title: &str) -> Option<DialogField> {
         "Designer · Model" => Some(DialogField::DesignerModel),
         "Designer · Effort" => Some(DialogField::DesignerEffort),
         "Designer · Agent" => Some(DialogField::DesignerAgent),
+        "Promptmax · Backend" => Some(DialogField::PromptmaxBackend),
+        "Promptmax · Model" => Some(DialogField::PromptmaxModel),
+        "Promptmax · Effort" => Some(DialogField::PromptmaxEffort),
+        "Promptmax · Agent" => Some(DialogField::PromptmaxAgent),
         "Reviewer · Backend" => Some(DialogField::ReviewerBackend),
         "Arbiter · Backend" => Some(DialogField::ArbiterBackend),
         "Reviewer · Model" => Some(DialogField::ReviewerModel),
@@ -6939,6 +7178,7 @@ pub(crate) fn block_has_inside(field: DialogField) -> bool {
             | DialogField::Cancel
             | DialogField::AgentSettings
             | DialogField::DesignerAgentSettings
+            | DialogField::PromptmaxAgentSettings
             | DialogField::ReviewerAgentSettings
             | DialogField::ArbiterAgentSettings
             | DialogField::TaskOptions
@@ -6958,6 +7198,7 @@ pub(crate) fn is_flag_field(field: DialogField) -> bool {
             | DialogField::Silence
             | DialogField::PlannedLaunch
             | DialogField::UseOrchestrator
+            | DialogField::UsePromptmax
             | DialogField::UseDesigner
             | DialogField::UseReviewer
             | DialogField::Runner
@@ -6970,6 +7211,8 @@ pub(crate) fn is_flag_field(field: DialogField) -> bool {
             | DialogField::QueueEnabled
             | DialogField::AutoRestartEnabled
             | DialogField::DesignerEnabled
+            | DialogField::PromptmaxEnabled
+            | DialogField::PromptmaxMega
             | DialogField::ReviewerEnabled
             | DialogField::AutoModeEnabled
             | DialogField::AutoModeArbiter
@@ -7009,9 +7252,13 @@ fn field_owns_vertical_arrows(field: DialogField) -> bool {
             | DialogField::Theme
             | DialogField::TaskSort
             | DialogField::DesignerBackend
+            | DialogField::PromptmaxBackend
             | DialogField::DesignerModel
+            | DialogField::PromptmaxModel
             | DialogField::DesignerEffort
+            | DialogField::PromptmaxEffort
             | DialogField::DesignerAgent
+            | DialogField::PromptmaxAgent
             | DialogField::ReviewerBackend
             | DialogField::ArbiterBackend
             | DialogField::ReviewerModel

@@ -318,7 +318,7 @@ pub(super) fn validate(op: &Operation) -> Result<()> {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         || !matches!(
             run.phase.as_str(),
-            "executor" | "designer" | "reviewer" | "orchestrator"
+            "executor" | "promptmaxer" | "designer" | "reviewer" | "orchestrator"
         )
     {
         return Err(invalid("invalid run descriptor"));

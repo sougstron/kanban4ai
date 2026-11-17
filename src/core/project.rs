@@ -126,6 +126,11 @@ impl<'a> Roots<'a> {
         normalize_path(&self.kanban_dir()).join(relative)
     }
 
+    /// Where the promptmaxer writes a task's brief for the phases after it.
+    pub fn promptmax_brief(&self, task_id: &str) -> PathBuf {
+        self.data_path("prompts").join(format!("{task_id}.md"))
+    }
+
     /// Whether the board lives outside the code folder.
     pub fn is_split(&self) -> bool {
         normalize_path(self.data_root) != normalize_path(self.work_path)

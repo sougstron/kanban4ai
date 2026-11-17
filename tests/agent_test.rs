@@ -1908,3 +1908,84 @@ fn project_default_readonly_reaches_launch_prompt_and_unsupported_presets_fail()
     assert!(error.to_string().contains("edits"));
     assert!(error.to_string().contains("kimi"));
 }
+
+#[test]
+fn promptmaxer_prompt_researches_in_english_and_writes_the_brief() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let mut task = storage
+        .create_task(NewTask {
+            title: "Добавить вход".into(),
+            description: "Пользователи входят через OAuth".into(),
+            silence: true,
+            ..Default::default()
+        })
+        .unwrap();
+    task.run_phase = Some(RunPhase::Promptmax);
+    storage.save_task(&task).unwrap();
+
+    let prompt = build_agent_prompt(dir.path(), &task, "ses-pm", false, Role::Promptmaxer).unwrap();
+    let brief = Roots::same(dir.path()).promptmax_brief("TASK-001");
+
+    assert!(prompt.contains("PROMPTMAXER"), "{prompt}");
+    assert!(prompt.contains("Role: promptmaxer"), "{prompt}");
+    assert!(prompt.contains(&brief.display().to_string()), "{prompt}");
+    assert!(prompt.contains("English only, strictly"), "{prompt}");
+    assert!(prompt.contains("Response language (mandatory section)"));
+    assert!(prompt.contains("8. Subagents"));
+    assert!(
+        prompt.contains("Style: EXPANDED"),
+        "default style is expanded"
+    );
+    assert!(!prompt.contains("Style: MEGA"));
+    assert!(prompt.contains("Silence mode: the executor cannot ask"));
+    assert!(
+        prompt.contains("Subagents: allowed for this task"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("\"$KANBAN_CMD\" done TASK-001 --session ses-pm --agent"));
+    assert!(prompt.contains("Пользователи входят через OAuth"));
+    assert!(!prompt.contains("Before editing an existing file"));
+}
+
+#[test]
+fn promptmaxer_prompt_follows_the_mega_style() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    write_agent_config(
+        dir.path(),
+        "orchestration:\n  designer:\n    promptmax:\n      enabled: true\n      style: mega\n",
+    );
+    let mut task = storage.create_task(NewTask::titled("Fix it")).unwrap();
+    task.run_phase = Some(RunPhase::Promptmax);
+    storage.save_task(&task).unwrap();
+
+    let prompt = build_agent_prompt(dir.path(), &task, "ses-pm", false, Role::Promptmaxer).unwrap();
+    assert!(prompt.contains("Style: MEGA"), "{prompt}");
+    assert!(prompt.contains("Common mistakes to avoid"));
+    assert!(!prompt.contains("Style: EXPANDED"));
+}
+
+#[test]
+fn executor_prompt_carries_the_brief_only_after_a_finished_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = Storage::new(dir.path());
+    storage.init_board().unwrap();
+    let mut task = storage.create_task(NewTask::titled("Fix it")).unwrap();
+    let brief = Roots::same(dir.path()).promptmax_brief(&task.id);
+    fs::create_dir_all(brief.parent().unwrap()).unwrap();
+    fs::write(&brief, "## Goal\nPatch src/lib.rs:10 only.\n").unwrap();
+
+    let stale = build_agent_prompt(dir.path(), &task, "ses-x", false, Role::Executor).unwrap();
+    assert!(!stale.contains("Patch src/lib.rs:10 only."), "{stale}");
+
+    task.promptmaxed = true;
+    let prompt = build_agent_prompt(dir.path(), &task, "ses-x", false, Role::Executor).unwrap();
+    assert!(prompt.contains("Prepared brief"), "{prompt}");
+    assert!(prompt.contains("Patch src/lib.rs:10 only."), "{prompt}");
+    task.run_phase = Some(RunPhase::Design);
+    let design = build_agent_prompt(dir.path(), &task, "ses-d", false, Role::Designer).unwrap();
+    assert!(design.contains("Patch src/lib.rs:10 only."), "{design}");
+}

@@ -109,12 +109,13 @@ tests/
 7. `auto_launch_on_delegate`: On agent `take`, auto-launch the backend for the task (gated by `auto_launch.enabled`)
 8. `auto_launch_chained`: When a task enters Review, auto-launch every To Do task whose `chained_to` points at it (gated by `auto_launch.enabled`)
 9. Designer-phase agents cannot move their task at all; they record a plan and finish the design phase with `kanban done` (that does not complete the work)
-10. Reviewer-phase agents cannot move their task at all; they must not implement fixes; their only exit is `kanban verdict`
+10. Promptmaxer-phase agents cannot move their task either; they write the brief to `.kanban/prompts/<id>.md` and finish the phase with `kanban done`
+11. Reviewer-phase agents cannot move their task at all; they must not implement fixes; their only exit is `kanban verdict`
 
 When `interactive: true`, delegated agents are instructed to use `kanban ask --wait` for blocking questions and `kanban suggest` for non-blocking ideas.
 
 **Role contracts.** A session's role comes from the task's run phase
-(`Role::from_phase`: `design` → designer, `review` → reviewer, everything else
+(`Role::from_phase`: `promptmax` → promptmaxer, `design` → designer, `review` → reviewer, everything else
 including a missing phase → executor). The role picks the prompt
 (`agent/prompt.rs`) *and* the move gate in `operations::move_task`, so the
 contract is enforced, not merely worded:
@@ -123,6 +124,7 @@ contract is enforced, not merely worded:
 |---|---|---|
 | executor | finish with `kanban done`, which lands the task in Review (or starts bot review); never move a task to Done; do not use `kanban move` to change columns | `user_only_review_to_done`: an agent move to Done, or out of Review, is refused |
 | designer | plan, do not implement, do not move the task out of In Progress; record the plan with `kanban context`; finish the design phase with `kanban done` (that does not complete the work) | any `move` is refused with *"designer cannot move a task; finish the design phase with kanban done"*; `done` without a recorded plan is refused with *"Designer cannot finish without recording a plan via context"* |
+| promptmaxer | research, do not implement or move the task; write an English brief to `.kanban/prompts/<id>.md`; finish the phase with `kanban done` | any `move` is refused; `done` with an empty brief is refused |
 | reviewer | check the result against the task requirements and the project conventions in `AGENTS.md`/`CLAUDE.md`; do not edit project files; do not implement fixes; the only exit is `kanban verdict` | any `move` is refused with *"reviewer cannot move a task; finish with kanban verdict"*; `kanban done` from a review phase is refused with *"bot reviewer must finish with kanban verdict, not done"* |
 
 Run phases, the queue dispatcher and the daemon that drive these rules are in

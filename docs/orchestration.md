@@ -22,6 +22,7 @@ Done             human only (unchanged)
 |---|---|---|
 | `queued` | `⏸ queued` | waiting for a free agent slot; the dispatcher starts it. No session runs, so a queued task occupies no slot. A paused task whose wait deadline passed or that was revoked while paused is parked here too |
 | `orchestrate` | `◧ plan` | the orchestrator bot is decomposing the task into a subtask graph (only when the task has `use_orchestrator`) |
+| `promptmax` | `✍ brief` | the promptmaxer is writing the executor's brief (only when `orchestration.designer.promptmax.enabled` or the task's `use_promptmax`) |
 | `design` | `✎ design` | the designer bot is planning (only when `orchestration.designer.enabled`) |
 | `execute` | `▶ running` | the task's own assigned bot is doing the work |
 | `review` | `⚖ review` | the reviewer bot is checking the result; the task is still In Progress |
@@ -69,6 +70,10 @@ How a task enters each phase:
   re-queued by the readiness sweep once every subtask has reached Review or
   Done, and runs then as an ordinary executor (the integration pass). Finishing
   without an accepted plan is refused. See **Orchestrator mode**.
+- **`promptmax` → `design` | `execute`** — the promptmaxer's `kanban done`
+  (refused while `.kanban/prompts/<id>.md` is empty) closes its session, sets
+  `promptmaxed: true`, and launches the designer (when it still owes a pass)
+  or the task's own bot on the same slot. See **Promptmaxer**.
 - **`design` → `execute`** — the designer's `kanban done` closes the design
   session, sets `designed: true`, flips the phase to `execute`, and launches the task's own bot
   directly on the same slot (re-queueing would stall a task whose slot is
@@ -686,3 +691,29 @@ arrows select, Enter opens the subagent's thread in the same view (Esc
 returns to the parent), and `x` cancel / `m` merge / `d` discard each ask
 first and go through operations. A subagent's own detail is read-only. In
 the Sessions tab a subagent's sessions follow its parent's (`└`).
+
+## Promptmaxer
+
+An optional pre-launch bot that sits next to the designer
+(`orchestration.designer.promptmax`, the Designer settings tab, the task
+form's Promptmax checkbox, `kanban create --promptmax`). It runs first —
+after the orchestrator, before the designer and the executor — researches
+the task, and writes a self-contained **English** brief to
+`.kanban/prompts/<id>.md`: goal, response language (the language the task is
+written in), scope fence, stack and exact commands, a `path:line` codebase map,
+hidden knowledge, the work breakdown, a subagent decision checked against the
+task's spawn policy and caps, verification, decisions, and a definition of
+done. The prompt (`agent/prompt.rs`, `build_promptmaxer_prompt`) feeds it the
+run facts (executor model, permission, silence, isolation, designer/reviewer
+on, subagent caps). It may ask the human through an ask form unless silence
+mode is on.
+
+Two styles: `expanded` (default) front-loads what a capable model would look
+up first; `mega` spells out every edit, edge case, convention and command so
+the weakest model cannot go wrong. Model `same` runs it on the task's own
+backend and model (its own effort/agent still apply when set).
+
+Once `promptmaxed` is set the brief is appended after the user task in the
+designer and executor prompts; a stale file never reaches a task that has not
+been promptmaxed. `promptmaxed` gates the phase like `designed` and is cleared
+by the same To Do resets. A designed task or a review bounce skips it.

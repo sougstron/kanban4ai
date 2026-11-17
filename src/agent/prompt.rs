@@ -1,4 +1,4 @@
-use crate::core::config::Config;
+use crate::core::config::{BoardConfig, Config, OrchestrationSettings, PromptmaxStyle};
 use crate::core::context::result_digest;
 use crate::core::error::Result;
 use crate::core::models::{Message, MessageKind, MessageStatus, Role, Task, TaskStatus};
@@ -105,6 +105,7 @@ pub fn build_agent_prompt<'a>(
     }
     match role {
         Role::Orchestrator => return build_orchestrator_prompt(roots, task, session_id),
+        Role::Promptmaxer => return build_promptmaxer_prompt(roots, task, session_id),
         Role::Designer => return build_designer_prompt(roots, task, session_id),
         Role::Reviewer => return build_reviewer_prompt(roots, task, session_id),
         Role::Executor if task.is_subagent() => {
@@ -220,6 +221,7 @@ not touch the project folder's own checkout.\n"
     } else {
         prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
     }
+    append_promptmax_brief(roots, task, &mut prompt);
     append_upstream_results(roots, task, &mut prompt)?;
     append_spawn_helpers(roots, task, &mut prompt)?;
     append_thread_context(roots, task, &mut prompt)?;
@@ -341,6 +343,11 @@ Continue from the latest state; do not repeat completed work.",
             "Submit the plan with \"$KANBAN_CMD\" plan {} --file <plan.yaml> --session {session_id} --agent, then finish with: \"$KANBAN_CMD\" done {} --session {session_id} --agent",
             task.id, task.id
         ),
+        Role::Promptmaxer => format!(
+            "Write the brief to {}, then finish with: \"$KANBAN_CMD\" done {} --session {session_id} --agent",
+            roots.promptmax_brief(&task.id).display(),
+            task.id
+        ),
         Role::Designer => format!(
             "Record the plan, then finish with: \"$KANBAN_CMD\" done {} --session {session_id} --agent",
             task.id
@@ -456,11 +463,278 @@ Ending a reply without one of those strands the design phase and forces an autom
     } else {
         prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
     }
+    append_promptmax_brief(roots, task, &mut prompt);
     append_upstream_results(roots, task, &mut prompt)?;
     append_spawn_helpers(roots, task, &mut prompt)?;
     append_thread_context(roots, task, &mut prompt)?;
     Ok(prompt)
 }
+
+/// The promptmaxer's brief, appended after the user task for the phases that
+/// run after it. Only a finished pass (`promptmaxed`) counts, so a stale file
+/// from an earlier run never reaches a task that has not been promptmaxed again.
+fn append_promptmax_brief(roots: Roots<'_>, task: &Task, prompt: &mut String) {
+    if !task.promptmaxed {
+        return;
+    }
+    let path = roots.promptmax_brief(&task.id);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    prompt.push_str(&format!(
+        "\nPrepared brief (written for you by the promptmaxer after researching this task; from {}). \
+Follow it; where it disagrees with the user task above, the user task wins:\n{text}\n",
+        path.display()
+    ));
+}
+
+/// Promptmax-pass prompt: an optional pre-launch bot that researches the task
+/// and writes a self-contained English brief for the executor (and the
+/// designer, when one runs next) to `.kanban/prompts/<task>.md`. Like the
+/// designer it never implements and finishes with `kanban done`, which hands
+/// the slot to the next phase. `style` picks how much it spells out.
+fn build_promptmaxer_prompt(roots: Roots<'_>, task: &Task, session_id: &str) -> Result<String> {
+    let config = Config::new(roots.data_root);
+    let orch = config.get_orchestration()?;
+    let board = config.load()?;
+    let brief = roots.promptmax_brief(&task.id).display().to_string();
+    let form_file = roots
+        .data_path("forms")
+        .join(format!("{}.ask.yaml", task.id))
+        .display()
+        .to_string();
+    let detached_log = roots
+        .data_path("detached")
+        .join("<task>-<stamp>.log")
+        .display()
+        .to_string();
+    let clarification_line = clarification_line(task);
+    let finish_clause = long_wait_finish_clause(task.silence);
+    let id = &task.id;
+
+    let mut prompt = format!(
+        "Task: {id}: {title}\n\n\
+You are the kanban4ai PROMPTMAXER for project: {work}\n\
+Work only on task {id}. The user-authored task is below.\n\n\
+Your job is to research, not to implement. Another model (the executor) will do the work right \
+after you, starting from the user task plus the brief you write. Find every piece of hidden, \
+contextual knowledge it would otherwise have to dig up or guess — what to take, which stack, \
+where to go and where not to, how to split the work, whether to use subagents — and write it \
+down as one self-contained brief, so the executor has no questions left and simply does the \
+job well.\n\n\
+Session contract:\n\
+- KANBAN_SESSION is set to {session_id}.\n\
+- KANBAN_TASK_ID is set to {id}.\n\
+- KANBAN_CMD is set to the current kanban4ai executable; use \"$KANBAN_CMD\" instead of bare kanban so callbacks target this binary.\n\
+- Write the brief, as Markdown, to: {brief}\n\
+  Create the folder if it is missing. That file (and the ask form below) is the only thing you write.\n\
+- Then record a one-line summary with: \"$KANBAN_CMD\" context {id} <text> --source agent\n\
+- Keep the session alive with: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
+- When the brief is written, finish with: \"$KANBAN_CMD\" done {id} --session {session_id} --agent\n\
+  That completes the promptmax phase only; done is refused while the brief file is empty. The \
+task stays In Progress and the board starts the next bot with your brief in its prompt.\n\
+- Do not implement the task. Do not edit, create, or delete project files. Do not run commands \
+that change the repo (builds and tests that only read are fine when they reveal something the \
+brief needs).\n\
+- Do not move the task between columns (no take/move to Review/Done).\n\
+{clarification_line}\
+- This session is non-interactive and terminates the moment you end your reply; background tasks, \
+monitors, and \"notifications\" die with it, so nothing you launch can re-invoke you later.\n\
+- Long-running foreground commands are safe: the board heartbeats for you while your process runs, \
+with no time limit. Prefer blocking in the foreground and collecting every result before you \
+continue; never end a reply while anything you launched is still running or unread.\n\
+- If a result will take too long to block on, never start it as a plain shell background job: \
+this session's whole process group dies with your reply. Instead run: \
+\"$KANBAN_CMD\" detach {id} --session {session_id} --eta <expected-seconds> --note <what you wait for> -- <command> [args...]\n\
+  It survives this session, logs to {detached_log} plus a .status file, and declares the wait. \
+To wait on something you did not detach, use \
+\"$KANBAN_CMD\" waiting {id} --session {session_id} --eta <expected-seconds> --note <what you wait for>\n\
+  Either way the board relaunches you after the deadline to check the result. \
+Details: \"$KANBAN_CMD\" detach --help, \"$KANBAN_CMD\" waiting --help.\n\
+- The final command of your reply must be {finish_clause}. \
+Ending a reply without one of those strands the promptmax phase and forces an automatic resume.\n\
+- Proactively record non-blocking ideas, risks, or better alternatives you notice with: \
+\"$KANBAN_CMD\" suggest {id} <idea>\n",
+        title = task.title,
+        work = roots.work_path.display(),
+    );
+    append_question_guidance(&mut prompt, task, session_id, &form_file, true);
+    if !task.silence {
+        prompt.push_str(
+            "- Ask only what the repo, the thread, and the task cannot answer and what would \
+change the brief materially (scope, an ambiguous requirement, a choice between designs). Batch \
+everything into one ask form, wait for the answer, and write the answers into the brief as \
+decisions. Never ask what you can look up yourself.\n",
+        );
+    }
+    append_context_economy(&mut prompt);
+    append_interactive_wait(&mut prompt, task, session_id);
+    prompt.push_str(role_column_block(Role::Promptmaxer));
+    append_promptmax_run_facts(roots, task, &orch, &board, &mut prompt)?;
+    prompt.push_str(PROMPTMAX_BRIEF_RULES);
+    prompt.push_str(match orch.promptmax.style {
+        PromptmaxStyle::Mega => PROMPTMAX_STYLE_MEGA,
+        PromptmaxStyle::Expanded => PROMPTMAX_STYLE_EXPANDED,
+    });
+    append_role_instructions(roots, Role::Promptmaxer, &mut prompt);
+    prompt.push_str("\nUser task:\n");
+    if task.description.trim().is_empty() {
+        prompt.push_str(&task.title);
+    } else {
+        prompt.push_str(&absolute_asset_links(roots, task.description.trim()));
+    }
+    append_upstream_results(roots, task, &mut prompt)?;
+    append_thread_context(roots, task, &mut prompt)?;
+    Ok(prompt)
+}
+
+/// What the brief must plan around: who runs it, under which permission, and
+/// what the subagent settings of this task allow.
+fn append_promptmax_run_facts(
+    roots: Roots<'_>,
+    task: &Task,
+    orch: &OrchestrationSettings,
+    board: &BoardConfig,
+    prompt: &mut String,
+) -> Result<()> {
+    use crate::core::config::SpawnPolicy;
+    let executor = crate::agent::backends::resolve_task_launch_settings(board, task)?;
+    let model = executor.model.as_deref().unwrap_or("backend default");
+    let mut facts = format!(
+        "\nRun facts (plan the brief around them):\n\
+- Executor: backend {}, model {model}{}.\n",
+        executor.backend,
+        executor
+            .effort
+            .as_deref()
+            .map(|e| format!(", effort {e}"))
+            .unwrap_or_default(),
+    );
+    if orch.designer_enabled_for(task) && !task.designed {
+        facts.push_str(
+            "- A designer bot runs after you and before the executor; it reads your brief and \
+records the implementation plan. Still give the full breakdown: the designer refines it.\n",
+        );
+    }
+    if orch.reviewer_enabled_for(task) {
+        facts.push_str("- A reviewer bot checks the result before the human sees it.\n");
+    }
+    facts.push_str(if task.permission() == Some("readonly") {
+        "- Permission: readonly. The executor investigates and reports; it must not change project files. Plan an investigation, not edits.\n"
+    } else {
+        "- Permission: the executor may edit project files.\n"
+    });
+    if task.silence {
+        facts.push_str("- Silence mode: the executor cannot ask the human, so the brief must settle every open point.\n");
+    }
+    if let (Some(branch), Some(_)) = (&task.branch, &task.worktree) {
+        facts.push_str(&format!(
+            "- Isolation: the executor works in its own git worktree on branch {branch} and commits there.\n"
+        ));
+    }
+    let effective =
+        crate::core::operations::Operations::new(roots.data_root).effective_spawn(task)?;
+    if effective.policy == SpawnPolicy::Forbidden || effective.max_children == 0 {
+        facts.push_str("- Subagents: forbidden for this task. Plan the work for a single agent and say so in the brief.\n");
+    } else {
+        facts.push_str(&format!(
+            "- Subagents: {} for this task (policy {}), at most {} per run, {} running at once. \
+Each subagent starts on its own branch seeded from the executor's worktree and sees only its \
+description and the context excerpts handed to it.\n",
+            if effective.requires_helper {
+                "mandatory (at least one)"
+            } else {
+                "allowed"
+            },
+            effective.policy.as_str(),
+            effective.max_children,
+            orch.subagents.max_parallel_per_parent,
+        ));
+    }
+    prompt.push_str(&facts);
+    Ok(())
+}
+
+/// Rules every brief follows, whatever its style.
+const PROMPTMAX_BRIEF_RULES: &str = "
+How to research:
+- Read the task and the thread first, then the repo: entry points, the modules the change \
+touches, the closest existing feature to copy, its tests, docs and config surfaces. Verify every \
+path, symbol and command you name by actually opening or running it; never cite from memory.
+- Hunt for what is not written in the task: conventions the code follows, invariants and \
+compatibility constraints, generated or snapshot files that must change together, places that \
+must stay untouched, and the traps an outsider would fall into.
+- AGENTS.md, CLAUDE.md and similar agent files are already loaded into the executor's session. \
+Do not restate them; name a rule from them only when it is decisive for this task.
+
+How to write the brief:
+- English only, strictly, even when the task is written in another language. Quote user-facing \
+strings, identifiers or file contents verbatim in their original language when the result must \
+contain them literally.
+- Address the executor directly (\"Edit X\", \"Do not touch Y\"). It also gets the user task \
+text, so restate the goal precisely instead of copying the task.
+- Ground everything in `path:line` anchors and exact names. Mark anything you could not verify \
+as an assumption, and say how the executor should check it.
+- Settle ambiguity: record each decision you made (or the human's answer) with a one-line reason \
+and the rejected alternative.
+- Response language (mandatory section): name the language the user task is written in and \
+instruct the executor to write everything addressed to people — context notes, suggestions, \
+questions and the final summary — in that language. Code, identifiers, comments and commit \
+messages follow the repo's conventions.
+
+Brief layout (keep this order and these headings; drop a section only when it is truly empty):
+1. Goal — the outcome in a few sentences and what \"done\" looks like to the user.
+2. Response language.
+3. Scope — in scope; out of scope; files, modules and behaviour that must not change.
+4. Stack and environment — languages, frameworks, tools and versions actually in use, and the \
+exact build, lint and test commands of this repo.
+5. Codebase map — files and symbols to read and change, each with `path:line` and why; the \
+existing implementation to mirror.
+6. Hidden knowledge — conventions, invariants, gotchas, coupled files (tests, snapshots, \
+fixtures, docs, config, migrations) and anything else an outsider would miss.
+7. Work breakdown — ordered subtasks; each with the files it touches, the change, and how to \
+verify it before moving on.
+8. Subagents — the decision and why. \"None\" with a reason, or a numbered list: title, readonly \
+or not, the exact description to pass, the context files to hand over, and how the executor \
+merges or uses the result. Respect the run facts above: never exceed the caps, plan at least one \
+when they are mandatory, none when forbidden. Use subagents only for independent, sizeable \
+parallel work; never for something the executor finishes in a few steps.
+9. Verification — exact commands with the expected result, plus any manual or visual check.
+10. Decisions, assumptions and risks.
+11. Definition of done — a checklist the executor ticks off before kanban done.
+";
+
+/// Expanded brief: what a capable model would look up first, nothing more.
+const PROMPTMAX_STYLE_EXPANDED: &str = "
+Style: EXPANDED. The executor is a capable model. Front-load what it would otherwise search for \
+first: the exact entry points and files, the reference implementation to copy, the scope fence, \
+the commands to build and test, and the non-obvious traps. Keep every section tight — bullets \
+with `path:line`, one line per fact — and skip what a competent engineer reads off the code at a \
+glance. Spend the words on what is surprising, not on what is obvious. Usually 80–200 lines.
+";
+
+/// Mega brief: everything spelled out so the weakest model cannot go wrong.
+const PROMPTMAX_STYLE_MEGA: &str = "
+Style: MEGA. Write for the weakest model that might run this brief: it follows instructions \
+literally, does not explore on its own, and fills every gap with a guess. Leave nothing to \
+inference:
+- For every subtask give the file, the function, struct or section with its line anchor, the \
+existing code it must mirror (quote the few lines that show the pattern), the exact edits in \
+order, and the names to use for anything new.
+- Spell out every edge case and how it must behave, every error path, and every place that must \
+change together with the edit (call sites, tests, snapshots, docs, config defaults, CLI help).
+- For each convention the change touches (naming, error handling, logging, formatting, tests, \
+docs) give one concrete example from this repo.
+- Give every command exactly as it must be typed, where to run it, and what success looks like; \
+say what to do when it fails.
+- Add a \"Common mistakes to avoid\" list and finish with a step-by-step checklist.
+- Quote only the lines that matter — never whole files. Length is no concern; precision and \
+completeness are.
+";
 
 /// Planning-pass prompt for the orchestrator: it decomposes the task into a
 /// DAG of subtasks and submits it as a plan file. It never implements, and it
@@ -719,6 +993,15 @@ Column ownership:
 - Do not move this task out of In Progress. Do not call kanban move.
 - Do not implement the task and do not start any subtask yourself.
 - Finish the planning phase only with kanban done, after kanban plan accepted your graph.
+"
+        }
+        Role::Promptmaxer => {
+            "
+Role: promptmaxer
+Column ownership:
+- Do not move this task out of In Progress. Do not call kanban move.
+- Do not implement the task.
+- Finish the promptmax phase only with kanban done after writing the brief. That does not complete the work.
 "
         }
         Role::Designer => {

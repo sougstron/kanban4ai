@@ -330,6 +330,7 @@ fn rust_written_task_is_parseable_and_stable() {
             permission: Some("readonly".into()),
             silence: false,
             use_designer: false,
+            use_promptmax: false,
             use_reviewer: false,
             use_orchestrator: false,
             chained_to: Some("TASK-999".into()),

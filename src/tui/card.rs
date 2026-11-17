@@ -127,7 +127,10 @@ pub fn render_card(
     // color: those stages run long, and the colored row marks the burning
     // card at a glance. Executor keeps the badge-only look.
     if session_state == Some(SessionState::Live)
-        && matches!(task.run_phase, Some(RunPhase::Design | RunPhase::Review))
+        && matches!(
+            task.run_phase,
+            Some(RunPhase::Promptmax | RunPhase::Design | RunPhase::Review)
+        )
     {
         lines.push(Line::from(Span::styled(
             "▶ running",
@@ -354,6 +357,7 @@ pub fn badges(
             app.theme.warn,
         )),
         Some(RunPhase::Orchestrate) => Some(("◧ plan", app.theme.focus)),
+        Some(RunPhase::Promptmax) => Some(("✍ brief", app.theme.focus)),
         Some(RunPhase::Design) => Some(("✎ design", app.theme.focus)),
         Some(RunPhase::Review) => Some(("⚖ review", app.theme.review)),
         _ => None,
@@ -362,6 +366,7 @@ pub fn badges(
         Some(SessionState::Live) => {
             let label = match task.run_phase {
                 Some(RunPhase::Orchestrate) => "◧ plan",
+                Some(RunPhase::Promptmax) => "✍ brief",
                 Some(RunPhase::Design) => "✎ design",
                 Some(RunPhase::Review) => "⚖ review",
                 _ => "▶ running",
@@ -451,6 +456,13 @@ pub fn badges(
         {
             badges.push(("◧ plan".to_string(), app.theme.focus));
         }
+        if (app.board.promptmax_bot || task.use_promptmax)
+            && !task.promptmaxed
+            && !task.designed
+            && !badges.iter().any(|(label, _)| label == "✍ brief")
+        {
+            badges.push(("✍ brief".to_string(), app.theme.focus));
+        }
         if (app.board.designer_bot || task.use_designer)
             && !task.designed
             && !badges.iter().any(|(label, _)| label == "✎ design")
@@ -508,7 +520,7 @@ fn subagent_wait_label(app: &App, task_id: &str, awaited: &[String]) -> String {
 /// the "▶ running" row and the telemetry stats line so all three agree.
 pub(super) fn phase_color(theme: &Theme, phase: Option<RunPhase>) -> Color {
     match phase {
-        Some(RunPhase::Orchestrate | RunPhase::Design) => theme.focus,
+        Some(RunPhase::Orchestrate | RunPhase::Promptmax | RunPhase::Design) => theme.focus,
         Some(RunPhase::Review) => theme.review,
         _ => theme.ok,
     }
@@ -618,7 +630,10 @@ pub(crate) fn card_line_count(app: &App, task: &Task) -> u16 {
     }
     // Mirrors render_card: a live design/review phase adds the "▶ running" row.
     if session_state == Some(SessionState::Live)
-        && matches!(task.run_phase, Some(RunPhase::Design | RunPhase::Review))
+        && matches!(
+            task.run_phase,
+            Some(RunPhase::Promptmax | RunPhase::Design | RunPhase::Review)
+        )
     {
         lines += 1;
     }

@@ -8,7 +8,9 @@ use std::thread;
 use serde_yaml_ng::{Mapping, Value};
 
 use crate::agent::prompt::{build_agent_prompt, build_resume_prompt};
-use crate::core::config::{BoardConfig, BotSettings, Config, OrchestrationSettings};
+use crate::core::config::{
+    BoardConfig, BotSettings, Config, OrchestrationSettings, PromptmaxSettings, SAME_MODEL,
+};
 use crate::core::error::{KanbanError, Result};
 use crate::core::global::AutoQuestions;
 use crate::core::models::{Role, RunPhase, SessionStatus, Task};
@@ -233,6 +235,9 @@ pub fn resolve_launch_settings(config: &BoardConfig, task: &Task) -> Result<Laun
     // The orchestrator runs on the task's own assignment on purpose: planning
     // a graph is the expensive judgment call, so the model is chosen per task
     // rather than board-wide (there is no `orchestration.orchestrator` bot).
+    if task.run_phase == Some(RunPhase::Promptmax) && orch.promptmax_enabled_for(task) {
+        return resolve_promptmax_launch_settings(config, task, &orch.promptmax);
+    }
     if task.run_phase == Some(RunPhase::Design) && orch.designer_enabled_for(task) {
         return resolve_bot_launch_settings(config, &orch.designer);
     }
@@ -266,6 +271,15 @@ pub fn upcoming_run_plan(config: &BoardConfig, task: &Task) -> Result<(LaunchSet
     // no designer pass ever ran (the designer may have been switched on
     // mid-flight), because the requested edits are already folded into the
     // thread for the executor.
+    // The promptmaxer writes the executor's brief before anything else runs
+    // (the designer then plans with that brief in hand); `promptmaxed` gates
+    // it the same way `designed` gates design.
+    if promptmax_pending(&orch, task) {
+        return Ok((
+            resolve_promptmax_launch_settings(config, task, &orch.promptmax)?,
+            RunPhase::Promptmax,
+        ));
+    }
     if orch.designer_enabled_for(task) && !task.designed && task.review_rounds == 0 {
         Ok((
             resolve_bot_launch_settings(config, &orch.designer)?,
@@ -285,6 +299,38 @@ pub fn upcoming_run_plan(config: &BoardConfig, task: &Task) -> Result<(LaunchSet
 /// back, never a reason to re-plan.
 pub fn orchestrator_pending(task: &Task) -> bool {
     task.use_orchestrator && !task.orchestrated && task.review_rounds == 0
+}
+
+/// Whether this task still owes a promptmaxer pass. A design that already ran
+/// or a bot-review bounce means the brief's moment has passed.
+pub fn promptmax_pending(orch: &OrchestrationSettings, task: &Task) -> bool {
+    orch.promptmax_enabled_for(task)
+        && !task.promptmaxed
+        && !task.designed
+        && task.review_rounds == 0
+}
+
+/// Launch settings of the promptmaxer. Model `same` runs it on the task's own
+/// backend and model (its effort and agent still apply when set); anything
+/// else is an ordinary role bot.
+pub fn resolve_promptmax_launch_settings(
+    config: &BoardConfig,
+    task: &Task,
+    settings: &PromptmaxSettings,
+) -> Result<LaunchSettings> {
+    let bot = &settings.bot;
+    if bot.model.as_deref().map(str::trim) != Some(SAME_MODEL) {
+        return resolve_bot_launch_settings(config, bot);
+    }
+    let mut launch = resolve_task_launch_settings(config, task)?;
+    let set = |value: &Option<String>| value.clone().filter(|v| !v.trim().is_empty());
+    if let Some(effort) = set(&bot.effort) {
+        launch.effort = Some(effort);
+    }
+    if let Some(agent) = set(&bot.agent) {
+        launch.agent = Some(agent);
+    }
+    Ok(launch)
 }
 
 /// Launch settings from the task's own assignment (the executor bot).

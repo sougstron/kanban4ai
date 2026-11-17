@@ -3696,6 +3696,7 @@ fn mouse_backend_selection_refreshes_each_role_popup() {
         let model_field = match slot {
             AgentSlot::Primary => DialogField::Model,
             AgentSlot::Designer => DialogField::DesignerModel,
+            AgentSlot::Promptmax => DialogField::PromptmaxModel,
             AgentSlot::Reviewer => DialogField::ReviewerModel,
             AgentSlot::Arbiter => DialogField::ArbiterModel,
         };
@@ -11915,6 +11916,7 @@ fn new_task_mode_toggles_save_on_the_task() {
     for (field, toggle) in [
         (DialogField::Silence, true),
         (DialogField::UseOrchestrator, true),
+        (DialogField::UsePromptmax, true),
         (DialogField::UseDesigner, true),
         (DialogField::UseReviewer, true),
         (DialogField::SpawnPolicy, false),
@@ -11956,6 +11958,7 @@ fn new_task_mode_toggles_save_on_the_task() {
     assert_eq!(created.permission(), Some("readonly"));
     assert!(created.silence);
     assert!(created.use_orchestrator);
+    assert!(created.use_promptmax);
     assert!(created.use_designer);
     assert!(created.use_reviewer);
 }
@@ -15001,4 +15004,49 @@ fn project_settings_save_the_detail_tab_and_inherit_it_by_default() {
     assert_eq!(raw["inherit"]["detail_tab"].as_bool(), Some(false));
     assert_eq!(raw["tui"]["detail_tab"].as_str(), Some("diff"));
     assert!(app.settings.detail_tab_diff);
+}
+
+#[test]
+fn settings_designer_tab_edits_and_saves_the_promptmaxer() {
+    let (_dir, mut app) = settings_app();
+    app.handle_key(key(KeyCode::Char('s')))
+        .expect("open settings");
+    app.modal
+        .as_mut()
+        .unwrap()
+        .set_settings_tab(SettingsTab::Designer);
+    insta::assert_snapshot!(
+        "settings_tab_designer_promptmax",
+        render_at(&mut app, 80, 40)
+    );
+    {
+        let modal = app.modal.as_mut().expect("settings");
+        assert!(
+            modal
+                .options_for(DialogField::PromptmaxModel)
+                .iter()
+                .any(|option| option.value.as_deref() == Some("same")),
+            "promptmax model list offers same"
+        );
+        modal.focus_field(DialogField::PromptmaxEnabled);
+    }
+    app.handle_key(key(KeyCode::Char(' '))).expect("enable");
+    app.handle_key(key(KeyCode::Down)).expect("to mega");
+    assert_eq!(
+        app.modal.as_ref().unwrap().active_field(),
+        DialogField::PromptmaxMega
+    );
+    app.handle_key(key(KeyCode::Char(' '))).expect("mega");
+    app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .expect("save");
+    assert!(app.modal.is_none(), "save should close the dialog");
+
+    let saved = app.ops.config.load_fresh().expect("reload");
+    let orch = crate::core::config::OrchestrationSettings::from_mapping(&saved.orchestration);
+    assert!(orch.promptmax.bot.enabled);
+    assert_eq!(
+        orch.promptmax.style,
+        crate::core::config::PromptmaxStyle::Mega
+    );
+    assert_eq!(orch.promptmax.bot.model.as_deref(), Some("same"));
 }

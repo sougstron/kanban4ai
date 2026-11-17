@@ -1,6 +1,5 @@
 ---
 source: src/tui/tests.rs
-assertion_line: 14427
 expression: "render_at(&mut app, 100, 40)"
 ---
 ┌ To Do (1) ────────────┐┌ In Progress (0) ──────┐┌ Review (1) ───────────┐┌ Done (0) ─── ▸ Kanban ┐
@@ -17,17 +16,17 @@ expression: "render_at(&mut app, 100, 40)"
 │              ││  │┌ Orchestrator ────────────────────────────────────────────┐│  ││              │
 │              ││  ││☐ plan a subtask graph first (Space toggles)              ││  ││              │
 │              │└──│└──────────────────────────────────────────────────────────┘│──┘│              │
-│              │┌ A│┌ Designer ────────────────────────────────────────────────┐│──┐│              │
-│              ││de││☐ designer for this task (Space toggles)                  ││  ││              │
+│              │┌ A│┌ Promptmax ───────────────────────────────────────────────┐│──┐│              │
+│              ││de││☐ detailed brief before launch (Space toggles)            ││  ││              │
 │              │└──│└──────────────────────────────────────────────────────────┘│──┘│              │
-│              │┌ P│┌ Reviewer ────────────────────────────────────────────────┐│──┐│              │
-│              ││Pr││☐ reviewer for this task (Space toggles)                  ││  ││              │
+│              │┌ P│┌ Designer ────────────────────────────────────────────────┐│──┐│              │
+│              ││Pr││☐ designer for this task (Space toggles)                  ││  ││              │
 │              ││  │└──────────────────────────────────────────────────────────┘│  ││              │
-│              │└──│┌ Fan-out policy · Space cycles ───────────────────────────┐│──┘│              │
-│              │┌ C││Inherit (project: allowed)                                ││──┐│              │
+│              │└──│┌ Reviewer ────────────────────────────────────────────────┐│──┘│              │
+│              │┌ C││☐ reviewer for this task (Space toggles)                  ││──┐│              │
 │              ││/ │└──────────────────────────────────────────────────────────┘│  ││              │
-│              ││› │┌ Helper model · Space cycles ─────────────────────────────┐│  ││              │
-│              ││  ││Inherit (project: same)                                   ││  ││              │
+│              ││› │┌ Fan-out policy · Space cycles ───────────────────────────┐│  ││              │
+│              ││  ││Inherit (project: allowed)                                ││  ││              │
 │              │└──│└──────────────────────────────────────────────────────────┘│──┘│              │
 │              │┌ O│                                                            │──┐│              │
 │              ││of│                                                            │  ││              │

@@ -25,7 +25,7 @@ use crate::agent::{
 use crate::core::config::RoleCandidate;
 use crate::core::config::{
     BoardConfig, Config, InheritFlags, InheritGroup, OnChangesRequested, OrchestrationSettings,
-    copy_group, resolve_inherited,
+    PromptmaxStyle, SAME_MODEL, copy_group, resolve_inherited,
 };
 use crate::core::context::ContextManager;
 use crate::core::daemon;
@@ -176,6 +176,9 @@ pub struct BoardSnapshot {
     /// Project-wide designer bot on; drives the pending `✎ design` card mark
     /// (a task's own `use_designer` ORs in).
     pub designer_bot: bool,
+    /// Project-wide promptmaxer on; drives the pending `✍ brief` card mark
+    /// (a task's own `use_promptmax` ORs in).
+    pub promptmax_bot: bool,
     /// Project-wide reviewer bot on; drives the pending `⚖ review` card mark
     /// (a task's own `use_reviewer` ORs in).
     pub reviewer_bot: bool,
@@ -3461,6 +3464,7 @@ impl App {
                         field,
                         DialogField::Backend
                             | DialogField::DesignerBackend
+                            | DialogField::PromptmaxBackend
                             | DialogField::ReviewerBackend
                             | DialogField::ArbiterBackend
                     ) {
@@ -3469,6 +3473,7 @@ impl App {
                         field,
                         DialogField::Model
                             | DialogField::DesignerModel
+                            | DialogField::PromptmaxModel
                             | DialogField::ReviewerModel
                             | DialogField::ArbiterModel
                     ) && let Some(config) = self.modal_config(&modal)
@@ -6441,7 +6446,12 @@ impl App {
         modal.set_backend_options(backend_options);
         let default_agent = mapping_str(Some(&config.auto_launch), "default_agent")
             .unwrap_or_else(|| "opencode".to_string());
-        for slot in [AgentSlot::Designer, AgentSlot::Reviewer, AgentSlot::Arbiter] {
+        for slot in [
+            AgentSlot::Designer,
+            AgentSlot::Promptmax,
+            AgentSlot::Reviewer,
+            AgentSlot::Arbiter,
+        ] {
             let role_backends = std::iter::once(SelectOption {
                 label: format!("Default backend ({default_agent})"),
                 value: None,
@@ -7451,6 +7461,7 @@ impl App {
         self.refresh_slot_options_with_config(modal, config, AgentSlot::Primary);
         if modal.is_settings_form() {
             self.refresh_slot_options_with_config(modal, config, AgentSlot::Designer);
+            self.refresh_slot_options_with_config(modal, config, AgentSlot::Promptmax);
             self.refresh_slot_options_with_config(modal, config, AgentSlot::Reviewer);
             self.refresh_slot_options_with_config(modal, config, AgentSlot::Arbiter);
         }
@@ -7496,6 +7507,16 @@ impl App {
             .chain(self.backend_model_options(&backend, backend_settings, &config.auto_launch))
             .collect::<Vec<_>>();
         let mut models = models;
+        if slot == AgentSlot::Promptmax {
+            // `same`: run the promptmaxer on the task's own backend and model.
+            models.insert(
+                1,
+                SelectOption {
+                    label: "same (the task's own model)".to_string(),
+                    value: Some(SAME_MODEL.to_string()),
+                },
+            );
+        }
         if modal.is_settings_form() {
             add_missing_option(&mut models, modal.model_text_for(slot));
         }
@@ -8175,6 +8196,7 @@ impl App {
                     permission: modal.permission.clone(),
                     silence: modal.silence,
                     use_designer: modal.use_designer,
+                    use_promptmax: modal.use_promptmax,
                     use_reviewer: modal.use_reviewer,
                     use_orchestrator: modal.use_orchestrator,
                     chained_to: modal.chain_text(),
@@ -8238,6 +8260,7 @@ impl App {
                         permission: Some(modal.permission.clone()),
                         silence: Some(modal.silence),
                         use_designer: Some(modal.use_designer),
+                        use_promptmax: Some(modal.use_promptmax),
                         use_reviewer: Some(modal.use_reviewer),
                         spawn_policy: Some(modal.spawn_policy),
                         spawn_helper_model: Some(modal.spawn_helper_model),
@@ -8638,6 +8661,7 @@ impl BoardSnapshot {
             remote_runs: HashMap::new(),
             suggestions: HashMap::new(),
             designer_bot: false,
+            promptmax_bot: false,
             reviewer_bot: false,
             stamps: BoardStamps::default(),
             archived: Vec::new(),
@@ -8738,6 +8762,7 @@ impl BoardSnapshot {
             remote_runs: sessions.remote_runs,
             suggestions,
             designer_bot: orch.designer.enabled,
+            promptmax_bot: orch.promptmax.bot.enabled,
             reviewer_bot: orch.reviewer.enabled,
             stamps,
             archived,
@@ -9591,6 +9616,10 @@ fn slot_selection_snapshot(modal: &ModalState, field: DialogField) -> SlotSelect
             backend: modal.designer_backend_selected(),
             model: modal.designer_model_selected(),
         },
+        AgentSlot::Promptmax => SlotSelection {
+            backend: modal.promptmax_backend_selected(),
+            model: modal.promptmax_model_selected(),
+        },
         AgentSlot::Reviewer => SlotSelection {
             backend: modal.reviewer_backend_selected(),
             model: modal.reviewer_model_selected(),
@@ -9639,9 +9668,13 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         DialogField::Question => Some(modal.question_selected),
         DialogField::Variant => modal.variant_selected,
         DialogField::DesignerBackend => Some(modal.designer_backend_selected()),
+        DialogField::PromptmaxBackend => Some(modal.promptmax_backend_selected()),
         DialogField::DesignerModel => Some(modal.designer_model_selected()),
+        DialogField::PromptmaxModel => Some(modal.promptmax_model_selected()),
         DialogField::DesignerEffort => Some(modal.designer.effort_selected),
+        DialogField::PromptmaxEffort => Some(modal.promptmax.effort_selected),
         DialogField::DesignerAgent => Some(modal.designer.agent_selected),
+        DialogField::PromptmaxAgent => Some(modal.promptmax.agent_selected),
         DialogField::ReviewerBackend => Some(modal.reviewer_backend_selected()),
         DialogField::ReviewerModel => Some(modal.reviewer_model_selected()),
         DialogField::ReviewerEffort => Some(modal.reviewer.effort_selected),
@@ -9664,6 +9697,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::SubagentInstructions
         | DialogField::AgentSettings
         | DialogField::DesignerAgentSettings
+        | DialogField::PromptmaxAgentSettings
         | DialogField::ReviewerAgentSettings
         | DialogField::ArbiterAgentSettings
         | DialogField::TaskOptions
@@ -9671,6 +9705,7 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::Permission
         | DialogField::Silence
         | DialogField::UseOrchestrator
+        | DialogField::UsePromptmax
         | DialogField::UseDesigner
         | DialogField::UseReviewer
         | DialogField::PlannedLaunch
@@ -9690,6 +9725,8 @@ fn selector_index(modal: &ModalState, field: DialogField) -> Option<usize> {
         | DialogField::AutoRestartEnabled
         | DialogField::AutoRestartDelays
         | DialogField::DesignerEnabled
+        | DialogField::PromptmaxEnabled
+        | DialogField::PromptmaxMega
         | DialogField::ReviewerEnabled
         | DialogField::ReviewerMaxRounds
         | DialogField::AutoModeEnabled
@@ -9855,6 +9892,14 @@ fn fill_settings_group(modal: &mut ModalState, config: &BoardConfig, group: Inhe
             modal.set_model_text_for(AgentSlot::Designer, bot.model.as_deref().unwrap_or(""));
             modal.set_effort_text_for(AgentSlot::Designer, bot.effort.as_deref().unwrap_or(""));
             modal.set_agent_text_for(AgentSlot::Designer, bot.agent.as_deref().unwrap_or(""));
+            let promptmax = &orch.promptmax;
+            modal.promptmax_enabled = promptmax.bot.enabled;
+            modal.promptmax_mega = promptmax.style == PromptmaxStyle::Mega;
+            let bot = &promptmax.bot;
+            modal.set_backend_text_for(AgentSlot::Promptmax, bot.backend.as_deref().unwrap_or(""));
+            modal.set_model_text_for(AgentSlot::Promptmax, bot.model.as_deref().unwrap_or(""));
+            modal.set_effort_text_for(AgentSlot::Promptmax, bot.effort.as_deref().unwrap_or(""));
+            modal.set_agent_text_for(AgentSlot::Promptmax, bot.agent.as_deref().unwrap_or(""));
         }
         InheritGroup::Reviewer => {
             let bot = &orch.reviewer;
@@ -10057,6 +10102,12 @@ struct OrchestrationDraft {
     auto_restart_enabled: bool,
     auto_restart_delays: Vec<i64>,
     designer_enabled: bool,
+    promptmax_enabled: bool,
+    promptmax_mega: bool,
+    promptmax_backend: Option<String>,
+    promptmax_model: Option<String>,
+    promptmax_effort: Option<String>,
+    promptmax_agent: Option<String>,
     designer_backend: Option<String>,
     designer_model: Option<String>,
     designer_effort: Option<String>,
@@ -10207,10 +10258,16 @@ fn parse_orchestration_modal(
         auto_restart_enabled: modal.auto_restart_enabled,
         auto_restart_delays,
         designer_enabled: modal.designer_enabled,
+        promptmax_enabled: modal.promptmax_enabled,
+        promptmax_mega: modal.promptmax_mega,
         designer_backend: modal.backend_text_for(AgentSlot::Designer),
+        promptmax_backend: modal.backend_text_for(AgentSlot::Promptmax),
         designer_model: modal.model_text_for(AgentSlot::Designer),
+        promptmax_model: modal.model_text_for(AgentSlot::Promptmax),
         designer_effort: modal.effort_text_for(AgentSlot::Designer),
+        promptmax_effort: modal.effort_text_for(AgentSlot::Promptmax),
         designer_agent: modal.agent_text_for(AgentSlot::Designer),
+        promptmax_agent: modal.agent_text_for(AgentSlot::Promptmax),
         reviewer_enabled: modal.reviewer_enabled,
         reviewer_backend: modal.backend_text_for(AgentSlot::Reviewer),
         reviewer_model: modal.model_text_for(AgentSlot::Reviewer),
@@ -10705,6 +10762,21 @@ fn apply_orchestration_draft(orch: &mut Mapping, draft: &OrchestrationDraft) {
     insert_str_opt(designer, "model", draft.designer_model.as_deref());
     insert_str_opt(designer, "effort", draft.designer_effort.as_deref());
     insert_str_opt(designer, "agent", draft.designer_agent.as_deref());
+    let promptmax = ensure_mapping(designer, "promptmax");
+    insert_bool(promptmax, "enabled", draft.promptmax_enabled);
+    let style = if draft.promptmax_mega {
+        PromptmaxStyle::Mega
+    } else {
+        PromptmaxStyle::Expanded
+    };
+    promptmax.insert(
+        Value::String("style".into()),
+        Value::String(style.as_str().into()),
+    );
+    insert_str_opt(promptmax, "backend", draft.promptmax_backend.as_deref());
+    insert_str_opt(promptmax, "model", draft.promptmax_model.as_deref());
+    insert_str_opt(promptmax, "effort", draft.promptmax_effort.as_deref());
+    insert_str_opt(promptmax, "agent", draft.promptmax_agent.as_deref());
     let reviewer = ensure_mapping(orch, "reviewer");
     insert_bool(reviewer, "enabled", draft.reviewer_enabled);
     insert_str_opt(reviewer, "backend", draft.reviewer_backend.as_deref());
