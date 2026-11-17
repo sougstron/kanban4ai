@@ -118,8 +118,10 @@ instead of starting to type; from a text panel use `Alt+o`. Without a pin,
   **Thread** / **Diff** (the border title is the tab strip; clicking a tab
   label also switches).
   The Diff tab lists every changed file with its `+/−` counts; `↑/↓` select,
-  `Enter` or a click expands/collapses the file's hunks inline, and
-  PgUp/PgDn/wheel/Home/End scroll. Source, first that applies: the
+  `Enter` or a click expands/collapses the file's hunks inline,
+  `Ctrl+O` shows the selected file's folder in the file manager (the
+  worktree's copy for a worktree diff, else the work folder's; the nearest
+  existing folder for a deleted file), and PgUp/PgDn/wheel/Home/End scroll. Source, first that applies: the
   worktree against its base commit (uncommitted edits included), the branch
   against its base, the `kanban: land TASK-N` commit, or a non-isolated
   run's backups against the current files. The tick worker recomputes it
