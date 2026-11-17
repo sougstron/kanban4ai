@@ -1,3 +1,13 @@
+# kanban4ai 0.8.23
+
+Notes are from the reviewed diff since 0.8.22. There were no `.changes/` logs.
+
+- **The Diff tab is a file list plus the selected file.** The list takes 25–55% of the panel, sized to the longest `path +a −r` row and at least 18 columns; long paths are cut from the left. The right pane shows that file's hunks. Left/Right, Enter, or a click moves between the panes. Up/Down selects a file or scrolls lines (Shift ×3, Ctrl ×10). The wheel follows the pane under the pointer, and PgUp/PgDn/Home/End act on the focused pane. Ctrl+O still opens the selected file's folder.
+- **A task can open on the Diff tab.** `tui.detail_tab` is `thread` (default) or `diff` (Settings → Common, **Task screen**). The `detail_tab` inherit group follows the global value unless the project unticks it. With `diff`, the detail switches to Diff once that task's diff arrives and has changes; a task with no changes stays on the thread.
+- **An optional promptmaxer runs before the designer and the executor.** It runs when `orchestration.designer.promptmax.enabled` is on, or when the task has `use_promptmax` (`kanban create --promptmax`, the task form's Promptmax checkbox, or `use_promptmax` on the HTTP task API). The phase is `promptmax`. The promptmaxer writes an English brief to `.kanban/prompts/<id>.md`, and `kanban done` is refused while that file is empty. The designer or the executor then receives the brief. Style is `expanded` (default) or `mega`. Model `same` uses the task's own backend and model. The Designer settings tab holds the toggle, the Mega checkbox, and the launcher. A card shows `✍ brief` while a promptmax pass is pending or running.
+
+Board files that are not in the `promptmax` phase stay loadable by 0.8.22. `use_promptmax` and `promptmaxed` are omitted while false; 0.8.22 ignores those unknown fields and drops them if it rewrites the file. `run_phase: promptmax` does not parse on 0.8.22, and a journal run whose phase is `promptmaxer` is rejected there as an invalid run descriptor, which can stall sync until that peer is updated. Project `config.yaml` may gain `tui.detail_tab` and `orchestration.designer.promptmax`; 0.8.22 keeps unknown keys and does not apply them. Store format is still 5. Sync protocol is still 3.
+
 # kanban4ai 0.8.22
 
 Notes are from the reviewed diff since 0.8.21. There were no `.changes/` logs.
