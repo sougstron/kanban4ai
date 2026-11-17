@@ -11,7 +11,7 @@ expression: wide
 ┌ Analytics ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │Time 45m · 2 runs │ Input 120.0k · Cache R 1.1M · Cache W 0 · Output 45.6k · Cache hit 90.0% · ≈592.8k eq                                                     │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Thread │ Diff · g ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+┌ Thread │ Diff · M-←→ ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │MSG-001 · <timestamp> · system · open                                                                                                                         │
 │Task created: Analytics card                                                                                                                                  │
 │Status: todo                                                                                                                                                  │
@@ -72,8 +72,8 @@ expression: wide
 9:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 9:1-9 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold().underlined()
 9:9-10 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-9:10-20 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-9:20-160 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+9:10-23 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+9:23-160 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 10:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 10:1-45 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 10:45-159 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)

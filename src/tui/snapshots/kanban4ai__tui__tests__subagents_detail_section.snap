@@ -11,7 +11,7 @@ expression: "render_at(&mut app, 120, 30)"
 │✓ TASK-003 done            claude/sonnet · 1m · 0 · Read the logs — Leak is in cache.rs:42                            │
 │✗ TASK-004 failed          claude/sonnet · 1m · 0 · Run the fuzzer — stalled                                          │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Thread │ Diff · g ───────────────────────────────────────────────────────────────────────────────────────────────────┐
+┌ Thread │ Diff · M-←→ ────────────────────────────────────────────────────────────────────────────────────────────────┐
 │MSG-001 · <timestamp> · system · open                                                                                 │
 │Task created: Parent with helpers                                                                                     │
 │Status: todo                                                                                                          │
@@ -74,8 +74,8 @@ expression: "render_at(&mut app, 120, 30)"
 9:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 9:1-9 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold().underlined()
 9:9-10 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-9:10-20 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-9:20-120 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+9:10-23 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+9:23-120 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 10:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 10:1-45 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 10:45-119 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
