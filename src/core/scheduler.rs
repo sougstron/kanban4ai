@@ -761,7 +761,9 @@ impl Operations {
 mod tests {
     use super::*;
     use crate::core::config::ExecutorPools;
-    use crate::core::config::{BotSettings, OnChangesRequested, ReviewerSettings};
+    use crate::core::config::{
+        BotSettings, OnChangesRequested, PromptmaxSettings, PromptmaxStyle, ReviewerSettings,
+    };
 
     /// A crash-supplied deadline is used as-is inside the sane range, floored
     /// to a minute out, and refused (falling back to the ladder) when it is so
@@ -805,6 +807,16 @@ mod tests {
                 model: None,
                 effort: None,
                 agent: None,
+            },
+            promptmax: PromptmaxSettings {
+                bot: BotSettings {
+                    enabled: false,
+                    backend: None,
+                    model: None,
+                    effort: None,
+                    agent: None,
+                },
+                style: PromptmaxStyle::Expanded,
             },
             reviewer: ReviewerSettings {
                 enabled: false,
@@ -961,6 +973,7 @@ mod tests {
 
     #[test]
     fn role_follows_the_run_phase() {
+        assert_eq!(role_for_phase(Some(RunPhase::Promptmax)), Role::Promptmaxer);
         assert_eq!(role_for_phase(Some(RunPhase::Design)), Role::Designer);
         assert_eq!(role_for_phase(Some(RunPhase::Review)), Role::Reviewer);
         assert_eq!(role_for_phase(Some(RunPhase::Queued)), Role::Executor);

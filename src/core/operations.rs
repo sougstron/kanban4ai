@@ -63,8 +63,8 @@ use serde_json::Value;
 
 use crate::agent::{
     KanbanLauncher, build_agent_prompt, materialize_task_launch_settings, orchestrator_pending,
-    resolve_bot_launch_settings, resolve_launch_settings, resolve_task_launch_settings,
-    upcoming_run_plan,
+    promptmax_pending, resolve_bot_launch_settings, resolve_launch_settings,
+    resolve_task_launch_settings, upcoming_run_plan,
 };
 use crate::core::ask_form::AskForm;
 use crate::core::config::{
@@ -156,6 +156,7 @@ pub struct TaskPatch {
     pub clear_legacy_readonly: bool,
     pub silence: Option<bool>,
     pub use_designer: Option<bool>,
+    pub use_promptmax: Option<bool>,
     pub use_reviewer: Option<bool>,
     pub use_orchestrator: Option<bool>,
     pub chained_to: Option<Option<String>>,
@@ -571,6 +572,7 @@ impl Operations {
         copied.spawned = false;
         copied.review_rounds = 0;
         copied.designed = false;
+        copied.promptmaxed = false;
         // A copy is a fresh root, not a second node of the same graph: it
         // keeps the settings (including `use_orchestrator`) but never the
         // edges, or the duplicate would silently re-join someone else's plan.
@@ -667,6 +669,9 @@ impl Operations {
         if let Some(use_designer) = patch.use_designer {
             task.use_designer = use_designer;
         }
+        if let Some(use_promptmax) = patch.use_promptmax {
+            task.use_promptmax = use_promptmax;
+        }
         if let Some(use_reviewer) = patch.use_reviewer {
             task.use_reviewer = use_reviewer;
         }
@@ -748,6 +753,7 @@ impl Operations {
             permission: new_task.permission,
             silence: new_task.silence,
             use_designer: new_task.use_designer,
+            use_promptmax: new_task.use_promptmax,
             use_reviewer: new_task.use_reviewer,
             use_orchestrator: new_task.use_orchestrator,
             chained_to: new_task.chained_to,
@@ -972,6 +978,7 @@ impl Operations {
         task.run_phase = None;
         // Back at the top of the pipeline: the next run plans again.
         task.designed = false;
+        task.promptmaxed = false;
         clear_orchestration_join(&mut task);
         task.updated_at = timefmt::now();
         self.storage.save_task(&task)?;
@@ -1039,6 +1046,12 @@ impl Operations {
                     Role::Designer => {
                         return Err(KanbanError::Permission(
                             "designer cannot move a task; finish the design phase with kanban done"
+                                .to_string(),
+                        ));
+                    }
+                    Role::Promptmaxer => {
+                        return Err(KanbanError::Permission(
+                            "promptmaxer cannot move a task; write the brief and finish with kanban done"
                                 .to_string(),
                         ));
                     }
@@ -1121,6 +1134,7 @@ impl Operations {
         // next run plans again. Any other human move keeps the existing plan.
         if task.status == TaskStatus::Todo {
             task.designed = false;
+            task.promptmaxed = false;
             clear_orchestration_join(&mut task);
         }
         self.storage.save_task(&task)?;
@@ -1323,8 +1337,10 @@ impl Operations {
             let mut queued = false;
             // A task whose plan is already on the thread skips straight to the
             // executor, however this run was started (see `upcoming_run_plan`).
-            let designer_enabled =
-                self.config.get_orchestration()?.designer_enabled_for(&task) && !task.designed;
+            let orch = self.config.get_orchestration()?;
+            let designer_enabled = orch.designer_enabled_for(&task) && !task.designed;
+            // The promptmaxer writes the brief before the designer plans.
+            let promptmax_enabled = promptmax_pending(&orch, &task);
             // Orchestration outranks design: the graph is planned first, and
             // each node runs its own design pass when it starts.
             let orchestrator_enabled = orchestrator_pending(&task);
@@ -1337,6 +1353,8 @@ impl Operations {
                 // orchestrator or designer: the planning pass still runs first.
                 task.run_phase = if orchestrator_enabled {
                     Some(RunPhase::Orchestrate)
+                } else if promptmax_enabled {
+                    Some(RunPhase::Promptmax)
                 } else if designer_enabled {
                     Some(RunPhase::Design)
                 } else {
@@ -1355,6 +1373,8 @@ impl Operations {
                 task.conflict_held = false;
             } else if will_auto_launch && orchestrator_enabled {
                 task.run_phase = Some(RunPhase::Orchestrate);
+            } else if will_auto_launch && promptmax_enabled {
+                task.run_phase = Some(RunPhase::Promptmax);
             } else if will_auto_launch && designer_enabled {
                 task.run_phase = Some(RunPhase::Design);
             } else {
@@ -1702,6 +1722,10 @@ impl Operations {
                 drop(_guard);
                 return self.complete_orchestrate_phase(task_id, session_id);
             }
+            if is_agent && task.run_phase == Some(RunPhase::Promptmax) {
+                drop(_guard);
+                return self.complete_promptmax_phase(task_id, session_id);
+            }
             if is_agent && task.run_phase == Some(RunPhase::Design) {
                 drop(_guard);
                 return self.complete_design_phase(task_id, session_id);
@@ -1916,6 +1940,97 @@ impl Operations {
         self.storage.load_task(task_id)
     }
 
+    /// Promptmaxer `kanban done`: the brief must be written, then the slot
+    /// passes to the designer (when it still owes a pass) or the executor.
+    fn complete_promptmax_phase(&self, task_id: &str, session_id: &str) -> Result<Option<Task>> {
+        {
+            let _guard = self.storage.lock()?;
+            let Some(task) = self.storage.load_task(task_id)? else {
+                return Ok(None);
+            };
+            if task.run_phase != Some(RunPhase::Promptmax) || task.status != TaskStatus::InProgress
+            {
+                return Ok(None);
+            }
+            self.require_current_agent_session(&task, session_id)?;
+            let brief = Roots::same(self.data_root()).promptmax_brief(task_id);
+            let written = std::fs::read_to_string(&brief).unwrap_or_default();
+            if written.trim().is_empty() {
+                return Err(KanbanError::Permission(format!(
+                    "Promptmaxer cannot finish before writing the brief to {}",
+                    brief.display()
+                )));
+            }
+        }
+        self.session_manager().close_session(session_id)?;
+        self.advance_from_promptmax(task_id, session_id)?;
+        self.storage.load_task(task_id)
+    }
+
+    /// Hand the promptmaxer's slot to the next phase, like
+    /// [`Self::advance_from_design`]: design when the designer still owes a
+    /// pass, otherwise execute.
+    fn advance_from_promptmax(&self, task_id: &str, promptmax_session: &str) -> Result<()> {
+        let session_mgr = self.session_manager();
+        let (new_session_id, next) = {
+            let _guard = self.storage.lock()?;
+            let Some(mut task) = self.storage.load_task(task_id)? else {
+                return Ok(());
+            };
+            if task.status != TaskStatus::InProgress
+                || task.run_phase != Some(RunPhase::Promptmax)
+                || task.session.as_deref() != Some(promptmax_session)
+            {
+                return Ok(());
+            }
+            task.promptmaxed = true;
+            let designing = self.config.get_orchestration()?.designer_enabled_for(&task)
+                && !task.designed
+                && task.review_rounds == 0;
+            let next = if designing {
+                RunPhase::Design
+            } else {
+                RunPhase::Execute
+            };
+            task.run_phase = Some(next);
+            let settings = resolve_launch_settings(&self.config.load()?, &task)?;
+            let new_session_id = self.fresh_session_id(&safe_session_component(&settings.backend));
+            task.auto_resumes = 0;
+            task.session = Some(new_session_id.clone());
+            task.updated_at = timefmt::now();
+            session_mgr.link_named_session(&task.id, &new_session_id, &task.title)?;
+            if let Err(err) = self.storage.save_task(&task) {
+                session_mgr.unlink_session(&new_session_id);
+                return Err(err);
+            }
+            let role = if designing { "designer" } else { "executor" };
+            self.post_queue_note(
+                &task.id,
+                &format!(
+                    "▶ brief written; starting {role} session {new_session_id} ({})",
+                    settings.backend
+                ),
+            );
+            (new_session_id, next)
+        };
+        match self.finish_launch(
+            &new_session_id,
+            self.launch_agent(task_id, &new_session_id, false),
+        ) {
+            Ok(true) => Ok(()),
+            failed => {
+                let reason = if next == RunPhase::Design {
+                    "designer launch failed"
+                } else {
+                    "executor launch failed"
+                };
+                let _ = self.schedule_crash_restart(task_id, reason);
+                failed?;
+                Ok(())
+            }
+        }
+    }
+
     /// Hand the designer's slot to the executor: claim Execute under the
     /// lock and launch outside it. Caps are not re-checked — the slot is
     /// already accounted for.
@@ -1979,7 +2094,7 @@ impl Operations {
         }
         if matches!(
             task.run_phase,
-            Some(RunPhase::Design) | Some(RunPhase::Review)
+            Some(RunPhase::Promptmax) | Some(RunPhase::Design) | Some(RunPhase::Review)
         ) {
             return Ok(false);
         }
@@ -2779,6 +2894,7 @@ impl Operations {
                 // A silent planner must not spawn children that stop to ask.
                 silence: parent.silence,
                 use_designer: node.designer,
+                use_promptmax: false,
                 use_reviewer: node.reviewer,
                 // A node that planned more nodes would let one orchestrated
                 // task spend the board without limit.
@@ -5349,7 +5465,10 @@ impl Operations {
         // Designer/reviewer bots must not overwrite the task's assigned
         // executor backend/model/effort/agent — those fields are what the
         // next phase launches with.
-        if matches!(task.run_phase, Some(RunPhase::Design | RunPhase::Review)) {
+        if matches!(
+            task.run_phase,
+            Some(RunPhase::Promptmax | RunPhase::Design | RunPhase::Review)
+        ) {
             return Ok(task);
         }
         let settings = resolve_launch_settings(&self.config.load()?, &task)?;

@@ -1474,3 +1474,103 @@ fn a_failure_without_auto_restart_still_alerts() {
         "a crash with auto-restart off must still alert instead of failing silently"
     );
 }
+
+fn promptmax_board(designer: bool) -> (tempfile::TempDir, Operations, RecordingLauncher) {
+    dispatch_board(&format!(
+        "  queue_enabled: true\n  max_running_total: 0\n  max_running_per_backend: {{}}\n  max_running_per_role: {{}}\n  designer:\n    enabled: {designer}\n    backend: claude\n    model: sonnet\n    promptmax:\n      enabled: true\n      model: same\n      effort: max\n"
+    ))
+}
+
+fn write_brief(dir: &std::path::Path, id: &str, text: &str) {
+    let brief = kanban4ai::core::project::Roots::same(dir).promptmax_brief(id);
+    fs::create_dir_all(brief.parent().unwrap()).unwrap();
+    fs::write(brief, text).unwrap();
+}
+
+#[test]
+fn promptmax_runs_first_on_the_same_model_then_hands_over_to_the_designer() {
+    let (dir, ops, recorder) = promptmax_board(true);
+    let id = queued_task(&ops, "Brief me", "opencode");
+    let mut task = ops.get_task(&id).unwrap().unwrap();
+    task.ai_model = Some("openai/gpt-5.5".to_string());
+    ops.storage.save_task(&task).unwrap();
+
+    let started = ops.dispatch_queue().unwrap();
+    assert_eq!(started[0].role, "promptmaxer");
+    assert_eq!(started[0].backend, "opencode", "same: the task's backend");
+    let pm_session = started[0].session_id.clone();
+    let current = ops.get_task(&id).unwrap().unwrap();
+    assert_eq!(current.run_phase, Some(RunPhase::Promptmax));
+    let config = ops.config.load().unwrap();
+    let settings = resolve_launch_settings(&config, &current).unwrap();
+    assert_eq!(settings.model.as_deref(), Some("openai/gpt-5.5"));
+    assert_eq!(
+        settings.effort.as_deref(),
+        Some("max"),
+        "the bot's own effort"
+    );
+
+    match ops.complete_task(&id, &pm_session, true) {
+        Err(kanban4ai::core::error::KanbanError::Permission(msg)) => {
+            assert!(msg.contains("brief"), "{msg}");
+        }
+        other => panic!("expected permission error, got {other:?}"),
+    }
+    assert_eq!(recorder.calls().len(), 1);
+
+    write_brief(dir.path(), &id, "## Goal\nDo it.\n");
+    let after = ops.complete_task(&id, &pm_session, true).unwrap().unwrap();
+    assert_eq!(after.status, TaskStatus::InProgress);
+    assert_eq!(after.run_phase, Some(RunPhase::Design));
+    assert!(after.promptmaxed);
+    assert_eq!(
+        recorder.calls().len(),
+        2,
+        "designer launched on the same slot"
+    );
+    assert!(recorder.calls()[1].1.starts_with("ses-claude-"));
+    assert!(!SessionManager::new(dir.path()).is_session_active(&pm_session));
+
+    // A re-queue after the brief never runs the promptmaxer again.
+    let (_, phase) = upcoming_run_plan(&config, &after).unwrap();
+    assert_eq!(phase, RunPhase::Design);
+}
+
+#[test]
+fn promptmax_done_goes_straight_to_the_executor_without_a_designer() {
+    let (dir, ops, recorder) = promptmax_board(false);
+    let id = queued_task(&ops, "Brief then run", "opencode");
+    let started = ops.dispatch_queue().unwrap();
+    let pm_session = started[0].session_id.clone();
+    write_brief(dir.path(), &id, "## Goal\nDo it.\n");
+
+    let after = ops.complete_task(&id, &pm_session, true).unwrap().unwrap();
+    assert_eq!(after.run_phase, Some(RunPhase::Execute));
+    assert!(after.promptmaxed);
+    assert_eq!(recorder.calls().len(), 2);
+    assert!(recorder.calls()[1].1.starts_with("ses-opencode-"));
+}
+
+#[test]
+fn upcoming_run_plan_honors_per_task_promptmax() {
+    let (_dir, ops) = ops_with_config("");
+    let task = ops
+        .create_task(NewTask {
+            title: "Just this one".into(),
+            agent_backend: Some("opencode".into()),
+            use_promptmax: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let config = ops.config.load().unwrap();
+    let (settings, phase) = upcoming_run_plan(&config, &task).unwrap();
+    assert_eq!(phase, RunPhase::Promptmax);
+    assert_eq!(settings.backend, "opencode", "default model is same");
+
+    let mut bounced = task.clone();
+    bounced.review_rounds = 1;
+    assert_eq!(
+        upcoming_run_plan(&config, &bounced).unwrap().1,
+        RunPhase::Execute
+    );
+}

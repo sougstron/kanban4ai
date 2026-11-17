@@ -298,6 +298,13 @@ orchestration:
     model: sonnet
     effort: null
     agent: null
+    promptmax:
+      enabled: false
+      style: expanded
+      backend: null
+      model: same
+      effort: null
+      agent: null
   reviewer:
     enabled: false
     backend: claude
@@ -873,6 +880,47 @@ pub struct BotSettings {
     pub agent: Option<String>,
 }
 
+/// Model value of a role bot that means "the model the task itself runs":
+/// the bot then launches on the task's own backend and model.
+pub const SAME_MODEL: &str = "same";
+
+/// How much the promptmaxer spells out (`orchestration.designer.promptmax.style`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptmaxStyle {
+    /// Every detail chewed over, so even the weakest model cannot go wrong.
+    Mega,
+    /// The key facts an ordinary model would go looking for first.
+    Expanded,
+}
+
+impl PromptmaxStyle {
+    pub const ALL: [PromptmaxStyle; 2] = [PromptmaxStyle::Expanded, PromptmaxStyle::Mega];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mega => "mega",
+            Self::Expanded => "expanded",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "mega" => Some(Self::Mega),
+            "expanded" => Some(Self::Expanded),
+            _ => None,
+        }
+    }
+}
+
+/// Typed view of `orchestration.designer.promptmax`: the optional pre-launch
+/// pass that turns the task into a detailed English brief for the executor.
+/// `bot.model == "same"` ([`SAME_MODEL`]) runs it on the task's own model.
+#[derive(Debug, Clone)]
+pub struct PromptmaxSettings {
+    pub bot: BotSettings,
+    pub style: PromptmaxStyle,
+}
+
 /// What happens to a task after the reviewer bot requests changes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnChangesRequested {
@@ -904,6 +952,7 @@ pub struct OrchestrationSettings {
     /// before attempt `n + 1`. Exhausting it leaves the task crashed.
     pub auto_restart_delays_minutes: Vec<i64>,
     pub designer: BotSettings,
+    pub promptmax: PromptmaxSettings,
     pub reviewer: ReviewerSettings,
     pub orchestrator: OrchestratorSettings,
     /// Named model rosters the orchestrator assigns to the nodes it plans
@@ -1315,6 +1364,10 @@ pub struct IsolationSettings {
 impl OrchestrationSettings {
     pub fn designer_enabled_for(&self, task: &Task) -> bool {
         self.designer.enabled || task.use_designer
+    }
+
+    pub fn promptmax_enabled_for(&self, task: &Task) -> bool {
+        self.promptmax.bot.enabled || task.use_promptmax
     }
 
     pub fn reviewer_enabled_for(&self, task: &Task) -> bool {
@@ -1731,7 +1784,7 @@ fn coerce_int_cap(map: &mut Mapping, key: &str) -> Result<()> {
 /// — split on the FIRST slash only, because model ids themselves contain
 /// slashes (`opencode/openai/gpt-5.5`). A bare model id would silently never
 /// match any census key, so it is rejected outright. `..._per_role` keys are a
-/// closed set (`executor` / `designer` / `reviewer`) and are checked for the
+/// closed set (`executor` / `orchestrator` / `promptmaxer` / `designer` / `reviewer`) and are checked for the
 /// same reason: a typo would cap nothing and look like it worked.
 ///
 /// `max_running_per_backend` keys are checked too, but only as a *warning*:
@@ -1788,7 +1841,7 @@ fn validate_cap_map(
                 }
                 if check_roles && key_str.parse::<Role>().is_err() {
                     return Err(KanbanError::Invalid(format!(
-                        "orchestration '{key}' entry '{key_str}' is not a role (known: executor, orchestrator, designer, reviewer)"
+                        "orchestration '{key}' entry '{key_str}' is not a role (known: executor, orchestrator, promptmaxer, designer, reviewer)"
                     )));
                 }
                 let parsed = as_int(&value).ok_or_else(|| {
@@ -2147,6 +2200,15 @@ impl OrchestrationSettings {
             .and_then(Value::as_mapping)
             .or_else(|| default_section("designer"))
             .expect("built-in defaults contain orchestration.designer");
+        let promptmax = designer
+            .get("promptmax")
+            .and_then(Value::as_mapping)
+            .or_else(|| {
+                default_section("designer")
+                    .and_then(|d| d.get("promptmax"))
+                    .and_then(Value::as_mapping)
+            })
+            .expect("built-in defaults contain orchestration.designer.promptmax");
         let reviewer = mapping
             .get("reviewer")
             .and_then(Value::as_mapping)
@@ -2244,6 +2306,14 @@ impl OrchestrationSettings {
             auto_restart_enabled,
             auto_restart_delays_minutes,
             designer: bot_at(designer),
+            promptmax: PromptmaxSettings {
+                bot: bot_at(promptmax),
+                style: promptmax
+                    .get("style")
+                    .and_then(Value::as_str)
+                    .and_then(PromptmaxStyle::parse)
+                    .unwrap_or(PromptmaxStyle::Expanded),
+            },
             reviewer: ReviewerSettings {
                 enabled: reviewer.get("enabled").and_then(as_bool).unwrap_or(false),
                 backend: str_opt_at(reviewer, "backend"),
@@ -2722,6 +2792,18 @@ impl Config {
                 continue;
             };
             coerce_bool_field(bot, "enabled", &format!("orchestration.{role}"))?;
+        }
+        if let Some(promptmax) =
+            sub_mapping_mut(orch, "designer").and_then(|d| sub_mapping_mut(d, "promptmax"))
+        {
+            coerce_bool_field(promptmax, "enabled", "orchestration.designer.promptmax")?;
+            if let Some(style) = promptmax.get("style").filter(|v| !matches!(v, Value::Null))
+                && style.as_str().and_then(PromptmaxStyle::parse).is_none()
+            {
+                return Err(KanbanError::Invalid(format!(
+                    "orchestration.designer.promptmax.style must be 'expanded' or 'mega', got {style:?}"
+                )));
+            }
         }
         if let Some(reviewer) = sub_mapping_mut(orch, "reviewer") {
             let yaml_key = Value::String("on_changes_requested".into());

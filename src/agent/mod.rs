@@ -17,9 +17,10 @@ pub use backends::{
     parse_codex_models_json, parse_grok_models_cache, parse_grok_models_text,
     parse_kimi_config_models, parse_omp_models_json, parse_opencode_models_verbose,
     parse_pi_builtin_catalog, parse_pi_models_json, parse_pi_models_store, pi_builtin_data_dir,
-    recent_models, record_recent_model, resolve_bot_launch_settings, resolve_launch_settings,
-    resolve_opencode_agent, resolve_task_launch_settings, sort_efforts, sort_opencode_models,
-    upcoming_run_plan, warm_backend_catalog, warm_opencode_catalog,
+    promptmax_pending, recent_models, record_recent_model, resolve_bot_launch_settings,
+    resolve_launch_settings, resolve_opencode_agent, resolve_promptmax_launch_settings,
+    resolve_task_launch_settings, sort_efforts, sort_opencode_models, upcoming_run_plan,
+    warm_backend_catalog, warm_opencode_catalog,
 };
 pub use launcher::KanbanLauncher;
 pub use prompt::{build_agent_prompt, build_resume_prompt};

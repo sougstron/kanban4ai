@@ -328,7 +328,9 @@ orchestration:
   max_running_per_backend_model: {}
   max_running_per_role: {orchestrator: 1, designer: 1, reviewer: 1, executor: 3}
   auto_restart: {enabled: true, delays_minutes: [1, 30, 270]}
-  designer: {enabled: false, backend: claude, model: sonnet, effort: null, agent: null}
+  designer: {enabled: false, backend: claude, model: sonnet, effort: null, agent: null,
+             promptmax: {enabled: false, style: expanded, backend: null, model: same,
+                         effort: null, agent: null}}
   reviewer: {enabled: false, backend: claude, model: sonnet, effort: null, agent: null,
              on_changes_requested: in_progress, max_rounds: 3}
   orchestrator: {max_subtasks: 12, upstream_budget_chars: 4000, default_role: cheap}
@@ -359,7 +361,7 @@ orchestration:
   ("Max tasks per backend/model") and these docs
 - `max_running_per_role`: designer 1, reviewer 1, executor 3 - cap per role.
   Unlike the backend maps this is a closed set: a key that is not `executor`,
-  `designer` or `reviewer` is rejected by `Config::validate`, since there is no
+  `orchestrator`, `promptmaxer`, `designer` or `reviewer` is rejected by `Config::validate`, since there is no
   user-extensible role to be wrong about
 - `auto_restart.enabled`: true - master switch for crash auto-restart
 - `auto_restart.delays_minutes`: `[1, 30, 270]` - backoff schedule; entry *n*
@@ -372,6 +374,18 @@ orchestration:
   `auto_launch.default_agent`, and a name with no `agents:` entry falls back to
   `opencode`, matching the task path; unset model/effort/agent inherit that
   backend's configured defaults
+- `designer.promptmax.enabled`: false - run the promptmaxer before every task:
+  it writes a detailed English brief for the executor to
+  `.kanban/prompts/<id>.md` (see "Promptmaxer" in `docs/orchestration.md`). A
+  single task opts in with `use_promptmax` / the Promptmax checkbox /
+  `kanban create --promptmax`
+- `designer.promptmax.style`: `expanded` - `expanded` (the key facts a capable
+  model would look up first) or `mega` (everything spelled out for the weakest
+  model); any other value is a config error
+- `designer.promptmax.backend` / `model` / `effort` / `agent`: unset / `same` /
+  unset / unset - model `same` runs it on the task's own backend and model
+  (its effort/agent still override when set); any other model uses the
+  designer's fallback chain
 - `reviewer.enabled`: false - run a bot review before human Review on every task. A single task can still opt in with `use_reviewer` / the create-dialog Reviewer checkbox / `kanban create --reviewer`
 - `reviewer.backend` / `model` / `effort` / `agent`: same defaults and same
   fallback chain as the designer

@@ -412,10 +412,11 @@ pub fn attribute(
 /// Display order of roles: the run's own order of events.
 pub fn role_rank(role: &str) -> u8 {
     match role {
-        "designer" => 0,
-        "executor" => 1,
-        "reviewer" => 2,
-        _ => 3,
+        "promptmaxer" => 0,
+        "designer" => 1,
+        "executor" => 2,
+        "reviewer" => 3,
+        _ => 4,
     }
 }
 

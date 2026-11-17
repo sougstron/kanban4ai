@@ -351,6 +351,7 @@ impl Storage {
         task.set_permission(new_task.permission);
         task.silence = new_task.silence;
         task.use_designer = new_task.use_designer;
+        task.use_promptmax = new_task.use_promptmax;
         task.use_reviewer = new_task.use_reviewer;
         task.use_orchestrator = new_task.use_orchestrator;
         task.chained_to = new_task.chained_to;
@@ -738,6 +739,7 @@ pub struct NewTask {
     pub permission: Option<String>,
     pub silence: bool,
     pub use_designer: bool,
+    pub use_promptmax: bool,
     pub use_reviewer: bool,
     pub use_orchestrator: bool,
     pub chained_to: Option<String>,

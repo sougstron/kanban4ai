@@ -179,7 +179,9 @@ instead of starting to type; from a text panel use `Alt+o`. Without a pin,
     `unavailable — <reason>`; probed once when the dialog opens, since the
     probe runs git)
   - **Designer**: enable-for-all toggle and the designer bot's nested
-    agent-settings launcher
+    agent-settings launcher, then the promptmaxer: its enable-for-all toggle,
+    the Mega checkbox (off = expanded brief) and its own launcher, whose model
+    list adds `same` (the task's own backend and model)
   - **Reviewer**: enable-for-all toggle, launcher, where `--changes` verdicts
     drop the task, and the review bounce cap
   - **Executor**: the six ordered pool slots (`Middle 1st–3rd`, `Cheap
@@ -555,12 +557,12 @@ as: Title, Description, an `Agent settings` row that opens a nested popup for
 backend, model, effort, and persona, a Permission selector (project default, readonly,
 edits, full, or a custom preset), a "Chain to task" selector,
 and an `Options` row that opens a second nested popup holding the
-Silence, Orchestrator, Designer, and Reviewer checkboxes plus the "Planned
+Silence, Orchestrator, Promptmax, Designer, and Reviewer checkboxes plus the "Planned
 launch" checkbox with an HH:MM time field. Silence forbids questions on this
 task: the agent decides ambiguous points itself and records each dispute as a
-suggestion. Orchestrator, Designer, and Reviewer are per-task opt-ins; models
+suggestion. Orchestrator, Promptmax, Designer, and Reviewer are per-task opt-ins; models
 and agents come from project settings. The Options summary names the toggles
-that are on (`silence`, `orchestrator`, `designer`, `reviewer`, `launch at
+that are on (`silence`, `orchestrator`, `promptmax`, `designer`, `reviewer`, `launch at
 HH:MM`), and a silence task shows a `🔇 silence` badge. Below Runner, a
 read-only `Runs after` row lists the nearest tasks this one starts after: the
 chain target (`chain: TASK-…`, live with the selector) and the orchestrator's

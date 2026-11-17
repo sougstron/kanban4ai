@@ -89,6 +89,9 @@ enum Command {
         /// Run the project designer bot for this task even if it is off board-wide
         #[arg(long)]
         designer: bool,
+        /// Run the promptmaxer for this task even if it is off board-wide
+        #[arg(long)]
+        promptmax: bool,
         /// Run the project reviewer bot for this task even if it is off board-wide
         #[arg(long)]
         reviewer: bool,
@@ -1384,6 +1387,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             permission,
             silence,
             designer,
+            promptmax,
             reviewer,
             orchestrator,
             chained_to,
@@ -1417,6 +1421,7 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
                 },
                 silence,
                 use_designer: designer,
+                use_promptmax: promptmax,
                 use_reviewer: reviewer,
                 use_orchestrator: orchestrator,
                 chained_to: chained_to.filter(|c| !c.is_empty()),
@@ -2682,6 +2687,7 @@ fn task_to_json_base(task: &Task) -> serde_json::Value {
         "permission": task.permission(),
         "silence": task.silence,
         "use_designer": task.use_designer,
+        "use_promptmax": task.use_promptmax,
         "use_reviewer": task.use_reviewer,
         "use_orchestrator": task.use_orchestrator,
         "chained_to": task.chained_to,

@@ -1489,6 +1489,7 @@ fn limit_shares_line(theme: &Theme, shares: &[LimitShare]) -> Line<'static> {
         }
         previous = Some((&share.provider, &share.label));
         let (glyph, phase) = match share.role.as_str() {
+            "promptmaxer" => ("✍", Some(RunPhase::Promptmax)),
             "designer" => ("✎", Some(RunPhase::Design)),
             "reviewer" => ("⚖", Some(RunPhase::Review)),
             _ => ("▶", None),
