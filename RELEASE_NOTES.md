@@ -1,3 +1,12 @@
+# kanban4ai 0.8.20
+
+Notes are from the reviewed diff since 0.8.19. There were no `.changes/` logs.
+
+- **The task detail header collapses.** It starts as two rows — `TASK-N title │ status · phase │ badges` and `▶ time · runs │ tokens · cache · ≈eq │ Δ +a −r · n files │ backend/model` — with the Analytics panel folded into the second row. Alarm lines (blocked, waiting, crash, integration conflict) always show. `z` (`Alt+z` while a text panel takes letters) or a click on the header expands the full Task block plus Analytics. The choice is saved per board as `tui.detail_header_expanded`. A detail area under 24 rows stays collapsed.
+- **Detail has a Thread | Diff tab.** `g`, or a click on a tab label in the border title, switches the lower panel. The Diff tab lists every changed file with its `+/−` counts; `↑/↓` select a file, `Enter` or a click expands or collapses its hunks, and PgUp/PgDn/wheel/Home/End scroll. The source is the first that applies: the worktree against its base commit (uncommitted edits included), the branch against its base, the `kanban: land TASK-N` commit, or a non-isolated run's backups against the current files. The tick worker recomputes the diff while that detail is open, at most every 5 seconds, off the render path.
+
+Board files stay loadable by 0.8.19. Project `config.yaml` may gain `tui.detail_header_expanded`; 0.8.19 keeps unknown `tui` keys and does not apply them. Store format is still 5. Sync protocol is still 3. Journal records are unchanged.
+
 # kanban4ai 0.8.19
 
 Notes are from the reviewed diff since 0.8.18. There were no `.changes/` logs.
