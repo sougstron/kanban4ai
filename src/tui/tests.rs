@@ -9641,6 +9641,7 @@ fn o_on_the_board_opens_the_open_projects_folder() {
 #[test]
 fn o_in_review_detail_opens_the_pinned_result() {
     let (dir, mut app) = app_with_board();
+    app.settings.detail_header_expanded = true;
     let store_dir = tempfile::tempdir().expect("store");
     let marker = store_dir.path().join("marker");
     let store = ProjectStore::at(store_dir.path());
@@ -12191,6 +12192,7 @@ fn live_design_session_shows_the_design_badge() {
 #[test]
 fn detail_meta_shows_the_run_phase() {
     let (_dir, mut app) = app_with_board();
+    app.settings.detail_header_expanded = true;
     let task = app
         .ops
         .create_task(NewTask::titled("Detail phase"))
@@ -12738,6 +12740,7 @@ fn isolation_and_conflict_badges_follow_integration_state() {
 #[test]
 fn conflict_detail_shows_worktree_branch_base_and_urgent_rerun() {
     let (dir, mut app) = app_with_board();
+    app.settings.detail_header_expanded = true;
     let task = app
         .ops
         .create_task(NewTask::titled("Landing went sideways"))
@@ -13030,6 +13033,7 @@ fn global_settings_edit_and_save_the_inheritable_groups() {
 fn detail_analytics_panel_sums_runs_and_tokens() {
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();
+    app.settings.detail_header_expanded = true;
     let task = app
         .ops
         .create_task(NewTask {
@@ -13080,7 +13084,7 @@ fn detail_analytics_panel_sums_runs_and_tokens() {
         rendered.contains("│Time 45m · 2 runs │ Input 120.0k · Cache R 1.1M · Cache W 0 · Output 45.6k · Cache hit 90.0%"),
         "analytics row missing:\n{rendered}"
     );
-    let wide = render_at(&mut app, 160, 24);
+    let wide = render_at(&mut app, 160, 28);
     // The card's model is openai/gpt-5.5, so output weighs 8×:
     // 120_000 + 1_080_000×0.1 + 45_600×8 = 592_800.
     assert!(
@@ -13099,6 +13103,7 @@ fn detail_analytics_panel_shows_limit_shares_per_role() {
     use crate::core::limit_share::LimitShare;
     let dir = tempfile::tempdir().unwrap();
     let mut app = App::new(dir.path()).unwrap();
+    app.settings.detail_header_expanded = true;
     app.ops
         .create_task(NewTask {
             title: "Limit shares".to_string(),
@@ -14384,6 +14389,7 @@ fn task_form_links_row_shows_and_clears_chain_and_dependencies() {
 #[test]
 fn permission_selector_custom_and_badges_snapshots() {
     let (_dir, mut app) = app_with_board();
+    app.settings.detail_header_expanded = true;
     app.handle_key(key(KeyCode::Char('n'))).unwrap();
     let modal = app.modal.as_mut().unwrap();
     modal.permission_choices.push(Some("audit".into()));
@@ -14684,4 +14690,120 @@ fn parent_detail_lists_subagents_and_controls_them_through_operations() {
         app.ops.get_task(&ids[1]).unwrap().unwrap().sub_collected,
         Some(crate::core::models::SubCollected::Discarded)
     );
+}
+
+#[test]
+fn z_and_a_header_click_toggle_the_collapsed_task_header() {
+    let (dir, mut app) = app_with_board();
+    let task = app
+        .ops
+        .create_task(NewTask {
+            title: "Header card".to_string(),
+            description: "First line of the description".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
+
+    let collapsed = render_at(&mut app, 96, 28);
+    assert!(collapsed.contains("Task ▸ z"), "{collapsed}");
+    assert!(!collapsed.contains("Description:"), "{collapsed}");
+    assert!(!collapsed.contains(" Analytics "), "{collapsed}");
+    insta::assert_snapshot!("detail_header_collapsed", collapsed);
+
+    app.handle_key(key(KeyCode::Char('z'))).unwrap();
+    assert!(app.settings.detail_header_expanded);
+    let expanded = render_at(&mut app, 96, 28);
+    assert!(expanded.contains("Task ▾ z"), "{expanded}");
+    assert!(expanded.contains("Description:"), "{expanded}");
+    assert!(expanded.contains(" Analytics "), "{expanded}");
+    // The choice is saved in the board's tui config.
+    let config = std::fs::read_to_string(dir.path().join(".kanban/config.yaml")).unwrap();
+    assert!(config.contains("detail_header_expanded: true"), "{config}");
+
+    // A click on the header body collapses it again.
+    let header = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::ToggleDetailHeader))
+        .copied()
+        .expect("header hitbox");
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        header.area.x + 2,
+        header.area.y + 1,
+    ))
+    .unwrap();
+    assert!(!app.settings.detail_header_expanded);
+
+    // A short terminal keeps it collapsed even when expanded is saved.
+    app.settings.detail_header_expanded = true;
+    let short = render_at(&mut app, 96, 20);
+    assert!(short.contains("Task ▸ z"), "{short}");
+}
+
+#[test]
+fn g_opens_the_diff_tab_and_enter_or_a_click_expands_a_file() {
+    let (dir, mut app) = app_with_board();
+    let task = app.ops.create_task(NewTask::titled("Diff card")).unwrap();
+    // A non-isolated run: originals in the task's backups, edits in place.
+    let backups = dir.path().join(".kanban/backups").join(&task.id);
+    std::fs::create_dir_all(backups.join("src")).unwrap();
+    std::fs::write(backups.join("src/a.txt"), "one\ntwo\nthree\n").unwrap();
+    std::fs::write(backups.join("notes.md"), "old\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+    std::fs::write(dir.path().join("notes.md"), "new\n").unwrap();
+    app.board = super::app::BoardSnapshot::load(&app.ops).unwrap();
+    app.clamp_focus();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    assert_eq!(app.detail.as_ref().unwrap().task_id, task.id);
+    app.tick().unwrap();
+
+    let thread = render_at(&mut app, 96, 28);
+    assert!(thread.contains("Thread │ Diff +3 −2 (2) · g"), "{thread}");
+    assert!(thread.contains("Δ +3 −2 · 2 files · g"), "{thread}");
+
+    app.handle_key(key(KeyCode::Char('g'))).unwrap();
+    let list = render_at(&mut app, 96, 28);
+    assert!(
+        list.contains("backups vs current files · +3 −2 · 2 files"),
+        "{list}"
+    );
+    assert!(list.contains("▸ notes.md"), "{list}");
+    assert!(list.contains("▸ src/a.txt"), "{list}");
+
+    // ↓ selects the second file, Enter shows its hunk.
+    app.handle_key(key(KeyCode::Down)).unwrap();
+    app.handle_key(key(KeyCode::Enter)).unwrap();
+    let expanded = render_at(&mut app, 96, 28);
+    assert!(expanded.contains("▾ src/a.txt"), "{expanded}");
+    assert!(expanded.contains("@@ -1,3 +1,4 @@"), "{expanded}");
+    assert!(expanded.contains("+TWO"), "{expanded}");
+    insta::assert_snapshot!("detail_diff_tab_expanded", expanded);
+
+    // A click on a file row toggles it too.
+    let first = app
+        .hitboxes
+        .iter()
+        .find(|hitbox| hitbox.action == HitAction::Action(UiAction::ToggleDiffFile(0)))
+        .copied()
+        .expect("file row hitbox");
+    app.handle_mouse(mouse(
+        MouseEventKind::Down(MouseButton::Left),
+        first.area.x + 1,
+        first.area.y,
+    ))
+    .unwrap();
+    let both = render_at(&mut app, 96, 28);
+    assert!(both.contains("▾ notes.md"), "{both}");
+    assert!(both.contains("+new"), "{both}");
+
+    // g returns to the thread.
+    app.handle_key(key(KeyCode::Char('g'))).unwrap();
+    let back = render_at(&mut app, 96, 28);
+    assert!(back.contains("MSG-001"), "{back}");
 }

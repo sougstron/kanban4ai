@@ -127,6 +127,7 @@ fn tick_worker_blocked_refresh_leaves_navigation_responsive_and_coalesces() {
         main_stamps: app.board.stamps,
         global_changed: false,
         live: tick_worker::live_tasks(&app.board),
+        diff_task: None,
         before_read: Some((gate, entered)),
     }));
     app.tick_in_flight = true;

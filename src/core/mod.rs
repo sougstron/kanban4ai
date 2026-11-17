@@ -30,6 +30,7 @@ pub mod stats;
 pub mod storage;
 pub mod subagents;
 pub mod sync;
+pub mod task_diff;
 pub mod telemetry;
 pub mod thread;
 pub mod timefmt;

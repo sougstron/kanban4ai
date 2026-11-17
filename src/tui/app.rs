@@ -46,6 +46,7 @@ use crate::core::provenance::{self, InputManifest};
 use crate::core::session::{SessionManager, SessionState};
 use crate::core::stats::{self, TaskAnalytics};
 use crate::core::storage::{BoardStamps, Fingerprint, NewTask, Storage, TaskCache};
+use crate::core::task_diff::TaskDiff;
 use crate::core::telemetry::{self, SessionProgress, TokenBreakdown};
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
@@ -128,6 +129,9 @@ pub struct TuiSettings {
     pub hidden_limits: Vec<String>,
     /// Hide thread messages authored by kanban (audit notes). Display filter only.
     pub hide_kanban_messages: bool,
+    /// Task detail shows the full Task block and the Analytics panel instead
+    /// of the two-row summary header (`z` / click toggles, saved per board).
+    pub detail_header_expanded: bool,
     /// Seconds a limits snapshot stays fresh before a background refresh.
     pub limits_refresh_interval: i64,
 }
@@ -300,6 +304,12 @@ pub enum UiAction {
     CheckUpdates,
     /// Global Settings "Update now": run the same apply path the CLI uses.
     ApplyUpdate,
+    /// Collapse or expand the detail's Task header (`z`, click on it).
+    ToggleDetailHeader,
+    /// Switch the detail's lower panel between Thread and Diff (`g`).
+    ToggleDiffTab,
+    /// Expand or collapse one file's hunks in the Diff tab (Enter, click).
+    ToggleDiffFile(usize),
 }
 
 /// Which detail panel receives keyboard input. `Thread` is the neutral state;
@@ -359,6 +369,33 @@ pub struct DetailState {
     /// Parent task whose detail Esc returns to: set while this detail shows
     /// one of its subagents.
     pub back_to: Option<String>,
+    /// The Diff tab sharing the thread's panel.
+    pub diff: DiffView,
+}
+
+/// The task's changes and how the Diff tab shows them. `diff` arrives from
+/// the tick worker; nothing here shells out.
+#[derive(Clone, Default)]
+pub struct DiffView {
+    /// The Diff tab replaces the thread in the lower panel.
+    pub open: bool,
+    /// `None` until the first computation finished.
+    pub loaded: bool,
+    pub diff: Option<TaskDiff>,
+    /// Selected file (index into `diff.files`).
+    pub selected: usize,
+    /// Paths whose hunks are shown inline.
+    pub expanded: HashSet<String>,
+    pub scroll: u16,
+    pub max_scroll: u16,
+    /// On the next paint, scroll so the selected file's row is visible.
+    pub follow_selected: bool,
+}
+
+impl DiffView {
+    pub fn file_count(&self) -> usize {
+        self.diff.as_ref().map_or(0, |diff| diff.files.len())
+    }
 }
 
 impl DetailState {
@@ -479,6 +516,8 @@ pub struct App {
     /// Inline fallback cache; the real event loop keeps its cache on the worker.
     progress_cache: ProgressCache,
     tick_worker: Option<TickWorker>,
+    /// Diff cache for the synchronous fallback when no tick worker runs.
+    diff_cache: tick_worker::DiffCache,
     tick_in_flight: bool,
     /// A refresh was asked for while one was in flight.
     tick_pending: bool,
@@ -1082,6 +1121,7 @@ impl App {
             token_costs: crate::core::token_costs::TokenCosts::builtin(),
             progress_cache: ProgressCache::default(),
             tick_worker: None,
+            diff_cache: Default::default(),
             tick_in_flight: false,
             tick_pending: false,
             tick_global_pending: false,
@@ -1215,6 +1255,7 @@ impl App {
             token_costs: crate::core::token_costs::TokenCosts::builtin(),
             progress_cache: ProgressCache::default(),
             tick_worker: None,
+            diff_cache: Default::default(),
             tick_in_flight: false,
             tick_pending: false,
             tick_global_pending: false,
@@ -1662,6 +1703,19 @@ impl App {
                 self.open_continue_dialog()?
             }
             (KeyCode::Char('/'), _) => self.dispatch(UiAction::Search)?,
+            (KeyCode::Char('z'), _) if self.screen == Screen::Detail => {
+                self.dispatch(UiAction::ToggleDetailHeader)?
+            }
+            (KeyCode::Char('g'), _) if self.screen == Screen::Detail => {
+                self.dispatch(UiAction::ToggleDiffTab)?
+            }
+            (KeyCode::Enter, _) if self.diff_tab_open() => {
+                let selected = self.detail.as_ref().map_or(0, |d| d.diff.selected);
+                self.dispatch(UiAction::ToggleDiffFile(selected))?
+            }
+            (KeyCode::Up | KeyCode::Down, KeyModifiers::NONE) if self.diff_tab_open() => {
+                self.move_diff_selection(if key.code == KeyCode::Up { -1 } else { 1 })
+            }
             (KeyCode::Enter, _)
                 if self.screen == Screen::Detail
                     && self
@@ -1833,7 +1887,10 @@ impl App {
         if viewing_subagent
             && let KeyCode::Char(ch) = normalize_command_key(key).code
             && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !matches!(ch, 'p' | 'v' | 'L' | '[' | ']' | 'q' | '?' | 'l' | '/')
+            && !matches!(
+                ch,
+                'p' | 'v' | 'L' | '[' | ']' | 'q' | '?' | 'l' | '/' | 'z' | 'g'
+            )
         {
             self.status = "Subagent: control it from its parent (Esc)".to_string();
             return Ok(true);
@@ -2515,6 +2572,9 @@ impl App {
             UiAction::RefreshLimits(provider) => self.refresh_provider_limits(provider),
             UiAction::CheckUpdates => self.check_updates_now(),
             UiAction::ApplyUpdate => self.apply_update_now()?,
+            UiAction::ToggleDetailHeader => self.toggle_detail_header(),
+            UiAction::ToggleDiffTab => self.toggle_diff_tab(),
+            UiAction::ToggleDiffFile(index) => self.toggle_diff_file(index),
         }
         Ok(())
     }
@@ -3462,10 +3522,109 @@ impl App {
         self.scroll_column(column, delta);
     }
 
+    fn toggle_detail_header(&mut self) {
+        let expanded = !self.settings.detail_header_expanded;
+        self.settings.detail_header_expanded = expanded;
+        self.status = if expanded {
+            "Task header expanded (z collapses)"
+        } else {
+            "Task header collapsed (z expands)"
+        }
+        .to_string();
+        if let Err(err) = self.save_board_tui_bool("detail_header_expanded", expanded) {
+            self.status = format!("Could not save the header state: {err}");
+        }
+    }
+
+    fn diff_tab_open(&self) -> bool {
+        self.screen == Screen::Detail
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.diff.open && detail.focus == DetailFocus::Thread)
+    }
+
+    fn toggle_diff_tab(&mut self) {
+        let Some(detail) = self.detail.as_mut() else {
+            return;
+        };
+        detail.diff.open = !detail.diff.open;
+        detail.diff.follow_selected = detail.diff.open;
+        if detail.diff.open {
+            detail.focus = DetailFocus::Thread;
+        }
+        self.status = if detail.diff.open {
+            "Diff: ↑/↓ file · Enter expand · g back to thread"
+        } else {
+            "Thread"
+        }
+        .to_string();
+    }
+
+    fn toggle_diff_file(&mut self, index: usize) {
+        let Some(detail) = self.detail.as_mut() else {
+            return;
+        };
+        let view = &mut detail.diff;
+        let Some(path) = view
+            .diff
+            .as_ref()
+            .and_then(|diff| diff.files.get(index))
+            .map(|file| file.path.clone())
+        else {
+            return;
+        };
+        view.selected = index;
+        view.follow_selected = true;
+        if !view.expanded.remove(&path) {
+            view.expanded.insert(path);
+        }
+    }
+
+    fn move_diff_selection(&mut self, delta: isize) {
+        let Some(detail) = self.detail.as_mut() else {
+            return;
+        };
+        let view = &mut detail.diff;
+        let count = view.file_count();
+        if count == 0 {
+            return;
+        }
+        view.selected = view.selected.saturating_add_signed(delta).min(count - 1);
+        view.follow_selected = true;
+    }
+
+    /// The open detail's task, for the tick worker to diff.
+    fn diff_task(&self) -> Option<Task> {
+        (self.screen == Screen::Detail)
+            .then(|| self.detail.as_ref()?.task.clone())
+            .flatten()
+    }
+
+    fn apply_detail_diff(&mut self, task_id: &str, diff: Option<TaskDiff>) {
+        let Some(detail) = self.detail.as_mut().filter(|d| d.task_id == task_id) else {
+            return;
+        };
+        let view = &mut detail.diff;
+        view.loaded = true;
+        if view.diff != diff {
+            view.diff = diff;
+            view.selected = view.selected.min(view.file_count().saturating_sub(1));
+        }
+    }
+
     fn scroll_detail(&mut self, delta: isize) {
         let Some(detail) = self.detail.as_mut() else {
             return;
         };
+        if detail.diff.open {
+            let view = &mut detail.diff;
+            view.scroll = view
+                .scroll
+                .saturating_add_signed(delta.clamp(-1000, 1000) as i16)
+                .min(view.max_scroll);
+            return;
+        }
         detail.scroll = if delta < 0 {
             detail.scroll.saturating_sub(delta.unsigned_abs() as u16)
         } else {
@@ -3543,6 +3702,7 @@ impl App {
                 main_stamps: self.board.stamps,
                 global_changed: self.tick_global_pending,
                 live: tick_worker::live_tasks(&self.board),
+                diff_task: self.diff_task(),
                 #[cfg(test)]
                 before_read: None,
             };
@@ -3574,6 +3734,9 @@ impl App {
         self.tick_in_flight = false;
         self.session_progress = result.progress;
         self.task_tokens = result.tokens;
+        if let Some((task_id, diff)) = result.diff.take() {
+            self.apply_detail_diff(&task_id, diff);
+        }
         if result.generation == self.board_generation {
             if let Some(board) = result.board.take() {
                 let sessions_changed = board.stamps.sessions != self.board.stamps.sessions;
@@ -3696,6 +3859,13 @@ impl App {
         self.poll_launches();
         timer.mark("poll_launches");
         self.reload_if_changed()?;
+        if self.tick_worker.is_none()
+            && let Some(task) = self.diff_task()
+        {
+            // Synchronous fallback (tests, a stopped worker): same cache.
+            let diff = self.diff_cache.get(&self.ops, &task);
+            self.apply_detail_diff(&task.id, diff);
+        }
         timer.mark("reload_if_changed");
         super::diag::busy("tick: sync board");
         if let Some(store) = &self.store {
@@ -4411,7 +4581,11 @@ impl App {
             }
             Screen::Detail => {
                 if let Some(detail) = self.detail.as_mut() {
-                    detail.scroll = 0;
+                    if detail.diff.open {
+                        detail.diff.scroll = 0;
+                    } else {
+                        detail.scroll = 0;
+                    }
                 }
             }
             Screen::Sessions => self.session_selected = 0,
@@ -4438,7 +4612,11 @@ impl App {
             Screen::Board => self.focus_last_card(),
             Screen::Detail => {
                 if let Some(detail) = self.detail.as_mut() {
-                    detail.scroll = detail.max_scroll;
+                    if detail.diff.open {
+                        detail.diff.scroll = detail.diff.max_scroll;
+                    } else {
+                        detail.scroll = detail.max_scroll;
+                    }
                 }
             }
             Screen::Sessions => {
@@ -4872,6 +5050,11 @@ impl App {
         let preserved_scroll = self.detail.as_ref().and_then(|detail| {
             (detail.task_id == task_id).then_some((detail.scroll, detail.pin_last_message))
         });
+        let preserved_diff = self
+            .detail
+            .as_ref()
+            .filter(|detail| detail.task_id == task_id)
+            .map(|detail| detail.diff.clone());
         let hide_kanban = self.settings.hide_kanban_messages;
         let task = self.ops.get_task(task_id)?;
         let threads = ThreadManager::new(self.ops.data_root())?;
@@ -4928,6 +5111,7 @@ impl App {
                 .map_or(0, |(selected, _)| *selected),
             subagent_count,
             back_to: preserved_subagents.and_then(|(_, back_to)| back_to),
+            diff: preserved_diff.unwrap_or_default(),
         };
         // A fresh open stays on the thread so Esc closes the detail at once.
         // Plain letters still jump into the review editor (or the answer box)
@@ -8276,6 +8460,18 @@ impl App {
         Ok(())
     }
 
+    fn save_board_tui_bool(&self, key: &str, value: bool) -> Result<()> {
+        ensure_config_write_target_is_safe(&self.ops.config)?;
+        let _lock = self.ops.storage.lock()?;
+        ensure_config_write_target_is_safe(&self.ops.config)?;
+        let mut config = self.ops.config.load_raw_fresh()?;
+        config
+            .tui
+            .insert(Value::String(key.to_string()), Value::Bool(value));
+        retain_source_legacy_auto_launch_keys(&self.ops.config.config_file, &mut config)?;
+        self.ops.config.save(&config)
+    }
+
     fn save_board_theme(&self, next: &str) -> Result<()> {
         ensure_config_write_target_is_safe(&self.ops.config)?;
         let _lock = self.ops.storage.lock()?;
@@ -9462,6 +9658,7 @@ fn default_project_settings() -> TuiSettings {
         show_limits: true,
         hidden_limits: Vec::new(),
         hide_kanban_messages: false,
+        detail_header_expanded: false,
         limits_refresh_interval: crate::core::limits::DEFAULT_REFRESH_INTERVAL,
     }
 }
@@ -9595,6 +9792,7 @@ fn load_settings(ops: &Operations) -> Result<TuiSettings> {
         show_limits: tui_bool(&config.tui, "show_limits", true),
         hidden_limits: Vec::new(),
         hide_kanban_messages: tui_bool(&config.tui, "hide_kanban_messages", false),
+        detail_header_expanded: tui_bool(&config.tui, "detail_header_expanded", false),
         limits_refresh_interval: ops
             .config
             .get_threshold("limits_refresh_interval")
