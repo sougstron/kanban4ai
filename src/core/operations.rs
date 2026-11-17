@@ -91,6 +91,7 @@ use crate::core::scheduler::{Slots, role_for_phase};
 use crate::core::session::{SessionManager, SessionState};
 use crate::core::stats;
 use crate::core::storage::{NewTask, Storage, atomic_write_text};
+use crate::core::task_diff;
 use crate::core::thread::ThreadManager;
 use crate::core::timefmt;
 use crate::core::vcs;
@@ -2590,6 +2591,53 @@ impl Operations {
             digest,
             diff_stat,
             changed_files,
+        })
+    }
+
+    /// What the task changed, for the detail's Diff tab. Tried in order: the
+    /// live worktree against its base (uncommitted work included), the
+    /// branch against its base, the `kanban: land TASK-N` commit once the
+    /// branch is gone, then a non-isolated run's backups against the
+    /// current files. `None` when none applies. Shells out to git, so call
+    /// it off the render path.
+    pub fn task_diff(&self, task: &Task) -> Option<task_diff::TaskDiff> {
+        use task_diff::{DiffSource, git_diff, parse};
+        if let Some(base) = task.base_commit.as_deref() {
+            if let Some(rel) = task.worktree.as_deref() {
+                let dir = self.storage.worktrees_dir.join(rel);
+                if dir.is_dir()
+                    && let Some(patch) = git_diff(&dir, &[base, "--"])
+                {
+                    return Some(parse(DiffSource::Worktree, &patch));
+                }
+            }
+            if let Some(branch) = task.branch.as_deref()
+                && let Some(patch) = git_diff(self.work_path(), &[base, branch, "--"])
+            {
+                return Some(parse(DiffSource::Branch, &patch));
+            }
+            let grep = format!("--grep=^kanban: land {}$", task.id);
+            let land = std::process::Command::new("git")
+                .current_dir(self.work_path())
+                .args(["log", "--all", "-1", "--format=%H", &grep])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .filter(|sha| !sha.is_empty());
+            if let Some(sha) = land
+                && let Some(patch) = git_diff(self.work_path(), &[&format!("{sha}^1"), &sha, "--"])
+            {
+                return Some(parse(DiffSource::Landed, &patch));
+            }
+            return None;
+        }
+        let backups = self.backup_dir(&task.id);
+        backups.is_dir().then(|| {
+            parse(
+                DiffSource::Backups,
+                &task_diff::backups_patch(&backups, self.work_path()),
+            )
         })
     }
 

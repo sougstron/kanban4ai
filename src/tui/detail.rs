@@ -14,11 +14,12 @@ use crate::core::models::{
 };
 use crate::core::session::SessionState;
 use crate::core::stats::TaskAnalytics;
+use crate::core::task_diff::TaskDiff;
 use crate::core::telemetry::SessionProgress;
 use crate::core::timefmt;
 use crate::core::token_costs::TokenCosts;
 
-use super::app::{App, DetailFocus, HitAction, Hitbox, TextRegion, UiAction};
+use super::app::{App, DetailFocus, DiffView, HitAction, Hitbox, TextRegion, UiAction};
 use super::board;
 use super::card;
 use super::card::{format_tokens, sanitize_terminal_text, truncate_display};
@@ -27,10 +28,15 @@ use super::projects::shorten_path;
 use super::theme::Theme;
 use super::thread_view::{pin_last_message_scroll, visible_thread_messages};
 
-/// Width of the meta block's own title, which the project badge has to clear
-/// on the same border row.
-const META_TITLE: &str = " Task ";
-const META_TITLE_WIDTH: u16 = META_TITLE.len() as u16;
+/// The meta block's own title in both header states; the arrow and `z`
+/// advertise the toggle. Both are the same width, which the project badge
+/// has to clear on the same border row.
+const META_TITLE_EXPANDED: &str = " Task ▾ z ";
+const META_TITLE_COLLAPSED: &str = " Task ▸ z ";
+const META_TITLE_WIDTH: u16 = 10;
+/// Below this many rows the header stays collapsed even when the user
+/// expanded it: the thread would otherwise shrink to its five-row floor.
+const EXPANDED_HEADER_MIN_HEIGHT: u16 = 24;
 /// Prefix of the custom-answer option row; the answer text starts right
 /// after the `› ` marker and this label, and `render_answer_panel` plus the
 /// mouse caret mapping both measure it.
@@ -80,7 +86,13 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let edits_editable = detail.edits_editable();
     let focus = detail.focus;
     let task = task.clone();
-    let analytics_height = analytics_height(&detail.analytics);
+    let header_expanded =
+        app.settings.detail_header_expanded && area.height >= EXPANDED_HEADER_MIN_HEIGHT;
+    let analytics_height = if header_expanded {
+        analytics_height(&detail.analytics)
+    } else {
+        0
+    };
     let question_index = detail.question_index;
     let count = app
         .sync_board
@@ -114,7 +126,17 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         + u16::from(task.result_path.is_some())
         + u16::from(conflicted)
         + description_lines;
-    let meta_height = 6 + meta_extra_lines;
+    let alarm_lines = alarm_lines(
+        &task,
+        waiting,
+        wait_deadline.is_some(),
+        session_state == Some(SessionState::Crashed),
+    );
+    let meta_height = if header_expanded {
+        6 + meta_extra_lines
+    } else {
+        4 + alarm_lines
+    };
     let answer_height = if show_answer {
         let question = &open_questions[question_index.min(open_questions.len() - 1)];
         // Two more rows when several questions are open: the prev/next
@@ -181,10 +203,37 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .map(|rel| shorten_path(&app.ops.storage.worktrees_dir.join(rel))),
         result_path: app.ops.result_path(&task).map(|path| shorten_path(&path)),
     };
-    render_meta(frame, &theme, &task, &meta_state, chunks[0]);
+    let live_progress = app.session_progress.get(&task.id);
+    if header_expanded {
+        render_meta(frame, &theme, &task, &meta_state, chunks[0]);
+    } else {
+        let detail = app.detail.as_ref().unwrap();
+        let totals = AnalyticsTotals::new(
+            &task,
+            &detail.analytics,
+            live_progress,
+            session_state,
+            &app.token_costs,
+        );
+        render_meta_compact(
+            frame,
+            &theme,
+            &task,
+            &meta_state,
+            &totals,
+            detail.diff.diff.as_ref(),
+            chunks[0],
+        );
+    }
     if let Some(hitbox) = board::render_project_badge(frame, app, chunks[0], META_TITLE_WIDTH) {
         app.hitboxes.push(hitbox);
     }
+    // The badge registered first, so a click on it still opens projects;
+    // anywhere else on the header toggles it.
+    app.hitboxes.push(Hitbox {
+        area: chunks[0],
+        action: HitAction::Action(UiAction::ToggleDetailHeader),
+    });
     if let Some(detail) = app.detail.as_mut() {
         detail.subagent_count = subagents.len();
         if detail.subagent_count == 0 && detail.focus == DetailFocus::Subagents {
@@ -203,22 +252,53 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             sub_area,
         );
     }
-    let live_progress = app.session_progress.get(&task.id);
-    render_analytics(
-        frame,
-        &theme,
-        &task,
-        &app.detail.as_ref().unwrap().analytics,
-        live_progress,
-        session_state,
-        &app.token_costs,
-        chunks[1],
-    );
+    if header_expanded {
+        render_analytics(
+            frame,
+            &theme,
+            &task,
+            &app.detail.as_ref().unwrap().analytics,
+            live_progress,
+            session_state,
+            &app.token_costs,
+            chunks[1],
+        );
+    }
+
+    let tab_title = panel_tab_title(&theme, &app.detail.as_ref().unwrap().diff);
+    let diff_open = app.detail.as_ref().unwrap().diff.open;
+    push_tab_hitboxes(app, &tab_title, chunks[2]);
+    if diff_open {
+        render_diff_panel(frame, app, &theme, tab_title.line, focus, chunks[2]);
+    } else {
+        render_thread_panel(frame, app, &theme, tab_title.line, focus, chunks[2]);
+    }
+
+    if show_answer {
+        render_answer_panel(frame, app, &theme, &open_questions, chunks[3]);
+    }
+
+    if show_edits {
+        render_edits_panel(frame, app, &theme, edits_editable, chunks[4]);
+    }
+
+    render_action_bar(frame, app, &theme, &task, show_answer, chunks[5]);
+}
+
+fn render_thread_panel(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    theme: &Theme,
+    title: Line<'static>,
+    focus: DetailFocus,
+    area: Rect,
+) {
+    let theme = *theme;
 
     // Thread panel with a clamped scroll and a scrollbar. Input-provenance
     // (what the agent actually consumed) is telemetry, not conversation, so it
     // is kept out of the thread entirely and shown only in the `v` popup.
-    let inner_width = chunks[2].width.saturating_sub(2);
+    let inner_width = area.width.saturating_sub(2);
     let hide_kanban = app.settings.hide_kanban_messages;
     let mut links = Vec::new();
     let mut thread_region = TextRegion::default();
@@ -262,7 +342,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // stop the scroll short of the thread's last row. The block is attached
     // after measuring so `line_count` sees the inner width only.
     let content_height = u16::try_from(thread.line_count(inner_width)).unwrap_or(u16::MAX);
-    let visible_height = chunks[2].height.saturating_sub(2);
+    let visible_height = area.height.saturating_sub(2);
     let max_scroll = content_height.saturating_sub(visible_height);
     let scroll = {
         let detail = app.detail.as_mut().unwrap();
@@ -276,12 +356,12 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         detail.scroll
     };
     app.hitboxes.push(Hitbox {
-        area: chunks[2],
+        area,
         action: HitAction::DetailThread,
     });
     thread_region.area = Rect::new(
-        chunks[2].x.saturating_add(1),
-        chunks[2].y.saturating_add(1),
+        area.x.saturating_add(1),
+        area.y.saturating_add(1),
         inner_width,
         visible_height,
     );
@@ -296,7 +376,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         thread
             .block(
                 Block::default()
-                    .title(" Thread ")
+                    .title(title)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(if focus == DetailFocus::Thread {
                         theme.focus
@@ -305,7 +385,7 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                     })),
             )
             .scroll((scroll, 0)),
-        chunks[2],
+        area,
     );
     for link in links {
         if link.row < usize::from(scroll)
@@ -315,8 +395,8 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             continue;
         }
         let area = Rect::new(
-            chunks[2].x + 1 + link.column as u16,
-            chunks[2].y + 1 + (link.row - usize::from(scroll)) as u16,
+            area.x + 1 + link.column as u16,
+            area.y + 1 + (link.row - usize::from(scroll)) as u16,
             link.width.min(usize::from(inner_width) - link.column) as u16,
             1,
         );
@@ -345,20 +425,492 @@ pub fn render(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             ScrollbarState::new(max_scroll as usize).position(scroll as usize);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            chunks[2],
+            area,
             &mut scrollbar_state,
         );
     }
+}
 
-    if show_answer {
-        render_answer_panel(frame, app, &theme, &open_questions, chunks[3]);
+/// Rows of the warnings the collapsed header never hides: blocked on a
+/// question, a declared wait, a crash (or its retry) and an integration
+/// conflict. Mirrors the conditions in [`alarm_spans`].
+fn alarm_lines(task: &Task, waiting: bool, wait_deadline: bool, crashed: bool) -> u16 {
+    u16::from(waiting)
+        + u16::from(wait_deadline)
+        + u16::from(task.status == TaskStatus::InProgress && (task.restart_at.is_some() || crashed))
+        + u16::from(task.integration == IntegrationState::Conflict)
+}
+
+/// The alarm rows themselves, shared by both header states.
+fn alarm_spans(theme: &Theme, task: &Task, meta_state: &MetaState<'_>) -> Vec<Line<'static>> {
+    let warn = Style::default().fg(theme.warn).add_modifier(Modifier::BOLD);
+    let err = Style::default().fg(theme.err).add_modifier(Modifier::BOLD);
+    let mut lines = Vec::new();
+    if meta_state.waiting {
+        lines.push(Line::from(Span::styled(
+            "⏳ Agent is blocked on a question and waits for your answer",
+            warn,
+        )));
+    }
+    if let Some(deadline) = meta_state.wait_deadline {
+        let note = meta_state
+            .wait_note
+            .map(sanitize_terminal_text)
+            .filter(|note| !note.is_empty())
+            .unwrap_or_else(|| "declared wait".to_string());
+        lines.push(Line::from(Span::styled(
+            format!("⏳ Waiting until {} — {note}", deadline.format("%H:%M")),
+            warn,
+        )));
+    }
+    if task.status == TaskStatus::InProgress {
+        if let Some(restart_at) = task.restart_at {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "↻ Crash retry at {} — waiting for the backoff before the queue picks it up",
+                    restart_at.format("%H:%M")
+                ),
+                warn,
+            )));
+        } else if meta_state.session_state == Some(SessionState::Crashed) {
+            lines.push(Line::from(Span::styled(
+                "✖ Session is stuck or crashed — press u / Recover to return it to To Do",
+                err,
+            )));
+        }
+    }
+    if task.integration == IntegrationState::Conflict {
+        lines.push(Line::from(Span::styled(
+            "⚠ Integration conflict — resolve in the worktree, then Re-run (Ctrl+R)",
+            err,
+        )));
+    }
+    lines
+}
+
+/// Run time and token totals of every agent run, the live session included:
+/// what both the Analytics panel and the collapsed header show.
+struct AnalyticsTotals {
+    running_seconds: i64,
+    runs: usize,
+    tokens: crate::core::telemetry::TokenBreakdown,
+    /// Tokens weighted by the task's backend/model prices (plus unsplit ones).
+    equivalent: f64,
+    empty: bool,
+}
+
+impl AnalyticsTotals {
+    fn new(
+        task: &Task,
+        analytics: &TaskAnalytics,
+        live: Option<&SessionProgress>,
+        session_state: Option<SessionState>,
+        costs: &TokenCosts,
+    ) -> Self {
+        let mut running_seconds = analytics.running_seconds;
+        if session_state == Some(SessionState::Live)
+            && let Some(since) = analytics.running_since
+        {
+            running_seconds += (timefmt::now() - since).num_seconds().max(0);
+        }
+        let tokens = analytics.tokens_with_live(
+            task.session.as_deref(),
+            live.and_then(|live| live.breakdown.as_ref()),
+        );
+        // The task's current backend/model stands in for every run. A task
+        // that switched models mid-way is priced as its latest one.
+        let weights = costs.weights_for(task.agent_backend.as_deref(), task.ai_model.as_deref());
+        let mut equivalent = weights.equivalent(&tokens);
+        if analytics.unsplit_tokens > 0 {
+            equivalent += analytics.unsplit_tokens as f64;
+        }
+        let empty = analytics.runs == 0 && tokens.is_empty() && analytics.unsplit_tokens == 0;
+        Self {
+            running_seconds,
+            runs: analytics.runs,
+            tokens,
+            equivalent,
+            empty,
+        }
+    }
+}
+
+/// The collapsed Task header: two rows plus any alarm. Row one names the
+/// task and its state, row two folds the Analytics panel and the diff size
+/// into one line; `z` or a click shows everything.
+#[allow(clippy::too_many_arguments)]
+fn render_meta_compact(
+    frame: &mut Frame<'_>,
+    theme: &Theme,
+    task: &Task,
+    meta_state: &MetaState<'_>,
+    totals: &AnalyticsTotals,
+    diff: Option<&TaskDiff>,
+    area: Rect,
+) {
+    let muted = Style::default().fg(theme.muted);
+    let value = Style::default().add_modifier(Modifier::BOLD);
+    let sep = || Span::styled(" │ ", Style::default().fg(theme.border));
+    let mut first = vec![
+        Span::styled(
+            task.id.clone(),
+            Style::default()
+                .fg(theme.focus)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::raw(sanitize_terminal_text(&task.title)),
+        sep(),
+        Span::styled(
+            format!(
+                "{}{}",
+                task.status,
+                task.run_phase
+                    .map(|phase| format!(" · {phase}"))
+                    .unwrap_or_default()
+            ),
+            value,
+        ),
+    ];
+    let mut badges = Vec::new();
+    if let Some(permission) = task.permission().filter(|p| *p != "full") {
+        badges.push(format!("🔒 {}", sanitize_terminal_text(permission)));
+    }
+    if task.silence {
+        badges.push("🔇".to_string());
+    }
+    if let Some(launch_at) = task.launch_at {
+        badges.push(format!("🕐 {}", launch_at.format("%H:%M")));
+    }
+    if task.integration != IntegrationState::None {
+        badges.push(format!("⇄ {}", task.integration));
+    }
+    if !badges.is_empty() {
+        first.push(sep());
+        first.push(Span::styled(badges.join(" "), muted));
+    }
+    if meta_state.result_path.is_some() {
+        first.push(sep());
+        first.push(Span::styled(
+            "Result · o",
+            Style::default()
+                .fg(theme.review)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
 
-    if show_edits {
-        render_edits_panel(frame, app, &theme, edits_editable, chunks[4]);
+    let mut second = Vec::new();
+    if totals.empty {
+        second.push(Span::styled("No agent runs yet", muted));
+    } else {
+        second.push(Span::styled("▶ ", muted));
+        second.push(Span::styled(format_span(totals.running_seconds), value));
+        second.push(Span::styled(
+            format!(
+                " · {} run{}",
+                totals.runs,
+                if totals.runs == 1 { "" } else { "s" }
+            ),
+            muted,
+        ));
+        second.push(sep());
+        second.push(Span::styled(
+            format_tokens(totals.tokens.prompt_total() + totals.tokens.output),
+            value,
+        ));
+        second.push(Span::styled(" tok", muted));
+        if let Some(rate) = totals.tokens.cache_hit_rate() {
+            second.push(Span::styled(format!(" · {rate:.0}% cache"), muted));
+        }
+        second.push(Span::styled(
+            format!(" · ≈{} eq", format_tokens(totals.equivalent.round() as i64)),
+            muted,
+        ));
+    }
+    if let Some(diff) = diff.filter(|diff| !diff.files.is_empty()) {
+        second.push(sep());
+        second.push(Span::styled("Δ ", muted));
+        second.push(Span::styled(
+            format!("+{}", diff.added()),
+            Style::default().fg(theme.ok),
+        ));
+        second.push(Span::styled(
+            format!(" −{}", diff.removed()),
+            Style::default().fg(theme.err),
+        ));
+        let count = diff.files.len();
+        second.push(Span::styled(
+            format!(" · {count} file{} · g", if count == 1 { "" } else { "s" }),
+            muted,
+        ));
+    }
+    second.push(sep());
+    second.push(Span::styled(
+        sanitize_terminal_text(&match (&task.agent_backend, &task.ai_model) {
+            (Some(backend), Some(model)) => format!("{backend}/{model}"),
+            (Some(backend), None) => backend.clone(),
+            (None, Some(model)) => model.clone(),
+            (None, None) => "default".to_string(),
+        }),
+        muted,
+    ));
+    if let Some(label) = meta_state.remote_label {
+        second.push(sep());
+        second.push(Span::styled(sanitize_terminal_text(label), muted));
     }
 
-    render_action_bar(frame, app, &theme, &task, show_answer, chunks[5]);
+    let mut lines = vec![Line::from(first), Line::from(second)];
+    lines.extend(alarm_spans(theme, task, meta_state));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .title(META_TITLE_COLLAPSED)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.focus)),
+            )
+            .style(Style::default().bg(theme.bg).fg(theme.fg)),
+        area,
+    );
+}
+
+/// The lower panel's tab strip, drawn as its border title:
+/// ` Thread │ Diff +12 −3 (2) · g `, the active tab bold. `diff_start` and
+/// `diff_end` are the Diff tab's columns within the title, for its hitbox.
+struct TabTitle {
+    line: Line<'static>,
+    thread_width: u16,
+    diff_width: u16,
+}
+
+fn panel_tab_title(theme: &Theme, view: &DiffView) -> TabTitle {
+    let active = Style::default()
+        .fg(theme.focus)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let idle = Style::default().fg(theme.muted);
+    let (thread_style, diff_style) = if view.open {
+        (idle, active)
+    } else {
+        (active, idle)
+    };
+    let thread = " Thread ";
+    let mut spans = vec![
+        Span::styled(thread, thread_style),
+        Span::styled("│", Style::default().fg(theme.border)),
+        Span::styled(" Diff", diff_style),
+    ];
+    let mut diff_text = String::from(" Diff");
+    if let Some(diff) = view.diff.as_ref().filter(|diff| !diff.files.is_empty()) {
+        let plus = format!(" +{}", diff.added());
+        let minus = format!(" −{}", diff.removed());
+        let count = format!(" ({})", diff.files.len());
+        spans.push(Span::styled(plus.clone(), Style::default().fg(theme.ok)));
+        spans.push(Span::styled(minus.clone(), Style::default().fg(theme.err)));
+        spans.push(Span::styled(count.clone(), idle));
+        diff_text.push_str(&plus);
+        diff_text.push_str(&minus);
+        diff_text.push_str(&count);
+    }
+    let hint = if view.open {
+        " · ↑↓ Enter · g "
+    } else {
+        " · g "
+    };
+    spans.push(Span::styled(hint, idle));
+    diff_text.push_str(hint);
+    TabTitle {
+        line: Line::from(spans),
+        thread_width: thread.width() as u16,
+        diff_width: diff_text.width() as u16,
+    }
+}
+
+/// Clicks on the inactive tab label switch tabs. Registered before the
+/// panel's own hitbox so they win.
+fn push_tab_hitboxes(app: &mut App, title: &TabTitle, area: Rect) {
+    if area.height == 0 || area.width < 3 {
+        return;
+    }
+    let right = area.right().saturating_sub(1);
+    let thread = Rect::new(
+        area.x + 1,
+        area.y,
+        title.thread_width.min(right.saturating_sub(area.x + 1)),
+        1,
+    );
+    let diff_x = (thread.right() + 1).min(right);
+    let diff = Rect::new(
+        diff_x,
+        area.y,
+        title.diff_width.min(right.saturating_sub(diff_x)),
+        1,
+    );
+    for rect in [thread, diff] {
+        app.hitboxes.push(Hitbox {
+            area: rect,
+            action: HitAction::Action(UiAction::ToggleDiffTab),
+        });
+    }
+}
+
+/// The Diff tab: one row per changed file, hunks of the expanded ones
+/// inline. Rows never wrap, so a row is a line and the selected file's row
+/// is known for scrolling and clicks.
+fn render_diff_panel(
+    frame: &mut Frame<'_>,
+    app: &mut App,
+    theme: &Theme,
+    title: Line<'static>,
+    focus: DetailFocus,
+    area: Rect,
+) {
+    let inner_width = usize::from(area.width.saturating_sub(2));
+    let visible_height = area.height.saturating_sub(2);
+    let muted = Style::default().fg(theme.muted);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut file_rows: Vec<(usize, usize)> = Vec::new();
+    let view = &app.detail.as_ref().unwrap().diff;
+    match (&view.diff, view.loaded) {
+        (_, false) => lines.push(Line::from(Span::styled("Computing the diff…", muted))),
+        (None, true) => lines.push(Line::from(Span::styled(
+            "No diff: the task has no worktree, branch, landed commit or backups yet",
+            muted,
+        ))),
+        (Some(diff), true) => {
+            let mut header = format!("{} · {}", diff.source.label(), diff.summary());
+            if diff.truncated {
+                header.push_str(" · long patch truncated");
+            }
+            lines.push(Line::from(Span::styled(
+                truncate_display(&header, inner_width),
+                muted,
+            )));
+            if diff.files.is_empty() {
+                lines.push(Line::from(Span::styled("No changes", muted)));
+            }
+            let selected = view.selected.min(diff.files.len().saturating_sub(1));
+            for (index, file) in diff.files.iter().enumerate() {
+                let expanded = view.expanded.contains(&file.path);
+                file_rows.push((index, lines.len()));
+                let counts = if file.binary {
+                    " binary".to_string()
+                } else {
+                    format!(" +{} −{}", file.added, file.removed)
+                };
+                let marker = if expanded { "▾ " } else { "▸ " };
+                let path_width = inner_width.saturating_sub(marker.width() + counts.width());
+                let path = truncate_display(&sanitize_terminal_text(&file.path), path_width);
+                let pad = " ".repeat(path_width.saturating_sub(path.width()));
+                let mut row_style = Style::default().fg(theme.fg);
+                if index == selected && focus == DetailFocus::Thread {
+                    row_style = row_style.bg(theme.border).add_modifier(Modifier::BOLD);
+                }
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(marker, muted),
+                        Span::raw(path),
+                        Span::raw(pad),
+                        Span::styled(
+                            counts,
+                            Style::default().fg(if file.binary {
+                                theme.muted
+                            } else if file.removed > file.added {
+                                theme.err
+                            } else {
+                                theme.ok
+                            }),
+                        ),
+                    ])
+                    .style(row_style),
+                );
+                if expanded {
+                    for text in &file.lines {
+                        let style = if text.starts_with("@@") {
+                            Style::default().fg(theme.focus)
+                        } else if text.starts_with('+') {
+                            Style::default().fg(theme.ok)
+                        } else if text.starts_with('-') {
+                            Style::default().fg(theme.err)
+                        } else {
+                            Style::default().fg(theme.fg)
+                        };
+                        lines.push(Line::from(Span::styled(
+                            truncate_display(
+                                &sanitize_terminal_text(&text.replace('\t', "    ")),
+                                inner_width,
+                            ),
+                            style,
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    let content_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let max_scroll = content_height.saturating_sub(visible_height);
+    let scroll = {
+        let view = &mut app.detail.as_mut().unwrap().diff;
+        view.max_scroll = max_scroll;
+        if view.follow_selected {
+            view.follow_selected = false;
+            if let Some(&(_, row)) = file_rows.iter().find(|(index, _)| *index == view.selected) {
+                let row = u16::try_from(row).unwrap_or(u16::MAX);
+                if row < view.scroll {
+                    view.scroll = row;
+                } else if row >= view.scroll.saturating_add(visible_height) {
+                    view.scroll = row.saturating_sub(visible_height.saturating_sub(1));
+                }
+            }
+        }
+        view.scroll = view.scroll.min(max_scroll);
+        view.scroll
+    };
+    for (index, row) in file_rows {
+        let Some(offset) = row.checked_sub(usize::from(scroll)) else {
+            continue;
+        };
+        if offset >= usize::from(visible_height) {
+            continue;
+        }
+        app.hitboxes.push(Hitbox {
+            area: Rect::new(
+                area.x + 1,
+                area.y + 1 + offset as u16,
+                inner_width as u16,
+                1,
+            ),
+            action: HitAction::Action(UiAction::ToggleDiffFile(index)),
+        });
+    }
+    app.hitboxes.push(Hitbox {
+        area,
+        action: HitAction::DetailThread,
+    });
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(Style::default().bg(theme.bg).fg(theme.fg))
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(if focus == DetailFocus::Thread {
+                        theme.focus
+                    } else {
+                        theme.border
+                    })),
+            )
+            .scroll((scroll, 0)),
+        area,
+    );
+    if max_scroll > 0 {
+        let mut scrollbar_state =
+            ScrollbarState::new(max_scroll as usize).position(scroll as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut scrollbar_state,
+        );
+    }
 }
 
 fn task_description_lines(task: &Task) -> u16 {
@@ -537,50 +1089,12 @@ fn render_meta(
             )));
         }
     }
-    if meta_state.waiting {
-        meta.push(Line::from(Span::styled(
-            "⏳ Agent is blocked on a question and waits for your answer",
-            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
-        )));
-    }
-    if let Some(deadline) = meta_state.wait_deadline {
-        let note = meta_state
-            .wait_note
-            .map(sanitize_terminal_text)
-            .filter(|note| !note.is_empty())
-            .unwrap_or_else(|| "declared wait".to_string());
-        meta.push(Line::from(Span::styled(
-            format!("⏳ Waiting until {} — {note}", deadline.format("%H:%M")),
-            Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
-        )));
-    }
-    if task.status == TaskStatus::InProgress {
-        if let Some(restart_at) = task.restart_at {
-            meta.push(Line::from(Span::styled(
-                format!(
-                    "↻ Crash retry at {} — waiting for the backoff before the queue picks it up",
-                    restart_at.format("%H:%M")
-                ),
-                Style::default().fg(theme.warn).add_modifier(Modifier::BOLD),
-            )));
-        } else if meta_state.session_state == Some(SessionState::Crashed) {
-            meta.push(Line::from(Span::styled(
-                "✖ Session is stuck or crashed — press u / Recover to return it to To Do",
-                Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
-            )));
-        }
-    }
-    if task.integration == IntegrationState::Conflict {
-        meta.push(Line::from(Span::styled(
-            "⚠ Integration conflict — resolve in the worktree, then Re-run (Ctrl+R)",
-            Style::default().fg(theme.err).add_modifier(Modifier::BOLD),
-        )));
-    }
+    meta.extend(alarm_spans(theme, task, meta_state));
     frame.render_widget(
         Paragraph::new(meta)
             .block(
                 Block::default()
-                    .title(META_TITLE)
+                    .title(META_TITLE_EXPANDED)
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(theme.focus)),
             )
@@ -691,20 +1205,17 @@ fn render_analytics(
     costs: &TokenCosts,
     area: Rect,
 ) {
-    let mut running_seconds = analytics.running_seconds;
-    if session_state == Some(SessionState::Live)
-        && let Some(since) = analytics.running_since
-    {
-        running_seconds += (timefmt::now() - since).num_seconds().max(0);
-    }
-    let tokens = analytics.tokens_with_live(
-        task.session.as_deref(),
-        live.and_then(|live| live.breakdown.as_ref()),
-    );
+    let AnalyticsTotals {
+        running_seconds,
+        tokens,
+        equivalent,
+        empty,
+        ..
+    } = AnalyticsTotals::new(task, analytics, live, session_state, costs);
 
     let muted = Style::default().fg(theme.muted);
     let value = Style::default().add_modifier(Modifier::BOLD);
-    let line = if analytics.runs == 0 && tokens.is_empty() && analytics.unsplit_tokens == 0 {
+    let line = if empty {
         Line::from(Span::styled("No agent runs recorded yet", muted))
     } else {
         let mut spans = vec![
@@ -726,13 +1237,6 @@ fn render_analytics(
             ));
         }
         spans.push(Span::styled(" │ ", Style::default().fg(theme.border)));
-        // The task's current backend/model stands in for every run. A task
-        // that switched models mid-way is priced as its latest one.
-        let weights = costs.weights_for(task.agent_backend.as_deref(), task.ai_model.as_deref());
-        let mut equivalent = weights.equivalent(&tokens);
-        if analytics.unsplit_tokens > 0 {
-            equivalent += analytics.unsplit_tokens as f64;
-        }
         spans.push(Span::styled("Input ", muted));
         spans.push(Span::styled(format_tokens(tokens.input), value));
         spans.push(Span::styled(" · Cache R ", muted));

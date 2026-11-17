@@ -6,16 +6,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use chrono::NaiveDateTime;
 
 use super::app::BoardSnapshot;
 use super::diag::PhaseTimer;
 use super::event::AppEvent;
+use crate::core::models::Task;
 use crate::core::operations::{Operations, OperationsSeed};
 use crate::core::session::SessionState;
 use crate::core::stats::{self, EventsStamp, TaskAnalytics};
 use crate::core::storage::BoardStamps;
+use crate::core::task_diff::TaskDiff;
 use crate::core::telemetry::{self, SessionProgress, TokenBreakdown};
 
 pub(super) struct LiveTask {
@@ -58,6 +61,8 @@ pub(super) struct TickRequest {
     /// The global config changed: reload even if the board stamps match.
     pub global_changed: bool,
     pub live: Vec<LiveTask>,
+    /// The task whose detail is open: its diff is (re)computed here.
+    pub diff_task: Option<Task>,
 }
 
 #[derive(Debug)]
@@ -69,7 +74,40 @@ pub struct TickResult {
     pub(super) board: Option<BoardSnapshot>,
     pub(super) progress: HashMap<String, SessionProgress>,
     pub(super) tokens: HashMap<String, TokenBreakdown>,
+    /// The open detail's diff, keyed by task id.
+    pub(super) diff: Option<(String, Option<TaskDiff>)>,
     pub(super) error: Option<String>,
+}
+
+/// A task's worktree changes without any board stamp moving, so the diff is
+/// re-read at most this often while its detail stays open.
+const DIFF_REFRESH: Duration = Duration::from_secs(5);
+
+/// The last computed diff: reused while the task is unchanged and the result
+/// is fresher than [`DIFF_REFRESH`].
+#[derive(Default)]
+pub(super) struct DiffCache {
+    entry: Option<(String, NaiveDateTime, Instant, Option<TaskDiff>)>,
+}
+
+impl DiffCache {
+    pub(super) fn get(&mut self, ops: &Operations, task: &Task) -> Option<TaskDiff> {
+        if let Some((id, updated, at, diff)) = &self.entry
+            && *id == task.id
+            && *updated == task.updated_at
+            && at.elapsed() < DIFF_REFRESH
+        {
+            return diff.clone();
+        }
+        let diff = ops.task_diff(task);
+        self.entry = Some((
+            task.id.clone(),
+            task.updated_at,
+            Instant::now(),
+            diff.clone(),
+        ));
+        diff
+    }
 }
 
 #[derive(Default)]
@@ -143,13 +181,14 @@ impl TickWorker {
             let ops = seed.build();
             let mut mirror = None;
             let mut cache = ProgressCache::default();
+            let mut diffs = DiffCache::default();
             while let Ok(request) = rx.recv() {
                 #[cfg(test)]
                 if let Some((gate, entered)) = &request.before_read {
                     let _ = entered.send(());
                     let _ = gate.recv();
                 }
-                let result = refresh(&ops, id, request, &mut mirror, &mut cache);
+                let result = refresh(&ops, id, request, &mut mirror, &mut cache, &mut diffs);
                 if wake.send(AppEvent::TickReady(Box::new(result))).is_err() {
                     break;
                 }
@@ -175,6 +214,7 @@ fn refresh(
     request: TickRequest,
     mirror: &mut Option<BoardSnapshot>,
     cache: &mut ProgressCache,
+    diffs: &mut DiffCache,
 ) -> TickResult {
     let mut timer = PhaseTimer::new("tick worker");
     let stamps = ops.storage.board_stamps();
@@ -197,6 +237,11 @@ fn refresh(
     timer.mark("snapshot");
     let (progress, tokens) = cache.refresh(ops.data_root(), &request.live);
     timer.mark("progress");
+    let diff = request
+        .diff_task
+        .as_ref()
+        .map(|task| (task.id.clone(), diffs.get(ops, task)));
+    timer.mark("diff");
     let board = if loaded.is_ok() {
         mirror
             .as_ref()
@@ -213,6 +258,7 @@ fn refresh(
         board,
         progress,
         tokens,
+        diff,
         error: loaded.err().map(|error| error.to_string()),
     }
 }

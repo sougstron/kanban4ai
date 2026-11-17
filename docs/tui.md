@@ -104,7 +104,24 @@ instead of starting to type; from a text panel use `Alt+o`. Without a pin,
   Analytics row shows cumulative agent run time, run count, and
   input/output tokens with the cache hit rate, plus a `Limits` row with the
   task's share of each provider window per role (`✎` designer, `▶` executor,
-  `⚖` reviewer, in the card role colors) once one exists (`docs/stats.md`)
+  `⚖` reviewer, in the card role colors) once one exists (`docs/stats.md`).
+  The Task header starts collapsed to two rows — `TASK-N title │ status ·
+  phase │ badges` and `▶ time · runs │ tokens · cache · ≈eq │ Δ +a −r · n
+  files │ backend/model` — with the Analytics panel folded into the second
+  row; alarm lines (blocked, waiting, crash, integration conflict) always
+  show. `z` (`Alt+z` while a text panel takes letters) or a click on the
+  header expands it to the full Task block plus Analytics; the choice is
+  saved per board as `tui.detail_header_expanded`. A detail area under 24
+  rows stays collapsed regardless
+- `g` (detail): switch the lower panel between **Thread** and **Diff**
+  (the border title is the tab strip; clicking a tab label also switches).
+  The Diff tab lists every changed file with its `+/−` counts; `↑/↓` select,
+  `Enter` or a click expands/collapses the file's hunks inline, and
+  PgUp/PgDn/wheel/Home/End scroll. Source, first that applies: the
+  worktree against its base commit (uncommitted edits included), the branch
+  against its base, the `kanban: land TASK-N` commit, or a non-isolated
+  run's backups against the current files. The tick worker recomputes it
+  while the detail is open (at most every 5 s), never the render path
 - `r`: **Run (= queue) / Revoke** — put the task into the orchestration queue
   (To Do moves to In Progress with phase `queued`; Review folds its edits and
   joins the queue) and pump the queue once, so on an idle board the task starts

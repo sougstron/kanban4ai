@@ -2,7 +2,7 @@
 source: src/tui/tests.rs
 expression: rendered
 ---
-┌ Task ────────────────────────────────────────────────────────────────────────────── ▸ Kanban ┐
+┌ Task ▾ z ────────────────────────────────────────────────────────────────────────── ▸ Kanban ┐
 │TASK-001 Limit shares                                                                         │
 │Status: todo │ Session: - │ Interactive: false                                                │
 │Backend: opencode │ Model: openai/gpt-5.5 │ Effort: - │ Agent: - │ Chain: -                   │
@@ -12,7 +12,7 @@ expression: rendered
 │No agent runs recorded yet                                                                    │
 │Limits claude 5h ✎0.4% ▶3.1% · 7d ▶<0.1% │ codex 7d ⚖1.2%                                     │
 └──────────────────────────────────────────────────────────────────────────────────────────────┘
-┌ Thread ──────────────────────────────────────────────────────────────────────────────────────┐
+┌ Thread │ Diff · g ───────────────────────────────────────────────────────────────────────────┐
 │MSG-001 · <timestamp> · system · open                                                         │
 │Task created: Limit shares                                                                    │
 │Status: todo                                                                                  │
@@ -67,7 +67,11 @@ expression: rendered
 8:58-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 8:95-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 9:0-96 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
-10:0-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+10:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+10:1-9 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset).bold().underlined()
+10:9-10 Style::new().fg(Color::Rgb(72, 76, 92)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+10:10-20 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
+10:20-96 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 11:0-1 Style::new().fg(Color::Rgb(106, 153, 255)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 11:1-45 Style::new().fg(Color::Rgb(130, 133, 145)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
 11:45-95 Style::new().fg(Color::Rgb(230, 230, 235)).bg(Color::Rgb(18, 18, 22)).underline_color(Color::Reset)
