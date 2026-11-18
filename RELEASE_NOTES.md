@@ -1,3 +1,12 @@
+# kanban4ai 0.8.24
+
+Notes are from the reviewed diff since 0.8.23. There were no `.changes/` logs.
+
+- **`kanban edit` can change bot opt-ins.** `kanban edit <id> [--permission PRESET] [--designer on|off] [--promptmax on|off] [--reviewer on|off]` changes an existing task's permission preset or its designer, promptmaxer, and reviewer opt-ins. At least one option is required. `off` drops that opt-in so the board setting decides; it cannot turn a board-wide bot off for one task.
+- **A plan node can opt into the promptmaxer.** `promptmax: true` on a plan node sets `use_promptmax` on the task `kanban plan` creates, the same way `designer` and `reviewer` already do. The orchestrator prompt documents the key.
+
+Board files stay loadable by 0.8.23. No new task fields: `use_promptmax` already exists. A plan file may include `promptmax`; 0.8.23 ignores that unknown key and does not opt the node in. Project `config.yaml`, the store format (5), the sync protocol (3), and journal records are unchanged.
+
 # kanban4ai 0.8.23
 
 Notes are from the reviewed diff since 0.8.22. There were no `.changes/` logs.
