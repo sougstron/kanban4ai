@@ -1,6 +1,6 @@
 ---
 name: update-app
-description: "Maintainer kanban4ai update-and-release pipeline, requested as ‘Update app’ or ‘Update app and release’ (optionally with a version or ‘minor’/‘major’). Picks the next version itself (patch bump by default, e.g. 0.8.14 → 0.8.15; a same-or-skipped patch number is corrected to the next patch and reported), writes release notes and the version bump, runs every gate, commits and tags, publishes the canonical Git commit/tag and GitHub release, updates both stable AUR packages, updates this laptop's global install and serve unit plus the kanban-server sync node, verifies every target, and only then clears release inputs. No local candidate stage. A plain commit/push/deploy request without ‘Update app’ does not authorize it."
+description: "Maintainer kanban4ai update-and-release pipeline, requested as ‘Update app’ or ‘Update app and release’ (optionally with a version or ‘minor’/‘major’). Picks the next version itself (patch bump by default, e.g. 0.8.14 → 0.8.15; a same-or-skipped patch number is corrected to the next patch and reported), writes release notes and the version bump, runs every gate, commits and tags, publishes the canonical Git commit/tag and GitHub release, updates all three AUR packages (kanban4ai, kanban4ai-bin, kanban4ai-git), updates this laptop's global install and serve unit plus the kanban-server sync node, verifies every target, and only then clears release inputs. No local candidate stage. A plain commit/push/deploy request without ‘Update app’ does not authorize it."
 compatibility: "Linux/Arch maintainer workstation with git, Rust (toolchain 1.88.0 with rustfmt and clippy), gh, curl, sha256sum, makepkg/updpkgsums, SSH access to the kanban4ai AUR repositories and to the Proxmox host root@192.168.0.128, and GitHub release permissions."
 ---
 
@@ -8,7 +8,7 @@ compatibility: "Linux/Arch maintainer workstation with git, Rust (toolchain 1.88
 
 One request, one pipeline: **Update app** and **Update app and release** mean
 the same thing — bump the version, gate it, and release it everywhere: the
-canonical Git/GitHub release, both stable AUR packages, this laptop, and the
+canonical Git/GitHub release, all three AUR packages, this laptop, and the
 kanban-server sync node. There is no local candidate stage any more. Run the
 pipeline; do not merely describe it. Keep a short phase checklist so a retry
 can resume from the first incomplete boundary.
@@ -16,12 +16,13 @@ can resume from the first incomplete boundary.
 ## Contract
 
 - The request needs no version. Pick it with phase 1.1; never ask for one.
-- Treat the release as one transaction with five required outcomes: canonical
-  Git/GitHub, `kanban4ai` AUR, `kanban4ai-bin` AUR, the effective
-  installation on this laptop, and the kanban-server sync node (CT 104). Do
+- Treat the release as one transaction with six required outcomes: canonical
+  Git/GitHub, `kanban4ai` AUR, `kanban4ai-bin` AUR, `kanban4ai-git` AUR, the
+  effective installation on this laptop, and the kanban-server sync node (CT 104). Do
   not report success after only some outcomes: peers on mismatched versions
   can stall sync (a newer journal record field rejected by an older server).
-- Keep `kanban4ai-git` unchanged: it follows the canonical branch.
+- `kanban4ai-git` builds from the canonical branch, but its AUR `pkgver` is
+  only refreshed when it is pushed, so republish it with every release.
 - Obey the active harness/session safety rules, including backup-before-edit
   and kanban callback rules. Never bypass a higher-priority restriction.
 - Do not force-push, move/delete a published tag, overwrite a release, discard
@@ -139,6 +140,7 @@ gh api repos/sougstron/kanban4ai >/dev/null
 git ls-remote origin HEAD >/dev/null
 git ls-remote ssh://aur@aur.archlinux.org/kanban4ai.git HEAD >/dev/null
 git ls-remote ssh://aur@aur.archlinux.org/kanban4ai-bin.git HEAD >/dev/null
+git ls-remote ssh://aur@aur.archlinux.org/kanban4ai-git.git HEAD >/dev/null
 ssh -o BatchMode=yes -o ConnectTimeout=8 root@192.168.0.128 \
   'pct status 104' | grep -q 'status: running'
 ```
@@ -150,7 +152,7 @@ release that cannot reach the server leaves sync split.
 ### 1.6 State table
 
 Build a state table for retry safety: local/remote `v$VERSION`, GitHub
-release and assets, tracked package versions, both AUR remote versions,
+release and assets, tracked package versions, all three AUR remote versions,
 laptop and server versions. On resume, reuse an existing tag only after
 proving that its immutable commit contains `Cargo.toml` version `VERSION` and
 the matching top release notes; never recreate or retarget it. Skip only
@@ -261,18 +263,22 @@ Read `packaging/aur/README.md` before this phase.
 
    - `packaging/aur/kanban4ai/{PKGBUILD,.SRCINFO}`
    - `packaging/aur/kanban4ai-bin/{PKGBUILD,.SRCINFO}`
+   - `packaging/aur/kanban4ai-git/{PKGBUILD,.SRCINFO}`
 
-   Set both `pkgver` values to `VERSION` and `pkgrel=1`. Set the source package
+   Set both stable `pkgver` values to `VERSION` and `pkgrel=1`. Set the source package
    checksum to the tagged source archive digest. Set both architecture-specific
    binary checksums to the locally verified release asset digests and
-   cross-check them against CI's `.sha256` files.
+   cross-check them against CI's `.sha256` files. For `kanban4ai-git`, set
+   `pkgrel=1` and `pkgver=VERSION.r0.g<short RELEASE_COMMIT>` (what its
+   `pkgver()` yields at the tag); step 7 publishes the value refreshed against
+   `PACKAGING_COMMIT`, which is not known until this commit exists.
 2. Run `updpkgsums` where applicable, regenerate each `.SRCINFO` using
    `makepkg --printsrcinfo`, and inspect it. Verify sources with
    `makepkg --verifysource`; manually retain the cross-architecture checksum
    check because the host architecture alone is insufficient. Run
    `sh scripts/test-packaging.sh` again.
-3. Ensure the diff contains only the four package metadata files, no downloaded
-   archives. Stage those four paths explicitly, commit as
+3. Ensure the diff contains only the six package metadata files, no downloaded
+   archives. Stage those six paths explicitly, commit as
    `Update AUR packaging to VERSION`, and record `PACKAGING_COMMIT`.
 4. Fetch `origin/master` once more. It should still equal `RELEASE_COMMIT`;
    stop on concurrent advancement rather than force-pushing. Push
@@ -283,19 +289,28 @@ Read `packaging/aur/README.md` before this phase.
 Publishing this post-tag package commit before AUR keeps the canonical source
 of package metadata from lagging behind the AUR repositories.
 
-## 7. Publish both stable AUR packages
+## 7. Publish all three AUR packages
 
 1. Clone fresh writable copies using the SSH URLs into a new temporary
    directory. Do not reuse dirty package-helper caches.
 2. Copy only each package's `PKGBUILD` and `.SRCINFO` from the reviewed tracked
    copies. Inspect `git diff`, rerun `makepkg --printsrcinfo`, and ensure each
    clone changes only those two files.
-3. Commit `Update to VERSION` separately in `kanban4ai` and `kanban4ai-bin`,
-   then push each repository's `master` normally. Never force.
+   For `kanban4ai-git`, also run a full `makepkg -f` in a scratch copy
+   against pushed `master` (it builds, runs `check()`, and rewrites
+   `pkgver`); copy the resulting `PKGBUILD` and regenerated `.SRCINFO`.
+   On CachyOS hosts use a config without `/etc/makepkg.conf.d/rust.conf`
+   (`makepkg --config <copy of /etc/makepkg.conf>`), whose
+   `-C opt-level=3` disables `debug_assertions` and breaks `check()`.
+3. Commit `Update to VERSION` separately in `kanban4ai`, `kanban4ai-bin`, and
+   `kanban4ai-git`, then push each repository's `master` normally. Never force.
 4. Verify each remote tip equals its local commit and, when available, use the
-   AUR RPC response to confirm both packages advertise `VERSION`. Record both
-   AUR commit IDs. If one push succeeds and the other fails, report that exact
-   partial state and retry only the missing package.
+   AUR RPC response (it can lag; fall back to
+   `https://aur.archlinux.org/cgit/aur.git/plain/.SRCINFO?h=PKG`) to confirm
+   the stable packages advertise `VERSION` and `kanban4ai-git` advertises
+   `VERSION.rN.gHASH`. Record all three AUR commit IDs. If some pushes
+   succeed and others fail, report that exact partial state and retry only
+   the missing packages.
 
 ## 8. Update this laptop
 
@@ -398,7 +413,8 @@ corrected the request, the version asked for and why it changed:
 - remote `origin/master` = `PACKAGING_COMMIT`;
 - remote annotated `v$VERSION` = `RELEASE_COMMIT`;
 - successful GitHub release URL and all four verified assets;
-- `kanban4ai` and `kanban4ai-bin` AUR commit IDs and package versions;
+- `kanban4ai`, `kanban4ai-bin`, and `kanban4ai-git` AUR commit IDs and package
+  versions;
 - effective laptop path, ownership mode, and `VERSION` output;
 - laptop serve unit active on a binary reporting `VERSION`;
 - CT 104 `/usr/local/bin/kanban4ai` reports `VERSION`, its serve unit is
