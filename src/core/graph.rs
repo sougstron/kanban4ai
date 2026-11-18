@@ -168,6 +168,9 @@ pub struct PlanNode {
     /// Run the designer bot on this node even when it is off board-wide.
     #[serde(default)]
     pub designer: bool,
+    /// Run the promptmaxer on this node even when it is off board-wide.
+    #[serde(default)]
+    pub promptmax: bool,
 }
 
 /// The YAML an orchestrator writes and `kanban plan` ingests.

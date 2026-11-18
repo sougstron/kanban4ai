@@ -268,6 +268,28 @@ fn silence_mode_is_inherited_by_planned_nodes() {
 }
 
 #[test]
+fn a_promptmax_node_opts_its_task_into_the_promptmaxer() {
+    let (_dir, ops, _recorder) =
+        graph_board("  queue_enabled: true\n  orchestrator:\n    max_subtasks: 4\n");
+    let parent = todo(&ops, "Brief one node");
+    let plan = Plan::parse(
+        "nodes:\n- key: one\n  title: Vague slice\n  promptmax: true\n- key: two\n  title: Plain slice\n",
+    )
+    .unwrap();
+    let outcome = ops.apply_plan(&parent.id, &plan, None).unwrap();
+    let opted = |title: &str| {
+        outcome
+            .created
+            .iter()
+            .find(|task| task.title == title)
+            .unwrap()
+            .use_promptmax
+    };
+    assert!(opted("Vague slice"));
+    assert!(!opted("Plain slice"));
+}
+
+#[test]
 fn a_plan_that_cannot_run_creates_nothing() {
     let (_dir, ops, _recorder) = graph_board("  queue_enabled: true\n");
     let parent = ops

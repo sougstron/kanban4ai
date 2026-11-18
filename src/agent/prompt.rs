@@ -790,6 +790,7 @@ Plan file schema (YAML), written to {plan_file}:\n\
       needs: null                # what this node takes from upstream\n\
       role: null                 # model roster to run on (see below)\n\
       designer: false            # run the designer bot on this node\n\
+      promptmax: false           # brief a weak/cheap role or a large, vague node first\n\
       reviewer: false            # run the reviewer bot on this node\n\
 Submit it with: \"$KANBAN_CMD\" plan {} --file {plan_file} --session {session_id} --agent\n\
 The plan is validated before anything is created: unknown references, duplicate keys, cycles,\
