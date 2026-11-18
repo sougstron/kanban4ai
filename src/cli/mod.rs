@@ -16,7 +16,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 
 use project::ProjectCommand;
 
@@ -52,6 +52,19 @@ pub struct Cli {
     project: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// `on` / `off` for a per-task bot opt-in; `off` leaves the board setting in charge.
+#[derive(Clone, Copy, ValueEnum)]
+enum Toggle {
+    On,
+    Off,
+}
+
+impl Toggle {
+    fn is_on(self) -> bool {
+        matches!(self, Toggle::On)
+    }
 }
 
 #[derive(Subcommand)]
@@ -109,11 +122,27 @@ enum Command {
         #[arg(long = "depends-on")]
         depends_on: Vec<String>,
     },
-    /// Change a task's permission preset (empty clears to project default).
+    /// Change a task's permission preset or its per-task bot opt-ins.
+    #[command(group(
+        ArgGroup::new("change")
+            .required(true)
+            .multiple(true)
+            .args(["permission", "designer", "promptmax", "reviewer"])
+    ))]
     Edit {
         task_id: String,
-        #[arg(long, required = true)]
-        permission: String,
+        /// Permission preset (empty clears to project default)
+        #[arg(long)]
+        permission: Option<String>,
+        /// Opt this task into the designer (off follows the board setting)
+        #[arg(long, value_enum)]
+        designer: Option<Toggle>,
+        /// Opt this task into the promptmaxer (off follows the board setting)
+        #[arg(long, value_enum)]
+        promptmax: Option<Toggle>,
+        /// Opt this task into the reviewer (off follows the board setting)
+        #[arg(long, value_enum)]
+        reviewer: Option<Toggle>,
     },
     /// Register a project in the store (migrating a local .kanban if present).
     Init {
@@ -1757,11 +1786,18 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
         Command::Edit {
             task_id,
             permission,
+            designer,
+            promptmax,
+            reviewer,
         } => {
             let updated = ops.update_task(
                 &task_id,
                 TaskPatch {
-                    permission: Some((!permission.trim().is_empty()).then_some(permission)),
+                    permission: permission
+                        .map(|permission| (!permission.trim().is_empty()).then_some(permission)),
+                    use_designer: designer.map(Toggle::is_on),
+                    use_promptmax: promptmax.map(Toggle::is_on),
+                    use_reviewer: reviewer.map(Toggle::is_on),
                     ..Default::default()
                 },
             )?;

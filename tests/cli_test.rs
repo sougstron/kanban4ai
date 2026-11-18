@@ -2325,3 +2325,41 @@ fn parent_done_refuses_live_subagents_unless_cancelled() {
         kanban4ai::core::models::TaskStatus::Review
     );
 }
+
+#[test]
+fn edit_toggles_the_per_task_bot_opt_ins() {
+    let dir = board();
+    kanban(&dir)
+        .args(["create", "Toggle me"])
+        .assert()
+        .success();
+    kanban(&dir)
+        .args(["edit", "TASK-001", "--promptmax", "on", "--designer", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Updated task TASK-001"));
+    let ops = Operations::new(dir.data_root());
+    let task = ops.get_task("TASK-001").unwrap().unwrap();
+    assert!(task.use_promptmax);
+    assert!(task.use_designer);
+    assert!(!task.use_reviewer);
+
+    kanban(&dir)
+        .args(["edit", "TASK-001", "--promptmax", "off", "--reviewer", "on"])
+        .assert()
+        .success();
+    let task = ops.get_task("TASK-001").unwrap().unwrap();
+    assert!(!task.use_promptmax);
+    assert!(task.use_designer, "an untouched flag keeps its value");
+    assert!(task.use_reviewer);
+
+    kanban(&dir)
+        .args(["edit", "TASK-001", "--promptmax", "maybe"])
+        .assert()
+        .failure();
+    kanban(&dir).args(["edit", "TASK-001"]).assert().failure();
+    kanban(&dir)
+        .args(["edit", "TASK-404", "--promptmax", "on"])
+        .assert()
+        .failure();
+}

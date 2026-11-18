@@ -2894,7 +2894,7 @@ impl Operations {
                 // A silent planner must not spawn children that stop to ask.
                 silence: parent.silence,
                 use_designer: node.designer,
-                use_promptmax: false,
+                use_promptmax: node.promptmax,
                 use_reviewer: node.reviewer,
                 // A node that planned more nodes would let one orchestrated
                 // task spend the board without limit.

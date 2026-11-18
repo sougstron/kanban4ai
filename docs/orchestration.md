@@ -529,7 +529,8 @@ The pass itself:
    unknown role profiles, size) **before anything is created**; a refused plan
    costs one message, an accepted 200-node plan would cost 200 sessions.
 3. Accepted, each node becomes a To Do task with its `depends_on` wired, its
-   `needs` contract, its role profile and `parent_task` set to the planner. A
+   `needs` contract, its role profile, its `designer` / `promptmax` / `reviewer`
+   opt-ins and `parent_task` set to the planner. A
    silent planner's nodes inherit `silence`, so the graph does not stop to ask. A
    node that named no `role:` takes
    `orchestration.orchestrator.default_role` (`cheap` by default, or `inherit`
@@ -696,7 +697,8 @@ the Sessions tab a subagent's sessions follow its parent's (`└`).
 
 An optional pre-launch bot that sits next to the designer
 (`orchestration.designer.promptmax`, the Designer settings tab, the task
-form's Promptmax checkbox, `kanban create --promptmax`). It runs first —
+form's Promptmax checkbox, `kanban create --promptmax`,
+`kanban edit <id> --promptmax on|off`, a plan node's `promptmax: true`). It runs first —
 after the orchestrator, before the designer and the executor — researches
 the task, and writes a self-contained **English** brief to
 `.kanban/prompts/<id>.md`: goal, response language (the language the task is
