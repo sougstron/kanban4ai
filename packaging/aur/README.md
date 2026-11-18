@@ -27,10 +27,12 @@ makepkg --printsrcinfo > .SRCINFO
 Each published AUR package has its own Git repository. Copy the verified
 `PKGBUILD` and `.SRCINFO` into clones of
 `ssh://aur@aur.archlinux.org/kanban4ai.git` and
-`ssh://aur@aur.archlinux.org/kanban4ai-bin.git`, then commit and push those
+`ssh://aur@aur.archlinux.org/kanban4ai-bin.git`, and
+`ssh://aur@aur.archlinux.org/kanban4ai-git.git`, then commit and push those
 repositories separately.
 
-For the VCS package, regenerate `.SRCINFO` after material package changes:
+For the VCS package, refresh `pkgver` on every release (a full `makepkg -f`
+rewrites it from `git describe`) and regenerate `.SRCINFO`:
 
 ```sh
 cd packaging/aur/kanban4ai-git
