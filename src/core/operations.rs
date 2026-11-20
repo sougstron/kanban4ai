@@ -1819,6 +1819,7 @@ impl Operations {
                     });
                 }
 
+                self.save_diff_snapshot(&task)?;
                 if !duplicate && self.should_start_bot_review(&task)? {
                     drop(_guard);
                     return self.start_bot_review(task_id, session_id);
@@ -1832,6 +1833,7 @@ impl Operations {
             } else {
                 if is_agent {
                     self.require_current_agent_session(&task, session_id)?;
+                    self.save_diff_snapshot(&task)?;
                 }
                 let Some(done) = self.move_task_to_done(&task)? else {
                     return Ok(None);
@@ -2709,27 +2711,65 @@ impl Operations {
         })
     }
 
-    /// What the task changed, for the detail's Diff tab. Tried in order: the
-    /// live worktree against its base (uncommitted work included), the
-    /// branch against its base, the `kanban: land TASK-N` commit once the
-    /// branch is gone, then a non-isolated run's backups against the
-    /// current files. `None` when none applies. Shells out to git, so call
-    /// it off the render path.
+    fn diff_snapshot_path(&self, task: &Task) -> PathBuf {
+        self.data_root().join(".kanban/diffs").join(format!(
+            "{}-{}.patch",
+            task.id,
+            task.created_at.and_utc().timestamp_micros()
+        ))
+    }
+
+    fn save_diff_snapshot(&self, task: &Task) -> Result<()> {
+        let patch = if let (Some(base), Some(dir)) =
+            (task.base_commit.as_deref(), self.task_worktree_path(task))
+            && dir.is_dir()
+        {
+            // The private index includes untracked additions without staging them.
+            let repo = crate::core::vcs::detect(&dir)
+                .ok_or_else(|| KanbanError::Invalid("missing task repository".into()))?;
+            let tree = repo.snapshot_tree(base)?;
+            task_diff::git_diff(&dir, &[base, tree.as_str(), "--"])
+                .ok_or_else(|| KanbanError::Invalid("could not capture task diff".into()))?
+        } else {
+            self.live_task_patch(task)
+                .map(|(_, patch)| patch)
+                .unwrap_or_default()
+        };
+        let path = self.diff_snapshot_path(task);
+        std::fs::create_dir_all(path.parent().expect("snapshot directory"))?;
+        atomic_write_text(&path, &patch)
+    }
+
+    /// Submitted work uses its saved patch. Older tasks and active executors
+    /// use the available worktree, branch, landing commit or file backups.
     pub fn task_diff(&self, task: &Task) -> Option<task_diff::TaskDiff> {
-        use task_diff::{DiffSource, git_diff, parse};
+        if (matches!(
+            task.status,
+            TaskStatus::Review | TaskStatus::Done | TaskStatus::Archive
+        ) || task.run_phase == Some(RunPhase::Review))
+            && let Ok(patch) = std::fs::read_to_string(self.diff_snapshot_path(task))
+        {
+            return Some(task_diff::parse(task_diff::DiffSource::Snapshot, &patch));
+        }
+        self.live_task_patch(task)
+            .map(|(source, patch)| task_diff::parse(source, &patch))
+    }
+
+    fn live_task_patch(&self, task: &Task) -> Option<(task_diff::DiffSource, String)> {
+        use task_diff::{DiffSource, git_diff};
         if let Some(base) = task.base_commit.as_deref() {
             if let Some(rel) = task.worktree.as_deref() {
                 let dir = self.storage.worktrees_dir.join(rel);
                 if dir.is_dir()
                     && let Some(patch) = git_diff(&dir, &[base, "--"])
                 {
-                    return Some(parse(DiffSource::Worktree, &patch));
+                    return Some((DiffSource::Worktree, patch));
                 }
             }
             if let Some(branch) = task.branch.as_deref()
                 && let Some(patch) = git_diff(self.work_path(), &[base, branch, "--"])
             {
-                return Some(parse(DiffSource::Branch, &patch));
+                return Some((DiffSource::Branch, patch));
             }
             let grep = format!("--grep=^kanban: land {}$", task.id);
             let land = std::process::Command::new("git")
@@ -2743,15 +2783,15 @@ impl Operations {
             if let Some(sha) = land
                 && let Some(patch) = git_diff(self.work_path(), &[&format!("{sha}^1"), &sha, "--"])
             {
-                return Some(parse(DiffSource::Landed, &patch));
+                return Some((DiffSource::Landed, patch));
             }
             return None;
         }
         let backups = self.backup_dir(&task.id);
         backups.is_dir().then(|| {
-            parse(
+            (
                 DiffSource::Backups,
-                &task_diff::backups_patch(&backups, self.work_path()),
+                task_diff::backups_patch(&backups, self.work_path()),
             )
         })
     }

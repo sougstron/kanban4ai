@@ -747,7 +747,7 @@ impl GitRepo {
         parse_oid(&String::from_utf8_lossy(&out.stdout))
     }
 
-    fn snapshot_tree(&self, parent: &str) -> Result<Oid> {
+    pub(crate) fn snapshot_tree(&self, parent: &str) -> Result<Oid> {
         let tmp = NamedTempFile::new()?;
         let index = Some(tmp.path());
         let seeded = self.seed_index(tmp.path())

@@ -523,6 +523,34 @@ fn recover_task_moves_to_todo_and_keeps_last_session() {
 }
 
 #[test]
+fn review_diff_freezes_the_submitted_patch_and_legacy_tasks_stay_live() {
+    use kanban4ai::core::task_diff::DiffSource;
+    let (dir, ops, _) = ops_with_recorder(false);
+    let task = ops.create_task(NewTask::titled("Snapshot")).unwrap();
+    ops.take_task(&task.id, "ses-diff", true).unwrap();
+    let backups = ops.backup_dir(&task.id);
+    fs::create_dir_all(&backups).unwrap();
+    fs::write(backups.join("example"), "original\n").unwrap();
+    let path = ops.work_path().join("example");
+    fs::write(&path, "submitted\n").unwrap();
+    let mut legacy = task.clone();
+    legacy.status = TaskStatus::Review;
+    assert_eq!(ops.task_diff(&legacy).unwrap().source, DiffSource::Backups);
+    ContextManager::new(dir.path())
+        .append_context(&task.id, "finished", "agent", &ops.storage)
+        .unwrap();
+    let submitted = ops
+        .complete_task(&task.id, "ses-diff", true)
+        .unwrap()
+        .unwrap();
+    fs::write(path, "later task\n").unwrap();
+    let diff = ops.task_diff(&submitted).unwrap();
+    assert_eq!(diff.source, DiffSource::Snapshot);
+    assert!(diff.files[0].lines.iter().any(|line| line == "+submitted"));
+    assert!(!diff.files[0].lines.iter().any(|line| line == "+later task"));
+}
+
+#[test]
 fn agent_done_requires_context_then_moves_to_review() {
     let (dir, ops, _rec) = ops_with_recorder(false);
     let task = ops.create_task(NewTask::titled("Agent flow")).unwrap();
