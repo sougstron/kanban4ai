@@ -14,6 +14,8 @@ pub const MAX_PATCH_LINES: usize = 20_000;
 /// Where a [`TaskDiff`] was read from, shown in the Diff tab's header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffSource {
+    /// Patch captured at executor handoff.
+    Snapshot,
     /// `git diff <base>` inside the task's worktree, uncommitted work included.
     Worktree,
     /// `git diff <base> <branch>` in the project folder.
@@ -27,6 +29,7 @@ pub enum DiffSource {
 impl DiffSource {
     pub fn label(&self) -> &'static str {
         match self {
+            DiffSource::Snapshot => "review snapshot",
             DiffSource::Worktree => "worktree vs base",
             DiffSource::Branch => "branch vs base",
             DiffSource::Landed => "landed commit",

@@ -126,11 +126,13 @@ instead of starting to type; from a text panel use `Alt+o`. Without a pin,
   `Ctrl+O` shows the selected file's folder in the file manager (the
   worktree's copy for a worktree diff, else the work folder's; the nearest
   existing folder for a deleted file), and PgUp/PgDn/Home/End page or jump
-  in the focused pane. Source, first that applies: the
-  worktree against its base commit (uncommitted edits included), the branch
-  against its base, the `kanban: land TASK-N` commit, or a non-isolated
-  run's backups against the current files. The tick worker recomputes it
-  while the detail is open (at most every 5 s), never the render path
+  in the focused pane. When the executor submits work, the board saves the
+  patch under `.kanban/diffs/`. The **review snapshot** stays readable after
+  cleanup and later edits. A resubmission replaces the task's saved patch.
+  Active executors and tasks without a local snapshot use the first available
+  source in this order: worktree against base, branch against base, landing
+  commit, or backed-up originals against current files. The tick worker reads
+  the diff while the detail is open (at most every 5 s).
 - `r`: **Run (= queue) / Revoke** — put the task into the orchestration queue
   (To Do moves to In Progress with phase `queued`; Review folds its edits and
   joins the queue) and pump the queue once, so on an idle board the task starts
