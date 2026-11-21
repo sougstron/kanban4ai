@@ -1,3 +1,11 @@
+# kanban4ai 0.8.26
+
+Notes are from the reviewed diff since 0.8.25. There were no `.changes/` logs.
+
+- **Task diffs include files and git checkouts outside the project.** `kanban track <id> <path>...` records an outside file's original under `.kanban/external/<id>/` (a missing path counts as a new file) or a git checkout's `HEAD`. Tracking a path again keeps that first record. A folder that is not inside a git checkout is refused; track its files one by one. The live Diff tab and the review snapshot written by `kanban done` append those changes under absolute paths. When the project itself has no changes, the source label is **tracked outside files**. A checkout's diff includes later commits, uncommitted edits, and untracked files. Executor prompts tell the agent to track a path before changing it.
+
+Board files stay loadable by 0.8.25. The records are new local files under `.kanban/external/`; 0.8.25 does not read them. A review snapshot written by this version can include those absolute-path hunks, and 0.8.25 still shows that saved patch. No new task fields. Project `config.yaml`, the store format (5), the sync protocol (3), and journal records are unchanged.
+
 # kanban4ai 0.8.25
 
 Notes are from the reviewed diff since 0.8.24. There were no `.changes/` logs.
