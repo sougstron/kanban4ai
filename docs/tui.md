@@ -131,7 +131,10 @@ instead of starting to type; from a text panel use `Alt+o`. Without a pin,
   cleanup and later edits. A resubmission replaces the task's saved patch.
   Active executors and tasks without a local snapshot use the first available
   source in this order: worktree against base, branch against base, landing
-  commit, or backed-up originals against current files. The tick worker reads
+  commit, or backed-up originals against current files. Files and git
+  checkouts outside the project recorded with `kanban track` follow under
+  their absolute paths (source **tracked outside files** when nothing in the
+  project changed). The tick worker reads
   the diff while the detail is open (at most every 5 s).
 - `r`: **Run (= queue) / Revoke** — put the task into the orchestration queue
   (To Do moves to In Progress with phase `queued`; Review folds its edits and

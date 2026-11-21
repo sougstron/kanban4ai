@@ -113,6 +113,7 @@ pub fn build_agent_prompt<'a>(
         }
         Role::Executor => {}
     }
+    let task_id = &task.id;
     let backups_dir = roots.data_path("backups").join(&task.id);
     let backups_dir = format!("{}/", backups_dir.display());
     let form_file = roots
@@ -136,6 +137,7 @@ Session contract:\n\
 - KANBAN_TASK_ID is set to {}.\n\
 - KANBAN_CMD is set to the current kanban4ai executable; use \"$KANBAN_CMD\" instead of bare kanban so callbacks target this binary.\n\
 - Before editing an existing file, copy it to {backups_dir} preserving the repo-relative path.\n\
+- Before changing files or git checkouts outside this project, run \"$KANBAN_CMD\" track {task_id} <path>... so the task's diff shows them.\n\
 - Record important progress with: \"$KANBAN_CMD\" context {} <text> --source agent\n\
 - Keep the session alive with: \"$KANBAN_CMD\" heartbeat --session {session_id}\n\
 - When implementation and verification are complete, run: \"$KANBAN_CMD\" done {} --session {session_id} --agent\n\

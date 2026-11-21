@@ -2728,8 +2728,10 @@ impl Operations {
             let repo = crate::core::vcs::detect(&dir)
                 .ok_or_else(|| KanbanError::Invalid("missing task repository".into()))?;
             let tree = repo.snapshot_tree(base)?;
-            task_diff::git_diff(&dir, &[base, tree.as_str(), "--"])
-                .ok_or_else(|| KanbanError::Invalid("could not capture task diff".into()))?
+            let mut patch = task_diff::git_diff(&dir, &[base, tree.as_str(), "--"])
+                .ok_or_else(|| KanbanError::Invalid("could not capture task diff".into()))?;
+            patch.push_str(&task_diff::external_patch(&self.external_dir(&task.id)));
+            patch
         } else {
             self.live_task_patch(task)
                 .map(|(_, patch)| patch)
@@ -2755,7 +2757,42 @@ impl Operations {
             .map(|(source, patch)| task_diff::parse(source, &patch))
     }
 
+    /// The project's diff (see [`Self::project_task_patch`]) followed by the
+    /// files and checkouts outside the project recorded with `kanban track`.
     fn live_task_patch(&self, task: &Task) -> Option<(task_diff::DiffSource, String)> {
+        let external = task_diff::external_patch(&self.external_dir(&task.id));
+        match self.project_task_patch(task) {
+            Some((source, mut patch)) => {
+                patch.push_str(&external);
+                Some((source, patch))
+            }
+            None => (!external.is_empty()).then_some((task_diff::DiffSource::External, external)),
+        }
+    }
+
+    /// Where `kanban track` keeps a task's records of outside files.
+    pub fn external_dir(&self, task_id: &str) -> PathBuf {
+        self.data_root()
+            .join(".kanban")
+            .join("external")
+            .join(task_id)
+    }
+
+    /// Record files or git checkouts outside the project so the task's diff
+    /// covers them. Returns one description per path, in order.
+    pub fn track_external(&self, task_id: &str, paths: &[PathBuf]) -> Result<Vec<String>> {
+        if self.storage.load_task(task_id)?.is_none() {
+            return Err(KanbanError::Invalid(format!("task {task_id} not found")));
+        }
+        let _guard = self.storage.lock()?;
+        let store = self.external_dir(task_id);
+        paths
+            .iter()
+            .map(|path| task_diff::track_external(&store, path).map_err(KanbanError::Invalid))
+            .collect()
+    }
+
+    fn project_task_patch(&self, task: &Task) -> Option<(task_diff::DiffSource, String)> {
         use task_diff::{DiffSource, git_diff};
         if let Some(base) = task.base_commit.as_deref() {
             if let Some(rel) = task.worktree.as_deref() {
@@ -2814,6 +2851,12 @@ impl Operations {
         };
         let mut folder = root.join(rel);
         folder.pop();
+        // A tracked file outside the project names itself absolutely.
+        let root = if Path::new(rel).is_absolute() {
+            PathBuf::from("/")
+        } else {
+            root
+        };
         while !folder.is_dir() && folder.starts_with(&root) && folder != root {
             folder.pop();
         }
