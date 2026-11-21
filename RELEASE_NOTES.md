@@ -1,3 +1,11 @@
+# kanban4ai 0.8.25
+
+Notes are from the reviewed diff since 0.8.24. There were no `.changes/` logs.
+
+- **The Diff tab keeps the patch the executor submitted.** When an agent finishes with `kanban done`, the board writes that patch to `.kanban/diffs/<id>-<created>.patch`. Review, Done, Archive, and a bot-review phase read this review snapshot, so later edits and worktree cleanup do not change what the review shows. Submitting again replaces that file. A worktree capture includes untracked files and does not stage them. A task already in review before this version, or one with no saved file, still uses the first live source: the worktree against its base, the branch against its base, the landing commit, or backups against the current files.
+
+Board files stay loadable by 0.8.24. The snapshot is a new local file under `.kanban/diffs/`; 0.8.24 does not read it. No new task fields. Project `config.yaml`, the store format (5), the sync protocol (3), and journal records are unchanged.
+
 # kanban4ai 0.8.24
 
 Notes are from the reviewed diff since 0.8.23. There were no `.changes/` logs.
