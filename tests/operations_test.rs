@@ -551,6 +551,42 @@ fn review_diff_freezes_the_submitted_patch_and_legacy_tasks_stay_live() {
 }
 
 #[test]
+fn tracked_outside_files_join_the_live_and_submitted_diff() {
+    use kanban4ai::core::task_diff::DiffSource;
+    let (dir, ops, _) = ops_with_recorder(false);
+    let outside = tempfile::tempdir().unwrap();
+    let file = fs::canonicalize(outside.path()).unwrap().join("tool.conf");
+    fs::write(&file, "old\n").unwrap();
+    let task = ops.create_task(NewTask::titled("Outside")).unwrap();
+    ops.take_task(&task.id, "ses-out", true).unwrap();
+    assert!(ops.task_diff(&task).is_none());
+    ops.track_external(&task.id, std::slice::from_ref(&file))
+        .unwrap();
+    assert!(ops.track_external("TASK-999", &[file.clone()]).is_err());
+    fs::write(&file, "new\n").unwrap();
+    let live = ops.task_diff(&task).unwrap();
+    assert_eq!(live.source, DiffSource::External);
+    assert_eq!(live.files[0].path, file.display().to_string());
+    assert_eq!((live.added(), live.removed()), (1, 1));
+
+    ContextManager::new(dir.path())
+        .append_context(&task.id, "finished", "agent", &ops.storage)
+        .unwrap();
+    let submitted = ops
+        .complete_task(&task.id, "ses-out", true)
+        .unwrap()
+        .unwrap();
+    fs::write(&file, "later\n").unwrap();
+    let diff = ops.task_diff(&submitted).unwrap();
+    assert_eq!(diff.source, DiffSource::Snapshot);
+    assert!(diff.files[0].lines.iter().any(|line| line == "+new"));
+    assert!(
+        ops.diff_file_folder(&submitted, &diff.source, &diff.files[0].path)
+            .ends_with(outside.path().file_name().unwrap())
+    );
+}
+
+#[test]
 fn agent_done_requires_context_then_moves_to_review() {
     let (dir, ops, _rec) = ops_with_recorder(false);
     let task = ops.create_task(NewTask::titled("Agent flow")).unwrap();

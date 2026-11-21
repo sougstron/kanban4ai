@@ -13,7 +13,7 @@ pub(crate) mod serve;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 
 use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
@@ -292,6 +292,15 @@ enum Command {
         /// Remove the pinned path instead.
         #[arg(long, conflicts_with = "path")]
         clear: bool,
+    },
+    /// Record files or git checkouts outside the project before changing
+    /// them, so the task's Diff tab shows those edits too. A file is copied
+    /// (a missing one counts as new); a folder must be a git checkout and
+    /// records its HEAD, so later commits, edits and untracked files show.
+    Track {
+        task_id: String,
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
     },
     /// Reject (quarantine) a thread message so it is excluded from future
     /// prompts and gathered context, while staying visible for audit.
@@ -805,6 +814,7 @@ impl Command {
             | Command::Suggest { task_id, .. }
             | Command::ResultPath { task_id, .. }
             | Command::Take { task_id, .. }
+            | Command::Track { task_id, .. }
             | Command::Unreject { task_id, .. }
             | Command::Verdict { task_id, .. }
             | Command::Waiting { task_id, .. }
@@ -1724,6 +1734,14 @@ fn dispatch(cli: Cli) -> Result<ExitCode> {
             Some(_) => println!("Suggestion added to {task_id}"),
             None => eprintln!("Failed to add suggestion to {task_id}"),
         },
+        Command::Track { task_id, paths } => {
+            // Path by path, so the ones recorded before a failure are reported.
+            for path in paths {
+                for tracked in ops.track_external(&task_id, std::slice::from_ref(&path))? {
+                    println!("Tracking for {task_id}: {tracked}");
+                }
+            }
+        }
         Command::ResultPath {
             task_id,
             path,
