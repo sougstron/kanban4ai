@@ -1,3 +1,11 @@
+# kanban4ai 0.8.27
+
+Notes are from the reviewed diff since 0.8.26. There were no `.changes/` logs.
+
+- **omo is a backend.** oh-my-opencode on the senpi/pi engine joins the pi family. `kanban create --backend omo` launches `omo -p --mode json`, passes effort as `--thinking`, and resumes a captured conversation with `omo --session <id>`. Stdin is closed, the same as pi and omp. Readonly adds `--exclude-tools edit,write`, the same partial file-edit gate as pi. The model list is `models-store.json` merged with `models.json` under `OMO_CODING_AGENT_DIR` (default `~/.omo/agent`); bundled catalogs are compiled into the `omo` binary. Telemetry, replies, provenance, and subscription limits reuse the pi-family parsers. The default config adds an `omo` agent and a per-backend cap of 2.
+
+Board files stay loadable by 0.8.26. No new task fields. Loading a board fills in `agents.omo` and `orchestration.max_running_per_backend.omo` when they are missing. 0.8.26 keeps an extra agent entry and reports an unknown backend cap as a warning rather than refusing the file. A task whose backend is `omo` does not get the pi-family launch flags on 0.8.26. Store format is still 5. Sync protocol is still 3. Journal records are unchanged.
+
 # kanban4ai 0.8.26
 
 Notes are from the reviewed diff since 0.8.25. There were no `.changes/` logs.
