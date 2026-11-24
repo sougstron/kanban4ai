@@ -56,7 +56,7 @@ pub fn session_messages(backend: &str, transcript: &Path) -> Option<Vec<String>>
         "claude" | "grok" => claude_session_messages(&raw),
         "codex" => codex_session_messages(&raw),
         "opencode" => opencode_session_messages(&raw),
-        "pi" | "omp" => pi_family_session_messages(&raw),
+        "pi" | "omp" | "omo" => pi_family_session_messages(&raw),
         "kimi" => kimi_session_messages(&raw),
         _ => None,
     }?;
@@ -481,6 +481,10 @@ mod tests {
         );
         assert_eq!(
             joined("pi", &path).as_deref(),
+            Some("Working.\n\nAll checks green.")
+        );
+        assert_eq!(
+            joined("omo", &path).as_deref(),
             Some("Working.\n\nAll checks green.")
         );
     }

@@ -235,6 +235,23 @@ agents:
     - max
     agent: null
     extra_args: []
+  omo:
+    command: omo
+    model: null
+    models:
+    - anthropic/claude-sonnet-5
+    - openai-codex/gpt-5.6-sol
+    effort: null
+    efforts:
+    - off
+    - minimal
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
+    agent: null
+    extra_args: []
   grok:
     command: grok
     model: grok-4.7
@@ -278,6 +295,7 @@ orchestration:
     opencode: 2
     omp: 2
     pi: 2
+    omo: 2
     grok: 2
     kimi: 2
   max_running_per_backend_model: {}
@@ -2733,17 +2751,18 @@ impl Config {
     fn validate_orchestration(config: &mut BoardConfig, warnings: &mut Vec<String>) -> Result<()> {
         // Known backends for `<backend>/<model>` key checks: the built-ins
         // plus anything the user configured under `agents:`.
-        let known_backends: Vec<String> =
-            ["opencode", "claude", "codex", "omp", "pi", "grok", "kimi"]
-                .into_iter()
-                .map(str::to_owned)
-                .chain(
-                    config
-                        .agents
-                        .keys()
-                        .filter_map(|k| k.as_str().map(str::to_owned)),
-                )
-                .collect();
+        let known_backends: Vec<String> = [
+            "opencode", "claude", "codex", "omp", "pi", "omo", "grok", "kimi",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .chain(
+            config
+                .agents
+                .keys()
+                .filter_map(|k| k.as_str().map(str::to_owned)),
+        )
+        .collect();
         let orch = &mut config.orchestration;
         if let Some(value) = orch.get("spawn") {
             let settings: SpawnSettings = serde_yaml_ng::from_value(value.clone())

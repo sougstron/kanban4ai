@@ -267,7 +267,7 @@ impl Dialect {
         match backend {
             "codex" => Dialect::Codex,
             "opencode" => Dialect::Opencode,
-            "pi" | "omp" => Dialect::PiFamily,
+            "pi" | "omp" | "omo" => Dialect::PiFamily,
             // Grok Build's streaming-messages-json is the claude stream shape.
             _ => Dialect::Claude,
         }

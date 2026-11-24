@@ -362,7 +362,7 @@ fn wrapper_script<'a>(roots: impl Into<Roots<'a>>, plan: &LaunchPlan) -> String 
     // non-interactive runs.
     let stdin_redirect = if matches!(
         plan.backend.as_str(),
-        "codex" | "pi" | "omp" | "grok" | "kimi"
+        "codex" | "pi" | "omp" | "omo" | "grok" | "kimi"
     ) {
         " < /dev/null"
     } else {

@@ -152,7 +152,7 @@ pub fn provider_for(backend: &str, model: Option<&str>) -> Option<&'static str> 
         "codex" => Some("codex"),
         "grok" => Some("grok"),
         "kimi" => Some("kimi"),
-        "opencode" | "omp" | "pi" => {
+        "opencode" | "omp" | "pi" | "omo" => {
             let model = model?;
             if model.starts_with("openai") {
                 Some("codex")

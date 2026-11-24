@@ -5925,7 +5925,7 @@ impl Operations {
                 prompt_dump,
                 root: repo_root,
             }),
-            "pi" | "omp" => Box::new(PiFamilyHarvester {
+            "pi" | "omp" | "omo" => Box::new(PiFamilyHarvester {
                 session_id: session,
                 backend: backend.clone(),
                 prompt_dump,

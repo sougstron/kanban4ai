@@ -75,7 +75,7 @@ pub fn resolve_permission(
             "claude" => vec!["--dangerously-skip-permissions"],
             "codex" => vec!["--dangerously-bypass-approvals-and-sandbox"],
             "grok" => vec!["--permission-mode", "bypassPermissions"],
-            "opencode" | "kimi" | "pi" | "omp" => vec![],
+            "opencode" | "kimi" | "pi" | "omp" | "omo" => vec![],
             _ => return Err(unsupported_permission(&backend.name, name)),
         };
         match (backend.name.as_str(), name) {
@@ -99,7 +99,7 @@ pub fn resolve_permission(
                         args.push("--disallowedTools=Edit,Write,MultiEdit,NotebookEdit".into());
                         "file-edit tools disabled; shell and extension tools can still write"
                     }
-                    "pi" => {
+                    "pi" | "omo" => {
                         args.extend(["--exclude-tools".into(), "edit,write".into()]);
                         "file-edit tools disabled; shell and extension tools can still write"
                     }
@@ -177,7 +177,7 @@ fn strip_permission_flags(backend: &str, args: &[String]) -> Vec<String> {
         ),
         "kimi" => (&["--yolo", "--yes", "-y"], &[]),
         "omp" => (&["--auto-approve"], &["--approval-mode"]),
-        "pi" => (&[], &["--exclude-tools", "-xt"]),
+        "pi" | "omo" => (&[], &["--exclude-tools", "-xt"]),
         _ => (&[], &[]),
     };
     let mut result = Vec::new();
@@ -498,9 +498,13 @@ pub fn build_launch_plan<'a>(
         task
     };
     let role = Role::from_phase(task.run_phase);
-    let resume = (!revert && matches!(backend.as_str(), "codex" | "pi" | "omp" | "grok" | "kimi"))
-        .then(|| native_resume_candidate(roots.data_root, task, session_id, &backend))
-        .flatten();
+    let resume = (!revert
+        && matches!(
+            backend.as_str(),
+            "codex" | "pi" | "omp" | "omo" | "grok" | "kimi"
+        ))
+    .then(|| native_resume_candidate(roots.data_root, task, session_id, &backend))
+    .flatten();
     let mut prompt = if let Some((previous_session, _)) = &resume {
         build_resume_prompt(roots, task, session_id, previous_session, role)?
     } else {
@@ -530,7 +534,7 @@ pub fn build_launch_plan<'a>(
     // on stdout.
     let transcript_file = matches!(
         backend.as_str(),
-        "claude" | "codex" | "opencode" | "pi" | "omp" | "grok" | "kimi"
+        "claude" | "codex" | "opencode" | "pi" | "omp" | "omo" | "grok" | "kimi"
     )
     .then(|| logs_dir.join(format!("{session_id}.transcript.jsonl")));
     // Grok's headless mode is `--prompt-file`, not a trailing positional.
@@ -693,7 +697,7 @@ pub(crate) fn backend_args(
         // emit the same NDJSON event stream on stdout as their session files
         // (`message_end`/`turn_end` carry `usage`, `cost`, and tool calls), so
         // the wrapper harvests it exactly like claude/opencode.
-        "omp" | "pi" => vec!["-p".to_string(), "--mode".to_string(), "json".to_string()],
+        "omp" | "pi" | "omo" => vec!["-p".to_string(), "--mode".to_string(), "json".to_string()],
         // Grok Build (`grok`) runs headlessly. `--prompt-file` (appended once
         // the prompt file exists) is what selects headless mode; this stream
         // is the Messages API `stream-json` shape claude already emits, so
@@ -725,9 +729,9 @@ pub(crate) fn backend_args(
                 args.insert(1, "resume".to_string());
                 args.insert(2, session.to_string());
             }
-            "pi" => {
-                // pi's `--resume` opens an interactive picker even with a
-                // following value; exact non-interactive lookup is
+            "pi" | "omo" => {
+                // pi's (and omo's) `--resume` opens an interactive picker even
+                // with a following value; exact non-interactive lookup is
                 // `--session <id>`.
                 args.push("--session".to_string());
                 args.push(session.to_string());
@@ -779,7 +783,7 @@ pub(crate) fn backend_args(
             _ => {
                 let flag = match backend {
                     "claude" => "--effort",
-                    "omp" | "pi" => "--thinking",
+                    "omp" | "pi" | "omo" => "--thinking",
                     "grok" => "--reasoning-effort",
                     _ => "--variant",
                 };
@@ -910,7 +914,7 @@ impl BackendCatalog {
 pub fn backend_has_catalog(backend: &str) -> bool {
     matches!(
         backend,
-        "opencode" | "omp" | "pi" | "grok" | "codex" | "kimi"
+        "opencode" | "omp" | "pi" | "omo" | "grok" | "codex" | "kimi"
     )
 }
 
@@ -963,6 +967,10 @@ fn fetch_backend_catalog(backend: &str, command: &str) -> Option<BackendCatalog>
             &pi_agent_dir(),
             pi_builtin_data_dir(command).as_deref(),
         )),
+        // omo (oh-my-opencode on the senpi/pi engine) keeps the same
+        // models-store.json / models.json / auth.json layout in its own agent
+        // dir; its bundled catalogs are compiled into the binary.
+        "omo" => Some(load_pi_catalog(&omo_agent_dir(), None)),
         // `grok models` is the scan (it also refreshes models_cache.json).
         // The text listing is the set of launchable ids; the cache supplies
         // each model's reasoning-effort menu. A failed CLI still falls back
@@ -1251,6 +1259,16 @@ pub(crate) fn pi_agent_dir() -> PathBuf {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".pi").join("agent"))
         })
         .unwrap_or_else(|| PathBuf::from(".pi").join("agent"))
+}
+
+/// omo's agent config directory (`OMO_CODING_AGENT_DIR`, default `~/.omo/agent`).
+pub(crate) fn omo_agent_dir() -> PathBuf {
+    std::env::var_os("OMO_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".omo").join("agent"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".omo").join("agent"))
 }
 
 /// Load pi's catalog from an agent config directory: builtin/remote
@@ -1771,7 +1789,9 @@ mod permission_tests {
     #[test]
     fn all_backends_preserve_legacy_and_report_readonly_enforcement() {
         let config = BoardConfig::default();
-        for name in ["claude", "codex", "grok", "omp", "pi", "kimi", "opencode"] {
+        for name in [
+            "claude", "codex", "grok", "omp", "pi", "omo", "kimi", "opencode",
+        ] {
             let original = backend_config(&config, name).unwrap();
             let legacy = resolve(&config, name, None).unwrap();
             assert_eq!(legacy.extra_args, original.extra_args, "{name}");
@@ -1790,7 +1810,7 @@ mod permission_tests {
                     .to_string()
                     .contains(name)
             );
-            if matches!(name, "claude" | "grok" | "pi") {
+            if matches!(name, "claude" | "grok" | "pi" | "omo") {
                 assert!(
                     readonly.warning.as_deref().unwrap().contains("file-edit"),
                     "{name}"
