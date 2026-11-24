@@ -941,7 +941,7 @@ base_url = "https://api.kimi.com/coding/v1/search"
 
 #[test]
 fn pi_family_auto_relaunch_resumes_native_conversation_with_delta_prompt() {
-    for backend in ["pi", "omp"] {
+    for backend in ["pi", "omp", "omo"] {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path());
         storage.init_board().unwrap();
@@ -994,7 +994,7 @@ fn pi_family_auto_relaunch_resumes_native_conversation_with_delta_prompt() {
             .unwrap();
 
         let plan = build_launch_plan(dir.path(), &task, "ses-current", false).unwrap();
-        let resume_flag = if backend == "pi" {
+        let resume_flag = if matches!(backend, "pi" | "omo") {
             "--session"
         } else {
             "--resume"

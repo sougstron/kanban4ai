@@ -10043,7 +10043,9 @@ fn role_cap(orch: &OrchestrationSettings, role: &str) -> i64 {
     orch.max_running_per_role.get(role).copied().unwrap_or(0)
 }
 
-const BACKEND_CAP_ORDER: [&str; 7] = ["claude", "codex", "opencode", "omp", "pi", "grok", "kimi"];
+const BACKEND_CAP_ORDER: [&str; 8] = [
+    "claude", "codex", "opencode", "omp", "pi", "omo", "grok", "kimi",
+];
 
 fn format_backend_cap_map(map: &HashMap<String, i64>) -> String {
     let mut keys: Vec<&String> = map.keys().collect();
@@ -10409,7 +10411,7 @@ fn parse_cap_lines(
 fn is_known_settings_backend(modal: &ModalState, backend: &str) -> bool {
     matches!(
         backend,
-        "opencode" | "claude" | "codex" | "omp" | "pi" | "grok" | "kimi"
+        "opencode" | "claude" | "codex" | "omp" | "pi" | "omo" | "grok" | "kimi"
     ) || modal
         .backend_options
         .iter()
